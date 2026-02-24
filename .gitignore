@@ -16,3 +16,4 @@ scripts/venv/
 pairtrade_history.json
 *.swp
 .venv/
+*.jsonl
