@@ -1,0 +1,14 @@
+[Unit]
+Description="debot03"
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/debot
+ExecStart=/bin/bash /opt/debot/scripts/debot_lighter.sh debot03
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
