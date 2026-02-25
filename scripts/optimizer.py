@@ -44,34 +44,34 @@ TARGET_PAIRS = None
 
 # Parameters to tune. This grid will be tested against the static dataset.
 PARAM_GRID = {
-    # Entry/exit risk (keep tighter grid to reduce combinations)
+    # Entry/exit thresholds
     "ENTRY_Z_SCORE_BASE": ["1.3", "1.5"],
     "ENTRY_Z_SCORE_MIN": ["1.1", "1.3"],
-    "ENTRY_Z_SCORE_MAX": ["1.9"],  # fixed to reduce grid
+    "ENTRY_Z_SCORE_MAX": ["1.9"],  # fixed
     "EXIT_Z_SCORE": ["0.8", "1.0"],
-    "STOP_LOSS_Z_SCORE": ["2.2", "2.8"],  # tighter to favor faster exits
+    "STOP_LOSS_Z_SCORE": ["2.2", "2.8"],
     "MAX_LOSS_R_MULT": ["1.0", "1.5"],
-    "RISK_PCT_PER_TRADE": ["0.005", "0.01", "0.02", "0.05"],
-    "MAX_LEVERAGE": ["20"],
+    # Fixed at quarter-Kelly based on historical win rate (51%) and odds (3.3x).
+    "RISK_PCT_PER_TRADE": ["0.02"],
+    "MAX_LEVERAGE": ["5"],
     # Force-close timings (seconds, 5-30 minutes)
     "FORCE_CLOSE_TIME_SECS": ["300", "600", "900", "1200", "1800"],
     # Mean-reversion diagnostics
     # NOTE: Strategy reads these as PAIR_SELECTION_LOOKBACK_HOURS_* (not LOOKBACK_HOURS_*).
-    # Added "1" to enable faster re-evaluation and higher entry frequency.
+    # Includes shorter windows to allow faster re-evaluation and higher entry frequency.
     "PAIR_SELECTION_LOOKBACK_HOURS_SHORT": ["1", "2", "4"],
-    # Added "4", "6" to allow tighter, more responsive cointegration windows.
-    "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["4", "6", "12"],
-    # Added "0.1", "0.2" to allow more pairs to qualify, increasing entry opportunities.
-    "ADF_P_THRESHOLD": ["0.02", "0.05", "0.1", "0.2"],
-    # Added "1.0", "1.5" to widen eligibility to slower mean-reverting regimes.
-    "HALF_LIFE_MAX_HOURS": ["0.25", "0.75", "1.0", "1.5"],
+    "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["6", "12"],
+    # Wider ADF threshold to reduce dead time from cointegration failures.
+    "ADF_P_THRESHOLD": ["0.05", "0.1", "0.2"],
+    # Wider half-life range to capture slower mean-reverting regimes.
+    "HALF_LIFE_MAX_HOURS": ["0.75", "1.25"],
     # Re-evaluation and velocity filters
-    "REEVAL_JUMP_Z_MULT": ["1.1"],  # fixed to keep total combos constant
-    "SPREAD_VELOCITY_MAX_SIGMA_PER_MIN": ["0.08", "0.12", "0.15"],  # tuned
+    "REEVAL_JUMP_Z_MULT": ["1.1"],  # fixed
+    "SPREAD_VELOCITY_MAX_SIGMA_PER_MIN": ["0.08", "0.12", "0.15"],
     # Volatility lookback and warm start behavior
     "ENTRY_VOL_LOOKBACK_HOURS": ["6"],  # fixed
-    "WARM_START_MODE": ["strict"],  # reduce grid size
-    # Added "60" to reduce startup dead-time from 40 min to 20 min.
+    "WARM_START_MODE": ["strict"],  # fixed
+    # Includes "60" to reduce startup dead-time from 40 min to 20 min.
     "WARM_START_MIN_BARS": ["60", "120"],
 }
 
