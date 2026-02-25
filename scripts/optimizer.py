@@ -57,18 +57,22 @@ PARAM_GRID = {
     "FORCE_CLOSE_TIME_SECS": ["300", "600", "900", "1200", "1800"],
     # Mean-reversion diagnostics
     # NOTE: Strategy reads these as PAIR_SELECTION_LOOKBACK_HOURS_* (not LOOKBACK_HOURS_*).
-    "PAIR_SELECTION_LOOKBACK_HOURS_SHORT": ["2", "4"],
-    # Shorter long window favors faster mean-reversion pairs.
-    "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["12"],
-    "ADF_P_THRESHOLD": ["0.02", "0.05"],
-    "HALF_LIFE_MAX_HOURS": ["0.25", "0.75"],
+    # Added "1" to enable faster re-evaluation and higher entry frequency.
+    "PAIR_SELECTION_LOOKBACK_HOURS_SHORT": ["1", "2", "4"],
+    # Added "4", "6" to allow tighter, more responsive cointegration windows.
+    "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["4", "6", "12"],
+    # Added "0.1", "0.2" to allow more pairs to qualify, increasing entry opportunities.
+    "ADF_P_THRESHOLD": ["0.02", "0.05", "0.1", "0.2"],
+    # Added "1.0", "1.5" to widen eligibility to slower mean-reverting regimes.
+    "HALF_LIFE_MAX_HOURS": ["0.25", "0.75", "1.0", "1.5"],
     # Re-evaluation and velocity filters
     "REEVAL_JUMP_Z_MULT": ["1.1"],  # fixed to keep total combos constant
     "SPREAD_VELOCITY_MAX_SIGMA_PER_MIN": ["0.08", "0.12", "0.15"],  # tuned
     # Volatility lookback and warm start behavior
     "ENTRY_VOL_LOOKBACK_HOURS": ["6"],  # fixed
     "WARM_START_MODE": ["strict"],  # reduce grid size
-    "WARM_START_MIN_BARS": ["120"],  # reduce grid size
+    # Added "60" to reduce startup dead-time from 40 min to 20 min.
+    "WARM_START_MIN_BARS": ["60", "120"],
 }
 
 # Parameters expected to be integers in PairTradeConfig.
@@ -169,7 +173,8 @@ DEFAULT_VALIDATION_DIVERSITY_KEYS = (
 DEFAULT_OPTIMIZER_SCORE_ENV = {
     "OPTIMIZER_SCORE_MODE": DEFAULT_SCORE_MODE,
     "OPTIMIZER_RETURN_SCALE": "1000",
-    "OPTIMIZER_MIN_TRADES": "5",
+    # Require at least 48 trades (≈ 1 entry/30 min over 24h) to pass.
+    "OPTIMIZER_MIN_TRADES": "48",
     "OPTIMIZER_MAX_DRAWDOWN": "1000",
     "OPTIMIZER_MIN_SHARPE": "0.0",
     "OPTIMIZER_MAX_AVG_HOLD_SECS": "7200",
@@ -179,6 +184,9 @@ DEFAULT_OPTIMIZER_SCORE_ENV = {
     "OPTIMIZER_MAX_SINGLE_LOSS": "30",
     "OPTIMIZER_CVAR_PCT": "0.05",
     "OPTIMIZER_CVAR_PENALTY": "1.0",
+    # Bonus per trade to reward higher entry frequency.
+    # Weight 0.02 means 48 trades → +0.96, 288 trades → +5.76 (meaningful but not dominant).
+    "OPTIMIZER_TRADE_FREQ_BONUS": "0.02",
 }
 
 LIBSIGNER_ERROR_MARKER = "libsigner.so"

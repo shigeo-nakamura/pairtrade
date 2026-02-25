@@ -380,12 +380,14 @@ if __name__ == "__main__":
     drawdown_penalty = parse_env_float("OPTIMIZER_DRAWDOWN_PENALTY") or 0.0
     hold_penalty = parse_env_float("OPTIMIZER_AVG_HOLD_PENALTY") or 0.0
     sharpe_bonus = parse_env_float("OPTIMIZER_SHARPE_BONUS") or 0.0
+    trade_freq_bonus = parse_env_float("OPTIMIZER_TRADE_FREQ_BONUS") or 0.0
     if math.isfinite(score):
         score -= drawdown_penalty * max_drawdown
         score -= hold_penalty * avg_hold_secs
         if cvar < 0.0 and cvar_penalty > 0.0:
             score -= cvar_penalty * abs(cvar)
         score += sharpe_bonus * sharpe
+        score += trade_freq_bonus * trade_count
 
     if math.isfinite(score):
         print(f"{score:.8f}")
