@@ -96,8 +96,8 @@ INT_PARAM_NAMES = {
 }
 
 # In backtesting, we use a portion of the dataset for warmup.
-# Keep warmup >= long lookback to avoid premature "insufficient history".
-WARMUP_DURATION_SECS = 24 * 3600
+# Keep warmup >= long lookback (max 12h) to avoid premature "insufficient history".
+WARMUP_DURATION_SECS = 12 * 3600
 DEFAULT_TRADING_PERIOD_SECS = int(os.getenv("TRADING_PERIOD_SECS", "60"))
 MAX_TAIL_BYTES = 2 * 1024 * 1024
 ENABLE_REFINEMENT = os.getenv("OPTIMIZER_ENABLE_REFINEMENT", "1") == "1"
@@ -173,8 +173,9 @@ DEFAULT_VALIDATION_DIVERSITY_KEYS = (
 DEFAULT_OPTIMIZER_SCORE_ENV = {
     "OPTIMIZER_SCORE_MODE": DEFAULT_SCORE_MODE,
     "OPTIMIZER_RETURN_SCALE": "1000",
-    # Require at least 48 trades (≈ 1 entry/30 min over 24h) to pass.
-    "OPTIMIZER_MIN_TRADES": "48",
+    # Require at least 16 trades over the train window (≈ 1 entry/30 min × 8h).
+    # Train window is ~1.3 days after warmup, so 48/day is too strict.
+    "OPTIMIZER_MIN_TRADES": "16",
     "OPTIMIZER_MAX_DRAWDOWN": "1000",
     "OPTIMIZER_MIN_SHARPE": "0.0",
     "OPTIMIZER_MAX_AVG_HOLD_SECS": "7200",
