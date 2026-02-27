@@ -24,7 +24,7 @@ net_funding_min_per_hour: -0.005
 spread_velocity_max_sigma_per_min: 0.15
 entry_vol_lookback_hours: 6
 vol_spike_mult: 2.5
-risk_pct_per_trade: 0.005
+risk_pct_per_trade: 0.02
 equity_usd_fallback: 500
 max_leverage: 5
 slippage_bps: 1

@@ -44,15 +44,17 @@ TARGET_PAIRS = None
 
 # Parameters to tune. This grid will be tested against the static dataset.
 PARAM_GRID = {
-    # Entry/exit thresholds
-    "ENTRY_Z_SCORE_BASE": ["1.3", "1.5"],
-    "ENTRY_Z_SCORE_MIN": ["1.1", "1.3"],
+    # Entry/exit thresholds – lower bases to increase entry frequency.
+    "ENTRY_Z_SCORE_BASE": ["1.0", "1.3", "1.5"],
+    "ENTRY_Z_SCORE_MIN": ["0.8", "1.0", "1.3"],
     "ENTRY_Z_SCORE_MAX": ["1.9"],  # fixed
-    "EXIT_Z_SCORE": ["0.8", "1.0"],
-    "STOP_LOSS_Z_SCORE": ["2.2", "2.8"],
-    "MAX_LOSS_R_MULT": ["1.0", "1.5"],
-    # Fixed at quarter-Kelly based on historical win rate (51%) and odds (3.3x).
-    "RISK_PCT_PER_TRADE": ["0.02"],
+    "EXIT_Z_SCORE": ["0.5", "0.8", "1.0"],
+    # Wider stop-loss to avoid rejecting entries at high |z|.
+    # Data shows 79% of eligible signals have |z| > 2.2 (fat tails).
+    "STOP_LOSS_Z_SCORE": ["3.5", "5.0", "8.0"],
+    "MAX_LOSS_R_MULT": ["1.5", "2.0", "3.0"],
+    # Explore risk sizing around quarter-Kelly (~0.02 at current win rate/odds).
+    "RISK_PCT_PER_TRADE": ["0.005", "0.01", "0.02"],
     "MAX_LEVERAGE": ["5"],
     # Force-close timings (seconds, 5-30 minutes)
     "FORCE_CLOSE_TIME_SECS": ["300", "600", "900", "1200", "1800"],
@@ -62,9 +64,9 @@ PARAM_GRID = {
     "PAIR_SELECTION_LOOKBACK_HOURS_SHORT": ["1", "2", "4"],
     "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["6", "12"],
     # Wider ADF threshold to reduce dead time from cointegration failures.
-    "ADF_P_THRESHOLD": ["0.05", "0.1", "0.2"],
+    "ADF_P_THRESHOLD": ["0.05", "0.1", "0.2", "0.3"],
     # Wider half-life range to capture slower mean-reverting regimes.
-    "HALF_LIFE_MAX_HOURS": ["0.75", "1.25"],
+    "HALF_LIFE_MAX_HOURS": ["0.75", "1.25", "2.0"],
     # Re-evaluation and velocity filters
     "REEVAL_JUMP_Z_MULT": ["1.1"],  # fixed
     "SPREAD_VELOCITY_MAX_SIGMA_PER_MIN": ["0.08", "0.12", "0.15"],
@@ -173,9 +175,9 @@ DEFAULT_VALIDATION_DIVERSITY_KEYS = (
 DEFAULT_OPTIMIZER_SCORE_ENV = {
     "OPTIMIZER_SCORE_MODE": DEFAULT_SCORE_MODE,
     "OPTIMIZER_RETURN_SCALE": "1000",
-    # Require at least 16 trades over the train window (≈ 1 entry/30 min × 8h).
-    # Train window is ~1.3 days after warmup, so 48/day is too strict.
-    "OPTIMIZER_MIN_TRADES": "16",
+    # Minimum 8 trades to produce a finite score.
+    # Target is ~288 trades (30min/trade over 6d), so this is a low floor.
+    "OPTIMIZER_MIN_TRADES": "8",
     "OPTIMIZER_MAX_DRAWDOWN": "1000",
     "OPTIMIZER_MIN_SHARPE": "0.0",
     "OPTIMIZER_MAX_AVG_HOLD_SECS": "7200",
@@ -185,9 +187,9 @@ DEFAULT_OPTIMIZER_SCORE_ENV = {
     "OPTIMIZER_MAX_SINGLE_LOSS": "30",
     "OPTIMIZER_CVAR_PCT": "0.05",
     "OPTIMIZER_CVAR_PENALTY": "1.0",
-    # Bonus per trade to reward higher entry frequency.
-    # Weight 0.02 means 48 trades → +0.96, 288 trades → +5.76 (meaningful but not dominant).
-    "OPTIMIZER_TRADE_FREQ_BONUS": "0.02",
+    # Bonus per trade to strongly reward higher entry frequency.
+    # Target ~288 trades: 0.05 * 288 = +14.4 bonus (dominant in scoring).
+    "OPTIMIZER_TRADE_FREQ_BONUS": "0.05",
 }
 
 LIBSIGNER_ERROR_MARKER = "libsigner.so"
