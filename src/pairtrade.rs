@@ -60,6 +60,10 @@ const POST_ONLY_ENTRY_ATTEMPTS: usize = 3;
 const POST_ONLY_EXIT_ATTEMPTS: usize = 3;
 const POST_ONLY_RETRY_DELAY_MS: u64 = 200;
 const POST_ONLY_RETRY_MAX_ELAPSED_MS: u64 = 1500;
+const DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA: f64 = 0.5;
+const DEFAULT_BETA_DIVERGENCE_MAX: f64 = 0.15;
+const DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES: u32 = 3;
+const DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 1800;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
@@ -136,6 +140,10 @@ struct PairTradeYaml {
     history_file: Option<String>,
     backtest_mode: Option<bool>,
     backtest_file: Option<String>,
+    spread_trend_max_slope_sigma: Option<f64>,
+    beta_divergence_max: Option<f64>,
+    circuit_breaker_consecutive_losses: Option<u32>,
+    circuit_breaker_cooldown_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +198,10 @@ pub struct PairTradeConfig {
     // For backtest feature
     pub backtest_mode: bool,
     pub backtest_file: Option<String>,
+    pub spread_trend_max_slope_sigma: f64,
+    pub beta_divergence_max: f64,
+    pub circuit_breaker_consecutive_losses: u32,
+    pub circuit_breaker_cooldown_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +333,18 @@ impl PairTradeConfig {
             history_file,
             backtest_mode: yaml.backtest_mode.unwrap_or(false),
             backtest_file: yaml.backtest_file,
+            spread_trend_max_slope_sigma: yaml
+                .spread_trend_max_slope_sigma
+                .unwrap_or(DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA),
+            beta_divergence_max: yaml
+                .beta_divergence_max
+                .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
+            circuit_breaker_consecutive_losses: yaml
+                .circuit_breaker_consecutive_losses
+                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES),
+            circuit_breaker_cooldown_secs: yaml
+                .circuit_breaker_cooldown_secs
+                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS),
         };
 
         cfg.apply_env_overrides(history_file_from_yaml, warm_start_min_from_yaml)?;
@@ -568,6 +592,22 @@ impl PairTradeConfig {
             history_file,
             backtest_mode,
             backtest_file,
+            spread_trend_max_slope_sigma: env::var("SPREAD_TREND_MAX_SLOPE_SIGMA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA),
+            beta_divergence_max: env::var("BETA_DIVERGENCE_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
+            circuit_breaker_consecutive_losses: env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES),
+            circuit_breaker_cooldown_secs: env::var("CIRCUIT_BREAKER_COOLDOWN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS),
         })
     }
 
@@ -840,6 +880,27 @@ impl PairTradeConfig {
             return Err(anyhow!(
                 "BACKTEST_FILE must be set if BACKTEST_MODE is true"
             ));
+        }
+
+        if let Ok(value) = env::var("SPREAD_TREND_MAX_SLOPE_SIGMA") {
+            if let Ok(parsed) = value.parse() {
+                self.spread_trend_max_slope_sigma = parsed;
+            }
+        }
+        if let Ok(value) = env::var("BETA_DIVERGENCE_MAX") {
+            if let Ok(parsed) = value.parse() {
+                self.beta_divergence_max = parsed;
+            }
+        }
+        if let Ok(value) = env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES") {
+            if let Ok(parsed) = value.parse() {
+                self.circuit_breaker_consecutive_losses = parsed;
+            }
+        }
+        if let Ok(value) = env::var("CIRCUIT_BREAKER_COOLDOWN_SECS") {
+            if let Ok(parsed) = value.parse() {
+                self.circuit_breaker_cooldown_secs = parsed;
+            }
         }
 
         Ok(())
@@ -1543,6 +1604,7 @@ struct PairState {
     eligible: bool,
     last_evaluated: Option<Instant>,
     p_value_weighted_score: f64,
+    beta_gap: f64,
     pending_entry: Option<PendingOrders>,
     pending_exit: Option<PendingOrders>,
     position_guard: bool,
@@ -1678,6 +1740,7 @@ impl PairState {
             eligible: false,
             last_evaluated: None,
             p_value_weighted_score: 0.0,
+            beta_gap: 0.0,
             pending_entry: None,
             pending_exit: None,
             position_guard: false,
@@ -1749,6 +1812,8 @@ pub struct PairTradeEngine {
     replay_connector: Option<Arc<ReplayConnector>>,
     pnl_logger: Option<PnlLogger>,
     status_reporter: Option<StatusReporter>,
+    consecutive_losses: u32,
+    circuit_breaker_until: Option<Instant>,
 }
 
 struct PlannedAction {
@@ -1868,6 +1933,8 @@ impl PairTradeEngine {
             data_dump_writer,
             pnl_logger,
             status_reporter,
+            consecutive_losses: 0,
+            circuit_breaker_until: None,
         })
     }
 
@@ -2539,6 +2606,7 @@ impl PairTradeEngine {
                     state.adf_p_value = eval.adf_p_value;
                     state.eligible = eval.eligible;
                     state.p_value_weighted_score = eval.score;
+                    state.beta_gap = eval.beta_gap;
                     state.last_evaluated = Some(Instant::now());
                 }
                 if prev_eligible != state.eligible {
@@ -2584,6 +2652,11 @@ impl PairTradeEngine {
                                 }
                             } else if !self.positions_ready {
                                 log_positions_not_ready = true;
+                            } else if self
+                                .circuit_breaker_until
+                                .map_or(false, |until| Instant::now() < until)
+                            {
+                                // entry blocked by circuit breaker; logged via ZCHECK
                             } else if should_enter(&self.cfg, state, z, std, net_funding) {
                                 let direction = if z > 0.0 {
                                     PositionDirection::ShortSpread
@@ -2596,8 +2669,10 @@ impl PairTradeEngine {
                                     beta: state.beta,
                                 };
                             }
+                            let slope_sig =
+                                spread_slope_sigma(&state.spread_history, self.cfg.metrics_window);
                             log::debug!(
-                            "[ZCHECK] {} z={:.2} entry={:.2} std={:.4} mean={:.4} spread={:.4} hist={} beta_s={:.3} beta_l={:.3} funding={:.5} eligible={}",
+                            "[ZCHECK] {} z={:.2} entry={:.2} std={:.4} mean={:.4} spread={:.4} hist={} beta_s={:.3} beta_l={:.3} funding={:.5} eligible={} beta_gap={:.3} slope_sigma={:.3} consec_loss={}",
                             key,
                             z,
                             state.z_entry,
@@ -2608,7 +2683,10 @@ impl PairTradeEngine {
                             beta_short,
                             beta_long,
                             net_funding,
-                            state.eligible
+                            state.eligible,
+                            state.beta_gap,
+                            slope_sig.unwrap_or(0.0),
+                            self.consecutive_losses
                         );
                         }
                     } else if state.eligible && spread_len < min_points {
@@ -2732,6 +2810,29 @@ impl PairTradeEngine {
                                 "exit_dry_run",
                             );
                             self.write_pnl_record(record);
+                            if pnl_value < 0.0 {
+                                self.consecutive_losses += 1;
+                                if self.consecutive_losses
+                                    >= self.cfg.circuit_breaker_consecutive_losses
+                                {
+                                    self.circuit_breaker_until = Some(
+                                        Instant::now()
+                                            + Duration::from_secs(
+                                                self.cfg.circuit_breaker_cooldown_secs,
+                                            ),
+                                    );
+                                    log::warn!(
+                                        "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
+                                        self.consecutive_losses, self.cfg.circuit_breaker_cooldown_secs
+                                    );
+                                }
+                            } else if pnl_value > 0.0 {
+                                if self.consecutive_losses > 0 {
+                                    log::info!("[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)", self.consecutive_losses);
+                                }
+                                self.consecutive_losses = 0;
+                                self.circuit_breaker_until = None;
+                            }
                         }
                         log::info!(
                             "[EXIT] pair={}/{} direction={:?} size_a={} price_a={} size_b={} price_b={} z={:.2} beta={:.2} force={} pnl={} ts={}",
@@ -3115,10 +3216,9 @@ impl PairTradeEngine {
                         || state.pending_entry.is_some()
                         || state.pending_exit.is_some();
                     if state.pending_entry.is_none() && state.pending_exit.is_none() {
-                        if let Some((symbol, snapshot)) =
-                            base.map(|b| (pair.base.clone(), b)).or_else(|| {
-                                quote.map(|q| (pair.quote.clone(), q))
-                            })
+                        if let Some((symbol, snapshot)) = base
+                            .map(|b| (pair.base.clone(), b))
+                            .or_else(|| quote.map(|q| (pair.quote.clone(), q)))
                         {
                             if unhedged_attempted.insert(symbol.clone()) {
                                 unhedged_closures.push((
@@ -3176,10 +3276,7 @@ impl PairTradeEngine {
         }
 
         const UNHEDGED_CLOSE_COOLDOWN_SECS: u64 = 30;
-        let last_exit = self
-            .states
-            .get(key)
-            .and_then(|state| state.last_exit_at);
+        let last_exit = self.states.get(key).and_then(|state| state.last_exit_at);
         if let Some(last_exit) = last_exit {
             if last_exit.elapsed() < Duration::from_secs(UNHEDGED_CLOSE_COOLDOWN_SECS) {
                 return;
@@ -3675,7 +3772,7 @@ impl PairTradeEngine {
             let mut pending = pending;
             self.update_pending_fills(&mut pending, &status.fills);
             let filled_qtys = self.filled_by_leg(&pending, &status.fills);
-            let mut pnl_record: Option<PnlLogRecord> = None;
+            let mut pnl_record: Option<(PnlLogRecord, f64)> = None;
             if status.open_remaining == 0 && self.all_filled(&pending, &status.fills) {
                 if let Some(state) = self.states.get_mut(key) {
                     if let Some(pos) = state.position.as_ref() {
@@ -3686,13 +3783,16 @@ impl PairTradeEngine {
                                 if let Some(pnl) =
                                     compute_pnl(pos, p1.price, p2.price).and_then(|p| p.to_f64())
                                 {
-                                    pnl_record = Some(PnlLogRecord::new(
-                                        base,
-                                        quote,
-                                        pos.direction,
+                                    pnl_record = Some((
+                                        PnlLogRecord::new(
+                                            base,
+                                            quote,
+                                            pos.direction,
+                                            pnl,
+                                            Utc::now().timestamp(),
+                                            "exit_fill",
+                                        ),
                                         pnl,
-                                        Utc::now().timestamp(),
-                                        "exit_fill",
                                     ));
                                 }
                             }
@@ -3703,8 +3803,30 @@ impl PairTradeEngine {
                     state.pending_exit = None;
                 }
                 log::info!("[ORDER] {} exit orders filled", key);
-                if let Some(record) = pnl_record {
+                if let Some((record, pnl_value)) = pnl_record {
                     self.write_pnl_record(record);
+                    if pnl_value < 0.0 {
+                        self.consecutive_losses += 1;
+                        if self.consecutive_losses >= self.cfg.circuit_breaker_consecutive_losses {
+                            self.circuit_breaker_until = Some(
+                                Instant::now()
+                                    + Duration::from_secs(self.cfg.circuit_breaker_cooldown_secs),
+                            );
+                            log::warn!(
+                                "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
+                                self.consecutive_losses, self.cfg.circuit_breaker_cooldown_secs
+                            );
+                        }
+                    } else if pnl_value > 0.0 {
+                        if self.consecutive_losses > 0 {
+                            log::info!(
+                                "[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)",
+                                self.consecutive_losses
+                            );
+                        }
+                        self.consecutive_losses = 0;
+                        self.circuit_breaker_until = None;
+                    }
                 }
             } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
                 let next_retry = pending.hedge_retry_count.saturating_add(1);
@@ -4034,6 +4156,7 @@ impl PairTradeEngine {
             adf_p_value,
             eligible,
             score: continuous_score,
+            beta_gap,
         })
     }
 
@@ -5163,6 +5286,10 @@ impl PairTradeEngine {
             history_file: "test-history.json".to_string(),
             backtest_mode: false,
             backtest_file: None,
+            spread_trend_max_slope_sigma: DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA,
+            beta_divergence_max: DEFAULT_BETA_DIVERGENCE_MAX,
+            circuit_breaker_consecutive_losses: DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES,
+            circuit_breaker_cooldown_secs: DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS,
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
@@ -5188,6 +5315,8 @@ impl PairTradeEngine {
             replay_connector: None,
             pnl_logger: None,
             status_reporter: None,
+            consecutive_losses: 0,
+            circuit_breaker_until: None,
         }
     }
 }
@@ -5233,6 +5362,7 @@ struct PairEvaluation {
     adf_p_value: f64,
     eligible: bool,
     score: f64,
+    beta_gap: f64,
 }
 
 fn regression_beta(x: &[PriceSample], y: &[PriceSample]) -> f64 {
@@ -5271,6 +5401,42 @@ fn entry_z_for_pair(cfg: &PairTradeConfig, state: &PairState, vol_median: f64) -
     z.clamp(cfg.entry_z_min, cfg.entry_z_max)
 }
 
+fn spread_slope_sigma(history: &VecDeque<f64>, window: usize) -> Option<f64> {
+    let len = history.len().min(window);
+    if len < 3 {
+        return None;
+    }
+    let start = history.len() - len;
+    let n = len as f64;
+    let mean_i = (n - 1.0) / 2.0;
+    let (mut mean_x, mut cov, mut var_i) = (0.0, 0.0, 0.0);
+    for j in 0..len {
+        mean_x += history[start + j];
+    }
+    mean_x /= n;
+    for j in 0..len {
+        let di = j as f64 - mean_i;
+        let dx = history[start + j] - mean_x;
+        cov += di * dx;
+        var_i += di * di;
+    }
+    if var_i.abs() < 1e-15 {
+        return None;
+    }
+    let slope = cov / var_i;
+    // std of history slice
+    let mut sum_sq = 0.0;
+    for j in 0..len {
+        let dx = history[start + j] - mean_x;
+        sum_sq += dx * dx;
+    }
+    let std = (sum_sq / n).max(0.0).sqrt();
+    if std < 1e-9 {
+        return None;
+    }
+    Some((slope / std).abs())
+}
+
 fn should_enter(
     cfg: &PairTradeConfig,
     state: &PairState,
@@ -5291,6 +5457,16 @@ fn should_enter(
     };
     // Avoid entering when the current z already triggers stop-loss exit.
     if z.abs() >= cfg.stop_loss_z {
+        return false;
+    }
+    // Spread trend filter: block entry if spread is trending
+    if let Some(slope_sigma) = spread_slope_sigma(&state.spread_history, cfg.metrics_window) {
+        if slope_sigma > cfg.spread_trend_max_slope_sigma {
+            return false;
+        }
+    }
+    // Beta stability filter: block entry if beta_s and beta_l diverge
+    if state.beta_gap > cfg.beta_divergence_max {
         return false;
     }
     // Account for estimated cost (fees + slippage) in sigma units

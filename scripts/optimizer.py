@@ -75,6 +75,13 @@ PARAM_GRID = {
     "WARM_START_MODE": ["strict"],  # fixed
     # Includes "60" to reduce startup dead-time from 40 min to 20 min.
     "WARM_START_MIN_BARS": ["60", "120"],
+    # Spread trend filter: block entry when spread slope / std exceeds threshold.
+    "SPREAD_TREND_MAX_SLOPE_SIGMA": ["0.3", "0.5", "0.8", "1.0"],
+    # Beta stability filter: block entry when |beta_s - beta_l| / beta_eff exceeds threshold.
+    "BETA_DIVERGENCE_MAX": ["0.10", "0.15", "0.20", "0.30"],
+    # Circuit breaker: pause entries after N consecutive losses.
+    "CIRCUIT_BREAKER_CONSECUTIVE_LOSSES": ["3", "5"],
+    "CIRCUIT_BREAKER_COOLDOWN_SECS": ["600", "1200", "1800"],
 }
 
 # Parameters expected to be integers in PairTradeConfig.
@@ -95,6 +102,8 @@ INT_PARAM_NAMES = {
     "ENTRY_PARTIAL_FILL_MAX_RETRIES",
     "STARTUP_FORCE_CLOSE_ATTEMPTS",
     "STARTUP_FORCE_CLOSE_WAIT_SECS",
+    "CIRCUIT_BREAKER_CONSECUTIVE_LOSSES",
+    "CIRCUIT_BREAKER_COOLDOWN_SECS",
 }
 
 # In backtesting, we use a portion of the dataset for warmup.
