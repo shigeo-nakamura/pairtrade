@@ -33,3 +33,7 @@ reeval_jump_z_mult: 1.1
 max_loss_r_mult: 1.5
 warm_start_mode: strict
 warm_start_min_bars: 120
+spread_trend_max_slope_sigma: 0.5
+beta_divergence_max: 0.15
+circuit_breaker_consecutive_losses: 3
+circuit_breaker_cooldown_secs: 1800
