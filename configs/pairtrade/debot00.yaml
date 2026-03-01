@@ -27,8 +27,8 @@ vol_spike_mult: 2.5
 risk_pct_per_trade: 0.02
 equity_usd_fallback: 500
 max_leverage: 5
-slippage_bps: 1
-fee_bps: 1
+slippage_bps: 0
+fee_bps: 0
 reeval_jump_z_mult: 1.1
 max_loss_r_mult: 1.5
 warm_start_mode: strict

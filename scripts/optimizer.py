@@ -611,21 +611,33 @@ def iter_param_combinations(param_grid, param_names=None, shuffle=False, rng=Non
             rng.shuffle(values)
     for combo in itertools.product(*param_values):
         params_to_run = dict(zip(param_names, combo))
-        if float(params_to_run.get("PAIR_SELECTION_LOOKBACK_HOURS_SHORT", 0)) >= float(
-            params_to_run.get("PAIR_SELECTION_LOOKBACK_HOURS_LONG", float("inf"))
-        ):
+        if not _combo_passes_constraints(params_to_run):
             continue
-        entry_base = try_parse_float(params_to_run.get("ENTRY_Z_SCORE_BASE"))
-        entry_min = try_parse_float(params_to_run.get("ENTRY_Z_SCORE_MIN"))
-        entry_max = try_parse_float(params_to_run.get("ENTRY_Z_SCORE_MAX"))
-        if entry_min is not None and entry_max is not None and entry_min > entry_max:
-            continue
-        if entry_base is not None:
-            if entry_min is not None and entry_base < entry_min:
-                continue
-            if entry_max is not None and entry_base > entry_max:
-                continue
         yield params_to_run
+
+
+def _combo_passes_constraints(combo):
+    """Check param constraint validity without full grid enumeration."""
+    if float(combo.get("PAIR_SELECTION_LOOKBACK_HOURS_SHORT", 0)) >= float(
+        combo.get("PAIR_SELECTION_LOOKBACK_HOURS_LONG", float("inf"))
+    ):
+        return False
+    entry_base = try_parse_float(combo.get("ENTRY_Z_SCORE_BASE"))
+    entry_min = try_parse_float(combo.get("ENTRY_Z_SCORE_MIN"))
+    entry_max = try_parse_float(combo.get("ENTRY_Z_SCORE_MAX"))
+    if entry_min is not None and entry_max is not None and entry_min > entry_max:
+        return False
+    if entry_base is not None:
+        if entry_min is not None and entry_base < entry_min:
+            return False
+        if entry_max is not None and entry_base > entry_max:
+            return False
+    return True
+
+
+def _random_combo(param_grid, param_names, rng):
+    """Generate a single random combo by picking one value per param."""
+    return {name: rng.choice(param_grid[name]) for name in param_names}
 
 
 def sample_param_combinations_stream(
@@ -635,84 +647,83 @@ def sample_param_combinations_stream(
     seed=None,
     strategy="random",
 ):
-    rng = random.Random(seed) if seed is not None else random
-    total = 0
+    """Sample max_samples combos directly without enumerating the full grid."""
+    rng = random.Random(seed) if seed is not None else random.Random()
     selected = []
     selected_keys = set()
     strategy = (strategy or "random").strip().lower()
+    max_rejects = max_samples * 200  # safety bound to avoid infinite loops
 
     if strategy == "balanced":
+        # Target: each value of each param appears roughly equally.
         target = {
-            name: max_samples / max(1, len(param_grid.get(name, [])))
+            name: max(1, max_samples // max(1, len(param_grid.get(name, []))))
             for name in param_names
         }
         counts = {
             name: {val: 0 for val in param_grid.get(name, [])} for name in param_names
         }
-        fallback = []
-        fallback_keys = set()
 
-        for combo in iter_param_combinations(
-            param_grid, param_names, shuffle=True, rng=rng
-        ):
-            total += 1
+        # Phase 1: balanced selection — pick combos that fill under-represented values.
+        rejects = 0
+        while len(selected) < max_samples and rejects < max_rejects:
+            combo = _random_combo(param_grid, param_names, rng)
+            if not _combo_passes_constraints(combo):
+                rejects += 1
+                continue
             key = tuple(combo[name] for name in param_names)
-
-            # Reservoir for fallback fills.
-            if len(fallback) < max_samples:
-                fallback.append(combo)
-                fallback_keys.add(key)
-            else:
-                j = rng.randrange(total)
-                if j < max_samples:
-                    old = fallback[j]
-                    old_key = tuple(old[name] for name in param_names)
-                    fallback_keys.discard(old_key)
-                    fallback[j] = combo
-                    fallback_keys.add(key)
-
-            if key in selected_keys or len(selected) >= max_samples:
+            if key in selected_keys:
+                rejects += 1
                 continue
-
-            should_take = False
-            for name in param_names:
-                val = combo[name]
-                if counts[name].get(val, 0) < target[name]:
-                    should_take = True
-                    break
+            # Accept if any param value is under its target count.
+            should_take = any(
+                counts[name].get(combo[name], 0) < target[name]
+                for name in param_names
+            )
             if not should_take:
+                rejects += 1
                 continue
-
             selected.append(combo)
             selected_keys.add(key)
             for name in param_names:
                 val = combo[name]
                 if val in counts[name]:
                     counts[name][val] += 1
+            rejects = 0  # reset on success
 
-        if len(selected) < max_samples:
-            for combo in fallback:
-                key = tuple(combo[name] for name in param_names)
-                if key in selected_keys:
-                    continue
-                selected.append(combo)
-                selected_keys.add(key)
-                if len(selected) >= max_samples:
-                    break
-
-        return selected, total
-
-    # Random strategy (uniform reservoir sampling).
-    for combo in iter_param_combinations(param_grid, param_names, shuffle=False, rng=rng):
-        total += 1
-        if len(selected) < max_samples:
+        # Phase 2: fill remaining slots with any valid unique combo.
+        rejects = 0
+        while len(selected) < max_samples and rejects < max_rejects:
+            combo = _random_combo(param_grid, param_names, rng)
+            if not _combo_passes_constraints(combo):
+                rejects += 1
+                continue
+            key = tuple(combo[name] for name in param_names)
+            if key in selected_keys:
+                rejects += 1
+                continue
             selected.append(combo)
-            selected_keys.add(tuple(combo[name] for name in param_names))
+            selected_keys.add(key)
+            rejects = 0
+
+        # total is unknown without enumeration; report selected count.
+        return selected, len(selected)
+
+    # Random strategy: generate unique valid combos directly.
+    rejects = 0
+    while len(selected) < max_samples and rejects < max_rejects:
+        combo = _random_combo(param_grid, param_names, rng)
+        if not _combo_passes_constraints(combo):
+            rejects += 1
             continue
-        j = rng.randrange(total)
-        if j < max_samples:
-            selected[j] = combo
-    return selected, total
+        key = tuple(combo[name] for name in param_names)
+        if key in selected_keys:
+            rejects += 1
+            continue
+        selected.append(combo)
+        selected_keys.add(key)
+        rejects = 0
+    return selected, len(selected)
 
 
 def build_param_combinations(

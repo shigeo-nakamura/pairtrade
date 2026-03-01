@@ -12,6 +12,8 @@ export OPTIMIZER_MAX_COMBOS="768"
 export DEX_NAME="lighter"
 export OPTIMIZER_LOG_PATH="${LOG_FILE}"
 
+# optimizer.py manages its own log file via OPTIMIZER_LOG_PATH;
+# redirect nohup output to /dev/null to avoid deleted-inode conflict.
 echo "Starting optimizer in background. Log: ${LOG_FILE}"
-nohup python3 -u "${SCRIPT_DIR}/optimizer.py" >> "${LOG_FILE}" 2>&1 &
+nohup python3 -u "${SCRIPT_DIR}/optimizer.py" > /dev/null 2>&1 &
 echo "PID: $!"
