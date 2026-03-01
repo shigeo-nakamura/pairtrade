@@ -6,7 +6,7 @@ LOG_FILE="${REPO_ROOT}/optimizer.log"
 
 export OPTIMIZER_CONFIG_PATH="${REPO_ROOT}/configs/pairtrade/debot00.yaml"
 export DEBOT_ENV="${SCRIPT_DIR}/debot00.env"
-export DATA_DUMP_FILE="${REPO_ROOT}/market_data_7d.jsonl"
+export DATA_DUMP_FILE="${REPO_ROOT}/market_data_365d.jsonl"
 export OPTIMIZER_MODE="optimize"
 export OPTIMIZER_MAX_COMBOS="768"
 export DEX_NAME="lighter"

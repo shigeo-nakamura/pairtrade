@@ -30,11 +30,11 @@ DEFAULT_SCORE_MODE = "return"
 # The file where market data will be stored.
 # Use an absolute path to avoid CWD changes in runner scripts.
 DATA_DUMP_FILE = os.path.abspath(
-    os.getenv("DATA_DUMP_FILE", "market_data_7d.jsonl")
+    os.getenv("DATA_DUMP_FILE", "market_data_365d.jsonl")
 )
 # How long to run the bot in live mode to gather data.
 # This should be long enough for the backtest period.
-DATA_GATHERING_DURATION_SECS = 7 * 24 * 3600
+DATA_GATHERING_DURATION_SECS = 365 * 24 * 3600
 
 # Step 2: Backtest & Optimization Configuration
 # ---------------------------------------------
@@ -109,6 +109,8 @@ INT_PARAM_NAMES = {
 # In backtesting, we use a portion of the dataset for warmup.
 # Keep warmup >= long lookback (max 12h) to avoid premature "insufficient history".
 WARMUP_DURATION_SECS = 12 * 3600
+# Use only the most recent N days of data for optimization (0 = use all).
+OPTIMIZER_DATA_TAIL_DAYS = float(os.getenv("OPTIMIZER_DATA_TAIL_DAYS", "30"))
 DEFAULT_TRADING_PERIOD_SECS = int(os.getenv("TRADING_PERIOD_SECS", "60"))
 MAX_TAIL_BYTES = 2 * 1024 * 1024
 ENABLE_REFINEMENT = os.getenv("OPTIMIZER_ENABLE_REFINEMENT", "1") == "1"
@@ -1715,6 +1717,11 @@ def preprocess_data_dump_file(data_file):
 
 
 def build_walk_forward_windows(data_start, data_end):
+    # Truncate to the most recent OPTIMIZER_DATA_TAIL_DAYS if set.
+    if OPTIMIZER_DATA_TAIL_DAYS > 0:
+        tail_start = data_end - timedelta(days=OPTIMIZER_DATA_TAIL_DAYS)
+        if tail_start > data_start:
+            data_start = tail_start
     mid = data_start + (data_end - data_start) / 2
     train_start = data_start + timedelta(seconds=WARMUP_DURATION_SECS)
     train_end = mid
