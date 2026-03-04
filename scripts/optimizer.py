@@ -56,8 +56,8 @@ PARAM_GRID = {
     # Explore risk sizing around quarter-Kelly (~0.02 at current win rate/odds).
     "RISK_PCT_PER_TRADE": ["0.005", "0.01", "0.02"],
     "MAX_LEVERAGE": ["5"],
-    # Force-close timings (seconds, 5-30 minutes)
-    "FORCE_CLOSE_TIME_SECS": ["300", "600", "900", "1200", "1800"],
+    # Force-close timings (seconds, 5-60 minutes)
+    "FORCE_CLOSE_TIME_SECS": ["300", "600", "900", "1200", "1800", "2700", "3600"],
     # Mean-reversion diagnostics
     # NOTE: Strategy reads these as PAIR_SELECTION_LOOKBACK_HOURS_* (not LOOKBACK_HOURS_*).
     # Includes shorter windows to allow faster re-evaluation and higher entry frequency.
@@ -114,7 +114,7 @@ OPTIMIZER_DATA_TAIL_DAYS = float(os.getenv("OPTIMIZER_DATA_TAIL_DAYS", "30"))
 DEFAULT_TRADING_PERIOD_SECS = int(os.getenv("TRADING_PERIOD_SECS", "60"))
 MAX_TAIL_BYTES = 2 * 1024 * 1024
 ENABLE_REFINEMENT = os.getenv("OPTIMIZER_ENABLE_REFINEMENT", "1") == "1"
-FORCE_CLOSE_TIME_MAX_SECS = 1800
+FORCE_CLOSE_TIME_MAX_SECS = 3600
 REFINE_PARAM_COUNT = int(os.getenv("OPTIMIZER_REFINE_PARAM_COUNT", "3"))
 REFINE_SEED_COUNT = int(os.getenv("OPTIMIZER_REFINE_SEED_COUNT", "5"))
 REFINE_MAX_RUNS = int(os.getenv("OPTIMIZER_REFINE_MAX_RUNS", "128"))
@@ -172,8 +172,8 @@ OPTIMIZER_SWEEP_CSV_PATH = os.getenv(
 VALIDATION_WORKERS = os.getenv("VALIDATION_WORKERS")
 OPTIMIZER_WORKERS = os.getenv("OPTIMIZER_WORKERS")
 VALIDATION_CANDIDATE_WORKERS = os.getenv("VALIDATION_CANDIDATE_WORKERS")
-VALIDATION_CANDIDATE_TOP_K = int(os.getenv("VALIDATION_CANDIDATE_TOP_K", "5"))
-VALIDATION_CANDIDATE_DIVERSE_K = int(os.getenv("VALIDATION_CANDIDATE_DIVERSE_K", "5"))
+VALIDATION_CANDIDATE_TOP_K = int(os.getenv("VALIDATION_CANDIDATE_TOP_K", "8"))
+VALIDATION_CANDIDATE_DIVERSE_K = int(os.getenv("VALIDATION_CANDIDATE_DIVERSE_K", "7"))
 VALIDATION_DIVERSITY_KEYS_RAW = os.getenv("VALIDATION_DIVERSITY_KEYS", "")
 DEFAULT_VALIDATION_DIVERSITY_KEYS = (
     "ENTRY_Z_SCORE_BASE",
@@ -198,9 +198,8 @@ DEFAULT_OPTIMIZER_SCORE_ENV = {
     "OPTIMIZER_MAX_SINGLE_LOSS": "30",
     "OPTIMIZER_CVAR_PCT": "0.05",
     "OPTIMIZER_CVAR_PENALTY": "1.0",
-    # Bonus per trade to strongly reward higher entry frequency.
-    # Target ~288 trades: 0.05 * 288 = +14.4 bonus (dominant in scoring).
-    "OPTIMIZER_TRADE_FREQ_BONUS": "0.05",
+    # Small bonus per trade to mildly reward higher entry frequency.
+    "OPTIMIZER_TRADE_FREQ_BONUS": "0.01",
 }
 
 LIBSIGNER_ERROR_MARKER = "libsigner.so"
