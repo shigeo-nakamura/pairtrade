@@ -3588,13 +3588,30 @@ impl PairTradeEngine {
             let filled_qtys = self.filled_by_leg(&pending, &status.fills);
             if self.all_filled(&pending, &status.fills) {
                 if let Some(state) = self.states.get_mut(key) {
+                    let (mut ep_a, mut ep_b, mut es_a, mut es_b) =
+                        (None, None, None, None);
+                    if let Some((base, quote)) = key.split_once('/') {
+                        for leg in &pending.legs {
+                            if leg.symbol == base {
+                                ep_a = price_map
+                                    .get(base)
+                                    .map(|s| s.price);
+                                es_a = Some(leg.target);
+                            } else if leg.symbol == quote {
+                                ep_b = price_map
+                                    .get(quote)
+                                    .map(|s| s.price);
+                                es_b = Some(leg.target);
+                            }
+                        }
+                    }
                     state.position = Some(Position {
                         direction: pending.direction,
                         entered_at: Instant::now(),
-                        entry_price_a: None,
-                        entry_price_b: None,
-                        entry_size_a: None,
-                        entry_size_b: None,
+                        entry_price_a: ep_a,
+                        entry_price_b: ep_b,
+                        entry_size_a: es_a,
+                        entry_size_b: es_b,
                     });
                     state.pending_entry = None;
                 }

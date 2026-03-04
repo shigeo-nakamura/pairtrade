@@ -9,7 +9,7 @@ on:
       - "build.rs"
       - ".github/workflows/ci.yml"
   schedule:
-    - cron: "15 * * * *"
+    - cron: "15 6 * * *"
   workflow_dispatch:
     inputs:
       dex_connector_ref:
