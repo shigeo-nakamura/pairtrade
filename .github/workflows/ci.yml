@@ -206,6 +206,7 @@ jobs:
             .cache/cargo/registry
             .cache/cargo/git
             .cache/cargo/bin
+            .cache/rustup
             debot/target
           key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
