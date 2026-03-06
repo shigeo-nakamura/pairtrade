@@ -64,6 +64,11 @@ const DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA: f64 = 0.5;
 const DEFAULT_BETA_DIVERGENCE_MAX: f64 = 0.15;
 const DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES: u32 = 3;
 const DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 1800;
+const DEFAULT_CB_TIER1_LOSSES: u32 = 0;
+const DEFAULT_CB_TIER1_COOLDOWN_SECS: u64 = 0;
+const DEFAULT_CB_TIER2_LOSSES: u32 = 0;
+const DEFAULT_CB_TIER2_COOLDOWN_SECS: u64 = 0;
+const DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS: u64 = 0;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
@@ -144,6 +149,11 @@ struct PairTradeYaml {
     beta_divergence_max: Option<f64>,
     circuit_breaker_consecutive_losses: Option<u32>,
     circuit_breaker_cooldown_secs: Option<u64>,
+    circuit_breaker_tier1_losses: Option<u32>,
+    circuit_breaker_tier1_cooldown_secs: Option<u64>,
+    circuit_breaker_tier2_losses: Option<u32>,
+    circuit_breaker_tier2_cooldown_secs: Option<u64>,
+    entry_post_only_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +212,11 @@ pub struct PairTradeConfig {
     pub beta_divergence_max: f64,
     pub circuit_breaker_consecutive_losses: u32,
     pub circuit_breaker_cooldown_secs: u64,
+    pub circuit_breaker_tier1_losses: u32,
+    pub circuit_breaker_tier1_cooldown_secs: u64,
+    pub circuit_breaker_tier2_losses: u32,
+    pub circuit_breaker_tier2_cooldown_secs: u64,
+    pub entry_post_only_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +360,21 @@ impl PairTradeConfig {
             circuit_breaker_cooldown_secs: yaml
                 .circuit_breaker_cooldown_secs
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS),
+            circuit_breaker_tier1_losses: yaml
+                .circuit_breaker_tier1_losses
+                .unwrap_or(DEFAULT_CB_TIER1_LOSSES),
+            circuit_breaker_tier1_cooldown_secs: yaml
+                .circuit_breaker_tier1_cooldown_secs
+                .unwrap_or(DEFAULT_CB_TIER1_COOLDOWN_SECS),
+            circuit_breaker_tier2_losses: yaml
+                .circuit_breaker_tier2_losses
+                .unwrap_or(DEFAULT_CB_TIER2_LOSSES),
+            circuit_breaker_tier2_cooldown_secs: yaml
+                .circuit_breaker_tier2_cooldown_secs
+                .unwrap_or(DEFAULT_CB_TIER2_COOLDOWN_SECS),
+            entry_post_only_timeout_secs: yaml
+                .entry_post_only_timeout_secs
+                .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
         };
 
         cfg.apply_env_overrides(history_file_from_yaml, warm_start_min_from_yaml)?;
@@ -608,6 +638,26 @@ impl PairTradeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS),
+            circuit_breaker_tier1_losses: env::var("CIRCUIT_BREAKER_TIER1_LOSSES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_CB_TIER1_LOSSES),
+            circuit_breaker_tier1_cooldown_secs: env::var("CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_CB_TIER1_COOLDOWN_SECS),
+            circuit_breaker_tier2_losses: env::var("CIRCUIT_BREAKER_TIER2_LOSSES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_CB_TIER2_LOSSES),
+            circuit_breaker_tier2_cooldown_secs: env::var("CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_CB_TIER2_COOLDOWN_SECS),
+            entry_post_only_timeout_secs: env::var("ENTRY_POST_ONLY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
         })
     }
 
@@ -902,12 +952,54 @@ impl PairTradeConfig {
                 self.circuit_breaker_cooldown_secs = parsed;
             }
         }
+        if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER1_LOSSES") {
+            if let Ok(parsed) = value.parse() {
+                self.circuit_breaker_tier1_losses = parsed;
+            }
+        }
+        if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS") {
+            if let Ok(parsed) = value.parse() {
+                self.circuit_breaker_tier1_cooldown_secs = parsed;
+            }
+        }
+        if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER2_LOSSES") {
+            if let Ok(parsed) = value.parse() {
+                self.circuit_breaker_tier2_losses = parsed;
+            }
+        }
+        if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS") {
+            if let Ok(parsed) = value.parse() {
+                self.circuit_breaker_tier2_cooldown_secs = parsed;
+            }
+        }
+        if let Ok(value) = env::var("ENTRY_POST_ONLY_TIMEOUT_SECS") {
+            if let Ok(parsed) = value.parse() {
+                self.entry_post_only_timeout_secs = parsed;
+            }
+        }
 
         Ok(())
     }
 
     fn slippage_cost_bps(&self) -> f64 {
         self.slippage_bps.max(0) as f64
+    }
+
+    fn circuit_breaker_cooldown_for(&self, losses: u32) -> Option<Duration> {
+        // Graduated tiers (check tier2 first as higher threshold)
+        if self.circuit_breaker_tier2_losses > 0 && losses >= self.circuit_breaker_tier2_losses {
+            return Some(Duration::from_secs(self.circuit_breaker_tier2_cooldown_secs));
+        }
+        if self.circuit_breaker_tier1_losses > 0 && losses >= self.circuit_breaker_tier1_losses {
+            return Some(Duration::from_secs(self.circuit_breaker_tier1_cooldown_secs));
+        }
+        // Legacy fallback
+        if self.circuit_breaker_consecutive_losses > 0
+            && losses >= self.circuit_breaker_consecutive_losses
+        {
+            return Some(Duration::from_secs(self.circuit_breaker_cooldown_secs));
+        }
+        None
     }
 }
 
@@ -1628,6 +1720,7 @@ struct PendingOrders {
     direction: PositionDirection,
     placed_at: Instant,
     hedge_retry_count: u32,
+    post_only_hybrid: bool,
 }
 
 #[derive(Debug)]
@@ -2213,6 +2306,76 @@ impl PairTradeEngine {
             direction: pending.direction,
             placed_at: Instant::now(),
             hedge_retry_count: retry_count,
+            post_only_hybrid: false,
+        }))
+    }
+
+    async fn reissue_entry_as_taker(
+        &mut self,
+        key: &str,
+        pending: &PendingOrders,
+        price_map: &HashMap<String, SymbolSnapshot>,
+    ) -> Result<Option<PendingOrders>> {
+        let mut new_legs = Vec::new();
+        for leg in &pending.legs {
+            let size = self.quantize_order_size(&leg.symbol, leg.target, price_map);
+            if size <= Decimal::ZERO {
+                log::warn!(
+                    "[ORDER] {} taker reissue leg {} below min size; skipping",
+                    key,
+                    leg.symbol
+                );
+                continue;
+            }
+            match self
+                .connector
+                .create_order(
+                    &leg.symbol,
+                    size,
+                    leg.side,
+                    None,  // no limit price = market/taker
+                    None,
+                    false,
+                    None,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    log::info!(
+                        "[ORDER] {} taker reissue leg {} size={}",
+                        key,
+                        leg.symbol,
+                        size
+                    );
+                    new_legs.push(PendingLeg {
+                        symbol: leg.symbol.clone(),
+                        order_id: resp.order_id,
+                        exchange_order_id: resp.exchange_order_id,
+                        target: size,
+                        filled: Decimal::ZERO,
+                        side: leg.side,
+                        placed_price: resp.ordered_price,
+                    });
+                }
+                Err(e) => {
+                    log::error!(
+                        "[ORDER] {} taker reissue failed for {}: {:?}",
+                        key,
+                        leg.symbol,
+                        e
+                    );
+                }
+            }
+        }
+        if new_legs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PendingOrders {
+            legs: new_legs,
+            direction: pending.direction,
+            placed_at: Instant::now(),
+            hedge_retry_count: 0,
+            post_only_hybrid: false,
         }))
     }
 
@@ -2812,18 +2975,11 @@ impl PairTradeEngine {
                             self.write_pnl_record(record);
                             if pnl_value < 0.0 {
                                 self.consecutive_losses += 1;
-                                if self.consecutive_losses
-                                    >= self.cfg.circuit_breaker_consecutive_losses
-                                {
-                                    self.circuit_breaker_until = Some(
-                                        Instant::now()
-                                            + Duration::from_secs(
-                                                self.cfg.circuit_breaker_cooldown_secs,
-                                            ),
-                                    );
+                                if let Some(cooldown) = self.cfg.circuit_breaker_cooldown_for(self.consecutive_losses) {
+                                    self.circuit_breaker_until = Some(Instant::now() + cooldown);
                                     log::warn!(
                                         "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
-                                        self.consecutive_losses, self.cfg.circuit_breaker_cooldown_secs
+                                        self.consecutive_losses, cooldown.as_secs()
                                     );
                                 }
                             } else if pnl_value > 0.0 {
@@ -2892,6 +3048,7 @@ impl PairTradeEngine {
                             direction,
                             placed_at: Instant::now(),
                             hedge_retry_count: 0,
+                            post_only_hybrid: false,
                         });
                     }
                 }
@@ -3040,12 +3197,15 @@ impl PairTradeEngine {
                             return Err(err);
                         }
                     };
+                    let hybrid = self.cfg.entry_post_only_timeout_secs > 0
+                        && self.post_only_supported();
                     if let Some(state) = self.states.get_mut(&plan.key) {
                         state.pending_entry = Some(PendingOrders {
                             legs,
                             direction,
                             placed_at: Instant::now(),
                             hedge_retry_count: 0,
+                            post_only_hybrid: hybrid,
                         });
                     }
                 }
@@ -3659,6 +3819,23 @@ impl PairTradeEngine {
                     state.pending_entry = None;
                 }
                 return Ok(());
+            } else if pending.post_only_hybrid
+                && self.cfg.entry_post_only_timeout_secs > 0
+                && pending.placed_at.elapsed()
+                    >= Duration::from_secs(self.cfg.entry_post_only_timeout_secs)
+            {
+                // Post-only entry timed out; cancel and reissue as taker
+                log::info!(
+                    "[ORDER] {} post-only entry timeout ({}s), falling back to taker",
+                    key,
+                    self.cfg.entry_post_only_timeout_secs
+                );
+                self.cancel_pending_orders(&pending).await?;
+                let new_pending =
+                    self.reissue_entry_as_taker(key, &pending, price_map).await?;
+                if let Some(state) = self.states.get_mut(key) {
+                    state.pending_entry = new_pending;
+                }
             } else if pending.placed_at.elapsed() >= timeout {
                 // Partial fill or stuck orders; cancel and flatten any filled leg
                 if status.open_remaining > 0 {
@@ -3824,14 +4001,11 @@ impl PairTradeEngine {
                     self.write_pnl_record(record);
                     if pnl_value < 0.0 {
                         self.consecutive_losses += 1;
-                        if self.consecutive_losses >= self.cfg.circuit_breaker_consecutive_losses {
-                            self.circuit_breaker_until = Some(
-                                Instant::now()
-                                    + Duration::from_secs(self.cfg.circuit_breaker_cooldown_secs),
-                            );
+                        if let Some(cooldown) = self.cfg.circuit_breaker_cooldown_for(self.consecutive_losses) {
+                            self.circuit_breaker_until = Some(Instant::now() + cooldown);
                             log::warn!(
                                 "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
-                                self.consecutive_losses, self.cfg.circuit_breaker_cooldown_secs
+                                self.consecutive_losses, cooldown.as_secs()
                             );
                         }
                     } else if pnl_value > 0.0 {
@@ -3959,6 +4133,7 @@ impl PairTradeEngine {
                             direction: pending.direction,
                             placed_at: Instant::now(),
                             hedge_retry_count: next_retry,
+                            post_only_hybrid: false,
                         });
                     }
                 }
@@ -4633,9 +4808,16 @@ impl PairTradeEngine {
         }
         let limit_a = self.limit_price_for(&pair.base, side_a, prices);
         let limit_b = self.limit_price_for(&pair.quote, side_b, prices);
+        let hybrid_active =
+            self.cfg.entry_post_only_timeout_secs > 0 && self.post_only_supported();
         let post_only = self.should_post_only();
+        let entry_attempts = if hybrid_active {
+            1
+        } else {
+            POST_ONLY_ENTRY_ATTEMPTS
+        };
         log::debug!(
-            "[ORDER_PARAMS][ENTRY] pair={}/{} side_a={:?} qty_a={} ref_price_a={} limit_a={:?} side_b={:?} qty_b={} ref_price_b={} limit_b={:?} post_only={}",
+            "[ORDER_PARAMS][ENTRY] pair={}/{} side_a={:?} qty_a={} ref_price_a={} limit_a={:?} side_b={:?} qty_b={} ref_price_b={} limit_b={:?} post_only={} hybrid={}",
             pair.base,
             pair.quote,
             side_a,
@@ -4646,7 +4828,8 @@ impl PairTradeEngine {
             qty_b,
             ref_price_b.unwrap_or(Decimal::ZERO),
             limit_b,
-            post_only
+            post_only,
+            hybrid_active
         );
         let mut legs: Vec<PendingLeg> = Vec::new();
         let res_a = self
@@ -4657,7 +4840,7 @@ impl PairTradeEngine {
                 false,
                 prices,
                 true,
-                POST_ONLY_ENTRY_ATTEMPTS,
+                entry_attempts,
                 false,
             )
             .await
@@ -4693,7 +4876,7 @@ impl PairTradeEngine {
                 false,
                 prices,
                 true,
-                POST_ONLY_ENTRY_ATTEMPTS,
+                entry_attempts,
                 false,
             )
             .await
@@ -5134,6 +5317,7 @@ impl PairTradeEngine {
                     direction,
                     placed_at: Instant::now(),
                     hedge_retry_count: 0,
+                    post_only_hybrid: false,
                 };
                 if is_exit {
                     state.pending_exit = Some(pending);
@@ -5307,6 +5491,11 @@ impl PairTradeEngine {
             beta_divergence_max: DEFAULT_BETA_DIVERGENCE_MAX,
             circuit_breaker_consecutive_losses: DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES,
             circuit_breaker_cooldown_secs: DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS,
+            circuit_breaker_tier1_losses: DEFAULT_CB_TIER1_LOSSES,
+            circuit_breaker_tier1_cooldown_secs: DEFAULT_CB_TIER1_COOLDOWN_SECS,
+            circuit_breaker_tier2_losses: DEFAULT_CB_TIER2_LOSSES,
+            circuit_breaker_tier2_cooldown_secs: DEFAULT_CB_TIER2_COOLDOWN_SECS,
+            entry_post_only_timeout_secs: DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS,
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
@@ -6052,6 +6241,7 @@ mod pending_tests {
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
             hedge_retry_count: 0,
+            post_only_hybrid: false,
         };
         let mut price_map = HashMap::new();
         price_map.insert(
@@ -6108,6 +6298,7 @@ mod pending_tests {
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
             hedge_retry_count: 0,
+            post_only_hybrid: false,
         };
         let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
 

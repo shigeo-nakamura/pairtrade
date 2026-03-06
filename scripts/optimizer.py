@@ -30,11 +30,11 @@ DEFAULT_SCORE_MODE = "return"
 # The file where market data will be stored.
 # Use an absolute path to avoid CWD changes in runner scripts.
 DATA_DUMP_FILE = os.path.abspath(
-    os.getenv("DATA_DUMP_FILE", "market_data_365d.jsonl")
+    os.getenv("DATA_DUMP_FILE", "market_data_30d.jsonl")
 )
 # How long to run the bot in live mode to gather data.
 # This should be long enough for the backtest period.
-DATA_GATHERING_DURATION_SECS = 365 * 24 * 3600
+DATA_GATHERING_DURATION_SECS = 30 * 24 * 3600
 
 # Step 2: Backtest & Optimization Configuration
 # ---------------------------------------------
@@ -79,9 +79,13 @@ PARAM_GRID = {
     "SPREAD_TREND_MAX_SLOPE_SIGMA": ["0.3", "0.5", "0.8", "1.0"],
     # Beta stability filter: block entry when |beta_s - beta_l| / beta_eff exceeds threshold.
     "BETA_DIVERGENCE_MAX": ["0.10", "0.15", "0.20", "0.30"],
-    # Circuit breaker: pause entries after N consecutive losses.
-    "CIRCUIT_BREAKER_CONSECUTIVE_LOSSES": ["3", "5"],
-    "CIRCUIT_BREAKER_COOLDOWN_SECS": ["600", "1200", "1800"],
+    # Circuit breaker: graduated tiers.
+    "CIRCUIT_BREAKER_TIER1_LOSSES": ["3"],
+    "CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS": ["300", "600"],
+    "CIRCUIT_BREAKER_TIER2_LOSSES": ["5", "7"],
+    "CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS": ["1800", "3600"],
+    # Post-only → taker hybrid entry timeout (0=disabled).
+    "ENTRY_POST_ONLY_TIMEOUT_SECS": ["0", "15", "30"],
 }
 
 # Parameters expected to be integers in PairTradeConfig.
@@ -104,6 +108,11 @@ INT_PARAM_NAMES = {
     "STARTUP_FORCE_CLOSE_WAIT_SECS",
     "CIRCUIT_BREAKER_CONSECUTIVE_LOSSES",
     "CIRCUIT_BREAKER_COOLDOWN_SECS",
+    "CIRCUIT_BREAKER_TIER1_LOSSES",
+    "CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS",
+    "CIRCUIT_BREAKER_TIER2_LOSSES",
+    "CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS",
+    "ENTRY_POST_ONLY_TIMEOUT_SECS",
 }
 
 # In backtesting, we use a portion of the dataset for warmup.
@@ -633,6 +642,15 @@ def _combo_passes_constraints(combo):
             return False
         if entry_max is not None and entry_base > entry_max:
             return False
+    # Graduated circuit breaker: tier2 must be stricter than tier1
+    cb_t1_losses = try_parse_float(combo.get("CIRCUIT_BREAKER_TIER1_LOSSES"))
+    cb_t2_losses = try_parse_float(combo.get("CIRCUIT_BREAKER_TIER2_LOSSES"))
+    cb_t1_cd = try_parse_float(combo.get("CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS"))
+    cb_t2_cd = try_parse_float(combo.get("CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS"))
+    if cb_t1_losses is not None and cb_t2_losses is not None and cb_t2_losses <= cb_t1_losses:
+        return False
+    if cb_t1_cd is not None and cb_t2_cd is not None and cb_t2_cd <= cb_t1_cd:
+        return False
     return True
 
 
