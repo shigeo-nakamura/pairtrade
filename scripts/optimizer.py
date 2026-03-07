@@ -53,8 +53,8 @@ PARAM_GRID = {
     # Data shows 79% of eligible signals have |z| > 2.2 (fat tails).
     "STOP_LOSS_Z_SCORE": ["3.5", "5.0", "8.0"],
     "MAX_LOSS_R_MULT": ["1.5", "2.0", "3.0"],
-    # Explore risk sizing around quarter-Kelly (~0.02 at current win rate/odds).
-    "RISK_PCT_PER_TRADE": ["0.005", "0.01", "0.02"],
+    # Fixed: risk sizing doesn't affect signal quality, only scales returns.
+    "RISK_PCT_PER_TRADE": ["0.02"],
     "MAX_LEVERAGE": ["5"],
     # Force-close timings (seconds, 5-60 minutes)
     "FORCE_CLOSE_TIME_SECS": ["300", "600", "900", "1200", "1800", "2700", "3600"],
