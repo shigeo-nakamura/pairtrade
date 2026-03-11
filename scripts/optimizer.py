@@ -44,28 +44,28 @@ TARGET_PAIRS = None
 
 # Parameters to tune. This grid will be tested against the static dataset.
 PARAM_GRID = {
-    # Entry/exit thresholds – lower bases to increase entry frequency.
-    "ENTRY_Z_SCORE_BASE": ["1.0", "1.3", "1.5"],
-    "ENTRY_Z_SCORE_MIN": ["0.8", "1.0", "1.3"],
+    # Entry/exit thresholds – focused around prior optimal (1.15).
+    "ENTRY_Z_SCORE_BASE": ["1.0", "1.15", "1.3"],
+    "ENTRY_Z_SCORE_MIN": ["1.0"],  # fixed: always 1.0 in prior results
     "ENTRY_Z_SCORE_MAX": ["1.9"],  # fixed
     "EXIT_Z_SCORE": ["0.5", "0.8", "1.0"],
-    # Wider stop-loss to avoid rejecting entries at high |z|.
-    # Data shows 79% of eligible signals have |z| > 2.2 (fat tails).
-    "STOP_LOSS_Z_SCORE": ["3.5", "5.0", "8.0"],
-    "MAX_LOSS_R_MULT": ["1.5", "2.0", "3.0"],
+    # Stop-loss: 8.0 is effectively infinite, removed.
+    "STOP_LOSS_Z_SCORE": ["3.5", "5.0"],
+    # Cap at 2.0 to prevent optimizer from relying on "hold and hope" strategy.
+    "MAX_LOSS_R_MULT": ["1.5", "2.0"],
     # Fixed: risk sizing doesn't affect signal quality, only scales returns.
     "RISK_PCT_PER_TRADE": ["0.04"],
     "MAX_LEVERAGE": ["5"],
-    # Force-close timings (seconds, 5-60 minutes)
-    "FORCE_CLOSE_TIME_SECS": ["300", "600", "900", "1200", "1800", "2700", "3600"],
+    # Force-close timings (10-20 minutes): 300s too short, 1800s+ too risky.
+    "FORCE_CLOSE_TIME_SECS": ["600", "900", "1200"],
     # Mean-reversion diagnostics
     # NOTE: Strategy reads these as PAIR_SELECTION_LOOKBACK_HOURS_* (not LOOKBACK_HOURS_*).
-    # Includes shorter windows to allow faster re-evaluation and higher entry frequency.
-    "PAIR_SELECTION_LOOKBACK_HOURS_SHORT": ["1", "2", "4"],
-    "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["6", "12"],
-    # Wider ADF threshold to reduce dead time from cointegration failures.
-    "ADF_P_THRESHOLD": ["0.05", "0.1", "0.2", "0.3"],
-    # Wider half-life range to capture slower mean-reverting regimes.
+    # Prior results show 3-5h short works; 1-2h produced mostly -inf.
+    "PAIR_SELECTION_LOOKBACK_HOURS_SHORT": ["3", "4", "5"],
+    "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["6", "12", "18"],
+    # ADF threshold: 0.05 too strict (-inf), 0.3 too loose.
+    "ADF_P_THRESHOLD": ["0.07", "0.1", "0.15"],
+    # Half-life range to capture mean-reverting regimes.
     "HALF_LIFE_MAX_HOURS": ["0.75", "1.25", "2.0"],
     # Re-evaluation and velocity filters
     "REEVAL_JUMP_Z_MULT": ["1.1"],  # fixed
@@ -73,7 +73,6 @@ PARAM_GRID = {
     # Volatility lookback and warm start behavior
     "ENTRY_VOL_LOOKBACK_HOURS": ["6"],  # fixed
     "WARM_START_MODE": ["strict"],  # fixed
-    # Includes "60" to reduce startup dead-time from 40 min to 20 min.
     "WARM_START_MIN_BARS": ["60", "120"],
     # Spread trend filter: block entry when spread slope / std exceeds threshold.
     "SPREAD_TREND_MAX_SLOPE_SIGMA": ["0.3", "0.5", "0.8", "1.0"],
@@ -82,10 +81,10 @@ PARAM_GRID = {
     # Circuit breaker: graduated tiers.
     "CIRCUIT_BREAKER_TIER1_LOSSES": ["3"],
     "CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS": ["300", "600"],
-    "CIRCUIT_BREAKER_TIER2_LOSSES": ["5", "7"],
+    "CIRCUIT_BREAKER_TIER2_LOSSES": ["5"],  # fixed: low impact
     "CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS": ["1800", "3600"],
-    # Post-only → taker hybrid entry timeout (0=disabled).
-    "ENTRY_POST_ONLY_TIMEOUT_SECS": ["0", "15", "30"],
+    # Post-only → taker hybrid entry timeout (0=disabled removed).
+    "ENTRY_POST_ONLY_TIMEOUT_SECS": ["15", "30"],
 }
 
 # Parameters expected to be integers in PairTradeConfig.
