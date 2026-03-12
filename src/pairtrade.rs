@@ -2820,6 +2820,9 @@ impl PairTradeEngine {
                                 .map_or(false, |until| Instant::now() < until)
                             {
                                 // entry blocked by circuit breaker; logged via ZCHECK
+                            } else if last_eval_at.is_none() {
+                                // Block entry until first evaluate_pair() completes,
+                                // because beta is still at its initial value (1.0).
                             } else if should_enter(&self.cfg, state, z, std, net_funding) {
                                 let direction = if z > 0.0 {
                                     PositionDirection::ShortSpread
