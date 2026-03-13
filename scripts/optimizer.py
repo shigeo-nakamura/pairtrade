@@ -2013,7 +2013,11 @@ def gather_data(target_pairs):
             "BOT_EXECUTABLE": os.path.abspath(
                 os.path.join(os.path.dirname(__file__), "run_pairtrade.sh")
             ),
-            "UNIVERSE_PAIRS": ",".join(target_pairs),
+            **(
+                {"UNIVERSE_SYMBOLS": os.environ["UNIVERSE_SYMBOLS"], "UNIVERSE_PAIRS": ""}
+                if os.environ.get("UNIVERSE_SYMBOLS")
+                else {"UNIVERSE_PAIRS": os.environ.get("UNIVERSE_PAIRS", "") or ",".join(target_pairs)}
+            ),
             "RESTART_GUARD_DIR": BACKTEST_LOG_DIR,
             "RESTART_GUARD_KEY": "optimizer_data_gathering",
         }

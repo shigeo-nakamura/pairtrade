@@ -1096,12 +1096,20 @@ fn parse_universe_pairs() -> Result<Vec<PairSpec>> {
                 .filter(|s| !s.is_empty())
                 .collect();
             let mut pairs = Vec::new();
-            for i in 0..syms.len() {
-                for j in (i + 1)..syms.len() {
-                    let a = syms[i].clone();
-                    let b = syms[j].clone();
-                    let (base, quote) = if a < b { (a, b) } else { (b, a) };
-                    pairs.push(PairSpec { base, quote });
+            if syms.len() == 1 {
+                // Single-symbol mode: create a self-pair for data-dump collection
+                pairs.push(PairSpec {
+                    base: syms[0].clone(),
+                    quote: syms[0].clone(),
+                });
+            } else {
+                for i in 0..syms.len() {
+                    for j in (i + 1)..syms.len() {
+                        let a = syms[i].clone();
+                        let b = syms[j].clone();
+                        let (base, quote) = if a < b { (a, b) } else { (b, a) };
+                        pairs.push(PairSpec { base, quote });
+                    }
                 }
             }
             if pairs.is_empty() {
