@@ -5,7 +5,7 @@ use dex_connector::{
     OpenOrdersResponse, OrderBookSnapshot, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
 };
 #[cfg(feature = "lighter-sdk")]
-use dex_connector::{create_lighter_connector, LighterConnector};
+use dex_connector::{create_lighter_connector, LighterConnector, LighterConnectorConfig};
 
 use rust_decimal::Decimal;
 
@@ -86,31 +86,25 @@ impl DexConnectorBox {
                     }
                 };
 
+                let connector_config = LighterConnectorConfig {
+                    api_key_public: lighter_config.api_key,
+                    api_key_index: lighter_config.api_key_index,
+                    api_private_key_hex: lighter_config.private_key,
+                    evm_wallet_private_key: lighter_config.evm_wallet_private_key,
+                    account_index: lighter_config.account_index,
+                    base_url: lighter_config.base_url,
+                    websocket_url: lighter_config.websocket_url,
+                    tracked_symbols: token_list.to_vec(),
+                    ob_stale_secs: None, // use default
+                };
+
                 if dry_run {
-                    let connector = LighterConnector::new(
-                        lighter_config.api_key,
-                        lighter_config.api_key_index,
-                        lighter_config.private_key,
-                        lighter_config.evm_wallet_private_key,
-                        lighter_config.account_index,
-                        lighter_config.base_url,
-                        lighter_config.websocket_url,
-                        token_list.to_vec(),
-                    )?;
+                    let connector = LighterConnector::new(connector_config)?;
                     Ok(DexConnectorBox {
                         inner: Box::new(connector),
                     })
                 } else {
-                    let connector = create_lighter_connector(
-                        lighter_config.api_key,
-                        lighter_config.api_key_index,
-                        lighter_config.private_key,
-                        lighter_config.evm_wallet_private_key,
-                        lighter_config.account_index,
-                        lighter_config.base_url,
-                        lighter_config.websocket_url,
-                        token_list.to_vec(),
-                    )?;
+                    let connector = create_lighter_connector(connector_config)?;
                     Ok(DexConnectorBox { inner: connector })
                 }
             }
