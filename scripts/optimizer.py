@@ -44,20 +44,22 @@ TARGET_PAIRS = None
 
 # Parameters to tune. This grid will be tested against the static dataset.
 PARAM_GRID = {
-    # Entry/exit thresholds – focused around prior optimal (1.15).
-    "ENTRY_Z_SCORE_BASE": ["1.0", "1.15", "1.3"],
+    # Entry/exit thresholds – raised from 1.15 to reduce noise trades.
+    # Live analysis showed z>2.0 in 24% of observations; 1.15 enters too shallow.
+    "ENTRY_Z_SCORE_BASE": ["1.5", "1.8", "2.0", "2.2"],
     "ENTRY_Z_SCORE_MIN": ["1.0"],  # fixed: always 1.0 in prior results
-    "ENTRY_Z_SCORE_MAX": ["1.9"],  # fixed
-    "EXIT_Z_SCORE": ["0.5", "0.8", "1.0"],
+    "ENTRY_Z_SCORE_MAX": ["2.5"],  # raised to accommodate higher base
+    "EXIT_Z_SCORE": ["0.3", "0.5", "0.8"],
     # Stop-loss: 8.0 is effectively infinite, removed.
     "STOP_LOSS_Z_SCORE": ["3.5", "5.0"],
-    # Cap at 2.0 to prevent optimizer from relying on "hold and hope" strategy.
-    "MAX_LOSS_R_MULT": ["1.5", "2.0"],
+    # Tighter cap to cut large drawdowns (live showed -$0.12 losses).
+    "MAX_LOSS_R_MULT": ["1.5", "2.0", "3.0"],
     # Fixed: risk sizing doesn't affect signal quality, only scales returns.
     "RISK_PCT_PER_TRADE": ["0.04"],
     "MAX_LEVERAGE": ["5"],
-    # Force-close timings (10-20 minutes): 300s too short, 1800s+ too risky.
-    "FORCE_CLOSE_TIME_SECS": ["600", "900", "1200"],
+    # Force-close extended: live half_life=0.75h but force_close=900s was too short.
+    # Need at least 1 half-life of hold time for mean reversion to play out.
+    "FORCE_CLOSE_TIME_SECS": ["1200", "1800", "2700"],
     # Mean-reversion diagnostics
     # NOTE: Strategy reads these as PAIR_SELECTION_LOOKBACK_HOURS_* (not LOOKBACK_HOURS_*).
     # Prior results show 3-5h short works; 1-2h produced mostly -inf.
@@ -65,7 +67,7 @@ PARAM_GRID = {
     "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["6", "12", "18"],
     # ADF threshold: 0.05 too strict (-inf), 0.3 too loose.
     "ADF_P_THRESHOLD": ["0.07", "0.1", "0.15"],
-    # Half-life range to capture mean-reverting regimes.
+    # Half-life: wider range to test slower mean-reversion regimes.
     "HALF_LIFE_MAX_HOURS": ["0.75", "1.25", "2.0"],
     # Re-evaluation and velocity filters
     "REEVAL_JUMP_Z_MULT": ["1.1"],  # fixed
@@ -469,6 +471,28 @@ def map_config_paths_by_pair(config_paths):
     return pair_to_configs, multi_pair_configs
 
 
+def update_config_pair_overrides(config_path, pair_key, updates):
+    """Write per-pair parameter overrides into config's pair_overrides section."""
+    if not updates:
+        return False
+    if not os.path.exists(config_path):
+        print(f"Config update skipped: {config_path} not found.", file=sys.stderr)
+        return False
+    config = load_config(config_path)
+    if "pair_overrides" not in config or not isinstance(config["pair_overrides"], dict):
+        config["pair_overrides"] = {}
+    if pair_key not in config["pair_overrides"] or not isinstance(
+        config["pair_overrides"][pair_key], dict
+    ):
+        config["pair_overrides"][pair_key] = {}
+    for key, value in updates.items():
+        yaml_key = key.lower()
+        config["pair_overrides"][pair_key][yaml_key] = coerce_yaml_value(key, value)
+    with open(config_path, "w") as f:
+        yaml.safe_dump(config, f, sort_keys=False)
+    return True
+
+
 def update_configs_per_pair(
     config_path,
     overall_results,
@@ -479,13 +503,18 @@ def update_configs_per_pair(
 ):
     config_paths = resolve_config_update_targets(config_path)
     pair_to_configs, multi_pair_configs = map_config_paths_by_pair(config_paths)
-    if multi_pair_configs:
-        config_list = ", ".join(os.path.basename(p) for p, _ in multi_pair_configs)
-        print(f"Skipping multi-pair configs for per-pair update: {config_list}")
-        return False
 
     updated_any = False
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+    # Handle multi-pair configs: write per-pair overrides
+    for multi_path, multi_pairs in multi_pair_configs:
+        for pair in multi_pairs:
+            # Register multi-pair config as a valid target for each contained pair
+            pair_to_configs.setdefault(pair, [])
+            if multi_path not in pair_to_configs[pair]:
+                pair_to_configs[pair].append(multi_path)
+
     for pair, result in overall_results.items():
         params = (
             result.get("val_params")
@@ -507,9 +536,19 @@ def update_configs_per_pair(
             print(f"Skipping {pair}: validation score {score:.4f} < 0.")
             continue
 
-        updated_paths = [
-            path for path in configs if update_config_params(path, params)
-        ]
+        updated_paths = []
+        for path in configs:
+            # Check if this config has multiple pairs
+            path_pairs = load_target_pairs(path)
+            if len(path_pairs) > 1:
+                # Multi-pair config: use pair_overrides
+                if update_config_pair_overrides(path, pair, params):
+                    updated_paths.append(path)
+            else:
+                # Single-pair config: update top-level params
+                if update_config_params(path, params):
+                    updated_paths.append(path)
+
         if updated_paths:
             updated_any = True
             config_list = ", ".join(os.path.basename(p) for p in updated_paths)
@@ -1902,15 +1941,24 @@ def resolve_config_path():
     return os.path.join(repo_root, "configs", "pairtrade", basename)
 
 
-def seed_param_grid_from_config(param_grid, config_path):
+def seed_param_grid_from_config(param_grid, config_path, pair_key=None):
     config = load_config(config_path)
     if not config:
         return param_grid
 
+    # If pair_key is given, merge pair_overrides on top of global config values
+    effective_config = dict(config)
+    if pair_key:
+        overrides = config.get("pair_overrides", {})
+        if isinstance(overrides, dict):
+            pair_ovr = overrides.get(pair_key, {})
+            if isinstance(pair_ovr, dict):
+                effective_config.update(pair_ovr)
+
     seeded = {}
     for name, values in param_grid.items():
         new_values = list(values)
-        config_val = config.get(name.lower())
+        config_val = effective_config.get(name.lower())
         if config_val is None:
             seeded[name] = new_values
             continue
@@ -2561,7 +2609,7 @@ def main():
                     if pair_configs:
                         pair_config_path = pair_configs[0]
                         pair_param_grid = seed_param_grid_from_config(
-                            base_param_grid, pair_config_path
+                            base_param_grid, pair_config_path, pair_key=pair
                         )
                         print(
                             f"Seeded PARAM_GRID for {pair} with values from {pair_config_path}."

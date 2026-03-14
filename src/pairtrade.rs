@@ -154,6 +154,65 @@ struct PairTradeYaml {
     circuit_breaker_tier2_losses: Option<u32>,
     circuit_breaker_tier2_cooldown_secs: Option<u64>,
     entry_post_only_timeout_secs: Option<u64>,
+    pair_overrides: Option<HashMap<String, PairOverrideYaml>>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+struct PairOverrideYaml {
+    entry_z_score_base: Option<f64>,
+    entry_z_score_min: Option<f64>,
+    entry_z_score_max: Option<f64>,
+    exit_z_score: Option<f64>,
+    stop_loss_z_score: Option<f64>,
+    force_close_time_secs: Option<u64>,
+    cooldown_secs: Option<u64>,
+    max_loss_r_mult: Option<f64>,
+    half_life_max_hours: Option<f64>,
+    adf_p_threshold: Option<f64>,
+    spread_velocity_max_sigma_per_min: Option<f64>,
+    spread_trend_max_slope_sigma: Option<f64>,
+    beta_divergence_max: Option<f64>,
+    pair_selection_lookback_hours_short: Option<u64>,
+    pair_selection_lookback_hours_long: Option<u64>,
+    entry_vol_lookback_hours: Option<u64>,
+    warm_start_min_bars: Option<usize>,
+    reeval_jump_z_mult: Option<f64>,
+    vol_spike_mult: Option<f64>,
+    circuit_breaker_tier1_losses: Option<u32>,
+    circuit_breaker_tier1_cooldown_secs: Option<u64>,
+    circuit_breaker_tier2_losses: Option<u32>,
+    circuit_breaker_tier2_cooldown_secs: Option<u64>,
+    entry_post_only_timeout_secs: Option<u64>,
+}
+
+/// Resolved per-pair parameters (global defaults merged with any pair-specific overrides).
+#[derive(Debug, Clone)]
+pub struct PairParams {
+    pub entry_z_base: f64,
+    pub entry_z_min: f64,
+    pub entry_z_max: f64,
+    pub exit_z: f64,
+    pub stop_loss_z: f64,
+    pub force_close_secs: u64,
+    pub cooldown_secs: u64,
+    pub max_loss_r_mult: f64,
+    pub half_life_max_hours: f64,
+    pub adf_p_threshold: f64,
+    pub spread_velocity_max_sigma_per_min: f64,
+    pub spread_trend_max_slope_sigma: f64,
+    pub beta_divergence_max: f64,
+    pub lookback_hours_short: u64,
+    pub lookback_hours_long: u64,
+    pub entry_vol_lookback_hours: u64,
+    pub warm_start_min_bars: usize,
+    pub reeval_jump_z_mult: f64,
+    pub vol_spike_mult: f64,
+    pub circuit_breaker_tier1_losses: u32,
+    pub circuit_breaker_tier1_cooldown_secs: u64,
+    pub circuit_breaker_tier2_losses: u32,
+    pub circuit_breaker_tier2_cooldown_secs: u64,
+    pub entry_post_only_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +276,8 @@ pub struct PairTradeConfig {
     pub circuit_breaker_tier2_losses: u32,
     pub circuit_breaker_tier2_cooldown_secs: u64,
     pub entry_post_only_timeout_secs: u64,
+    pub pair_params: HashMap<String, PairParams>,
+    pub default_pair_params: PairParams,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +287,106 @@ pub struct PairSpec {
 }
 
 impl PairTradeConfig {
+    pub fn params_for(&self, pair_key: &str) -> &PairParams {
+        self.pair_params
+            .get(pair_key)
+            .unwrap_or(&self.default_pair_params)
+    }
+
+    fn build_default_pair_params(&self) -> PairParams {
+        PairParams {
+            entry_z_base: self.entry_z_base,
+            entry_z_min: self.entry_z_min,
+            entry_z_max: self.entry_z_max,
+            exit_z: self.exit_z,
+            stop_loss_z: self.stop_loss_z,
+            force_close_secs: self.force_close_secs,
+            cooldown_secs: self.cooldown_secs,
+            max_loss_r_mult: self.max_loss_r_mult,
+            half_life_max_hours: self.half_life_max_hours,
+            adf_p_threshold: self.adf_p_threshold,
+            spread_velocity_max_sigma_per_min: self.spread_velocity_max_sigma_per_min,
+            spread_trend_max_slope_sigma: self.spread_trend_max_slope_sigma,
+            beta_divergence_max: self.beta_divergence_max,
+            lookback_hours_short: self.lookback_hours_short,
+            lookback_hours_long: self.lookback_hours_long,
+            entry_vol_lookback_hours: self.entry_vol_lookback_hours,
+            warm_start_min_bars: self.warm_start_min_bars,
+            reeval_jump_z_mult: self.reeval_jump_z_mult,
+            vol_spike_mult: self.vol_spike_mult,
+            circuit_breaker_tier1_losses: self.circuit_breaker_tier1_losses,
+            circuit_breaker_tier1_cooldown_secs: self.circuit_breaker_tier1_cooldown_secs,
+            circuit_breaker_tier2_losses: self.circuit_breaker_tier2_losses,
+            circuit_breaker_tier2_cooldown_secs: self.circuit_breaker_tier2_cooldown_secs,
+            entry_post_only_timeout_secs: self.entry_post_only_timeout_secs,
+        }
+    }
+
+    fn build_pair_params_map(
+        &self,
+        overrides: &Option<HashMap<String, PairOverrideYaml>>,
+    ) -> HashMap<String, PairParams> {
+        let mut map = HashMap::new();
+        if let Some(overrides) = overrides {
+            for (pair_key, ovr) in overrides {
+                let pp = PairParams {
+                    entry_z_base: ovr.entry_z_score_base.unwrap_or(self.entry_z_base),
+                    entry_z_min: ovr.entry_z_score_min.unwrap_or(self.entry_z_min),
+                    entry_z_max: ovr.entry_z_score_max.unwrap_or(self.entry_z_max),
+                    exit_z: ovr.exit_z_score.unwrap_or(self.exit_z),
+                    stop_loss_z: ovr.stop_loss_z_score.unwrap_or(self.stop_loss_z),
+                    force_close_secs: ovr.force_close_time_secs.unwrap_or(self.force_close_secs),
+                    cooldown_secs: ovr.cooldown_secs.unwrap_or(self.cooldown_secs),
+                    max_loss_r_mult: ovr.max_loss_r_mult.unwrap_or(self.max_loss_r_mult),
+                    half_life_max_hours: ovr
+                        .half_life_max_hours
+                        .unwrap_or(self.half_life_max_hours),
+                    adf_p_threshold: ovr.adf_p_threshold.unwrap_or(self.adf_p_threshold),
+                    spread_velocity_max_sigma_per_min: ovr
+                        .spread_velocity_max_sigma_per_min
+                        .unwrap_or(self.spread_velocity_max_sigma_per_min),
+                    spread_trend_max_slope_sigma: ovr
+                        .spread_trend_max_slope_sigma
+                        .unwrap_or(self.spread_trend_max_slope_sigma),
+                    beta_divergence_max: ovr
+                        .beta_divergence_max
+                        .unwrap_or(self.beta_divergence_max),
+                    lookback_hours_short: ovr
+                        .pair_selection_lookback_hours_short
+                        .unwrap_or(self.lookback_hours_short),
+                    lookback_hours_long: ovr
+                        .pair_selection_lookback_hours_long
+                        .unwrap_or(self.lookback_hours_long),
+                    entry_vol_lookback_hours: ovr
+                        .entry_vol_lookback_hours
+                        .unwrap_or(self.entry_vol_lookback_hours),
+                    warm_start_min_bars: ovr
+                        .warm_start_min_bars
+                        .unwrap_or(self.warm_start_min_bars),
+                    reeval_jump_z_mult: ovr.reeval_jump_z_mult.unwrap_or(self.reeval_jump_z_mult),
+                    vol_spike_mult: ovr.vol_spike_mult.unwrap_or(self.vol_spike_mult),
+                    circuit_breaker_tier1_losses: ovr
+                        .circuit_breaker_tier1_losses
+                        .unwrap_or(self.circuit_breaker_tier1_losses),
+                    circuit_breaker_tier1_cooldown_secs: ovr
+                        .circuit_breaker_tier1_cooldown_secs
+                        .unwrap_or(self.circuit_breaker_tier1_cooldown_secs),
+                    circuit_breaker_tier2_losses: ovr
+                        .circuit_breaker_tier2_losses
+                        .unwrap_or(self.circuit_breaker_tier2_losses),
+                    circuit_breaker_tier2_cooldown_secs: ovr
+                        .circuit_breaker_tier2_cooldown_secs
+                        .unwrap_or(self.circuit_breaker_tier2_cooldown_secs),
+                    entry_post_only_timeout_secs: ovr
+                        .entry_post_only_timeout_secs
+                        .unwrap_or(self.entry_post_only_timeout_secs),
+                };
+                map.insert(pair_key.clone(), pp);
+            }
+        }
+        map
+    }
+
     pub fn from_env_or_yaml() -> Result<Self> {
         let config_path = env::var("PAIRTRADE_CONFIG_PATH")
             .ok()
@@ -375,9 +536,45 @@ impl PairTradeConfig {
             entry_post_only_timeout_secs: yaml
                 .entry_post_only_timeout_secs
                 .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
+            pair_params: HashMap::new(),
+            default_pair_params: PairParams {
+                entry_z_base: 0.0, // placeholder, rebuilt below
+                entry_z_min: 0.0,
+                entry_z_max: 0.0,
+                exit_z: 0.0,
+                stop_loss_z: 0.0,
+                force_close_secs: 0,
+                cooldown_secs: 0,
+                max_loss_r_mult: 0.0,
+                half_life_max_hours: 0.0,
+                adf_p_threshold: 0.0,
+                spread_velocity_max_sigma_per_min: 0.0,
+                spread_trend_max_slope_sigma: 0.0,
+                beta_divergence_max: 0.0,
+                lookback_hours_short: 0,
+                lookback_hours_long: 0,
+                entry_vol_lookback_hours: 0,
+                warm_start_min_bars: 0,
+                reeval_jump_z_mult: 0.0,
+                vol_spike_mult: 0.0,
+                circuit_breaker_tier1_losses: 0,
+                circuit_breaker_tier1_cooldown_secs: 0,
+                circuit_breaker_tier2_losses: 0,
+                circuit_breaker_tier2_cooldown_secs: 0,
+                entry_post_only_timeout_secs: 0,
+            },
         };
 
+        cfg.default_pair_params = cfg.build_default_pair_params();
+        cfg.pair_params = cfg.build_pair_params_map(&yaml.pair_overrides);
         cfg.apply_env_overrides(history_file_from_yaml, warm_start_min_from_yaml)?;
+        // Rebuild pair params after env overrides may have changed global defaults
+        cfg.default_pair_params = cfg.build_default_pair_params();
+        // Re-merge: env overrides update globals, but pair_overrides from YAML still take precedence
+        let pair_params_rebuilt = cfg.build_pair_params_map(&yaml.pair_overrides);
+        if !pair_params_rebuilt.is_empty() {
+            cfg.pair_params = pair_params_rebuilt;
+        }
         Ok(cfg)
     }
 
@@ -574,7 +771,7 @@ impl PairTradeConfig {
             ));
         }
 
-        Ok(Self {
+        let mut cfg = Self {
             dex_name,
             rest_endpoint,
             web_socket_endpoint,
@@ -658,7 +855,36 @@ impl PairTradeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
-        })
+            pair_params: HashMap::new(),
+            default_pair_params: PairParams {
+                entry_z_base: 0.0,
+                entry_z_min: 0.0,
+                entry_z_max: 0.0,
+                exit_z: 0.0,
+                stop_loss_z: 0.0,
+                force_close_secs: 0,
+                cooldown_secs: 0,
+                max_loss_r_mult: 0.0,
+                half_life_max_hours: 0.0,
+                adf_p_threshold: 0.0,
+                spread_velocity_max_sigma_per_min: 0.0,
+                spread_trend_max_slope_sigma: 0.0,
+                beta_divergence_max: 0.0,
+                lookback_hours_short: 0,
+                lookback_hours_long: 0,
+                entry_vol_lookback_hours: 0,
+                warm_start_min_bars: 0,
+                reeval_jump_z_mult: 0.0,
+                vol_spike_mult: 0.0,
+                circuit_breaker_tier1_losses: 0,
+                circuit_breaker_tier1_cooldown_secs: 0,
+                circuit_breaker_tier2_losses: 0,
+                circuit_breaker_tier2_cooldown_secs: 0,
+                entry_post_only_timeout_secs: 0,
+            },
+        };
+        cfg.default_pair_params = cfg.build_default_pair_params();
+        Ok(cfg)
     }
 
     fn apply_env_overrides(
@@ -988,10 +1214,14 @@ impl PairTradeConfig {
     fn circuit_breaker_cooldown_for(&self, losses: u32) -> Option<Duration> {
         // Graduated tiers (check tier2 first as higher threshold)
         if self.circuit_breaker_tier2_losses > 0 && losses >= self.circuit_breaker_tier2_losses {
-            return Some(Duration::from_secs(self.circuit_breaker_tier2_cooldown_secs));
+            return Some(Duration::from_secs(
+                self.circuit_breaker_tier2_cooldown_secs,
+            ));
         }
         if self.circuit_breaker_tier1_losses > 0 && losses >= self.circuit_breaker_tier1_losses {
-            return Some(Duration::from_secs(self.circuit_breaker_tier1_cooldown_secs));
+            return Some(Duration::from_secs(
+                self.circuit_breaker_tier1_cooldown_secs,
+            ));
         }
         // Legacy fallback
         if self.circuit_breaker_consecutive_losses > 0
@@ -1984,9 +2214,11 @@ impl PairTradeEngine {
         let mut history = HashMap::new();
         let mut bar_builders = HashMap::new();
         for pair in &cfg.universe {
+            let pair_key = format!("{}/{}", pair.base, pair.quote);
+            let pp = cfg.params_for(&pair_key);
             states.insert(
-                format!("{}/{}", pair.base, pair.quote),
-                PairState::new(cfg.metrics_window, cfg.entry_z_base),
+                pair_key,
+                PairState::new(cfg.metrics_window, pp.entry_z_base),
             );
             history.insert(pair.base.clone(), VecDeque::new());
             history.insert(pair.quote.clone(), VecDeque::new());
@@ -2341,7 +2573,7 @@ impl PairTradeEngine {
                     &leg.symbol,
                     size,
                     leg.side,
-                    None,  // no limit price = market/taker
+                    None, // no limit price = market/taker
                     None,
                     false,
                     None,
@@ -2650,11 +2882,10 @@ impl PairTradeEngine {
                 )
             };
 
+            let pp = self.cfg.params_for(&key);
             let force_close_due = position_state
                 .as_ref()
-                .map(|pos| {
-                    pos.entered_at.elapsed() >= Duration::from_secs(self.cfg.force_close_secs)
-                })
+                .map(|pos| pos.entered_at.elapsed() >= Duration::from_secs(pp.force_close_secs))
                 .unwrap_or(false);
             if force_close_due {
                 if let Some(pos) = &position_state {
@@ -2692,10 +2923,10 @@ impl PairTradeEngine {
                 .map(|t| t.elapsed() >= Duration::from_secs(PAIR_SELECTION_INTERVAL_SECS))
                 .unwrap_or(true);
             let needs_eval_jump = z_snapshot
-                .map(|(z, _, _, _)| z.abs() >= z_entry_copy * self.cfg.reeval_jump_z_mult)
+                .map(|(z, _, _, _)| z.abs() >= z_entry_copy * pp.reeval_jump_z_mult)
                 .unwrap_or(false);
-            let needs_eval_velocity = velocity.abs()
-                >= self.cfg.spread_velocity_max_sigma_per_min * self.cfg.reeval_jump_z_mult;
+            let needs_eval_velocity =
+                velocity.abs() >= pp.spread_velocity_max_sigma_per_min * pp.reeval_jump_z_mult;
             let vol_spike = z_snapshot
                 .and_then(|(_, std, _, _)| {
                     tail_std(&self.states[&key].spread_history, self.cfg.metrics_window).map(
@@ -2708,7 +2939,7 @@ impl PairTradeEngine {
                         },
                     )
                 })
-                .map(|ratio| ratio >= self.cfg.vol_spike_mult)
+                .map(|ratio| ratio >= pp.vol_spike_mult)
                 .unwrap_or(false);
 
             let eval = if needs_eval_interval || needs_eval_jump || needs_eval_velocity || vol_spike
@@ -2736,12 +2967,11 @@ impl PairTradeEngine {
                         key,
                         pair.base,
                         avail_a,
-                        self.cfg
-                            .lookback_hours_long
-                            .max(self.cfg.lookback_hours_short)
+                        pp.lookback_hours_long
+                            .max(pp.lookback_hours_short)
                             * 3600
                             / self.cfg.trading_period_secs,
-                        (self.cfg.lookback_hours_short * 3600) / self.cfg.trading_period_secs,
+                        (pp.lookback_hours_short * 3600) / self.cfg.trading_period_secs,
                         self.cfg.warm_start_mode
                     );
                     log::debug!(
@@ -2749,12 +2979,11 @@ impl PairTradeEngine {
                         key,
                         pair.quote,
                         avail_b,
-                        self.cfg
-                            .lookback_hours_long
-                            .max(self.cfg.lookback_hours_short)
+                        pp.lookback_hours_long
+                            .max(pp.lookback_hours_short)
                             * 3600
                             / self.cfg.trading_period_secs,
-                        (self.cfg.lookback_hours_short * 3600) / self.cfg.trading_period_secs,
+                        (pp.lookback_hours_short * 3600) / self.cfg.trading_period_secs,
                         self.cfg.warm_start_mode
                     );
                 }
@@ -2791,7 +3020,7 @@ impl PairTradeEngine {
                     );
                 }
 
-                let z_entry = entry_z_for_pair(&self.cfg, state, vol_median);
+                let z_entry = entry_z_for_pair(&self.cfg, pp, state, vol_median);
                 state.z_entry = z_entry;
 
                 let min_points = (self.cfg.metrics_window / 2).max(10);
@@ -2802,17 +3031,17 @@ impl PairTradeEngine {
                             if let Some(pos) = &state.position {
                                 let equity_base = self.equity_cache.max(self.cfg.equity_usd);
                                 if let Some(reason) =
-                                    exit_reason(&self.cfg, state, z, std, p1, p2, equity_base)
+                                    exit_reason(&self.cfg, pp, state, z, std, p1, p2, equity_base)
                                 {
                                     log::info!(
                                     "[EXIT_CHECK] {} reason={} z={:.2} exit_z={:.2} stop_z={:.2} vel={:.3} max_vel={:.3}",
                                     key,
                                     reason,
                                     z,
-                                    self.cfg.exit_z,
-                                    self.cfg.stop_loss_z,
+                                    pp.exit_z,
+                                    pp.stop_loss_z,
                                     state.last_velocity_sigma_per_min,
-                                    self.cfg.spread_velocity_max_sigma_per_min
+                                    pp.spread_velocity_max_sigma_per_min
                                 );
                                     action = TradeAction::Close {
                                         direction: pos.direction,
@@ -2831,7 +3060,7 @@ impl PairTradeEngine {
                             } else if last_eval_at.is_none() {
                                 // Block entry until first evaluate_pair() completes,
                                 // because beta is still at its initial value (1.0).
-                            } else if should_enter(&self.cfg, state, z, std, net_funding) {
+                            } else if should_enter(&self.cfg, pp, state, z, std, net_funding) {
                                 let direction = if z > 0.0 {
                                     PositionDirection::ShortSpread
                                 } else {
@@ -2986,7 +3215,10 @@ impl PairTradeEngine {
                             self.write_pnl_record(record);
                             if pnl_value < 0.0 {
                                 self.consecutive_losses += 1;
-                                if let Some(cooldown) = self.cfg.circuit_breaker_cooldown_for(self.consecutive_losses) {
+                                if let Some(cooldown) = self
+                                    .cfg
+                                    .circuit_breaker_cooldown_for(self.consecutive_losses)
+                                {
                                     self.circuit_breaker_until = Some(Instant::now() + cooldown);
                                     log::warn!(
                                         "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
@@ -3208,8 +3440,9 @@ impl PairTradeEngine {
                             return Err(err);
                         }
                     };
-                    let hybrid = self.cfg.entry_post_only_timeout_secs > 0
-                        && self.post_only_supported();
+                    let entry_pp = self.cfg.params_for(&plan.key);
+                    let hybrid =
+                        entry_pp.entry_post_only_timeout_secs > 0 && self.post_only_supported();
                     if let Some(state) = self.states.get_mut(&plan.key) {
                         state.pending_entry = Some(PendingOrders {
                             legs,
@@ -3731,12 +3964,18 @@ impl PairTradeEngine {
     }
 
     fn max_history_len(&self) -> usize {
-        let max_hrs = self
-            .cfg
-            .lookback_hours_long
-            .max(self.cfg.lookback_hours_short);
-        let needed = (max_hrs * 3600 / self.cfg.trading_period_secs) as usize;
-        needed.max(self.cfg.metrics_window)
+        let mut max_needed = 0usize;
+        // Consider all per-pair params and the default
+        let all_params =
+            std::iter::once(&self.cfg.default_pair_params).chain(self.cfg.pair_params.values());
+        for pp in all_params {
+            let max_hrs = pp.lookback_hours_long.max(pp.lookback_hours_short);
+            let needed = (max_hrs * 3600 / self.cfg.trading_period_secs) as usize;
+            let vol_needed = ((pp.entry_vol_lookback_hours * 3600) / self.cfg.trading_period_secs)
+                .max(1) as usize;
+            max_needed = max_needed.max(needed).max(vol_needed);
+        }
+        max_needed.max(self.cfg.metrics_window)
     }
 
     async fn reconcile_pending_orders(
@@ -3759,19 +3998,14 @@ impl PairTradeEngine {
             let filled_qtys = self.filled_by_leg(&pending, &status.fills);
             if self.all_filled(&pending, &status.fills) {
                 if let Some(state) = self.states.get_mut(key) {
-                    let (mut ep_a, mut ep_b, mut es_a, mut es_b) =
-                        (None, None, None, None);
+                    let (mut ep_a, mut ep_b, mut es_a, mut es_b) = (None, None, None, None);
                     if let Some((base, quote)) = key.split_once('/') {
                         for leg in &pending.legs {
                             if leg.symbol == base {
-                                ep_a = price_map
-                                    .get(base)
-                                    .map(|s| s.price);
+                                ep_a = price_map.get(base).map(|s| s.price);
                                 es_a = Some(leg.target);
                             } else if leg.symbol == quote {
-                                ep_b = price_map
-                                    .get(quote)
-                                    .map(|s| s.price);
+                                ep_b = price_map.get(quote).map(|s| s.price);
                                 es_b = Some(leg.target);
                             }
                         }
@@ -3830,22 +4064,25 @@ impl PairTradeEngine {
                     state.pending_entry = None;
                 }
                 return Ok(());
-            } else if pending.post_only_hybrid
-                && self.cfg.entry_post_only_timeout_secs > 0
-                && pending.placed_at.elapsed()
-                    >= Duration::from_secs(self.cfg.entry_post_only_timeout_secs)
-            {
-                // Post-only entry timed out; cancel and reissue as taker
-                log::info!(
-                    "[ORDER] {} post-only entry timeout ({}s), falling back to taker",
-                    key,
-                    self.cfg.entry_post_only_timeout_secs
-                );
-                self.cancel_pending_orders(&pending).await?;
-                let new_pending =
-                    self.reissue_entry_as_taker(key, &pending, price_map).await?;
-                if let Some(state) = self.states.get_mut(key) {
-                    state.pending_entry = new_pending;
+            } else if pending.post_only_hybrid {
+                let recon_pp = self.cfg.params_for(key);
+                if recon_pp.entry_post_only_timeout_secs > 0
+                    && pending.placed_at.elapsed()
+                        >= Duration::from_secs(recon_pp.entry_post_only_timeout_secs)
+                {
+                    // Post-only entry timed out; cancel and reissue as taker
+                    log::info!(
+                        "[ORDER] {} post-only entry timeout ({}s), falling back to taker",
+                        key,
+                        recon_pp.entry_post_only_timeout_secs
+                    );
+                    self.cancel_pending_orders(&pending).await?;
+                    let new_pending = self
+                        .reissue_entry_as_taker(key, &pending, price_map)
+                        .await?;
+                    if let Some(state) = self.states.get_mut(key) {
+                        state.pending_entry = new_pending;
+                    }
                 }
             } else if pending.placed_at.elapsed() >= timeout {
                 // Partial fill or stuck orders; cancel and flatten any filled leg
@@ -4012,7 +4249,10 @@ impl PairTradeEngine {
                     self.write_pnl_record(record);
                     if pnl_value < 0.0 {
                         self.consecutive_losses += 1;
-                        if let Some(cooldown) = self.cfg.circuit_breaker_cooldown_for(self.consecutive_losses) {
+                        if let Some(cooldown) = self
+                            .cfg
+                            .circuit_breaker_cooldown_for(self.consecutive_losses)
+                        {
                             self.circuit_breaker_until = Some(Instant::now() + cooldown);
                             log::warn!(
                                 "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
@@ -4299,13 +4539,15 @@ impl PairTradeEngine {
     }
 
     fn evaluate_pair(&self, pair: &PairSpec) -> Option<PairEvaluation> {
+        let key = format!("{}/{}", pair.base, pair.quote);
+        let pp = self.cfg.params_for(&key);
         let hist_a = self.history.get(&pair.base)?;
         let hist_b = self.history.get(&pair.quote)?;
         let available = hist_a.len().min(hist_b.len());
         let desired_long =
-            ((self.cfg.lookback_hours_long * 3600) / self.cfg.trading_period_secs).max(1) as usize;
+            ((pp.lookback_hours_long * 3600) / self.cfg.trading_period_secs).max(1) as usize;
         let desired_short =
-            ((self.cfg.lookback_hours_short * 3600) / self.cfg.trading_period_secs).max(1) as usize;
+            ((pp.lookback_hours_short * 3600) / self.cfg.trading_period_secs).max(1) as usize;
         let (long_len, short_len) = match self.cfg.warm_start_mode {
             WarmStartMode::Strict => {
                 if available < desired_long {
@@ -4314,7 +4556,7 @@ impl PairTradeEngine {
                 (desired_long, desired_short)
             }
             WarmStartMode::Relaxed => {
-                let min_bars = self.cfg.warm_start_min_bars.max(1);
+                let min_bars = pp.warm_start_min_bars.max(1);
                 if available < min_bars {
                     return None;
                 }
@@ -4342,8 +4584,8 @@ impl PairTradeEngine {
         let (half_life_samples, adf_p_value) = half_life_and_p(&spreads);
         let half_life_hours = half_life_samples * (self.cfg.trading_period_secs as f64) / 3600.0;
         let beta_gap = ((beta_short - beta_long) / beta_eff.max(1e-6)).abs();
-        let half_ok = half_life_hours <= self.cfg.half_life_max_hours;
-        let adf_ok = adf_p_value <= self.cfg.adf_p_threshold;
+        let half_ok = half_life_hours <= pp.half_life_max_hours;
+        let adf_ok = adf_p_value <= pp.adf_p_threshold;
         let beta_ok = beta_gap <= 0.2;
         let score = half_ok as u8 + adf_ok as u8 + beta_ok as u8;
         let eligible = score >= 2;
@@ -4819,8 +5061,10 @@ impl PairTradeEngine {
         }
         let limit_a = self.limit_price_for(&pair.base, side_a, prices);
         let limit_b = self.limit_price_for(&pair.quote, side_b, prices);
+        let pair_key_for_hybrid = format!("{}/{}", pair.base, pair.quote);
+        let pp_for_hybrid = self.cfg.params_for(&pair_key_for_hybrid);
         let hybrid_active =
-            self.cfg.entry_post_only_timeout_secs > 0 && self.post_only_supported();
+            pp_for_hybrid.entry_post_only_timeout_secs > 0 && self.post_only_supported();
         let post_only = self.should_post_only();
         let entry_attempts = if hybrid_active {
             1
@@ -5447,7 +5691,7 @@ impl PairTradeEngine {
 #[cfg(test)]
 impl PairTradeEngine {
     fn test_instance(connector: Arc<dyn DexConnector + Send + Sync>) -> Self {
-        let cfg = PairTradeConfig {
+        let mut cfg = PairTradeConfig {
             dex_name: "test".to_string(),
             rest_endpoint: "http://localhost".to_string(),
             web_socket_endpoint: "ws://localhost".to_string(),
@@ -5507,7 +5751,35 @@ impl PairTradeEngine {
             circuit_breaker_tier2_losses: DEFAULT_CB_TIER2_LOSSES,
             circuit_breaker_tier2_cooldown_secs: DEFAULT_CB_TIER2_COOLDOWN_SECS,
             entry_post_only_timeout_secs: DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS,
+            pair_params: HashMap::new(),
+            default_pair_params: PairParams {
+                entry_z_base: 0.0,
+                entry_z_min: 0.0,
+                entry_z_max: 0.0,
+                exit_z: 0.0,
+                stop_loss_z: 0.0,
+                force_close_secs: 0,
+                cooldown_secs: 0,
+                max_loss_r_mult: 0.0,
+                half_life_max_hours: 0.0,
+                adf_p_threshold: 0.0,
+                spread_velocity_max_sigma_per_min: 0.0,
+                spread_trend_max_slope_sigma: 0.0,
+                beta_divergence_max: 0.0,
+                lookback_hours_short: 0,
+                lookback_hours_long: 0,
+                entry_vol_lookback_hours: 0,
+                warm_start_min_bars: 0,
+                reeval_jump_z_mult: 0.0,
+                vol_spike_mult: 0.0,
+                circuit_breaker_tier1_losses: 0,
+                circuit_breaker_tier1_cooldown_secs: 0,
+                circuit_breaker_tier2_losses: 0,
+                circuit_breaker_tier2_cooldown_secs: 0,
+                entry_post_only_timeout_secs: 0,
+            },
         };
+        cfg.default_pair_params = cfg.build_default_pair_params();
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
 
@@ -5609,13 +5881,18 @@ fn regression_beta(x: &[PriceSample], y: &[PriceSample]) -> f64 {
     }
 }
 
-fn entry_z_for_pair(cfg: &PairTradeConfig, state: &PairState, vol_median: f64) -> f64 {
+fn entry_z_for_pair(
+    cfg: &PairTradeConfig,
+    pp: &PairParams,
+    state: &PairState,
+    vol_median: f64,
+) -> f64 {
     let entry_vol_len =
-        ((cfg.entry_vol_lookback_hours * 3600) / cfg.trading_period_secs).max(1) as usize;
+        ((pp.entry_vol_lookback_hours * 3600) / cfg.trading_period_secs).max(1) as usize;
     let vol_pair = tail_std(&state.spread_history, entry_vol_len).unwrap_or(1.0);
     let alpha = (vol_pair / vol_median).clamp(0.5, 2.0);
-    let z = cfg.entry_z_base * alpha;
-    z.clamp(cfg.entry_z_min, cfg.entry_z_max)
+    let z = pp.entry_z_base * alpha;
+    z.clamp(pp.entry_z_min, pp.entry_z_max)
 }
 
 fn spread_slope_sigma(history: &VecDeque<f64>, window: usize) -> Option<f64> {
@@ -5656,13 +5933,14 @@ fn spread_slope_sigma(history: &VecDeque<f64>, window: usize) -> Option<f64> {
 
 fn should_enter(
     cfg: &PairTradeConfig,
+    pp: &PairParams,
     state: &PairState,
     z: f64,
     std: f64,
     net_funding: f64,
 ) -> bool {
     if let Some(last_exit) = state.last_exit_at {
-        if last_exit.elapsed() < Duration::from_secs(cfg.cooldown_secs) {
+        if last_exit.elapsed() < Duration::from_secs(pp.cooldown_secs) {
             return false;
         }
     }
@@ -5673,17 +5951,17 @@ fn should_enter(
         state.z_entry
     };
     // Avoid entering when the current z already triggers stop-loss exit.
-    if z.abs() >= cfg.stop_loss_z {
+    if z.abs() >= pp.stop_loss_z {
         return false;
     }
     // Spread trend filter: block entry if spread is trending
     if let Some(slope_sigma) = spread_slope_sigma(&state.spread_history, cfg.metrics_window) {
-        if slope_sigma > cfg.spread_trend_max_slope_sigma {
+        if slope_sigma > pp.spread_trend_max_slope_sigma {
             return false;
         }
     }
     // Beta stability filter: block entry if beta_s and beta_l diverge
-    if state.beta_gap > cfg.beta_divergence_max {
+    if state.beta_gap > pp.beta_divergence_max {
         return false;
     }
     // Account for estimated cost (fees + slippage) in sigma units
@@ -5699,6 +5977,7 @@ fn should_enter(
 
 fn exit_reason(
     cfg: &PairTradeConfig,
+    pp: &PairParams,
     state: &PairState,
     z: f64,
     std: f64,
@@ -5707,13 +5986,13 @@ fn exit_reason(
     equity_base: f64,
 ) -> Option<&'static str> {
     let pos = state.position.as_ref()?;
-    if z.abs() >= cfg.stop_loss_z {
+    if z.abs() >= pp.stop_loss_z {
         return Some("stop_loss_z");
     }
-    if pos.entered_at.elapsed() >= Duration::from_secs(cfg.force_close_secs) {
+    if pos.entered_at.elapsed() >= Duration::from_secs(pp.force_close_secs) {
         return Some("force_close");
     }
-    if cfg.exit_z > 0.0 && z.abs() <= cfg.exit_z {
+    if pp.exit_z > 0.0 && z.abs() <= pp.exit_z {
         return Some("exit_z");
     }
     let pnl = compute_pnl(pos, p1.price, p2.price);
@@ -5721,8 +6000,8 @@ fn exit_reason(
         let risk_budget = equity_base * cfg.risk_pct_per_trade;
         if let Some(target) = Decimal::from_f64(risk_budget) {
             if target > Decimal::ZERO {
-                if cfg.max_loss_r_mult > 0.0 {
-                    let loss_mult = Decimal::from_f64(cfg.max_loss_r_mult).unwrap_or(Decimal::ONE);
+                if pp.max_loss_r_mult > 0.0 {
+                    let loss_mult = Decimal::from_f64(pp.max_loss_r_mult).unwrap_or(Decimal::ONE);
                     let max_loss = -target * loss_mult;
                     if pnl <= max_loss {
                         return Some("max_loss_r");
@@ -5740,7 +6019,7 @@ fn exit_reason(
                 let half_life_hours = state.half_life_hours;
                 if half_life_hours.is_finite() && half_life_hours > 0.0 {
                     let elapsed_secs = pos.entered_at.elapsed().as_secs_f64();
-                    let remaining_secs = (cfg.force_close_secs as f64) - elapsed_secs;
+                    let remaining_secs = (pp.force_close_secs as f64) - elapsed_secs;
                     if remaining_secs > 0.0 {
                         let half_life_secs = half_life_hours * 3600.0;
                         let k = (2.0_f64).ln() / half_life_secs;

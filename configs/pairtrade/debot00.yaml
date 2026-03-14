@@ -5,6 +5,8 @@ dry_run: false
 agent_name: debot-pairtrade
 universe_pairs:
 - BTC/ETH
+- BTC/SOL
+- ETH/SOL
 max_active_pairs: 3
 interval_secs: 20
 trading_period_secs: 60
