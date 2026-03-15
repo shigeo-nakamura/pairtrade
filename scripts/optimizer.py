@@ -63,8 +63,8 @@ PARAM_GRID = {
     # Mean-reversion diagnostics
     # NOTE: Strategy reads these as PAIR_SELECTION_LOOKBACK_HOURS_* (not LOOKBACK_HOURS_*).
     # Prior results show 3-5h short works; 1-2h produced mostly -inf.
-    "PAIR_SELECTION_LOOKBACK_HOURS_SHORT": ["3", "4", "5"],
-    "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["6", "12", "18"],
+    "PAIR_SELECTION_LOOKBACK_HOURS_SHORT": ["1", "2", "3", "4", "5"],
+    "PAIR_SELECTION_LOOKBACK_HOURS_LONG": ["4", "6", "8", "12"],
     # ADF threshold: 0.05 too strict (-inf), 0.3 too loose.
     "ADF_P_THRESHOLD": ["0.07", "0.1", "0.15"],
     # Half-life: wider range to test slower mean-reversion regimes.
