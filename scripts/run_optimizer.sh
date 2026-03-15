@@ -12,6 +12,20 @@ export OPTIMIZER_MAX_COMBOS="768"
 export DEX_NAME="lighter"
 export OPTIMIZER_LOG_PATH="${LOG_FILE}"
 
+# BTC/ETH single pair
+export UNIVERSE_PAIRS="BTC/ETH"
+export OPTIMIZER_DATA_TAIL_DAYS="30"
+export OPTIMIZER_GAP_FILL_MAX_SECS="3600"
+
+# Sharpe-driven scoring: penalize drawdown, reward stability over frequency
+export OPTIMIZER_RETURN_SCALE="100"
+export OPTIMIZER_SHARPE_BONUS="50.0"
+export OPTIMIZER_MAX_DRAWDOWN="50"
+export OPTIMIZER_DRAWDOWN_PENALTY="2.0"
+export OPTIMIZER_MIN_TRADES="20"
+export OPTIMIZER_TRADE_FREQ_BONUS="0.0"
+export OPTIMIZER_CVAR_PENALTY="2.0"
+
 # optimizer.py manages its own log file via OPTIMIZER_LOG_PATH;
 # redirect nohup output to /dev/null to avoid deleted-inode conflict.
 echo "Starting optimizer in background. Log: ${LOG_FILE}"
