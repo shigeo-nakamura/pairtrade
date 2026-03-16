@@ -360,13 +360,18 @@ if __name__ == "__main__":
     if max_hold_secs is not None and max_hold_secs < 0:
         max_hold_secs = None
 
+    reject_reasons = []
     if min_trades > 0 and trade_count < min_trades:
+        reject_reasons.append(f"trades={trade_count}<{min_trades}")
         score = -math.inf
     if max_dd is not None and max_drawdown > max_dd:
+        reject_reasons.append(f"drawdown={max_drawdown:.2f}>{max_dd:.2f}")
         score = -math.inf
     if min_sharpe is not None and sharpe < min_sharpe:
+        reject_reasons.append(f"sharpe={sharpe:.4f}<{min_sharpe:.4f}")
         score = -math.inf
     if max_hold_secs is not None and avg_hold_secs > max_hold_secs:
+        reject_reasons.append(f"avg_hold={avg_hold_secs:.0f}s>{max_hold_secs:.0f}s")
         score = -math.inf
     max_single_loss = parse_env_float("OPTIMIZER_MAX_SINGLE_LOSS")
     if (
@@ -375,6 +380,7 @@ if __name__ == "__main__":
         and series
         and worst_trade < -max_single_loss
     ):
+        reject_reasons.append(f"worst_trade={worst_trade:.2f}<-{max_single_loss:.2f}")
         score = -math.inf
 
     drawdown_penalty = parse_env_float("OPTIMIZER_DRAWDOWN_PENALTY") or 0.0
@@ -392,4 +398,6 @@ if __name__ == "__main__":
     if math.isfinite(score):
         print(f"{score:.8f}")
     else:
+        reason_str = ",".join(reject_reasons) if reject_reasons else "unknown"
+        print(f"-inf [{reason_str}]", file=sys.stderr)
         print(str(score).lower())

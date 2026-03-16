@@ -1,14 +1,15 @@
 use chrono::{DateTime, FixedOffset, Utc};
 use debot::pairtrade::{PairTradeConfig, PairTradeEngine};
+use debot::ports::replay_dex::ReplayConnector;
 use env_logger::Builder;
 use log::LevelFilter;
+use std::collections::HashMap;
 use std::env;
 use std::io::Write;
 use std::str::FromStr;
+use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    // Initialize logging with local timezone
+fn init_logger() {
     let offset_seconds = env::var("TIMEZONE_OFFSET")
         .unwrap_or_else(|_| "3600".to_string())
         .parse::<i32>()
@@ -35,7 +36,9 @@ async fn main() -> std::io::Result<()> {
             .unwrap_or(LevelFilter::Debug),
         )
         .init();
+}
 
+async fn run_single() -> std::io::Result<()> {
     let dex_connector_git = option_env!("DEX_CONNECTOR_GIT_HASH").unwrap_or("unknown");
     log::info!("dex-connector git: {}", dex_connector_git);
     log::info!("Starting pair-trade loop...");
@@ -47,4 +50,176 @@ async fn main() -> std::io::Result<()> {
         .run()
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+async fn run_batch(batch_file: &str) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader};
+
+    // Read all param sets from the batch file (JSONL format).
+    let file = std::fs::File::open(batch_file).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("failed to open batch file {}: {}", batch_file, e),
+        )
+    })?;
+    let reader = BufReader::new(file);
+    let param_sets: Vec<HashMap<String, String>> = reader
+        .lines()
+        .filter_map(|line| {
+            let line = line.ok()?;
+            if line.trim().is_empty() {
+                return None;
+            }
+            serde_json::from_str(&line).ok()
+        })
+        .collect();
+
+    if param_sets.is_empty() {
+        eprintln!("[BATCH] No param sets found in {}", batch_file);
+        return Ok(());
+    }
+
+    // Load replay data once.
+    let backtest_file = env::var("BACKTEST_FILE").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "BACKTEST_FILE must be set for batch mode",
+        )
+    })?;
+    eprintln!(
+        "[BATCH] Loading data from {} ({} param sets)...",
+        backtest_file,
+        param_sets.len()
+    );
+    let replay = Arc::new(ReplayConnector::new(&backtest_file).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to load replay data: {}", e),
+        )
+    })?);
+    eprintln!("[BATCH] Data loaded: {} entries.", replay.len());
+
+    // Output dir for per-run log files.
+    let log_dir = env::var("BATCH_LOG_DIR").unwrap_or_else(|_| "/tmp/batch_logs".to_string());
+    std::fs::create_dir_all(&log_dir)?;
+
+    // Save original env vars that will be overridden.
+    let override_keys: Vec<String> = param_sets
+        .iter()
+        .flat_map(|ps| ps.keys().cloned())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let original_env: HashMap<String, Option<String>> = override_keys
+        .iter()
+        .map(|k| (k.clone(), env::var(k).ok()))
+        .collect();
+
+    for (idx, params) in param_sets.iter().enumerate() {
+        // Set env vars for this param set.
+        for (k, v) in params {
+            env::set_var(k, v);
+        }
+
+        // Build config from env (picks up the overridden vars).
+        let cfg = match PairTradeConfig::from_env_or_yaml() {
+            Ok(c) => c,
+            Err(e) => {
+                let result = serde_json::json!({
+                    "index": idx,
+                    "log_file": serde_json::Value::Null,
+                    "error": format!("{}", e),
+                });
+                println!("{}", result);
+                // Restore env vars before continuing.
+                for (k, orig) in &original_env {
+                    match orig {
+                        Some(v) => env::set_var(k, v),
+                        None => env::remove_var(k),
+                    }
+                }
+                continue;
+            }
+        };
+
+        // Redirect log output to a per-run file.
+        let log_file_path = format!("{}/batch_{}.log", log_dir, idx);
+
+        // Create engine with shared replay data.
+        let mut engine = match PairTradeEngine::new_with_replay(cfg, replay.clone()).await {
+            Ok(e) => e,
+            Err(e) => {
+                let result = serde_json::json!({
+                    "index": idx,
+                    "log_file": log_file_path,
+                    "error": format!("{}", e),
+                });
+                println!("{}", result);
+                for (k, orig) in &original_env {
+                    match orig {
+                        Some(v) => env::set_var(k, v),
+                        None => env::remove_var(k),
+                    }
+                }
+                continue;
+            }
+        };
+
+        // Run backtest, capturing log output to a file.
+        {
+            let log_file = std::fs::File::create(&log_file_path)?;
+            let log_file_clone = log_file.try_clone()?;
+            // Redirect stdout to the log file for this run.
+            use std::os::unix::io::AsRawFd;
+            let stdout_fd = std::io::stdout().as_raw_fd();
+            let saved_stdout = unsafe { libc::dup(stdout_fd) };
+            unsafe {
+                libc::dup2(log_file.as_raw_fd(), stdout_fd);
+            }
+            // Also redirect stderr for log output.
+            let stderr_fd = std::io::stderr().as_raw_fd();
+            let saved_stderr = unsafe { libc::dup(stderr_fd) };
+            unsafe {
+                libc::dup2(log_file_clone.as_raw_fd(), stderr_fd);
+            }
+
+            let _result = engine.run().await;
+
+            // Restore stdout/stderr.
+            unsafe {
+                libc::dup2(saved_stdout, stdout_fd);
+                libc::close(saved_stdout);
+                libc::dup2(saved_stderr, stderr_fd);
+                libc::close(saved_stderr);
+            }
+        }
+
+        // Output result as JSON to stdout.
+        let result = serde_json::json!({
+            "index": idx,
+            "log_file": log_file_path,
+        });
+        println!("{}", result);
+
+        // Restore env vars for next iteration.
+        for (k, orig) in &original_env {
+            match orig {
+                Some(v) => env::set_var(k, v),
+                None => env::remove_var(k),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    init_logger();
+
+    if let Ok(batch_file) = env::var("BATCH_PARAMS_FILE") {
+        run_batch(&batch_file).await
+    } else {
+        run_single().await
+    }
 }

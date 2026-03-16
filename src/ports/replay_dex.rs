@@ -8,7 +8,8 @@ use dex_connector::{
 };
 use rand;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -29,6 +30,67 @@ struct DumpedDataEntry {
     prices: HashMap<String, DumpedSymbolSnapshot>,
 }
 
+// Bincode-compatible representations using f64 (bincode doesn't support Decimal).
+#[derive(Serialize, Deserialize)]
+struct BincodeSymbolSnapshot {
+    price: f64,
+    funding_rate: f64,
+    bid_size: f64,
+    ask_size: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BincodeDataEntry {
+    timestamp: i64,
+    prices: HashMap<String, BincodeSymbolSnapshot>,
+}
+
+impl From<&DumpedDataEntry> for BincodeDataEntry {
+    fn from(e: &DumpedDataEntry) -> Self {
+        Self {
+            timestamp: e.timestamp,
+            prices: e
+                .prices
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        BincodeSymbolSnapshot {
+                            price: v.price.to_f64().unwrap_or(0.0),
+                            funding_rate: v.funding_rate.to_f64().unwrap_or(0.0),
+                            bid_size: v.bid_size.to_f64().unwrap_or(0.0),
+                            ask_size: v.ask_size.to_f64().unwrap_or(0.0),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<BincodeDataEntry> for DumpedDataEntry {
+    fn from(e: BincodeDataEntry) -> Self {
+        Self {
+            timestamp: e.timestamp,
+            prices: e
+                .prices
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        DumpedSymbolSnapshot {
+                            price: Decimal::from_f64(v.price).unwrap_or_default(),
+                            funding_rate: Decimal::from_f64(v.funding_rate).unwrap_or_default(),
+                            bid_size: Decimal::from_f64(v.bid_size).unwrap_or_default(),
+                            ask_size: Decimal::from_f64(v.ask_size).unwrap_or_default(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ReplayConnector {
     data: Vec<DumpedDataEntry>,
@@ -37,6 +99,25 @@ pub struct ReplayConnector {
 
 impl ReplayConnector {
     pub fn new(path: &str) -> Result<Self, DexError> {
+        let data = if path.ends_with(".bin") {
+            Self::load_bincode(path)?
+        } else {
+            Self::load_jsonl(path)?
+        };
+
+        if data.is_empty() {
+            return Err(DexError::Other(
+                anyhow!("Data dump file is empty or invalid").to_string(),
+            ));
+        }
+
+        Ok(Self {
+            data,
+            cursor: AtomicUsize::new(0),
+        })
+    }
+
+    fn load_jsonl(path: &str) -> Result<Vec<DumpedDataEntry>, DexError> {
         let file = File::open(path)
             .map_err(|e| DexError::Other(format!("failed to open replay file: {}", e)))?;
         let reader = BufReader::new(file);
@@ -53,17 +134,36 @@ impl ReplayConnector {
             })?;
             data.push(entry);
         }
+        Ok(data)
+    }
 
-        if data.is_empty() {
-            return Err(DexError::Other(
-                anyhow!("Data dump file is empty or invalid").to_string(),
-            ));
-        }
+    fn load_bincode(path: &str) -> Result<Vec<DumpedDataEntry>, DexError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| DexError::Other(format!("failed to read bincode file: {}", e)))?;
+        let bincode_data: Vec<BincodeDataEntry> = bincode::deserialize(&bytes)
+            .map_err(|e| DexError::Other(format!("failed to deserialize bincode: {}", e)))?;
+        Ok(bincode_data.into_iter().map(DumpedDataEntry::from).collect())
+    }
 
-        Ok(Self {
-            data,
-            cursor: AtomicUsize::new(0),
-        })
+    /// Convert a JSONL file to bincode format. Used by the convert-data tool.
+    pub fn convert_jsonl_to_bincode(input: &str, output: &str) -> Result<(), DexError> {
+        let data = Self::load_jsonl(input)?;
+        let bincode_data: Vec<BincodeDataEntry> = data.iter().map(BincodeDataEntry::from).collect();
+        let bytes = bincode::serialize(&bincode_data)
+            .map_err(|e| DexError::Other(format!("failed to serialize bincode: {}", e)))?;
+        std::fs::write(output, bytes)
+            .map_err(|e| DexError::Other(format!("failed to write bincode file: {}", e)))?;
+        Ok(())
+    }
+
+    /// Reset cursor to beginning for batch mode reuse.
+    pub fn reset(&self) {
+        self.cursor.store(0, AtomicOrdering::SeqCst);
+    }
+
+    /// Number of data entries.
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
 
     // Advances the simulation by one step. Returns false if the end is reached.

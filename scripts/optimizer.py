@@ -32,6 +32,8 @@ DEFAULT_SCORE_MODE = "return"
 DATA_DUMP_FILE = os.path.abspath(
     os.getenv("DATA_DUMP_FILE", "market_data_30d.jsonl")
 )
+# Keep the JSONL path for Python-side analysis even after bincode conversion.
+DATA_DUMP_JSONL = DATA_DUMP_FILE
 # How long to run the bot in live mode to gather data.
 # This should be long enough for the backtest period.
 DATA_GATHERING_DURATION_SECS = 30 * 24 * 3600
@@ -240,7 +242,14 @@ def resolve_lighter_go_path(_config_path=None):
     if env_override:
         return env_override
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    return os.path.join(repo_root, "lib")
+    # Check repo_root/lib first, then fall back to sibling lighter-go dir.
+    lib_path = os.path.join(repo_root, "lib")
+    if os.path.isfile(os.path.join(lib_path, "libsigner.so")):
+        return lib_path
+    sibling_path = os.path.join(repo_root, "..", "lighter-go")
+    if os.path.isdir(sibling_path):
+        return os.path.abspath(sibling_path)
+    return lib_path
 
 
 def ensure_libsigner_available(config_path):
@@ -1485,6 +1494,32 @@ def get_data_time_bounds(data_file):
         return None
 
 
+def convert_to_bincode(jsonl_path):
+    """Convert JSONL data file to bincode format for faster loading."""
+    bin_path = jsonl_path.rsplit(".", 1)[0] + ".bin"
+    if os.path.exists(bin_path) and os.path.getmtime(bin_path) >= os.path.getmtime(jsonl_path):
+        print(f"Bincode file up-to-date: {bin_path}")
+        return bin_path
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    converter = os.path.join(repo_root, "target", "release", "convert-data")
+    if not os.path.isfile(converter):
+        print(f"convert-data binary not found at {converter}; skipping bincode conversion.")
+        return jsonl_path
+    try:
+        result = subprocess.run(
+            [converter, jsonl_path, bin_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            print(f"Bincode conversion failed: {result.stderr.strip()}", file=sys.stderr)
+            return jsonl_path
+        print(f"Converted to bincode: {bin_path}")
+        return bin_path
+    except Exception as e:
+        print(f"Bincode conversion error: {e}", file=sys.stderr)
+        return jsonl_path
+
+
 def snapshot_data_file(source_path):
     if not source_path or not os.path.exists(source_path):
         return None
@@ -2129,19 +2164,20 @@ def run_backtest(
     """
     Runs a single backtest using the collected data file.
     """
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    binary_path = os.path.join(repo_root, "target", "release", "debot")
+    lighter_go_path = resolve_lighter_go_path()
+    ld_path = lighter_go_path + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+
     env = os.environ.copy()
     env.update(
         {
             "BACKTEST_MODE": "true",
             "BACKTEST_FILE": DATA_DUMP_FILE,
             "DRY_RUN": "true",
-            "RUST_LOG": "info,debot=info",
-            "BOT_EXECUTABLE": os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "run_pairtrade.sh")
-            ),
+            "RUST_LOG": "warn,debot::pairtrade=info",
+            "LD_LIBRARY_PATH": ld_path,
             "UNIVERSE_PAIRS": pair_str,
-            # Avoid rebuilding per run; run_pairtrade.sh respects this flag
-            "SKIP_BUILD": "1",
             "RESTART_GUARD_DIR": BACKTEST_LOG_DIR,
             "RESTART_GUARD_KEY": f"optimizer_{pair_str.replace('/', '_')}_{uuid.uuid4().hex}",
         }
@@ -2151,7 +2187,7 @@ def run_backtest(
     try:
         with open(backtest_log_file, "w") as log_file:
             subprocess.run(
-                [env["BOT_EXECUTABLE"]],
+                [binary_path],
                 env=env,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
@@ -2159,7 +2195,7 @@ def run_backtest(
                 timeout=3600,  # allow enough time for full backtest over 7d dataset
             )
     except subprocess.TimeoutExpired as e:
-        expected_bars = estimate_data_bars(DATA_DUMP_FILE)
+        expected_bars = estimate_data_bars(DATA_DUMP_JSONL)
         progress = estimate_progress_from_log(backtest_log_file, expected_bars)
         if progress:
             print(
@@ -2171,10 +2207,9 @@ def run_backtest(
                 f"      > Backtest timed out after {e.timeout}s.",
                 file=sys.stderr,
             )
-        return -float("inf")
+        return -float("inf"), "timeout"
     except Exception as e:
-        print(f"      > An error occurred during backtest: {e}", file=sys.stderr)
-        return -float("inf")
+        return -float("inf"), f"backtest_error: {e}"
 
     if detect_libsigner_error(backtest_log_file):
         raise FatalBacktestError(
@@ -2186,7 +2221,7 @@ def run_backtest(
         analyzer_path = os.path.join(os.path.dirname(__file__), "log_analyzer.py")
 
         if pnl_start_time is None:
-            bounds = get_data_time_bounds(DATA_DUMP_FILE)
+            bounds = get_data_time_bounds(DATA_DUMP_JSONL)
             if bounds is None:
                 raise ValueError("Cannot determine data time bounds.")
             pnl_start_time = bounds[0] + timedelta(seconds=WARMUP_DURATION_SECS)
@@ -2202,19 +2237,17 @@ def run_backtest(
             analyzer_cmd, capture_output=True, text=True, env=analyzer_env
         )
         if result.returncode != 0:
-            print(
-                f"      > Log analysis failed (exit {result.returncode}).",
-                file=sys.stderr,
-            )
+            reason = f"analyzer_exit={result.returncode}"
             if result.stderr:
-                print(result.stderr.strip(), file=sys.stderr)
-            return -float("inf")
+                reason += f" {result.stderr.strip()}"
+            return -float("inf"), reason
         score = float(result.stdout.strip())
-        print(f"      > Score: {score:.4f}")
-        return score
+        reject_reason = ""
+        if score == -float("inf") and result.stderr:
+            reject_reason = result.stderr.strip()
+        return score, reject_reason
     except Exception as e:
-        print(f"      > Log analysis failed: {e}", file=sys.stderr)
-        return -float("inf")
+        return -float("inf"), f"analyzer_error: {e}"
 
 
 def run_backtest_for_params(
@@ -2240,7 +2273,7 @@ def run_backtest_for_params(
         ) as tmp:
             backtest_log_file = tmp.name
 
-        score = run_backtest(
+        score, reject_reason = run_backtest(
             params_to_run,
             pair_str,
             backtest_log_file,
@@ -2248,7 +2281,7 @@ def run_backtest_for_params(
             pnl_end_time,
         )
         shutil.copyfile(backtest_log_file, latest_log_path)
-        return params_to_run, score
+        return params_to_run, score, reject_reason
     finally:
         if (
             backtest_log_file
@@ -2258,6 +2291,122 @@ def run_backtest_for_params(
             os.remove(backtest_log_file)
         elif backtest_log_file and os.path.exists(backtest_log_file):
             print(f"  > Kept backtest log at {backtest_log_file}")
+
+
+def run_backtest_batch(
+    pair_str, param_batch, pnl_start_time, pnl_end_time, batch_index
+):
+    """
+    Run multiple backtests in a single process using batch mode.
+    Returns list of (params, score, reject_reason) tuples.
+    """
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    binary_path = os.path.join(repo_root, "target", "release", "debot")
+    lighter_go_path = resolve_lighter_go_path()
+    ld_path = lighter_go_path + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    analyzer_path = os.path.join(os.path.dirname(__file__), "log_analyzer.py")
+
+    # Write param sets to a temp JSONL file.
+    batch_dir = os.path.join(BACKTEST_LOG_DIR, f"batch_{batch_index}")
+    os.makedirs(batch_dir, exist_ok=True)
+    params_file = os.path.join(batch_dir, "params.jsonl")
+    with open(params_file, "w") as f:
+        for params in param_batch:
+            f.write(json.dumps(params) + "\n")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "BACKTEST_MODE": "true",
+            "BACKTEST_FILE": DATA_DUMP_FILE,
+            "DRY_RUN": "true",
+            "RUST_LOG": "warn,debot::pairtrade=info",
+            "LD_LIBRARY_PATH": ld_path,
+            "UNIVERSE_PAIRS": pair_str,
+            "BATCH_PARAMS_FILE": params_file,
+            "BATCH_LOG_DIR": batch_dir,
+            "RESTART_GUARD_DIR": BACKTEST_LOG_DIR,
+            "RESTART_GUARD_KEY": f"optimizer_batch_{batch_index}_{uuid.uuid4().hex}",
+        }
+    )
+
+    try:
+        result = subprocess.run(
+            [binary_path],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=3600 * 2,
+        )
+    except subprocess.TimeoutExpired:
+        return [(p, -float("inf"), "batch_timeout") for p in param_batch]
+    except Exception as e:
+        return [(p, -float("inf"), f"batch_error: {e}") for p in param_batch]
+
+    # Parse batch output (JSONL on stdout): {"index": N, "log_file": "...", ...}
+    batch_outputs = {}
+    for line in (result.stdout or "").strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+            batch_outputs[entry["index"]] = entry
+        except (json.JSONDecodeError, KeyError):
+            continue
+
+    # Score each run's log file.
+    results = []
+    analyzer_env = build_analyzer_env()
+    for idx, params in enumerate(param_batch):
+        entry = batch_outputs.get(idx)
+        if not entry or "error" in entry:
+            error_msg = entry.get("error", "no_output") if entry else "no_output"
+            results.append((params, -float("inf"), f"batch_run_error: {error_msg}"))
+            continue
+
+        log_file = entry.get("log_file", "")
+        if not log_file or not os.path.exists(log_file):
+            results.append((params, -float("inf"), "no_log_file"))
+            continue
+
+        # Run analyzer on this log file.
+        analyzer_cmd = [sys.executable, analyzer_path, log_file]
+        if pnl_start_time is not None:
+            analyzer_cmd.extend(["--start-timestamp", format_timestamp(pnl_start_time)])
+        if pnl_end_time is not None:
+            analyzer_cmd.extend(["--end-timestamp", format_timestamp(pnl_end_time)])
+
+        try:
+            a_result = subprocess.run(
+                analyzer_cmd, capture_output=True, text=True, env=analyzer_env
+            )
+            if a_result.returncode != 0:
+                results.append((params, -float("inf"), f"analyzer_exit={a_result.returncode}"))
+                continue
+            score = float(a_result.stdout.strip())
+            reject_reason = ""
+            if score == -float("inf") and a_result.stderr:
+                reject_reason = a_result.stderr.strip()
+            results.append((params, score, reject_reason))
+        except Exception as e:
+            results.append((params, -float("inf"), f"analyzer_error: {e}"))
+
+        # Clean up log file unless keeping.
+        if not KEEP_BACKTEST_LOG and os.path.exists(log_file):
+            try:
+                os.remove(log_file)
+            except OSError:
+                pass
+
+    # Clean up batch dir.
+    try:
+        os.remove(params_file)
+        if not KEEP_BACKTEST_LOG:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+    except OSError:
+        pass
+
+    return results
 
 
 def optimize_for_pair(
@@ -2301,50 +2450,120 @@ def optimize_for_pair(
     worker_count = resolve_optimizer_workers(len(runnable_params))
     completed = 0
     latest_log_path = get_latest_log_path(pair_str)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
-        future_to_params = {
-            executor.submit(
-                run_backtest_for_params,
-                pair_str,
-                params,
-                pnl_start_time,
-                pnl_end_time,
-                latest_log_path,
-                idx + 1,
-                len(runnable_params),
-            ): params
-            for idx, params in enumerate(runnable_params)
-        }
-        for future in concurrent.futures.as_completed(future_to_params):
-            params_to_run = future_to_params[future]
-            try:
-                _, score = future.result()
-            except FatalBacktestError as e:
-                print(f"      > Fatal backtest error: {e}", file=sys.stderr)
-                raise
-            except Exception as e:
-                print(
-                    f"      > Backtest failed for params {params_to_run}: {e}",
-                    file=sys.stderr,
-                )
-                score = -float("inf")
 
-            stage1_results.append((params_to_run, score))
-            completed += 1
-            print(
-                f"  [Completed {completed}/{len(runnable_params)} for {pair_str}] "
-                f"score={score:.4f} params={params_to_run}"
-            )
-            if score > best_score:
-                best_score = score
-                best_params = params_to_run
-                print(
-                    f"  *** New best score for {pair_str}: {best_score:.4f} with params: {best_params} ***"
-                )
-                with open(log_file_path, "a") as opt_log:
-                    opt_log.write(
-                        f"[{pair_str}] new_best score={best_score:.4f} params={best_params}\n"
+    # Use batch mode: group params into batches, each batch runs in a single
+    # process that loads data once.
+    batch_size = int(os.getenv("OPTIMIZER_BATCH_SIZE", "0"))
+    use_batch = batch_size > 0 and os.path.isfile(
+        os.path.join(
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+            "target", "release", "debot",
+        )
+    )
+
+    if use_batch:
+        ensure_backtest_log_dir()
+        batches = [
+            runnable_params[i : i + batch_size]
+            for i in range(0, len(runnable_params), batch_size)
+        ]
+        print(
+            f"  Batch mode: {len(batches)} batches of ~{batch_size} "
+            f"({worker_count} workers)"
+        )
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_batch = {
+                executor.submit(
+                    run_backtest_batch,
+                    pair_str,
+                    batch,
+                    pnl_start_time,
+                    pnl_end_time,
+                    batch_idx,
+                ): batch
+                for batch_idx, batch in enumerate(batches)
+            }
+            for future in concurrent.futures.as_completed(future_to_batch):
+                try:
+                    batch_results = future.result()
+                except Exception as e:
+                    batch = future_to_batch[future]
+                    print(f"      > Batch failed: {e}", file=sys.stderr)
+                    batch_results = [
+                        (p, -float("inf"), f"batch_error: {e}") for p in batch
+                    ]
+
+                for params_to_run, score, reject_reason in batch_results:
+                    stage1_results.append((params_to_run, score))
+                    completed += 1
+                    reason_suffix = f" reason={reject_reason}" if reject_reason else ""
+                    print(
+                        f"  [Completed {completed}/{total_runs} for {pair_str}] "
+                        f"score={score:.4f}{reason_suffix} params={params_to_run}"
                     )
+                    if score > best_score:
+                        best_score = score
+                        best_params = params_to_run
+                        print(
+                            f"  *** New best score for {pair_str}: {best_score:.4f} "
+                            f"with params: {best_params} ***"
+                        )
+                        with open(log_file_path, "a") as opt_log:
+                            opt_log.write(
+                                f"[{pair_str}] new_best score={best_score:.4f} "
+                                f"params={best_params}\n"
+                            )
+    else:
+        # Fallback: original per-run mode.
+        with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_params = {
+                executor.submit(
+                    run_backtest_for_params,
+                    pair_str,
+                    params,
+                    pnl_start_time,
+                    pnl_end_time,
+                    latest_log_path,
+                    idx + 1,
+                    len(runnable_params),
+                ): params
+                for idx, params in enumerate(runnable_params)
+            }
+            for future in concurrent.futures.as_completed(future_to_params):
+                params_to_run = future_to_params[future]
+                reject_reason = ""
+                try:
+                    _, score, reject_reason = future.result()
+                except FatalBacktestError as e:
+                    print(f"      > Fatal backtest error: {e}", file=sys.stderr)
+                    raise
+                except Exception as e:
+                    print(
+                        f"      > Backtest failed for params {params_to_run}: {e}",
+                        file=sys.stderr,
+                    )
+                    score = -float("inf")
+                    reject_reason = f"backtest_error: {e}"
+
+                stage1_results.append((params_to_run, score))
+                completed += 1
+                reason_suffix = f" reason={reject_reason}" if reject_reason else ""
+                print(
+                    f"  [Completed {completed}/{total_runs} for {pair_str}] "
+                    f"score={score:.4f}{reason_suffix} params={params_to_run}"
+                )
+                if score > best_score:
+                    best_score = score
+                    best_params = params_to_run
+                    print(
+                        f"  *** New best score for {pair_str}: {best_score:.4f} "
+                        f"with params: {best_params} ***"
+                    )
+                    with open(log_file_path, "a") as opt_log:
+                        opt_log.write(
+                            f"[{pair_str}] new_best score={best_score:.4f} "
+                            f"params={best_params}\n"
+                        )
 
     stage2_best_params = None
     stage2_best_score = -float("inf")
@@ -2436,7 +2655,7 @@ def evaluate_params(pair_str, params, pnl_start_time, pnl_end_time, label=None):
             backtest_log_file = tmp.name
         label_text = f" {label}" if label else ""
         print(f"  > Validation backtest{label_text} for {pair_str} with params.")
-        score = run_backtest(
+        score, _reject_reason = run_backtest(
             params, pair_str, backtest_log_file, pnl_start_time, pnl_end_time
         )
         shutil.copyfile(backtest_log_file, latest_log_path)
@@ -2581,15 +2800,32 @@ def main():
             if data_dump_preprocessed:
                 print(f"Using preprocessed data file: {data_dump_preprocessed}")
                 DATA_DUMP_FILE = data_dump_preprocessed
+            DATA_DUMP_JSONL = DATA_DUMP_FILE
 
-        if os.path.exists(DATA_DUMP_FILE):
-            bounds = get_data_time_bounds(DATA_DUMP_FILE)
+        # Convert JSONL to bincode for faster loading in backtests.
+        if os.path.exists(DATA_DUMP_FILE) and not DATA_DUMP_FILE.endswith(".bin"):
+            bincode_path = convert_to_bincode(DATA_DUMP_FILE)
+            if bincode_path != DATA_DUMP_FILE:
+                DATA_DUMP_FILE = bincode_path
+
+        if os.path.exists(DATA_DUMP_JSONL):
+            bounds = get_data_time_bounds(DATA_DUMP_JSONL)
             if bounds is None:
                 print(
                     "Could not determine data time bounds. Halting optimization.",
                     file=sys.stderr,
                 )
                 return
+
+            data_duration_days = (bounds[1] - bounds[0]).total_seconds() / 86400.0
+            min_data_days = float(os.getenv("OPTIMIZER_MIN_DATA_DAYS", "7"))
+            if data_duration_days < min_data_days:
+                print(
+                    f"Insufficient data: {data_duration_days:.1f} days "
+                    f"(need {min_data_days:.0f}). Skipping optimization."
+                )
+                return
+
             train_start, train_end, val_start, val_end = build_walk_forward_windows(
                 bounds[0], bounds[1]
             )

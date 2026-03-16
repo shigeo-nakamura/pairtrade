@@ -2174,6 +2174,15 @@ enum TradeAction {
 }
 
 impl PairTradeEngine {
+    /// Create a new engine with a pre-loaded ReplayConnector (for batch mode).
+    pub async fn new_with_replay(
+        cfg: PairTradeConfig,
+        replay: Arc<ReplayConnector>,
+    ) -> Result<Self> {
+        replay.reset();
+        Self::new_inner(cfg, replay.clone(), Some(replay)).await
+    }
+
     pub async fn new(cfg: PairTradeConfig) -> Result<Self> {
         let (connector, replay_connector): (
             Arc<dyn DexConnector + Send + Sync>,
@@ -2210,6 +2219,14 @@ impl PairTradeEngine {
             (Arc::new(live_connector), None)
         };
 
+        Self::new_inner(cfg, connector, replay_connector).await
+    }
+
+    async fn new_inner(
+        cfg: PairTradeConfig,
+        connector: Arc<dyn DexConnector + Send + Sync>,
+        replay_connector: Option<Arc<ReplayConnector>>,
+    ) -> Result<Self> {
         let mut states = HashMap::new();
         let mut history = HashMap::new();
         let mut bar_builders = HashMap::new();
