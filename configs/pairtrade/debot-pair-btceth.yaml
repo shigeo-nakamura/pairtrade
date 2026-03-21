@@ -1,0 +1,58 @@
+dex_name: lighter
+rest_endpoint: https://mainnet.zklighter.elliot.ai/
+web_socket_endpoint: wss://mainnet.zklighter.elliot.ai/stream
+dry_run: false
+agent_name: debot-pair-btceth
+
+# Fixed pair: BTC/ETH only
+universe_pairs:
+- BTC/ETH
+max_active_pairs: 1
+
+# Timing
+interval_secs: 20
+trading_period_secs: 60
+
+# Pair diagnostics (simplified: relaxed thresholds)
+pair_selection_lookback_hours_short: 1
+pair_selection_lookback_hours_long: 2
+adf_p_threshold: 0.15
+half_life_max_hours: 2.0
+metrics_window_length: 240
+warm_start_mode: relaxed
+warm_start_min_bars: 60
+
+# Core MR params (from backtest: entry=3.0, exit=0, stop=4.0, lookback=60min)
+entry_z_score_base: 3.0
+entry_z_score_min: 2.5
+entry_z_score_max: 3.5
+exit_z_score: 0.3
+stop_loss_z_score: 4.0
+force_close_time_secs: 3600
+
+# Risk
+risk_pct_per_trade: 0.04
+equity_usd_fallback: 500
+max_leverage: 5
+max_loss_r_mult: 3.0
+
+# Execution
+cooldown_secs: 60
+slippage_bps: 0
+fee_bps: 0
+entry_post_only_timeout_secs: 30
+
+# Filters (relaxed: let z-score do the work)
+spread_velocity_max_sigma_per_min: 0.15
+spread_trend_max_slope_sigma: 1.0
+beta_divergence_max: 0.30
+entry_vol_lookback_hours: 2
+vol_spike_mult: 3.0
+net_funding_min_per_hour: -0.01
+reeval_jump_z_mult: 1.5
+
+# Circuit breaker
+circuit_breaker_tier1_losses: 5
+circuit_breaker_tier1_cooldown_secs: 600
+circuit_breaker_tier2_losses: 8
+circuit_breaker_tier2_cooldown_secs: 3600

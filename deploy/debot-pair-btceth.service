@@ -1,10 +1,10 @@
 [Unit]
-Description="debot02"
+Description="debot-pair-btceth"
 After=network.target
 
 [Service]
 WorkingDirectory=/opt/debot
-ExecStart=/bin/bash /opt/debot/scripts/debot_lighter.sh debot02
+ExecStart=/bin/bash /opt/debot/scripts/debot_lighter.sh debot-pair-btceth
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5

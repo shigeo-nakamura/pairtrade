@@ -57,10 +57,7 @@ jobs:
             --exclude "*.log" \
             --exclude "*.pyc"
           aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/" --exact-timestamps
-          aws s3 cp debot/deploy/debot00.service "s3://${S3_BUCKET}/deploy/debot00.service"
-          aws s3 cp debot/deploy/debot01.service "s3://${S3_BUCKET}/deploy/debot01.service"
-          aws s3 cp debot/deploy/debot02.service "s3://${S3_BUCKET}/deploy/debot02.service"
-          aws s3 cp debot/deploy/debot03.service "s3://${S3_BUCKET}/deploy/debot03.service"
+          aws s3 cp debot/deploy/debot-pair-btceth.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth.service"
 
       - name: Deploy via SSM (no restart)
         env:
@@ -74,7 +71,7 @@ jobs:
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exact-timestamps",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs --exact-timestamps",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
-              "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot00 debot01 debot02 debot03; do aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'"
+              "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot-pair-btceth; do aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'"
             ]
           }
           JSON
