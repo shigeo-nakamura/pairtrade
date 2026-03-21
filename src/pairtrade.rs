@@ -1436,6 +1436,23 @@ struct PnlLogRecord {
     direction: String,
     pnl: f64,
     source: String,
+    // Trade log fields for backtest calibration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_price_a: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_price_b: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_price_a: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_price_b: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beta: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    z_entry: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    z_exit: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold_secs: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1914,7 +1931,37 @@ impl PnlLogRecord {
             direction: direction_label(direction).to_string(),
             pnl,
             source: source.to_string(),
+            entry_price_a: None,
+            entry_price_b: None,
+            exit_price_a: None,
+            exit_price_b: None,
+            beta: None,
+            z_entry: None,
+            z_exit: None,
+            hold_secs: None,
         }
+    }
+
+    fn with_trade_details(
+        mut self,
+        entry_a: Option<f64>,
+        entry_b: Option<f64>,
+        exit_a: Option<f64>,
+        exit_b: Option<f64>,
+        beta: Option<f64>,
+        z_entry: Option<f64>,
+        z_exit: Option<f64>,
+        hold_secs: Option<f64>,
+    ) -> Self {
+        self.entry_price_a = entry_a;
+        self.entry_price_b = entry_b;
+        self.exit_price_a = exit_a;
+        self.exit_price_b = exit_b;
+        self.beta = beta;
+        self.z_entry = z_entry;
+        self.z_exit = z_exit;
+        self.hold_secs = hold_secs;
+        self
     }
 }
 
@@ -3221,6 +3268,16 @@ impl PairTradeEngine {
                         .and_then(|pos| compute_pnl(pos, price_a, price_b));
                     if let Some(pnl) = pnl {
                         if let Some(pnl_value) = pnl.to_f64() {
+                            let pos_ref = self.states.get(&plan.key)
+                                .and_then(|s| s.position.as_ref());
+                            let hold_secs = pos_ref
+                                .map(|p| p.entered_at.elapsed().as_secs_f64());
+                            let entry_a = pos_ref
+                                .and_then(|p| p.entry_price_a)
+                                .and_then(|v| v.to_f64());
+                            let entry_b = pos_ref
+                                .and_then(|p| p.entry_price_b)
+                                .and_then(|v| v.to_f64());
                             let record = PnlLogRecord::new(
                                 &plan.pair.base,
                                 &plan.pair.quote,
@@ -3228,6 +3285,13 @@ impl PairTradeEngine {
                                 pnl_value,
                                 now_ts,
                                 "exit_dry_run",
+                            ).with_trade_details(
+                                entry_a, entry_b,
+                                price_a.to_f64(), price_b.to_f64(),
+                                Some(beta), Some(z),
+                                self.states.get(&plan.key)
+                                    .and_then(|s| s.last_spread.map(|_| z)),
+                                hold_secs,
                             );
                             self.write_pnl_record(record);
                             if pnl_value < 0.0 {
