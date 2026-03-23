@@ -23,17 +23,17 @@ warm_start_mode: relaxed
 warm_start_min_bars: 60
 
 # Core MR params (from backtest: entry=3.0, exit=0, stop=4.0, lookback=60min)
-entry_z_score_base: 3.0
-entry_z_score_min: 2.5
-entry_z_score_max: 3.5
-exit_z_score: 0.3
+entry_z_score_base: 2.5
+entry_z_score_min: 2.0
+entry_z_score_max: 3.0
+exit_z_score: 0.5
 stop_loss_z_score: 4.0
 force_close_time_secs: 3600
 
 # Risk
-risk_pct_per_trade: 0.04
-equity_usd_fallback: 500
-max_leverage: 5
+risk_pct_per_trade: 0.20
+equity_usd_fallback: 1000
+max_leverage: 1
 max_loss_r_mult: 3.0
 
 # Execution
