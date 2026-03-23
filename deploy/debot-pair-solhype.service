@@ -1,0 +1,14 @@
+[Unit]
+Description="debot-pair-solhype"
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/debot
+ExecStart=/bin/bash /opt/debot/scripts/debot_lighter.sh debot-pair-solhype
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
