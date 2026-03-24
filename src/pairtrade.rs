@@ -1494,6 +1494,7 @@ struct StatusReporter {
     last_equity_history_ts: Option<i64>,
     last_snapshot: Option<Instant>,
     trade_stats: Option<PairTradeStats>,
+    maintenance: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1523,6 +1524,8 @@ struct StatusSnapshot {
     pnl_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     trade_stats: Option<PairTradeStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maintenance: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1705,6 +1708,7 @@ impl StatusReporter {
             last_equity_history_ts: None,
             last_snapshot: None,
             trade_stats: None,
+            maintenance: None,
         };
         reporter.load_equity_baseline();
         if let Err(err) = reporter.ensure_status_file() {
@@ -1822,6 +1826,10 @@ impl StatusReporter {
         self.append_equity_history(equity);
     }
 
+    fn set_maintenance(&mut self, status: Option<String>) {
+        self.maintenance = status;
+    }
+
     fn write_snapshot(
         &mut self,
         open_positions: &HashMap<String, PositionSnapshot>,
@@ -1859,6 +1867,7 @@ impl StatusReporter {
             pnl_today: self.pnl_today,
             pnl_source: "equity".to_string(),
             trade_stats: self.trade_stats.clone(),
+            maintenance: self.maintenance.clone(),
         };
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -2872,6 +2881,13 @@ impl PairTradeEngine {
         let maintenance_block_entries = self.connector.is_upcoming_maintenance(2).await;
         if maintenance_block_entries {
             log::warn!("Upcoming maintenance detected; blocking new entries this cycle");
+        }
+        if let Some(reporter) = &mut self.status_reporter {
+            reporter.set_maintenance(if maintenance_block_entries {
+                Some("blocking_entries".to_string())
+            } else {
+                None
+            });
         }
 
         self.refresh_equity_if_needed().await?;
