@@ -1493,6 +1493,7 @@ struct StatusReporter {
     equity_history_path: PathBuf,
     last_equity_history_ts: Option<i64>,
     last_snapshot: Option<Instant>,
+    trade_stats: Option<PairTradeStats>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1520,6 +1521,17 @@ struct StatusSnapshot {
     pnl_total: f64,
     pnl_today: f64,
     pnl_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trade_stats: Option<PairTradeStats>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PairTradeStats {
+    trades: u64,
+    wins: u64,
+    win_rate: f64,
+    max_dd: f64,
+    pnl: f64,
 }
 
 impl PnlLogger {
@@ -1692,6 +1704,7 @@ impl StatusReporter {
             equity_history_path,
             last_equity_history_ts: None,
             last_snapshot: None,
+            trade_stats: None,
         };
         reporter.load_equity_baseline();
         if let Err(err) = reporter.ensure_status_file() {
@@ -1845,6 +1858,7 @@ impl StatusReporter {
             pnl_total: self.pnl_total,
             pnl_today: self.pnl_today,
             pnl_source: "equity".to_string(),
+            trade_stats: self.trade_stats.clone(),
         };
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -2192,6 +2206,11 @@ pub struct PairTradeEngine {
     status_reporter: Option<StatusReporter>,
     consecutive_losses: u32,
     circuit_breaker_until: Option<Instant>,
+    total_trades: u64,
+    total_wins: u64,
+    total_pnl: f64,
+    peak_pnl: f64,
+    max_dd: f64,
 }
 
 struct PlannedAction {
@@ -2332,10 +2351,43 @@ impl PairTradeEngine {
             status_reporter,
             consecutive_losses: 0,
             circuit_breaker_until: None,
+            total_trades: 0,
+            total_wins: 0,
+            total_pnl: 0.0,
+            peak_pnl: 0.0,
+            max_dd: 0.0,
         })
     }
 
     fn write_pnl_record(&mut self, record: PnlLogRecord) {
+        // Update trade stats
+        self.total_trades += 1;
+        self.total_pnl += record.pnl;
+        if record.pnl > 0.0 {
+            self.total_wins += 1;
+        }
+        if self.total_pnl > self.peak_pnl {
+            self.peak_pnl = self.total_pnl;
+        }
+        let dd = self.peak_pnl - self.total_pnl;
+        if dd > self.max_dd {
+            self.max_dd = dd;
+        }
+
+        // Update status reporter
+        if let Some(reporter) = &mut self.status_reporter {
+            let wr = if self.total_trades > 0 {
+                self.total_wins as f64 / self.total_trades as f64 * 100.0
+            } else { 0.0 };
+            reporter.trade_stats = Some(PairTradeStats {
+                trades: self.total_trades,
+                wins: self.total_wins,
+                win_rate: wr,
+                max_dd: self.max_dd,
+                pnl: self.total_pnl,
+            });
+        }
+
         if let Some(logger) = &mut self.pnl_logger {
             if let Err(err) = logger.log(record) {
                 log::warn!("[PNL] failed to write pnl log: {:?}", err);
