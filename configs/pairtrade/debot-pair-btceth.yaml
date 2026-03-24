@@ -31,7 +31,7 @@ stop_loss_z_score: 4.0
 force_close_time_secs: 3600
 
 # Risk
-risk_pct_per_trade: 0.20
+risk_pct_per_trade: 0.40
 equity_usd_fallback: 1000
 max_leverage: 1
 max_loss_r_mult: 3.0
