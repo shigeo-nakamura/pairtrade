@@ -5955,6 +5955,11 @@ impl PairTradeEngine {
             status_reporter: None,
             consecutive_losses: 0,
             circuit_breaker_until: None,
+            total_trades: 0,
+            total_wins: 0,
+            total_pnl: 0.0,
+            peak_pnl: 0.0,
+            max_dd: 0.0,
         }
     }
 }
