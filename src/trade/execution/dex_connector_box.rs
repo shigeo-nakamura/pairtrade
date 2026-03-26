@@ -86,12 +86,45 @@ impl DexConnectorBox {
                     }
                 };
 
+                let mut account_index = lighter_config.account_index;
+
+                // Auto-discover account_index if not set (0 = not configured)
+                if account_index == 0 {
+                    let wallet_address =
+                        lighter_config.wallet_address.as_deref().ok_or_else(|| {
+                            DexError::Other(
+                                "LIGHTER_ACCOUNT_INDEX not set and LIGHTER_WALLET_ADDRESS not set. \
+                                 Set one of them to enable account discovery."
+                                    .to_string(),
+                            )
+                        })?;
+                    log::info!(
+                        "LIGHTER_ACCOUNT_INDEX not set, discovering for api_key_index={}...",
+                        lighter_config.api_key_index
+                    );
+                    let tmp_config = LighterConnectorConfig {
+                        api_key_public: lighter_config.api_key.clone(),
+                        api_key_index: lighter_config.api_key_index,
+                        api_private_key_hex: lighter_config.private_key.clone(),
+                        evm_wallet_private_key: lighter_config.evm_wallet_private_key.clone(),
+                        account_index: 0,
+                        base_url: lighter_config.base_url.clone(),
+                        websocket_url: lighter_config.websocket_url.clone(),
+                        tracked_symbols: vec![],
+                        ob_stale_secs: None,
+                    };
+                    let tmp_connector = LighterConnector::new(tmp_config)?;
+                    account_index = tmp_connector
+                        .discover_account_index(wallet_address)
+                        .await?;
+                }
+
                 let connector_config = LighterConnectorConfig {
                     api_key_public: lighter_config.api_key,
                     api_key_index: lighter_config.api_key_index,
                     api_private_key_hex: lighter_config.private_key,
                     evm_wallet_private_key: lighter_config.evm_wallet_private_key,
-                    account_index: lighter_config.account_index,
+                    account_index,
                     base_url: lighter_config.base_url,
                     websocket_url: lighter_config.websocket_url,
                     tracked_symbols: token_list.to_vec(),

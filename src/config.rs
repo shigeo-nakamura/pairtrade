@@ -13,6 +13,7 @@ pub struct LighterConfig {
     pub evm_wallet_private_key: Option<String>, // EVM wallet private key for API key registration
     pub api_key_index: u32,                     // API key index
     pub account_index: u64,                     // Account index
+    pub wallet_address: Option<String>,         // Wallet L1 address for account discovery
     pub base_url: String,
     pub websocket_url: String,
 }
@@ -174,9 +175,14 @@ pub async fn get_lighter_config_from_env() -> Result<LighterConfig, ConfigError>
         .expect("LIGHTER_API_KEY_INDEX must be a valid u32");
 
     let account_index: u64 = env::var("LIGHTER_ACCOUNT_INDEX")
-        .unwrap_or_else(|_| "0".to_string())
+        .ok()
+        .and_then(|v| if v.is_empty() { None } else { Some(v) })
+        .unwrap_or_else(|| "0".to_string())
         .parse()
         .expect("LIGHTER_ACCOUNT_INDEX must be a valid u64");
+    let wallet_address = env::var("LIGHTER_WALLET_ADDRESS")
+        .ok()
+        .and_then(|v| if v.is_empty() { None } else { Some(v) });
 
     Ok(LighterConfig {
         api_key,
@@ -184,6 +190,7 @@ pub async fn get_lighter_config_from_env() -> Result<LighterConfig, ConfigError>
         evm_wallet_private_key: evm_wallet_key,
         api_key_index,
         account_index,
+        wallet_address,
         base_url,
         websocket_url,
     })
