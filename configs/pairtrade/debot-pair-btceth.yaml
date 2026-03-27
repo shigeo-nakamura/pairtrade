@@ -22,10 +22,10 @@ metrics_window_length: 240
 warm_start_mode: relaxed
 warm_start_min_bars: 60
 
-# Core MR params (from backtest: entry=3.0, exit=0, stop=4.0, lookback=60min)
-entry_z_score_base: 2.5
-entry_z_score_min: 2.0
-entry_z_score_max: 3.0
+# Core MR params (optimized 2026-03-27: entry_z 2.5->1.5, 25 trades +$37.77 in 4.7d backtest)
+entry_z_score_base: 1.5
+entry_z_score_min: 1.0
+entry_z_score_max: 2.0
 exit_z_score: 0.5
 stop_loss_z_score: 4.0
 force_close_time_secs: 3600
