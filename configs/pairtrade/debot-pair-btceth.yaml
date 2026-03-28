@@ -28,7 +28,7 @@ entry_z_score_min: 1.0
 entry_z_score_max: 2.0
 exit_z_score: 0.5
 stop_loss_z_score: 4.0
-force_close_time_secs: 3600
+force_close_time_secs: 7200
 
 # Risk
 risk_pct_per_trade: 0.40

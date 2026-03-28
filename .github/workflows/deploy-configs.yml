@@ -73,7 +73,7 @@ jobs:
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs --exact-timestamps",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
               "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot-pair-btceth debot-pair-solhype; do aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'",
-              "for svc in debot-pair-btceth debot-pair-solhype; do if systemctl is-active --quiet $svc; then sudo systemctl restart $svc && echo \"Restarted $svc\"; fi; done"
+              "for svc in debot-pair-btceth; do if systemctl is-active --quiet $svc; then sudo systemctl restart $svc && echo \"Restarted $svc\"; fi; done"
             ]
           }
           JSON
