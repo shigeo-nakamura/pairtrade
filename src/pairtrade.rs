@@ -5236,6 +5236,29 @@ impl PairTradeEngine {
                 qty_b
             );
         }
+        // Check hedge ratio deviation after size rounding
+        let pair_key_for_dev = format!("{}/{}", pair.base, pair.quote);
+        let pp_for_dev = self.cfg.params_for(&pair_key_for_dev);
+        if pp_for_dev.hedge_ratio_max_deviation < 1.0 {
+            let dev_a = if qtys.0.is_zero() {
+                0.0
+            } else {
+                ((qty_a / qtys.0) - Decimal::ONE).abs().to_f64().unwrap_or(0.0)
+            };
+            let dev_b = if qtys.1.is_zero() {
+                0.0
+            } else {
+                ((qty_b / qtys.1) - Decimal::ONE).abs().to_f64().unwrap_or(0.0)
+            };
+            let max_dev = dev_a.max(dev_b);
+            if max_dev > pp_for_dev.hedge_ratio_max_deviation {
+                log::info!(
+                    "[ORDER_ADJUST][ENTRY] {}/{} BLOCKED: size rounding deviation {:.1}% exceeds limit {:.1}%",
+                    pair.base, pair.quote, max_dev * 100.0, pp_for_dev.hedge_ratio_max_deviation * 100.0
+                );
+                return Ok(Vec::new());
+            }
+        }
         let limit_a = self.limit_price_for(&pair.base, side_a, prices);
         let limit_b = self.limit_price_for(&pair.quote, side_b, prices);
         let pair_key_for_hybrid = format!("{}/{}", pair.base, pair.quote);
