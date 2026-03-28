@@ -4864,7 +4864,7 @@ impl PairTradeEngine {
 
     fn post_only_supported(&self) -> bool {
         let dex = self.cfg.dex_name.to_ascii_lowercase();
-        dex.contains("extended") || dex.contains("lighter")
+        dex.contains("lighter")
     }
 
     fn should_post_only(&self) -> bool {
@@ -5099,16 +5099,7 @@ impl PairTradeEngine {
         side: dex_connector::OrderSide,
         snapshot: &SymbolSnapshot,
     ) -> Decimal {
-        let mut effective_tick_size = snapshot.min_tick;
-
-        if effective_tick_size.is_none() && self.cfg.dex_name.contains("extended") {
-            log::debug!(
-                "[ORDER] Missing min_tick for {} on extended, defaulting to 1.",
-                symbol
-            );
-
-            effective_tick_size = Some(Decimal::ONE);
-        }
+        let effective_tick_size = snapshot.min_tick;
 
         let Some(tick_size) = effective_tick_size else {
             if !self.min_tick_warned.contains(symbol) {

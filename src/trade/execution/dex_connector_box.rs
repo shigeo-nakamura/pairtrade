@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use dex_connector::{
-    create_extended_connector, BalanceResponse, CanceledOrdersResponse, CreateOrderResponse,
-    DexConnector, DexError, FilledOrdersResponse, HyperliquidConnector, LastTradesResponse,
-    OpenOrdersResponse, OrderBookSnapshot, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
+    BalanceResponse, CanceledOrdersResponse, CreateOrderResponse, DexConnector, DexError,
+    FilledOrdersResponse, HyperliquidConnector, LastTradesResponse, OpenOrdersResponse,
+    OrderBookSnapshot, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
 };
 #[cfg(feature = "lighter-sdk")]
 use dex_connector::{create_lighter_connector, LighterConnector, LighterConnectorConfig};
@@ -11,7 +11,7 @@ use rust_decimal::Decimal;
 
 #[cfg(feature = "lighter-sdk")]
 use crate::config::get_lighter_config_from_env;
-use crate::config::{get_extended_config_from_env, get_hyperliquid_config_from_env, RunMode};
+use crate::config::{get_hyperliquid_config_from_env, RunMode};
 use crate::rate_limit_notifier::notify_rate_limit;
 use lazy_static::lazy_static;
 use std::env;
@@ -140,27 +140,6 @@ impl DexConnectorBox {
                     let connector = create_lighter_connector(connector_config)?;
                     Ok(DexConnectorBox { inner: connector })
                 }
-            }
-            "extended" => {
-                let extended_config = match get_extended_config_from_env().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Err(DexError::Other(e.to_string()));
-                    }
-                };
-
-                let connector = create_extended_connector(
-                    extended_config.api_key,
-                    extended_config.public_key,
-                    extended_config.private_key,
-                    extended_config.vault,
-                    extended_config.base_url,
-                    extended_config.websocket_url,
-                    token_list.to_vec(),
-                )
-                .await?;
-
-                Ok(DexConnectorBox { inner: connector })
             }
             _ => Err(DexError::Other("Unsupported dex".to_owned())),
         }

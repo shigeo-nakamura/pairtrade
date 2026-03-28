@@ -59,7 +59,6 @@ PARAM_GRID = {
     # Fixed: risk sizing doesn't affect signal quality, only scales returns.
     "RISK_PCT_PER_TRADE": ["0.04"],
     "MAX_LEVERAGE": ["5"],
-    # Force-close extended: live half_life=0.75h but force_close=900s was too short.
     # Need at least 1 half-life of hold time for mean reversion to play out.
     "FORCE_CLOSE_TIME_SECS": ["1200", "1800", "2700"],
     # Mean-reversion diagnostics
@@ -255,7 +254,7 @@ def resolve_lighter_go_path(_config_path=None):
 def ensure_libsigner_available(config_path):
     config = load_config(config_path)
     dex_name = str(config.get("dex_name") or os.getenv("DEX_NAME", DEX_NAME)).strip().lower()
-    if dex_name not in ("lighter", "extended"):
+    if dex_name != "lighter":
         return
     lighter_go_path = resolve_lighter_go_path(config_path)
     libsigner_path = os.path.join(lighter_go_path, "libsigner.so")
@@ -430,8 +429,6 @@ def resolve_config_update_targets(config_path):
             targets.insert(0, config_path)
         return targets or [config_path]
 
-    if base_name.startswith("debot_extended"):
-        return list_matching("debot_extended")
     if base_name.startswith("debot_lighter"):
         return list_matching("debot_lighter")
     return [config_path]
@@ -443,8 +440,6 @@ def describe_config_group(config_paths):
         return "debot*.yaml"
     if base_names and all(name.startswith("debot_lighter") for name in base_names):
         return "debot_lighter*.yaml"
-    if base_names and all(name.startswith("debot_extended") for name in base_names):
-        return "debot_extended*.yaml"
     if len(base_names) == 1:
         return base_names[0]
     return "config files"
@@ -1971,7 +1966,7 @@ def resolve_config_path():
     if os.getenv("PAIRTRADE_CONFIG_PATH"):
         return os.path.abspath(os.getenv("PAIRTRADE_CONFIG_PATH"))
     dex_name = os.getenv("DEX_NAME", "").strip().lower()
-    basename = "debot_extended_main.yaml" if dex_name == "extended" else "debot00.yaml"
+    basename = "debot00.yaml"
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     return os.path.join(repo_root, "configs", "pairtrade", basename)
 
