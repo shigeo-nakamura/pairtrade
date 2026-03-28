@@ -47,6 +47,8 @@ entry_post_only_timeout_secs: 30
 spread_velocity_max_sigma_per_min: 0.15
 spread_trend_max_slope_sigma: 1.0
 beta_divergence_max: 0.30
+beta_min: 0.30
+hedge_ratio_max_deviation: 0.20
 entry_vol_lookback_hours: 2
 vol_spike_mult: 3.0
 net_funding_min_per_hour: -0.01

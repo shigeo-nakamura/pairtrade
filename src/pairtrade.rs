@@ -147,6 +147,8 @@ struct PairTradeYaml {
     backtest_file: Option<String>,
     spread_trend_max_slope_sigma: Option<f64>,
     beta_divergence_max: Option<f64>,
+    beta_min: Option<f64>,
+    hedge_ratio_max_deviation: Option<f64>,
     circuit_breaker_consecutive_losses: Option<u32>,
     circuit_breaker_cooldown_secs: Option<u64>,
     circuit_breaker_tier1_losses: Option<u32>,
@@ -173,6 +175,8 @@ struct PairOverrideYaml {
     spread_velocity_max_sigma_per_min: Option<f64>,
     spread_trend_max_slope_sigma: Option<f64>,
     beta_divergence_max: Option<f64>,
+    beta_min: Option<f64>,
+    hedge_ratio_max_deviation: Option<f64>,
     pair_selection_lookback_hours_short: Option<u64>,
     pair_selection_lookback_hours_long: Option<u64>,
     entry_vol_lookback_hours: Option<u64>,
@@ -202,6 +206,8 @@ pub struct PairParams {
     pub spread_velocity_max_sigma_per_min: f64,
     pub spread_trend_max_slope_sigma: f64,
     pub beta_divergence_max: f64,
+    pub beta_min: f64,
+    pub hedge_ratio_max_deviation: f64,
     pub lookback_hours_short: u64,
     pub lookback_hours_long: u64,
     pub entry_vol_lookback_hours: u64,
@@ -269,6 +275,8 @@ pub struct PairTradeConfig {
     pub backtest_file: Option<String>,
     pub spread_trend_max_slope_sigma: f64,
     pub beta_divergence_max: f64,
+    pub beta_min: f64,
+    pub hedge_ratio_max_deviation: f64,
     pub circuit_breaker_consecutive_losses: u32,
     pub circuit_breaker_cooldown_secs: u64,
     pub circuit_breaker_tier1_losses: u32,
@@ -308,6 +316,8 @@ impl PairTradeConfig {
             spread_velocity_max_sigma_per_min: self.spread_velocity_max_sigma_per_min,
             spread_trend_max_slope_sigma: self.spread_trend_max_slope_sigma,
             beta_divergence_max: self.beta_divergence_max,
+            beta_min: self.beta_min,
+            hedge_ratio_max_deviation: self.hedge_ratio_max_deviation,
             lookback_hours_short: self.lookback_hours_short,
             lookback_hours_long: self.lookback_hours_long,
             entry_vol_lookback_hours: self.entry_vol_lookback_hours,
@@ -351,6 +361,10 @@ impl PairTradeConfig {
                     beta_divergence_max: ovr
                         .beta_divergence_max
                         .unwrap_or(self.beta_divergence_max),
+                    beta_min: ovr.beta_min.unwrap_or(self.beta_min),
+                    hedge_ratio_max_deviation: ovr
+                        .hedge_ratio_max_deviation
+                        .unwrap_or(self.hedge_ratio_max_deviation),
                     lookback_hours_short: ovr
                         .pair_selection_lookback_hours_short
                         .unwrap_or(self.lookback_hours_short),
@@ -515,6 +529,8 @@ impl PairTradeConfig {
             beta_divergence_max: yaml
                 .beta_divergence_max
                 .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
+            beta_min: yaml.beta_min.unwrap_or(0.0),
+            hedge_ratio_max_deviation: yaml.hedge_ratio_max_deviation.unwrap_or(1.0),
             circuit_breaker_consecutive_losses: yaml
                 .circuit_breaker_consecutive_losses
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES),
@@ -551,6 +567,8 @@ impl PairTradeConfig {
                 spread_velocity_max_sigma_per_min: 0.0,
                 spread_trend_max_slope_sigma: 0.0,
                 beta_divergence_max: 0.0,
+                beta_min: 0.0,
+                hedge_ratio_max_deviation: 1.0,
                 lookback_hours_short: 0,
                 lookback_hours_long: 0,
                 entry_vol_lookback_hours: 0,
@@ -827,6 +845,14 @@ impl PairTradeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
+            beta_min: env::var("BETA_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+            hedge_ratio_max_deviation: env::var("HEDGE_RATIO_MAX_DEVIATION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0),
             circuit_breaker_consecutive_losses: env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -870,6 +896,8 @@ impl PairTradeConfig {
                 spread_velocity_max_sigma_per_min: 0.0,
                 spread_trend_max_slope_sigma: 0.0,
                 beta_divergence_max: 0.0,
+                beta_min: 0.0,
+                hedge_ratio_max_deviation: 1.0,
                 lookback_hours_short: 0,
                 lookback_hours_long: 0,
                 entry_vol_lookback_hours: 0,
@@ -5893,6 +5921,8 @@ impl PairTradeEngine {
             backtest_file: None,
             spread_trend_max_slope_sigma: DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA,
             beta_divergence_max: DEFAULT_BETA_DIVERGENCE_MAX,
+            beta_min: 0.0,
+            hedge_ratio_max_deviation: 1.0,
             circuit_breaker_consecutive_losses: DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES,
             circuit_breaker_cooldown_secs: DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS,
             circuit_breaker_tier1_losses: DEFAULT_CB_TIER1_LOSSES,
@@ -5916,6 +5946,8 @@ impl PairTradeEngine {
                 spread_trend_max_slope_sigma: 0.0,
                 beta_divergence_max: 0.0,
                 lookback_hours_short: 0,
+                beta_min: 0.0,
+                hedge_ratio_max_deviation: 1.0,
                 lookback_hours_long: 0,
                 entry_vol_lookback_hours: 0,
                 warm_start_min_bars: 0,
@@ -6116,6 +6148,10 @@ fn should_enter(
     }
     // Beta stability filter: block entry if beta_s and beta_l diverge
     if state.beta_gap > pp.beta_divergence_max {
+        return false;
+    }
+    // Beta minimum filter: block entry if beta is too low (hedge leg too small)
+    if pp.beta_min > 0.0 && state.beta < pp.beta_min {
         return false;
     }
     // Account for estimated cost (fees + slippage) in sigma units
