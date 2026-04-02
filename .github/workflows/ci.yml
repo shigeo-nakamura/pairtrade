@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "src/**"
+      - "configs/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
