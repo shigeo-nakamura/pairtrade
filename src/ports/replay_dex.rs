@@ -147,8 +147,42 @@ impl ReplayConnector {
 
     /// Convert a JSONL file to bincode format. Used by the convert-data tool.
     pub fn convert_jsonl_to_bincode(input: &str, output: &str) -> Result<(), DexError> {
+        Self::convert_jsonl_to_bincode_with_interval(input, output, 0)
+    }
+
+    /// Convert JSONL to bincode with optional downsampling.
+    /// `interval_secs`: minimum seconds between samples (0 = keep all).
+    pub fn convert_jsonl_to_bincode_with_interval(
+        input: &str,
+        output: &str,
+        interval_secs: u64,
+    ) -> Result<(), DexError> {
         let data = Self::load_jsonl(input)?;
-        let bincode_data: Vec<BincodeDataEntry> = data.iter().map(BincodeDataEntry::from).collect();
+        let original_len = data.len();
+        let filtered: Vec<&_> = if interval_secs > 0 {
+            let interval_ms = (interval_secs * 1000) as i64;
+            let mut last_ts: i64 = 0;
+            data.iter()
+                .filter(|e| {
+                    if e.timestamp - last_ts >= interval_ms {
+                        last_ts = e.timestamp;
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .collect()
+        } else {
+            data.iter().collect()
+        };
+        eprintln!(
+            "Records: {} -> {} (interval={}s)",
+            original_len,
+            filtered.len(),
+            interval_secs
+        );
+        let bincode_data: Vec<BincodeDataEntry> =
+            filtered.iter().map(|e| BincodeDataEntry::from(*e)).collect();
         let bytes = bincode::serialize(&bincode_data)
             .map_err(|e| DexError::Other(format!("failed to serialize bincode: {}", e)))?;
         std::fs::write(output, bytes)
