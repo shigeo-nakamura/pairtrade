@@ -4844,11 +4844,14 @@ impl PairTradeEngine {
             }
             qty
         };
+        // Compute qty_b from the actual notional of leg A (after min_order adjustment)
+        // so that the hedge ratio matches beta: notional_b = notional_a * beta
+        let actual_notional_a = qty_a * p1.price;
         let qty_b = if p2.price == Decimal::ZERO {
             Decimal::ZERO
         } else {
-            let mut qty =
-                (notional * Decimal::from_f64(beta.abs()).unwrap_or(Decimal::ONE)) / p2.price;
+            let beta_dec = Decimal::from_f64(beta.abs()).unwrap_or(Decimal::ONE);
+            let mut qty = (actual_notional_a * beta_dec) / p2.price;
             if let Some(decimals) = p2.size_decimals {
                 qty = qty.round_dp(decimals);
             }
