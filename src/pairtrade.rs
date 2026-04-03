@@ -156,6 +156,10 @@ struct PairTradeYaml {
     circuit_breaker_tier2_losses: Option<u32>,
     circuit_breaker_tier2_cooldown_secs: Option<u64>,
     entry_post_only_timeout_secs: Option<u64>,
+    // Phase 2 filters (default off: 0.0 disables)
+    entry_velocity_block_sigma_per_min: Option<f64>,
+    funding_entry_z_scale: Option<f64>,
+    beta_gap_entry_z_scale: Option<f64>,
     pair_overrides: Option<HashMap<String, PairOverrideYaml>>,
 }
 
@@ -219,6 +223,10 @@ pub struct PairParams {
     pub circuit_breaker_tier2_losses: u32,
     pub circuit_breaker_tier2_cooldown_secs: u64,
     pub entry_post_only_timeout_secs: u64,
+    // Phase 2 filters (0.0 = disabled)
+    pub entry_velocity_block_sigma_per_min: f64,
+    pub funding_entry_z_scale: f64,
+    pub beta_gap_entry_z_scale: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +292,10 @@ pub struct PairTradeConfig {
     pub circuit_breaker_tier2_losses: u32,
     pub circuit_breaker_tier2_cooldown_secs: u64,
     pub entry_post_only_timeout_secs: u64,
+    // Phase 2 filters (0.0 = disabled)
+    pub entry_velocity_block_sigma_per_min: f64,
+    pub funding_entry_z_scale: f64,
+    pub beta_gap_entry_z_scale: f64,
     pub pair_params: HashMap<String, PairParams>,
     pub default_pair_params: PairParams,
 }
@@ -329,6 +341,9 @@ impl PairTradeConfig {
             circuit_breaker_tier2_losses: self.circuit_breaker_tier2_losses,
             circuit_breaker_tier2_cooldown_secs: self.circuit_breaker_tier2_cooldown_secs,
             entry_post_only_timeout_secs: self.entry_post_only_timeout_secs,
+            entry_velocity_block_sigma_per_min: self.entry_velocity_block_sigma_per_min,
+            funding_entry_z_scale: self.funding_entry_z_scale,
+            beta_gap_entry_z_scale: self.beta_gap_entry_z_scale,
         }
     }
 
@@ -394,6 +409,9 @@ impl PairTradeConfig {
                     entry_post_only_timeout_secs: ovr
                         .entry_post_only_timeout_secs
                         .unwrap_or(self.entry_post_only_timeout_secs),
+                    entry_velocity_block_sigma_per_min: self.entry_velocity_block_sigma_per_min,
+                    funding_entry_z_scale: self.funding_entry_z_scale,
+                    beta_gap_entry_z_scale: self.beta_gap_entry_z_scale,
                 };
                 map.insert(pair_key.clone(), pp);
             }
@@ -552,6 +570,11 @@ impl PairTradeConfig {
             entry_post_only_timeout_secs: yaml
                 .entry_post_only_timeout_secs
                 .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
+            entry_velocity_block_sigma_per_min: yaml
+                .entry_velocity_block_sigma_per_min
+                .unwrap_or(0.0),
+            funding_entry_z_scale: yaml.funding_entry_z_scale.unwrap_or(0.0),
+            beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
             pair_params: HashMap::new(),
             default_pair_params: PairParams {
                 entry_z_base: 0.0, // placeholder, rebuilt below
@@ -580,6 +603,9 @@ impl PairTradeConfig {
                 circuit_breaker_tier2_losses: 0,
                 circuit_breaker_tier2_cooldown_secs: 0,
                 entry_post_only_timeout_secs: 0,
+                entry_velocity_block_sigma_per_min: 0.0,
+                funding_entry_z_scale: 0.0,
+                beta_gap_entry_z_scale: 0.0,
             },
         };
 
@@ -881,6 +907,18 @@ impl PairTradeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
+            entry_velocity_block_sigma_per_min: env::var("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+            funding_entry_z_scale: env::var("FUNDING_ENTRY_Z_SCALE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+            beta_gap_entry_z_scale: env::var("BETA_GAP_ENTRY_Z_SCALE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
             pair_params: HashMap::new(),
             default_pair_params: PairParams {
                 entry_z_base: 0.0,
@@ -909,6 +947,9 @@ impl PairTradeConfig {
                 circuit_breaker_tier2_losses: 0,
                 circuit_breaker_tier2_cooldown_secs: 0,
                 entry_post_only_timeout_secs: 0,
+                entry_velocity_block_sigma_per_min: 0.0,
+                funding_entry_z_scale: 0.0,
+                beta_gap_entry_z_scale: 0.0,
             },
         };
         cfg.default_pair_params = cfg.build_default_pair_params();
@@ -5947,6 +5988,9 @@ impl PairTradeEngine {
             circuit_breaker_tier2_losses: DEFAULT_CB_TIER2_LOSSES,
             circuit_breaker_tier2_cooldown_secs: DEFAULT_CB_TIER2_COOLDOWN_SECS,
             entry_post_only_timeout_secs: DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS,
+            entry_velocity_block_sigma_per_min: 0.0,
+            funding_entry_z_scale: 0.0,
+            beta_gap_entry_z_scale: 0.0,
             pair_params: HashMap::new(),
             default_pair_params: PairParams {
                 entry_z_base: 0.0,
@@ -5975,6 +6019,9 @@ impl PairTradeEngine {
                 circuit_breaker_tier2_losses: 0,
                 circuit_breaker_tier2_cooldown_secs: 0,
                 entry_post_only_timeout_secs: 0,
+                entry_velocity_block_sigma_per_min: 0.0,
+                funding_entry_z_scale: 0.0,
+                beta_gap_entry_z_scale: 0.0,
             },
         };
         cfg.default_pair_params = cfg.build_default_pair_params();
@@ -6147,12 +6194,42 @@ fn should_enter(
             return false;
         }
     }
-    let entry_threshold = if net_funding > 0.0 {
+
+    // --- Phase 2 filter: spread momentum block ---
+    // Block entry when spread is moving fast (likely trending, not mean-reverting).
+    // Disabled when entry_velocity_block_sigma_per_min == 0.0.
+    if pp.entry_velocity_block_sigma_per_min > 0.0
+        && state.last_velocity_sigma_per_min.abs() >= pp.entry_velocity_block_sigma_per_min
+    {
+        return false;
+    }
+
+    let mut entry_threshold = if net_funding > 0.0 {
         // prefer positive carry by easing the required entry slightly
         state.z_entry * 0.9
     } else {
         state.z_entry
     };
+
+    // --- Phase 2 filter: funding rate continuous scaling ---
+    // Scale entry_z based on funding magnitude (beyond the simple 0.9x above).
+    // funding_entry_z_scale > 0: entry_z *= 1.0 - scale * net_funding
+    //   positive funding → lower threshold (easier entry)
+    //   negative funding → higher threshold (harder entry)
+    // Disabled when funding_entry_z_scale == 0.0.
+    if pp.funding_entry_z_scale > 0.0 {
+        let adjustment = 1.0 - pp.funding_entry_z_scale * net_funding;
+        entry_threshold *= adjustment.clamp(0.5, 2.0);
+    }
+
+    // --- Phase 2 filter: beta gap dynamic adjustment ---
+    // Raise entry threshold when beta_s and beta_l diverge (hedge unreliable).
+    // entry_z *= 1.0 + scale * beta_gap
+    // Disabled when beta_gap_entry_z_scale == 0.0.
+    if pp.beta_gap_entry_z_scale > 0.0 {
+        entry_threshold *= 1.0 + pp.beta_gap_entry_z_scale * state.beta_gap;
+    }
+
     // Avoid entering when the current z already triggers stop-loss exit.
     if z.abs() >= pp.stop_loss_z {
         return false;
