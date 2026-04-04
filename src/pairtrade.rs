@@ -1272,6 +1272,21 @@ impl PairTradeConfig {
                 self.entry_post_only_timeout_secs = parsed;
             }
         }
+        if let Ok(value) = env::var("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN") {
+            if let Ok(parsed) = value.parse() {
+                self.entry_velocity_block_sigma_per_min = parsed;
+            }
+        }
+        if let Ok(value) = env::var("FUNDING_ENTRY_Z_SCALE") {
+            if let Ok(parsed) = value.parse() {
+                self.funding_entry_z_scale = parsed;
+            }
+        }
+        if let Ok(value) = env::var("BETA_GAP_ENTRY_Z_SCALE") {
+            if let Ok(parsed) = value.parse() {
+                self.beta_gap_entry_z_scale = parsed;
+            }
+        }
 
         Ok(())
     }
