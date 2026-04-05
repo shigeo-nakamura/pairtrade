@@ -2961,8 +2961,8 @@ impl PairTradeEngine {
     }
 
     async fn step(&mut self) -> Result<()> {
-        // Skip new entries if maintenance is upcoming within 2 hours
-        let maintenance_block_entries = self.connector.is_upcoming_maintenance(2).await;
+        // Skip new entries if maintenance is upcoming within 1 hour
+        let maintenance_block_entries = self.connector.is_upcoming_maintenance(1).await;
         if maintenance_block_entries {
             log::warn!("Upcoming maintenance detected; blocking new entries this cycle");
         }
