@@ -33,7 +33,7 @@ force_close_time_secs: 3600
 
 # Risk
 risk_pct_per_trade: 0.40
-equity_usd_fallback: 1000
+equity_usd_fallback: 500
 max_leverage: 1
 max_loss_r_mult: 1.0
 max_dd_pct: 0.10                      # Max drawdown tolerance for auto-sizing
