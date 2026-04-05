@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 struct DumpedSymbolSnapshot {
     price: Decimal,
     funding_rate: Decimal,
+    #[serde(default)]
+    bid_price: Option<Decimal>,
+    #[serde(default)]
+    ask_price: Option<Decimal>,
     bid_size: Decimal,
     ask_size: Decimal,
 }
@@ -35,6 +39,8 @@ struct DumpedDataEntry {
 struct BincodeSymbolSnapshot {
     price: f64,
     funding_rate: f64,
+    bid_price: f64,
+    ask_price: f64,
     bid_size: f64,
     ask_size: f64,
 }
@@ -58,6 +64,8 @@ impl From<&DumpedDataEntry> for BincodeDataEntry {
                         BincodeSymbolSnapshot {
                             price: v.price.to_f64().unwrap_or(0.0),
                             funding_rate: v.funding_rate.to_f64().unwrap_or(0.0),
+                            bid_price: v.bid_price.and_then(|p| p.to_f64()).unwrap_or(0.0),
+                            ask_price: v.ask_price.and_then(|p| p.to_f64()).unwrap_or(0.0),
                             bid_size: v.bid_size.to_f64().unwrap_or(0.0),
                             ask_size: v.ask_size.to_f64().unwrap_or(0.0),
                         },
@@ -81,6 +89,16 @@ impl From<BincodeDataEntry> for DumpedDataEntry {
                         DumpedSymbolSnapshot {
                             price: Decimal::from_f64(v.price).unwrap_or_default(),
                             funding_rate: Decimal::from_f64(v.funding_rate).unwrap_or_default(),
+                            bid_price: if v.bid_price == 0.0 {
+                                None
+                            } else {
+                                Decimal::from_f64(v.bid_price)
+                            },
+                            ask_price: if v.ask_price == 0.0 {
+                                None
+                            } else {
+                                Decimal::from_f64(v.ask_price)
+                            },
                             bid_size: Decimal::from_f64(v.bid_size).unwrap_or_default(),
                             ask_size: Decimal::from_f64(v.ask_size).unwrap_or_default(),
                         },
@@ -322,11 +340,11 @@ impl DexConnector for ReplayConnector {
 
         Ok(OrderBookSnapshot {
             bids: vec![OrderBookLevel {
-                price: symbol_data.price,
+                price: symbol_data.bid_price.unwrap_or(symbol_data.price),
                 size: symbol_data.bid_size,
             }],
             asks: vec![OrderBookLevel {
-                price: symbol_data.price,
+                price: symbol_data.ask_price.unwrap_or(symbol_data.price),
                 size: symbol_data.ask_size,
             }],
         })
@@ -363,19 +381,25 @@ impl DexConnector for ReplayConnector {
             .data
             .get(current_cursor)
             .ok_or_else(|| DexError::Other("Cursor out of bounds".to_string()))?;
-        let fallback_price = snapshot
+        let symbol_data = snapshot
             .prices
             .get(symbol)
-            .ok_or_else(|| DexError::Other(format!("Symbol '{}' not found", symbol)))?
-            .price;
-        let fill_price = price.unwrap_or(fallback_price);
+            .ok_or_else(|| DexError::Other(format!("Symbol '{}' not found", symbol)))?;
+
+        // Fill at the appropriate side of the book (taker model):
+        // buys fill at ask price, sells fill at bid price.
+        let fill_price = match side {
+            OrderSide::Long => symbol_data.ask_price.unwrap_or(symbol_data.price),
+            OrderSide::Short => symbol_data.bid_price.unwrap_or(symbol_data.price),
+        };
 
         log::info!(
-            "[BACKTEST_FILL] symbol={}, side={:?}, size={}, price={}",
+            "[BACKTEST_FILL] symbol={}, side={:?}, size={}, price={} (limit={:?})",
             symbol,
             side,
             size,
-            fill_price
+            fill_price,
+            price,
         );
 
         Ok(CreateOrderResponse {
