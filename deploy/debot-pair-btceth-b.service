@@ -1,0 +1,15 @@
+[Unit]
+Description="debot-pair-btceth-b (A/B test: exit_z=0.2)"
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/debot
+ExecStart=/bin/bash /opt/debot/scripts/debot_lighter.sh debot-pair-btceth-b
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

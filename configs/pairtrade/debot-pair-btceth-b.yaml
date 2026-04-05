@@ -2,11 +2,7 @@ dex_name: lighter
 rest_endpoint: https://mainnet.zklighter.elliot.ai/
 web_socket_endpoint: wss://mainnet.zklighter.elliot.ai/stream
 dry_run: false
-agent_name: debot-pair-btceth
-
-# Data dump for BT
-enable_data_dump: true
-data_dump_file: /opt/debot/market_data_btceth.jsonl
+agent_name: debot-pair-btceth-b
 
 # Fixed pair: BTC/ETH only
 universe_pairs:
@@ -30,7 +26,8 @@ warm_start_min_bars: 60
 entry_z_score_base: 1.5
 entry_z_score_min: 1.0
 entry_z_score_max: 2.0
-exit_z_score: 0.3
+# A/B test: exit_z=0.2 (early take profit)
+exit_z_score: 0.2
 stop_loss_z_score: 6.0
 force_close_time_secs: 3600
 
