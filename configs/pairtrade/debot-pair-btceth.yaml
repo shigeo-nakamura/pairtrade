@@ -54,6 +54,11 @@ vol_spike_mult: 3.0
 net_funding_min_per_hour: -0.01
 reeval_jump_z_mult: 1.5
 
+# Phase 2 filters (BT 2026-04-05: beta_gap=3.0 best, +$0.84 vs baseline +$0.20)
+entry_velocity_block_sigma_per_min: 0.0
+funding_entry_z_scale: 0.0
+beta_gap_entry_z_scale: 3.0
+
 # Circuit breaker
 circuit_breaker_tier1_losses: 5
 circuit_breaker_tier1_cooldown_secs: 600
