@@ -2614,7 +2614,25 @@ impl PairTradeEngine {
             }
             // allow connector/WS to warm up before first step to reduce spurious logs
             sleep(Duration::from_secs(5)).await;
-            let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
+            // Wall-clock aligned ticker: fires at floor(now/interval)*interval + interval boundaries
+            // so every bot process observing the same stream ticks at identical wall-clock seconds.
+            // This is required on top of the BarBuilder bucket alignment (pairtrade#4): without
+            // aligning the tick phase itself, two bots would sample the last tick of a 60s bucket
+            // at different wall-clock seconds and therefore see slightly different close prices,
+            // which cascades into divergent beta/mean/std/z.
+            let interval_secs = self.cfg.interval_secs.max(1);
+            fn next_wall_clock_boundary(interval_secs: u64) -> tokio::time::Instant {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now_unix_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let interval_ms = interval_secs.saturating_mul(1000);
+                let next_boundary_ms = ((now_unix_ms / interval_ms) + 1) * interval_ms;
+                let wait_ms = next_boundary_ms.saturating_sub(now_unix_ms);
+                tokio::time::Instant::now() + Duration::from_millis(wait_ms)
+            }
+            let mut next_tick = next_wall_clock_boundary(interval_secs);
             let mut sigterm = tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::terminate(),
             )
@@ -2648,7 +2666,8 @@ impl PairTradeEngine {
                 }
 
                 tokio::select! {
-                    _ = ticker.tick() => {
+                    _ = tokio::time::sleep_until(next_tick) => {
+                        next_tick = next_wall_clock_boundary(interval_secs);
                         if let Err(e) = self.step().await {
                             self.log_inconsistent_state_debug(&e).await;
                             log::error!("pairtrade step failed: {:?}", e);
