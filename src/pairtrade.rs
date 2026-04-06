@@ -1211,9 +1211,11 @@ impl PairTradeConfig {
         if let Ok(value) = env::var("OBSERVE_ONLY") {
             self.observe_only = value.to_lowercase() == "true";
         }
-        if self.enable_data_dump {
-            self.observe_only = true;
-        }
+        // Note: enable_data_dump no longer forces observe_only. Data dump
+        // is just JSONL writes to disk and is independent of trading.
+        // The previous forced linkage prevented running a bot that both
+        // collects data and trades live (e.g. debot-pair-btceth running
+        // as the data collector while the A leg of an A/B test).
 
         if let Ok(value) = env::var("DISABLE_HISTORY_PERSIST") {
             let lower = value.trim().to_ascii_lowercase();
