@@ -30,10 +30,12 @@ fn init_logger() {
         .filter(
             None,
             LevelFilter::from_str(&env::var("RUST_LOG").unwrap_or_else(|_| {
-                // Default log configuration with WebSocket libraries suppressed
-                "debug,tokio_tungstenite=info,tungstenite=info".to_string()
+                // Default to info: debug-level logs (PRICE_SNAPSHOT, ZCHECK, etc.)
+                // are 50x noisier than info and only useful for ad-hoc debugging.
+                // Override per-service via RUST_LOG env when needed.
+                "info,tokio_tungstenite=info,tungstenite=info".to_string()
             }))
-            .unwrap_or(LevelFilter::Debug),
+            .unwrap_or(LevelFilter::Info),
         )
         .init();
 }
