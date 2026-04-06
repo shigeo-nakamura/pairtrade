@@ -2188,10 +2188,27 @@ impl BarBuilder {
         }
     }
 
+    /// Align a timestamp down to the wall-clock bucket boundary.
+    ///
+    /// Buckets are anchored to the Unix epoch (`floor(ts / window) * window`),
+    /// so all bots observing the same stream produce identical bucket IDs
+    /// regardless of their own startup phase. This is required for multi-bot
+    /// A/B fairness: without this, each process anchors its first bar to its
+    /// own first tick, causing beta/mean/std/z to diverge across bots even
+    /// though they share the same price feed. See pairtrade#4.
+    fn bucket_start(&self, ts: i64) -> i64 {
+        let w = self.window_secs as i64;
+        if w <= 0 {
+            return ts;
+        }
+        ts - ts.rem_euclid(w)
+    }
+
     fn push(&mut self, ts: i64, price: Decimal) -> Option<(Decimal, i64)> {
+        let current_bucket = self.bucket_start(ts);
         match self.start_ts {
             None => {
-                self.start_ts = Some(ts);
+                self.start_ts = Some(current_bucket);
                 self.open = price;
                 self.high = price;
                 self.low = price;
@@ -2199,11 +2216,10 @@ impl BarBuilder {
                 None
             }
             Some(start) => {
-                let elapsed = ts.saturating_sub(start);
-                if elapsed >= self.window_secs as i64 {
+                if current_bucket > start {
                     let prev_close = self.close;
                     let bar_close_ts = start.saturating_add(self.window_secs as i64);
-                    self.start_ts = Some(ts);
+                    self.start_ts = Some(current_bucket);
                     self.open = price;
                     self.high = price;
                     self.low = price;
