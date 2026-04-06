@@ -30,6 +30,7 @@ const DEFAULT_ENTRY_Z_MAX: f64 = 2.3;
 const DEFAULT_EXIT_Z: f64 = 0.5;
 const DEFAULT_STOP_LOSS_Z: f64 = 3.3;
 const DEFAULT_FORCE_CLOSE_SECS: u64 = 3600;
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 3660; // DEFAULT_FORCE_CLOSE_SECS + 60s buffer
 const DEFAULT_COOLDOWN_SECS: u64 = 30;
 const MAX_EXIT_RETRIES: u32 = 3;
 const DEFAULT_NET_FUNDING_MIN_PER_HOUR: f64 = -0.005;
@@ -161,6 +162,9 @@ struct PairTradeYaml {
     funding_entry_z_scale: Option<f64>,
     beta_gap_entry_z_scale: Option<f64>,
     pair_overrides: Option<HashMap<String, PairOverrideYaml>>,
+    /// Graceful shutdown: max seconds to wait for natural exit on SIGTERM before
+    /// force-closing both legs. 0 = immediate force close (legacy behavior).
+    shutdown_grace_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -298,6 +302,9 @@ pub struct PairTradeConfig {
     pub beta_gap_entry_z_scale: f64,
     pub pair_params: HashMap<String, PairParams>,
     pub default_pair_params: PairParams,
+    /// Graceful shutdown: max seconds to wait for natural pair exit on SIGTERM
+    /// before force-closing both legs. 0 = immediate force close (legacy).
+    pub shutdown_grace_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -575,6 +582,9 @@ impl PairTradeConfig {
                 .unwrap_or(0.0),
             funding_entry_z_scale: yaml.funding_entry_z_scale.unwrap_or(0.0),
             beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
+            shutdown_grace_secs: yaml
+                .shutdown_grace_secs
+                .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
             pair_params: HashMap::new(),
             default_pair_params: PairParams {
                 entry_z_base: 0.0, // placeholder, rebuilt below
@@ -919,6 +929,10 @@ impl PairTradeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
+            shutdown_grace_secs: env::var("SHUTDOWN_GRACE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
             pair_params: HashMap::new(),
             default_pair_params: PairParams {
                 entry_z_base: 0.0,
@@ -2304,6 +2318,11 @@ pub struct PairTradeEngine {
     total_pnl: f64,
     peak_pnl: f64,
     max_dd: f64,
+    /// Graceful shutdown flag. When true:
+    ///   - new entries are blocked
+    ///   - existing exit logic (exit_z / stop_loss_z / force_close_secs) runs normally
+    ///   - live loop exits as soon as open_positions is empty, or after shutdown_grace_secs
+    shutdown_pending: bool,
 }
 
 struct PlannedAction {
@@ -2449,6 +2468,7 @@ impl PairTradeEngine {
             total_pnl: 0.0,
             peak_pnl: 0.0,
             max_dd: 0.0,
+            shutdown_pending: false,
         })
     }
 
@@ -2577,11 +2597,89 @@ impl PairTradeEngine {
             // allow connector/WS to warm up before first step to reduce spurious logs
             sleep(Duration::from_secs(5)).await;
             let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .expect("failed to register SIGTERM handler");
+            let mut sigint = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::interrupt(),
+            )
+            .expect("failed to register SIGINT handler");
+
+            let grace = Duration::from_secs(self.cfg.shutdown_grace_secs);
+            let mut shutdown_deadline: Option<Instant> = None;
+            let mut force_shutdown = false;
             loop {
-                ticker.tick().await;
-                if let Err(e) = self.step().await {
-                    self.log_inconsistent_state_debug(&e).await;
-                    log::error!("pairtrade step failed: {:?}", e);
+                // Graceful shutdown: exit as soon as positions are flat, or after grace expires.
+                if self.shutdown_pending {
+                    if self.open_positions.is_empty() {
+                        log::info!("[PAIR] Shutdown: all positions flat, exiting");
+                        break;
+                    }
+                    if let Some(dl) = shutdown_deadline {
+                        if Instant::now() >= dl {
+                            log::warn!(
+                                "[PAIR] Shutdown grace ({}s) expired with {} open positions, force-closing",
+                                self.cfg.shutdown_grace_secs,
+                                self.open_positions.len()
+                            );
+                            force_shutdown = true;
+                            break;
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if let Err(e) = self.step().await {
+                            self.log_inconsistent_state_debug(&e).await;
+                            log::error!("pairtrade step failed: {:?}", e);
+                        }
+                    }
+                    _ = sigterm.recv() => {
+                        if !self.shutdown_pending {
+                            if self.open_positions.is_empty() || self.cfg.shutdown_grace_secs == 0 {
+                                log::info!(
+                                    "[PAIR] SIGTERM received, shutting down (flat={}, grace={}s)",
+                                    self.open_positions.is_empty(),
+                                    self.cfg.shutdown_grace_secs
+                                );
+                                force_shutdown = !self.open_positions.is_empty();
+                                break;
+                            }
+                            log::info!(
+                                "[PAIR] SIGTERM received, entering graceful shutdown: \
+                                 waiting for natural exit of {} open positions (grace={}s). \
+                                 Send SIGTERM/SIGINT again to force.",
+                                self.open_positions.len(),
+                                self.cfg.shutdown_grace_secs
+                            );
+                            self.shutdown_pending = true;
+                            shutdown_deadline = Some(Instant::now() + grace);
+                        } else {
+                            log::warn!("[PAIR] Second SIGTERM received, force-closing immediately");
+                            force_shutdown = true;
+                            break;
+                        }
+                    }
+                    _ = sigint.recv() => {
+                        if self.shutdown_pending {
+                            log::warn!("[PAIR] SIGINT received during graceful shutdown, force-closing");
+                            force_shutdown = true;
+                            break;
+                        } else {
+                            log::info!("[PAIR] SIGINT received, shutting down...");
+                            force_shutdown = !self.open_positions.is_empty();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if force_shutdown {
+                log::warn!("[PAIR] Force-closing all open positions on shutdown");
+                if let Err(e) = self.connector.close_all_positions(None).await {
+                    log::error!("[PAIR] close_all_positions on shutdown failed: {:?}", e);
                 }
             }
         }
@@ -3334,6 +3432,10 @@ impl PairTradeEngine {
                 action = TradeAction::None;
             }
             if maintenance_block_entries && matches!(action, TradeAction::Open { .. }) {
+                action = TradeAction::None;
+            }
+            if self.shutdown_pending && matches!(action, TradeAction::Open { .. }) {
+                log::debug!("[ENTRY] blocked by graceful shutdown; key={}", key);
                 action = TradeAction::None;
             }
 
@@ -6006,6 +6108,7 @@ impl PairTradeEngine {
             entry_velocity_block_sigma_per_min: 0.0,
             funding_entry_z_scale: 0.0,
             beta_gap_entry_z_scale: 0.0,
+            shutdown_grace_secs: 0,
             pair_params: HashMap::new(),
             default_pair_params: PairParams {
                 entry_z_base: 0.0,
@@ -6071,6 +6174,7 @@ impl PairTradeEngine {
             total_pnl: 0.0,
             peak_pnl: 0.0,
             max_dd: 0.0,
+            shutdown_pending: false,
         }
     }
 }
@@ -6899,5 +7003,56 @@ mod pending_tests {
         assert_eq!(result.legs.len(), 1);
         assert_eq!(result.legs[0].target, dec("0.05"));
         assert_eq!(result.legs[0].filled, dec("0.02"));
+    }
+}
+
+#[cfg(test)]
+mod shutdown_grace_tests {
+    use super::*;
+
+    fn config_path(name: &str) -> String {
+        format!("{}/configs/pairtrade/{}", env!("CARGO_MANIFEST_DIR"), name)
+    }
+
+    #[test]
+    fn default_when_yaml_omits_key() {
+        // from_env() path with no env var set = default
+        // Use a scoped env guard to avoid bleeding into other tests.
+        let prev = std::env::var("SHUTDOWN_GRACE_SECS").ok();
+        std::env::remove_var("SHUTDOWN_GRACE_SECS");
+        // Also ensure required env vars have sensible fallbacks.
+        std::env::set_var("DEX_NAME", "hyperliquid");
+        std::env::set_var("UNIVERSE_PAIRS", "BTC/ETH");
+        let cfg = PairTradeConfig::from_env().expect("from_env failed");
+        assert_eq!(cfg.shutdown_grace_secs, DEFAULT_SHUTDOWN_GRACE_SECS);
+        assert_eq!(cfg.shutdown_grace_secs, 3660);
+        if let Some(v) = prev {
+            std::env::set_var("SHUTDOWN_GRACE_SECS", v);
+        }
+    }
+
+    #[test]
+    fn live_btceth_configs_pin_grace_above_force_close() {
+        for name in &[
+            "debot-pair-btceth.yaml",
+            "debot-pair-btceth-b.yaml",
+            "debot-pair-btceth-c.yaml",
+            "debot-pair-solhype.yaml",
+        ] {
+            let path = config_path(name);
+            let cfg = PairTradeConfig::from_yaml_path(&path)
+                .unwrap_or_else(|e| panic!("failed to load {path}: {e}"));
+            assert_eq!(
+                cfg.shutdown_grace_secs, 3660,
+                "{name}: expected shutdown_grace_secs=3660, got {}",
+                cfg.shutdown_grace_secs
+            );
+            assert!(
+                cfg.shutdown_grace_secs >= cfg.force_close_secs + 60,
+                "{name}: grace ({}) must be >= force_close_secs ({}) + 60",
+                cfg.shutdown_grace_secs,
+                cfg.force_close_secs
+            );
+        }
     }
 }

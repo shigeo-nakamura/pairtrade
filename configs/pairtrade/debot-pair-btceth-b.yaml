@@ -30,6 +30,7 @@ entry_z_score_max: 2.0
 exit_z_score: 0.2
 stop_loss_z_score: 6.0
 force_close_time_secs: 3600
+shutdown_grace_secs: 3660  # force_close_time_secs + 60s buffer for graceful SIGTERM handling
 
 # Risk
 risk_pct_per_trade: 0.40
