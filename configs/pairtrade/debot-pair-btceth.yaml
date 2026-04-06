@@ -4,9 +4,10 @@ web_socket_endpoint: wss://mainnet.zklighter.elliot.ai/stream
 dry_run: false
 agent_name: debot-pair-btceth
 
-# Data dump for BT
+# Data dump for BT (independent of trading; observe_only must be set explicitly)
 enable_data_dump: true
 data_dump_file: /opt/debot/market_data_btceth.jsonl
+observe_only: false
 
 # Fixed pair: BTC/ETH only
 universe_pairs:
