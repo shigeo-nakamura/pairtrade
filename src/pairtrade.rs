@@ -2183,6 +2183,14 @@ struct BarBuilder {
     high: Decimal,
     low: Decimal,
     close: Decimal,
+    /// Exchange timestamp of the tick currently used as `close`. Used to keep
+    /// the bar close monotonic with respect to the exchange clock so that two
+    /// bots observing the same WS feed converge on the same close price for
+    /// the same bucket. Updates from older ts are ignored even if they arrive
+    /// later in wall-clock time, and the open price is locked to the
+    /// earliest tick of the bucket. See pairtrade#4.
+    close_ts: Option<i64>,
+    open_ts: Option<i64>,
 }
 
 impl BarBuilder {
@@ -2194,6 +2202,8 @@ impl BarBuilder {
             high: Decimal::ZERO,
             low: Decimal::ZERO,
             close: Decimal::ZERO,
+            close_ts: None,
+            open_ts: None,
         }
     }
 
@@ -2222,6 +2232,8 @@ impl BarBuilder {
                 self.high = price;
                 self.low = price;
                 self.close = price;
+                self.close_ts = Some(ts);
+                self.open_ts = Some(ts);
                 None
             }
             Some(start) => {
@@ -2233,15 +2245,38 @@ impl BarBuilder {
                     self.high = price;
                     self.low = price;
                     self.close = price;
+                    self.close_ts = Some(ts);
+                    self.open_ts = Some(ts);
                     Some((prev_close, bar_close_ts))
                 } else {
+                    // Within the same bucket: pick the tick with the largest
+                    // exchange ts as the canonical close (deterministic across
+                    // processes); fall back to last-write-wins if ts info is
+                    // missing. The open price is locked to the earliest ts.
                     if price > self.high {
                         self.high = price;
                     }
                     if price < self.low || self.low.is_zero() {
                         self.low = price;
                     }
-                    self.close = price;
+                    match self.close_ts {
+                        Some(prev_close_ts) if ts < prev_close_ts => {
+                            // older tick — leave close unchanged
+                        }
+                        _ => {
+                            self.close = price;
+                            self.close_ts = Some(ts);
+                        }
+                    }
+                    match self.open_ts {
+                        Some(prev_open_ts) if ts >= prev_open_ts => {
+                            // newer tick — open already locked to earlier ts
+                        }
+                        _ => {
+                            self.open = price;
+                            self.open_ts = Some(ts);
+                        }
+                    }
                     None
                 }
             }
