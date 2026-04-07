@@ -1526,6 +1526,12 @@ enum PositionDirection {
 struct Position {
     direction: PositionDirection,
     entered_at: Instant,
+    /// Replay-aware entry timestamp (seconds). In live mode equals
+    /// `chrono::Utc::now().timestamp()` at the moment of entry; in backtest
+    /// mode equals the replay's logical timestamp. Used for all
+    /// duration-based decisions (force_close, hold-time PnL, etc.) so they
+    /// behave identically under replay.
+    entered_ts: i64,
     entry_price_a: Option<Decimal>,
     entry_price_b: Option<Decimal>,
     entry_size_a: Option<Decimal>,
@@ -2102,12 +2108,19 @@ struct PairState {
     last_velocity_sigma_per_min: f64,
     position: Option<Position>,
     last_exit_at: Option<Instant>,
+    /// Replay-aware companion to `last_exit_at`. Drives the should_enter
+    /// cooldown and unhedged-close cooldown so they fire correctly under
+    /// backtest replay.
+    last_exit_ts: Option<i64>,
     beta_short: f64,
     beta_long: f64,
     half_life_hours: f64,
     adf_p_value: f64,
     eligible: bool,
     last_evaluated: Option<Instant>,
+    /// Replay-aware companion to `last_evaluated`. Drives the periodic
+    /// pair re-evaluation interval (PAIR_SELECTION_INTERVAL_SECS).
+    last_evaluated_ts: Option<i64>,
     p_value_weighted_score: f64,
     beta_gap: f64,
     pending_entry: Option<PendingOrders>,
@@ -2290,12 +2303,14 @@ impl PairState {
             last_velocity_sigma_per_min: 0.0,
             position: None,
             last_exit_at: None,
+            last_exit_ts: None,
             beta_short: 1.0,
             beta_long: 1.0,
             half_life_hours: 0.0,
             adf_p_value: 1.0,
             eligible: false,
             last_evaluated: None,
+            last_evaluated_ts: None,
             p_value_weighted_score: 0.0,
             beta_gap: 0.0,
             pending_entry: None,
@@ -2371,6 +2386,10 @@ pub struct PairTradeEngine {
     status_reporter: Option<StatusReporter>,
     consecutive_losses: u32,
     circuit_breaker_until: Option<Instant>,
+    /// Replay-aware companion to `circuit_breaker_until`. Compared against
+    /// the per-step `now_ts` so backtest replays can honour the same
+    /// cool-down logic as live.
+    circuit_breaker_until_ts: Option<i64>,
     total_trades: u64,
     total_wins: u64,
     total_pnl: f64,
@@ -2521,6 +2540,7 @@ impl PairTradeEngine {
             status_reporter,
             consecutive_losses: 0,
             circuit_breaker_until: None,
+            circuit_breaker_until_ts: None,
             total_trades: 0,
             total_wins: 0,
             total_pnl: 0.0,
@@ -3207,14 +3227,7 @@ impl PairTradeEngine {
         // Falls back to local wall clock only when the connector cannot supply
         // an exchange timestamp (e.g. REST fallback path).
         let max_history_len = self.max_history_len();
-        let now_ts = if self.cfg.backtest_mode {
-            self.replay_connector
-                .as_ref()
-                .and_then(|r| r.current_timestamp_secs())
-                .unwrap_or_else(|| chrono::Utc::now().timestamp())
-        } else {
-            chrono::Utc::now().timestamp()
-        };
+        let now_ts = self.current_now_ts();
         // Merge bars written by other bots since the last tick. Without this
         // each process's `history` only ever holds bars from its own WS feed,
         // and ms-level differences in tick aggregation get amplified by the
@@ -3281,7 +3294,7 @@ impl PairTradeEngine {
             let (
                 prev_eligible,
                 z_snapshot,
-                last_eval_at,
+                last_eval_ts,
                 z_entry_copy,
                 spread_len,
                 position_state,
@@ -3300,7 +3313,7 @@ impl PairTradeEngine {
                 (
                     prev_eligible,
                     state.z_score_details(),
-                    state.last_evaluated,
+                    state.last_evaluated_ts,
                     state.z_entry,
                     state.spread_history.len(),
                     state.position.clone(),
@@ -3342,7 +3355,7 @@ impl PairTradeEngine {
             let pp = self.cfg.params_for(&key);
             let force_close_due = position_state
                 .as_ref()
-                .map(|pos| pos.entered_at.elapsed() >= Duration::from_secs(pp.force_close_secs))
+                .map(|pos| now_ts.saturating_sub(pos.entered_ts) >= pp.force_close_secs as i64)
                 .unwrap_or(false);
             if force_close_due {
                 if let Some(pos) = &position_state {
@@ -3376,8 +3389,8 @@ impl PairTradeEngine {
                 }
             }
 
-            let needs_eval_interval = last_eval_at
-                .map(|t| t.elapsed() >= Duration::from_secs(PAIR_SELECTION_INTERVAL_SECS))
+            let needs_eval_interval = last_eval_ts
+                .map(|t| now_ts.saturating_sub(t) >= PAIR_SELECTION_INTERVAL_SECS as i64)
                 .unwrap_or(true);
             let needs_eval_jump = z_snapshot
                 .map(|(z, _, _, _)| z.abs() >= z_entry_copy * pp.reeval_jump_z_mult)
@@ -3465,6 +3478,7 @@ impl PairTradeEngine {
                     state.p_value_weighted_score = eval.score;
                     state.beta_gap = eval.beta_gap;
                     state.last_evaluated = Some(Instant::now());
+                    state.last_evaluated_ts = Some(now_ts);
                 }
                 if prev_eligible != state.eligible {
                     log::info!(
@@ -3488,7 +3502,7 @@ impl PairTradeEngine {
                             if let Some(pos) = &state.position {
                                 let equity_base = self.equity_cache.max(self.cfg.equity_usd);
                                 if let Some(reason) =
-                                    exit_reason(&self.cfg, pp, state, z, std, p1, p2, equity_base)
+                                    exit_reason(&self.cfg, pp, state, z, std, p1, p2, equity_base, now_ts)
                                 {
                                     log::info!(
                                     "[EXIT_CHECK] {} reason={} z={:.2} exit_z={:.2} stop_z={:.2} vel={:.3} max_vel={:.3}",
@@ -3510,14 +3524,14 @@ impl PairTradeEngine {
                             } else if !self.positions_ready {
                                 log_positions_not_ready = true;
                             } else if self
-                                .circuit_breaker_until
-                                .map_or(false, |until| Instant::now() < until)
+                                .circuit_breaker_until_ts
+                                .map_or(false, |until| now_ts < until)
                             {
                                 // entry blocked by circuit breaker; logged via ZCHECK
-                            } else if last_eval_at.is_none() {
+                            } else if last_eval_ts.is_none() {
                                 // Block entry until first evaluate_pair() completes,
                                 // because beta is still at its initial value (1.0).
-                            } else if should_enter(&self.cfg, pp, state, z, std, net_funding) {
+                            } else if should_enter(&self.cfg, pp, state, z, std, net_funding, now_ts) {
                                 let direction = if z > 0.0 {
                                     PositionDirection::ShortSpread
                                 } else {
@@ -3638,6 +3652,7 @@ impl PairTradeEngine {
                         state.pending_exit = None;
                         state.position_guard = false;
                         state.last_exit_at = Some(Instant::now());
+                        state.last_exit_ts = Some(now_ts);
                     }
                     continue;
                 }
@@ -3668,7 +3683,7 @@ impl PairTradeEngine {
                             let pos_ref = self.states.get(&plan.key)
                                 .and_then(|s| s.position.as_ref());
                             let hold_secs = pos_ref
-                                .map(|p| p.entered_at.elapsed().as_secs_f64());
+                                .map(|p| now_ts.saturating_sub(p.entered_ts).max(0) as f64);
                             let entry_a = pos_ref
                                 .and_then(|p| p.entry_price_a)
                                 .and_then(|v| v.to_f64());
@@ -3698,6 +3713,8 @@ impl PairTradeEngine {
                                     .circuit_breaker_cooldown_for(self.consecutive_losses)
                                 {
                                     self.circuit_breaker_until = Some(Instant::now() + cooldown);
+                                    self.circuit_breaker_until_ts =
+                                        Some(now_ts + cooldown.as_secs() as i64);
                                     log::warn!(
                                         "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
                                         self.consecutive_losses, cooldown.as_secs()
@@ -3709,6 +3726,7 @@ impl PairTradeEngine {
                                 }
                                 self.consecutive_losses = 0;
                                 self.circuit_breaker_until = None;
+                                self.circuit_breaker_until_ts = None;
                             }
                         }
                         log::info!(
@@ -3745,6 +3763,7 @@ impl PairTradeEngine {
                     if let Some(state) = self.states.get_mut(&plan.key) {
                         state.position = None;
                         state.last_exit_at = Some(Instant::now());
+                        state.last_exit_ts = Some(now_ts);
                     }
                 } else if self.cfg.observe_only {
                     log::info!(
@@ -3881,6 +3900,7 @@ impl PairTradeEngine {
                         state.position = Some(Position {
                             direction,
                             entered_at: Instant::now(),
+                            entered_ts: now_ts,
                             entry_price_a: Some(price_a),
                             entry_price_b: Some(price_b),
                             entry_size_a: Some(qtys.0),
@@ -3985,6 +4005,7 @@ impl PairTradeEngine {
         if self.replay_connector.is_some() {
             return Ok(());
         }
+        let now_ts = self.current_now_ts();
         let positions = match self.connector.get_positions().await {
             Ok(v) => v,
             Err(err) => {
@@ -4078,14 +4099,15 @@ impl PairTradeEngine {
                     } else {
                         PositionDirection::ShortSpread
                     };
-                    let entered_at = state
+                    let (entered_at, entered_ts) = state
                         .position
                         .as_ref()
-                        .map(|p| p.entered_at)
-                        .unwrap_or_else(Instant::now);
+                        .map(|p| (p.entered_at, p.entered_ts))
+                        .unwrap_or((Instant::now(), now_ts));
                     state.position = Some(Position {
                         direction,
                         entered_at,
+                        entered_ts,
                         entry_price_a: b.entry_price,
                         entry_price_b: q.entry_price,
                         entry_size_a: Some(b.size),
@@ -4147,6 +4169,7 @@ impl PairTradeEngine {
         size: Decimal,
         prices: &HashMap<String, SymbolSnapshot>,
     ) {
+        let now_ts = self.current_now_ts();
         if self.cfg.dry_run || self.cfg.observe_only {
             log::warn!(
                 "[UNHEDGED] {} close skipped (mode) symbol={} size={}",
@@ -4206,6 +4229,7 @@ impl PairTradeEngine {
                 );
                 if let Some(state) = self.states.get_mut(key) {
                     state.last_exit_at = Some(Instant::now());
+                    state.last_exit_ts = Some(now_ts);
                 }
             }
             Err(err) => {
@@ -4219,6 +4243,7 @@ impl PairTradeEngine {
                     );
                     if let Some(state) = self.states.get_mut(key) {
                         state.last_exit_at = Some(Instant::now());
+                        state.last_exit_ts = Some(now_ts);
                     }
                 } else {
                     log::error!(
@@ -4233,6 +4258,7 @@ impl PairTradeEngine {
     }
 
     fn clear_stale_pending(&mut self, max_age: Duration, reason: &str) {
+        let now_ts = self.current_now_ts();
         for (key, state) in self.states.iter_mut() {
             let entry_age = state.pending_entry.as_ref().map(|p| p.placed_at.elapsed());
             let exit_age = state.pending_exit.as_ref().map(|p| p.placed_at.elapsed());
@@ -4255,6 +4281,7 @@ impl PairTradeEngine {
                     state.position = None;
                     state.position_guard = false;
                     state.last_exit_at = Some(Instant::now());
+                    state.last_exit_ts = Some(now_ts);
                 }
             }
         }
@@ -4427,6 +4454,14 @@ impl PairTradeEngine {
         if self.cfg.disable_history_persist {
             return;
         }
+        // Skip persisted-history loading entirely under backtest replay: the
+        // file's timestamps reflect the wall clock at dump time and would
+        // always look stale relative to the replayed cursor, producing
+        // millions of WARN lines without contributing anything useful (the
+        // replay data already supplies a clean, gap-free history).
+        if self.cfg.backtest_mode {
+            return;
+        }
         let path = &self.history_path;
         let Ok(content) = std::fs::read_to_string(path) else {
             return;
@@ -4435,7 +4470,7 @@ impl PairTradeEngine {
         let Ok(map) = parsed else {
             return;
         };
-        let now = chrono::Utc::now().timestamp();
+        let now = self.current_now_ts();
         let max_age_secs =
             (self.max_history_len() as i64).saturating_mul(self.cfg.trading_period_secs as i64);
         // Stale-history guard (pairtrade#4): if the newest sample for a symbol
@@ -4511,6 +4546,21 @@ impl PairTradeEngine {
         ((self.cfg.entry_vol_lookback_hours * 3600) / self.cfg.trading_period_secs).max(1) as usize
     }
 
+    /// Virtual clock used by all duration-based decisions. In live mode this
+    /// is the wall-clock UTC second; in backtest mode it tracks the replay
+    /// connector's logical timestamp so cooldown / force_close /
+    /// circuit_breaker / re-eval intervals fire correctly under replay.
+    fn current_now_ts(&self) -> i64 {
+        if self.cfg.backtest_mode {
+            self.replay_connector
+                .as_ref()
+                .and_then(|r| r.current_timestamp_secs())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp())
+        } else {
+            chrono::Utc::now().timestamp()
+        }
+    }
+
     fn max_history_len(&self) -> usize {
         let mut max_needed = 0usize;
         // Consider all per-pair params and the default
@@ -4532,6 +4582,7 @@ impl PairTradeEngine {
         price_map: &HashMap<String, SymbolSnapshot>,
     ) -> Result<()> {
         let timeout = Duration::from_secs(self.cfg.order_timeout_secs.max(1));
+        let now_ts = self.current_now_ts();
         let (pending_entry, pending_exit) = {
             let state = self
                 .states
@@ -4561,6 +4612,7 @@ impl PairTradeEngine {
                     state.position = Some(Position {
                         direction: pending.direction,
                         entered_at: Instant::now(),
+                        entered_ts: now_ts,
                         entry_price_a: ep_a,
                         entry_price_b: ep_b,
                         entry_size_a: es_a,
@@ -4746,6 +4798,7 @@ impl PairTradeEngine {
                         state.pending_entry = Some(pending);
                     } else {
                         state.last_exit_at = Some(Instant::now());
+                        state.last_exit_ts = Some(now_ts);
                         state.pending_entry = None;
                         if flattened_any {
                             state.position = None;
@@ -4790,6 +4843,7 @@ impl PairTradeEngine {
                     }
                     state.position = None;
                     state.last_exit_at = Some(Instant::now());
+                    state.last_exit_ts = Some(now_ts);
                     state.pending_exit = None;
                 }
                 log::info!("[ORDER] {} exit orders filled", key);
@@ -4802,6 +4856,8 @@ impl PairTradeEngine {
                             .circuit_breaker_cooldown_for(self.consecutive_losses)
                         {
                             self.circuit_breaker_until = Some(Instant::now() + cooldown);
+                            self.circuit_breaker_until_ts =
+                                Some(now_ts + cooldown.as_secs() as i64);
                             log::warn!(
                                 "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
                                 self.consecutive_losses, cooldown.as_secs()
@@ -4816,6 +4872,7 @@ impl PairTradeEngine {
                         }
                         self.consecutive_losses = 0;
                         self.circuit_breaker_until = None;
+                        self.circuit_breaker_until_ts = None;
                     }
                 }
             } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
@@ -6386,6 +6443,7 @@ impl PairTradeEngine {
             status_reporter: None,
             consecutive_losses: 0,
             circuit_breaker_until: None,
+            circuit_breaker_until_ts: None,
             total_trades: 0,
             total_wins: 0,
             total_pnl: 0.0,
@@ -6530,9 +6588,10 @@ fn should_enter(
     z: f64,
     std: f64,
     net_funding: f64,
+    now_ts: i64,
 ) -> bool {
-    if let Some(last_exit) = state.last_exit_at {
-        if last_exit.elapsed() < Duration::from_secs(pp.cooldown_secs) {
+    if let Some(last_exit_ts) = state.last_exit_ts {
+        if now_ts.saturating_sub(last_exit_ts) < pp.cooldown_secs as i64 {
             return false;
         }
     }
@@ -6610,12 +6669,13 @@ fn exit_reason(
     p1: &SymbolSnapshot,
     p2: &SymbolSnapshot,
     equity_base: f64,
+    now_ts: i64,
 ) -> Option<&'static str> {
     let pos = state.position.as_ref()?;
     if z.abs() >= pp.stop_loss_z {
         return Some("stop_loss_z");
     }
-    if pos.entered_at.elapsed() >= Duration::from_secs(pp.force_close_secs) {
+    if now_ts.saturating_sub(pos.entered_ts) >= pp.force_close_secs as i64 {
         return Some("force_close");
     }
     if pp.exit_z > 0.0 && z.abs() <= pp.exit_z {
@@ -6644,7 +6704,7 @@ fn exit_reason(
             if pnl > Decimal::ZERO {
                 let half_life_hours = state.half_life_hours;
                 if half_life_hours.is_finite() && half_life_hours > 0.0 {
-                    let elapsed_secs = pos.entered_at.elapsed().as_secs_f64();
+                    let elapsed_secs = now_ts.saturating_sub(pos.entered_ts).max(0) as f64;
                     let remaining_secs = (pp.force_close_secs as f64) - elapsed_secs;
                     if remaining_secs > 0.0 {
                         let half_life_secs = half_life_hours * 3600.0;
