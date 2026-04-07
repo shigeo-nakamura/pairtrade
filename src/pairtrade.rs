@@ -3215,6 +3215,13 @@ impl PairTradeEngine {
         } else {
             chrono::Utc::now().timestamp()
         };
+        // Merge bars written by other bots since the last tick. Without this
+        // each process's `history` only ever holds bars from its own WS feed,
+        // and ms-level differences in tick aggregation get amplified by the
+        // regression into z-value divergence across A/B/C (pairtrade#4).
+        // Reloading before bar-build means every bot reads the most recent
+        // consensus state before pushing its own latest bar.
+        self.load_history_from_disk();
         let mut updated = HashSet::new();
         for (symbol, snapshot) in price_map.iter() {
             if let Some(builder) = self.bar_builders.get_mut(symbol) {
@@ -3224,17 +3231,23 @@ impl PairTradeEngine {
                         .history
                         .entry(symbol.clone())
                         .or_insert_with(VecDeque::new);
-                    if entry.len() >= max_history_len {
-                        entry.pop_front();
-                    }
                     let log_price = close_price
                         .to_f64()
                         .ok_or_else(|| anyhow!("invalid price for {}", symbol))?
                         .ln();
-                    entry.push_back(PriceSample {
-                        log_price,
-                        ts: close_ts,
-                    });
+                    // First writer wins for a given bucket_ts: if another bot
+                    // has already persisted this bar, leave the shared value
+                    // in place. Once a bar is recorded it becomes immutable,
+                    // so all three bots converge on one canonical series.
+                    if entry.back().map(|s| s.ts) != Some(close_ts) {
+                        if entry.len() >= max_history_len {
+                            entry.pop_front();
+                        }
+                        entry.push_back(PriceSample {
+                            log_price,
+                            ts: close_ts,
+                        });
+                    }
                     updated.insert(symbol.clone());
                 }
             } else {
