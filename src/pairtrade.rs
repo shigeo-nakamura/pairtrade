@@ -2624,6 +2624,7 @@ impl PairTradeEngine {
             self.should_post_only()
         );
         self.load_history_from_disk();
+        self.warm_start_states_from_history();
 
         if self.replay_connector.is_some() {
             // --- Backtest Mode ---
@@ -4450,6 +4451,40 @@ impl PairTradeEngine {
             if !deque.is_empty() {
                 self.history.insert(sym, deque);
             }
+        }
+    }
+
+    /// Rebuild each pair's beta and spread_history from the shared on-disk
+    /// price history so A/B/C bots have identical regression windows the
+    /// instant they start, instead of waiting metrics_window live bars to
+    /// converge (pairtrade#4).
+    fn warm_start_states_from_history(&mut self) {
+        if self.cfg.disable_history_persist {
+            return;
+        }
+        for pair in self.cfg.universe.clone() {
+            let key = format!("{}/{}", pair.base, pair.quote);
+            let Some(eval) = self.evaluate_pair(&pair) else { continue };
+            let (Some(hist_a), Some(hist_b)) =
+                (self.history.get(&pair.base), self.history.get(&pair.quote))
+            else { continue };
+            let take = self.cfg.metrics_window.min(hist_a.len()).min(hist_b.len());
+            if take < 2 { continue }
+            let spreads: VecDeque<f64> = tail_samples(hist_a, take)
+                .iter()
+                .zip(tail_samples(hist_b, take).iter())
+                .map(|(sa, sb)| sa.log_price - eval.beta_eff * sb.log_price)
+                .collect();
+            let Some(state) = self.states.get_mut(&key) else { continue };
+            state.beta = eval.beta_eff;
+            state.beta_short = eval.beta_short;
+            state.beta_long = eval.beta_long;
+            state.last_spread = spreads.back().copied();
+            state.spread_history = spreads;
+            log::info!(
+                "[WARM_START] {} seeded spread_history len={} beta_eff={:.4}",
+                key, state.spread_history.len(), state.beta
+            );
         }
     }
 
