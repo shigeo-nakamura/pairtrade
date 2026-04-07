@@ -1453,23 +1453,19 @@ fn parse_universe_pairs() -> Result<Vec<PairSpec>> {
     parse_pairs_list(&raw)
 }
 
-fn default_history_file(universe: &[PairSpec], agent_name: Option<&str>) -> String {
+fn default_history_file(universe: &[PairSpec], _agent_name: Option<&str>) -> String {
     let mut symbols: Vec<String> = universe
         .iter()
         .flat_map(|p| [p.base.clone(), p.quote.clone()])
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    // Append the agent name (if any) so multi-bot A/B deployments do not
-    // share a single history file. Without this, A/B/C bots running the same
-    // pair clobber each other's persisted history on every step (pairtrade#4).
-    let agent_suffix = agent_name
-        .map(sanitize_symbol_for_filename)
-        .filter(|s| !s.is_empty())
-        .map(|s| format!("_{}", s))
-        .unwrap_or_default();
+    // A/B/C bots watching the same pair on the same host intentionally share
+    // one history file so their rolling regression windows stay identical
+    // (pairtrade#4). The shared file is written atomically via tmpfile+rename
+    // in persist_history_to_disk to avoid torn reads under concurrent writers.
     if symbols.is_empty() {
-        return format!("pairtrade_history{}.json", agent_suffix);
+        return "pairtrade_history.json".to_string();
     }
     symbols.sort();
     let parts: Vec<String> = symbols
@@ -1478,9 +1474,9 @@ fn default_history_file(universe: &[PairSpec], agent_name: Option<&str>) -> Stri
         .filter(|sym| !sym.is_empty())
         .collect();
     if parts.is_empty() {
-        return format!("pairtrade_history{}.json", agent_suffix);
+        return "pairtrade_history.json".to_string();
     }
-    format!("pairtrade_history_{}{}.json", parts.join("_"), agent_suffix)
+    format!("pairtrade_history_{}.json", parts.join("_"))
 }
 
 fn sanitize_symbol_for_filename(symbol: &str) -> String {
@@ -4392,8 +4388,23 @@ impl PairTradeEngine {
             snapshot.insert(sym.clone(), v);
         }
         if let Ok(json) = serde_json::to_string(&snapshot) {
-            if let Err(e) = fs::write(&self.history_path, json) {
-                log::debug!("persist history failed: {:?}", e);
+            // Atomic write: tmpfile in the same directory + rename. Multiple
+            // bots may be writing this shared file concurrently (pairtrade#4);
+            // rename guarantees readers never observe a torn JSON document.
+            let path = std::path::Path::new(&self.history_path);
+            let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let file_name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "pairtrade_history.json".to_string());
+            let tmp = dir.join(format!(".{}.tmp.{}", file_name, std::process::id()));
+            if let Err(e) = fs::write(&tmp, json) {
+                log::debug!("persist history tmp write failed: {:?}", e);
+                return;
+            }
+            if let Err(e) = fs::rename(&tmp, path) {
+                log::debug!("persist history rename failed: {:?}", e);
+                let _ = fs::remove_file(&tmp);
             }
         }
     }
@@ -4413,7 +4424,22 @@ impl PairTradeEngine {
         let now = chrono::Utc::now().timestamp();
         let max_age_secs =
             (self.max_history_len() as i64).saturating_mul(self.cfg.trading_period_secs as i64);
+        // Stale-history guard (pairtrade#4): if the newest sample for a symbol
+        // is older than a few bars, the persisted file is from a stopped bot
+        // and replaying it would freeze a stale rolling window. Drop it and
+        // let the live feed warm up from scratch.
+        let stale_threshold_secs =
+            (self.cfg.trading_period_secs as i64).saturating_mul(5).max(60);
         for (sym, entries) in map {
+            let newest_ts = entries.iter().map(|(_, ts)| *ts).max().unwrap_or(0);
+            if now.saturating_sub(newest_ts) > stale_threshold_secs {
+                log::warn!(
+                    "discarding stale persisted history for {}: newest sample {}s old",
+                    sym,
+                    now.saturating_sub(newest_ts)
+                );
+                continue;
+            }
             let mut deque = VecDeque::new();
             for (log_price, ts) in entries {
                 if now.saturating_sub(ts) > max_age_secs {
