@@ -22,13 +22,14 @@ metrics_window_length: 240
 warm_start_mode: relaxed
 warm_start_min_bars: 60
 
-# Core MR params (optimized 2026-04-02: exit_z 0.5->0.3, sl_z 4.0->6.0, +$26.74/7d in 16-grid BT)
+# Core MR params (was champion exit_z=0.2/sl_z=4.0; swapped to A's old values 2026-04-07
+# because the never-finished A/B test should treat C as the champion. The old A params
+# are now the challenger here so the previous comparison is not lost.)
 entry_z_score_base: 1.5
 entry_z_score_min: 1.0
 entry_z_score_max: 2.0
-# A/B test: Grid2 best (exit_z=0.2, sl_z=4.0)
-exit_z_score: 0.2
-stop_loss_z_score: 4.0
+exit_z_score: 0.3
+stop_loss_z_score: 6.0
 force_close_time_secs: 3600
 shutdown_grace_secs: 3660  # force_close_time_secs + 60s buffer for graceful SIGTERM handling
 
@@ -36,7 +37,7 @@ shutdown_grace_secs: 3660  # force_close_time_secs + 60s buffer for graceful SIG
 risk_pct_per_trade: 0.40
 equity_usd_fallback: 500
 max_leverage: 1
-max_loss_r_mult: 1.0
+max_loss_r_mult: 3.0    # was 1.0 (champion); now A's old value as challenger. Swapped 2026-04-07.
 max_dd_pct: 0.10                      # Max drawdown tolerance for auto-sizing
 
 # Execution
