@@ -284,6 +284,7 @@ impl DexConnector for ReplayConnector {
             open_interest: None,
             funding_rate: Some(symbol_data.funding_rate),
             oracle_price: Some(symbol_data.price),
+            exchange_ts: Some(current_cursor as u64),
         })
     }
 

@@ -462,7 +462,8 @@ impl PairTradeConfig {
         let warm_start_min_bars = yaml.warm_start_min_bars.unwrap_or(metrics_window);
         let history_file = yaml
             .history_file
-            .unwrap_or_else(|| default_history_file(&universe));
+            .clone()
+            .unwrap_or_else(|| default_history_file(&universe, yaml.agent_name.as_deref()));
 
         let mut cfg = PairTradeConfig {
             dex_name: yaml.dex_name.unwrap_or_else(|| "hyperliquid".to_string()),
@@ -812,7 +813,7 @@ impl PairTradeConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| default_history_file(&universe));
+            .unwrap_or_else(|| default_history_file(&universe, agent_name.as_deref()));
 
         let backtest_mode = env::var("BACKTEST_MODE")
             .unwrap_or_else(|_| "false".to_string())
@@ -1226,7 +1227,7 @@ impl PairTradeConfig {
                 self.history_file = value.trim().to_string();
             }
         } else if universe_overridden && !history_file_from_yaml {
-            self.history_file = default_history_file(&self.universe);
+            self.history_file = default_history_file(&self.universe, self.agent_name.as_deref());
         }
 
         if let Ok(value) = env::var("BACKTEST_MODE") {
@@ -1452,15 +1453,23 @@ fn parse_universe_pairs() -> Result<Vec<PairSpec>> {
     parse_pairs_list(&raw)
 }
 
-fn default_history_file(universe: &[PairSpec]) -> String {
+fn default_history_file(universe: &[PairSpec], agent_name: Option<&str>) -> String {
     let mut symbols: Vec<String> = universe
         .iter()
         .flat_map(|p| [p.base.clone(), p.quote.clone()])
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
+    // Append the agent name (if any) so multi-bot A/B deployments do not
+    // share a single history file. Without this, A/B/C bots running the same
+    // pair clobber each other's persisted history on every step (pairtrade#4).
+    let agent_suffix = agent_name
+        .map(sanitize_symbol_for_filename)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("_{}", s))
+        .unwrap_or_default();
     if symbols.is_empty() {
-        return "pairtrade_history.json".to_string();
+        return format!("pairtrade_history{}.json", agent_suffix);
     }
     symbols.sort();
     let parts: Vec<String> = symbols
@@ -1469,9 +1478,9 @@ fn default_history_file(universe: &[PairSpec]) -> String {
         .filter(|sym| !sym.is_empty())
         .collect();
     if parts.is_empty() {
-        return "pairtrade_history.json".to_string();
+        return format!("pairtrade_history{}.json", agent_suffix);
     }
-    format!("pairtrade_history_{}.json", parts.join("_"))
+    format!("pairtrade_history_{}{}.json", parts.join("_"), agent_suffix)
 }
 
 fn sanitize_symbol_for_filename(symbol: &str) -> String {
@@ -2668,9 +2677,23 @@ impl PairTradeEngine {
                 tokio::select! {
                     _ = tokio::time::sleep_until(next_tick) => {
                         next_tick = next_wall_clock_boundary(interval_secs);
+                        // Monitor step() execution time. If it exceeds interval_secs,
+                        // the next wall-clock boundary will be skipped, causing tick
+                        // phase to drift across A/B/C bots and breaking bar alignment
+                        // (pairtrade#4). WARN so we can spot it in production logs.
+                        let step_start = Instant::now();
                         if let Err(e) = self.step().await {
                             self.log_inconsistent_state_debug(&e).await;
                             log::error!("pairtrade step failed: {:?}", e);
+                        }
+                        let step_elapsed = step_start.elapsed();
+                        if step_elapsed >= Duration::from_secs(interval_secs) {
+                            log::warn!(
+                                "[STEP_OVERRUN] step() took {:.2}s >= interval_secs={}; \
+                                 next wall-clock tick will be skipped, A/B/C alignment may drift",
+                                step_elapsed.as_secs_f64(),
+                                interval_secs
+                            );
                         }
                     }
                     _ = sigterm.recv() => {
@@ -3141,7 +3164,16 @@ impl PairTradeEngine {
         }
         let mut planned: Vec<PlannedAction> = Vec::new();
 
-        // Push history samples for symbols using 1-minute bars
+        // Push history samples for symbols using 1-minute bars.
+        //
+        // Bar timestamps come from the exchange-side `last_updated_at` of each
+        // tick (see SymbolSnapshot::exchange_ts), NOT from the local wall clock.
+        // This is required for multi-bot A/B fairness (pairtrade#4): all bots
+        // observing the same WS feed see identical event timestamps for the
+        // same update, so they place ticks into identical buckets and produce
+        // identical bar closes regardless of their own scheduling jitter.
+        // Falls back to local wall clock only when the connector cannot supply
+        // an exchange timestamp (e.g. REST fallback path).
         let max_history_len = self.max_history_len();
         let now_ts = if self.cfg.backtest_mode {
             self.replay_connector
@@ -3154,7 +3186,8 @@ impl PairTradeEngine {
         let mut updated = HashSet::new();
         for (symbol, snapshot) in price_map.iter() {
             if let Some(builder) = self.bar_builders.get_mut(symbol) {
-                if let Some((close_price, close_ts)) = builder.push(now_ts, snapshot.price) {
+                let tick_ts = snapshot.exchange_ts.unwrap_or(now_ts);
+                if let Some((close_price, close_ts)) = builder.push(tick_ts, snapshot.price) {
                     let entry = self
                         .history
                         .entry(symbol.clone())
@@ -3232,6 +3265,34 @@ impl PairTradeEngine {
                     state.beta_long,
                 )
             };
+
+            // [ZCHECK] Per-step alignment audit log. Designed for side-by-side
+            // comparison across A/B/C bots running the same pair: if buckets are
+            // properly aligned, identical bucket_ts rows should show identical
+            // close/beta/mean/std/z values across processes. See pairtrade#4.
+            let base_bar = self.history.get(&pair.base).and_then(|h| h.back()).cloned();
+            let quote_bar = self.history.get(&pair.quote).and_then(|h| h.back()).cloned();
+            if let (Some(ba), Some(bq)) = (base_bar, quote_bar) {
+                if let Some((z, std, mean, latest)) = z_snapshot {
+                    log::info!(
+                        "[ZCHECK] {} bucket_ts={} close_a={:.6} close_b={:.6} \
+                         beta_eff={:.4} beta_s={:.4} beta_l={:.4} mean={:.6} std={:.6} \
+                         spread={:.6} z={:.4} hist={}",
+                        key,
+                        ba.ts,
+                        ba.log_price,
+                        bq.log_price,
+                        beta_eff,
+                        beta_short,
+                        beta_long,
+                        mean,
+                        std,
+                        latest,
+                        z,
+                        spread_len,
+                    );
+                }
+            }
 
             let pp = self.cfg.params_for(&key);
             let force_close_due = position_state
@@ -5177,6 +5238,7 @@ impl PairTradeEngine {
             min_order: ticker.min_order,
             min_tick: ticker.min_tick,
             size_decimals: ticker.size_decimals,
+            exchange_ts: ticker.exchange_ts.map(|v| v as i64),
         })
     }
 
@@ -6057,6 +6119,7 @@ impl PairTradeEngine {
                     min_order: ticker.min_order,
                     min_tick: ticker.min_tick,
                     size_decimals: ticker.size_decimals,
+                    exchange_ts: ticker.exchange_ts.map(|v| v as i64),
                 },
             );
             log::debug!(
@@ -6227,6 +6290,12 @@ struct SymbolSnapshot {
     min_order: Option<Decimal>,
     min_tick: Option<Decimal>,
     size_decimals: Option<u32>,
+    /// Exchange-side timestamp (Unix seconds) for the most recent price update
+    /// from the connector. When `Some`, all bots observing the same feed see
+    /// identical values for the same update — used to align bar buckets across
+    /// processes (pairtrade#4).
+    #[serde(default)]
+    exchange_ts: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -6986,6 +7055,7 @@ mod pending_tests {
                 min_order: Some(dec("0.001")),
                 min_tick: Some(dec("0.001")),
                 size_decimals: Some(3),
+                exchange_ts: None,
             },
         );
         let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
