@@ -4457,32 +4457,38 @@ impl PairTradeEngine {
     /// Rebuild each pair's beta and spread_history from the shared on-disk
     /// price history so A/B/C bots have identical regression windows the
     /// instant they start, instead of waiting metrics_window live bars to
-    /// converge (pairtrade#4).
+    /// converge (pairtrade#4). Computes beta directly from whatever bars
+    /// are available — does not go through evaluate_pair() because that
+    /// path enforces full lookback_hours_long under Strict warm-start and
+    /// would skip the seed when the loaded history is shorter than the
+    /// configured long window.
     fn warm_start_states_from_history(&mut self) {
         if self.cfg.disable_history_persist {
             return;
         }
         for pair in self.cfg.universe.clone() {
             let key = format!("{}/{}", pair.base, pair.quote);
-            let Some(eval) = self.evaluate_pair(&pair) else { continue };
             let (Some(hist_a), Some(hist_b)) =
                 (self.history.get(&pair.base), self.history.get(&pair.quote))
             else { continue };
             let take = self.cfg.metrics_window.min(hist_a.len()).min(hist_b.len());
             if take < 2 { continue }
-            let spreads: VecDeque<f64> = tail_samples(hist_a, take)
+            let tail_a = tail_samples(hist_a, take);
+            let tail_b = tail_samples(hist_b, take);
+            let beta = regression_beta(&tail_b, &tail_a);
+            let spreads: VecDeque<f64> = tail_a
                 .iter()
-                .zip(tail_samples(hist_b, take).iter())
-                .map(|(sa, sb)| sa.log_price - eval.beta_eff * sb.log_price)
+                .zip(tail_b.iter())
+                .map(|(sa, sb)| sa.log_price - beta * sb.log_price)
                 .collect();
             let Some(state) = self.states.get_mut(&key) else { continue };
-            state.beta = eval.beta_eff;
-            state.beta_short = eval.beta_short;
-            state.beta_long = eval.beta_long;
+            state.beta = beta;
+            state.beta_short = beta;
+            state.beta_long = beta;
             state.last_spread = spreads.back().copied();
             state.spread_history = spreads;
             log::info!(
-                "[WARM_START] {} seeded spread_history len={} beta_eff={:.4}",
+                "[WARM_START] {} seeded spread_history len={} beta={:.4}",
                 key, state.spread_history.len(), state.beta
             );
         }
