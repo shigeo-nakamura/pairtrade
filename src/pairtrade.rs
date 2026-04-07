@@ -6248,8 +6248,10 @@ impl PairTradeEngine {
                 ticker.min_order,
                 ticker.min_tick
             );
-            // avoid hammering
-            sleep(Duration::from_millis(50)).await;
+            // avoid hammering (skipped in backtest: ReplayConnector is synchronous)
+            if !self.cfg.backtest_mode {
+                sleep(Duration::from_millis(50)).await;
+            }
         }
         Ok(map)
     }
