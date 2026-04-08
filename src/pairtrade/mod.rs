@@ -25,6 +25,7 @@ mod defaults;
 mod entry;
 mod exit;
 mod market;
+mod pair_eval;
 mod sizing;
 mod state;
 mod stats;
@@ -34,6 +35,7 @@ use bar::BarBuilder;
 use entry::{entry_z_for_pair, should_enter};
 use exit::{compute_pnl, exit_reason};
 use market::{liquidity_score, net_funding_for_direction, SymbolSnapshot};
+use pair_eval::PairEvaluation;
 use stats::{regression_beta, spread_slope_sigma, tail_samples, PriceSample};
 pub use config::{PairTradeConfig, WarmStartMode};
 use config::PairSpec;
@@ -46,8 +48,7 @@ use status::{
     PairTradeStats, ShutdownPosition, ShutdownStatus, StatusReporter,
 };
 use util::{
-    half_life_and_p, quantize_size_by_step, quantize_size_by_step_ceiling,
-    round_price_by_tick, tail_std,
+    quantize_size_by_step, quantize_size_by_step_ceiling, round_price_by_tick, tail_std,
 };
 
 
@@ -3205,70 +3206,7 @@ impl PairTradeEngine {
     }
 
     fn evaluate_pair(&self, pair: &PairSpec) -> Option<PairEvaluation> {
-        let key = format!("{}/{}", pair.base, pair.quote);
-        let pp = self.cfg.params_for(&key);
-        let hist_a = self.history.get(&pair.base)?;
-        let hist_b = self.history.get(&pair.quote)?;
-        let available = hist_a.len().min(hist_b.len());
-        let desired_long =
-            ((pp.lookback_hours_long * 3600) / self.cfg.trading_period_secs).max(1) as usize;
-        let desired_short =
-            ((pp.lookback_hours_short * 3600) / self.cfg.trading_period_secs).max(1) as usize;
-        let (long_len, short_len) = match self.cfg.warm_start_mode {
-            WarmStartMode::Strict => {
-                if available < desired_long {
-                    return None;
-                }
-                (desired_long, desired_short)
-            }
-            WarmStartMode::Relaxed => {
-                let min_bars = pp.warm_start_min_bars.max(1);
-                if available < min_bars {
-                    return None;
-                }
-                let long_len = desired_long.min(available);
-                let short_len = desired_short.min(long_len);
-                (long_len, short_len)
-            }
-        };
-
-        let tail_a = tail_samples(hist_a, long_len);
-        let tail_b = tail_samples(hist_b, long_len);
-        let beta_long = regression_beta(&tail_b, &tail_a);
-        let beta_short = regression_beta(
-            &tail_b[tail_b.len() - short_len..],
-            &tail_a[tail_a.len() - short_len..],
-        );
-        let beta_eff = 0.7 * beta_short + 0.3 * beta_long;
-
-        // Build spread series for diagnostics using long window
-        let spreads: Vec<f64> = tail_a
-            .iter()
-            .zip(tail_b.iter())
-            .map(|(sa, sb)| sa.log_price - beta_eff * sb.log_price)
-            .collect();
-        let (half_life_samples, adf_p_value) = half_life_and_p(&spreads);
-        let half_life_hours = half_life_samples * (self.cfg.trading_period_secs as f64) / 3600.0;
-        let beta_gap = ((beta_short - beta_long) / beta_eff.max(1e-6)).abs();
-        let half_ok = half_life_hours <= pp.half_life_max_hours;
-        let adf_ok = adf_p_value <= pp.adf_p_threshold;
-        let beta_ok = beta_gap <= 0.2;
-        let score = half_ok as u8 + adf_ok as u8 + beta_ok as u8;
-        let eligible = score >= 2;
-        // softer ranking: weight lower p and faster half-life
-        let continuous_score =
-            (1.0 - adf_p_value.min(1.0)) * 0.6 + (1.0 / (1.0 + half_life_hours)) * 0.4;
-
-        Some(PairEvaluation {
-            beta_short,
-            beta_long,
-            beta_eff,
-            half_life_hours,
-            adf_p_value,
-            eligible,
-            score: continuous_score,
-            beta_gap,
-        })
+        pair_eval::evaluate_pair(&self.cfg, &self.history, pair)
     }
 
     fn exit_sizes_for_pair(
@@ -4483,17 +4421,6 @@ struct DataDumpEntry<'a> {
     prices: &'a HashMap<String, SymbolSnapshot>,
 }
 
-#[derive(Debug)]
-struct PairEvaluation {
-    beta_short: f64,
-    beta_long: f64,
-    beta_eff: f64,
-    half_life_hours: f64,
-    adf_p_value: f64,
-    eligible: bool,
-    score: f64,
-    beta_gap: f64,
-}
 
 
 
