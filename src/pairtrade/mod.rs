@@ -25,7 +25,9 @@ mod config;
 mod defaults;
 mod util;
 use bar::BarBuilder;
-use config::{PairOverrideYaml, PairTradeYaml};
+use config::{
+    parse_universe_pairs, resolve_universe_from_yaml, PairOverrideYaml, PairSpec, PairTradeYaml,
+};
 use defaults::*;
 use util::{
     half_life_and_p, mean_std, quantize_size_by_step, quantize_size_by_step_ceiling,
@@ -140,12 +142,6 @@ pub struct PairTradeConfig {
     /// Graceful shutdown: max seconds to wait for natural pair exit on SIGTERM
     /// before force-closing both legs. 0 = immediate force close (legacy).
     pub shutdown_grace_secs: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PairSpec {
-    pub base: String,
-    pub quote: String,
 }
 
 impl PairTradeConfig {
@@ -1186,108 +1182,6 @@ impl std::str::FromStr for WarmStartMode {
     }
 }
 
-fn env_has_universe_override() -> bool {
-    env::var("UNIVERSE_PAIRS")
-        .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-        || env::var("UNIVERSE_SYMBOLS")
-            .ok()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
-}
-
-fn parse_pairs_vec(pairs: &[String]) -> Result<Vec<PairSpec>> {
-    let joined = pairs.join(",");
-    parse_pairs_list(&joined)
-}
-
-fn parse_symbols_vec(symbols: &[String]) -> Result<Vec<PairSpec>> {
-    let syms: Vec<String> = symbols
-        .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if syms.is_empty() {
-        return Err(anyhow!("UNIVERSE_SYMBOLS produced no valid pairs"));
-    }
-    let mut pairs = Vec::new();
-    for i in 0..syms.len() {
-        for j in (i + 1)..syms.len() {
-            let a = syms[i].clone();
-            let b = syms[j].clone();
-            let (base, quote) = if a < b { (a, b) } else { (b, a) };
-            pairs.push(PairSpec { base, quote });
-        }
-    }
-    if pairs.is_empty() {
-        return Err(anyhow!("UNIVERSE_SYMBOLS produced no valid pairs"));
-    }
-    Ok(pairs)
-}
-
-fn resolve_universe_from_yaml(yaml: &PairTradeYaml) -> Result<Vec<PairSpec>> {
-    if env_has_universe_override() {
-        return parse_universe_pairs();
-    }
-    if let Some(pairs) = yaml.universe_pairs.clone() {
-        let pairs = pairs.into_vec();
-        if pairs.is_empty() {
-            return Err(anyhow!("universe_pairs produced no valid pairs"));
-        }
-        return parse_pairs_vec(&pairs);
-    }
-    if let Some(symbols) = yaml.universe_symbols.clone() {
-        let symbols = symbols.into_vec();
-        if symbols.is_empty() {
-            return Err(anyhow!("universe_symbols produced no valid pairs"));
-        }
-        return parse_symbols_vec(&symbols);
-    }
-    let raw = "BTC/ETH,BTC/SOL,ETH/SOL".to_string();
-    parse_pairs_list(&raw)
-}
-
-fn parse_universe_pairs() -> Result<Vec<PairSpec>> {
-    if let Ok(raw_pairs) = env::var("UNIVERSE_PAIRS") {
-        if !raw_pairs.trim().is_empty() {
-            return parse_pairs_list(&raw_pairs);
-        }
-    }
-    if let Ok(symbols_raw) = env::var("UNIVERSE_SYMBOLS") {
-        if !symbols_raw.trim().is_empty() {
-            let syms: Vec<String> = symbols_raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let mut pairs = Vec::new();
-            if syms.len() == 1 {
-                // Single-symbol mode: create a self-pair for data-dump collection
-                pairs.push(PairSpec {
-                    base: syms[0].clone(),
-                    quote: syms[0].clone(),
-                });
-            } else {
-                for i in 0..syms.len() {
-                    for j in (i + 1)..syms.len() {
-                        let a = syms[i].clone();
-                        let b = syms[j].clone();
-                        let (base, quote) = if a < b { (a, b) } else { (b, a) };
-                        pairs.push(PairSpec { base, quote });
-                    }
-                }
-            }
-            if pairs.is_empty() {
-                return Err(anyhow!("UNIVERSE_SYMBOLS produced no valid pairs"));
-            }
-            return Ok(pairs);
-        }
-    }
-    let raw = "BTC/ETH,BTC/SOL,ETH/SOL".to_string();
-    parse_pairs_list(&raw)
-}
-
 fn default_history_file(universe: &[PairSpec], _agent_name: Option<&str>) -> String {
     let mut symbols: Vec<String> = universe
         .iter()
@@ -1324,31 +1218,6 @@ fn sanitize_symbol_for_filename(symbol: &str) -> String {
         }
     }
     out
-}
-
-fn parse_pairs_list(raw: &str) -> Result<Vec<PairSpec>> {
-    let mut pairs = Vec::new();
-    for part in raw.split(',') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut split = trimmed.split('/');
-        let base = split
-            .next()
-            .ok_or_else(|| anyhow!("invalid pair: {}", trimmed))?;
-        let quote = split
-            .next()
-            .ok_or_else(|| anyhow!("invalid pair: {}", trimmed))?;
-        pairs.push(PairSpec {
-            base: base.to_string(),
-            quote: quote.to_string(),
-        });
-    }
-    if pairs.is_empty() {
-        return Err(anyhow!("UNIVERSE_PAIRS produced no valid pairs"));
-    }
-    Ok(pairs)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
