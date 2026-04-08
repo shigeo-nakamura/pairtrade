@@ -1776,7 +1776,13 @@ impl StatusReporter {
             equity_history_path,
             last_equity_history_ts: None,
             last_snapshot: None,
-            trade_stats: None,
+            trade_stats: Some(PairTradeStats {
+                trades: 0,
+                wins: 0,
+                win_rate: 0.0,
+                max_dd: 0.0,
+                pnl: 0.0,
+            }),
             maintenance: None,
         };
         reporter.load_equity_baseline();
