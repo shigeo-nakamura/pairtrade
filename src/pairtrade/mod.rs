@@ -3,16 +3,15 @@ use chrono::Utc;
 use dex_connector::{DexConnector, DexError, PositionSnapshot};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::env;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
 use crate::email_client::EmailClient;
@@ -26,6 +25,7 @@ mod entry;
 mod exit;
 mod market;
 mod pair_eval;
+mod pnl_log;
 mod sizing;
 mod state;
 mod stats;
@@ -36,6 +36,7 @@ use entry::{entry_z_for_pair, should_enter};
 use exit::{compute_pnl, exit_reason};
 use market::{liquidity_score, net_funding_for_direction, SymbolSnapshot};
 use pair_eval::PairEvaluation;
+use pnl_log::{PnlLogRecord, PnlLogger};
 use stats::{regression_beta, spread_slope_sigma, tail_samples, PriceSample};
 pub use config::{PairTradeConfig, WarmStartMode};
 use config::PairSpec;
@@ -53,302 +54,6 @@ use util::{
 
 
 
-#[derive(Debug, Deserialize, Serialize)]
-struct PnlLogRecord {
-    ts: i64,
-    pair: String,
-    base: String,
-    quote: String,
-    direction: String,
-    pnl: f64,
-    source: String,
-    // Trade log fields for backtest calibration
-    #[serde(skip_serializing_if = "Option::is_none")]
-    entry_price_a: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    entry_price_b: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_price_a: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_price_b: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    beta: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    z_entry: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    z_exit: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hold_secs: Option<f64>,
-}
-
-
-struct PnlLogger {
-    dir: PathBuf,
-    tag: Option<String>,
-    retain_days: u64,
-    last_cleanup: Option<Instant>,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct LifetimeStats {
-    trades: u64,
-    wins: u64,
-    total_pnl: f64,
-    peak_pnl: f64,
-    max_dd: f64,
-}
-
-
-impl PnlLogger {
-    fn from_env(cfg: &PairTradeConfig) -> Option<Self> {
-        let enabled = env::var("DEBOT_PNL_LOG")
-            .ok()
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                !(v == "0" || v == "false" || v == "no")
-            })
-            .unwrap_or(true);
-        if !enabled {
-            return None;
-        }
-        let dir = env::var("DEBOT_PNL_DIR")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                env::var("HOME")
-                    .ok()
-                    .map(|home| PathBuf::from(home).join("debot_pnl"))
-            })
-            .unwrap_or_else(|| PathBuf::from("debot_pnl"));
-        let tag = env::var("DEBOT_PNL_TAG")
-            .ok()
-            .or_else(|| env::var("AGENT_NAME").ok())
-            .or_else(|| cfg.agent_name.clone())
-            .or_else(|| env::var("DEX_NAME").ok())
-            .or_else(|| Some(cfg.dex_name.clone()))
-            .map(|v| sanitize_pnl_tag(&v))
-            .filter(|v| !v.is_empty());
-        let retain_days = env::var("DEBOT_PNL_RETAIN_DAYS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(7)
-            .max(1);
-        Some(Self {
-            dir,
-            tag,
-            retain_days,
-            last_cleanup: None,
-        })
-    }
-
-    fn log(&mut self, record: PnlLogRecord) -> std::io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
-        let path = self.log_path();
-        let line = serde_json::to_string(&record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(file, "{line}")?;
-        self.maybe_cleanup();
-        Ok(())
-    }
-
-    /// Replay all retained pnl-*.jsonl files in chronological order to
-    /// reconstruct lifetime trade stats after a restart. Without this,
-    /// `total_trades`/`max_dd` reset to 0 on every process start and the
-    /// dashboard shows Trades=0 until a fresh exit is recorded. See
-    /// shigeo-nakamura/bot-strategy#33.
-    fn load_lifetime_stats(&self) -> LifetimeStats {
-        let mut stats = LifetimeStats::default();
-        let Ok(entries) = fs::read_dir(&self.dir) else {
-            return stats;
-        };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| is_pnl_log_file(p) && self.matches_tag(p))
-            .collect();
-        files.sort();
-        let mut records: Vec<PnlLogRecord> = Vec::new();
-        for path in files {
-            let Ok(content) = fs::read_to_string(&path) else {
-                continue;
-            };
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(rec) = serde_json::from_str::<PnlLogRecord>(line) {
-                    records.push(rec);
-                }
-            }
-        }
-        records.sort_by_key(|r| r.ts);
-        for rec in records {
-            stats.trades += 1;
-            stats.total_pnl += rec.pnl;
-            if rec.pnl > 0.0 {
-                stats.wins += 1;
-            }
-            if stats.total_pnl > stats.peak_pnl {
-                stats.peak_pnl = stats.total_pnl;
-            }
-            let dd = stats.peak_pnl - stats.total_pnl;
-            if dd > stats.max_dd {
-                stats.max_dd = dd;
-            }
-        }
-        stats
-    }
-
-    /// Returns true when `path`'s filename is for our tag. Filenames are
-    /// `pnl-<tag>-<date>.jsonl` or `pnl-<date>.jsonl`. Without this filter
-    /// one bot would inherit another bot's stats when they share a pnl
-    /// directory.
-    fn matches_tag(&self, path: &Path) -> bool {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            return false;
-        };
-        let Some(stem) = name
-            .strip_prefix("pnl-")
-            .and_then(|s| s.strip_suffix(".jsonl"))
-        else {
-            return false;
-        };
-        match &self.tag {
-            Some(tag) => stem
-                .strip_prefix(tag.as_str())
-                .and_then(|rest| rest.strip_prefix('-'))
-                .map(|date| !date.contains('-'))
-                .unwrap_or(false),
-            None => !stem.contains('-'),
-        }
-    }
-
-    fn log_path(&self) -> PathBuf {
-        let date = Utc::now().format("%Y%m%d").to_string();
-        let mut name = String::from("pnl");
-        if let Some(tag) = &self.tag {
-            name.push('-');
-            name.push_str(tag);
-        }
-        name.push('-');
-        name.push_str(&date);
-        name.push_str(".jsonl");
-        self.dir.join(name)
-    }
-
-    fn maybe_cleanup(&mut self) {
-        let due = self
-            .last_cleanup
-            .map(|t| t.elapsed() >= Duration::from_secs(21_600))
-            .unwrap_or(true);
-        if !due {
-            return;
-        }
-        self.last_cleanup = Some(Instant::now());
-        let cutoff = SystemTime::now()
-            .checked_sub(Duration::from_secs(self.retain_days.saturating_mul(86_400)))
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let Ok(entries) = fs::read_dir(&self.dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_pnl_log_file(&path) {
-                continue;
-            }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            let Ok(modified) = metadata.modified() else {
-                continue;
-            };
-            if modified < cutoff {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-}
-
-
-fn sanitize_pnl_tag(raw: &str) -> String {
-    raw.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn is_pnl_log_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    name.starts_with("pnl-") && name.ends_with(".jsonl")
-}
-
-fn direction_label(direction: PositionDirection) -> &'static str {
-    match direction {
-        PositionDirection::LongSpread => "long_spread",
-        PositionDirection::ShortSpread => "short_spread",
-    }
-}
-
-impl PnlLogRecord {
-    fn new(
-        base: &str,
-        quote: &str,
-        direction: PositionDirection,
-        pnl: f64,
-        ts: i64,
-        source: &str,
-    ) -> Self {
-        Self {
-            ts,
-            pair: format!("{}/{}", base, quote),
-            base: base.to_string(),
-            quote: quote.to_string(),
-            direction: direction_label(direction).to_string(),
-            pnl,
-            source: source.to_string(),
-            entry_price_a: None,
-            entry_price_b: None,
-            exit_price_a: None,
-            exit_price_b: None,
-            beta: None,
-            z_entry: None,
-            z_exit: None,
-            hold_secs: None,
-        }
-    }
-
-    fn with_trade_details(
-        mut self,
-        entry_a: Option<f64>,
-        entry_b: Option<f64>,
-        exit_a: Option<f64>,
-        exit_b: Option<f64>,
-        beta: Option<f64>,
-        z_entry: Option<f64>,
-        z_exit: Option<f64>,
-        hold_secs: Option<f64>,
-    ) -> Self {
-        self.entry_price_a = entry_a;
-        self.entry_price_b = entry_b;
-        self.exit_price_a = exit_a;
-        self.exit_price_b = exit_b;
-        self.beta = beta;
-        self.z_entry = z_entry;
-        self.z_exit = z_exit;
-        self.hold_secs = hold_secs;
-        self
-    }
-}
 
 pub struct PairTradeEngine {
     cfg: PairTradeConfig,

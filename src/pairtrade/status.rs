@@ -15,7 +15,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::config::PairTradeConfig;
-use super::sanitize_pnl_tag;
+use super::pnl_log::sanitize_pnl_tag;
 
 use std::env;
 
