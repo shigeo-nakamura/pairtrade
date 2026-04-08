@@ -23,15 +23,17 @@ mod bar;
 mod config;
 mod defaults;
 mod entry;
+mod exit;
 mod state;
 mod stats;
 mod status;
 mod util;
 use bar::BarBuilder;
 use entry::{entry_z_for_pair, should_enter};
+use exit::{compute_pnl, exit_reason};
 use stats::{regression_beta, spread_slope_sigma, tail_samples, PriceSample};
 pub use config::{PairTradeConfig, WarmStartMode};
-use config::{PairParams, PairSpec};
+use config::PairSpec;
 use defaults::*;
 use state::{
     PairState, PartialOrderPlacementError, PendingLeg, PendingOrders, PendingStatus, Position,
@@ -4511,22 +4513,22 @@ impl PairTradeEngine {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SymbolSnapshot {
-    price: Decimal,
-    funding_rate: Decimal,
-    bid_price: Option<Decimal>,
-    ask_price: Option<Decimal>,
-    bid_size: Decimal,
-    ask_size: Decimal,
-    min_order: Option<Decimal>,
-    min_tick: Option<Decimal>,
-    size_decimals: Option<u32>,
+pub(super) struct SymbolSnapshot {
+    pub(super) price: Decimal,
+    pub(super) funding_rate: Decimal,
+    pub(super) bid_price: Option<Decimal>,
+    pub(super) ask_price: Option<Decimal>,
+    pub(super) bid_size: Decimal,
+    pub(super) ask_size: Decimal,
+    pub(super) min_order: Option<Decimal>,
+    pub(super) min_tick: Option<Decimal>,
+    pub(super) size_decimals: Option<u32>,
     /// Exchange-side timestamp (Unix seconds) for the most recent price update
     /// from the connector. When `Some`, all bots observing the same feed see
     /// identical values for the same update — used to align bar buckets across
     /// processes (pairtrade#4).
     #[serde(default)]
-    exchange_ts: Option<i64>,
+    pub(super) exchange_ts: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -4545,89 +4547,6 @@ struct PairEvaluation {
     eligible: bool,
     score: f64,
     beta_gap: f64,
-}
-
-fn exit_reason(
-    cfg: &PairTradeConfig,
-    pp: &PairParams,
-    state: &PairState,
-    z: f64,
-    std: f64,
-    p1: &SymbolSnapshot,
-    p2: &SymbolSnapshot,
-    equity_base: f64,
-    now_ts: i64,
-) -> Option<&'static str> {
-    let pos = state.position.as_ref()?;
-    if z.abs() >= pp.stop_loss_z {
-        return Some("stop_loss_z");
-    }
-    if now_ts.saturating_sub(pos.entered_ts) >= pp.force_close_secs as i64 {
-        return Some("force_close");
-    }
-    if pp.exit_z > 0.0 && z.abs() <= pp.exit_z {
-        return Some("exit_z");
-    }
-    let pnl = compute_pnl(pos, p1.price, p2.price);
-    if let Some(pnl) = pnl {
-        let risk_budget = equity_base * cfg.risk_pct_per_trade;
-        if let Some(target) = Decimal::from_f64(risk_budget) {
-            if target > Decimal::ZERO {
-                if pp.max_loss_r_mult > 0.0 {
-                    let loss_mult = Decimal::from_f64(pp.max_loss_r_mult).unwrap_or(Decimal::ONE);
-                    let max_loss = -target * loss_mult;
-                    if pnl <= max_loss {
-                        return Some("max_loss_r");
-                    }
-                }
-                if pnl >= target {
-                    return Some("risk_budget");
-                }
-            }
-        }
-    }
-    if std > 1e-9 {
-        if let Some(pnl) = pnl {
-            if pnl > Decimal::ZERO {
-                let half_life_hours = state.half_life_hours;
-                if half_life_hours.is_finite() && half_life_hours > 0.0 {
-                    let elapsed_secs = now_ts.saturating_sub(pos.entered_ts).max(0) as f64;
-                    let remaining_secs = (pp.force_close_secs as f64) - elapsed_secs;
-                    if remaining_secs > 0.0 {
-                        let half_life_secs = half_life_hours * 3600.0;
-                        let k = (2.0_f64).ln() / half_life_secs;
-                        let decay = (-k * remaining_secs).exp();
-                        let expected_improvement = z.abs() * (1.0 - decay);
-                        let total_cost_bps = cfg.fee_bps * 2.0 + cfg.slippage_cost_bps() * 2.0;
-                        let cost_ratio = total_cost_bps / 10_000.0;
-                        let cost_in_sigma = cost_ratio / std;
-                        if expected_improvement <= cost_in_sigma {
-                            return Some("expected_value");
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn compute_pnl(pos: &Position, exit_price_a: Decimal, exit_price_b: Decimal) -> Option<Decimal> {
-    let entry_price_a = pos.entry_price_a?;
-    let entry_price_b = pos.entry_price_b?;
-    let entry_size_a = pos.entry_size_a?;
-    let entry_size_b = pos.entry_size_b?;
-    let (pnl_a, pnl_b) = match pos.direction {
-        PositionDirection::LongSpread => (
-            (exit_price_a - entry_price_a) * entry_size_a,
-            (entry_price_b - exit_price_b) * entry_size_b,
-        ),
-        PositionDirection::ShortSpread => (
-            (entry_price_a - exit_price_a) * entry_size_a,
-            (exit_price_b - entry_price_b) * entry_size_b,
-        ),
-    };
-    Some(pnl_a + pnl_b)
 }
 
 fn net_funding_for_direction(z: f64, p1: &SymbolSnapshot, p2: &SymbolSnapshot) -> f64 {
