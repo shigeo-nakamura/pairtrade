@@ -2730,6 +2730,26 @@ impl PairTradeEngine {
                                 self.open_positions.len(),
                                 self.cfg.shutdown_grace_secs
                             );
+                            // Surface per-position force_close ETA so operators can
+                            // see when each leg will be auto-flushed if it doesn't
+                            // exit naturally. See pairtrade#6.
+                            let now_ts = chrono::Utc::now().timestamp();
+                            for (key, state) in &self.states {
+                                if let Some(pos) = &state.position {
+                                    let pp = self.cfg.params_for(key);
+                                    let elapsed = now_ts.saturating_sub(pos.entered_ts).max(0);
+                                    let remaining =
+                                        (pp.force_close_secs as i64).saturating_sub(elapsed);
+                                    log::info!(
+                                        "[PAIR] shutdown: {} held={}s force_close_secs={} \
+                                         force_close_in={}s",
+                                        key,
+                                        elapsed,
+                                        pp.force_close_secs,
+                                        remaining.max(0),
+                                    );
+                                }
+                            }
                             self.shutdown_pending = true;
                             shutdown_deadline = Some(Instant::now() + grace);
                         } else {
