@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::{NaiveDate, Utc};
+use chrono::Utc;
 use dex_connector::{DexConnector, DexError, PositionSnapshot};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -23,6 +23,7 @@ mod bar;
 mod config;
 mod defaults;
 mod state;
+mod status;
 mod util;
 use bar::BarBuilder;
 pub use config::{PairTradeConfig, WarmStartMode};
@@ -31,6 +32,9 @@ use defaults::*;
 use state::{
     PairState, PartialOrderPlacementError, PendingLeg, PendingOrders, PendingStatus, Position,
     PositionDirection,
+};
+use status::{
+    PairTradeStats, ShutdownPosition, ShutdownStatus, StatusReporter,
 };
 use util::{
     half_life_and_p, quantize_size_by_step, quantize_size_by_step_ceiling,
@@ -67,17 +71,6 @@ struct PnlLogRecord {
     hold_secs: Option<f64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct EquityBaseline {
-    date: String,
-    equity: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct EquityHistoryPoint {
-    ts: i64,
-    equity: f64,
-}
 
 struct PnlLogger {
     dir: PathBuf,
@@ -95,93 +88,6 @@ struct LifetimeStats {
     max_dd: f64,
 }
 
-#[derive(Debug)]
-struct StatusReporter {
-    path: PathBuf,
-    id: Option<String>,
-    agent: Option<String>,
-    dex: String,
-    dry_run: bool,
-    backtest_mode: bool,
-    interval_secs: u64,
-    snapshot_every: Duration,
-    pnl_total: f64,
-    pnl_today: f64,
-    pnl_today_date: NaiveDate,
-    equity_day_start: f64,
-    equity_day_start_set: bool,
-    equity_baseline_path: PathBuf,
-    equity_history_path: PathBuf,
-    last_equity_history_ts: Option<i64>,
-    last_snapshot: Option<Instant>,
-    trade_stats: Option<PairTradeStats>,
-    maintenance: Option<String>,
-    shutdown: Option<ShutdownStatus>,
-}
-
-#[derive(Debug, Serialize)]
-struct StatusPosition {
-    symbol: String,
-    side: String,
-    size: String,
-    entry_price: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct StatusSnapshot {
-    ts: i64,
-    updated_at: String,
-    id: Option<String>,
-    agent: Option<String>,
-    dex: String,
-    dry_run: bool,
-    backtest_mode: bool,
-    interval_secs: u64,
-    positions_ready: bool,
-    position_count: usize,
-    has_position: bool,
-    positions: Vec<StatusPosition>,
-    pnl_total: f64,
-    pnl_today: f64,
-    pnl_source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    trade_stats: Option<PairTradeStats>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    maintenance: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    shutdown: Option<ShutdownStatus>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PairTradeStats {
-    trades: u64,
-    wins: u64,
-    win_rate: f64,
-    max_dd: f64,
-    pnl: f64,
-}
-
-/// Graceful shutdown status surfaced in the status snapshot so the
-/// dashboard can show when the bot is winding down and when each open
-/// leg will be auto-flushed by `force_close_secs`. See pairtrade#6.
-#[derive(Debug, Clone, Serialize)]
-struct ShutdownStatus {
-    pending: bool,
-    /// Unix timestamp (s) at which the grace window expires and any
-    /// remaining positions will be force-closed unconditionally.
-    grace_deadline_ts: i64,
-    /// Earliest force_close ETA across all open positions (Unix ts, s).
-    /// None when there are no open positions at shutdown start.
-    force_close_eta_ts: Option<i64>,
-    positions: Vec<ShutdownPosition>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ShutdownPosition {
-    key: String,
-    entered_ts: i64,
-    force_close_eta_ts: i64,
-}
 
 impl PnlLogger {
     fn from_env(cfg: &PairTradeConfig) -> Option<Self> {
@@ -356,291 +262,6 @@ impl PnlLogger {
     }
 }
 
-impl StatusReporter {
-    fn from_env(cfg: &PairTradeConfig) -> Option<Self> {
-        let enabled = env::var("DEBOT_STATUS_ENABLED")
-            .ok()
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                !(v == "0" || v == "false" || v == "no")
-            })
-            .unwrap_or(true);
-        if !enabled {
-            return None;
-        }
-
-        let id = env::var("DEBOT_STATUS_ID")
-            .ok()
-            .map(|v| sanitize_pnl_tag(&v))
-            .filter(|v| !v.is_empty());
-
-        let path = env::var("DEBOT_STATUS_PATH")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                env::var("DEBOT_STATUS_DIR")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .map(PathBuf::from)
-                    .map(|dir| match &id {
-                        Some(id) => dir.join(id).join("status.json"),
-                        None => dir.join("status.json"),
-                    })
-            })
-            .or_else(|| {
-                env::var("HOME")
-                    .ok()
-                    .map(|home| PathBuf::from(home).join("debot_status"))
-                    .map(|base| match &id {
-                        Some(id) => base.join(id).join("status.json"),
-                        None => base.join("status.json"),
-                    })
-            })
-            .unwrap_or_else(|| PathBuf::from("status.json"));
-
-        let equity_baseline_path = path.with_extension("equity.json");
-        let equity_history_path = path.with_extension("equity_history.jsonl");
-        let interval_secs = cfg.interval_secs.max(1);
-        let snapshot_every = {
-            let target_secs = 60_u64;
-            let n = ((target_secs + interval_secs - 1) / interval_secs).max(1);
-            Duration::from_secs(interval_secs.saturating_mul(n).max(1))
-        };
-
-        let mut reporter = Self {
-            path,
-            id,
-            agent: cfg.agent_name.clone(),
-            dex: cfg.dex_name.clone(),
-            dry_run: cfg.dry_run,
-            backtest_mode: cfg.backtest_mode,
-            interval_secs: cfg.interval_secs,
-            snapshot_every,
-            pnl_total: 0.0,
-            pnl_today: 0.0,
-            pnl_today_date: Utc::now().date_naive(),
-            equity_day_start: 0.0,
-            equity_day_start_set: false,
-            equity_baseline_path,
-            equity_history_path,
-            last_equity_history_ts: None,
-            last_snapshot: None,
-            trade_stats: Some(PairTradeStats {
-                trades: 0,
-                wins: 0,
-                win_rate: 0.0,
-                max_dd: 0.0,
-                pnl: 0.0,
-            }),
-            maintenance: None,
-            shutdown: None,
-        };
-        reporter.load_equity_baseline();
-        if let Err(err) = reporter.ensure_status_file() {
-            log::warn!(
-                "[STATUS] failed to create status file {}: {:?}",
-                reporter.path.display(),
-                err
-            );
-        }
-        Some(reporter)
-    }
-
-    fn ensure_status_file(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        Ok(())
-    }
-
-    fn load_equity_baseline(&mut self) {
-        let Ok(payload) = fs::read_to_string(&self.equity_baseline_path) else {
-            return;
-        };
-        let Ok(baseline) = serde_json::from_str::<EquityBaseline>(&payload) else {
-            return;
-        };
-        let Ok(date) = NaiveDate::parse_from_str(&baseline.date, "%Y-%m-%d") else {
-            return;
-        };
-        self.equity_day_start = baseline.equity;
-        self.pnl_today_date = date;
-        self.equity_day_start_set = true;
-    }
-
-    fn persist_equity_baseline(&self) {
-        let baseline = EquityBaseline {
-            date: self.pnl_today_date.format("%Y-%m-%d").to_string(),
-            equity: self.equity_day_start,
-        };
-        let payload = match serde_json::to_string(&baseline) {
-            Ok(v) => v,
-            Err(err) => {
-                log::warn!("[STATUS] failed to encode equity baseline: {:?}", err);
-                return;
-            }
-        };
-        if let Some(parent) = self.equity_baseline_path.parent() {
-            if let Err(err) = fs::create_dir_all(parent) {
-                log::warn!("[STATUS] failed to create equity baseline dir: {:?}", err);
-                return;
-            }
-        }
-        let tmp_path = self.equity_baseline_path.with_extension("equity.json.tmp");
-        if let Err(err) = fs::write(&tmp_path, payload) {
-            log::warn!("[STATUS] failed to write equity baseline: {:?}", err);
-            return;
-        }
-        if let Err(err) = fs::rename(&tmp_path, &self.equity_baseline_path) {
-            log::warn!("[STATUS] failed to finalize equity baseline: {:?}", err);
-        }
-    }
-
-    fn append_equity_history(&mut self, equity: f64) {
-        let ts = Utc::now().timestamp_millis();
-        if self.last_equity_history_ts == Some(ts) {
-            return;
-        }
-        self.last_equity_history_ts = Some(ts);
-        let point = EquityHistoryPoint { ts, equity };
-        let line = match serde_json::to_string(&point) {
-            Ok(v) => v,
-            Err(err) => {
-                log::warn!("[STATUS] failed to encode equity history: {:?}", err);
-                return;
-            }
-        };
-        if let Some(parent) = self.equity_history_path.parent() {
-            if let Err(err) = fs::create_dir_all(parent) {
-                log::warn!("[STATUS] failed to create equity history dir: {:?}", err);
-                return;
-            }
-        }
-        let mut file = match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.equity_history_path)
-        {
-            Ok(f) => f,
-            Err(err) => {
-                log::warn!("[STATUS] failed to open equity history: {:?}", err);
-                return;
-            }
-        };
-        if writeln!(file, "{line}").is_err() {
-            log::warn!("[STATUS] failed to write equity history");
-        }
-    }
-
-    fn update_equity(&mut self, equity: f64) {
-        let today = Utc::now().date_naive();
-        self.pnl_total = equity;
-        if !self.equity_day_start_set || self.pnl_today_date != today {
-            self.pnl_today_date = today;
-            self.equity_day_start = equity;
-            self.equity_day_start_set = true;
-            self.persist_equity_baseline();
-        }
-        if self.equity_day_start_set {
-            self.pnl_today = equity - self.equity_day_start;
-        }
-        self.append_equity_history(equity);
-    }
-
-    fn set_maintenance(&mut self, status: Option<String>) {
-        self.maintenance = status;
-    }
-
-    fn set_shutdown_status(&mut self, status: Option<ShutdownStatus>) {
-        self.shutdown = status;
-    }
-
-    fn write_snapshot(
-        &mut self,
-        open_positions: &HashMap<String, PositionSnapshot>,
-        positions_ready: bool,
-    ) -> std::io::Result<()> {
-        self.reset_daily_if_needed();
-        let positions: Vec<StatusPosition> = open_positions
-            .values()
-            .filter(|pos| pos.sign != 0 && pos.size > Decimal::ZERO)
-            .map(|pos| StatusPosition {
-                symbol: pos.symbol.clone(),
-                side: match pos.sign.cmp(&0) {
-                    Ordering::Greater => "LONG".to_string(),
-                    Ordering::Less => "SHORT".to_string(),
-                    Ordering::Equal => "FLAT".to_string(),
-                },
-                size: pos.size.to_string(),
-                entry_price: pos.entry_price.map(|v| v.to_string()),
-            })
-            .collect();
-        let snapshot = StatusSnapshot {
-            ts: Utc::now().timestamp(),
-            updated_at: Utc::now().to_rfc3339(),
-            id: self.id.clone(),
-            agent: self.agent.clone(),
-            dex: self.dex.clone(),
-            dry_run: self.dry_run,
-            backtest_mode: self.backtest_mode,
-            interval_secs: self.interval_secs,
-            positions_ready,
-            position_count: positions.len(),
-            has_position: !positions.is_empty(),
-            positions,
-            pnl_total: self.pnl_total,
-            pnl_today: self.pnl_today,
-            pnl_source: "equity".to_string(),
-            trade_stats: self.trade_stats.clone(),
-            maintenance: self.maintenance.clone(),
-            shutdown: self.shutdown.clone(),
-        };
-        let payload = serde_json::to_string(&snapshot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp_path = self.path.with_extension("json.tmp");
-        fs::write(&tmp_path, payload)?;
-        fs::rename(tmp_path, &self.path)?;
-        Ok(())
-    }
-
-    fn write_snapshot_if_due(
-        &mut self,
-        open_positions: &HashMap<String, PositionSnapshot>,
-        positions_ready: bool,
-    ) -> std::io::Result<bool> {
-        let due = self
-            .last_snapshot
-            .map(|t| t.elapsed() >= self.snapshot_every)
-            .unwrap_or(true);
-        if !due {
-            return Ok(false);
-        }
-        self.write_snapshot(open_positions, positions_ready)?;
-        self.last_snapshot = Some(Instant::now());
-        Ok(true)
-    }
-
-    fn reset_daily_if_needed(&mut self) {
-        if !self.equity_day_start_set {
-            return;
-        }
-        let today = Utc::now().date_naive();
-        if today != self.pnl_today_date {
-            self.pnl_today_date = today;
-            self.equity_day_start = self.pnl_total;
-            self.persist_equity_baseline();
-        }
-        self.pnl_today = self.pnl_total - self.equity_day_start;
-    }
-}
 
 fn sanitize_pnl_tag(raw: &str) -> String {
     raw.chars()
