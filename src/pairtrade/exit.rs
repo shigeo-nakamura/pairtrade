@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 
 use super::config::{PairParams, PairTradeConfig};
 use super::state::{PairState, Position, PositionDirection};
-use super::SymbolSnapshot;
+use super::market::SymbolSnapshot;
 
 pub(super) fn exit_reason(
     cfg: &PairTradeConfig,
