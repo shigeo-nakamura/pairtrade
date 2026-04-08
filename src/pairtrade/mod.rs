@@ -20,61 +20,14 @@ use crate::email_client::EmailClient;
 use crate::ports::replay_dex::ReplayConnector;
 use crate::trade::execution::dex_connector_box::DexConnectorBox;
 
+mod defaults;
 mod util;
+use defaults::*;
 use util::{
     half_life_and_p, mean_std, quantize_size_by_step, quantize_size_by_step_ceiling,
     round_price_by_tick, tail_std,
 };
 
-const DEFAULT_INTERVAL_SECS: u64 = 20;
-const DEFAULT_TRADING_PERIOD_SECS: u64 = 60;
-const DEFAULT_METRICS_WINDOW: usize = 240;
-const DEFAULT_ENTRY_Z_BASE: f64 = 2.0;
-const DEFAULT_ENTRY_Z_MIN: f64 = 1.8;
-const DEFAULT_ENTRY_Z_MAX: f64 = 2.3;
-const DEFAULT_EXIT_Z: f64 = 0.5;
-const DEFAULT_STOP_LOSS_Z: f64 = 3.3;
-const DEFAULT_FORCE_CLOSE_SECS: u64 = 3600;
-const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 3660; // DEFAULT_FORCE_CLOSE_SECS + 60s buffer
-const DEFAULT_COOLDOWN_SECS: u64 = 30;
-const MAX_EXIT_RETRIES: u32 = 3;
-const DEFAULT_NET_FUNDING_MIN_PER_HOUR: f64 = -0.005;
-const DEFAULT_SPREAD_VELOCITY_MAX_SIGMA_PER_MIN: f64 = 0.1;
-const DEFAULT_NOTIONAL_PER_LEG: f64 = 100.0;
-const DEFAULT_RISK_PCT_PER_TRADE: f64 = 0.01;
-const DEFAULT_MAX_LOSS_R_MULT: f64 = 1.0;
-const DEFAULT_EQUITY_USD: f64 = 10_000.0;
-const DEFAULT_LOOKBACK_HOURS_SHORT: u64 = 4;
-const DEFAULT_LOOKBACK_HOURS_LONG: u64 = 24;
-const DEFAULT_HALF_LIFE_MAX_HOURS: f64 = 1.5;
-const DEFAULT_ADF_P_THRESHOLD: f64 = 0.05;
-const PAIR_SELECTION_INTERVAL_SECS: u64 = 3600;
-const DEFAULT_ENTRY_VOL_LOOKBACK_HOURS: u64 = 24;
-const DEFAULT_SLIPPAGE_BPS: i32 = 0;
-const DEFAULT_FEE_BPS: f64 = 0.0;
-const DEFAULT_MAX_LEVERAGE: f64 = 5.0;
-const DEFAULT_REEVAL_JUMP_Z_MULT: f64 = 1.5;
-const DEFAULT_VOL_SPIKE_MULT: f64 = 2.5;
-const DEFAULT_MAX_ACTIVE_PAIRS: usize = 3;
-const DEFAULT_WARM_START_MODE: &str = "strict";
-const DEFAULT_ORDER_TIMEOUT_SECS: u64 = 120;
-const DEFAULT_ENTRY_PARTIAL_FILL_MAX_RETRIES: u32 = 3;
-const DEFAULT_FORCE_CLOSE_ON_STARTUP: bool = true;
-const DEFAULT_STARTUP_FORCE_CLOSE_ATTEMPTS: u32 = 3;
-const DEFAULT_STARTUP_FORCE_CLOSE_WAIT_SECS: u64 = 3;
-const POST_ONLY_ENTRY_ATTEMPTS: usize = 3;
-const POST_ONLY_EXIT_ATTEMPTS: usize = 3;
-const POST_ONLY_RETRY_DELAY_MS: u64 = 200;
-const POST_ONLY_RETRY_MAX_ELAPSED_MS: u64 = 1500;
-const DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA: f64 = 0.5;
-const DEFAULT_BETA_DIVERGENCE_MAX: f64 = 0.15;
-const DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES: u32 = 3;
-const DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 1800;
-const DEFAULT_CB_TIER1_LOSSES: u32 = 0;
-const DEFAULT_CB_TIER1_COOLDOWN_SECS: u64 = 0;
-const DEFAULT_CB_TIER2_LOSSES: u32 = 0;
-const DEFAULT_CB_TIER2_COOLDOWN_SECS: u64 = 0;
-const DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS: u64 = 0;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
