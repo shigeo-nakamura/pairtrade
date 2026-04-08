@@ -23,9 +23,11 @@ mod bar;
 mod config;
 mod defaults;
 mod state;
+mod stats;
 mod status;
 mod util;
 use bar::BarBuilder;
+use stats::{regression_beta, spread_slope_sigma, tail_samples, PriceSample};
 pub use config::{PairTradeConfig, WarmStartMode};
 use config::{PairParams, PairSpec};
 use defaults::*;
@@ -4531,19 +4533,6 @@ struct DataDumpEntry<'a> {
     prices: &'a HashMap<String, SymbolSnapshot>,
 }
 
-#[derive(Debug, Clone)]
-struct PriceSample {
-    log_price: f64,
-    ts: i64,
-}
-
-fn tail_samples(history: &VecDeque<PriceSample>, len: usize) -> Vec<PriceSample> {
-    let take = len.min(history.len());
-    let mut v: Vec<PriceSample> = history.iter().rev().take(take).cloned().collect();
-    v.reverse();
-    v
-}
-
 #[derive(Debug)]
 struct PairEvaluation {
     beta_short: f64,
@@ -4554,33 +4543,6 @@ struct PairEvaluation {
     eligible: bool,
     score: f64,
     beta_gap: f64,
-}
-
-fn regression_beta(x: &[PriceSample], y: &[PriceSample]) -> f64 {
-    let n = x.len().min(y.len());
-    if n < 2 {
-        return 1.0;
-    }
-    let (mut sum_x, mut sum_y) = (0.0, 0.0);
-    for i in 0..n {
-        sum_x += x[i].log_price;
-        sum_y += y[i].log_price;
-    }
-    let mean_x = sum_x / n as f64;
-    let mean_y = sum_y / n as f64;
-    let mut cov = 0.0;
-    let mut var_x = 0.0;
-    for i in 0..n {
-        let dx = x[i].log_price - mean_x;
-        let dy = y[i].log_price - mean_y;
-        cov += dx * dy;
-        var_x += dx * dx;
-    }
-    if var_x.abs() < 1e-9 {
-        1.0
-    } else {
-        (cov / var_x).clamp(0.1, 10.0)
-    }
 }
 
 fn entry_z_for_pair(
@@ -4595,42 +4557,6 @@ fn entry_z_for_pair(
     let alpha = (vol_pair / vol_median).clamp(0.5, 2.0);
     let z = pp.entry_z_base * alpha;
     z.clamp(pp.entry_z_min, pp.entry_z_max)
-}
-
-fn spread_slope_sigma(history: &VecDeque<f64>, window: usize) -> Option<f64> {
-    let len = history.len().min(window);
-    if len < 3 {
-        return None;
-    }
-    let start = history.len() - len;
-    let n = len as f64;
-    let mean_i = (n - 1.0) / 2.0;
-    let (mut mean_x, mut cov, mut var_i) = (0.0, 0.0, 0.0);
-    for j in 0..len {
-        mean_x += history[start + j];
-    }
-    mean_x /= n;
-    for j in 0..len {
-        let di = j as f64 - mean_i;
-        let dx = history[start + j] - mean_x;
-        cov += di * dx;
-        var_i += di * di;
-    }
-    if var_i.abs() < 1e-15 {
-        return None;
-    }
-    let slope = cov / var_i;
-    // std of history slice
-    let mut sum_sq = 0.0;
-    for j in 0..len {
-        let dx = history[start + j] - mean_x;
-        sum_sq += dx * dx;
-    }
-    let std = (sum_sq / n).max(0.0).sqrt();
-    if std < 1e-9 {
-        return None;
-    }
-    Some((slope / std).abs())
 }
 
 fn should_enter(
