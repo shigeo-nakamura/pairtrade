@@ -6,7 +6,6 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -23,6 +22,7 @@ mod config;
 mod defaults;
 mod entry;
 mod exit;
+mod history_io;
 mod market;
 mod pair_eval;
 mod pnl_log;
@@ -2179,94 +2179,19 @@ impl PairTradeEngine {
     }
 
     fn persist_history_to_disk(&self) {
-        if self.cfg.disable_history_persist {
-            return;
-        }
-        // Backtest replay re-drives this per tick, producing hundreds of
-        // thousands of disk writes per run. That serialises a grid of
-        // concurrent backtest processes on ext4 and leaves them wedged in
-        // `Dl` state. The persisted file is only consumed by peer live bots
-        // for A/B/C alignment, which is irrelevant under replay.
-        if self.cfg.backtest_mode {
-            return;
-        }
-        let mut snapshot: HashMap<String, Vec<(f64, i64)>> = HashMap::new();
-        for (sym, deque) in &self.history {
-            let v: Vec<(f64, i64)> = deque.iter().map(|p| (p.log_price, p.ts)).collect();
-            snapshot.insert(sym.clone(), v);
-        }
-        if let Ok(json) = serde_json::to_string(&snapshot) {
-            // Atomic write: tmpfile in the same directory + rename. Multiple
-            // bots may be writing this shared file concurrently (pairtrade#4);
-            // rename guarantees readers never observe a torn JSON document.
-            let path = std::path::Path::new(&self.history_path);
-            let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-            let file_name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "pairtrade_history.json".to_string());
-            let tmp = dir.join(format!(".{}.tmp.{}", file_name, std::process::id()));
-            if let Err(e) = fs::write(&tmp, json) {
-                log::debug!("persist history tmp write failed: {:?}", e);
-                return;
-            }
-            if let Err(e) = fs::rename(&tmp, path) {
-                log::debug!("persist history rename failed: {:?}", e);
-                let _ = fs::remove_file(&tmp);
-            }
-        }
+        history_io::persist_history_to_disk(&self.cfg, &self.history, &self.history_path);
     }
 
     fn load_history_from_disk(&mut self) {
-        if self.cfg.disable_history_persist {
-            return;
-        }
-        // Skip persisted-history loading entirely under backtest replay: the
-        // file's timestamps reflect the wall clock at dump time and would
-        // always look stale relative to the replayed cursor, producing
-        // millions of WARN lines without contributing anything useful (the
-        // replay data already supplies a clean, gap-free history).
-        if self.cfg.backtest_mode {
-            return;
-        }
-        let path = &self.history_path;
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let parsed: Result<HashMap<String, Vec<(f64, i64)>>, _> = serde_json::from_str(&content);
-        let Ok(map) = parsed else {
-            return;
-        };
         let now = self.current_now_ts();
-        let max_age_secs =
-            (self.max_history_len() as i64).saturating_mul(self.cfg.trading_period_secs as i64);
-        // Stale-history guard (pairtrade#4): if the newest sample for a symbol
-        // is older than a few bars, the persisted file is from a stopped bot
-        // and replaying it would freeze a stale rolling window. Drop it and
-        // let the live feed warm up from scratch.
-        let stale_threshold_secs =
-            (self.cfg.trading_period_secs as i64).saturating_mul(5).max(60);
-        for (sym, entries) in map {
-            let newest_ts = entries.iter().map(|(_, ts)| *ts).max().unwrap_or(0);
-            if now.saturating_sub(newest_ts) > stale_threshold_secs {
-                log::warn!(
-                    "discarding stale persisted history for {}: newest sample {}s old",
-                    sym,
-                    now.saturating_sub(newest_ts)
-                );
-                continue;
-            }
-            let mut deque = VecDeque::new();
-            for (log_price, ts) in entries {
-                if now.saturating_sub(ts) > max_age_secs {
-                    continue;
-                }
-                deque.push_back(PriceSample { log_price, ts });
-            }
-            if !deque.is_empty() {
-                self.history.insert(sym, deque);
-            }
-        }
+        let max_len = self.max_history_len();
+        history_io::load_history_from_disk(
+            &self.cfg,
+            &mut self.history,
+            &self.history_path,
+            now,
+            max_len,
+        );
     }
 
     /// Rebuild each pair's beta and spread_history from the shared on-disk
