@@ -25,6 +25,7 @@ mod defaults;
 mod entry;
 mod exit;
 mod market;
+mod sizing;
 mod state;
 mod stats;
 mod status;
@@ -3311,46 +3312,7 @@ impl PairTradeEngine {
         p1: &SymbolSnapshot,
         p2: &SymbolSnapshot,
     ) -> Result<(Decimal, Decimal)> {
-        let total_risk = self.equity_cache.max(self.cfg.equity_usd)
-            * self.cfg.risk_pct_per_trade
-            * self.cfg.max_leverage;
-        let leg_notional = (total_risk / 2.0).max(10.0);
-        let notional =
-            Decimal::from_f64(leg_notional).ok_or_else(|| anyhow!("invalid notional"))?;
-
-        let qty_a = if p1.price == Decimal::ZERO {
-            Decimal::ZERO
-        } else {
-            let mut qty = notional / p1.price;
-            if let Some(decimals) = p1.size_decimals {
-                qty = qty.round_dp(decimals);
-            }
-            if let Some(min_ord) = p1.min_order {
-                if qty > Decimal::ZERO && qty < min_ord {
-                    qty = min_ord;
-                }
-            }
-            qty
-        };
-        // Compute qty_b from the actual notional of leg A (after min_order adjustment)
-        // so that the hedge ratio matches beta: notional_b = notional_a * beta
-        let actual_notional_a = qty_a * p1.price;
-        let qty_b = if p2.price == Decimal::ZERO {
-            Decimal::ZERO
-        } else {
-            let beta_dec = Decimal::from_f64(beta.abs()).unwrap_or(Decimal::ONE);
-            let mut qty = (actual_notional_a * beta_dec) / p2.price;
-            if let Some(decimals) = p2.size_decimals {
-                qty = qty.round_dp(decimals);
-            }
-            if let Some(min_ord) = p2.min_order {
-                if qty > Decimal::ZERO && qty < min_ord {
-                    qty = min_ord;
-                }
-            }
-            qty
-        };
-        Ok((qty_a, qty_b))
+        sizing::hedged_sizes(&self.cfg, self.equity_cache, beta, p1, p2)
     }
 
     fn post_only_supported(&self) -> bool {
