@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::error::Error;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -23,39 +22,22 @@ use crate::trade::execution::dex_connector_box::DexConnectorBox;
 mod bar;
 mod config;
 mod defaults;
+mod state;
 mod util;
 use bar::BarBuilder;
 pub use config::{PairTradeConfig, WarmStartMode};
 use config::{PairParams, PairSpec};
 use defaults::*;
+use state::{
+    PartialOrderPlacementError, PendingLeg, PendingOrders, PendingStatus, Position,
+    PositionDirection,
+};
 use util::{
     half_life_and_p, mean_std, quantize_size_by_step, quantize_size_by_step_ceiling,
     round_price_by_tick, tail_std,
 };
 
 
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PositionDirection {
-    LongSpread,
-    ShortSpread,
-}
-
-#[derive(Debug, Clone)]
-struct Position {
-    direction: PositionDirection,
-    entered_at: Instant,
-    /// Replay-aware entry timestamp (seconds). In live mode equals
-    /// `chrono::Utc::now().timestamp()` at the moment of entry; in backtest
-    /// mode equals the replay's logical timestamp. Used for all
-    /// duration-based decisions (force_close, hold-time PnL, etc.) so they
-    /// behave identically under replay.
-    entered_ts: i64,
-    entry_price_a: Option<Decimal>,
-    entry_price_b: Option<Decimal>,
-    entry_size_a: Option<Decimal>,
-    entry_size_b: Option<Decimal>,
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct PnlLogRecord {
@@ -764,62 +746,6 @@ struct PairState {
     pending_entry: Option<PendingOrders>,
     pending_exit: Option<PendingOrders>,
     position_guard: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PendingLeg {
-    symbol: String,
-    order_id: String,
-    exchange_order_id: Option<String>,
-    target: Decimal,
-    filled: Decimal,
-    side: dex_connector::OrderSide,
-    #[allow(dead_code)]
-    placed_price: Decimal,
-}
-
-#[derive(Debug)]
-struct PendingOrders {
-    legs: Vec<PendingLeg>,
-    direction: PositionDirection,
-    placed_at: Instant,
-    hedge_retry_count: u32,
-    post_only_hybrid: bool,
-}
-
-#[derive(Debug)]
-struct PendingStatus {
-    open_remaining: usize,
-    fills: HashMap<String, Decimal>,
-    open_ids: HashSet<String>,
-}
-
-#[derive(Debug)]
-struct PartialOrderPlacementError {
-    legs: Vec<PendingLeg>,
-    source: DexError,
-}
-
-impl PartialOrderPlacementError {
-    fn new(legs: Vec<PendingLeg>, source: DexError) -> Self {
-        Self { legs, source }
-    }
-
-    fn legs(&self) -> &[PendingLeg] {
-        &self.legs
-    }
-}
-
-impl std::fmt::Display for PartialOrderPlacementError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "failed to place all legs: {}", self.source)
-    }
-}
-
-impl Error for PartialOrderPlacementError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
-    }
 }
 
 impl PairState {
