@@ -10,6 +10,41 @@ use std::env;
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
+/// Resolved per-pair parameters (global defaults merged with any pair-specific overrides).
+#[derive(Debug, Clone)]
+pub struct PairParams {
+    pub entry_z_base: f64,
+    pub entry_z_min: f64,
+    pub entry_z_max: f64,
+    pub exit_z: f64,
+    pub stop_loss_z: f64,
+    pub force_close_secs: u64,
+    pub cooldown_secs: u64,
+    pub max_loss_r_mult: f64,
+    pub half_life_max_hours: f64,
+    pub adf_p_threshold: f64,
+    pub spread_velocity_max_sigma_per_min: f64,
+    pub spread_trend_max_slope_sigma: f64,
+    pub beta_divergence_max: f64,
+    pub beta_min: f64,
+    pub hedge_ratio_max_deviation: f64,
+    pub lookback_hours_short: u64,
+    pub lookback_hours_long: u64,
+    pub entry_vol_lookback_hours: u64,
+    pub warm_start_min_bars: usize,
+    pub reeval_jump_z_mult: f64,
+    pub vol_spike_mult: f64,
+    pub circuit_breaker_tier1_losses: u32,
+    pub circuit_breaker_tier1_cooldown_secs: u64,
+    pub circuit_breaker_tier2_losses: u32,
+    pub circuit_breaker_tier2_cooldown_secs: u64,
+    pub entry_post_only_timeout_secs: u64,
+    // Phase 2 filters (0.0 = disabled)
+    pub entry_velocity_block_sigma_per_min: f64,
+    pub funding_entry_z_scale: f64,
+    pub beta_gap_entry_z_scale: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PairSpec {
     pub base: String,
