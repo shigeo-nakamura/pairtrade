@@ -1255,6 +1255,15 @@ struct PnlLogger {
     last_cleanup: Option<Instant>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct LifetimeStats {
+    trades: u64,
+    wins: u64,
+    total_pnl: f64,
+    peak_pnl: f64,
+    max_dd: f64,
+}
+
 #[derive(Debug)]
 struct StatusReporter {
     path: PathBuf,
@@ -1395,6 +1404,79 @@ impl PnlLogger {
         writeln!(file, "{line}")?;
         self.maybe_cleanup();
         Ok(())
+    }
+
+    /// Replay all retained pnl-*.jsonl files in chronological order to
+    /// reconstruct lifetime trade stats after a restart. Without this,
+    /// `total_trades`/`max_dd` reset to 0 on every process start and the
+    /// dashboard shows Trades=0 until a fresh exit is recorded. See
+    /// shigeo-nakamura/bot-strategy#33.
+    fn load_lifetime_stats(&self) -> LifetimeStats {
+        let mut stats = LifetimeStats::default();
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return stats;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_pnl_log_file(p) && self.matches_tag(p))
+            .collect();
+        files.sort();
+        let mut records: Vec<PnlLogRecord> = Vec::new();
+        for path in files {
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(rec) = serde_json::from_str::<PnlLogRecord>(line) {
+                    records.push(rec);
+                }
+            }
+        }
+        records.sort_by_key(|r| r.ts);
+        for rec in records {
+            stats.trades += 1;
+            stats.total_pnl += rec.pnl;
+            if rec.pnl > 0.0 {
+                stats.wins += 1;
+            }
+            if stats.total_pnl > stats.peak_pnl {
+                stats.peak_pnl = stats.total_pnl;
+            }
+            let dd = stats.peak_pnl - stats.total_pnl;
+            if dd > stats.max_dd {
+                stats.max_dd = dd;
+            }
+        }
+        stats
+    }
+
+    /// Returns true when `path`'s filename is for our tag. Filenames are
+    /// `pnl-<tag>-<date>.jsonl` or `pnl-<date>.jsonl`. Without this filter
+    /// one bot would inherit another bot's stats when they share a pnl
+    /// directory.
+    fn matches_tag(&self, path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let Some(stem) = name
+            .strip_prefix("pnl-")
+            .and_then(|s| s.strip_suffix(".jsonl"))
+        else {
+            return false;
+        };
+        match &self.tag {
+            Some(tag) => stem
+                .strip_prefix(tag.as_str())
+                .and_then(|rest| rest.strip_prefix('-'))
+                .map(|date| !date.contains('-'))
+                .unwrap_or(false),
+            None => !stem.contains('-'),
+        }
     }
 
     fn log_path(&self) -> PathBuf {
@@ -2114,7 +2196,32 @@ impl PairTradeEngine {
 
         let backtest_mode = cfg.backtest_mode;
         let pnl_logger = PnlLogger::from_env(&cfg);
-        let status_reporter = StatusReporter::from_env(&cfg);
+        let mut status_reporter = StatusReporter::from_env(&cfg);
+
+        // Restore lifetime trade stats from the on-disk pnl log so the
+        // dashboard's Trades / Win Rate / Max DD survive process restarts.
+        // Without this, every restart resets counts to 0 and the dashboard
+        // shows Trades=0 until a fresh exit lands. shigeo-nakamura/bot-strategy#33
+        let lifetime = pnl_logger
+            .as_ref()
+            .filter(|_| !backtest_mode)
+            .map(|l| l.load_lifetime_stats())
+            .unwrap_or_default();
+        if let Some(reporter) = status_reporter.as_mut() {
+            let win_rate = if lifetime.trades > 0 {
+                lifetime.wins as f64 / lifetime.trades as f64 * 100.0
+            } else {
+                0.0
+            };
+            reporter.trade_stats = Some(PairTradeStats {
+                trades: lifetime.trades,
+                wins: lifetime.wins,
+                win_rate,
+                max_dd: lifetime.max_dd,
+                pnl: lifetime.total_pnl,
+            });
+        }
+
         Ok(Self {
             cfg,
             connector,
@@ -2139,11 +2246,11 @@ impl PairTradeEngine {
             consecutive_losses: 0,
             circuit_breaker_until: None,
             circuit_breaker_until_ts: None,
-            total_trades: 0,
-            total_wins: 0,
-            total_pnl: 0.0,
-            peak_pnl: 0.0,
-            max_dd: 0.0,
+            total_trades: lifetime.trades,
+            total_wins: lifetime.wins,
+            total_pnl: lifetime.total_pnl,
+            peak_pnl: lifetime.peak_pnl,
+            max_dd: lifetime.max_dd,
             shutdown_pending: false,
         })
     }
