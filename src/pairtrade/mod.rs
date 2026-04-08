@@ -1564,6 +1564,7 @@ struct StatusReporter {
     last_snapshot: Option<Instant>,
     trade_stats: Option<PairTradeStats>,
     maintenance: Option<String>,
+    shutdown: Option<ShutdownStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1595,6 +1596,8 @@ struct StatusSnapshot {
     trade_stats: Option<PairTradeStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     maintenance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shutdown: Option<ShutdownStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1604,6 +1607,28 @@ struct PairTradeStats {
     win_rate: f64,
     max_dd: f64,
     pnl: f64,
+}
+
+/// Graceful shutdown status surfaced in the status snapshot so the
+/// dashboard can show when the bot is winding down and when each open
+/// leg will be auto-flushed by `force_close_secs`. See pairtrade#6.
+#[derive(Debug, Clone, Serialize)]
+struct ShutdownStatus {
+    pending: bool,
+    /// Unix timestamp (s) at which the grace window expires and any
+    /// remaining positions will be force-closed unconditionally.
+    grace_deadline_ts: i64,
+    /// Earliest force_close ETA across all open positions (Unix ts, s).
+    /// None when there are no open positions at shutdown start.
+    force_close_eta_ts: Option<i64>,
+    positions: Vec<ShutdownPosition>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ShutdownPosition {
+    key: String,
+    entered_ts: i64,
+    force_close_eta_ts: i64,
 }
 
 impl PnlLogger {
@@ -1784,6 +1809,7 @@ impl StatusReporter {
                 pnl: 0.0,
             }),
             maintenance: None,
+            shutdown: None,
         };
         reporter.load_equity_baseline();
         if let Err(err) = reporter.ensure_status_file() {
@@ -1905,6 +1931,10 @@ impl StatusReporter {
         self.maintenance = status;
     }
 
+    fn set_shutdown_status(&mut self, status: Option<ShutdownStatus>) {
+        self.shutdown = status;
+    }
+
     fn write_snapshot(
         &mut self,
         open_positions: &HashMap<String, PositionSnapshot>,
@@ -1943,6 +1973,7 @@ impl StatusReporter {
             pnl_source: "equity".to_string(),
             trade_stats: self.trade_stats.clone(),
             maintenance: self.maintenance.clone(),
+            shutdown: self.shutdown.clone(),
         };
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -2734,12 +2765,17 @@ impl PairTradeEngine {
                             // see when each leg will be auto-flushed if it doesn't
                             // exit naturally. See pairtrade#6.
                             let now_ts = chrono::Utc::now().timestamp();
+                            let grace_deadline_ts =
+                                now_ts + self.cfg.shutdown_grace_secs as i64;
+                            let mut shutdown_positions: Vec<ShutdownPosition> = Vec::new();
                             for (key, state) in &self.states {
                                 if let Some(pos) = &state.position {
                                     let pp = self.cfg.params_for(key);
                                     let elapsed = now_ts.saturating_sub(pos.entered_ts).max(0);
                                     let remaining =
                                         (pp.force_close_secs as i64).saturating_sub(elapsed);
+                                    let eta_ts =
+                                        pos.entered_ts + pp.force_close_secs as i64;
                                     log::info!(
                                         "[PAIR] shutdown: {} held={}s force_close_secs={} \
                                          force_close_in={}s",
@@ -2748,7 +2784,24 @@ impl PairTradeEngine {
                                         pp.force_close_secs,
                                         remaining.max(0),
                                     );
+                                    shutdown_positions.push(ShutdownPosition {
+                                        key: key.clone(),
+                                        entered_ts: pos.entered_ts,
+                                        force_close_eta_ts: eta_ts,
+                                    });
                                 }
+                            }
+                            let earliest_eta = shutdown_positions
+                                .iter()
+                                .map(|p| p.force_close_eta_ts)
+                                .min();
+                            if let Some(reporter) = &mut self.status_reporter {
+                                reporter.set_shutdown_status(Some(ShutdownStatus {
+                                    pending: true,
+                                    grace_deadline_ts,
+                                    force_close_eta_ts: earliest_eta,
+                                    positions: shutdown_positions,
+                                }));
                             }
                             self.shutdown_pending = true;
                             shutdown_deadline = Some(Instant::now() + grace);
