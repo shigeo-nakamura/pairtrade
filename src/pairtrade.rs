@@ -4423,6 +4423,14 @@ impl PairTradeEngine {
         if self.cfg.disable_history_persist {
             return;
         }
+        // Backtest replay re-drives this per tick, producing hundreds of
+        // thousands of disk writes per run. That serialises a grid of
+        // concurrent backtest processes on ext4 and leaves them wedged in
+        // `Dl` state. The persisted file is only consumed by peer live bots
+        // for A/B/C alignment, which is irrelevant under replay.
+        if self.cfg.backtest_mode {
+            return;
+        }
         let mut snapshot: HashMap<String, Vec<(f64, i64)>> = HashMap::new();
         for (sym, deque) in &self.history {
             let v: Vec<(f64, i64)> = deque.iter().map(|p| (p.log_price, p.ts)).collect();
