@@ -699,146 +699,38 @@ impl PairTradeConfig {
         }
 
         let prev_metrics_window = self.metrics_window;
-        if let Ok(value) = env::var("INTERVAL_SECS") {
-            if let Ok(parsed) = value.parse() {
-                self.interval_secs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("TRADING_PERIOD_SECS") {
-            if let Ok(parsed) = value.parse() {
-                self.trading_period_secs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("METRICS_WINDOW_LENGTH") {
-            if let Ok(parsed) = value.parse() {
-                self.metrics_window = parsed;
-            }
-        }
-        if let Ok(value) = env::var("ENTRY_Z_SCORE_BASE") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.entry_z_base = parsed;
-            }
-        }
-        if let Ok(value) = env::var("ENTRY_Z_SCORE_MIN") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.entry_z_min = parsed;
-            }
-        }
-        if let Ok(value) = env::var("ENTRY_Z_SCORE_MAX") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.entry_z_max = parsed;
-            }
-        }
-        if let Ok(value) = env::var("EXIT_Z_SCORE") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.exit_z = parsed;
-            }
-        }
-        if let Ok(value) = env::var("STOP_LOSS_Z_SCORE") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.stop_loss_z = parsed;
-            }
-        }
-        if let Ok(value) = env::var("FORCE_CLOSE_TIME_SECS") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.force_close_secs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("COOLDOWN_SECS") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.cooldown_secs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("NET_FUNDING_MIN_PER_HOUR") {
-            if let Ok(parsed) = value.parse() {
-                self.net_funding_min_per_hour = parsed;
-            }
-        }
-        if let Ok(value) = env::var("SPREAD_VELOCITY_MAX_SIGMA_PER_MIN") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.spread_velocity_max_sigma_per_min = parsed;
-            }
-        }
-        if let Ok(value) = env::var("NOTIONAL_PER_LEG_USD") {
-            if let Ok(parsed) = value.parse() {
-                self.notional_per_leg = parsed;
-            }
-        }
-        if let Ok(value) = env::var("RISK_PCT_PER_TRADE") {
-            if let Ok(parsed) = value.parse() {
-                self.risk_pct_per_trade = parsed;
-            }
-        }
-        if let Ok(value) = env::var("MAX_LOSS_R_MULT") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.max_loss_r_mult = parsed;
-            }
-        }
-        if let Ok(value) = env::var("EQUITY_USD_FALLBACK") {
-            if let Ok(parsed) = value.parse() {
-                self.equity_usd = parsed;
-            }
-        }
-        if let Ok(value) = env::var("PAIR_SELECTION_LOOKBACK_HOURS_SHORT") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.lookback_hours_short = parsed;
-            }
-        }
-        if let Ok(value) = env::var("PAIR_SELECTION_LOOKBACK_HOURS_LONG") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.lookback_hours_long = parsed;
-            }
-        }
-        if let Ok(value) = env::var("HALF_LIFE_MAX_HOURS") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.half_life_max_hours = parsed;
-            }
-        }
-        if let Ok(value) = env::var("ADF_P_THRESHOLD") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.adf_p_threshold = parsed;
-            }
-        }
-        if let Ok(value) = env::var("ENTRY_VOL_LOOKBACK_HOURS") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.entry_vol_lookback_hours = parsed;
-            }
-        }
+        env_override("INTERVAL_SECS", &mut self.interval_secs);
+        env_override("TRADING_PERIOD_SECS", &mut self.trading_period_secs);
+        env_override("METRICS_WINDOW_LENGTH", &mut self.metrics_window);
+        env_override("ENTRY_Z_SCORE_BASE", &mut self.default_pair_params.entry_z_base);
+        env_override("ENTRY_Z_SCORE_MIN", &mut self.default_pair_params.entry_z_min);
+        env_override("ENTRY_Z_SCORE_MAX", &mut self.default_pair_params.entry_z_max);
+        env_override("EXIT_Z_SCORE", &mut self.default_pair_params.exit_z);
+        env_override("STOP_LOSS_Z_SCORE", &mut self.default_pair_params.stop_loss_z);
+        env_override("FORCE_CLOSE_TIME_SECS", &mut self.default_pair_params.force_close_secs);
+        env_override("COOLDOWN_SECS", &mut self.default_pair_params.cooldown_secs);
+        env_override("NET_FUNDING_MIN_PER_HOUR", &mut self.net_funding_min_per_hour);
+        env_override("SPREAD_VELOCITY_MAX_SIGMA_PER_MIN", &mut self.default_pair_params.spread_velocity_max_sigma_per_min);
+        env_override("NOTIONAL_PER_LEG_USD", &mut self.notional_per_leg);
+        env_override("RISK_PCT_PER_TRADE", &mut self.risk_pct_per_trade);
+        env_override("MAX_LOSS_R_MULT", &mut self.default_pair_params.max_loss_r_mult);
+        env_override("EQUITY_USD_FALLBACK", &mut self.equity_usd);
+        env_override("PAIR_SELECTION_LOOKBACK_HOURS_SHORT", &mut self.default_pair_params.lookback_hours_short);
+        env_override("PAIR_SELECTION_LOOKBACK_HOURS_LONG", &mut self.default_pair_params.lookback_hours_long);
+        env_override("HALF_LIFE_MAX_HOURS", &mut self.default_pair_params.half_life_max_hours);
+        env_override("ADF_P_THRESHOLD", &mut self.default_pair_params.adf_p_threshold);
+        env_override("ENTRY_VOL_LOOKBACK_HOURS", &mut self.default_pair_params.entry_vol_lookback_hours);
         if let Ok(value) = env::var("SLIPPAGE_BPS") {
             if let Ok(parsed) = value.parse::<i32>() {
                 self.slippage_bps = parsed;
             }
         }
-        if let Ok(value) = env::var("FEE_BPS") {
-            if let Ok(parsed) = value.parse() {
-                self.fee_bps = parsed;
-            }
-        }
-        if let Ok(value) = env::var("MAX_LEVERAGE") {
-            if let Ok(parsed) = value.parse() {
-                self.max_leverage = parsed;
-            }
-        }
-        if let Ok(value) = env::var("REEVAL_JUMP_Z_MULT") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.reeval_jump_z_mult = parsed;
-            }
-        }
-        if let Ok(value) = env::var("VOL_SPIKE_MULT") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.vol_spike_mult = parsed;
-            }
-        }
-        if let Ok(value) = env::var("MAX_ACTIVE_PAIRS") {
-            if let Ok(parsed) = value.parse() {
-                self.max_active_pairs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("WARM_START_MODE") {
-            if let Ok(parsed) = value.parse() {
-                self.warm_start_mode = parsed;
-            }
-        }
+        env_override("FEE_BPS", &mut self.fee_bps);
+        env_override("MAX_LEVERAGE", &mut self.max_leverage);
+        env_override("REEVAL_JUMP_Z_MULT", &mut self.default_pair_params.reeval_jump_z_mult);
+        env_override("VOL_SPIKE_MULT", &mut self.default_pair_params.vol_spike_mult);
+        env_override("MAX_ACTIVE_PAIRS", &mut self.max_active_pairs);
+        env_override("WARM_START_MODE", &mut self.warm_start_mode);
         let mut warm_start_min_overridden = false;
         if let Ok(value) = env::var("WARM_START_MIN_BARS") {
             if let Ok(parsed) = value.parse() {
@@ -853,16 +745,8 @@ impl PairTradeConfig {
         {
             self.default_pair_params.warm_start_min_bars = self.metrics_window;
         }
-        if let Ok(value) = env::var("ORDER_TIMEOUT_SECS") {
-            if let Ok(parsed) = value.parse() {
-                self.order_timeout_secs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("ENTRY_PARTIAL_FILL_MAX_RETRIES") {
-            if let Ok(parsed) = value.parse() {
-                self.entry_partial_fill_max_retries = parsed;
-            }
-        }
+        env_override("ORDER_TIMEOUT_SECS", &mut self.order_timeout_secs);
+        env_override("ENTRY_PARTIAL_FILL_MAX_RETRIES", &mut self.entry_partial_fill_max_retries);
         if let Ok(value) = env::var("STARTUP_FORCE_CLOSE_ATTEMPTS") {
             if let Ok(parsed) = value.parse::<u32>() {
                 if parsed > 0 {
@@ -942,66 +826,18 @@ impl PairTradeConfig {
             ));
         }
 
-        if let Ok(value) = env::var("SPREAD_TREND_MAX_SLOPE_SIGMA") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.spread_trend_max_slope_sigma = parsed;
-            }
-        }
-        if let Ok(value) = env::var("BETA_DIVERGENCE_MAX") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.beta_divergence_max = parsed;
-            }
-        }
-        if let Ok(value) = env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES") {
-            if let Ok(parsed) = value.parse() {
-                self.circuit_breaker_consecutive_losses = parsed;
-            }
-        }
-        if let Ok(value) = env::var("CIRCUIT_BREAKER_COOLDOWN_SECS") {
-            if let Ok(parsed) = value.parse() {
-                self.circuit_breaker_cooldown_secs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER1_LOSSES") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.circuit_breaker_tier1_losses = parsed;
-            }
-        }
-        if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.circuit_breaker_tier1_cooldown_secs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER2_LOSSES") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.circuit_breaker_tier2_losses = parsed;
-            }
-        }
-        if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.circuit_breaker_tier2_cooldown_secs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("ENTRY_POST_ONLY_TIMEOUT_SECS") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.entry_post_only_timeout_secs = parsed;
-            }
-        }
-        if let Ok(value) = env::var("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.entry_velocity_block_sigma_per_min = parsed;
-            }
-        }
-        if let Ok(value) = env::var("FUNDING_ENTRY_Z_SCALE") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.funding_entry_z_scale = parsed;
-            }
-        }
-        if let Ok(value) = env::var("BETA_GAP_ENTRY_Z_SCALE") {
-            if let Ok(parsed) = value.parse() {
-                self.default_pair_params.beta_gap_entry_z_scale = parsed;
-            }
-        }
+        env_override("SPREAD_TREND_MAX_SLOPE_SIGMA", &mut self.default_pair_params.spread_trend_max_slope_sigma);
+        env_override("BETA_DIVERGENCE_MAX", &mut self.default_pair_params.beta_divergence_max);
+        env_override("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES", &mut self.circuit_breaker_consecutive_losses);
+        env_override("CIRCUIT_BREAKER_COOLDOWN_SECS", &mut self.circuit_breaker_cooldown_secs);
+        env_override("CIRCUIT_BREAKER_TIER1_LOSSES", &mut self.default_pair_params.circuit_breaker_tier1_losses);
+        env_override("CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS", &mut self.default_pair_params.circuit_breaker_tier1_cooldown_secs);
+        env_override("CIRCUIT_BREAKER_TIER2_LOSSES", &mut self.default_pair_params.circuit_breaker_tier2_losses);
+        env_override("CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS", &mut self.default_pair_params.circuit_breaker_tier2_cooldown_secs);
+        env_override("ENTRY_POST_ONLY_TIMEOUT_SECS", &mut self.default_pair_params.entry_post_only_timeout_secs);
+        env_override("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", &mut self.default_pair_params.entry_velocity_block_sigma_per_min);
+        env_override("FUNDING_ENTRY_Z_SCALE", &mut self.default_pair_params.funding_entry_z_scale);
+        env_override("BETA_GAP_ENTRY_Z_SCALE", &mut self.default_pair_params.beta_gap_entry_z_scale);
 
         Ok(())
     }
@@ -1089,6 +925,16 @@ fn env_parse<T: std::str::FromStr>(key: &str, fallback: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(fallback)
+}
+
+/// If `key` is set in the environment AND parses, overwrite `target`. Used by
+/// `apply_env_overrides` to collapse the dozens of `if let Ok(value)…` blocks.
+fn env_override<T: std::str::FromStr>(key: &str, target: &mut T) {
+    if let Ok(value) = env::var(key) {
+        if let Ok(parsed) = value.parse() {
+            *target = parsed;
+        }
+    }
 }
 
 /// Resolve global per-pair defaults from environment variables, falling back
