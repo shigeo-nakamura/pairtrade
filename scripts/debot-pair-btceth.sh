@@ -1,0 +1,63 @@
+#!/bin/bash
+# Production wrapper for the consolidated single-process pairtrade
+# A/B/C deployment (shigeo-nakamura/bot-strategy#25 commit 9 cutover).
+#
+# Loads the three legacy per-bot env files in isolated subshells so
+# unset vars in B/C (e.g. LIGHTER_ACCOUNT_INDEX which they auto-discover
+# via wallet) cannot leak A's value into B/C's slot, then re-exports
+# every credential as LIGHTER_*_{A,B,C} for the suffixed env lookup
+# added in commit 3. The legacy env files themselves stay untouched so
+# rollback to a single-instance deployment is just one commit away.
+
+set -eu
+
+ENV_DIR="${DEBOT_ENV_DIR:-/opt/debot/scripts}"
+
+# Common KMS-encrypted shared key + RUST_LOG defaults
+source "$ENV_DIR/debot_secrets_common.env"
+source "$ENV_DIR/debot.env"
+
+vars_for_variant() {
+    # Echoes "VAR_<id>=value" lines for the given env file. Runs in a
+    # subshell so the sourced exports do not leak into the parent.
+    (
+        # shellcheck disable=SC1090
+        source "$2" >/dev/null 2>&1
+        for var in LIGHTER_PUBLIC_API_KEY LIGHTER_PRIVATE_API_KEY \
+                   LIGHTER_API_KEY_INDEX LIGHTER_WALLET_ADDRESS \
+                   LIGHTER_EVM_WALLET_PRIVATE_KEY LIGHTER_ACCOUNT_INDEX; do
+            if [ -n "${!var:-}" ]; then
+                printf '%s_%s=%s\n' "$var" "$1" "${!var}"
+            fi
+        done
+    )
+}
+
+while IFS='=' read -r k v; do export "$k=$v"; done < <(vars_for_variant A "$ENV_DIR/debot-pair-btceth.env")
+while IFS='=' read -r k v; do export "$k=$v"; done < <(vars_for_variant B "$ENV_DIR/debot-pair-btceth-b.env")
+while IFS='=' read -r k v; do export "$k=$v"; done < <(vars_for_variant C "$ENV_DIR/debot-pair-btceth-c.env")
+
+# Wipe the suffix-less LIGHTER_* so lighter_env() never falls through to
+# them and accidentally cross-wires variants. Each instance must hit its
+# own suffixed copy or fail loudly.
+unset LIGHTER_PUBLIC_API_KEY LIGHTER_PRIVATE_API_KEY LIGHTER_ACCOUNT_INDEX
+unset LIGHTER_API_KEY_INDEX LIGHTER_WALLET_ADDRESS LIGHTER_EVM_WALLET_PRIVATE_KEY
+unset LIGHTER_MAINTENANCE_TTL_MINS
+
+# Production paths. DEBOT_STATUS_ID=debot-pair-btceth makes the
+# StatusReporter::from_env_for_instance suffix logic produce
+# /home/ec2-user/debot_status/debot-pair-btceth-{a,b,c}/status.json.
+# Same shape for the pnl logger.
+export DEBOT_STATUS_DIR="${DEBOT_STATUS_DIR:-/home/ec2-user/debot_status}"
+export DEBOT_STATUS_ID=debot-pair-btceth
+export PAIRTRADE_CONFIG_PATH=/opt/debot/configs/pairtrade/debot-pair-btceth.yaml
+
+# Make libsigner.so discoverable
+if [ -f /opt/debot/lib/libsigner.so ]; then
+    export LIGHTER_GO_PATH=/opt/debot/lib
+    export LD_LIBRARY_PATH="${LIGHTER_GO_PATH}:${LD_LIBRARY_PATH:-}"
+fi
+
+mkdir -p "$DEBOT_STATUS_DIR"
+
+exec /opt/debot/bin/debot
