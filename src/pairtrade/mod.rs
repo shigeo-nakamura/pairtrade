@@ -3282,100 +3282,7 @@ impl PairTradeEngine {
         {
             Ok(res) => res,
             Err(e) => {
-                log::error!(
-                    "[ORDER] Failed to place leg B for {}/{} (leg A={}): {:?}",
-                    pair.base,
-                    pair.quote,
-                    res_a.order_id,
-                    e
-                );
-
-                // Attempt to cancel leg A, but proceed even if it fails
-                if let Err(cancel_err) = self
-                    .connector
-                    .cancel_order(&pair.base, &res_a.order_id)
-                    .await
-                {
-                    log::warn!(
-                        "[SAFETY] Failed to cancel leg A {} after leg B failed: {:?}",
-                        res_a.order_id,
-                        cancel_err
-                    );
-                } else {
-                    log::info!(
-                        "[SAFETY] Canceled leg A {} after leg B failed.",
-                        res_a.order_id
-                    );
-                }
-
-                // Give some time for the fill to be processed by the exchange
-                sleep(Duration::from_secs(5)).await;
-
-                // Check if leg A was filled despite the cancellation attempt
-                match self.connector.get_filled_orders(&pair.base).await {
-                    Ok(filled_orders) => {
-                        let matches_order = |order_id: &str| {
-                            order_id == res_a.order_id
-                                || res_a
-                                    .exchange_order_id
-                                    .as_ref()
-                                    .map_or(false, |id| order_id == id)
-                        };
-                        if let Some(filled_order) = filled_orders
-                            .orders
-                            .iter()
-                            .find(|o| matches_order(&o.order_id))
-                        {
-                            let filled_size = filled_order.filled_size.unwrap_or(Decimal::ZERO);
-                            if filled_size > Decimal::ZERO {
-                                log::warn!(
-                                    "[SAFETY] Leg A {} was filled for {}. Hedging immediately.",
-                                    res_a.order_id,
-                                    pair.base
-                                );
-                                let hedge_side = match side_a {
-                                    dex_connector::OrderSide::Long => {
-                                        dex_connector::OrderSide::Short
-                                    }
-                                    dex_connector::OrderSide::Short => {
-                                        dex_connector::OrderSide::Long
-                                    }
-                                };
-
-                                // Create a market order to close the partial position
-                                if let Err(hedge_err) = self
-                                    .connector
-                                    .create_order(
-                                        &pair.base,
-                                        filled_size,
-                                        hedge_side,
-                                        None,
-                                        None,
-                                        true,
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    log::error!(
-                                        "[SAFETY] FAILED TO HEDGE partial fill for {}: {:?}",
-                                        pair.base,
-                                        hedge_err
-                                    );
-                                } else {
-                                    log::info!("[SAFETY] Successfully submitted hedge order for partial fill on {}", pair.base);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "[SAFETY] Could not check for filled orders for {}: {:?}",
-                            pair.base,
-                            e
-                        );
-                    }
-                }
-
+                self.recover_from_leg_b_failure(pair, &res_a, side_a, &e).await;
                 return Err(PartialOrderPlacementError::new(legs.clone(), e).into());
             }
         };
@@ -3401,6 +3308,106 @@ impl PairTradeEngine {
             side: side_b,
         });
         Ok(legs)
+    }
+
+    /// Recovery path when leg B placement fails after leg A succeeded:
+    /// cancel leg A, wait briefly, check whether the exchange filled it
+    /// anyway, and if so submit a market reduce-only order in the opposite
+    /// direction to neutralize the unhedged exposure. All errors here are
+    /// logged but not propagated — the caller still surfaces the original
+    /// leg-B failure.
+    async fn recover_from_leg_b_failure(
+        &self,
+        pair: &PairSpec,
+        res_a: &dex_connector::CreateOrderResponse,
+        side_a: dex_connector::OrderSide,
+        leg_b_err: &DexError,
+    ) {
+        log::error!(
+            "[ORDER] Failed to place leg B for {}/{} (leg A={}): {:?}",
+            pair.base,
+            pair.quote,
+            res_a.order_id,
+            leg_b_err
+        );
+
+        // Attempt to cancel leg A, but proceed even if it fails.
+        if let Err(cancel_err) = self
+            .connector
+            .cancel_order(&pair.base, &res_a.order_id)
+            .await
+        {
+            log::warn!(
+                "[SAFETY] Failed to cancel leg A {} after leg B failed: {:?}",
+                res_a.order_id,
+                cancel_err
+            );
+        } else {
+            log::info!(
+                "[SAFETY] Canceled leg A {} after leg B failed.",
+                res_a.order_id
+            );
+        }
+
+        // Give the exchange time to settle any concurrent fill.
+        sleep(Duration::from_secs(5)).await;
+
+        let filled_orders = match self.connector.get_filled_orders(&pair.base).await {
+            Ok(orders) => orders,
+            Err(e) => {
+                log::error!(
+                    "[SAFETY] Could not check for filled orders for {}: {:?}",
+                    pair.base,
+                    e
+                );
+                return;
+            }
+        };
+
+        let matches_order = |order_id: &str| {
+            order_id == res_a.order_id
+                || res_a
+                    .exchange_order_id
+                    .as_ref()
+                    .map_or(false, |id| order_id == id)
+        };
+        let Some(filled_order) = filled_orders
+            .orders
+            .iter()
+            .find(|o| matches_order(&o.order_id))
+        else {
+            return;
+        };
+        let filled_size = filled_order.filled_size.unwrap_or(Decimal::ZERO);
+        if filled_size <= Decimal::ZERO {
+            return;
+        }
+
+        log::warn!(
+            "[SAFETY] Leg A {} was filled for {}. Hedging immediately.",
+            res_a.order_id,
+            pair.base
+        );
+        let hedge_side = match side_a {
+            dex_connector::OrderSide::Long => dex_connector::OrderSide::Short,
+            dex_connector::OrderSide::Short => dex_connector::OrderSide::Long,
+        };
+        if let Err(hedge_err) = self
+            .connector
+            .create_order(&pair.base, filled_size, hedge_side, None, None, true, None)
+            .await
+        {
+            log::error!(
+                "[SAFETY] FAILED TO HEDGE partial fill for {}: {:?}",
+                pair.base,
+                hedge_err
+            );
+        } else {
+            log::info!(
+                "[SAFETY] Successfully submitted hedge order for partial fill on {}",
+                pair.base
+            );
+        }
     }
 
     async fn close_pair_orders(
