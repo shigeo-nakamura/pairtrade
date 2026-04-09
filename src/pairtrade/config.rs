@@ -426,72 +426,7 @@ impl PairTradeConfig {
         &self,
         overrides: &Option<HashMap<String, PairOverrideYaml>>,
     ) -> HashMap<String, PairParams> {
-        let mut map = HashMap::new();
-        if let Some(overrides) = overrides {
-            for (pair_key, ovr) in overrides {
-                let pp = PairParams {
-                    entry_z_base: ovr.entry_z_score_base.unwrap_or(self.entry_z_base),
-                    entry_z_min: ovr.entry_z_score_min.unwrap_or(self.entry_z_min),
-                    entry_z_max: ovr.entry_z_score_max.unwrap_or(self.entry_z_max),
-                    exit_z: ovr.exit_z_score.unwrap_or(self.exit_z),
-                    stop_loss_z: ovr.stop_loss_z_score.unwrap_or(self.stop_loss_z),
-                    force_close_secs: ovr.force_close_time_secs.unwrap_or(self.force_close_secs),
-                    cooldown_secs: ovr.cooldown_secs.unwrap_or(self.cooldown_secs),
-                    max_loss_r_mult: ovr.max_loss_r_mult.unwrap_or(self.max_loss_r_mult),
-                    half_life_max_hours: ovr
-                        .half_life_max_hours
-                        .unwrap_or(self.half_life_max_hours),
-                    adf_p_threshold: ovr.adf_p_threshold.unwrap_or(self.adf_p_threshold),
-                    spread_velocity_max_sigma_per_min: ovr
-                        .spread_velocity_max_sigma_per_min
-                        .unwrap_or(self.spread_velocity_max_sigma_per_min),
-                    spread_trend_max_slope_sigma: ovr
-                        .spread_trend_max_slope_sigma
-                        .unwrap_or(self.spread_trend_max_slope_sigma),
-                    beta_divergence_max: ovr
-                        .beta_divergence_max
-                        .unwrap_or(self.beta_divergence_max),
-                    beta_min: ovr.beta_min.unwrap_or(self.beta_min),
-                    hedge_ratio_max_deviation: ovr
-                        .hedge_ratio_max_deviation
-                        .unwrap_or(self.hedge_ratio_max_deviation),
-                    lookback_hours_short: ovr
-                        .pair_selection_lookback_hours_short
-                        .unwrap_or(self.lookback_hours_short),
-                    lookback_hours_long: ovr
-                        .pair_selection_lookback_hours_long
-                        .unwrap_or(self.lookback_hours_long),
-                    entry_vol_lookback_hours: ovr
-                        .entry_vol_lookback_hours
-                        .unwrap_or(self.entry_vol_lookback_hours),
-                    warm_start_min_bars: ovr
-                        .warm_start_min_bars
-                        .unwrap_or(self.warm_start_min_bars),
-                    reeval_jump_z_mult: ovr.reeval_jump_z_mult.unwrap_or(self.reeval_jump_z_mult),
-                    vol_spike_mult: ovr.vol_spike_mult.unwrap_or(self.vol_spike_mult),
-                    circuit_breaker_tier1_losses: ovr
-                        .circuit_breaker_tier1_losses
-                        .unwrap_or(self.circuit_breaker_tier1_losses),
-                    circuit_breaker_tier1_cooldown_secs: ovr
-                        .circuit_breaker_tier1_cooldown_secs
-                        .unwrap_or(self.circuit_breaker_tier1_cooldown_secs),
-                    circuit_breaker_tier2_losses: ovr
-                        .circuit_breaker_tier2_losses
-                        .unwrap_or(self.circuit_breaker_tier2_losses),
-                    circuit_breaker_tier2_cooldown_secs: ovr
-                        .circuit_breaker_tier2_cooldown_secs
-                        .unwrap_or(self.circuit_breaker_tier2_cooldown_secs),
-                    entry_post_only_timeout_secs: ovr
-                        .entry_post_only_timeout_secs
-                        .unwrap_or(self.entry_post_only_timeout_secs),
-                    entry_velocity_block_sigma_per_min: self.entry_velocity_block_sigma_per_min,
-                    funding_entry_z_scale: self.funding_entry_z_scale,
-                    beta_gap_entry_z_scale: self.beta_gap_entry_z_scale,
-                };
-                map.insert(pair_key.clone(), pp);
-            }
-        }
-        map
+        apply_pair_overrides(&self.default_pair_params, overrides)
     }
 
     pub fn from_env_or_yaml() -> Result<Self> {
@@ -1397,4 +1332,82 @@ fn sanitize_symbol_for_filename(symbol: &str) -> String {
         }
     }
     out
+}
+
+/// Build the resolved per-pair params map from the resolved global defaults
+/// plus any per-pair YAML overrides. Free function so it does not depend on
+/// `PairTradeConfig`'s currently-duplicated per-pair fields.
+fn apply_pair_overrides(
+    default: &PairParams,
+    overrides: &Option<HashMap<String, PairOverrideYaml>>,
+) -> HashMap<String, PairParams> {
+    let mut map = HashMap::new();
+    let Some(overrides) = overrides else {
+        return map;
+    };
+    for (pair_key, ovr) in overrides {
+        let pp = PairParams {
+            entry_z_base: ovr.entry_z_score_base.unwrap_or(default.entry_z_base),
+            entry_z_min: ovr.entry_z_score_min.unwrap_or(default.entry_z_min),
+            entry_z_max: ovr.entry_z_score_max.unwrap_or(default.entry_z_max),
+            exit_z: ovr.exit_z_score.unwrap_or(default.exit_z),
+            stop_loss_z: ovr.stop_loss_z_score.unwrap_or(default.stop_loss_z),
+            force_close_secs: ovr.force_close_time_secs.unwrap_or(default.force_close_secs),
+            cooldown_secs: ovr.cooldown_secs.unwrap_or(default.cooldown_secs),
+            max_loss_r_mult: ovr.max_loss_r_mult.unwrap_or(default.max_loss_r_mult),
+            half_life_max_hours: ovr
+                .half_life_max_hours
+                .unwrap_or(default.half_life_max_hours),
+            adf_p_threshold: ovr.adf_p_threshold.unwrap_or(default.adf_p_threshold),
+            spread_velocity_max_sigma_per_min: ovr
+                .spread_velocity_max_sigma_per_min
+                .unwrap_or(default.spread_velocity_max_sigma_per_min),
+            spread_trend_max_slope_sigma: ovr
+                .spread_trend_max_slope_sigma
+                .unwrap_or(default.spread_trend_max_slope_sigma),
+            beta_divergence_max: ovr
+                .beta_divergence_max
+                .unwrap_or(default.beta_divergence_max),
+            beta_min: ovr.beta_min.unwrap_or(default.beta_min),
+            hedge_ratio_max_deviation: ovr
+                .hedge_ratio_max_deviation
+                .unwrap_or(default.hedge_ratio_max_deviation),
+            lookback_hours_short: ovr
+                .pair_selection_lookback_hours_short
+                .unwrap_or(default.lookback_hours_short),
+            lookback_hours_long: ovr
+                .pair_selection_lookback_hours_long
+                .unwrap_or(default.lookback_hours_long),
+            entry_vol_lookback_hours: ovr
+                .entry_vol_lookback_hours
+                .unwrap_or(default.entry_vol_lookback_hours),
+            warm_start_min_bars: ovr
+                .warm_start_min_bars
+                .unwrap_or(default.warm_start_min_bars),
+            reeval_jump_z_mult: ovr
+                .reeval_jump_z_mult
+                .unwrap_or(default.reeval_jump_z_mult),
+            vol_spike_mult: ovr.vol_spike_mult.unwrap_or(default.vol_spike_mult),
+            circuit_breaker_tier1_losses: ovr
+                .circuit_breaker_tier1_losses
+                .unwrap_or(default.circuit_breaker_tier1_losses),
+            circuit_breaker_tier1_cooldown_secs: ovr
+                .circuit_breaker_tier1_cooldown_secs
+                .unwrap_or(default.circuit_breaker_tier1_cooldown_secs),
+            circuit_breaker_tier2_losses: ovr
+                .circuit_breaker_tier2_losses
+                .unwrap_or(default.circuit_breaker_tier2_losses),
+            circuit_breaker_tier2_cooldown_secs: ovr
+                .circuit_breaker_tier2_cooldown_secs
+                .unwrap_or(default.circuit_breaker_tier2_cooldown_secs),
+            entry_post_only_timeout_secs: ovr
+                .entry_post_only_timeout_secs
+                .unwrap_or(default.entry_post_only_timeout_secs),
+            entry_velocity_block_sigma_per_min: default.entry_velocity_block_sigma_per_min,
+            funding_entry_z_scale: default.funding_entry_z_scale,
+            beta_gap_entry_z_scale: default.beta_gap_entry_z_scale,
+        };
+        map.insert(pair_key.clone(), pp);
+    }
+    map
 }
