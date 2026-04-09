@@ -388,40 +388,6 @@ impl PairTradeConfig {
             .unwrap_or(&self.default_pair_params)
     }
 
-    fn build_default_pair_params(&self) -> PairParams {
-        PairParams {
-            entry_z_base: self.entry_z_base,
-            entry_z_min: self.entry_z_min,
-            entry_z_max: self.entry_z_max,
-            exit_z: self.exit_z,
-            stop_loss_z: self.stop_loss_z,
-            force_close_secs: self.force_close_secs,
-            cooldown_secs: self.cooldown_secs,
-            max_loss_r_mult: self.max_loss_r_mult,
-            half_life_max_hours: self.half_life_max_hours,
-            adf_p_threshold: self.adf_p_threshold,
-            spread_velocity_max_sigma_per_min: self.spread_velocity_max_sigma_per_min,
-            spread_trend_max_slope_sigma: self.spread_trend_max_slope_sigma,
-            beta_divergence_max: self.beta_divergence_max,
-            beta_min: self.beta_min,
-            hedge_ratio_max_deviation: self.hedge_ratio_max_deviation,
-            lookback_hours_short: self.lookback_hours_short,
-            lookback_hours_long: self.lookback_hours_long,
-            entry_vol_lookback_hours: self.entry_vol_lookback_hours,
-            warm_start_min_bars: self.warm_start_min_bars,
-            reeval_jump_z_mult: self.reeval_jump_z_mult,
-            vol_spike_mult: self.vol_spike_mult,
-            circuit_breaker_tier1_losses: self.circuit_breaker_tier1_losses,
-            circuit_breaker_tier1_cooldown_secs: self.circuit_breaker_tier1_cooldown_secs,
-            circuit_breaker_tier2_losses: self.circuit_breaker_tier2_losses,
-            circuit_breaker_tier2_cooldown_secs: self.circuit_breaker_tier2_cooldown_secs,
-            entry_post_only_timeout_secs: self.entry_post_only_timeout_secs,
-            entry_velocity_block_sigma_per_min: self.entry_velocity_block_sigma_per_min,
-            funding_entry_z_scale: self.funding_entry_z_scale,
-            beta_gap_entry_z_scale: self.beta_gap_entry_z_scale,
-        }
-    }
-
     fn build_pair_params_map(
         &self,
         overrides: &Option<HashMap<String, PairOverrideYaml>>,
@@ -467,6 +433,13 @@ impl PairTradeConfig {
             .history_file
             .clone()
             .unwrap_or_else(|| default_history_file(&universe, yaml.agent_name.as_deref()));
+
+        // Build the resolved per-pair defaults before consuming `yaml` into the
+        // PairTradeConfig literal below.
+        let mut default_pair_params = default_pair_params_from_yaml(&yaml);
+        if default_pair_params.warm_start_min_bars == 0 {
+            default_pair_params.warm_start_min_bars = metrics_window;
+        }
 
         let mut cfg = PairTradeConfig {
             dex_name: yaml.dex_name.unwrap_or_else(|| "hyperliquid".to_string()),
@@ -590,11 +563,9 @@ impl PairTradeConfig {
                 .shutdown_grace_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
             pair_params: HashMap::new(),
-            // Placeholder rebuilt immediately below.
-            default_pair_params: PairParams::default(),
+            default_pair_params,
         };
 
-        cfg.default_pair_params = cfg.build_default_pair_params();
         cfg.pair_params = cfg.build_pair_params_map(&yaml.pair_overrides);
         cfg.apply_env_overrides(history_file_from_yaml, warm_start_min_from_yaml)?;
         // apply_env_overrides mutates cfg.default_pair_params in place; re-merge
@@ -911,7 +882,10 @@ impl PairTradeConfig {
             // Placeholder rebuilt immediately below.
             default_pair_params: PairParams::default(),
         };
-        cfg.default_pair_params = cfg.build_default_pair_params();
+        cfg.default_pair_params = default_pair_params_from_env();
+        if cfg.default_pair_params.warm_start_min_bars == 0 {
+            cfg.default_pair_params.warm_start_min_bars = cfg.metrics_window;
+        }
         Ok(cfg)
     }
 
@@ -1331,6 +1305,143 @@ fn sanitize_symbol_for_filename(symbol: &str) -> String {
         }
     }
     out
+}
+
+fn env_parse<T: std::str::FromStr>(key: &str, fallback: T) -> T {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(fallback)
+}
+
+/// Resolve global per-pair defaults from environment variables, falling back
+/// to compile-time `DEFAULT_*` constants for any missing entries.
+pub(super) fn default_pair_params_from_env() -> PairParams {
+    PairParams {
+        entry_z_base: env_parse("ENTRY_Z_SCORE_BASE", DEFAULT_ENTRY_Z_BASE),
+        entry_z_min: env_parse("ENTRY_Z_SCORE_MIN", DEFAULT_ENTRY_Z_MIN),
+        entry_z_max: env_parse("ENTRY_Z_SCORE_MAX", DEFAULT_ENTRY_Z_MAX),
+        exit_z: env_parse("EXIT_Z_SCORE", DEFAULT_EXIT_Z),
+        stop_loss_z: env_parse("STOP_LOSS_Z_SCORE", DEFAULT_STOP_LOSS_Z),
+        force_close_secs: env_parse("FORCE_CLOSE_TIME_SECS", DEFAULT_FORCE_CLOSE_SECS),
+        cooldown_secs: env_parse("COOLDOWN_SECS", DEFAULT_COOLDOWN_SECS),
+        max_loss_r_mult: env_parse("MAX_LOSS_R_MULT", DEFAULT_MAX_LOSS_R_MULT),
+        half_life_max_hours: env_parse("HALF_LIFE_MAX_HOURS", DEFAULT_HALF_LIFE_MAX_HOURS),
+        adf_p_threshold: env_parse("ADF_P_THRESHOLD", DEFAULT_ADF_P_THRESHOLD),
+        spread_velocity_max_sigma_per_min: env_parse(
+            "SPREAD_VELOCITY_MAX_SIGMA_PER_MIN",
+            DEFAULT_SPREAD_VELOCITY_MAX_SIGMA_PER_MIN,
+        ),
+        spread_trend_max_slope_sigma: env_parse(
+            "SPREAD_TREND_MAX_SLOPE_SIGMA",
+            DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA,
+        ),
+        beta_divergence_max: env_parse("BETA_DIVERGENCE_MAX", DEFAULT_BETA_DIVERGENCE_MAX),
+        beta_min: env_parse("BETA_MIN", 0.0),
+        hedge_ratio_max_deviation: env_parse("HEDGE_RATIO_MAX_DEVIATION", 1.0),
+        lookback_hours_short: env_parse(
+            "PAIR_SELECTION_LOOKBACK_HOURS_SHORT",
+            DEFAULT_LOOKBACK_HOURS_SHORT,
+        ),
+        lookback_hours_long: env_parse(
+            "PAIR_SELECTION_LOOKBACK_HOURS_LONG",
+            DEFAULT_LOOKBACK_HOURS_LONG,
+        ),
+        entry_vol_lookback_hours: env_parse(
+            "ENTRY_VOL_LOOKBACK_HOURS",
+            DEFAULT_ENTRY_VOL_LOOKBACK_HOURS,
+        ),
+        // Caller is responsible for filling warm_start_min_bars from
+        // metrics_window when omitted.
+        warm_start_min_bars: env_parse::<usize>("WARM_START_MIN_BARS", 0),
+        reeval_jump_z_mult: env_parse("REEVAL_JUMP_Z_MULT", DEFAULT_REEVAL_JUMP_Z_MULT),
+        vol_spike_mult: env_parse("VOL_SPIKE_MULT", DEFAULT_VOL_SPIKE_MULT),
+        circuit_breaker_tier1_losses: env_parse("CIRCUIT_BREAKER_TIER1_LOSSES", DEFAULT_CB_TIER1_LOSSES),
+        circuit_breaker_tier1_cooldown_secs: env_parse(
+            "CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS",
+            DEFAULT_CB_TIER1_COOLDOWN_SECS,
+        ),
+        circuit_breaker_tier2_losses: env_parse("CIRCUIT_BREAKER_TIER2_LOSSES", DEFAULT_CB_TIER2_LOSSES),
+        circuit_breaker_tier2_cooldown_secs: env_parse(
+            "CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS",
+            DEFAULT_CB_TIER2_COOLDOWN_SECS,
+        ),
+        entry_post_only_timeout_secs: env_parse(
+            "ENTRY_POST_ONLY_TIMEOUT_SECS",
+            DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS,
+        ),
+        entry_velocity_block_sigma_per_min: env_parse("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", 0.0),
+        funding_entry_z_scale: env_parse("FUNDING_ENTRY_Z_SCALE", 0.0),
+        beta_gap_entry_z_scale: env_parse("BETA_GAP_ENTRY_Z_SCALE", 0.0),
+    }
+}
+
+/// Resolve global per-pair defaults directly from a YAML document, falling
+/// back to compile-time `DEFAULT_*` constants for any missing fields.
+pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams {
+    PairParams {
+        entry_z_base: yaml.entry_z_score_base.unwrap_or(DEFAULT_ENTRY_Z_BASE),
+        entry_z_min: yaml.entry_z_score_min.unwrap_or(DEFAULT_ENTRY_Z_MIN),
+        entry_z_max: yaml.entry_z_score_max.unwrap_or(DEFAULT_ENTRY_Z_MAX),
+        exit_z: yaml.exit_z_score.unwrap_or(DEFAULT_EXIT_Z),
+        stop_loss_z: yaml.stop_loss_z_score.unwrap_or(DEFAULT_STOP_LOSS_Z),
+        force_close_secs: yaml
+            .force_close_time_secs
+            .unwrap_or(DEFAULT_FORCE_CLOSE_SECS),
+        cooldown_secs: yaml.cooldown_secs.unwrap_or(DEFAULT_COOLDOWN_SECS),
+        max_loss_r_mult: yaml.max_loss_r_mult.unwrap_or(DEFAULT_MAX_LOSS_R_MULT),
+        half_life_max_hours: yaml
+            .half_life_max_hours
+            .unwrap_or(DEFAULT_HALF_LIFE_MAX_HOURS),
+        adf_p_threshold: yaml.adf_p_threshold.unwrap_or(DEFAULT_ADF_P_THRESHOLD),
+        spread_velocity_max_sigma_per_min: yaml
+            .spread_velocity_max_sigma_per_min
+            .unwrap_or(DEFAULT_SPREAD_VELOCITY_MAX_SIGMA_PER_MIN),
+        spread_trend_max_slope_sigma: yaml
+            .spread_trend_max_slope_sigma
+            .unwrap_or(DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA),
+        beta_divergence_max: yaml
+            .beta_divergence_max
+            .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
+        beta_min: yaml.beta_min.unwrap_or(0.0),
+        hedge_ratio_max_deviation: yaml.hedge_ratio_max_deviation.unwrap_or(1.0),
+        lookback_hours_short: yaml
+            .pair_selection_lookback_hours_short
+            .unwrap_or(DEFAULT_LOOKBACK_HOURS_SHORT),
+        lookback_hours_long: yaml
+            .pair_selection_lookback_hours_long
+            .unwrap_or(DEFAULT_LOOKBACK_HOURS_LONG),
+        entry_vol_lookback_hours: yaml
+            .entry_vol_lookback_hours
+            .unwrap_or(DEFAULT_ENTRY_VOL_LOOKBACK_HOURS),
+        // Caller is responsible for clamping warm_start_min_bars to
+        // metrics_window when omitted (it has a cross-field default).
+        warm_start_min_bars: yaml.warm_start_min_bars.unwrap_or(0),
+        reeval_jump_z_mult: yaml
+            .reeval_jump_z_mult
+            .unwrap_or(DEFAULT_REEVAL_JUMP_Z_MULT),
+        vol_spike_mult: yaml.vol_spike_mult.unwrap_or(DEFAULT_VOL_SPIKE_MULT),
+        circuit_breaker_tier1_losses: yaml
+            .circuit_breaker_tier1_losses
+            .unwrap_or(DEFAULT_CB_TIER1_LOSSES),
+        circuit_breaker_tier1_cooldown_secs: yaml
+            .circuit_breaker_tier1_cooldown_secs
+            .unwrap_or(DEFAULT_CB_TIER1_COOLDOWN_SECS),
+        circuit_breaker_tier2_losses: yaml
+            .circuit_breaker_tier2_losses
+            .unwrap_or(DEFAULT_CB_TIER2_LOSSES),
+        circuit_breaker_tier2_cooldown_secs: yaml
+            .circuit_breaker_tier2_cooldown_secs
+            .unwrap_or(DEFAULT_CB_TIER2_COOLDOWN_SECS),
+        entry_post_only_timeout_secs: yaml
+            .entry_post_only_timeout_secs
+            .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
+        entry_velocity_block_sigma_per_min: yaml
+            .entry_velocity_block_sigma_per_min
+            .unwrap_or(0.0),
+        funding_entry_z_scale: yaml.funding_entry_z_scale.unwrap_or(0.0),
+        beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
+    }
 }
 
 /// Build the resolved per-pair params map from the resolved global defaults
