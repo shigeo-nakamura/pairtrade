@@ -217,27 +217,20 @@ impl PairTradeEngine {
         let mut status_reporter =
             StatusReporter::from_env_for_instance(&cfg, &instance_id, false);
 
-        // Restore lifetime trade stats from the on-disk pnl log so the
-        // dashboard's Trades / Win Rate / Max DD survive process restarts.
-        // Without this, every restart resets counts to 0 and the dashboard
-        // shows Trades=0 until a fresh exit lands. shigeo-nakamura/bot-strategy#33
-        let lifetime = pnl_logger
-            .as_ref()
-            .filter(|_| !backtest_mode)
-            .map(|l| l.load_lifetime_stats())
-            .unwrap_or_default();
+        // Trade counters start at 0 on every process restart so the
+        // dashboard shows session-relative stats instead of accumulating
+        // forever. The on-disk pnl-*.jsonl files are still written and
+        // retained for monthly reports — we just don't replay them at
+        // boot. Reverses the load_lifetime_stats restore that was added
+        // in shigeo-nakamura/bot-strategy#33; see #39 for the rationale.
+        let _ = backtest_mode;
         if let Some(reporter) = status_reporter.as_mut() {
-            let win_rate = if lifetime.trades > 0 {
-                lifetime.wins as f64 / lifetime.trades as f64 * 100.0
-            } else {
-                0.0
-            };
             reporter.trade_stats = Some(PairTradeStats {
-                trades: lifetime.trades,
-                wins: lifetime.wins,
-                win_rate,
-                max_dd: lifetime.max_dd,
-                pnl: lifetime.total_pnl,
+                trades: 0,
+                wins: 0,
+                win_rate: 0.0,
+                max_dd: 0.0,
+                pnl: 0.0,
             });
         }
 
@@ -254,11 +247,11 @@ impl PairTradeEngine {
             consecutive_losses: 0,
             circuit_breaker_until: None,
             circuit_breaker_until_ts: None,
-            total_trades: lifetime.trades,
-            total_wins: lifetime.wins,
-            total_pnl: lifetime.total_pnl,
-            peak_pnl: lifetime.peak_pnl,
-            max_dd: lifetime.max_dd,
+            total_trades: 0,
+            total_wins: 0,
+            total_pnl: 0.0,
+            peak_pnl: 0.0,
+            max_dd: 0.0,
         };
 
         Ok(Self {
