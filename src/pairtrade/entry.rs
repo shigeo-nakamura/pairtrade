@@ -6,6 +6,17 @@ use super::state::PairState;
 use super::stats::spread_slope_sigma;
 use super::util::tail_std;
 
+/// Lower bound for any dynamic entry-z scaling factor (vol or funding).
+/// Prevents the threshold from collapsing on noisy single-bar inputs.
+const ENTRY_Z_SCALE_MIN: f64 = 0.5;
+/// Upper bound for any dynamic entry-z scaling factor.
+const ENTRY_Z_SCALE_MAX: f64 = 2.0;
+/// Discount applied to the entry-z threshold when net funding is positive,
+/// nudging the strategy to take small carry-favorable trades it would
+/// otherwise skip. The continuous `funding_entry_z_scale` filter (PairParams)
+/// is layered on top.
+const FUNDING_CARRY_ENTRY_DISCOUNT: f64 = 0.9;
+
 pub(super) fn entry_z_for_pair(
     cfg: &PairTradeConfig,
     pp: &PairParams,
@@ -15,7 +26,7 @@ pub(super) fn entry_z_for_pair(
     let entry_vol_len =
         ((pp.entry_vol_lookback_hours * 3600) / cfg.trading_period_secs).max(1) as usize;
     let vol_pair = tail_std(&state.spread_history, entry_vol_len).unwrap_or(1.0);
-    let alpha = (vol_pair / vol_median).clamp(0.5, 2.0);
+    let alpha = (vol_pair / vol_median).clamp(ENTRY_Z_SCALE_MIN, ENTRY_Z_SCALE_MAX);
     let z = pp.entry_z_base * alpha;
     z.clamp(pp.entry_z_min, pp.entry_z_max)
 }
@@ -46,20 +57,20 @@ pub(super) fn should_enter(
 
     let mut entry_threshold = if net_funding > 0.0 {
         // prefer positive carry by easing the required entry slightly
-        state.z_entry * 0.9
+        state.z_entry * FUNDING_CARRY_ENTRY_DISCOUNT
     } else {
         state.z_entry
     };
 
     // --- Phase 2 filter: funding rate continuous scaling ---
-    // Scale entry_z based on funding magnitude (beyond the simple 0.9x above).
-    // funding_entry_z_scale > 0: entry_z *= 1.0 - scale * net_funding
+    // Scale entry_z based on funding magnitude (beyond the simple discount
+    // above). funding_entry_z_scale > 0: entry_z *= 1.0 - scale * net_funding
     //   positive funding → lower threshold (easier entry)
     //   negative funding → higher threshold (harder entry)
     // Disabled when funding_entry_z_scale == 0.0.
     if pp.funding_entry_z_scale > 0.0 {
         let adjustment = 1.0 - pp.funding_entry_z_scale * net_funding;
-        entry_threshold *= adjustment.clamp(0.5, 2.0);
+        entry_threshold *= adjustment.clamp(ENTRY_Z_SCALE_MIN, ENTRY_Z_SCALE_MAX);
     }
 
     // --- Phase 2 filter: beta gap dynamic adjustment ---
