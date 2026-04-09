@@ -54,6 +54,12 @@ impl DexConnectorBox {
         dry_run: bool,
         agent_name: Option<String>,
         token_list: &[String],
+        // Optional instance id for the multi-strategy single-process
+        // architecture (shigeo-nakamura/bot-strategy#25). When `Some`, the
+        // Lighter env loader prefers credentials suffixed with this id so
+        // each strategy variant can target its own sub-account. `None`
+        // preserves single-instance behavior.
+        instance_id: Option<&str>,
     ) -> Result<Self, DexError> {
         match dex_name {
             "hyperliquid" => {
@@ -88,7 +94,7 @@ impl DexConnectorBox {
             }
             #[cfg(feature = "lighter-sdk")]
             "lighter" => {
-                let lighter_config = match get_lighter_config_from_env().await {
+                let lighter_config = match get_lighter_config_from_env(instance_id).await {
                     Ok(v) => v,
                     Err(e) => {
                         return Err(DexError::Other(e.to_string()));

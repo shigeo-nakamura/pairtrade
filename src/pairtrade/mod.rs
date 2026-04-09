@@ -59,6 +59,14 @@ use util::{round_price_by_tick, tail_std};
 struct StrategyInstance {
     #[allow(dead_code)]
     id: String,
+    /// Per-strategy connector. For single-instance deployments this is the
+    /// same `Arc` as `PairTradeEngine.connector`. For multi-strategy
+    /// deployments each instance owns its own connector pointing at its
+    /// sub-account credentials. Submodules currently still go through
+    /// `engine.connector`; commit 4 of #25 will switch them to read from
+    /// the per-instance connector.
+    #[allow(dead_code)]
+    connector: Arc<dyn DexConnector + Send + Sync>,
     states: HashMap<String, PairState>,
     pnl_logger: Option<PnlLogger>,
     status_reporter: Option<StatusReporter>,
@@ -134,17 +142,22 @@ impl PairTradeEngine {
         replay: Arc<ReplayConnector>,
     ) -> Result<Self> {
         replay.reset();
-        Self::new_inner(cfg, replay.clone(), Some(replay)).await
+        let primary: Arc<dyn DexConnector + Send + Sync> = replay.clone();
+        let n = cfg.strategies.len().max(1);
+        let instance_connectors = std::iter::repeat(primary.clone()).take(n).collect();
+        Self::new_inner(cfg, primary, instance_connectors, Some(replay)).await
     }
 
     pub async fn new(cfg: PairTradeConfig) -> Result<Self> {
-        let (connector, replay_connector) = backtest::create_connector(&cfg).await?;
-        Self::new_inner(cfg, connector, replay_connector).await
+        let (connector, instance_connectors, replay_connector) =
+            backtest::create_connector(&cfg).await?;
+        Self::new_inner(cfg, connector, instance_connectors, replay_connector).await
     }
 
     async fn new_inner(
         cfg: PairTradeConfig,
         connector: Arc<dyn DexConnector + Send + Sync>,
+        instance_connectors: Vec<Arc<dyn DexConnector + Send + Sync>>,
         replay_connector: Option<Arc<ReplayConnector>>,
     ) -> Result<Self> {
         let mut states = HashMap::new();
@@ -216,8 +229,17 @@ impl PairTradeEngine {
                     .clone()
                     .unwrap_or_else(|| "default".to_string())
             });
+        // For commit 3 of #25 there is still exactly one StrategyInstance,
+        // so it owns the (only) per-strategy connector. Single-instance
+        // deployments end up with this Arc pointing at the same connector
+        // as `engine.connector` below.
+        let instance_connector = instance_connectors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| connector.clone());
         let instance = StrategyInstance {
             id: instance_id,
+            connector: instance_connector,
             states,
             pnl_logger,
             status_reporter,
@@ -3829,9 +3851,10 @@ impl PairTradeEngine {
 
         Self {
             cfg,
-            connector,
+            connector: connector.clone(),
             instances: vec![StrategyInstance {
                 id: "default".to_string(),
+                connector,
                 states: HashMap::new(),
                 pnl_logger: None,
                 status_reporter: None,

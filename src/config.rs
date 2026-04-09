@@ -72,14 +72,37 @@ impl From<rust_decimal::Error> for ConfigError {
     }
 }
 
+/// Look up an env var for a Lighter credential, optionally falling back
+/// from an instance-suffixed name to the unsuffixed name.
+///
+/// When `instance_id` is `Some("debot-pair-btceth-b")`, this checks
+/// `<NAME>_DEBOT_PAIR_BTCETH_B` first, then `<NAME>`. The single-instance
+/// path passes `None` and behaves exactly as today.
+///
+/// commit 3 of shigeo-nakamura/bot-strategy#25.
 #[cfg(feature = "lighter-sdk")]
-pub async fn get_lighter_config_from_env() -> Result<LighterConfig, ConfigError> {
+fn lighter_env(name: &str, instance_id: Option<&str>) -> Option<String> {
+    if let Some(id) = instance_id {
+        let suffix = id.to_uppercase().replace('-', "_");
+        if let Ok(value) = env::var(format!("{name}_{suffix}")) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+#[cfg(feature = "lighter-sdk")]
+pub async fn get_lighter_config_from_env(
+    instance_id: Option<&str>,
+) -> Result<LighterConfig, ConfigError> {
     // Check for plain (unencrypted) keys first
-    let plain_private_api_key = env::var("LIGHTER_PLAIN_PRIVATE_API_KEY").ok();
-    let plain_public_api_key = env::var("LIGHTER_PLAIN_PUBLIC_API_KEY").ok();
-    let private_api_key = env::var("LIGHTER_PRIVATE_API_KEY").ok();
-    let public_api_key = env::var("LIGHTER_PUBLIC_API_KEY").ok();
-    let evm_wallet_private_key = env::var("LIGHTER_EVM_WALLET_PRIVATE_KEY").ok();
+    let plain_private_api_key = lighter_env("LIGHTER_PLAIN_PRIVATE_API_KEY", instance_id);
+    let plain_public_api_key = lighter_env("LIGHTER_PLAIN_PUBLIC_API_KEY", instance_id);
+    let private_api_key = lighter_env("LIGHTER_PRIVATE_API_KEY", instance_id);
+    let public_api_key = lighter_env("LIGHTER_PUBLIC_API_KEY", instance_id);
+    let evm_wallet_private_key = lighter_env("LIGHTER_EVM_WALLET_PRIVATE_KEY", instance_id);
 
     let (api_key, private_key, evm_wallet_key) = if let (Some(plain_priv), Some(plain_pub)) =
         (plain_private_api_key, plain_public_api_key)
@@ -113,13 +136,8 @@ pub async fn get_lighter_config_from_env() -> Result<LighterConfig, ConfigError>
         // Use encrypted keys with KMS
         log::info!("Using KMS encrypted keys");
 
-        let api_key = public_api_key
-            .or_else(|| env::var("LIGHTER_PUBLIC_API_KEY").ok())
-            .expect("LIGHTER_PUBLIC_API_KEY must be set");
-
-        let private_key = private_api_key
-            .or_else(|| env::var("LIGHTER_PRIVATE_API_KEY").ok())
-            .expect("LIGHTER_PRIVATE_API_KEY must be set");
+        let api_key = public_api_key.expect("LIGHTER_PUBLIC_API_KEY must be set");
+        let private_key = private_api_key.expect("LIGHTER_PRIVATE_API_KEY must be set");
 
         let encrypted_data_key = env::var("ENCRYPTED_DATA_KEY")
             .expect("ENCRYPTED_DATA_KEY must be set")
@@ -158,21 +176,19 @@ pub async fn get_lighter_config_from_env() -> Result<LighterConfig, ConfigError>
     let websocket_url = env::var("WEB_SOCKET_ENDPOINT")
         .unwrap_or_else(|_| "wss://mainnet.zklighter.elliot.ai/stream".to_string());
 
-    // Read additional configuration
-    let api_key_index: u32 = env::var("LIGHTER_API_KEY_INDEX")
-        .unwrap_or_else(|_| "0".to_string())
+    // Read additional configuration (instance-suffixed values win over the
+    // unsuffixed defaults so each strategy variant can point at its own
+    // sub-account; see lighter_env() above).
+    let api_key_index: u32 = lighter_env("LIGHTER_API_KEY_INDEX", instance_id)
+        .unwrap_or_else(|| "0".to_string())
         .parse()
         .expect("LIGHTER_API_KEY_INDEX must be a valid u32");
 
-    let account_index: u64 = env::var("LIGHTER_ACCOUNT_INDEX")
-        .ok()
-        .and_then(|v| if v.is_empty() { None } else { Some(v) })
+    let account_index: u64 = lighter_env("LIGHTER_ACCOUNT_INDEX", instance_id)
         .unwrap_or_else(|| "0".to_string())
         .parse()
         .expect("LIGHTER_ACCOUNT_INDEX must be a valid u64");
-    let wallet_address = env::var("LIGHTER_WALLET_ADDRESS")
-        .ok()
-        .and_then(|v| if v.is_empty() { None } else { Some(v) });
+    let wallet_address = lighter_env("LIGHTER_WALLET_ADDRESS", instance_id);
 
     Ok(LighterConfig {
         api_key,
