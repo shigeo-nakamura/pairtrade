@@ -12,6 +12,7 @@ scripts/venv/
 *.log
 *.md
 !online_adaptation_plan.md
+!docs/*.md
 *.patch
 pairtrade_history.json
 *.swp

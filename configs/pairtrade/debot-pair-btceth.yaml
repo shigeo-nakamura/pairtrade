@@ -70,3 +70,34 @@ circuit_breaker_tier1_losses: 5
 circuit_breaker_tier1_cooldown_secs: 600
 circuit_breaker_tier2_losses: 8
 circuit_breaker_tier2_cooldown_secs: 3600
+
+# Multi-strategy A/B/C variants for the single-process architecture
+# (shigeo-nakamura/bot-strategy#25). The schema is wired through but
+# the engine still ignores the list -- it runs only the first entry's
+# scalars (and only as a single StrategyInstance) until a follow-up
+# commit splits step() into a shared phase + per-instance phase. See
+# docs/issue-25-cutover.md "Status" section for details.
+#
+# Once the engine loop is fixed, uncomment this block to flip A/B/C
+# into the same process (and follow the runbook for credential setup
+# and pnl/status file migration).
+#
+# strategies:
+#   - id: a
+#     agent_name: debot-pair-btceth-a
+#     exit_z_score: 0.2
+#     stop_loss_z_score: 4.0
+#     max_loss_r_mult: 1.0
+#     equity_usd_fallback: 1000
+#   - id: b
+#     agent_name: debot-pair-btceth-b
+#     exit_z_score: 0.2
+#     stop_loss_z_score: 6.0
+#     max_loss_r_mult: 3.0
+#     equity_usd_fallback: 500
+#   - id: c
+#     agent_name: debot-pair-btceth-c
+#     exit_z_score: 0.3
+#     stop_loss_z_score: 6.0
+#     max_loss_r_mult: 3.0
+#     equity_usd_fallback: 500

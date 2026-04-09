@@ -62,9 +62,7 @@ struct StrategyInstance {
     /// Per-strategy connector. For single-instance deployments this is the
     /// same `Arc` as `PairTradeEngine.connector`. For multi-strategy
     /// deployments each instance owns its own connector pointing at its
-    /// sub-account credentials. Submodules currently still go through
-    /// `engine.connector`; commit 4 of #25 will switch them to read from
-    /// the per-instance connector.
+    /// sub-account credentials.
     #[allow(dead_code)]
     connector: Arc<dyn DexConnector + Send + Sync>,
     states: HashMap<String, PairState>,
@@ -202,15 +200,22 @@ impl PairTradeEngine {
                     .clone()
                     .unwrap_or_else(|| "default".to_string())
             });
-        // commit 4 of #25: keep single-instance byte-identical to today
-        // (multi_instance=false suppresses the suffix). When commit 6
-        // ships YAML with multiple `strategies:` entries, len()>1 will
-        // turn the suffix on and each instance gets its own pnl/status
-        // files.
-        let multi_instance = cfg.strategies.len() > 1;
-        let pnl_logger = PnlLogger::from_env_for_instance(&cfg, &instance_id, multi_instance);
+        // NOTE for #25 follow-up: today the engine still builds exactly
+        // ONE StrategyInstance even when cfg.strategies has multiple
+        // entries. The reason is that the current step() loop calls
+        // fetch_latest_prices() per iteration, which advances the
+        // ReplayConnector clock — so iterating per instance would have
+        // each variant see a different replay tick rather than the same
+        // shared tick. Splitting step() into a shared phase (price/bar
+        // update / evaluate_pair) and a per-instance phase (decision /
+        // order placement) is its own commit; until then the
+        // multi-strategy YAML format parses correctly but instances.len()
+        // stays at 1 and only the first cfg.strategies entry is honored.
+        // multi_instance stays false here so single-bot pnl/status keying
+        // remains exactly today's, even when YAML lists multiple variants.
+        let pnl_logger = PnlLogger::from_env_for_instance(&cfg, &instance_id, false);
         let mut status_reporter =
-            StatusReporter::from_env_for_instance(&cfg, &instance_id, multi_instance);
+            StatusReporter::from_env_for_instance(&cfg, &instance_id, false);
 
         // Restore lifetime trade stats from the on-disk pnl log so the
         // dashboard's Trades / Win Rate / Max DD survive process restarts.
@@ -236,10 +241,6 @@ impl PairTradeEngine {
             });
         }
 
-        // For commit 3 of #25 there is still exactly one StrategyInstance,
-        // so it owns the (only) per-strategy connector. Single-instance
-        // deployments end up with this Arc pointing at the same connector
-        // as `engine.connector` below.
         let instance_connector = instance_connectors
             .first()
             .cloned()
@@ -4331,10 +4332,11 @@ mod shutdown_grace_tests {
 
     #[test]
     fn live_btceth_configs_pin_grace_above_force_close() {
+        // The -b / -c YAMLs were folded into the single multi-strategy
+        // debot-pair-btceth.yaml in commit 7 of #25; only the consolidated
+        // file is checked here.
         for name in &[
             "debot-pair-btceth.yaml",
-            "debot-pair-btceth-b.yaml",
-            "debot-pair-btceth-c.yaml",
             "debot-pair-solhype.yaml",
         ] {
             let path = config_path(name);
