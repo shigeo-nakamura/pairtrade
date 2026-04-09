@@ -283,18 +283,6 @@ impl PairTradeEngine {
         })
     }
 
-    #[allow(dead_code)]
-    #[inline]
-    fn instance(&self) -> &StrategyInstance {
-        &self.instances[0]
-    }
-
-    #[allow(dead_code)]
-    #[inline]
-    fn instance_mut(&mut self) -> &mut StrategyInstance {
-        &mut self.instances[0]
-    }
-
     /// Whether every strategy instance is currently flat. For single-instance
     /// deployments this is exactly today's `self.open_positions.is_empty()`
     /// check (golden-test stable). For multi-instance deployments this also
@@ -328,23 +316,23 @@ impl PairTradeEngine {
         from_states.max(self.open_positions.len())
     }
 
-    fn write_pnl_record(&mut self, record: PnlLogRecord) {
+    fn write_pnl_record(&mut self, inst_idx: usize, record: PnlLogRecord) {
         // Update trade stats
-        self.instances[0].total_trades += 1;
-        self.instances[0].total_pnl += record.pnl;
+        self.instances[inst_idx].total_trades += 1;
+        self.instances[inst_idx].total_pnl += record.pnl;
         if record.pnl > 0.0 {
-            self.instances[0].total_wins += 1;
+            self.instances[inst_idx].total_wins += 1;
         }
-        if self.instances[0].total_pnl > self.instances[0].peak_pnl {
-            self.instances[0].peak_pnl = self.instances[0].total_pnl;
+        if self.instances[inst_idx].total_pnl > self.instances[inst_idx].peak_pnl {
+            self.instances[inst_idx].peak_pnl = self.instances[inst_idx].total_pnl;
         }
-        let dd = self.instances[0].peak_pnl - self.instances[0].total_pnl;
-        if dd > self.instances[0].max_dd {
-            self.instances[0].max_dd = dd;
+        let dd = self.instances[inst_idx].peak_pnl - self.instances[inst_idx].total_pnl;
+        if dd > self.instances[inst_idx].max_dd {
+            self.instances[inst_idx].max_dd = dd;
         }
 
         // Update status reporter
-        let inst = &mut self.instances[0];
+        let inst = &mut self.instances[inst_idx];
         if let Some(reporter) = &mut inst.status_reporter {
             let wr = if inst.total_trades > 0 {
                 inst.total_wins as f64 / inst.total_trades as f64 * 100.0
@@ -358,7 +346,7 @@ impl PairTradeEngine {
             });
         }
 
-        if let Some(logger) = &mut self.instances[0].pnl_logger {
+        if let Some(logger) = &mut self.instances[inst_idx].pnl_logger {
             if let Err(err) = logger.log(record) {
                 log::warn!("[PNL] failed to write pnl log: {:?}", err);
             }
@@ -376,23 +364,25 @@ impl PairTradeEngine {
         }
 
         // Log internal state for active pairs
-        for (key, state) in self.instances[0].states.iter() {
-            let is_active = state.position.is_some()
-                || state.pending_entry.is_some()
-                || state.pending_exit.is_some()
-                || state.position_guard;
-            if !is_active {
-                continue;
+        for inst in self.instances.iter() {
+            for (key, state) in inst.states.iter() {
+                let is_active = state.position.is_some()
+                    || state.pending_entry.is_some()
+                    || state.pending_exit.is_some()
+                    || state.position_guard;
+                if !is_active {
+                    continue;
+                }
+                log::error!(
+                    "[DEBUG][STATE] key={} position={:?} pending_entry={:?} pending_exit={:?} guard={} positions_ready={}",
+                    key,
+                    state.position,
+                    state.pending_entry.as_ref().map(|p| p.legs.len()),
+                    state.pending_exit.as_ref().map(|p| p.legs.len()),
+                    state.position_guard,
+                    self.positions_ready
+                );
             }
-            log::error!(
-                "[DEBUG][STATE] key={} position={:?} pending_entry={:?} pending_exit={:?} guard={} positions_ready={}",
-                key,
-                state.position,
-                state.pending_entry.as_ref().map(|p| p.legs.len()),
-                state.pending_exit.as_ref().map(|p| p.legs.len()),
-                state.position_guard,
-                self.positions_ready
-            );
         }
 
         // Log what the exchange reports for positions
@@ -634,9 +624,11 @@ impl PairTradeEngine {
                 }
             }
         }
-        if let Some(reporter) = &mut self.instances[0].status_reporter {
-            if let Err(err) = reporter.write_snapshot(&self.open_positions, self.positions_ready) {
-                log::warn!("[STATUS] failed to write status: {:?}", err);
+        for inst in self.instances.iter_mut() {
+            if let Some(reporter) = &mut inst.status_reporter {
+                if let Err(err) = reporter.write_snapshot(&self.open_positions, self.positions_ready) {
+                    log::warn!("[STATUS] failed to write status: {:?}", err);
+                }
             }
         }
         Ok(())
@@ -1006,7 +998,19 @@ impl PairTradeEngine {
         }
     }
 
-    async fn step(&mut self) -> Result<()> {
+    pub async fn step(&mut self) -> Result<()> {
+        for inst_idx in 0..self.instances.len() {
+            // Engine.connector is the legacy single-connector pointer that
+            // many submodule helpers still read. Point it at the active
+            // instance's connector for the duration of this iteration so
+            // their unchanged code paths hit the correct sub-account.
+            self.connector = self.instances[inst_idx].connector.clone();
+            self.step_for_instance(inst_idx).await?;
+        }
+        Ok(())
+    }
+
+    async fn step_for_instance(&mut self, inst_idx: usize) -> Result<()> {
         // Lighter WAF cooldown is host-shared. Any REST call we make here
         // would be rejected anyway and would refresh the rolling window,
         // turning a 60s cooldown into a permanent block. Skip silently.
@@ -1022,7 +1026,7 @@ impl PairTradeEngine {
         if maintenance_block_entries {
             log::warn!("Upcoming maintenance detected; blocking new entries this cycle");
         }
-        if let Some(reporter) = &mut self.instances[0].status_reporter {
+        if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
             reporter.set_maintenance(if maintenance_block_entries {
                 Some("blocking_entries".to_string())
             } else {
@@ -1030,9 +1034,9 @@ impl PairTradeEngine {
             });
         }
 
-        self.refresh_equity_if_needed().await?;
+        self.refresh_equity_if_needed(inst_idx).await?;
         let price_map = self.fetch_latest_prices().await?;
-        self.sync_positions_from_exchange(&price_map).await?;
+        self.sync_positions_from_exchange(inst_idx, &price_map).await?;
 
         if let Some(writer) = &mut self.data_dump_writer {
             let dump_entry = DataDumpEntry {
@@ -1046,10 +1050,10 @@ impl PairTradeEngine {
             }
         }
 
-        let vol_median = self.compute_vol_median();
+        let vol_median = self.compute_vol_median(inst_idx);
         let positions_clear = self.open_positions.is_empty();
         let has_pending_orders = self
-            .instances[0]
+            .instances[inst_idx]
             .states
             .values()
             .any(|state| state.pending_entry.is_some() || state.pending_exit.is_some());
@@ -1128,7 +1132,7 @@ impl PairTradeEngine {
             }
 
             // First, reconcile any pending entry/exit orders for this pair
-            self.reconcile_pending_orders(&key, &price_map).await?;
+            self.reconcile_pending_orders(inst_idx, &key, &price_map).await?;
 
             let mut action = TradeAction::None;
             let log_a = self
@@ -1151,7 +1155,7 @@ impl PairTradeEngine {
                 beta_long,
             ) = {
                 let state = self
-                    .instances[0]
+                    .instances[inst_idx]
                     .states
                     .get_mut(&key)
                     .ok_or_else(|| anyhow!("missing state for {}", key))?;
@@ -1217,14 +1221,14 @@ impl PairTradeEngine {
                 }
             }
 
-            if self.instances[0].states[&key].pending_entry.is_some() || self.instances[0].states[&key].pending_exit.is_some()
+            if self.instances[inst_idx].states[&key].pending_entry.is_some() || self.instances[inst_idx].states[&key].pending_exit.is_some()
             {
                 if !matches!(action, TradeAction::None) {
                     log::debug!("[ORDER] {} has pending orders; skipping new actions", key);
                 }
                 continue;
             }
-            if self.instances[0].states[&key].position_guard {
+            if self.instances[inst_idx].states[&key].position_guard {
                 if matches!(action, TradeAction::None) {
                     if self.should_log_position_warn(&key) {
                         log::warn!(
@@ -1247,7 +1251,7 @@ impl PairTradeEngine {
                 velocity.abs() >= pp.spread_velocity_max_sigma_per_min * pp.reeval_jump_z_mult;
             let vol_spike = z_snapshot
                 .and_then(|(_, std, _, _)| {
-                    tail_std(&self.instances[0].states[&key].spread_history, self.cfg.metrics_window).map(
+                    tail_std(&self.instances[inst_idx].states[&key].spread_history, self.cfg.metrics_window).map(
                         |base_std| {
                             if base_std <= 1e-9 {
                                 0.0
@@ -1311,11 +1315,11 @@ impl PairTradeEngine {
             };
 
             let mut log_positions_not_ready = false;
-            let circuit_breaker_until_ts_snapshot = self.instances[0].circuit_breaker_until_ts;
-            let consecutive_losses_snapshot = self.instances[0].consecutive_losses;
+            let circuit_breaker_until_ts_snapshot = self.instances[inst_idx].circuit_breaker_until_ts;
+            let consecutive_losses_snapshot = self.instances[inst_idx].consecutive_losses;
             {
                 let state = self
-                    .instances[0]
+                    .instances[inst_idx]
                     .states
                     .get_mut(&key)
                     .ok_or_else(|| anyhow!("missing state for {}", key))?;
@@ -1479,7 +1483,7 @@ impl PairTradeEngine {
             }
         }
 
-        self.maybe_log_metrics();
+        self.maybe_log_metrics(inst_idx);
         // Process exits first
         for plan in planned.iter() {
             if let TradeAction::Close {
@@ -1490,14 +1494,14 @@ impl PairTradeEngine {
             } = plan.action
             {
                 let qtys = self
-                    .exit_sizes_for_pair(&plan.key, &plan.pair, beta, &plan.p1, &plan.p2)
+                    .exit_sizes_for_pair(inst_idx, &plan.key, &plan.pair, beta, &plan.p1, &plan.p2)
                     .context("exit_sizes_for_pair")?;
                 if qtys.0 <= Decimal::ZERO && qtys.1 <= Decimal::ZERO {
                     log::warn!(
                         "[EXIT] {} no open position sizes available; clearing state",
                         plan.key
                     );
-                    if let Some(state) = self.instances[0].states.get_mut(&plan.key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         state.position = None;
                         state.pending_exit = None;
                         state.position_guard = false;
@@ -1524,14 +1528,14 @@ impl PairTradeEngine {
                         .map(|s| s.price)
                         .unwrap_or_default();
                     let pnl = self
-                        .instances[0]
+                        .instances[inst_idx]
                         .states
                         .get(&plan.key)
                         .and_then(|s| s.position.as_ref())
                         .and_then(|pos| compute_pnl(pos, price_a, price_b));
                     if let Some(pnl) = pnl {
                         if let Some(pnl_value) = pnl.to_f64() {
-                            let pos_ref = self.instances[0].states.get(&plan.key)
+                            let pos_ref = self.instances[inst_idx].states.get(&plan.key)
                                 .and_then(|s| s.position.as_ref());
                             let hold_secs = pos_ref
                                 .map(|p| now_ts.saturating_sub(p.entered_ts).max(0) as f64);
@@ -1552,32 +1556,32 @@ impl PairTradeEngine {
                                 entry_a, entry_b,
                                 price_a.to_f64(), price_b.to_f64(),
                                 Some(beta), Some(z),
-                                self.instances[0].states.get(&plan.key)
+                                self.instances[inst_idx].states.get(&plan.key)
                                     .and_then(|s| s.last_spread.map(|_| z)),
                                 hold_secs,
                             );
-                            self.write_pnl_record(record);
+                            self.write_pnl_record(inst_idx, record);
                             if pnl_value < 0.0 {
-                                self.instances[0].consecutive_losses += 1;
+                                self.instances[inst_idx].consecutive_losses += 1;
                                 if let Some(cooldown) = self
                                     .cfg
-                                    .circuit_breaker_cooldown_for(self.instances[0].consecutive_losses)
+                                    .circuit_breaker_cooldown_for(self.instances[inst_idx].consecutive_losses)
                                 {
-                                    self.instances[0].circuit_breaker_until = Some(Instant::now() + cooldown);
-                                    self.instances[0].circuit_breaker_until_ts =
+                                    self.instances[inst_idx].circuit_breaker_until = Some(Instant::now() + cooldown);
+                                    self.instances[inst_idx].circuit_breaker_until_ts =
                                         Some(now_ts + cooldown.as_secs() as i64);
                                     log::warn!(
                                         "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
-                                        self.instances[0].consecutive_losses, cooldown.as_secs()
+                                        self.instances[inst_idx].consecutive_losses, cooldown.as_secs()
                                     );
                                 }
                             } else if pnl_value > 0.0 {
-                                if self.instances[0].consecutive_losses > 0 {
-                                    log::info!("[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)", self.instances[0].consecutive_losses);
+                                if self.instances[inst_idx].consecutive_losses > 0 {
+                                    log::info!("[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)", self.instances[inst_idx].consecutive_losses);
                                 }
-                                self.instances[0].consecutive_losses = 0;
-                                self.instances[0].circuit_breaker_until = None;
-                                self.instances[0].circuit_breaker_until_ts = None;
+                                self.instances[inst_idx].consecutive_losses = 0;
+                                self.instances[inst_idx].circuit_breaker_until = None;
+                                self.instances[inst_idx].circuit_breaker_until_ts = None;
                             }
                         }
                         log::info!(
@@ -1611,7 +1615,7 @@ impl PairTradeEngine {
                             now_ts
                         );
                     }
-                    if let Some(state) = self.instances[0].states.get_mut(&plan.key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         state.position = None;
                         state.last_exit_at = Some(Instant::now());
                         state.last_exit_ts = Some(now_ts);
@@ -1629,11 +1633,11 @@ impl PairTradeEngine {
                     {
                         Ok(legs) => legs,
                         Err(err) => {
-                            self.register_partial_leg_failure(&plan.key, direction, &err, true);
+                            self.register_partial_leg_failure(inst_idx, &plan.key, direction, &err, true);
                             return Err(err);
                         }
                     };
-                    if let Some(state) = self.instances[0].states.get_mut(&plan.key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         state.pending_exit = Some(PendingOrders {
                             legs,
                             direction,
@@ -1652,7 +1656,7 @@ impl PairTradeEngine {
             .iter()
             .filter_map(|pair| {
                 let key = format!("{}/{}", pair.base, pair.quote);
-                let state = self.instances[0].states.get(&key)?;
+                let state = self.instances[inst_idx].states.get(&key)?;
                 let is_active = state.position.is_some()
                     || state.pending_entry.is_some()
                     || state.pending_exit.is_some()
@@ -1695,8 +1699,8 @@ impl PairTradeEngine {
             })
             .collect();
         entry_candidates.sort_by(|a, b| {
-            self.state_score(&b.key)
-                .partial_cmp(&self.state_score(&a.key))
+            self.state_score(inst_idx, &b.key)
+                .partial_cmp(&self.state_score(inst_idx, &a.key))
                 .unwrap_or(Ordering::Equal)
         });
         let shortlisted: Vec<&PlannedAction> = entry_candidates
@@ -1708,8 +1712,8 @@ impl PairTradeEngine {
                 .partial_cmp(&b.net_funding_per_hour)
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| {
-                    self.state_score(&a.key)
-                        .partial_cmp(&self.state_score(&b.key))
+                    self.state_score(inst_idx, &a.key)
+                        .partial_cmp(&self.state_score(inst_idx, &b.key))
                         .unwrap_or(Ordering::Equal)
                 })
                 .then_with(|| {
@@ -1747,7 +1751,7 @@ impl PairTradeEngine {
                             plan.net_funding_per_hour,
                             now_ts
                         );
-                    if let Some(state) = self.instances[0].states.get_mut(&plan.key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         state.position = Some(Position {
                             direction,
                             entered_at: Instant::now(),
@@ -1785,14 +1789,14 @@ impl PairTradeEngine {
                     {
                         Ok(legs) => legs,
                         Err(err) => {
-                            self.register_partial_leg_failure(&plan.key, direction, &err, false);
+                            self.register_partial_leg_failure(inst_idx, &plan.key, direction, &err, false);
                             return Err(err);
                         }
                     };
                     let entry_pp = self.cfg.params_for(&plan.key);
                     let hybrid =
                         entry_pp.entry_post_only_timeout_secs > 0 && self.post_only_supported();
-                    if let Some(state) = self.instances[0].states.get_mut(&plan.key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         state.pending_entry = Some(PendingOrders {
                             legs,
                             direction,
@@ -1805,7 +1809,7 @@ impl PairTradeEngine {
             }
         }
 
-        if let Some(reporter) = &mut self.instances[0].status_reporter {
+        if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
             if let Err(err) =
                 reporter.write_snapshot_if_due(&self.open_positions, self.positions_ready)
             {
@@ -1822,7 +1826,7 @@ impl PairTradeEngine {
             .map(|p| p.log_price)
     }
 
-    async fn refresh_equity_if_needed(&mut self) -> Result<()> {
+    async fn refresh_equity_if_needed(&mut self, inst_idx: usize) -> Result<()> {
         const CACHE_SECS: u64 = 300;
         if self
             .last_equity_fetch
@@ -1836,7 +1840,7 @@ impl PairTradeEngine {
                 if let Some(eq) = resp.equity.to_f64() {
                     self.equity_cache = eq.max(0.0);
                     self.last_equity_fetch = Some(Instant::now());
-                    if let Some(reporter) = &mut self.instances[0].status_reporter {
+                    if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
                         reporter.update_equity(self.equity_cache);
                     }
                 }
@@ -1851,6 +1855,7 @@ impl PairTradeEngine {
 
     async fn sync_positions_from_exchange(
         &mut self,
+        inst_idx: usize,
         prices: &HashMap<String, SymbolSnapshot>,
     ) -> Result<()> {
         if self.replay_connector.is_some() {
@@ -1863,7 +1868,7 @@ impl PairTradeEngine {
                 let err_msg = err.to_string();
                 if err_msg.contains("positions not ready from websocket") {
                     let stale_clear_secs = self.cfg.order_timeout_secs.max(1).saturating_mul(6);
-                    self.clear_stale_pending(Duration::from_secs(stale_clear_secs), "ws_not_ready");
+                    self.clear_stale_pending(inst_idx, Duration::from_secs(stale_clear_secs), "ws_not_ready");
                     if self.should_log_position_warn(&self.cfg.dex_name) {
                         log::warn!(
                             "[POSITION] waiting for initial WS positions on {}",
@@ -1907,7 +1912,7 @@ impl PairTradeEngine {
             let key = format!("{}/{}", pair.base, pair.quote);
             let log_warn = self.should_log_position_warn(&key);
 
-            let Some(state) = self.instances[0].states.get_mut(&key) else {
+            let Some(state) = self.instances[inst_idx].states.get_mut(&key) else {
                 continue;
             };
 
@@ -2005,7 +2010,7 @@ impl PairTradeEngine {
         }
 
         for (key, symbol, sign, size) in unhedged_closures {
-            self.try_close_unhedged_leg(&key, &symbol, sign, size, prices)
+            self.try_close_unhedged_leg(inst_idx, &key, &symbol, sign, size, prices)
                 .await;
         }
 
@@ -2014,6 +2019,7 @@ impl PairTradeEngine {
 
     async fn try_close_unhedged_leg(
         &mut self,
+        inst_idx: usize,
         key: &str,
         symbol: &str,
         sign: i32,
@@ -2032,7 +2038,7 @@ impl PairTradeEngine {
         }
 
         const UNHEDGED_CLOSE_COOLDOWN_SECS: u64 = 30;
-        let last_exit = self.instances[0].states.get(key).and_then(|state| state.last_exit_at);
+        let last_exit = self.instances[inst_idx].states.get(key).and_then(|state| state.last_exit_at);
         if let Some(last_exit) = last_exit {
             if last_exit.elapsed() < Duration::from_secs(UNHEDGED_CLOSE_COOLDOWN_SECS) {
                 return;
@@ -2078,7 +2084,7 @@ impl PairTradeEngine {
                     symbol,
                     res.order_id
                 );
-                if let Some(state) = self.instances[0].states.get_mut(key) {
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.last_exit_at = Some(Instant::now());
                     state.last_exit_ts = Some(now_ts);
                 }
@@ -2092,7 +2098,7 @@ impl PairTradeEngine {
                         key,
                         symbol
                     );
-                    if let Some(state) = self.instances[0].states.get_mut(key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                         state.last_exit_at = Some(Instant::now());
                         state.last_exit_ts = Some(now_ts);
                     }
@@ -2108,9 +2114,9 @@ impl PairTradeEngine {
         }
     }
 
-    fn clear_stale_pending(&mut self, max_age: Duration, reason: &str) {
+    fn clear_stale_pending(&mut self, inst_idx: usize, max_age: Duration, reason: &str) {
         let now_ts = self.current_now_ts();
-        for (key, state) in self.instances[0].states.iter_mut() {
+        for (key, state) in self.instances[inst_idx].states.iter_mut() {
             let entry_age = state.pending_entry.as_ref().map(|p| p.placed_at.elapsed());
             let exit_age = state.pending_exit.as_ref().map(|p| p.placed_at.elapsed());
             let age = match (entry_age, exit_age) {
@@ -2138,10 +2144,10 @@ impl PairTradeEngine {
         }
     }
 
-    fn compute_vol_median(&self) -> f64 {
+    fn compute_vol_median(&self, inst_idx: usize) -> f64 {
         let tail_len = self.entry_vol_window();
         let mut vols: Vec<f64> = self
-            .instances[0]
+            .instances[inst_idx]
             .states
             .values()
             .filter_map(|s| tail_std(&s.spread_history, tail_len))
@@ -2153,7 +2159,7 @@ impl PairTradeEngine {
         vols[vols.len() / 2].max(1e-9)
     }
 
-    fn maybe_log_metrics(&mut self) {
+    fn maybe_log_metrics(&mut self, inst_idx: usize) {
         const LOG_INTERVAL: u64 = 300;
         if self
             .last_metrics_log
@@ -2163,7 +2169,7 @@ impl PairTradeEngine {
             return;
         }
         let mut lines = Vec::new();
-        for (k, s) in &self.instances[0].states {
+        for (k, s) in &self.instances[inst_idx].states {
             let z = s.z_score().map(|(z, _)| z).unwrap_or(0.0);
             lines.push(format!(
                 "{} elig={} z={:.2} beta={:.2} hl={:.2}h p={:.3}",
@@ -2177,8 +2183,8 @@ impl PairTradeEngine {
         self.last_metrics_log = Some(Instant::now());
     }
 
-    fn state_score(&self, key: &str) -> f64 {
-        self.instances[0].states
+    fn state_score(&self, inst_idx: usize, key: &str) -> f64 {
+        self.instances[inst_idx].states
             .get(key)
             .map(|s| s.p_value_weighted_score)
             .unwrap_or(0.0)
@@ -2299,31 +2305,33 @@ impl PairTradeEngine {
         if self.cfg.disable_history_persist {
             return;
         }
-        for pair in self.cfg.universe.clone() {
-            let key = format!("{}/{}", pair.base, pair.quote);
-            let (Some(hist_a), Some(hist_b)) =
-                (self.history.get(&pair.base), self.history.get(&pair.quote))
-            else { continue };
-            let take = self.cfg.metrics_window.min(hist_a.len()).min(hist_b.len());
-            if take < 2 { continue }
-            let tail_a = tail_samples(hist_a, take);
-            let tail_b = tail_samples(hist_b, take);
-            let beta = regression_beta(&tail_b, &tail_a);
-            let spreads: VecDeque<f64> = tail_a
-                .iter()
-                .zip(tail_b.iter())
-                .map(|(sa, sb)| sa.log_price - beta * sb.log_price)
-                .collect();
-            let Some(state) = self.instances[0].states.get_mut(&key) else { continue };
-            state.beta = beta;
-            state.beta_short = beta;
-            state.beta_long = beta;
-            state.last_spread = spreads.back().copied();
-            state.spread_history = spreads;
-            log::info!(
-                "[WARM_START] {} seeded spread_history len={} beta={:.4}",
-                key, state.spread_history.len(), state.beta
-            );
+        for inst_idx in 0..self.instances.len() {
+            for pair in self.cfg.universe.clone() {
+                let key = format!("{}/{}", pair.base, pair.quote);
+                let (Some(hist_a), Some(hist_b)) =
+                    (self.history.get(&pair.base), self.history.get(&pair.quote))
+                else { continue };
+                let take = self.cfg.metrics_window.min(hist_a.len()).min(hist_b.len());
+                if take < 2 { continue }
+                let tail_a = tail_samples(hist_a, take);
+                let tail_b = tail_samples(hist_b, take);
+                let beta = regression_beta(&tail_b, &tail_a);
+                let spreads: VecDeque<f64> = tail_a
+                    .iter()
+                    .zip(tail_b.iter())
+                    .map(|(sa, sb)| sa.log_price - beta * sb.log_price)
+                    .collect();
+                let Some(state) = self.instances[inst_idx].states.get_mut(&key) else { continue };
+                state.beta = beta;
+                state.beta_short = beta;
+                state.beta_long = beta;
+                state.last_spread = spreads.back().copied();
+                state.spread_history = spreads;
+                log::info!(
+                    "[WARM_START] {} seeded spread_history len={} beta={:.4}",
+                    key, state.spread_history.len(), state.beta
+                );
+            }
         }
     }
 
@@ -2365,6 +2373,7 @@ impl PairTradeEngine {
 
     async fn reconcile_pending_orders(
         &mut self,
+        inst_idx: usize,
         key: &str,
         price_map: &HashMap<String, SymbolSnapshot>,
     ) -> Result<()> {
@@ -2372,7 +2381,7 @@ impl PairTradeEngine {
         let now_ts = self.current_now_ts();
         let (pending_entry, pending_exit) = {
             let state = self
-                .instances[0]
+                .instances[inst_idx]
                 .states
                 .get_mut(key)
                 .ok_or_else(|| anyhow!("missing state for {}", key))?;
@@ -2384,7 +2393,7 @@ impl PairTradeEngine {
             self.update_pending_fills(&mut pending, &status.fills);
             let filled_qtys = self.filled_by_leg(&pending, &status.fills);
             if self.all_filled(&pending, &status.fills) {
-                if let Some(state) = self.instances[0].states.get_mut(key) {
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     let (mut ep_a, mut ep_b, mut es_a, mut es_b) = (None, None, None, None);
                     if let Some((base, quote)) = key.split_once('/') {
                         for leg in &pending.legs {
@@ -2445,10 +2454,10 @@ impl PairTradeEngine {
                     )
                     .await?
                 {
-                    if let Some(state) = self.instances[0].states.get_mut(key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                         state.pending_entry = Some(new_pending);
                     }
-                } else if let Some(state) = self.instances[0].states.get_mut(key) {
+                } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.pending_entry = None;
                 }
                 return Ok(());
@@ -2468,7 +2477,7 @@ impl PairTradeEngine {
                     let new_pending = self
                         .reissue_entry_as_taker(key, &pending, price_map)
                         .await?;
-                    if let Some(state) = self.instances[0].states.get_mut(key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                         state.pending_entry = new_pending;
                     }
                 }
@@ -2572,7 +2581,7 @@ impl PairTradeEngine {
                         }
                     }
                 }
-                if let Some(state) = self.instances[0].states.get_mut(key) {
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     if hedge_failed {
                         retry_count = retry_count.saturating_add(1);
                         pending.hedge_retry_count = retry_count;
@@ -2593,7 +2602,7 @@ impl PairTradeEngine {
                         }
                     }
                 }
-            } else if let Some(state) = self.instances[0].states.get_mut(key) {
+            } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                 state.pending_entry = Some(pending);
             }
         }
@@ -2605,7 +2614,7 @@ impl PairTradeEngine {
             let filled_qtys = self.filled_by_leg(&pending, &status.fills);
             let mut pnl_record: Option<(PnlLogRecord, f64)> = None;
             if status.open_remaining == 0 && self.all_filled(&pending, &status.fills) {
-                if let Some(state) = self.instances[0].states.get_mut(key) {
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     if let Some(pos) = state.position.as_ref() {
                         if let Some((base, quote)) = key.split_once('/') {
                             if let (Some(p1), Some(p2)) =
@@ -2636,38 +2645,38 @@ impl PairTradeEngine {
                 }
                 log::info!("[ORDER] {} exit orders filled", key);
                 if let Some((record, pnl_value)) = pnl_record {
-                    self.write_pnl_record(record);
+                    self.write_pnl_record(inst_idx, record);
                     if pnl_value < 0.0 {
-                        self.instances[0].consecutive_losses += 1;
+                        self.instances[inst_idx].consecutive_losses += 1;
                         if let Some(cooldown) = self
                             .cfg
-                            .circuit_breaker_cooldown_for(self.instances[0].consecutive_losses)
+                            .circuit_breaker_cooldown_for(self.instances[inst_idx].consecutive_losses)
                         {
-                            self.instances[0].circuit_breaker_until = Some(Instant::now() + cooldown);
-                            self.instances[0].circuit_breaker_until_ts =
+                            self.instances[inst_idx].circuit_breaker_until = Some(Instant::now() + cooldown);
+                            self.instances[inst_idx].circuit_breaker_until_ts =
                                 Some(now_ts + cooldown.as_secs() as i64);
                             log::warn!(
                                 "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
-                                self.instances[0].consecutive_losses, cooldown.as_secs()
+                                self.instances[inst_idx].consecutive_losses, cooldown.as_secs()
                             );
                         }
                     } else if pnl_value > 0.0 {
-                        if self.instances[0].consecutive_losses > 0 {
+                        if self.instances[inst_idx].consecutive_losses > 0 {
                             log::info!(
                                 "[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)",
-                                self.instances[0].consecutive_losses
+                                self.instances[inst_idx].consecutive_losses
                             );
                         }
-                        self.instances[0].consecutive_losses = 0;
-                        self.instances[0].circuit_breaker_until = None;
-                        self.instances[0].circuit_breaker_until_ts = None;
+                        self.instances[inst_idx].consecutive_losses = 0;
+                        self.instances[inst_idx].circuit_breaker_until = None;
+                        self.instances[inst_idx].circuit_breaker_until_ts = None;
                     }
                 }
             } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
                 let next_retry = pending.hedge_retry_count.saturating_add(1);
                 if next_retry > MAX_EXIT_RETRIES {
                     self.force_close_all_positions(key, "partial_fill").await;
-                    if let Some(state) = self.instances[0].states.get_mut(key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                         state.pending_exit = None;
                     }
                     return Ok(());
@@ -2681,10 +2690,10 @@ impl PairTradeEngine {
                     .reissue_partial_legs(&pending, &filled_qtys, price_map, true, true, next_retry)
                     .await?
                 {
-                    if let Some(state) = self.instances[0].states.get_mut(key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                         state.pending_exit = Some(new_pending);
                     }
-                } else if let Some(state) = self.instances[0].states.get_mut(key) {
+                } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.pending_exit = None;
                 }
                 return Ok(());
@@ -2692,7 +2701,7 @@ impl PairTradeEngine {
                 let next_retry = pending.hedge_retry_count.saturating_add(1);
                 if next_retry > MAX_EXIT_RETRIES {
                     self.force_close_all_positions(key, "timeout").await;
-                    if let Some(state) = self.instances[0].states.get_mut(key) {
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                         state.pending_exit = None;
                     }
                     return Ok(());
@@ -2766,7 +2775,7 @@ impl PairTradeEngine {
                         }
                     }
                 }
-                if let Some(state) = self.instances[0].states.get_mut(key) {
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     if new_legs.is_empty() {
                         state.pending_exit = None;
                         // Keep position state unchanged; will retry next loop
@@ -2780,7 +2789,7 @@ impl PairTradeEngine {
                         });
                     }
                 }
-            } else if let Some(state) = self.instances[0].states.get_mut(key) {
+            } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                 state.pending_exit = Some(pending);
             }
         }
@@ -2936,6 +2945,7 @@ impl PairTradeEngine {
 
     fn exit_sizes_for_pair(
         &self,
+        inst_idx: usize,
         key: &str,
         pair: &PairSpec,
         beta: f64,
@@ -2952,7 +2962,7 @@ impl PairTradeEngine {
 
         let mut qty_a = Decimal::ZERO;
         let mut qty_b = Decimal::ZERO;
-        if let Some(state) = self.instances[0].states.get(key).and_then(|s| s.position.as_ref()) {
+        if let Some(state) = self.instances[inst_idx].states.get(key).and_then(|s| s.position.as_ref()) {
             qty_a = state.entry_size_a.unwrap_or(Decimal::ZERO);
             qty_b = state.entry_size_b.unwrap_or(Decimal::ZERO);
         }
@@ -3711,13 +3721,14 @@ impl PairTradeEngine {
 
     fn register_partial_leg_failure(
         &mut self,
+        inst_idx: usize,
         key: &str,
         direction: PositionDirection,
         err: &anyhow::Error,
         is_exit: bool,
     ) {
         if let Some(partial) = err.downcast_ref::<PartialOrderPlacementError>() {
-            if let Some(state) = self.instances[0].states.get_mut(key) {
+            if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                 let pending = PendingOrders {
                     legs: partial.legs().to_vec(),
                     direction,
