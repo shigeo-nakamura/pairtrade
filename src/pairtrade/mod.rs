@@ -40,6 +40,8 @@ use pair_eval::PairEvaluation;
 use pnl_log::{PnlLogRecord, PnlLogger};
 use stats::{regression_beta, spread_slope_sigma, tail_samples, PriceSample};
 pub use config::{PairTradeConfig, WarmStartMode};
+#[cfg(test)]
+use config::PairParams;
 use config::PairSpec;
 use defaults::*;
 use state::{
@@ -2234,7 +2236,9 @@ impl PairTradeEngine {
     }
 
     fn entry_vol_window(&self) -> usize {
-        ((self.cfg.entry_vol_lookback_hours * 3600) / self.cfg.trading_period_secs).max(1) as usize
+        ((self.cfg.default_pair_params.entry_vol_lookback_hours * 3600)
+            / self.cfg.trading_period_secs)
+            .max(1) as usize
     }
 
     /// Virtual clock used by all duration-based decisions. In live mode this
@@ -3839,7 +3843,7 @@ impl PairTradeEngine {
 #[cfg(test)]
 impl PairTradeEngine {
     fn test_instance(connector: Arc<dyn DexConnector + Send + Sync>) -> Self {
-        let mut cfg = PairTradeConfig {
+        let cfg = PairTradeConfig {
             dex_name: "test".to_string(),
             rest_endpoint: "http://localhost".to_string(),
             web_socket_endpoint: "ws://localhost".to_string(),
@@ -3848,36 +3852,19 @@ impl PairTradeEngine {
             interval_secs: 1,
             trading_period_secs: 1,
             metrics_window: 1,
-            entry_z_base: 2.0,
-            entry_z_min: 1.8,
-            entry_z_max: 2.3,
-            exit_z: 0.5,
-            stop_loss_z: 3.0,
-            force_close_secs: 60,
-            cooldown_secs: 1,
             net_funding_min_per_hour: 0.0,
-            spread_velocity_max_sigma_per_min: 0.1,
             notional_per_leg: 1.0,
             risk_pct_per_trade: 0.01,
-            max_loss_r_mult: DEFAULT_MAX_LOSS_R_MULT,
             equity_usd: DEFAULT_EQUITY_USD,
             universe: vec![PairSpec {
                 base: "AAA".to_string(),
                 quote: "BBB".to_string(),
             }],
-            lookback_hours_short: 1,
-            lookback_hours_long: 1,
-            half_life_max_hours: 1.0,
-            adf_p_threshold: 0.05,
-            entry_vol_lookback_hours: 1,
             slippage_bps: 0,
             fee_bps: 0.0,
             max_leverage: 1.0,
-            reeval_jump_z_mult: 1.0,
-            vol_spike_mult: 1.0,
             max_active_pairs: 1,
             warm_start_mode: WarmStartMode::Strict,
-            warm_start_min_bars: 1,
             order_timeout_secs: DEFAULT_ORDER_TIMEOUT_SECS,
             entry_partial_fill_max_retries: DEFAULT_ENTRY_PARTIAL_FILL_MAX_RETRIES,
             startup_force_close_attempts: DEFAULT_STARTUP_FORCE_CLOSE_ATTEMPTS,
@@ -3890,55 +3877,30 @@ impl PairTradeEngine {
             history_file: "test-history.json".to_string(),
             backtest_mode: false,
             backtest_file: None,
-            spread_trend_max_slope_sigma: DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA,
-            beta_divergence_max: DEFAULT_BETA_DIVERGENCE_MAX,
-            beta_min: 0.0,
-            hedge_ratio_max_deviation: 1.0,
             circuit_breaker_consecutive_losses: DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES,
             circuit_breaker_cooldown_secs: DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS,
-            circuit_breaker_tier1_losses: DEFAULT_CB_TIER1_LOSSES,
-            circuit_breaker_tier1_cooldown_secs: DEFAULT_CB_TIER1_COOLDOWN_SECS,
-            circuit_breaker_tier2_losses: DEFAULT_CB_TIER2_LOSSES,
-            circuit_breaker_tier2_cooldown_secs: DEFAULT_CB_TIER2_COOLDOWN_SECS,
-            entry_post_only_timeout_secs: DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS,
-            entry_velocity_block_sigma_per_min: 0.0,
-            funding_entry_z_scale: 0.0,
-            beta_gap_entry_z_scale: 0.0,
             shutdown_grace_secs: 0,
             pair_params: HashMap::new(),
             default_pair_params: PairParams {
-                entry_z_base: 0.0,
-                entry_z_min: 0.0,
-                entry_z_max: 0.0,
-                exit_z: 0.0,
-                stop_loss_z: 0.0,
-                force_close_secs: 0,
-                cooldown_secs: 0,
-                max_loss_r_mult: 0.0,
-                half_life_max_hours: 0.0,
-                adf_p_threshold: 0.0,
-                spread_velocity_max_sigma_per_min: 0.0,
-                spread_trend_max_slope_sigma: 0.0,
-                beta_divergence_max: 0.0,
-                lookback_hours_short: 0,
-                beta_min: 0.0,
+                entry_z_base: 2.0,
+                entry_z_min: 1.8,
+                entry_z_max: 2.3,
+                exit_z: 0.5,
+                stop_loss_z: 3.0,
+                force_close_secs: 60,
+                cooldown_secs: 1,
+                max_loss_r_mult: 1.0,
+                half_life_max_hours: 1.0,
+                adf_p_threshold: 0.05,
+                spread_velocity_max_sigma_per_min: 0.1,
+                lookback_hours_short: 1,
+                lookback_hours_long: 1,
+                entry_vol_lookback_hours: 1,
+                warm_start_min_bars: 1,
                 hedge_ratio_max_deviation: 1.0,
-                lookback_hours_long: 0,
-                entry_vol_lookback_hours: 0,
-                warm_start_min_bars: 0,
-                reeval_jump_z_mult: 0.0,
-                vol_spike_mult: 0.0,
-                circuit_breaker_tier1_losses: 0,
-                circuit_breaker_tier1_cooldown_secs: 0,
-                circuit_breaker_tier2_losses: 0,
-                circuit_breaker_tier2_cooldown_secs: 0,
-                entry_post_only_timeout_secs: 0,
-                entry_velocity_block_sigma_per_min: 0.0,
-                funding_entry_z_scale: 0.0,
-                beta_gap_entry_z_scale: 0.0,
+                ..PairParams::default()
             },
         };
-        cfg.default_pair_params = cfg.build_default_pair_params();
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
 
@@ -3989,6 +3951,7 @@ struct DataDumpEntry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::util::{quantize_size_by_step, quantize_size_by_step_ceiling};
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
@@ -4367,10 +4330,10 @@ mod shutdown_grace_tests {
                 cfg.shutdown_grace_secs
             );
             assert!(
-                cfg.shutdown_grace_secs >= cfg.force_close_secs + 60,
+                cfg.shutdown_grace_secs >= cfg.default_pair_params.force_close_secs + 60,
                 "{name}: grace ({}) must be >= force_close_secs ({}) + 60",
                 cfg.shutdown_grace_secs,
-                cfg.force_close_secs
+                cfg.default_pair_params.force_close_secs
             );
         }
     }

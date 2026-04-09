@@ -317,33 +317,16 @@ pub struct PairTradeConfig {
     pub interval_secs: u64,
     pub trading_period_secs: u64,
     pub metrics_window: usize,
-    pub entry_z_base: f64,
-    pub entry_z_min: f64,
-    pub entry_z_max: f64,
-    pub exit_z: f64,
-    pub stop_loss_z: f64,
-    pub force_close_secs: u64,
-    pub cooldown_secs: u64,
     pub net_funding_min_per_hour: f64,
-    pub spread_velocity_max_sigma_per_min: f64,
     pub notional_per_leg: f64,
     pub risk_pct_per_trade: f64,
-    pub max_loss_r_mult: f64,
     pub equity_usd: f64,
     pub universe: Vec<PairSpec>,
-    pub lookback_hours_short: u64,
-    pub lookback_hours_long: u64,
-    pub half_life_max_hours: f64,
-    pub adf_p_threshold: f64,
-    pub entry_vol_lookback_hours: u64,
     pub slippage_bps: i32,
     pub fee_bps: f64,
     pub max_leverage: f64,
-    pub reeval_jump_z_mult: f64,
-    pub vol_spike_mult: f64,
     pub max_active_pairs: usize,
     pub warm_start_mode: WarmStartMode,
-    pub warm_start_min_bars: usize,
     pub order_timeout_secs: u64,
     pub entry_partial_fill_max_retries: u32,
     pub startup_force_close_attempts: u32,
@@ -359,21 +342,11 @@ pub struct PairTradeConfig {
     // For backtest feature
     pub backtest_mode: bool,
     pub backtest_file: Option<String>,
-    pub spread_trend_max_slope_sigma: f64,
-    pub beta_divergence_max: f64,
-    pub beta_min: f64,
-    pub hedge_ratio_max_deviation: f64,
     pub circuit_breaker_consecutive_losses: u32,
     pub circuit_breaker_cooldown_secs: u64,
-    pub circuit_breaker_tier1_losses: u32,
-    pub circuit_breaker_tier1_cooldown_secs: u64,
-    pub circuit_breaker_tier2_losses: u32,
-    pub circuit_breaker_tier2_cooldown_secs: u64,
-    pub entry_post_only_timeout_secs: u64,
-    // Phase 2 filters (0.0 = disabled)
-    pub entry_velocity_block_sigma_per_min: f64,
-    pub funding_entry_z_scale: f64,
-    pub beta_gap_entry_z_scale: f64,
+    /// All per-pair tunables — z-score thresholds, hedge gates, lookback
+    /// windows, circuit-breaker tiers, Phase 2 filters — live here. Engine
+    /// reads them via `params_for(key)` so per-pair YAML overrides win.
     pub pair_params: HashMap<String, PairParams>,
     pub default_pair_params: PairParams,
     /// Graceful shutdown: max seconds to wait for natural pair exit on SIGTERM
@@ -428,7 +401,6 @@ impl PairTradeConfig {
             .unwrap_or(DEFAULT_WARM_START_MODE)
             .parse()
             .unwrap_or(WarmStartMode::Strict);
-        let warm_start_min_bars = yaml.warm_start_min_bars.unwrap_or(metrics_window);
         let history_file = yaml
             .history_file
             .clone()
@@ -456,53 +428,22 @@ impl PairTradeConfig {
                 .trading_period_secs
                 .unwrap_or(DEFAULT_TRADING_PERIOD_SECS),
             metrics_window,
-            entry_z_base: yaml.entry_z_score_base.unwrap_or(DEFAULT_ENTRY_Z_BASE),
-            entry_z_min: yaml.entry_z_score_min.unwrap_or(DEFAULT_ENTRY_Z_MIN),
-            entry_z_max: yaml.entry_z_score_max.unwrap_or(DEFAULT_ENTRY_Z_MAX),
-            exit_z: yaml.exit_z_score.unwrap_or(DEFAULT_EXIT_Z),
-            stop_loss_z: yaml.stop_loss_z_score.unwrap_or(DEFAULT_STOP_LOSS_Z),
-            force_close_secs: yaml
-                .force_close_time_secs
-                .unwrap_or(DEFAULT_FORCE_CLOSE_SECS),
-            cooldown_secs: yaml.cooldown_secs.unwrap_or(DEFAULT_COOLDOWN_SECS),
             net_funding_min_per_hour: yaml
                 .net_funding_min_per_hour
                 .unwrap_or(DEFAULT_NET_FUNDING_MIN_PER_HOUR),
-            spread_velocity_max_sigma_per_min: yaml
-                .spread_velocity_max_sigma_per_min
-                .unwrap_or(DEFAULT_SPREAD_VELOCITY_MAX_SIGMA_PER_MIN),
             notional_per_leg: yaml
                 .notional_per_leg_usd
                 .unwrap_or(DEFAULT_NOTIONAL_PER_LEG),
             risk_pct_per_trade: yaml
                 .risk_pct_per_trade
                 .unwrap_or(DEFAULT_RISK_PCT_PER_TRADE),
-            max_loss_r_mult: yaml.max_loss_r_mult.unwrap_or(DEFAULT_MAX_LOSS_R_MULT),
             equity_usd: yaml.equity_usd_fallback.unwrap_or(DEFAULT_EQUITY_USD),
             universe,
-            lookback_hours_short: yaml
-                .pair_selection_lookback_hours_short
-                .unwrap_or(DEFAULT_LOOKBACK_HOURS_SHORT),
-            lookback_hours_long: yaml
-                .pair_selection_lookback_hours_long
-                .unwrap_or(DEFAULT_LOOKBACK_HOURS_LONG),
-            half_life_max_hours: yaml
-                .half_life_max_hours
-                .unwrap_or(DEFAULT_HALF_LIFE_MAX_HOURS),
-            adf_p_threshold: yaml.adf_p_threshold.unwrap_or(DEFAULT_ADF_P_THRESHOLD),
-            entry_vol_lookback_hours: yaml
-                .entry_vol_lookback_hours
-                .unwrap_or(DEFAULT_ENTRY_VOL_LOOKBACK_HOURS),
             slippage_bps: yaml.slippage_bps.unwrap_or(DEFAULT_SLIPPAGE_BPS),
             fee_bps: yaml.fee_bps.unwrap_or(DEFAULT_FEE_BPS),
             max_leverage: yaml.max_leverage.unwrap_or(DEFAULT_MAX_LEVERAGE),
-            reeval_jump_z_mult: yaml
-                .reeval_jump_z_mult
-                .unwrap_or(DEFAULT_REEVAL_JUMP_Z_MULT),
-            vol_spike_mult: yaml.vol_spike_mult.unwrap_or(DEFAULT_VOL_SPIKE_MULT),
             max_active_pairs: yaml.max_active_pairs.unwrap_or(DEFAULT_MAX_ACTIVE_PAIRS),
             warm_start_mode,
-            warm_start_min_bars,
             order_timeout_secs: yaml
                 .order_timeout_secs
                 .unwrap_or(DEFAULT_ORDER_TIMEOUT_SECS),
@@ -525,40 +466,12 @@ impl PairTradeConfig {
             history_file,
             backtest_mode: yaml.backtest_mode.unwrap_or(false),
             backtest_file: yaml.backtest_file,
-            spread_trend_max_slope_sigma: yaml
-                .spread_trend_max_slope_sigma
-                .unwrap_or(DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA),
-            beta_divergence_max: yaml
-                .beta_divergence_max
-                .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
-            beta_min: yaml.beta_min.unwrap_or(0.0),
-            hedge_ratio_max_deviation: yaml.hedge_ratio_max_deviation.unwrap_or(1.0),
             circuit_breaker_consecutive_losses: yaml
                 .circuit_breaker_consecutive_losses
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES),
             circuit_breaker_cooldown_secs: yaml
                 .circuit_breaker_cooldown_secs
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS),
-            circuit_breaker_tier1_losses: yaml
-                .circuit_breaker_tier1_losses
-                .unwrap_or(DEFAULT_CB_TIER1_LOSSES),
-            circuit_breaker_tier1_cooldown_secs: yaml
-                .circuit_breaker_tier1_cooldown_secs
-                .unwrap_or(DEFAULT_CB_TIER1_COOLDOWN_SECS),
-            circuit_breaker_tier2_losses: yaml
-                .circuit_breaker_tier2_losses
-                .unwrap_or(DEFAULT_CB_TIER2_LOSSES),
-            circuit_breaker_tier2_cooldown_secs: yaml
-                .circuit_breaker_tier2_cooldown_secs
-                .unwrap_or(DEFAULT_CB_TIER2_COOLDOWN_SECS),
-            entry_post_only_timeout_secs: yaml
-                .entry_post_only_timeout_secs
-                .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
-            entry_velocity_block_sigma_per_min: yaml
-                .entry_velocity_block_sigma_per_min
-                .unwrap_or(0.0),
-            funding_entry_z_scale: yaml.funding_entry_z_scale.unwrap_or(0.0),
-            beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
             shutdown_grace_secs: yaml
                 .shutdown_grace_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
@@ -600,42 +513,10 @@ impl PairTradeConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_METRICS_WINDOW);
-        let entry_z_base = env::var("ENTRY_Z_SCORE_BASE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_ENTRY_Z_BASE);
-        let entry_z_min = env::var("ENTRY_Z_SCORE_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_ENTRY_Z_MIN);
-        let entry_z_max = env::var("ENTRY_Z_SCORE_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_ENTRY_Z_MAX);
-        let exit_z = env::var("EXIT_Z_SCORE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_EXIT_Z);
-        let stop_loss_z = env::var("STOP_LOSS_Z_SCORE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_STOP_LOSS_Z);
-        let force_close_secs = env::var("FORCE_CLOSE_TIME_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_FORCE_CLOSE_SECS);
-        let cooldown_secs = env::var("COOLDOWN_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_COOLDOWN_SECS);
         let net_funding_min_per_hour = env::var("NET_FUNDING_MIN_PER_HOUR")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_NET_FUNDING_MIN_PER_HOUR);
-        let spread_velocity_max_sigma_per_min = env::var("SPREAD_VELOCITY_MAX_SIGMA_PER_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_SPREAD_VELOCITY_MAX_SIGMA_PER_MIN);
         let notional_per_leg = env::var("NOTIONAL_PER_LEG_USD")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -644,35 +525,11 @@ impl PairTradeConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_RISK_PCT_PER_TRADE);
-        let max_loss_r_mult = env::var("MAX_LOSS_R_MULT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_MAX_LOSS_R_MULT);
         let equity_usd = env::var("EQUITY_USD_FALLBACK")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_EQUITY_USD);
         let universe = parse_universe_pairs()?;
-        let lookback_hours_short = env::var("PAIR_SELECTION_LOOKBACK_HOURS_SHORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_LOOKBACK_HOURS_SHORT);
-        let lookback_hours_long = env::var("PAIR_SELECTION_LOOKBACK_HOURS_LONG")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_LOOKBACK_HOURS_LONG);
-        let half_life_max_hours = env::var("HALF_LIFE_MAX_HOURS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_HALF_LIFE_MAX_HOURS);
-        let adf_p_threshold = env::var("ADF_P_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_ADF_P_THRESHOLD);
-        let entry_vol_lookback_hours = env::var("ENTRY_VOL_LOOKBACK_HOURS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_ENTRY_VOL_LOOKBACK_HOURS);
         let slippage_bps = env::var("SLIPPAGE_BPS")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
@@ -685,14 +542,6 @@ impl PairTradeConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MAX_LEVERAGE);
-        let reeval_jump_z_mult = env::var("REEVAL_JUMP_Z_MULT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_REEVAL_JUMP_Z_MULT);
-        let vol_spike_mult = env::var("VOL_SPIKE_MULT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_VOL_SPIKE_MULT);
         let max_active_pairs = env::var("MAX_ACTIVE_PAIRS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -702,10 +551,6 @@ impl PairTradeConfig {
             .unwrap_or_else(|| DEFAULT_WARM_START_MODE.to_string())
             .parse()
             .unwrap_or(WarmStartMode::Strict);
-        let warm_start_min_bars = env::var("WARM_START_MIN_BARS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(metrics_window);
         let order_timeout_secs = env::var("ORDER_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -779,33 +624,16 @@ impl PairTradeConfig {
             interval_secs,
             trading_period_secs,
             metrics_window,
-            entry_z_base,
-            entry_z_min,
-            entry_z_max,
-            exit_z,
-            stop_loss_z,
-            force_close_secs,
-            cooldown_secs,
             net_funding_min_per_hour,
-            spread_velocity_max_sigma_per_min,
             notional_per_leg,
             risk_pct_per_trade,
-            max_loss_r_mult,
             equity_usd,
             universe,
-            lookback_hours_short,
-            lookback_hours_long,
-            half_life_max_hours,
-            adf_p_threshold,
-            entry_vol_lookback_hours,
             slippage_bps,
             fee_bps,
             max_leverage,
-            reeval_jump_z_mult,
-            vol_spike_mult,
             max_active_pairs,
             warm_start_mode,
-            warm_start_min_bars,
             order_timeout_secs,
             entry_partial_fill_max_retries,
             startup_force_close_attempts,
@@ -818,22 +646,6 @@ impl PairTradeConfig {
             history_file,
             backtest_mode,
             backtest_file,
-            spread_trend_max_slope_sigma: env::var("SPREAD_TREND_MAX_SLOPE_SIGMA")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA),
-            beta_divergence_max: env::var("BETA_DIVERGENCE_MAX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
-            beta_min: env::var("BETA_MIN")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0),
-            hedge_ratio_max_deviation: env::var("HEDGE_RATIO_MAX_DEVIATION")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1.0),
             circuit_breaker_consecutive_losses: env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -842,38 +654,6 @@ impl PairTradeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS),
-            circuit_breaker_tier1_losses: env::var("CIRCUIT_BREAKER_TIER1_LOSSES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_CB_TIER1_LOSSES),
-            circuit_breaker_tier1_cooldown_secs: env::var("CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_CB_TIER1_COOLDOWN_SECS),
-            circuit_breaker_tier2_losses: env::var("CIRCUIT_BREAKER_TIER2_LOSSES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_CB_TIER2_LOSSES),
-            circuit_breaker_tier2_cooldown_secs: env::var("CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_CB_TIER2_COOLDOWN_SECS),
-            entry_post_only_timeout_secs: env::var("ENTRY_POST_ONLY_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
-            entry_velocity_block_sigma_per_min: env::var("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0),
-            funding_entry_z_scale: env::var("FUNDING_ENTRY_Z_SCALE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0),
-            beta_gap_entry_z_scale: env::var("BETA_GAP_ENTRY_Z_SCALE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0),
             shutdown_grace_secs: env::var("SHUTDOWN_GRACE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1231,16 +1011,13 @@ impl PairTradeConfig {
     }
 
     pub(super) fn circuit_breaker_cooldown_for(&self, losses: u32) -> Option<Duration> {
+        let dpp = &self.default_pair_params;
         // Graduated tiers (check tier2 first as higher threshold)
-        if self.circuit_breaker_tier2_losses > 0 && losses >= self.circuit_breaker_tier2_losses {
-            return Some(Duration::from_secs(
-                self.circuit_breaker_tier2_cooldown_secs,
-            ));
+        if dpp.circuit_breaker_tier2_losses > 0 && losses >= dpp.circuit_breaker_tier2_losses {
+            return Some(Duration::from_secs(dpp.circuit_breaker_tier2_cooldown_secs));
         }
-        if self.circuit_breaker_tier1_losses > 0 && losses >= self.circuit_breaker_tier1_losses {
-            return Some(Duration::from_secs(
-                self.circuit_breaker_tier1_cooldown_secs,
-            ));
+        if dpp.circuit_breaker_tier1_losses > 0 && losses >= dpp.circuit_breaker_tier1_losses {
+            return Some(Duration::from_secs(dpp.circuit_breaker_tier1_cooldown_secs));
         }
         // Legacy fallback
         if self.circuit_breaker_consecutive_losses > 0
