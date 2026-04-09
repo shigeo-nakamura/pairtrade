@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 #[cfg(feature = "lighter-sdk")]
 use crate::config::get_lighter_config_from_env;
 use crate::config::{get_hyperliquid_config_from_env, RunMode};
-use crate::rate_limit_notifier::notify_rate_limit;
+use crate::rate_limit_notifier::{notify_lighter_waf_cooldown, notify_rate_limit};
 use lazy_static::lazy_static;
 use std::env;
 
@@ -31,6 +31,15 @@ pub struct DexConnectorBox {
 
 impl DexConnectorBox {
     fn report_rate_limit(&self, operation: &str, detail: &str, err: &DexError) {
+        // New structured form of the Lighter WAF cooldown (HTTP 405 +
+        // x-amzn-waf-action: captcha or HTTP 429). Send a single deduped email
+        // per engagement event across all bot processes on this host. See
+        // bot-strategy#35.
+        if let DexError::RateLimited { until_unix } = err {
+            let context = format!("{} ({})", operation, detail);
+            notify_lighter_waf_cooldown(*until_unix, &context);
+            return;
+        }
         let err_text = err.to_string();
         if err_text.contains("429") || err_text.contains("Too Many Requests") {
             let context = format!("{} ({})", operation, detail);

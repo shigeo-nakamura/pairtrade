@@ -12,7 +12,11 @@ pub struct EmailClient {
 impl EmailClient {
     pub fn new() -> Self {
         let from_address = env::var("GMAIL_USER").ok();
-        let to_address = env::var("TO_ADDRESS").ok();
+        // Prefer GMAIL_TO (matches stock-signal-bot convention); fall back to
+        // legacy TO_ADDRESS for backwards compatibility with older env files.
+        let to_address = env::var("GMAIL_TO")
+            .ok()
+            .or_else(|| env::var("TO_ADDRESS").ok());
         let app_password = env::var("GMAIL_APP_PASSWORD").ok();
 
         if let (Some(from_address), Some(to_address), Some(app_password)) =

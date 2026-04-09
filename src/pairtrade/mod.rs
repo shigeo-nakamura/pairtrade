@@ -894,6 +894,16 @@ impl PairTradeEngine {
     }
 
     async fn step(&mut self) -> Result<()> {
+        // Lighter WAF cooldown is host-shared. Any REST call we make here
+        // would be rejected anyway and would refresh the rolling window,
+        // turning a 60s cooldown into a permanent block. Skip silently.
+        // dex-connector logs once on engagement; the email goes out via
+        // report_rate_limit. See bot-strategy#35.
+        #[cfg(feature = "lighter-sdk")]
+        if dex_connector::lighter_waf_cooldown::cooldown_remaining().is_some() {
+            return Ok(());
+        }
+
         // Skip new entries if maintenance is upcoming within 1 hour
         let maintenance_block_entries = self.connector.is_upcoming_maintenance(1).await;
         if maintenance_block_entries {
