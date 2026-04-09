@@ -60,6 +60,35 @@ pub(super) struct LifetimeStats {
 }
 
 impl PnlLogger {
+    /// Per-instance variant of `from_env` for the multi-strategy
+    /// single-process architecture (shigeo-nakamura/bot-strategy#25).
+    ///
+    /// When `multi_instance == false`, behavior is identical to
+    /// `from_env(cfg)` so existing single-bot deployments keep writing
+    /// to and reading from the same `pnl-<tag>-<date>.jsonl` files,
+    /// preserving the lifetime-stats restore path.
+    ///
+    /// When `multi_instance == true`, the resolved tag is suffixed with
+    /// `-{instance_id}` so each variant gets its own log files and
+    /// `load_lifetime_stats()` only sees its own history.
+    pub(super) fn from_env_for_instance(
+        cfg: &PairTradeConfig,
+        instance_id: &str,
+        multi_instance: bool,
+    ) -> Option<Self> {
+        let mut logger = Self::from_env(cfg)?;
+        if multi_instance {
+            let suffix = sanitize_pnl_tag(instance_id);
+            if !suffix.is_empty() {
+                logger.tag = Some(match logger.tag {
+                    Some(base) if !base.is_empty() => format!("{base}-{suffix}"),
+                    _ => suffix,
+                });
+            }
+        }
+        Some(logger)
+    }
+
     pub(super) fn from_env(cfg: &PairTradeConfig) -> Option<Self> {
         let enabled = env::var("DEBOT_PNL_LOG")
             .ok()

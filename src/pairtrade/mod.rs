@@ -193,8 +193,24 @@ impl PairTradeEngine {
         };
 
         let backtest_mode = cfg.backtest_mode;
-        let pnl_logger = PnlLogger::from_env(&cfg);
-        let mut status_reporter = StatusReporter::from_env(&cfg);
+        let instance_id = cfg
+            .strategies
+            .first()
+            .map(|s| s.id.clone())
+            .unwrap_or_else(|| {
+                cfg.agent_name
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string())
+            });
+        // commit 4 of #25: keep single-instance byte-identical to today
+        // (multi_instance=false suppresses the suffix). When commit 6
+        // ships YAML with multiple `strategies:` entries, len()>1 will
+        // turn the suffix on and each instance gets its own pnl/status
+        // files.
+        let multi_instance = cfg.strategies.len() > 1;
+        let pnl_logger = PnlLogger::from_env_for_instance(&cfg, &instance_id, multi_instance);
+        let mut status_reporter =
+            StatusReporter::from_env_for_instance(&cfg, &instance_id, multi_instance);
 
         // Restore lifetime trade stats from the on-disk pnl log so the
         // dashboard's Trades / Win Rate / Max DD survive process restarts.
@@ -220,15 +236,6 @@ impl PairTradeEngine {
             });
         }
 
-        let instance_id = cfg
-            .strategies
-            .first()
-            .map(|s| s.id.clone())
-            .unwrap_or_else(|| {
-                cfg.agent_name
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string())
-            });
         // For commit 3 of #25 there is still exactly one StrategyInstance,
         // so it owns the (only) per-strategy connector. Single-instance
         // deployments end up with this Arc pointing at the same connector

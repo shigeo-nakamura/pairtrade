@@ -120,6 +120,66 @@ pub(super) struct ShutdownPosition {
 }
 
 impl StatusReporter {
+    /// Per-instance variant of `from_env` for the multi-strategy
+    /// single-process architecture (shigeo-nakamura/bot-strategy#25).
+    ///
+    /// When `multi_instance == false`, returns exactly what `from_env`
+    /// returns so single-bot deployments keep writing to the same
+    /// `<dir>/<DEBOT_STATUS_ID>/status.json` path and the dashboard
+    /// keeps finding it.
+    ///
+    /// When `multi_instance == true`, the on-disk directory is
+    /// suffixed with `-{instance_id}` so each strategy variant has its
+    /// own status.json that the dashboard can subscribe to via a
+    /// separate `status_path` entry.
+    pub(super) fn from_env_for_instance(
+        cfg: &PairTradeConfig,
+        instance_id: &str,
+        multi_instance: bool,
+    ) -> Option<Self> {
+        let reporter = Self::from_env(cfg)?;
+        if !multi_instance {
+            return Some(reporter);
+        }
+        let suffix = sanitize_pnl_tag(instance_id);
+        if suffix.is_empty() {
+            return Some(reporter);
+        }
+        let mut reporter = reporter;
+        // Rewrite the on-disk parent directory to include the instance
+        // suffix. The original layout is `<dir>/<id>/status.json`; the
+        // new layout is `<dir>/<id>-<instance>/status.json`. When `id`
+        // is None we degrade to `<dir>/<instance>/status.json`.
+        if let Some(parent) = reporter.path.parent() {
+            let last = parent
+                .file_name()
+                .map(|os| os.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let new_last = if last.is_empty() {
+                suffix.clone()
+            } else {
+                format!("{last}-{suffix}")
+            };
+            let grand = parent.parent().map(PathBuf::from).unwrap_or_default();
+            let new_parent = grand.join(new_last);
+            let file_name = reporter
+                .path
+                .file_name()
+                .map(|os| os.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "status.json".to_string());
+            reporter.path = new_parent.join(file_name);
+        }
+        // Keep auxiliary files (`equity.json`, `equity_history.jsonl`)
+        // co-located with the rewritten status.json.
+        reporter.equity_baseline_path = reporter.path.with_extension("equity.json");
+        reporter.equity_history_path = reporter.path.with_extension("equity_history.jsonl");
+        reporter.id = Some(match reporter.id.take() {
+            Some(prev) if !prev.is_empty() => format!("{prev}-{suffix}"),
+            _ => suffix,
+        });
+        Some(reporter)
+    }
+
     pub(super) fn from_env(cfg: &PairTradeConfig) -> Option<Self> {
         let enabled = env::var("DEBOT_STATUS_ENABLED")
             .ok()
