@@ -597,9 +597,8 @@ impl PairTradeConfig {
         cfg.default_pair_params = cfg.build_default_pair_params();
         cfg.pair_params = cfg.build_pair_params_map(&yaml.pair_overrides);
         cfg.apply_env_overrides(history_file_from_yaml, warm_start_min_from_yaml)?;
-        // Rebuild pair params after env overrides may have changed global defaults
-        cfg.default_pair_params = cfg.build_default_pair_params();
-        // Re-merge: env overrides update globals, but pair_overrides from YAML still take precedence
+        // apply_env_overrides mutates cfg.default_pair_params in place; re-merge
+        // pair-specific overrides on top so YAML pair_overrides still win.
         let pair_params_rebuilt = cfg.build_pair_params_map(&yaml.pair_overrides);
         if !pair_params_rebuilt.is_empty() {
             cfg.pair_params = pair_params_rebuilt;
@@ -963,37 +962,37 @@ impl PairTradeConfig {
         }
         if let Ok(value) = env::var("ENTRY_Z_SCORE_BASE") {
             if let Ok(parsed) = value.parse() {
-                self.entry_z_base = parsed;
+                self.default_pair_params.entry_z_base = parsed;
             }
         }
         if let Ok(value) = env::var("ENTRY_Z_SCORE_MIN") {
             if let Ok(parsed) = value.parse() {
-                self.entry_z_min = parsed;
+                self.default_pair_params.entry_z_min = parsed;
             }
         }
         if let Ok(value) = env::var("ENTRY_Z_SCORE_MAX") {
             if let Ok(parsed) = value.parse() {
-                self.entry_z_max = parsed;
+                self.default_pair_params.entry_z_max = parsed;
             }
         }
         if let Ok(value) = env::var("EXIT_Z_SCORE") {
             if let Ok(parsed) = value.parse() {
-                self.exit_z = parsed;
+                self.default_pair_params.exit_z = parsed;
             }
         }
         if let Ok(value) = env::var("STOP_LOSS_Z_SCORE") {
             if let Ok(parsed) = value.parse() {
-                self.stop_loss_z = parsed;
+                self.default_pair_params.stop_loss_z = parsed;
             }
         }
         if let Ok(value) = env::var("FORCE_CLOSE_TIME_SECS") {
             if let Ok(parsed) = value.parse() {
-                self.force_close_secs = parsed;
+                self.default_pair_params.force_close_secs = parsed;
             }
         }
         if let Ok(value) = env::var("COOLDOWN_SECS") {
             if let Ok(parsed) = value.parse() {
-                self.cooldown_secs = parsed;
+                self.default_pair_params.cooldown_secs = parsed;
             }
         }
         if let Ok(value) = env::var("NET_FUNDING_MIN_PER_HOUR") {
@@ -1003,7 +1002,7 @@ impl PairTradeConfig {
         }
         if let Ok(value) = env::var("SPREAD_VELOCITY_MAX_SIGMA_PER_MIN") {
             if let Ok(parsed) = value.parse() {
-                self.spread_velocity_max_sigma_per_min = parsed;
+                self.default_pair_params.spread_velocity_max_sigma_per_min = parsed;
             }
         }
         if let Ok(value) = env::var("NOTIONAL_PER_LEG_USD") {
@@ -1018,7 +1017,7 @@ impl PairTradeConfig {
         }
         if let Ok(value) = env::var("MAX_LOSS_R_MULT") {
             if let Ok(parsed) = value.parse() {
-                self.max_loss_r_mult = parsed;
+                self.default_pair_params.max_loss_r_mult = parsed;
             }
         }
         if let Ok(value) = env::var("EQUITY_USD_FALLBACK") {
@@ -1028,27 +1027,27 @@ impl PairTradeConfig {
         }
         if let Ok(value) = env::var("PAIR_SELECTION_LOOKBACK_HOURS_SHORT") {
             if let Ok(parsed) = value.parse() {
-                self.lookback_hours_short = parsed;
+                self.default_pair_params.lookback_hours_short = parsed;
             }
         }
         if let Ok(value) = env::var("PAIR_SELECTION_LOOKBACK_HOURS_LONG") {
             if let Ok(parsed) = value.parse() {
-                self.lookback_hours_long = parsed;
+                self.default_pair_params.lookback_hours_long = parsed;
             }
         }
         if let Ok(value) = env::var("HALF_LIFE_MAX_HOURS") {
             if let Ok(parsed) = value.parse() {
-                self.half_life_max_hours = parsed;
+                self.default_pair_params.half_life_max_hours = parsed;
             }
         }
         if let Ok(value) = env::var("ADF_P_THRESHOLD") {
             if let Ok(parsed) = value.parse() {
-                self.adf_p_threshold = parsed;
+                self.default_pair_params.adf_p_threshold = parsed;
             }
         }
         if let Ok(value) = env::var("ENTRY_VOL_LOOKBACK_HOURS") {
             if let Ok(parsed) = value.parse() {
-                self.entry_vol_lookback_hours = parsed;
+                self.default_pair_params.entry_vol_lookback_hours = parsed;
             }
         }
         if let Ok(value) = env::var("SLIPPAGE_BPS") {
@@ -1068,12 +1067,12 @@ impl PairTradeConfig {
         }
         if let Ok(value) = env::var("REEVAL_JUMP_Z_MULT") {
             if let Ok(parsed) = value.parse() {
-                self.reeval_jump_z_mult = parsed;
+                self.default_pair_params.reeval_jump_z_mult = parsed;
             }
         }
         if let Ok(value) = env::var("VOL_SPIKE_MULT") {
             if let Ok(parsed) = value.parse() {
-                self.vol_spike_mult = parsed;
+                self.default_pair_params.vol_spike_mult = parsed;
             }
         }
         if let Ok(value) = env::var("MAX_ACTIVE_PAIRS") {
@@ -1089,16 +1088,16 @@ impl PairTradeConfig {
         let mut warm_start_min_overridden = false;
         if let Ok(value) = env::var("WARM_START_MIN_BARS") {
             if let Ok(parsed) = value.parse() {
-                self.warm_start_min_bars = parsed;
+                self.default_pair_params.warm_start_min_bars = parsed;
                 warm_start_min_overridden = true;
             }
         }
         if !warm_start_min_overridden
             && !warm_start_min_from_yaml
-            && self.warm_start_min_bars == prev_metrics_window
+            && self.default_pair_params.warm_start_min_bars == prev_metrics_window
             && self.metrics_window != prev_metrics_window
         {
-            self.warm_start_min_bars = self.metrics_window;
+            self.default_pair_params.warm_start_min_bars = self.metrics_window;
         }
         if let Ok(value) = env::var("ORDER_TIMEOUT_SECS") {
             if let Ok(parsed) = value.parse() {
@@ -1191,12 +1190,12 @@ impl PairTradeConfig {
 
         if let Ok(value) = env::var("SPREAD_TREND_MAX_SLOPE_SIGMA") {
             if let Ok(parsed) = value.parse() {
-                self.spread_trend_max_slope_sigma = parsed;
+                self.default_pair_params.spread_trend_max_slope_sigma = parsed;
             }
         }
         if let Ok(value) = env::var("BETA_DIVERGENCE_MAX") {
             if let Ok(parsed) = value.parse() {
-                self.beta_divergence_max = parsed;
+                self.default_pair_params.beta_divergence_max = parsed;
             }
         }
         if let Ok(value) = env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES") {
@@ -1211,42 +1210,42 @@ impl PairTradeConfig {
         }
         if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER1_LOSSES") {
             if let Ok(parsed) = value.parse() {
-                self.circuit_breaker_tier1_losses = parsed;
+                self.default_pair_params.circuit_breaker_tier1_losses = parsed;
             }
         }
         if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS") {
             if let Ok(parsed) = value.parse() {
-                self.circuit_breaker_tier1_cooldown_secs = parsed;
+                self.default_pair_params.circuit_breaker_tier1_cooldown_secs = parsed;
             }
         }
         if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER2_LOSSES") {
             if let Ok(parsed) = value.parse() {
-                self.circuit_breaker_tier2_losses = parsed;
+                self.default_pair_params.circuit_breaker_tier2_losses = parsed;
             }
         }
         if let Ok(value) = env::var("CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS") {
             if let Ok(parsed) = value.parse() {
-                self.circuit_breaker_tier2_cooldown_secs = parsed;
+                self.default_pair_params.circuit_breaker_tier2_cooldown_secs = parsed;
             }
         }
         if let Ok(value) = env::var("ENTRY_POST_ONLY_TIMEOUT_SECS") {
             if let Ok(parsed) = value.parse() {
-                self.entry_post_only_timeout_secs = parsed;
+                self.default_pair_params.entry_post_only_timeout_secs = parsed;
             }
         }
         if let Ok(value) = env::var("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN") {
             if let Ok(parsed) = value.parse() {
-                self.entry_velocity_block_sigma_per_min = parsed;
+                self.default_pair_params.entry_velocity_block_sigma_per_min = parsed;
             }
         }
         if let Ok(value) = env::var("FUNDING_ENTRY_Z_SCALE") {
             if let Ok(parsed) = value.parse() {
-                self.funding_entry_z_scale = parsed;
+                self.default_pair_params.funding_entry_z_scale = parsed;
             }
         }
         if let Ok(value) = env::var("BETA_GAP_ENTRY_Z_SCALE") {
             if let Ok(parsed) = value.parse() {
-                self.beta_gap_entry_z_scale = parsed;
+                self.default_pair_params.beta_gap_entry_z_scale = parsed;
             }
         }
 
