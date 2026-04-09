@@ -6,6 +6,20 @@ use super::config::{PairSpec, PairTradeConfig, WarmStartMode};
 use super::stats::{regression_beta, tail_samples, PriceSample};
 use super::util::half_life_and_p;
 
+/// Weight on the short-window beta when blending into `beta_eff`. The
+/// `BETA_EFF_LONG_WEIGHT` companion weights the long-window beta. Kept as
+/// two separate consts (not derived as `1 - SHORT`) to avoid IEEE-754 drift
+/// from rebalancing the literal `0.3` into `1.0 - 0.7`.
+const BETA_EFF_SHORT_WEIGHT: f64 = 0.7;
+const BETA_EFF_LONG_WEIGHT: f64 = 0.3;
+/// Weights on the inverse-p-value and half-life terms in the eligibility
+/// ranking score. Kept as two literals for the same reason as the beta
+/// weights above.
+const SCORE_PVALUE_WEIGHT: f64 = 0.6;
+const SCORE_HALF_LIFE_WEIGHT: f64 = 0.4;
+/// Eligibility threshold on `beta_gap` (relative beta divergence).
+const ELIGIBILITY_BETA_GAP_MAX: f64 = 0.2;
+
 #[derive(Debug)]
 pub(super) struct PairEvaluation {
     pub(super) beta_short: f64,
@@ -57,7 +71,7 @@ pub(super) fn evaluate_pair(
         &tail_b[tail_b.len() - short_len..],
         &tail_a[tail_a.len() - short_len..],
     );
-    let beta_eff = 0.7 * beta_short + 0.3 * beta_long;
+    let beta_eff = BETA_EFF_SHORT_WEIGHT * beta_short + BETA_EFF_LONG_WEIGHT * beta_long;
 
     // Build spread series for diagnostics using long window
     let spreads: Vec<f64> = tail_a
@@ -70,12 +84,12 @@ pub(super) fn evaluate_pair(
     let beta_gap = ((beta_short - beta_long) / beta_eff.max(1e-6)).abs();
     let half_ok = half_life_hours <= pp.half_life_max_hours;
     let adf_ok = adf_p_value <= pp.adf_p_threshold;
-    let beta_ok = beta_gap <= 0.2;
+    let beta_ok = beta_gap <= ELIGIBILITY_BETA_GAP_MAX;
     let score = half_ok as u8 + adf_ok as u8 + beta_ok as u8;
     let eligible = score >= 2;
     // softer ranking: weight lower p and faster half-life
-    let continuous_score =
-        (1.0 - adf_p_value.min(1.0)) * 0.6 + (1.0 / (1.0 + half_life_hours)) * 0.4;
+    let continuous_score = (1.0 - adf_p_value.min(1.0)) * SCORE_PVALUE_WEIGHT
+        + (1.0 / (1.0 + half_life_hours)) * SCORE_HALF_LIFE_WEIGHT;
 
     Some(PairEvaluation {
         beta_short,
