@@ -667,7 +667,6 @@ impl PairTradeEngine {
                             target: filled,
                             filled,
                             side: leg.side,
-                            placed_price: leg.placed_price,
                         });
                     }
                     new_legs.push(PendingLeg {
@@ -677,7 +676,6 @@ impl PairTradeEngine {
                         target: quantized_size,
                         filled: Decimal::ZERO,
                         side: leg.side,
-                        placed_price: resp.ordered_price,
                     });
                 }
                 Err(e) => {
@@ -773,7 +771,6 @@ impl PairTradeEngine {
                         target: size,
                         filled: Decimal::ZERO,
                         side: leg.side,
-                        placed_price: resp.ordered_price,
                     });
                 }
                 Err(e) => {
@@ -2658,7 +2655,6 @@ impl PairTradeEngine {
                                     target: quantized,
                                     filled: Decimal::ZERO,
                                     side: leg.side,
-                                    placed_price: resp.ordered_price,
                                 });
                                 log::warn!(
                                     "[ORDER] Retrying exit leg {} size={} mode=MARKET",
@@ -3269,7 +3265,6 @@ impl PairTradeEngine {
             target: target_a,
             filled: Decimal::ZERO,
             side: side_a,
-            placed_price: res_a.ordered_price,
         });
 
         let res_b = match self
@@ -3404,7 +3399,6 @@ impl PairTradeEngine {
             target: target_b,
             filled: Decimal::ZERO,
             side: side_b,
-            placed_price: res_b.ordered_price,
         });
         Ok(legs)
     }
@@ -3509,7 +3503,6 @@ impl PairTradeEngine {
                         target: qty_a,
                         filled: Decimal::ZERO,
                         side: side_a,
-                        placed_price: res.ordered_price,
                     });
                     res_a = Some(res);
                 }
@@ -3690,7 +3683,6 @@ impl PairTradeEngine {
                     target: qty_b,
                     filled: Decimal::ZERO,
                     side: side_b,
-                    placed_price: res_b.ordered_price,
                 });
             }
         }
@@ -4210,7 +4202,6 @@ mod pending_tests {
                 target: dec("0.05"),
                 filled: Decimal::ZERO,
                 side: OrderSide::Long,
-                placed_price: dec("0.10"),
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
@@ -4268,7 +4259,6 @@ mod pending_tests {
                 target: dec("0.05"),
                 filled: Decimal::ZERO,
                 side: OrderSide::Long,
-                placed_price: dec("0.10"),
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),

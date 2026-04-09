@@ -43,8 +43,6 @@ pub(super) struct PendingLeg {
     pub(super) target: Decimal,
     pub(super) filled: Decimal,
     pub(super) side: dex_connector::OrderSide,
-    #[allow(dead_code)]
-    pub(super) placed_price: Decimal,
 }
 
 #[derive(Debug)]
