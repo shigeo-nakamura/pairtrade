@@ -274,6 +274,28 @@ pub(super) struct PairTradeYaml {
     /// Graceful shutdown: max seconds to wait for natural exit on SIGTERM before
     /// force-closing both legs. 0 = immediate force close (legacy behavior).
     pub(super) shutdown_grace_secs: Option<u64>,
+    /// Optional list of strategy variants for the single-process A/B/C
+    /// architecture (shigeo-nakamura/bot-strategy#25). When absent, the
+    /// loader synthesizes a single strategy from the top-level scalars
+    /// (legacy single-bot YAML format) so existing configs keep working.
+    pub(super) strategies: Option<Vec<StrategyYaml>>,
+}
+
+/// Per-strategy override block in the new multi-strategy YAML format.
+/// Every field is optional; unset fields fall back to the corresponding
+/// top-level scalar (or its compile-time default).
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub(super) struct StrategyYaml {
+    pub(super) id: Option<String>,
+    pub(super) agent_name: Option<String>,
+    pub(super) exit_z_score: Option<f64>,
+    pub(super) stop_loss_z_score: Option<f64>,
+    pub(super) max_loss_r_mult: Option<f64>,
+    pub(super) risk_pct_per_trade: Option<f64>,
+    pub(super) equity_usd_fallback: Option<f64>,
+    pub(super) enable_data_dump: Option<bool>,
+    pub(super) data_dump_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -352,6 +374,25 @@ pub struct PairTradeConfig {
     /// Graceful shutdown: max seconds to wait for natural pair exit on SIGTERM
     /// before force-closing both legs. 0 = immediate force close (legacy).
     pub shutdown_grace_secs: u64,
+    /// Resolved strategy variants. Always non-empty: legacy single-bot YAML
+    /// produces a single entry derived from top-level scalars; new
+    /// multi-strategy YAML produces N entries (shigeo-nakamura/bot-strategy#25).
+    pub strategies: Vec<StrategyConfig>,
+}
+
+/// Resolved per-strategy config for one A/B/C variant. Fields here override
+/// the top-level scalar of the same name when an instance runs.
+#[derive(Debug, Clone)]
+pub struct StrategyConfig {
+    pub id: String,
+    pub agent_name: Option<String>,
+    pub exit_z: f64,
+    pub stop_loss_z: f64,
+    pub max_loss_r_mult: f64,
+    pub risk_pct_per_trade: f64,
+    pub equity_usd: f64,
+    pub enable_data_dump: bool,
+    pub data_dump_file: Option<String>,
 }
 
 impl PairTradeConfig {
@@ -477,10 +518,12 @@ impl PairTradeConfig {
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
             pair_params: HashMap::new(),
             default_pair_params,
+            strategies: Vec::new(),
         };
 
         cfg.pair_params = cfg.build_pair_params_map(&yaml.pair_overrides);
         cfg.apply_env_overrides(history_file_from_yaml, warm_start_min_from_yaml)?;
+        cfg.strategies = resolve_strategies(&cfg, yaml.strategies.as_deref());
         // apply_env_overrides mutates cfg.default_pair_params in place; re-merge
         // pair-specific overrides on top so YAML pair_overrides still win.
         let pair_params_rebuilt = cfg.build_pair_params_map(&yaml.pair_overrides);
@@ -661,11 +704,13 @@ impl PairTradeConfig {
             pair_params: HashMap::new(),
             // Placeholder rebuilt immediately below.
             default_pair_params: PairParams::default(),
+            strategies: Vec::new(),
         };
         cfg.default_pair_params = default_pair_params_from_env();
         if cfg.default_pair_params.warm_start_min_bars == 0 {
             cfg.default_pair_params.warm_start_min_bars = cfg.metrics_window;
         }
+        cfg.strategies = resolve_strategies(&cfg, None);
         Ok(cfg)
     }
 
@@ -996,6 +1041,72 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         entry_velocity_block_sigma_per_min: env_parse("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", 0.0),
         funding_entry_z_scale: env_parse("FUNDING_ENTRY_Z_SCALE", 0.0),
         beta_gap_entry_z_scale: env_parse("BETA_GAP_ENTRY_Z_SCALE", 0.0),
+    }
+}
+
+/// Build the resolved `strategies: Vec<StrategyConfig>` for a `PairTradeConfig`.
+///
+/// If the YAML supplied a `strategies:` list, every entry becomes one
+/// `StrategyConfig` and any unset field falls back to the resolved
+/// top-level value already on `cfg`. If `yaml_strategies` is `None`
+/// (legacy single-bot YAML, or env-only `from_env`), this returns a
+/// single `StrategyConfig` derived entirely from the top-level scalars,
+/// preserving today's behavior.
+///
+/// commit 2 of shigeo-nakamura/bot-strategy#25: parsing only — the
+/// engine still runs `instances.len() == 1` and does not yet branch on
+/// per-strategy values.
+pub(super) fn resolve_strategies(
+    cfg: &PairTradeConfig,
+    yaml_strategies: Option<&[StrategyYaml]>,
+) -> Vec<StrategyConfig> {
+    let default_id = cfg
+        .agent_name
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    match yaml_strategies {
+        Some(list) if !list.is_empty() => list
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let id = s
+                    .id
+                    .clone()
+                    .or_else(|| s.agent_name.clone())
+                    .unwrap_or_else(|| format!("strategy-{}", idx));
+                StrategyConfig {
+                    id,
+                    agent_name: s.agent_name.clone().or_else(|| cfg.agent_name.clone()),
+                    exit_z: s.exit_z_score.unwrap_or(cfg.default_pair_params.exit_z),
+                    stop_loss_z: s
+                        .stop_loss_z_score
+                        .unwrap_or(cfg.default_pair_params.stop_loss_z),
+                    max_loss_r_mult: s
+                        .max_loss_r_mult
+                        .unwrap_or(cfg.default_pair_params.max_loss_r_mult),
+                    risk_pct_per_trade: s
+                        .risk_pct_per_trade
+                        .unwrap_or(cfg.risk_pct_per_trade),
+                    equity_usd: s.equity_usd_fallback.unwrap_or(cfg.equity_usd),
+                    enable_data_dump: s.enable_data_dump.unwrap_or(cfg.enable_data_dump),
+                    data_dump_file: s
+                        .data_dump_file
+                        .clone()
+                        .or_else(|| cfg.data_dump_file.clone()),
+                }
+            })
+            .collect(),
+        _ => vec![StrategyConfig {
+            id: default_id,
+            agent_name: cfg.agent_name.clone(),
+            exit_z: cfg.default_pair_params.exit_z,
+            stop_loss_z: cfg.default_pair_params.stop_loss_z,
+            max_loss_r_mult: cfg.default_pair_params.max_loss_r_mult,
+            risk_pct_per_trade: cfg.risk_pct_per_trade,
+            equity_usd: cfg.equity_usd,
+            enable_data_dump: cfg.enable_data_dump,
+            data_dump_file: cfg.data_dump_file.clone(),
+        }],
     }
 }
 

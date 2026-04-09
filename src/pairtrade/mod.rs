@@ -208,9 +208,14 @@ impl PairTradeEngine {
         }
 
         let instance_id = cfg
-            .agent_name
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
+            .strategies
+            .first()
+            .map(|s| s.id.clone())
+            .unwrap_or_else(|| {
+                cfg.agent_name
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string())
+            });
         let instance = StrategyInstance {
             id: instance_id,
             states,
@@ -3817,6 +3822,7 @@ impl PairTradeEngine {
                 hedge_ratio_max_deviation: 1.0,
                 ..PairParams::default()
             },
+            strategies: Vec::new(),
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
