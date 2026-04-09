@@ -295,6 +295,39 @@ impl PairTradeEngine {
         &mut self.instances[0]
     }
 
+    /// Whether every strategy instance is currently flat. For single-instance
+    /// deployments this is exactly today's `self.open_positions.is_empty()`
+    /// check (golden-test stable). For multi-instance deployments this also
+    /// requires every per-pair `state.position` across every instance to be
+    /// `None`, so SIGTERM waits for all A/B/C variants to flatten before
+    /// exiting. commit 5 of shigeo-nakamura/bot-strategy#25.
+    fn all_instances_flat(&self) -> bool {
+        if self.instances.len() <= 1 {
+            return self.open_positions.is_empty();
+        }
+        self.open_positions.is_empty()
+            && self.instances.iter().all(|inst| {
+                inst.states.values().all(|s| s.position.is_none())
+            })
+    }
+
+    /// Total open-position count surfaced in shutdown log lines. Mirrors
+    /// `all_instances_flat`'s split: single-instance returns today's count,
+    /// multi-instance sums per-pair `state.position` presence across all
+    /// instances so the log reflects everything graceful shutdown is
+    /// waiting on.
+    fn total_open_positions(&self) -> usize {
+        if self.instances.len() <= 1 {
+            return self.open_positions.len();
+        }
+        let from_states: usize = self
+            .instances
+            .iter()
+            .map(|inst| inst.states.values().filter(|s| s.position.is_some()).count())
+            .sum();
+        from_states.max(self.open_positions.len())
+    }
+
     fn write_pnl_record(&mut self, record: PnlLogRecord) {
         // Update trade stats
         self.instances[0].total_trades += 1;
@@ -455,7 +488,7 @@ impl PairTradeEngine {
             loop {
                 // Graceful shutdown: exit as soon as positions are flat, or after grace expires.
                 if self.shutdown_pending {
-                    if self.open_positions.is_empty() {
+                    if self.all_instances_flat() {
                         log::info!("[PAIR] Shutdown: all positions flat, exiting");
                         break;
                     }
@@ -464,7 +497,7 @@ impl PairTradeEngine {
                             log::warn!(
                                 "[PAIR] Shutdown grace ({}s) expired with {} open positions, force-closing",
                                 self.cfg.shutdown_grace_secs,
-                                self.open_positions.len()
+                                self.total_open_positions()
                             );
                             force_shutdown = true;
                             break;
@@ -496,63 +529,81 @@ impl PairTradeEngine {
                     }
                     _ = sigterm.recv() => {
                         if !self.shutdown_pending {
-                            if self.open_positions.is_empty() || self.cfg.shutdown_grace_secs == 0 {
+                            let flat = self.all_instances_flat();
+                            if flat || self.cfg.shutdown_grace_secs == 0 {
                                 log::info!(
                                     "[PAIR] SIGTERM received, shutting down (flat={}, grace={}s)",
-                                    self.open_positions.is_empty(),
+                                    flat,
                                     self.cfg.shutdown_grace_secs
                                 );
-                                force_shutdown = !self.open_positions.is_empty();
+                                force_shutdown = !flat;
                                 break;
                             }
                             log::info!(
                                 "[PAIR] SIGTERM received, entering graceful shutdown: \
                                  waiting for natural exit of {} open positions (grace={}s). \
                                  Send SIGTERM/SIGINT again to force.",
-                                self.open_positions.len(),
+                                self.total_open_positions(),
                                 self.cfg.shutdown_grace_secs
                             );
                             // Surface per-position force_close ETA so operators can
                             // see when each leg will be auto-flushed if it doesn't
-                            // exit naturally. See pairtrade#6.
+                            // exit naturally. Iterates every instance so multi-strategy
+                            // shutdown reports the union of A/B/C positions, not
+                            // just the first instance. See pairtrade#6, extended in
+                            // commit 5 of shigeo-nakamura/bot-strategy#25.
                             let now_ts = chrono::Utc::now().timestamp();
                             let grace_deadline_ts =
                                 now_ts + self.cfg.shutdown_grace_secs as i64;
-                            let mut shutdown_positions: Vec<ShutdownPosition> = Vec::new();
-                            for (key, state) in &self.instances[0].states {
-                                if let Some(pos) = &state.position {
-                                    let pp = self.cfg.params_for(key);
-                                    let elapsed = now_ts.saturating_sub(pos.entered_ts).max(0);
-                                    let remaining =
-                                        (pp.force_close_secs as i64).saturating_sub(elapsed);
-                                    let eta_ts =
-                                        pos.entered_ts + pp.force_close_secs as i64;
-                                    log::info!(
-                                        "[PAIR] shutdown: {} held={}s force_close_secs={} \
-                                         force_close_in={}s",
-                                        key,
-                                        elapsed,
-                                        pp.force_close_secs,
-                                        remaining.max(0),
-                                    );
-                                    shutdown_positions.push(ShutdownPosition {
-                                        key: key.clone(),
-                                        entered_ts: pos.entered_ts,
-                                        force_close_eta_ts: eta_ts,
-                                    });
-                                }
-                            }
-                            let earliest_eta = shutdown_positions
+                            let cfg_ref = &self.cfg;
+                            let per_instance_positions: Vec<Vec<ShutdownPosition>> = self
+                                .instances
                                 .iter()
-                                .map(|p| p.force_close_eta_ts)
-                                .min();
-                            if let Some(reporter) = &mut self.instances[0].status_reporter {
-                                reporter.set_shutdown_status(Some(ShutdownStatus {
-                                    pending: true,
-                                    grace_deadline_ts,
-                                    force_close_eta_ts: earliest_eta,
-                                    positions: shutdown_positions,
-                                }));
+                                .map(|inst| {
+                                    let mut out = Vec::new();
+                                    for (key, state) in &inst.states {
+                                        if let Some(pos) = &state.position {
+                                            let pp = cfg_ref.params_for(key);
+                                            let elapsed =
+                                                now_ts.saturating_sub(pos.entered_ts).max(0);
+                                            let remaining = (pp.force_close_secs as i64)
+                                                .saturating_sub(elapsed);
+                                            let eta_ts =
+                                                pos.entered_ts + pp.force_close_secs as i64;
+                                            log::info!(
+                                                "[PAIR] shutdown: [{}] {} held={}s \
+                                                 force_close_secs={} force_close_in={}s",
+                                                inst.id,
+                                                key,
+                                                elapsed,
+                                                pp.force_close_secs,
+                                                remaining.max(0),
+                                            );
+                                            out.push(ShutdownPosition {
+                                                key: key.clone(),
+                                                entered_ts: pos.entered_ts,
+                                                force_close_eta_ts: eta_ts,
+                                            });
+                                        }
+                                    }
+                                    out
+                                })
+                                .collect();
+                            for (inst, shutdown_positions) in
+                                self.instances.iter_mut().zip(per_instance_positions.into_iter())
+                            {
+                                let earliest_eta = shutdown_positions
+                                    .iter()
+                                    .map(|p| p.force_close_eta_ts)
+                                    .min();
+                                if let Some(reporter) = &mut inst.status_reporter {
+                                    reporter.set_shutdown_status(Some(ShutdownStatus {
+                                        pending: true,
+                                        grace_deadline_ts,
+                                        force_close_eta_ts: earliest_eta,
+                                        positions: shutdown_positions,
+                                    }));
+                                }
                             }
                             self.shutdown_pending = true;
                             shutdown_deadline = Some(Instant::now() + grace);
@@ -569,7 +620,7 @@ impl PairTradeEngine {
                             break;
                         } else {
                             log::info!("[PAIR] SIGINT received, shutting down...");
-                            force_shutdown = !self.open_positions.is_empty();
+                            force_shutdown = !self.all_instances_flat();
                             break;
                         }
                     }
