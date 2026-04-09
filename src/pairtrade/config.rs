@@ -13,7 +13,7 @@ use serde::Deserialize;
 use super::defaults::*;
 
 /// Resolved per-pair parameters (global defaults merged with any pair-specific overrides).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PairParams {
     pub entry_z_base: f64,
     pub entry_z_min: f64,
@@ -655,37 +655,8 @@ impl PairTradeConfig {
                 .shutdown_grace_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
             pair_params: HashMap::new(),
-            default_pair_params: PairParams {
-                entry_z_base: 0.0, // placeholder, rebuilt below
-                entry_z_min: 0.0,
-                entry_z_max: 0.0,
-                exit_z: 0.0,
-                stop_loss_z: 0.0,
-                force_close_secs: 0,
-                cooldown_secs: 0,
-                max_loss_r_mult: 0.0,
-                half_life_max_hours: 0.0,
-                adf_p_threshold: 0.0,
-                spread_velocity_max_sigma_per_min: 0.0,
-                spread_trend_max_slope_sigma: 0.0,
-                beta_divergence_max: 0.0,
-                beta_min: 0.0,
-                hedge_ratio_max_deviation: 1.0,
-                lookback_hours_short: 0,
-                lookback_hours_long: 0,
-                entry_vol_lookback_hours: 0,
-                warm_start_min_bars: 0,
-                reeval_jump_z_mult: 0.0,
-                vol_spike_mult: 0.0,
-                circuit_breaker_tier1_losses: 0,
-                circuit_breaker_tier1_cooldown_secs: 0,
-                circuit_breaker_tier2_losses: 0,
-                circuit_breaker_tier2_cooldown_secs: 0,
-                entry_post_only_timeout_secs: 0,
-                entry_velocity_block_sigma_per_min: 0.0,
-                funding_entry_z_scale: 0.0,
-                beta_gap_entry_z_scale: 0.0,
-            },
+            // Placeholder rebuilt immediately below.
+            default_pair_params: PairParams::default(),
         };
 
         cfg.default_pair_params = cfg.build_default_pair_params();
@@ -1003,37 +974,8 @@ impl PairTradeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
             pair_params: HashMap::new(),
-            default_pair_params: PairParams {
-                entry_z_base: 0.0,
-                entry_z_min: 0.0,
-                entry_z_max: 0.0,
-                exit_z: 0.0,
-                stop_loss_z: 0.0,
-                force_close_secs: 0,
-                cooldown_secs: 0,
-                max_loss_r_mult: 0.0,
-                half_life_max_hours: 0.0,
-                adf_p_threshold: 0.0,
-                spread_velocity_max_sigma_per_min: 0.0,
-                spread_trend_max_slope_sigma: 0.0,
-                beta_divergence_max: 0.0,
-                beta_min: 0.0,
-                hedge_ratio_max_deviation: 1.0,
-                lookback_hours_short: 0,
-                lookback_hours_long: 0,
-                entry_vol_lookback_hours: 0,
-                warm_start_min_bars: 0,
-                reeval_jump_z_mult: 0.0,
-                vol_spike_mult: 0.0,
-                circuit_breaker_tier1_losses: 0,
-                circuit_breaker_tier1_cooldown_secs: 0,
-                circuit_breaker_tier2_losses: 0,
-                circuit_breaker_tier2_cooldown_secs: 0,
-                entry_post_only_timeout_secs: 0,
-                entry_velocity_block_sigma_per_min: 0.0,
-                funding_entry_z_scale: 0.0,
-                beta_gap_entry_z_scale: 0.0,
-            },
+            // Placeholder rebuilt immediately below.
+            default_pair_params: PairParams::default(),
         };
         cfg.default_pair_params = cfg.build_default_pair_params();
         Ok(cfg)
