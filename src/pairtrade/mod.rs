@@ -40,7 +40,6 @@ use pair_eval::PairEvaluation;
 use pnl_log::{PnlLogRecord, PnlLogger};
 use stats::{regression_beta, spread_slope_sigma, tail_samples, PriceSample};
 pub use config::{PairTradeConfig, WarmStartMode};
-#[cfg(test)]
 use config::PairParams;
 use config::PairSpec;
 use defaults::*;
@@ -79,6 +78,12 @@ struct StrategyInstance {
     total_pnl: f64,
     peak_pnl: f64,
     max_dd: f64,
+    /// Per-instance pair parameter overrides. Built at `new_inner` time by
+    /// overlaying the strategy's `exit_z` / `stop_loss_z` / `max_loss_r_mult`
+    /// on top of the engine-wide defaults. Look up via
+    /// `PairTradeEngine::pair_params_for(inst_idx, key)`.
+    pair_params: HashMap<String, PairParams>,
+    default_pair_params: PairParams,
 }
 
 pub struct PairTradeEngine {
@@ -158,16 +163,9 @@ impl PairTradeEngine {
         instance_connectors: Vec<Arc<dyn DexConnector + Send + Sync>>,
         replay_connector: Option<Arc<ReplayConnector>>,
     ) -> Result<Self> {
-        let mut states = HashMap::new();
         let mut history = HashMap::new();
         let mut bar_builders = HashMap::new();
         for pair in &cfg.universe {
-            let pair_key = format!("{}/{}", pair.base, pair.quote);
-            let pp = cfg.params_for(&pair_key);
-            states.insert(
-                pair_key,
-                PairState::new(cfg.metrics_window, pp.entry_z_base),
-            );
             history.insert(pair.base.clone(), VecDeque::new());
             history.insert(pair.quote.clone(), VecDeque::new());
             bar_builders.insert(pair.base.clone(), BarBuilder::new(cfg.trading_period_secs));
@@ -191,74 +189,89 @@ impl PairTradeEngine {
         };
 
         let backtest_mode = cfg.backtest_mode;
-        let instance_id = cfg
-            .strategies
-            .first()
-            .map(|s| s.id.clone())
-            .unwrap_or_else(|| {
-                cfg.agent_name
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string())
-            });
-        // NOTE for #25 follow-up: today the engine still builds exactly
-        // ONE StrategyInstance even when cfg.strategies has multiple
-        // entries. The reason is that the current step() loop calls
-        // fetch_latest_prices() per iteration, which advances the
-        // ReplayConnector clock — so iterating per instance would have
-        // each variant see a different replay tick rather than the same
-        // shared tick. Splitting step() into a shared phase (price/bar
-        // update / evaluate_pair) and a per-instance phase (decision /
-        // order placement) is its own commit; until then the
-        // multi-strategy YAML format parses correctly but instances.len()
-        // stays at 1 and only the first cfg.strategies entry is honored.
-        // multi_instance stays false here so single-bot pnl/status keying
-        // remains exactly today's, even when YAML lists multiple variants.
-        let pnl_logger = PnlLogger::from_env_for_instance(&cfg, &instance_id, false);
-        let mut status_reporter =
-            StatusReporter::from_env_for_instance(&cfg, &instance_id, false);
-
-        // Trade counters start at 0 on every process restart so the
-        // dashboard shows session-relative stats instead of accumulating
-        // forever. The on-disk pnl-*.jsonl files are still written and
-        // retained for monthly reports — we just don't replay them at
-        // boot. Reverses the load_lifetime_stats restore that was added
-        // in shigeo-nakamura/bot-strategy#33; see #39 for the rationale.
         let _ = backtest_mode;
-        if let Some(reporter) = status_reporter.as_mut() {
-            reporter.trade_stats = Some(PairTradeStats {
-                trades: 0,
-                wins: 0,
-                win_rate: 0.0,
+        let multi_instance = cfg.strategies.len() > 1;
+
+        // Build one StrategyInstance per entry in cfg.strategies. For legacy
+        // single-strategy YAML this is exactly one instance whose parameters
+        // match today's behavior (golden-test stable). For multi-strategy
+        // YAML this produces N instances that share the engine's history /
+        // bar_builders but each hold their own pair_params overlay,
+        // connector, PnL log, and status reporter.
+        let mut built_instances: Vec<StrategyInstance> = Vec::new();
+        let strategies = cfg.strategies.clone();
+        for (i, strategy) in strategies.iter().enumerate() {
+            // Overlay per-strategy exit_z / stop_loss_z / max_loss_r_mult on
+            // top of the engine's default_pair_params and per-pair overrides
+            // so each variant evaluates z-exits at its own thresholds.
+            let mut inst_default = cfg.default_pair_params.clone();
+            inst_default.exit_z = strategy.exit_z;
+            inst_default.stop_loss_z = strategy.stop_loss_z;
+            inst_default.max_loss_r_mult = strategy.max_loss_r_mult;
+
+            let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
+            for (k, v) in cfg.pair_params.iter() {
+                let mut pp = v.clone();
+                pp.exit_z = strategy.exit_z;
+                pp.stop_loss_z = strategy.stop_loss_z;
+                pp.max_loss_r_mult = strategy.max_loss_r_mult;
+                inst_pair_params.insert(k.clone(), pp);
+            }
+
+            let mut states = HashMap::new();
+            for pair in &cfg.universe {
+                let pair_key = format!("{}/{}", pair.base, pair.quote);
+                let pp = inst_pair_params
+                    .get(&pair_key)
+                    .unwrap_or(&inst_default);
+                states.insert(
+                    pair_key,
+                    PairState::new(cfg.metrics_window, pp.entry_z_base),
+                );
+            }
+
+            let instance_connector = instance_connectors
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| connector.clone());
+            let pnl_logger =
+                PnlLogger::from_env_for_instance(&cfg, &strategy.id, multi_instance);
+            let mut status_reporter =
+                StatusReporter::from_env_for_instance(&cfg, &strategy.id, multi_instance);
+            if let Some(reporter) = status_reporter.as_mut() {
+                reporter.trade_stats = Some(PairTradeStats {
+                    trades: 0,
+                    wins: 0,
+                    win_rate: 0.0,
+                    max_dd: 0.0,
+                    pnl: 0.0,
+                });
+            }
+
+            built_instances.push(StrategyInstance {
+                id: strategy.id.clone(),
+                connector: instance_connector,
+                states,
+                pnl_logger,
+                status_reporter,
+                consecutive_losses: 0,
+                circuit_breaker_until: None,
+                circuit_breaker_until_ts: None,
+                total_trades: 0,
+                total_wins: 0,
+                total_pnl: 0.0,
+                peak_pnl: 0.0,
                 max_dd: 0.0,
-                pnl: 0.0,
+                pair_params: inst_pair_params,
+                default_pair_params: inst_default,
             });
         }
-
-        let instance_connector = instance_connectors
-            .first()
-            .cloned()
-            .unwrap_or_else(|| connector.clone());
-        let instance = StrategyInstance {
-            id: instance_id,
-            connector: instance_connector,
-            states,
-            pnl_logger,
-            status_reporter,
-            consecutive_losses: 0,
-            circuit_breaker_until: None,
-            circuit_breaker_until_ts: None,
-            total_trades: 0,
-            total_wins: 0,
-            total_pnl: 0.0,
-            peak_pnl: 0.0,
-            max_dd: 0.0,
-        };
 
         Ok(Self {
             cfg,
             connector,
             replay_connector,
-            instances: vec![instance],
+            instances: built_instances,
             history,
             bar_builders,
             equity_cache,
@@ -308,6 +321,16 @@ impl PairTradeEngine {
             .map(|inst| inst.states.values().filter(|s| s.position.is_some()).count())
             .sum();
         from_states.max(self.open_positions.len())
+    }
+
+    /// Return the per-instance `PairParams` for a pair key, falling back to
+    /// the instance's `default_pair_params` when the pair has no override.
+    /// Use this inside any per-instance phase in place of
+    /// `self.cfg.params_for(key)` so each variant sees its own
+    /// `exit_z` / `stop_loss_z` / `max_loss_r_mult`.
+    fn pair_params_for(&self, inst_idx: usize, key: &str) -> &PairParams {
+        let inst = &self.instances[inst_idx];
+        inst.pair_params.get(key).unwrap_or(&inst.default_pair_params)
     }
 
     fn write_pnl_record(&mut self, inst_idx: usize, record: PnlLogRecord) {
@@ -993,18 +1016,32 @@ impl PairTradeEngine {
     }
 
     pub async fn step(&mut self) -> Result<()> {
+        // One process, one shared WS subscription is the goal of #25. Until
+        // the connector layer truly merges WS, instances[0]'s connector is
+        // the canonical source for the shared price fetch. The per-instance
+        // phase below will re-point self.connector at each instance's
+        // connector for order placement / balance / sync calls.
+        if !self.instances.is_empty() {
+            self.connector = self.instances[0].connector.clone();
+        }
+        let Some((price_map, updated)) = self.step_shared().await? else {
+            return Ok(());
+        };
         for inst_idx in 0..self.instances.len() {
-            // Engine.connector is the legacy single-connector pointer that
-            // many submodule helpers still read. Point it at the active
-            // instance's connector for the duration of this iteration so
-            // their unchanged code paths hit the correct sub-account.
             self.connector = self.instances[inst_idx].connector.clone();
-            self.step_for_instance(inst_idx).await?;
+            self.step_for_instance(inst_idx, &price_map, &updated).await?;
         }
         Ok(())
     }
 
-    async fn step_for_instance(&mut self, inst_idx: usize) -> Result<()> {
+    /// Shared phase: run once per outer step. Fetches the canonical price
+    /// tick, advances the ReplayConnector clock exactly once, updates the
+    /// engine-wide history + bar builders, and returns the `(price_map,
+    /// updated)` pair for the per-instance phase. Returns `Ok(None)` when a
+    /// host-shared cooldown is active and every instance should skip.
+    async fn step_shared(
+        &mut self,
+    ) -> Result<Option<(HashMap<String, SymbolSnapshot>, HashSet<String>)>> {
         // Lighter WAF cooldown is host-shared. Any REST call we make here
         // would be rejected anyway and would refresh the rolling window,
         // turning a 60s cooldown into a permanent block. Skip silently.
@@ -1012,25 +1049,10 @@ impl PairTradeEngine {
         // report_rate_limit. See bot-strategy#35.
         #[cfg(feature = "lighter-sdk")]
         if dex_connector::lighter_waf_cooldown::cooldown_remaining().is_some() {
-            return Ok(());
+            return Ok(None);
         }
 
-        // Skip new entries if maintenance is upcoming within 1 hour
-        let maintenance_block_entries = self.connector.is_upcoming_maintenance(1).await;
-        if maintenance_block_entries {
-            log::warn!("Upcoming maintenance detected; blocking new entries this cycle");
-        }
-        if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
-            reporter.set_maintenance(if maintenance_block_entries {
-                Some("blocking_entries".to_string())
-            } else {
-                None
-            });
-        }
-
-        self.refresh_equity_if_needed(inst_idx).await?;
         let price_map = self.fetch_latest_prices().await?;
-        self.sync_positions_from_exchange(inst_idx, &price_map).await?;
 
         if let Some(writer) = &mut self.data_dump_writer {
             let dump_entry = DataDumpEntry {
@@ -1044,41 +1066,11 @@ impl PairTradeEngine {
             }
         }
 
-        let vol_median = self.compute_vol_median(inst_idx);
-        let positions_clear = self.open_positions.is_empty();
-        let has_pending_orders = self
-            .instances[inst_idx]
-            .states
-            .values()
-            .any(|state| state.pending_entry.is_some() || state.pending_exit.is_some());
-        if !positions_clear && !has_pending_orders && self.should_log_position_warn("entry_block") {
-            log::info!(
-                "[POSITION] open positions detected ({} symbols) with no pending orders; blocking new entries",
-                self.open_positions.len()
-            );
-            self.last_position_warn
-                .insert("entry_block".to_string(), Instant::now());
-        }
-        let mut planned: Vec<PlannedAction> = Vec::new();
-
-        // Push history samples for symbols using 1-minute bars.
-        //
-        // Bar timestamps come from the exchange-side `last_updated_at` of each
-        // tick (see SymbolSnapshot::exchange_ts), NOT from the local wall clock.
-        // This is required for multi-bot A/B fairness (pairtrade#4): all bots
-        // observing the same WS feed see identical event timestamps for the
-        // same update, so they place ticks into identical buckets and produce
-        // identical bar closes regardless of their own scheduling jitter.
-        // Falls back to local wall clock only when the connector cannot supply
-        // an exchange timestamp (e.g. REST fallback path).
+        // Bar build + history update is engine-wide: all instances read
+        // from the same `self.history`, so we must do it exactly once per
+        // outer tick before any per-instance decision logic runs.
         let max_history_len = self.max_history_len();
         let now_ts = self.current_now_ts();
-        // Merge bars written by other bots since the last tick. Without this
-        // each process's `history` only ever holds bars from its own WS feed,
-        // and ms-level differences in tick aggregation get amplified by the
-        // regression into z-value divergence across A/B/C (pairtrade#4).
-        // Reloading before bar-build means every bot reads the most recent
-        // consensus state before pushing its own latest bar.
         self.load_history_from_disk();
         let mut updated = HashSet::new();
         for (symbol, snapshot) in price_map.iter() {
@@ -1093,10 +1085,6 @@ impl PairTradeEngine {
                         .to_f64()
                         .ok_or_else(|| anyhow!("invalid price for {}", symbol))?
                         .ln();
-                    // First writer wins for a given bucket_ts: if another bot
-                    // has already persisted this bar, leave the shared value
-                    // in place. Once a bar is recorded it becomes immutable,
-                    // so all three bots converge on one canonical series.
                     if entry.back().map(|s| s.ts) != Some(close_ts) {
                         if entry.len() >= max_history_len {
                             entry.pop_front();
@@ -1114,6 +1102,49 @@ impl PairTradeEngine {
         }
         self.persist_history_to_disk();
 
+        Ok(Some((price_map, updated)))
+    }
+
+    async fn step_for_instance(
+        &mut self,
+        inst_idx: usize,
+        price_map: &HashMap<String, SymbolSnapshot>,
+        updated: &HashSet<String>,
+    ) -> Result<()> {
+        // Skip new entries if maintenance is upcoming within 1 hour
+        let maintenance_block_entries = self.connector.is_upcoming_maintenance(1).await;
+        if maintenance_block_entries {
+            log::warn!("Upcoming maintenance detected; blocking new entries this cycle");
+        }
+        if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
+            reporter.set_maintenance(if maintenance_block_entries {
+                Some("blocking_entries".to_string())
+            } else {
+                None
+            });
+        }
+
+        self.refresh_equity_if_needed(inst_idx).await?;
+        self.sync_positions_from_exchange(inst_idx, price_map).await?;
+
+        let vol_median = self.compute_vol_median(inst_idx);
+        let positions_clear = self.open_positions.is_empty();
+        let has_pending_orders = self
+            .instances[inst_idx]
+            .states
+            .values()
+            .any(|state| state.pending_entry.is_some() || state.pending_exit.is_some());
+        if !positions_clear && !has_pending_orders && self.should_log_position_warn("entry_block") {
+            log::info!(
+                "[POSITION] open positions detected ({} symbols) with no pending orders; blocking new entries",
+                self.open_positions.len()
+            );
+            self.last_position_warn
+                .insert("entry_block".to_string(), Instant::now());
+        }
+        let mut planned: Vec<PlannedAction> = Vec::new();
+        let now_ts = self.current_now_ts();
+
         let universe = self.cfg.universe.clone();
         for pair in &universe {
             let key = format!("{}/{}", pair.base, pair.quote);
@@ -1126,7 +1157,7 @@ impl PairTradeEngine {
             }
 
             // First, reconcile any pending entry/exit orders for this pair
-            self.reconcile_pending_orders(inst_idx, &key, &price_map).await?;
+            self.reconcile_pending_orders(inst_idx, &key, price_map).await?;
 
             let mut action = TradeAction::None;
             let log_a = self
@@ -1198,7 +1229,8 @@ impl PairTradeEngine {
                 }
             }
 
-            let pp = self.cfg.params_for(&key);
+            let pp = self.pair_params_for(inst_idx, &key).clone();
+            let pp = &pp;
             let force_close_due = position_state
                 .as_ref()
                 .map(|pos| now_ts.saturating_sub(pos.entered_ts) >= pp.force_close_secs as i64)
@@ -1622,7 +1654,7 @@ impl PairTradeEngine {
                     );
                 } else {
                     let legs = match self
-                        .close_pair_orders(&plan.pair, direction, qtys, &price_map, force)
+                        .close_pair_orders(&plan.pair, direction, qtys, price_map, force)
                         .await
                     {
                         Ok(legs) => legs,
@@ -1778,7 +1810,7 @@ impl PairTradeEngine {
                         now_ts
                     );
                     let legs = match self
-                        .place_pair_orders(&plan.pair, direction, qtys, &price_map)
+                        .place_pair_orders(inst_idx, &plan.pair, direction, qtys, price_map)
                         .await
                     {
                         Ok(legs) => legs,
@@ -1787,7 +1819,8 @@ impl PairTradeEngine {
                             return Err(err);
                         }
                     };
-                    let entry_pp = self.cfg.params_for(&plan.key);
+                    let entry_pp = self.pair_params_for(inst_idx, &plan.key).clone();
+                    let entry_pp = &entry_pp;
                     let hybrid =
                         entry_pp.entry_post_only_timeout_secs > 0 && self.post_only_supported();
                     if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
@@ -2456,7 +2489,8 @@ impl PairTradeEngine {
                 }
                 return Ok(());
             } else if pending.post_only_hybrid {
-                let recon_pp = self.cfg.params_for(key);
+                let recon_pp = self.pair_params_for(inst_idx, key).clone();
+                let recon_pp = &recon_pp;
                 if recon_pp.entry_post_only_timeout_secs > 0
                     && pending.placed_at.elapsed()
                         >= Duration::from_secs(recon_pp.entry_post_only_timeout_secs)
@@ -3246,6 +3280,7 @@ impl PairTradeEngine {
 
     async fn place_pair_orders(
         &mut self,
+        inst_idx: usize,
         pair: &PairSpec,
         direction: PositionDirection,
         qtys: (Decimal, Decimal),
@@ -3283,7 +3318,8 @@ impl PairTradeEngine {
         }
         // Check hedge ratio deviation after size rounding
         let pair_key_for_dev = format!("{}/{}", pair.base, pair.quote);
-        let pp_for_dev = self.cfg.params_for(&pair_key_for_dev);
+        let pp_for_dev = self.pair_params_for(inst_idx, &pair_key_for_dev).clone();
+        let pp_for_dev = &pp_for_dev;
         if pp_for_dev.hedge_ratio_max_deviation < 1.0 {
             let dev_a = if qtys.0.is_zero() {
                 0.0
@@ -3307,7 +3343,8 @@ impl PairTradeEngine {
         let limit_a = self.limit_price_for(&pair.base, side_a, prices);
         let limit_b = self.limit_price_for(&pair.quote, side_b, prices);
         let pair_key_for_hybrid = format!("{}/{}", pair.base, pair.quote);
-        let pp_for_hybrid = self.cfg.params_for(&pair_key_for_hybrid);
+        let pp_for_hybrid = self.pair_params_for(inst_idx, &pair_key_for_hybrid).clone();
+        let pp_for_hybrid = &pp_for_hybrid;
         let hybrid_active =
             pp_for_hybrid.entry_post_only_timeout_secs > 0 && self.post_only_supported();
         let post_only = self.should_post_only();
@@ -3929,6 +3966,8 @@ impl PairTradeEngine {
                 total_pnl: 0.0,
                 peak_pnl: 0.0,
                 max_dd: 0.0,
+                pair_params: HashMap::new(),
+                default_pair_params: PairParams::default(),
             }],
             history: HashMap::new(),
             bar_builders: HashMap::new(),
