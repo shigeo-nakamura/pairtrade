@@ -15,8 +15,8 @@ use tokio::time::{sleep, Duration};
 
 use crate::email_client::EmailClient;
 use crate::ports::replay_dex::ReplayConnector;
-use crate::trade::execution::dex_connector_box::DexConnectorBox;
 
+mod backtest;
 mod bar;
 mod config;
 mod defaults;
@@ -132,41 +132,7 @@ impl PairTradeEngine {
     }
 
     pub async fn new(cfg: PairTradeConfig) -> Result<Self> {
-        let (connector, replay_connector): (
-            Arc<dyn DexConnector + Send + Sync>,
-            Option<Arc<ReplayConnector>>,
-        ) = if cfg.backtest_mode {
-            // Backtest mode: use the ReplayConnector
-            let replay = Arc::new(ReplayConnector::new(
-                cfg.backtest_file.as_ref().unwrap().as_str(),
-            )?);
-            (replay.clone(), Some(replay))
-        } else {
-            // Live mode: use the DexConnectorBox
-            let tokens: Vec<String> = cfg
-                .universe
-                .iter()
-                .flat_map(|p| [p.base.clone(), p.quote.clone()])
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            let live_connector = DexConnectorBox::create(
-                &cfg.dex_name,
-                &cfg.rest_endpoint,
-                &cfg.web_socket_endpoint,
-                cfg.dry_run,
-                cfg.agent_name.clone(),
-                &tokens,
-            )
-            .await
-            .context("failed to initialize connector")?;
-            live_connector
-                .start()
-                .await
-                .context("failed to start connector")?;
-            (Arc::new(live_connector), None)
-        };
-
+        let (connector, replay_connector) = backtest::create_connector(&cfg).await?;
         Self::new_inner(cfg, connector, replay_connector).await
     }
 
