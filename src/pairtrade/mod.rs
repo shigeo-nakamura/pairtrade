@@ -64,6 +64,14 @@ struct StrategyInstance {
     /// sub-account credentials.
     #[allow(dead_code)]
     connector: Arc<dyn DexConnector + Send + Sync>,
+    /// Per-instance live equity from the instance's connector. Was
+    /// engine-wide before this commit, which meant only the first
+    /// instance's `refresh_equity_if_needed` ran each cycle and the
+    /// other variants reused the first one's value -- the dashboard
+    /// then showed `pnl_total=0` for B/C and order sizing was
+    /// computed against the wrong sub-account balance.
+    equity_cache: f64,
+    last_equity_fetch: Option<Instant>,
     states: HashMap<String, PairState>,
     pnl_logger: Option<PnlLogger>,
     status_reporter: Option<StatusReporter>,
@@ -92,8 +100,6 @@ pub struct PairTradeEngine {
     instances: Vec<StrategyInstance>,
     history: HashMap<String, VecDeque<PriceSample>>,
     bar_builders: HashMap<String, BarBuilder>,
-    equity_cache: f64,
-    last_equity_fetch: Option<Instant>,
     last_metrics_log: Option<Instant>,
     last_ob_warn: HashMap<String, Instant>,
     last_ticker_warn: HashMap<String, Instant>,
@@ -172,7 +178,6 @@ impl PairTradeEngine {
             bar_builders.insert(pair.quote.clone(), BarBuilder::new(cfg.trading_period_secs));
         }
 
-        let equity_cache = cfg.equity_usd;
         let history_path = PathBuf::from(cfg.history_file.as_str());
 
         let min_order_warned = HashSet::new();
@@ -251,6 +256,8 @@ impl PairTradeEngine {
             built_instances.push(StrategyInstance {
                 id: strategy.id.clone(),
                 connector: instance_connector,
+                equity_cache: cfg.equity_usd,
+                last_equity_fetch: None,
                 states,
                 pnl_logger,
                 status_reporter,
@@ -274,8 +281,6 @@ impl PairTradeEngine {
             instances: built_instances,
             history,
             bar_builders,
-            equity_cache,
-            last_equity_fetch: None,
             last_metrics_log: None,
             last_ob_warn: HashMap::new(),
             last_ticker_warn: HashMap::new(),
@@ -1343,6 +1348,7 @@ impl PairTradeEngine {
             let mut log_positions_not_ready = false;
             let circuit_breaker_until_ts_snapshot = self.instances[inst_idx].circuit_breaker_until_ts;
             let consecutive_losses_snapshot = self.instances[inst_idx].consecutive_losses;
+            let equity_cache_snapshot = self.instances[inst_idx].equity_cache;
             {
                 let state = self
                     .instances[inst_idx]
@@ -1381,7 +1387,7 @@ impl PairTradeEngine {
                         if let Some((z, std, mean, latest_spread)) = z_snapshot {
                             let net_funding = net_funding_for_direction(z, p1, p2);
                             if let Some(pos) = &state.position {
-                                let equity_base = self.equity_cache.max(self.cfg.equity_usd);
+                                let equity_base = equity_cache_snapshot.max(self.cfg.equity_usd);
                                 if let Some(reason) =
                                     exit_reason(&self.cfg, pp, state, z, std, p1, p2, equity_base, now_ts)
                                 {
@@ -1752,7 +1758,7 @@ impl PairTradeEngine {
         if let Some(plan) = best_entry {
             if let TradeAction::Open { direction, z, beta } = plan.action {
                 let qtys = self
-                    .hedged_sizes(&plan.pair, beta, &plan.p1, &plan.p2)
+                    .hedged_sizes(inst_idx, &plan.pair, beta, &plan.p1, &plan.p2)
                     .context("hedged_sizes")?;
                 let price_a = price_map
                     .get(&plan.pair.base)
@@ -1855,7 +1861,7 @@ impl PairTradeEngine {
 
     async fn refresh_equity_if_needed(&mut self, inst_idx: usize) -> Result<()> {
         const CACHE_SECS: u64 = 300;
-        if self
+        if self.instances[inst_idx]
             .last_equity_fetch
             .map(|t| t.elapsed() < Duration::from_secs(CACHE_SECS))
             .unwrap_or(false)
@@ -1865,16 +1871,17 @@ impl PairTradeEngine {
         match self.connector.get_balance(None).await {
             Ok(resp) => {
                 if let Some(eq) = resp.equity.to_f64() {
-                    self.equity_cache = eq.max(0.0);
-                    self.last_equity_fetch = Some(Instant::now());
-                    if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
-                        reporter.update_equity(self.equity_cache);
+                    let inst = &mut self.instances[inst_idx];
+                    inst.equity_cache = eq.max(0.0);
+                    inst.last_equity_fetch = Some(Instant::now());
+                    if let Some(reporter) = &mut inst.status_reporter {
+                        reporter.update_equity(inst.equity_cache);
                     }
                 }
             }
             Err(err) => {
-                log::warn!("equity refresh failed, using fallback: {:?}", err);
-                self.last_equity_fetch = Some(Instant::now());
+                log::warn!("equity refresh failed for {}: {:?}", self.instances[inst_idx].id, err);
+                self.instances[inst_idx].last_equity_fetch = Some(Instant::now());
             }
         }
         Ok(())
@@ -3000,7 +3007,7 @@ impl PairTradeEngine {
                 "[EXIT] {} missing position sizes from exchange/state; falling back to hedge sizing",
                 key
             );
-            return self.hedged_sizes(pair, beta, p1, p2);
+            return self.hedged_sizes(inst_idx, pair, beta, p1, p2);
         }
 
         Ok((qty_a, qty_b))
@@ -3008,12 +3015,13 @@ impl PairTradeEngine {
 
     fn hedged_sizes(
         &self,
+        inst_idx: usize,
         _pair: &PairSpec,
         beta: f64,
         p1: &SymbolSnapshot,
         p2: &SymbolSnapshot,
     ) -> Result<(Decimal, Decimal)> {
-        sizing::hedged_sizes(&self.cfg, self.equity_cache, beta, p1, p2)
+        sizing::hedged_sizes(&self.cfg, self.instances[inst_idx].equity_cache, beta, p1, p2)
     }
 
     fn post_only_supported(&self) -> bool {
@@ -3955,6 +3963,8 @@ impl PairTradeEngine {
             instances: vec![StrategyInstance {
                 id: "default".to_string(),
                 connector,
+                equity_cache: DEFAULT_EQUITY_USD,
+                last_equity_fetch: None,
                 states: HashMap::new(),
                 pnl_logger: None,
                 status_reporter: None,
@@ -3971,8 +3981,6 @@ impl PairTradeEngine {
             }],
             history: HashMap::new(),
             bar_builders: HashMap::new(),
-            equity_cache: DEFAULT_EQUITY_USD,
-            last_equity_fetch: None,
             last_metrics_log: None,
             last_ob_warn: HashMap::new(),
             last_ticker_warn: HashMap::new(),
