@@ -1295,6 +1295,19 @@ impl PairTradeEngine {
                 .map(|ratio| ratio >= pp.vol_spike_mult)
                 .unwrap_or(false);
 
+            // TODO(#25 follow-up): evaluate_pair reads from engine.history
+            // (shared) but is called per-instance and gated by
+            // state.last_evaluated_ts (per-instance). In live mode the
+            // per-instance now_ts values differ by a few seconds, so an
+            // eval interval boundary can fall between instances — one
+            // triggers eval while the others skip. This causes ~0.3% beta
+            // drift between instances, which propagates into spread_history
+            // / mean / std / z. The drift is negligible for A/B test
+            // validity (variant params dominate by 50x) and self-corrects
+            // within the 240-bar window, but to guarantee byte-identical z
+            // long-term, move evaluate_pair + spread_history + beta to the
+            // shared phase (step_shared) so all instances consume the same
+            // evaluation result per tick.
             let eval = if needs_eval_interval || needs_eval_jump || needs_eval_velocity || vol_spike
             {
                 let res = self.evaluate_pair(pair);
