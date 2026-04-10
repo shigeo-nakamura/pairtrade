@@ -9,13 +9,15 @@ use super::market::SymbolSnapshot;
 
 pub(super) fn hedged_sizes(
     cfg: &PairTradeConfig,
-    equity_cache: f64,
+    equity: f64,
     beta: f64,
     p1: &SymbolSnapshot,
     p2: &SymbolSnapshot,
 ) -> Result<(Decimal, Decimal)> {
-    let total_risk =
-        equity_cache.max(cfg.equity_usd) * cfg.risk_pct_per_trade * cfg.max_leverage;
+    // `equity` is expected to be pre-floored by the caller with the
+    // per-instance equity_usd_fallback so each variant sizes against
+    // its own sub-account capacity. See StrategyInstance.equity_usd_fallback.
+    let total_risk = equity * cfg.risk_pct_per_trade * cfg.max_leverage;
     let leg_notional = (total_risk / 2.0).max(10.0);
     let notional = Decimal::from_f64(leg_notional).ok_or_else(|| anyhow!("invalid notional"))?;
 
