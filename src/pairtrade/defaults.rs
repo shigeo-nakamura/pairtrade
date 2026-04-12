@@ -51,6 +51,9 @@ pub(super) const DEFAULT_CB_TIER2_LOSSES: u32 = 0;
 pub(super) const DEFAULT_CB_TIER2_COOLDOWN_SECS: u64 = 0;
 pub(super) const DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS: u64 = 0;
 
+// Multi-timeframe z-score confluence (disabled by default)
+pub(super) const DEFAULT_MTF_Z_MIN: f64 = 0.0;
+
 // Kalman filter beta estimation (disabled by default)
 pub(super) const DEFAULT_USE_KALMAN_BETA: bool = false;
 pub(super) const DEFAULT_KALMAN_Q: f64 = 1e-5;

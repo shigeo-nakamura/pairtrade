@@ -45,6 +45,9 @@ pub struct PairParams {
     pub entry_velocity_block_sigma_per_min: f64,
     pub funding_entry_z_scale: f64,
     pub beta_gap_entry_z_scale: f64,
+    // Multi-timeframe z-score confluence (empty = disabled)
+    pub mtf_windows: Vec<usize>,
+    pub mtf_z_min: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +273,8 @@ pub(super) struct PairTradeYaml {
     pub(super) entry_velocity_block_sigma_per_min: Option<f64>,
     pub(super) funding_entry_z_scale: Option<f64>,
     pub(super) beta_gap_entry_z_scale: Option<f64>,
+    pub(super) mtf_windows: Option<Vec<usize>>,
+    pub(super) mtf_z_min: Option<f64>,
     pub(super) pair_overrides: Option<HashMap<String, PairOverrideYaml>>,
     /// Graceful shutdown: max seconds to wait for natural exit on SIGTERM before
     /// force-closing both legs. 0 = immediate force close (legacy behavior).
@@ -936,6 +941,13 @@ impl PairTradeConfig {
         env_override("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", &mut self.default_pair_params.entry_velocity_block_sigma_per_min);
         env_override("FUNDING_ENTRY_Z_SCALE", &mut self.default_pair_params.funding_entry_z_scale);
         env_override("BETA_GAP_ENTRY_Z_SCALE", &mut self.default_pair_params.beta_gap_entry_z_scale);
+        if let Ok(value) = env::var("MTF_WINDOWS") {
+            self.default_pair_params.mtf_windows = value
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+        }
+        env_override("MTF_Z_MIN", &mut self.default_pair_params.mtf_z_min);
 
         // Kalman filter
         if let Ok(value) = env::var("USE_KALMAN_BETA") {
@@ -1114,6 +1126,11 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         entry_velocity_block_sigma_per_min: env_parse("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", 0.0),
         funding_entry_z_scale: env_parse("FUNDING_ENTRY_Z_SCALE", 0.0),
         beta_gap_entry_z_scale: env_parse("BETA_GAP_ENTRY_Z_SCALE", 0.0),
+        mtf_windows: env::var("MTF_WINDOWS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+            .unwrap_or_default(),
+        mtf_z_min: env_parse("MTF_Z_MIN", DEFAULT_MTF_Z_MIN),
     }
 }
 
@@ -1248,6 +1265,8 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
             .unwrap_or(0.0),
         funding_entry_z_scale: yaml.funding_entry_z_scale.unwrap_or(0.0),
         beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
+        mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),
+        mtf_z_min: yaml.mtf_z_min.unwrap_or(DEFAULT_MTF_Z_MIN),
     }
 }
 
@@ -1323,6 +1342,8 @@ fn apply_pair_overrides(
             entry_velocity_block_sigma_per_min: default.entry_velocity_block_sigma_per_min,
             funding_entry_z_scale: default.funding_entry_z_scale,
             beta_gap_entry_z_scale: default.beta_gap_entry_z_scale,
+            mtf_windows: default.mtf_windows.clone(),
+            mtf_z_min: default.mtf_z_min,
         };
         map.insert(pair_key.clone(), pp);
     }

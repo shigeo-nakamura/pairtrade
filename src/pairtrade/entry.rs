@@ -107,5 +107,20 @@ pub(super) fn should_enter(
         return false;
     }
 
+    // Multi-timeframe z-score confluence filter.
+    // All configured windows must show z in the same direction and above mtf_z_min.
+    // Disabled when mtf_windows is empty or mtf_z_min == 0.0.
+    if !pp.mtf_windows.is_empty() && pp.mtf_z_min > 0.0 {
+        let primary_sign = z.signum();
+        for &w in &pp.mtf_windows {
+            if let Some(z_w) = state.z_score_for_window(w) {
+                if z_w.signum() != primary_sign || z_w.abs() < pp.mtf_z_min {
+                    return false;
+                }
+            }
+            // Insufficient data for this window → skip (permissive)
+        }
+    }
+
     z.abs() >= entry_threshold + cost_in_sigma && net_funding >= cfg.net_funding_min_per_hour
 }

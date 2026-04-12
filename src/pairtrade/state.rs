@@ -189,4 +189,30 @@ impl PairState {
         };
         Some((z, std, mean, latest))
     }
+
+    /// Compute z-score using only the last `window` bars of spread_history.
+    /// Used by the multi-timeframe confluence filter.
+    pub(super) fn z_score_for_window(&self, window: usize) -> Option<f64> {
+        let len = self.spread_history.len().min(window);
+        if len < 2 {
+            return None;
+        }
+        let start = self.spread_history.len() - len;
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        for i in start..self.spread_history.len() {
+            let v = self.spread_history[i];
+            sum += v;
+            sum_sq += v * v;
+        }
+        let n = len as f64;
+        let mean = sum / n;
+        let var = (sum_sq / n) - mean * mean;
+        let std = var.max(0.0).sqrt();
+        if std < 1e-9 {
+            return None;
+        }
+        let latest = *self.spread_history.back().unwrap();
+        Some((latest - mean) / std)
+    }
 }
