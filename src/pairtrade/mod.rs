@@ -6,8 +6,6 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,6 +17,7 @@ use crate::ports::replay_dex::ReplayConnector;
 mod backtest;
 mod bar;
 mod config;
+mod data_dump;
 mod defaults;
 mod entry;
 mod exit;
@@ -111,7 +110,7 @@ pub struct PairTradeEngine {
     positions_ready: bool,
     open_positions: HashMap<String, PositionSnapshot>,
     history_path: PathBuf,
-    data_dump_writer: Option<BufWriter<File>>,
+    data_dump_writer: Option<data_dump::RotatingDumpWriter>,
     replay_connector: Option<Arc<ReplayConnector>>,
     /// Graceful shutdown flag. When true:
     ///   - new entries are blocked
@@ -186,11 +185,7 @@ impl PairTradeEngine {
         let min_tick_warned = HashSet::new();
         let data_dump_writer = if cfg.enable_data_dump {
             let file_path = cfg.data_dump_file.as_ref().unwrap(); // is_none checked in from_env
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(file_path)?;
-            Some(BufWriter::new(file))
+            Some(data_dump::RotatingDumpWriter::new(file_path)?)
         } else {
             None
         };
@@ -1092,7 +1087,7 @@ impl PairTradeEngine {
                 prices: &price_map,
             };
             if let Ok(json_string) = serde_json::to_string(&dump_entry) {
-                if writeln!(writer, "{}", json_string).is_err() {
+                if writer.write_line(&json_string).is_err() {
                     log::error!("[DataDump] Failed to write to dump file");
                 }
             }

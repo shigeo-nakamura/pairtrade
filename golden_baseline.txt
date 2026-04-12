@@ -2066,8 +2066,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=34860 close_a=11.168526 close_b=7.675163 beta_eff=0.5961 beta_s=0.5984 beta_l=0.5906 mean=6.400874 std=0.743321 spread=6.593551 z=0.2592 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=34860 close_a=11.168526 close_b=7.675163 beta_eff=0.5961 beta_s=0.5984 beta_l=0.5906 mean=6.400874 std=0.743321 spread=6.593551 z=0.2592 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=34920 close_a=11.168656 close_b=7.675697 beta_eff=0.5961 beta_s=0.5984 beta_l=0.5906 mean=6.407227 std=0.738408 spread=6.593363 z=0.2521 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0282204667524098514827385988 price_a=70876.5 size_b=0.5497071771101833625892150015 price_b=2155.295 z=0.00 beta=0.60 force=true pnl=2.2650446578521881446001498936 ts=1774341094
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=34920 close_a=11.168656 close_b=7.675697 beta_eff=0.5961 beta_s=0.5984 beta_l=0.5906 mean=6.407227 std=0.738408 spread=6.593363 z=0.2521 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0282204667524098514827385988 price_a=70876.5 size_b=0.5497071771101833625892150015 price_b=2155.295 z=0.00 beta=0.60 force=true pnl=2.2650446578521881446001498936 ts=1774341094
@@ -2106,6 +2104,8 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=35460 close_a=11.169948 close_b=7.673888 beta_eff=0.7277 beta_s=0.7499 beta_l=0.6758 mean=6.397758 std=0.745745 spread=5.585740 z=-1.0889 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=35460 close_a=11.169948 close_b=7.673888 beta_eff=0.7277 beta_s=0.7499 beta_l=0.6758 mean=6.397758 std=0.745745 spread=5.585740 z=-1.0889 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=35520 close_a=11.170320 close_b=7.674415 beta_eff=0.7277 beta_s=0.7499 beta_l=0.6758 mean=6.395739 std=0.747283 spread=5.585727 z=-1.0839 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0282204667524098514827385988 price_a=71001.95 size_b=0.5497071771101833625892150015 price_b=2152.725 z=0.00 beta=0.73 force=true pnl=7.2180496571151752549639896669 ts=1774344729
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=35520 close_a=11.170320 close_b=7.674415 beta_eff=0.7277 beta_s=0.7499 beta_l=0.6758 mean=6.395739 std=0.747283 spread=5.585727 z=-1.0839 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=35520 close_a=11.170320 close_b=7.674415 beta_eff=0.7277 beta_s=0.7499 beta_l=0.6758 mean=6.395739 std=0.747283 spread=5.585727 z=-1.0839 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=35580 close_a=11.170687 close_b=7.675500 beta_eff=0.7277 beta_s=0.7499 beta_l=0.6758 mean=6.393717 std=0.748815 spread=5.585305 z=-1.0796 hist=240
@@ -2214,8 +2214,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=36900 close_a=11.173655 close_b=7.681500 beta_eff=0.9041 beta_s=0.9315 beta_l=0.8402 mean=6.249326 std=0.931239 spread=4.228427 z=-2.1701 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=36900 close_a=11.173655 close_b=7.681500 beta_eff=0.9041 beta_s=0.9315 beta_l=0.8402 mean=6.249326 std=0.931239 spread=4.228427 z=-2.1701 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=36960 close_a=11.171668 close_b=7.679693 beta_eff=0.9041 beta_s=0.9315 beta_l=0.8402 mean=6.241041 std=0.940296 spread=4.228075 z=-2.1408 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0280790622154801273947052716 price_a=71088.45 size_b=0.8507957129069545008425769883 price_b=2163.905 z=0.00 beta=0.90 force=true pnl=-7.1913150783371168536205928122 ts=1774353446
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=36960 close_a=11.171668 close_b=7.679693 beta_eff=0.9041 beta_s=0.9315 beta_l=0.8402 mean=6.241041 std=0.940296 spread=4.228075 z=-2.1408 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0280790622154801273947052716 price_a=71088.45 size_b=0.8507957129069545008425769883 price_b=2163.905 z=0.00 beta=0.90 force=true pnl=-7.1913150783371168536205928122 ts=1774353446
@@ -2223,7 +2221,6 @@
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0280790622154801273947052716 price_a=71088.45 size_b=0.8507957129069545008425769883 price_b=2163.905 z=0.00 beta=0.90 force=true pnl=-7.1913150783371168536205928122 ts=1774353446
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=37020 close_a=11.170679 close_b=7.679596 beta_eff=0.9041 beta_s=0.9315 beta_l=0.8402 mean=6.232754 std=0.949202 spread=4.227174 z=-2.1129 hist=240
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0281613787811051229068175178 price_a=71019.25 size_b=0.8357036976761427208089453536 price_b=2163.805 z=-2.11 beta=0.90 carry=0.0000 ts=1774353810
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=37020 close_a=11.170679 close_b=7.679596 beta_eff=0.9041 beta_s=0.9315 beta_l=0.8402 mean=6.232754 std=0.949202 spread=4.227174 z=-2.1129 hist=240
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0281613787811051229068175178 price_a=71019.25 size_b=0.8357036976761427208089453536 price_b=2163.805 z=-2.11 beta=0.90 carry=0.0000 ts=1774353810
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=37020 close_a=11.170679 close_b=7.679596 beta_eff=0.9041 beta_s=0.9315 beta_l=0.8402 mean=6.232754 std=0.949202 spread=4.227174 z=-2.1129 hist=240
@@ -2259,7 +2256,7 @@
 [INFO] - [EVAL] BTC/ETH beta_s=0.636 beta_l=0.789 beta=0.682 hl=0.25h p=0.500 eligible=false score=0.621
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.25h beta_gap=0.153)
 [INFO] - [EXIT_CHECK] BTC/ETH reason=ineligible
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0281613787811051229068175178 price_a=70884.55 size_b=0.8357036976761427208089453536 price_b=2160.085 z=0.00 beta=0.68 force=false pnl=-0.6845199664596091341390429323 ts=1774356716
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0280790622154801273947052716 price_a=70884.55 size_b=0.8507957129069545008425769883 price_b=2160.085 z=0.00 beta=0.68 force=false pnl=-9.666596240768948636182353596 ts=1774356716
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=37500 close_a=11.168990 close_b=7.677998 beta_eff=0.7229 beta_s=0.6935 beta_l=0.7916 mean=6.177695 std=1.001507 spread=5.618221 z=-0.5586 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.636 beta_l=0.789 beta=0.682 hl=0.25h p=0.500 eligible=false score=0.621
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.25h beta_gap=0.153)
@@ -2355,7 +2352,6 @@
 [INFO] - [EVAL] BTC/ETH beta_s=1.091 beta_l=0.883 beta=1.028 hl=0.15h p=0.500 eligible=false score=0.648
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.15h beta_gap=0.208)
 [INFO] - [EXIT_CHECK] BTC/ETH reason=ineligible
-[WARN] - [CIRCUIT_BREAKER] activated after 3 consecutive losses, cooldown 1800s
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0285551317498085021477028467 price_a=69794.9 size_b=0.9310290495861589005425632297 price_b=2129.855 z=0.00 beta=1.03 force=false pnl=-1.9884987485170385663755924080 ts=1774363246
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=38580 close_a=11.153088 close_b=7.663593 beta_eff=1.0072 beta_s=1.0668 beta_l=0.8682 mean=6.169777 std=1.072354 spread=3.434497 z=-2.5507 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.091 beta_l=0.883 beta=1.028 hl=0.15h p=0.500 eligible=false score=0.648
@@ -2372,6 +2368,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=38640 close_a=11.150003 close_b=7.660929 beta_eff=1.0282 beta_s=1.0906 beta_l=0.8826 mean=6.158701 std=1.088368 spread=3.273156 z=-2.6513 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.112 beta_l=0.903 beta=1.050 hl=0.15h p=0.500 eligible=true score=0.647
 [INFO] - [ELIGIBILITY] BTC/ETH -> true (p=0.500 hl=0.15h beta_gap=0.209)
+[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0287480442346156638031218939 price_a=69569.95 size_b=0.9881404183940629854540319176 price_b=2124.3 z=-2.65 beta=1.05 carry=0.0000 ts=1774363609
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=38640 close_a=11.150003 close_b=7.660929 beta_eff=1.0282 beta_s=1.0906 beta_l=0.8826 mean=6.158701 std=1.088368 spread=3.273156 z=-2.6513 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.112 beta_l=0.903 beta=1.050 hl=0.15h p=0.500 eligible=true score=0.647
 [INFO] - [ELIGIBILITY] BTC/ETH -> true (p=0.500 hl=0.15h beta_gap=0.209)
@@ -2381,6 +2378,9 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=38700 close_a=11.155720 close_b=7.667292 beta_eff=1.0496 beta_s=1.1124 beta_l=0.9030 mean=6.146929 std=1.105876 spread=3.108488 z=-2.7475 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.128 beta_l=0.912 beta=1.063 hl=0.16h p=0.500 eligible=false score=0.644
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.16h beta_gap=0.216)
+[INFO] - [EXIT_CHECK] BTC/ETH reason=ineligible
+[WARN] - [CIRCUIT_BREAKER] activated after 3 consecutive losses, cooldown 1800s
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0287480442346156638031218939 price_a=69857.1 size_b=0.9881404183940629854540319176 price_b=2134.465 z=0.00 beta=1.06 force=false pnl=-1.789446451005762386073782609 ts=1774363972
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=38700 close_a=11.155720 close_b=7.667292 beta_eff=1.0496 beta_s=1.1124 beta_l=0.9030 mean=6.146929 std=1.105876 spread=3.108488 z=-2.7475 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.128 beta_l=0.912 beta=1.063 hl=0.16h p=0.500 eligible=false score=0.644
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.16h beta_gap=0.216)
@@ -2402,7 +2402,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=38880 close_a=11.154420 close_b=7.665524 beta_eff=1.0869 beta_s=1.1529 beta_l=0.9330 mean=6.109158 std=1.162707 spread=2.822465 z=-2.8268 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.163 beta_l=0.945 beta=1.098 hl=0.13h p=0.500 eligible=true score=0.655
 [INFO] - [ELIGIBILITY] BTC/ETH -> true (p=0.500 hl=0.13h beta_gap=0.218)
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0286049576682382707158891243 price_a=69917.95 size_b=1.0285259481005728042114926155 price_b=2135.11 z=-2.83 beta=1.10 carry=0.0000 ts=1774365060
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=38880 close_a=11.154420 close_b=7.665524 beta_eff=1.0869 beta_s=1.1529 beta_l=0.9330 mean=6.109158 std=1.162707 spread=2.822465 z=-2.8268 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.163 beta_l=0.945 beta=1.098 hl=0.13h p=0.500 eligible=true score=0.655
 [INFO] - [ELIGIBILITY] BTC/ETH -> true (p=0.500 hl=0.13h beta_gap=0.218)
@@ -2419,6 +2418,7 @@
 [INFO] - [EVAL] BTC/ETH beta_s=1.176 beta_l=0.959 beta=1.111 hl=0.12h p=0.500 eligible=true score=0.656
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=39000 close_a=11.159291 close_b=7.671384 beta_eff=1.1110 beta_s=1.1762 beta_l=0.9588 mean=6.082100 std=1.203552 spread=2.636444 z=-2.8629 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.184 beta_l=0.967 beta=1.119 hl=0.13h p=0.500 eligible=true score=0.653
+[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0285154771316566708037871405 price_a=70137.35 size_b=1.0443265190067129694457669358 price_b=2142.42 z=-2.86 beta=1.12 carry=0.0000 ts=1774365785
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=39000 close_a=11.159291 close_b=7.671384 beta_eff=1.1110 beta_s=1.1762 beta_l=0.9588 mean=6.082100 std=1.203552 spread=2.636444 z=-2.8629 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.184 beta_l=0.967 beta=1.119 hl=0.13h p=0.500 eligible=true score=0.653
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=39000 close_a=11.159291 close_b=7.671384 beta_eff=1.1110 beta_s=1.1762 beta_l=0.9588 mean=6.082100 std=1.203552 spread=2.636444 z=-2.8629 hist=240
@@ -2466,10 +2466,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=39420 close_a=11.153151 close_b=7.665667 beta_eff=1.1476 beta_s=1.2006 beta_l=1.0240 mean=5.979623 std=1.350791 spread=2.356039 z=-2.6826 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.203 beta_l=1.035 beta=1.153 hl=0.13h p=0.500 eligible=true score=0.654
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=39480 close_a=11.154378 close_b=7.667006 beta_eff=1.1526 beta_s=1.2030 beta_l=1.0351 mean=5.964354 std=1.371238 spread=2.317135 z=-2.6598 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.203 beta_l=1.044 beta=1.155 hl=0.14h p=0.500 eligible=true score=0.651
-[WARN] - [CIRCUIT_BREAKER] activated after 4 consecutive losses, cooldown 1800s
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0286049576682382707158891243 price_a=69871.6 size_b=1.0285259481005728042114926155 price_b=2136.505 z=0.00 beta=1.15 force=true pnl=-2.7606334855231429095564931099 ts=1774368688
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=39480 close_a=11.154378 close_b=7.667006 beta_eff=1.1526 beta_s=1.2030 beta_l=1.0351 mean=5.964354 std=1.371238 spread=2.317135 z=-2.6598 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.203 beta_l=1.044 beta=1.155 hl=0.14h p=0.500 eligible=true score=0.651
@@ -2506,7 +2503,6 @@
 [INFO] - [EVAL] BTC/ETH beta_s=1.201 beta_l=1.080 beta=1.165 hl=0.12h p=0.500 eligible=true score=0.658
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=39780 close_a=11.147702 close_b=7.660941 beta_eff=1.1648 beta_s=1.2012 beta_l=1.0800 mean=5.886825 std=1.469620 spread=2.224108 z=-2.4923 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.201 beta_l=1.098 beta=1.170 hl=0.12h p=0.500 eligible=true score=0.657
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0288136484489973210510354545 price_a=69411.55 size_b=1.1018341952950145578394612785 price_b=2124.285 z=-2.49 beta=1.17 carry=0.0000 ts=1774370504
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=39780 close_a=11.147702 close_b=7.660941 beta_eff=1.1648 beta_s=1.2012 beta_l=1.0800 mean=5.886825 std=1.469620 spread=2.224108 z=-2.4923 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.201 beta_l=1.098 beta=1.170 hl=0.12h p=0.500 eligible=true score=0.657
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0288136484489973210510354545 price_a=69411.55 size_b=1.1018341952950145578394612785 price_b=2124.285 z=-2.49 beta=1.17 carry=0.0000 ts=1774370504
@@ -2550,7 +2546,10 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40140 close_a=11.143620 close_b=7.655999 beta_eff=1.1797 beta_s=1.1815 beta_l=1.1754 mean=5.788423 std=1.581718 spread=2.112143 z=-2.3242 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.172 beta_l=1.188 beta=1.177 hl=0.11h p=0.075 eligible=true score=0.917
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40200 close_a=11.144289 close_b=7.657465 beta_eff=1.1765 beta_s=1.1718 beta_l=1.1875 mean=5.771962 std=1.599001 spread=2.135163 z=-2.2744 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.168 beta_l=1.200 beta=1.178 hl=0.10h p=0.075 eligible=true score=0.917
+[WARN] - [CIRCUIT_BREAKER] activated after 4 consecutive losses, cooldown 1800s
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0285154771316566708037871405 price_a=69140.35 size_b=1.0443265190067129694457669358 price_b=2115.76 z=0.00 beta=1.18 force=true pnl=-0.588185703542733025951632570 ts=1774373044
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40200 close_a=11.144289 close_b=7.657465 beta_eff=1.1765 beta_s=1.1718 beta_l=1.1875 mean=5.771962 std=1.599001 spread=2.135163 z=-2.2744 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.168 beta_l=1.200 beta=1.178 hl=0.10h p=0.075 eligible=true score=0.917
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40200 close_a=11.144289 close_b=7.657465 beta_eff=1.1765 beta_s=1.1718 beta_l=1.1875 mean=5.771962 std=1.599001 spread=2.135163 z=-2.2744 hist=240
@@ -2562,9 +2561,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40320 close_a=11.142563 close_b=7.652933 beta_eff=1.1777 beta_s=1.1681 beta_l=1.2001 mean=5.738998 std=1.632634 spread=2.129980 z=-2.2105 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40320 close_a=11.142563 close_b=7.652933 beta_eff=1.1777 beta_s=1.1681 beta_l=1.2001 mean=5.738998 std=1.632634 spread=2.129980 z=-2.2105 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40380 close_a=11.144092 close_b=7.654863 beta_eff=1.1777 beta_s=1.1681 beta_l=1.2001 mean=5.722515 std=1.648944 spread=2.129236 z=-2.1791 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [CIRCUIT_BREAKER] reset after win (was 4 consecutive losses)
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0288136484489973210510354545 price_a=69145.85 size_b=1.1018341952950145578394612785 price_b=2110.85 z=0.00 beta=1.18 force=true pnl=7.1473560208899323813130420164 ts=1774374133
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40380 close_a=11.144092 close_b=7.654863 beta_eff=1.1777 beta_s=1.1681 beta_l=1.2001 mean=5.722515 std=1.648944 spread=2.129236 z=-2.1791 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [CIRCUIT_BREAKER] reset after win (was 4 consecutive losses)
@@ -2574,7 +2570,6 @@
 [INFO] - [CIRCUIT_BREAKER] reset after win (was 4 consecutive losses)
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0288136484489973210510354545 price_a=69145.85 size_b=1.1018341952950145578394612785 price_b=2110.85 z=0.00 beta=1.18 force=true pnl=7.1473560208899323813130420164 ts=1774374133
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40440 close_a=11.141177 close_b=7.651942 beta_eff=1.1777 beta_s=1.1681 beta_l=1.2001 mean=5.706037 std=1.664927 spread=2.129760 z=-2.1480 hist=240
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0290060426838421114078590422 price_a=68951.15 size_b=1.1189472501517708259103541639 price_b=2104.95 z=-2.15 beta=1.18 carry=0.0000 ts=1774374497
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40440 close_a=11.141177 close_b=7.651942 beta_eff=1.1777 beta_s=1.1681 beta_l=1.2001 mean=5.706037 std=1.664927 spread=2.129760 z=-2.1480 hist=240
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0290060426838421114078590422 price_a=68951.15 size_b=1.1189472501517708259103541639 price_b=2104.95 z=-2.15 beta=1.18 carry=0.0000 ts=1774374497
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40440 close_a=11.141177 close_b=7.651942 beta_eff=1.1777 beta_s=1.1681 beta_l=1.2001 mean=5.706037 std=1.664927 spread=2.129760 z=-2.1480 hist=240
@@ -2613,8 +2608,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40980 close_a=11.148483 close_b=7.658409 beta_eff=1.0929 beta_s=1.0549 beta_l=1.1818 mean=5.561788 std=1.780187 spread=2.778260 z=-1.5636 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=40980 close_a=11.148483 close_b=7.658409 beta_eff=1.0929 beta_s=1.0549 beta_l=1.1818 mean=5.561788 std=1.780187 spread=2.778260 z=-1.5636 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=41040 close_a=11.148164 close_b=7.658268 beta_eff=1.0929 beta_s=1.0549 beta_l=1.1818 mean=5.547559 std=1.788712 spread=2.778096 z=-1.5483 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0290060426838421114078590422 price_a=69412.4 size_b=1.1189472501517708259103541639 price_b=2117.61 z=0.00 beta=1.09 force=true pnl=-0.786834998999244769150100500 ts=1774378126
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=41040 close_a=11.148164 close_b=7.658268 beta_eff=1.0929 beta_s=1.0549 beta_l=1.1818 mean=5.547559 std=1.788712 spread=2.778096 z=-1.5483 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0290060426838421114078590422 price_a=69412.4 size_b=1.1189472501517708259103541639 price_b=2117.61 z=0.00 beta=1.09 force=true pnl=-0.786834998999244769150100500 ts=1774378126
@@ -3786,10 +3779,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=60600 close_a=11.168164 close_b=7.673981 beta_eff=0.6378 beta_s=0.6645 beta_l=0.5756 mean=4.205325 std=0.840555 spread=6.273756 z=2.4608 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.669 beta_l=0.572 beta=0.639 hl=0.26h p=0.500 eligible=true score=0.618
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=60660 close_a=11.167529 close_b=7.673011 beta_eff=0.6395 beta_s=0.6686 beta_l=0.5716 mean=4.218567 std=0.847769 spread=6.260822 z=2.4090 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.672 beta_l=0.566 beta=0.640 hl=0.25h p=0.500 eligible=true score=0.620
-[INFO] - [CIRCUIT_BREAKER] reset after win (was 1 consecutive losses)
-[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0282369617593886133039857177 price_a=70790.5 size_b=0.5957335392934382346779637336 price_b=2149.495 z=0.00 beta=0.64 force=true pnl=1.9521935362793881533087055842 ts=1774496922
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=60660 close_a=11.167529 close_b=7.673011 beta_eff=0.6395 beta_s=0.6686 beta_l=0.5716 mean=4.218567 std=0.847769 spread=6.260822 z=2.4090 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.672 beta_l=0.566 beta=0.640 hl=0.25h p=0.500 eligible=true score=0.620
@@ -3802,7 +3792,6 @@
 [INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0282369617593886133039857177 price_a=70790.5 size_b=0.5957335392934382346779637336 price_b=2149.495 z=0.00 beta=0.64 force=true pnl=1.9521935362793881533087055842 ts=1774496922
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=60720 close_a=11.168260 close_b=7.674195 beta_eff=0.6402 beta_s=0.6721 beta_l=0.5658 mean=4.231781 std=0.854665 spread=6.255050 z=2.3673 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.675 beta_l=0.561 beta=0.641 hl=0.25h p=0.500 eligible=true score=0.620
-[INFO] - [ENTRY] pair=BTC/ETH direction=ShortSpread size_a=0.0282246484443632201783656658 price_a=70860.05 size_b=0.5952627971936948531974110324 price_b=2152.21 z=2.37 beta=0.64 carry=0.0000 ts=1774497286
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=60720 close_a=11.168260 close_b=7.674195 beta_eff=0.6402 beta_s=0.6721 beta_l=0.5658 mean=4.231781 std=0.854665 spread=6.255050 z=2.3673 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.675 beta_l=0.561 beta=0.641 hl=0.25h p=0.500 eligible=true score=0.620
 [INFO] - [ENTRY] pair=BTC/ETH direction=ShortSpread size_a=0.0282246484443632201783656658 price_a=70860.05 size_b=0.5952627971936948531974110324 price_b=2152.21 z=2.37 beta=0.64 carry=0.0000 ts=1774497286
@@ -3837,11 +3826,12 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=61200 close_a=11.167780 close_b=7.673672 beta_eff=0.6409 beta_s=0.6773 beta_l=0.5561 mean=4.320833 std=0.914234 spread=6.249489 z=2.1096 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=61200 close_a=11.167780 close_b=7.673672 beta_eff=0.6409 beta_s=0.6773 beta_l=0.5561 mean=4.320833 std=0.914234 spread=6.249489 z=2.1096 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=61260 close_a=11.168051 close_b=7.674597 beta_eff=0.6409 beta_s=0.6773 beta_l=0.5561 mean=4.329935 std=0.922476 spread=6.249167 z=2.0805 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
+[INFO] - [CIRCUIT_BREAKER] reset after win (was 4 consecutive losses)
+[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0282369617593886133039857177 price_a=70830.8 size_b=0.5957335392934382346779637336 price_b=2152.885 z=0.00 beta=0.64 force=true pnl=2.8337806755807826527163782178 ts=1774500561
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=61260 close_a=11.168051 close_b=7.674597 beta_eff=0.6409 beta_s=0.6773 beta_l=0.5561 mean=4.329935 std=0.922476 spread=6.249167 z=2.0805 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=61260 close_a=11.168051 close_b=7.674597 beta_eff=0.6409 beta_s=0.6773 beta_l=0.5561 mean=4.329935 std=0.922476 spread=6.249167 z=2.0805 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=61320 close_a=11.167142 close_b=7.672863 beta_eff=0.6409 beta_s=0.6773 beta_l=0.5561 mean=4.339037 std=0.930558 spread=6.249369 z=2.0529 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0282246484443632201783656658 price_a=70735.95 size_b=0.5952627971936948531974110324 price_b=2148.21 z=0.00 beta=0.64 force=true pnl=1.1216276831706962113455349962 ts=1774500925
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=61320 close_a=11.167142 close_b=7.672863 beta_eff=0.6409 beta_s=0.6773 beta_l=0.5561 mean=4.339037 std=0.930558 spread=6.249369 z=2.0529 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0282246484443632201783656658 price_a=70735.95 size_b=0.5952627971936948531974110324 price_b=2148.21 z=0.00 beta=0.64 force=true pnl=1.1216276831706962113455349962 ts=1774500925
@@ -4965,9 +4955,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=78900 close_a=11.123194 close_b=7.621712 beta_eff=1.0637 beta_s=1.0637 beta_l=1.0639 mean=5.678379 std=1.349785 spread=3.015758 z=-1.9726 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=78900 close_a=11.123194 close_b=7.621712 beta_eff=1.0637 beta_s=1.0637 beta_l=1.0639 mean=5.678379 std=1.349785 spread=3.015758 z=-1.9726 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=78960 close_a=11.121145 close_b=7.619709 beta_eff=1.0637 beta_s=1.0637 beta_l=1.0639 mean=5.663351 std=1.359234 spread=3.015839 z=-1.9478 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.258 beta_l=1.187 beta=1.237 hl=0.15h p=0.500 eligible=true score=0.648
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0295310397066977136330783082 price_a=67589.35 size_b=1.0406270756372167873214635102 price_b=2037.785 z=0.00 beta=1.06 force=true pnl=2.8675267052292999940328312048 ts=1774607754
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=78960 close_a=11.121145 close_b=7.619709 beta_eff=1.0637 beta_s=1.0637 beta_l=1.0639 mean=5.663351 std=1.359234 spread=3.015839 z=-1.9478 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.258 beta_l=1.187 beta=1.237 hl=0.15h p=0.500 eligible=true score=0.648
@@ -4978,7 +4966,6 @@
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0295310397066977136330783082 price_a=67589.35 size_b=1.0406270756372167873214635102 price_b=2037.785 z=0.00 beta=1.06 force=true pnl=2.8675267052292999940328312048 ts=1774607754
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79020 close_a=11.110232 close_b=7.604890 beta_eff=1.2368 beta_s=1.2581 beta_l=1.1871 mean=5.642399 std=1.381159 spread=1.704772 z=-2.8510 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.168 beta_l=1.148 beta=1.162 hl=0.14h p=0.500 eligible=true score=0.651
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0299165179566419905254387631 price_a=66852.7 size_b=1.15703556427757721181226229 price_b=2008.76 z=-2.85 beta=1.16 carry=0.0000 ts=1774608116
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79020 close_a=11.110232 close_b=7.604890 beta_eff=1.2368 beta_s=1.2581 beta_l=1.1871 mean=5.642399 std=1.381159 spread=1.704772 z=-2.8510 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.168 beta_l=1.148 beta=1.162 hl=0.14h p=0.500 eligible=true score=0.651
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0299165179566419905254387631 price_a=66852.7 size_b=1.15703556427757721181226229 price_b=2008.76 z=-2.85 beta=1.16 carry=0.0000 ts=1774608116
@@ -5013,11 +5000,11 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79500 close_a=11.107822 close_b=7.599178 beta_eff=1.1340 beta_s=1.1346 beta_l=1.1326 mean=5.484646 std=1.462129 spread=2.490473 z=-2.0478 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79500 close_a=11.107822 close_b=7.599178 beta_eff=1.1340 beta_s=1.1346 beta_l=1.1326 mean=5.484646 std=1.462129 spread=2.490473 z=-2.0478 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79560 close_a=11.106724 close_b=7.597750 beta_eff=1.1340 beta_s=1.1346 beta_l=1.1326 mean=5.463343 std=1.468332 spread=2.490995 z=-2.0243 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0295310397066977136330783082 price_a=66619.25 size_b=1.0406270756372167873214635102 price_b=1993.595 z=0.00 beta=1.13 force=true pnl=20.204775558170457830319036936 ts=1774611380
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79560 close_a=11.106724 close_b=7.597750 beta_eff=1.1340 beta_s=1.1346 beta_l=1.1326 mean=5.463343 std=1.468332 spread=2.490995 z=-2.0243 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79560 close_a=11.106724 close_b=7.597750 beta_eff=1.1340 beta_s=1.1346 beta_l=1.1326 mean=5.463343 std=1.468332 spread=2.490995 z=-2.0243 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79620 close_a=11.108112 close_b=7.597948 beta_eff=1.1340 beta_s=1.1346 beta_l=1.1326 mean=5.441774 std=1.473788 spread=2.492159 z=-2.0014 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0299165179566419905254387631 price_a=66710.15 size_b=1.15703556427757721181226229 price_b=1994.275 z=0.00 beta=1.13 force=true pnl=12.495060513841390163699323591 ts=1774611744
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79620 close_a=11.108112 close_b=7.597948 beta_eff=1.1340 beta_s=1.1346 beta_l=1.1326 mean=5.441774 std=1.473788 spread=2.492159 z=-2.0014 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0299165179566419905254387631 price_a=66710.15 size_b=1.15703556427757721181226229 price_b=1994.275 z=0.00 beta=1.13 force=true pnl=12.495060513841390163699323591 ts=1774611744
@@ -5026,7 +5013,6 @@
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0299165179566419905254387631 price_a=66710.15 size_b=1.15703556427757721181226229 price_b=1994.275 z=0.00 beta=1.13 force=true pnl=12.495060513841390163699323591 ts=1774611744
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79680 close_a=11.109458 close_b=7.598414 beta_eff=1.1340 beta_s=1.1346 beta_l=1.1326 mean=5.420025 std=1.478622 spread=2.492975 z=-1.9796 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.876 beta_l=0.949 beta=0.898 hl=0.33h p=0.500 eligible=true score=0.601
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0299316734723809224492789086 price_a=66818.85 size_b=0.8997622829311586125007202039 price_b=1995.965 z=-1.98 beta=0.90 carry=0.0000 ts=1774612107
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=79680 close_a=11.109458 close_b=7.598414 beta_eff=1.1340 beta_s=1.1346 beta_l=1.1326 mean=5.420025 std=1.478622 spread=2.492975 z=-1.9796 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.876 beta_l=0.949 beta=0.898 hl=0.33h p=0.500 eligible=true score=0.601
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0299316734723809224492789086 price_a=66818.85 size_b=0.8997622829311586125007202039 price_b=1995.965 z=-1.98 beta=0.90 carry=0.0000 ts=1774612107
@@ -5064,8 +5050,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=80220 close_a=11.105568 close_b=7.593208 beta_eff=0.8857 beta_s=0.8632 beta_l=0.9384 mean=5.289377 std=1.410219 spread=4.379932 z=-0.6449 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=80220 close_a=11.105568 close_b=7.593208 beta_eff=0.8857 beta_s=0.8632 beta_l=0.9384 mean=5.289377 std=1.410219 spread=4.379932 z=-0.6449 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=80280 close_a=11.104609 close_b=7.593021 beta_eff=0.8857 beta_s=0.8632 beta_l=0.9384 mean=5.274855 std=1.401547 spread=4.379138 z=-0.6391 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0299316734723809224492789086 price_a=66468.45 size_b=0.8997622829311586125007202039 price_b=1983.78 z=0.00 beta=0.89 force=true pnl=0.475545032793892467093946112 ts=1774615739
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=80280 close_a=11.104609 close_b=7.593021 beta_eff=0.8857 beta_s=0.8632 beta_l=0.9384 mean=5.274855 std=1.401547 spread=4.379138 z=-0.6391 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0299316734723809224492789086 price_a=66468.45 size_b=0.8997622829311586125007202039 price_b=1983.78 z=0.00 beta=0.89 force=true pnl=0.475545032793892467093946112 ts=1774615739
@@ -5640,9 +5624,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89040 close_a=11.099235 close_b=7.594681 beta_eff=1.2807 beta_s=1.3738 beta_l=1.0633 mean=4.568046 std=1.284020 spread=1.373023 z=-2.4883 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.374 beta_l=1.068 beta=1.282 hl=0.07h p=0.025 eligible=true score=0.959
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89100 close_a=11.100402 close_b=7.595563 beta_eff=1.2820 beta_s=1.3739 beta_l=1.0676 mean=4.548807 std=1.297244 spread=1.362653 z=-2.4561 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.369 beta_l=1.068 beta=1.279 hl=0.07h p=0.005 eligible=true score=0.972
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0303212460212839986446403028 price_a=66198.35 size_b=1.2669665332792756184190956806 price_b=1989.385 z=0.00 beta=1.28 force=true pnl=-0.2586459932821344712482724491 ts=1774669166
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89100 close_a=11.100402 close_b=7.595563 beta_eff=1.2820 beta_s=1.3739 beta_l=1.0676 mean=4.548807 std=1.297244 spread=1.362653 z=-2.4561 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.369 beta_l=1.068 beta=1.279 hl=0.07h p=0.005 eligible=true score=0.972
@@ -5653,7 +5635,6 @@
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0303212460212839986446403028 price_a=66198.35 size_b=1.2669665332792756184190956806 price_b=1989.385 z=0.00 beta=1.28 force=true pnl=-0.2586459932821344712482724491 ts=1774669166
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89160 close_a=11.100233 close_b=7.595334 beta_eff=1.2785 beta_s=1.3687 beta_l=1.0683 mean=4.529679 std=1.309785 spread=1.389220 z=-2.3977 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.369 beta_l=1.128 beta=1.297 hl=0.08h p=0.025 eligible=true score=0.957
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0302168207976334185951293507 price_a=66188.3 size_b=1.3038841425598344809555054459 price_b=1988.895 z=-2.40 beta=1.30 carry=0.0000 ts=1774669530
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89160 close_a=11.100233 close_b=7.595334 beta_eff=1.2785 beta_s=1.3687 beta_l=1.0683 mean=4.529679 std=1.309785 spread=1.389220 z=-2.3977 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.369 beta_l=1.128 beta=1.297 hl=0.08h p=0.025 eligible=true score=0.957
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0302168207976334185951293507 price_a=66188.3 size_b=1.3038841425598344809555054459 price_b=1988.895 z=-2.40 beta=1.30 carry=0.0000 ts=1774669530
@@ -5709,16 +5690,16 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89640 close_a=11.101282 close_b=7.595837 beta_eff=1.3157 beta_s=1.3793 beta_l=1.1671 mean=4.367801 std=1.416342 spread=1.107691 z=-2.3018 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.383 beta_l=1.170 beta=1.319 hl=0.08h p=0.075 eligible=true score=0.924
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89700 close_a=11.101081 close_b=7.595691 beta_eff=1.3191 beta_s=1.3828 beta_l=1.1705 mean=4.346572 std=1.427215 spread=1.081496 z=-2.2877 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.395 beta_l=1.173 beta=1.328 hl=0.08h p=0.075 eligible=true score=0.924
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0303212460212839986446403028 price_a=66244.15 size_b=1.2669665332792756184190956806 price_b=1989.595 z=0.00 beta=1.32 force=true pnl=0.8640041025040247868082433265 ts=1774672812
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89700 close_a=11.101081 close_b=7.595691 beta_eff=1.3191 beta_s=1.3828 beta_l=1.1705 mean=4.346572 std=1.427215 spread=1.081496 z=-2.2877 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.395 beta_l=1.173 beta=1.328 hl=0.08h p=0.075 eligible=true score=0.924
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89700 close_a=11.101081 close_b=7.595691 beta_eff=1.3191 beta_s=1.3828 beta_l=1.1705 mean=4.346572 std=1.427215 spread=1.081496 z=-2.2877 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.395 beta_l=1.173 beta=1.328 hl=0.08h p=0.075 eligible=true score=0.924
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89760 close_a=11.101262 close_b=7.595782 beta_eff=1.3283 beta_s=1.3950 beta_l=1.1727 mean=4.325050 std=1.438353 spread=1.011624 z=-2.3036 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.397 beta_l=1.174 beta=1.330 hl=0.08h p=0.075 eligible=true score=0.924
-[INFO] - [CIRCUIT_BREAKER] reset after win (was 1 consecutive losses)
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0302168207976334185951293507 price_a=66261.35 size_b=1.3038841425598344809555054459 price_b=1989.785 z=0.00 beta=1.33 force=true pnl=1.0468818723888685403237992217 ts=1774673176
+[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0301835081838809502070211368 price_a=66261.35 size_b=1.3371174216166399887425023326 price_b=1989.785 z=-2.30 beta=1.33 carry=0.0000 ts=1774673176
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=89760 close_a=11.101262 close_b=7.595782 beta_eff=1.3283 beta_s=1.3950 beta_l=1.1727 mean=4.325050 std=1.438353 spread=1.011624 z=-2.3036 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.397 beta_l=1.174 beta=1.330 hl=0.08h p=0.075 eligible=true score=0.924
@@ -5790,8 +5771,10 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=90900 close_a=11.103464 close_b=7.601372 beta_eff=1.3363 beta_s=1.3906 beta_l=1.2096 mean=3.913899 std=1.587629 spread=0.945897 z=-1.8695 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=90900 close_a=11.103464 close_b=7.601372 beta_eff=1.3363 beta_s=1.3906 beta_l=1.2096 mean=3.913899 std=1.587629 spread=0.945897 z=-1.8695 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=90960 close_a=11.103691 close_b=7.601655 beta_eff=1.3363 beta_s=1.3906 beta_l=1.2096 mean=3.892689 std=1.593129 spread=0.945747 z=-1.8498 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.740 beta_l=0.925 beta=0.795 hl=0.26h p=0.500 eligible=false score=0.618
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.26h beta_gap=0.185)
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0301835081838809502070211368 price_a=66375.4 size_b=1.3371174216166399887425023326 price_b=2000.295 z=0.00 beta=1.34 force=true pnl=-10.610674992819263910572938864 ts=1774680476
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=90960 close_a=11.103691 close_b=7.601655 beta_eff=1.3363 beta_s=1.3906 beta_l=1.2096 mean=3.892689 std=1.593129 spread=0.945747 z=-1.8498 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.740 beta_l=0.925 beta=0.795 hl=0.26h p=0.500 eligible=false score=0.618
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.26h beta_gap=0.185)
@@ -5994,10 +5977,10 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=94140 close_a=11.101709 close_b=7.599349 beta_eff=0.5504 beta_s=0.5533 beta_l=0.5435 mean=4.308161 std=1.793178 spread=6.919359 z=1.4562 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=94140 close_a=11.101709 close_b=7.599349 beta_eff=0.5504 beta_s=0.5533 beta_l=0.5435 mean=4.308161 std=1.793178 spread=6.919359 z=1.4562 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=94200 close_a=11.103567 close_b=7.600912 beta_eff=0.5504 beta_s=0.5533 beta_l=0.5435 mean=4.318746 std=1.801051 spread=6.920356 z=1.4445 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.809 beta_l=0.540 beta=0.728 hl=0.19h p=0.500 eligible=false score=0.636
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.19h beta_gap=0.269)
-[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0302171175438318175671745409 price_a=66409.75 size_b=0.551571251502261731463548466 price_b=2000.16 z=0.00 beta=0.55 force=true pnl=-4.1932990433772218775383667866 ts=1774700130
+[INFO] - [EXIT_CHECK] BTC/ETH reason=ineligible
+[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0302171175438318175671745409 price_a=66409.75 size_b=0.551571251502261731463548466 price_b=2000.16 z=0.00 beta=0.73 force=false pnl=-4.1932990433772218775383667866 ts=1774700130
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=94200 close_a=11.103567 close_b=7.600912 beta_eff=0.5504 beta_s=0.5533 beta_l=0.5435 mean=4.318746 std=1.801051 spread=6.920356 z=1.4445 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.809 beta_l=0.540 beta=0.728 hl=0.19h p=0.500 eligible=false score=0.636
@@ -6945,10 +6928,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=110280 close_a=11.102499 close_b=7.594791 beta_eff=0.4666 beta_s=0.4608 beta_l=0.4801 mean=6.105651 std=0.793367 spread=7.558665 z=1.8315 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=110280 close_a=11.102499 close_b=7.594791 beta_eff=0.4666 beta_s=0.4608 beta_l=0.4801 mean=6.105651 std=0.793367 spread=7.558665 z=1.8315 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=110340 close_a=11.102780 close_b=7.595060 beta_eff=0.4666 beta_s=0.4608 beta_l=0.4801 mean=6.108682 std=0.797512 spread=7.558819 z=1.8183 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.601 beta_l=0.507 beta=0.573 hl=0.15h p=0.500 eligible=true score=0.648
-[INFO] - [CIRCUIT_BREAKER] reset after win (was 1 consecutive losses)
-[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0300485960920298352510597764 price_a=66350.45 size_b=0.4683455313939390897844781075 price_b=1988.395 z=0.00 beta=0.47 force=true pnl=4.2903927384105340983282045692 ts=1774798753
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=110340 close_a=11.102780 close_b=7.595060 beta_eff=0.4666 beta_s=0.4608 beta_l=0.4801 mean=6.108682 std=0.797512 spread=7.558819 z=1.8183 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.601 beta_l=0.507 beta=0.573 hl=0.15h p=0.500 eligible=true score=0.648
@@ -6990,6 +6970,9 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=110880 close_a=11.105935 close_b=7.600310 beta_eff=0.5826 beta_s=0.6167 beta_l=0.5029 mean=6.109518 std=0.797787 spread=6.678066 z=0.7127 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=110880 close_a=11.105935 close_b=7.600310 beta_eff=0.5826 beta_s=0.6167 beta_l=0.5029 mean=6.109518 std=0.797787 spread=6.678066 z=0.7127 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=110940 close_a=11.105239 close_b=7.599173 beta_eff=0.5826 beta_s=0.6167 beta_l=0.5029 mean=6.109923 std=0.798051 spread=6.678032 z=0.7119 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
+[INFO] - [CIRCUIT_BREAKER] reset after win (was 2 consecutive losses)
+[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0300485960920298352510597764 price_a=66525.05 size_b=0.4683455313939390897844781075 price_b=1996.755 z=0.00 beta=0.58 force=true pnl=2.9592765031954556540914045884 ts=1774802392
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=110940 close_a=11.105239 close_b=7.599173 beta_eff=0.5826 beta_s=0.6167 beta_l=0.5029 mean=6.109923 std=0.798051 spread=6.678032 z=0.7119 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=110940 close_a=11.105239 close_b=7.599173 beta_eff=0.5826 beta_s=0.6167 beta_l=0.5029 mean=6.109923 std=0.798051 spread=6.678032 z=0.7119 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=111000 close_a=11.105063 close_b=7.598693 beta_eff=0.5826 beta_s=0.6167 beta_l=0.5029 mean=6.110330 std=0.798315 spread=6.678137 z=0.7113 hist=240
@@ -7181,7 +7164,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=113580 close_a=11.106022 close_b=7.602204 beta_eff=0.3800 beta_s=0.2846 beta_l=0.6025 mean=6.316880 std=1.069286 spread=8.217251 z=1.7772 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.592 beta_l=0.607 beta=0.596 hl=0.37h p=0.500 eligible=true score=0.593
 [INFO] - [ELIGIBILITY] BTC/ETH -> true (p=0.500 hl=0.37h beta_gap=0.016)
-[INFO] - [ENTRY] pair=BTC/ETH direction=ShortSpread size_a=0.0300410134936722360202266144 price_a=66575.65 size_b=0.5955129992458513299612021834 price_b=2002.69 z=1.78 beta=0.60 carry=0.0000 ts=1774818420
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=113580 close_a=11.106022 close_b=7.602204 beta_eff=0.3800 beta_s=0.2846 beta_l=0.6025 mean=6.316880 std=1.069286 spread=8.217251 z=1.7772 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.592 beta_l=0.607 beta=0.596 hl=0.37h p=0.500 eligible=true score=0.593
 [INFO] - [ELIGIBILITY] BTC/ETH -> true (p=0.500 hl=0.37h beta_gap=0.016)
@@ -7223,8 +7205,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=114120 close_a=11.104863 close_b=7.600180 beta_eff=0.5915 beta_s=0.5888 beta_l=0.5977 mean=6.360576 std=1.056309 spread=6.609573 z=0.2357 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=114120 close_a=11.104863 close_b=7.600180 beta_eff=0.5915 beta_s=0.5888 beta_l=0.5977 mean=6.360576 std=1.056309 spread=6.609573 z=0.2357 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=114180 close_a=11.101631 close_b=7.596498 beta_eff=0.5915 beta_s=0.5888 beta_l=0.5977 mean=6.365440 std=1.054752 spread=6.608518 z=0.2305 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0300410134936722360202266144 price_a=66287.85 size_b=0.5955129992458513299612021834 price_b=1991.385 z=0.00 beta=0.59 force=true pnl=1.9135292270045202414098289407 ts=1774822058
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=114180 close_a=11.101631 close_b=7.596498 beta_eff=0.5915 beta_s=0.5888 beta_l=0.5977 mean=6.365440 std=1.054752 spread=6.608518 z=0.2305 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0300410134936722360202266144 price_a=66287.85 size_b=0.5955129992458513299612021834 price_b=1991.385 z=0.00 beta=0.59 force=true pnl=1.9135292270045202414098289407 ts=1774822058
@@ -7995,8 +7975,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=127320 close_a=11.106419 close_b=7.612873 beta_eff=0.8031 beta_s=0.7987 beta_l=0.8131 mean=6.007060 std=0.821405 spread=4.992825 z=-1.2348 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=127320 close_a=11.106419 close_b=7.612873 beta_eff=0.8031 beta_s=0.7987 beta_l=0.8131 mean=6.007060 std=0.821405 spread=4.992825 z=-1.2348 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=127380 close_a=11.105848 close_b=7.612127 beta_eff=0.8031 beta_s=0.7987 beta_l=0.8131 mean=5.992916 std=0.809431 spread=4.992854 z=-1.2355 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0301205499711219227151868566 price_a=66558.9 size_b=0.8048010856481204719673474238 price_b=2022.815 z=0.00 beta=0.80 force=true pnl=2.5694224765181293052205906525 ts=1774901957
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=127380 close_a=11.105848 close_b=7.612127 beta_eff=0.8031 beta_s=0.7987 beta_l=0.8131 mean=5.992916 std=0.809431 spread=4.992854 z=-1.2355 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0301205499711219227151868566 price_a=66558.9 size_b=0.8048010856481204719673474238 price_b=2022.815 z=0.00 beta=0.80 force=true pnl=2.5694224765181293052205906525 ts=1774901957
@@ -8037,6 +8015,8 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=127920 close_a=11.107823 close_b=7.617069 beta_eff=0.7389 beta_s=0.7095 beta_l=0.8075 mean=5.888116 std=0.686757 spread=5.479760 z=-0.5946 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=127920 close_a=11.107823 close_b=7.617069 beta_eff=0.7389 beta_s=0.7095 beta_l=0.8075 mean=5.888116 std=0.686757 spread=5.479760 z=-0.5946 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=127980 close_a=11.109435 close_b=7.619361 beta_eff=0.7389 beta_s=0.7095 beta_l=0.8075 mean=5.876709 std=0.670519 spread=5.479678 z=-0.5921 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0301205499711219227151868566 price_a=66821.45 size_b=0.8048010856481204719673474238 price_b=2037.82 z=0.00 beta=0.74 force=true pnl=-1.598467418713857567777148241 ts=1774905595
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=127980 close_a=11.109435 close_b=7.619361 beta_eff=0.7389 beta_s=0.7095 beta_l=0.8075 mean=5.876709 std=0.670519 spread=5.479678 z=-0.5921 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=127980 close_a=11.109435 close_b=7.619361 beta_eff=0.7389 beta_s=0.7095 beta_l=0.8075 mean=5.876709 std=0.670519 spread=5.479678 z=-0.5921 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=128040 close_a=11.110016 close_b=7.621452 beta_eff=0.7389 beta_s=0.7095 beta_l=0.8075 mean=5.872154 std=0.669493 spread=5.478714 z=-0.5877 hist=240
@@ -8586,9 +8566,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137100 close_a=11.110478 close_b=7.627958 beta_eff=0.9709 beta_s=1.0049 beta_l=0.8915 mean=5.456041 std=0.931713 spread=3.704836 z=-1.8796 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137100 close_a=11.110478 close_b=7.627958 beta_eff=0.9709 beta_s=1.0049 beta_l=0.8915 mean=5.456041 std=0.931713 spread=3.704836 z=-1.8796 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137160 close_a=11.110447 close_b=7.628617 beta_eff=0.9709 beta_s=1.0049 beta_l=0.8915 mean=5.442118 std=0.932820 spread=3.704165 z=-1.8631 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.926 beta_l=0.971 beta=0.939 hl=0.30h p=0.500 eligible=true score=0.608
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0300076144321621611483914043 price_a=66854.75 size_b=0.9518349931074395884243112008 price_b=2055.47 z=0.00 beta=0.97 force=true pnl=-8.606640609537607783098707286 ts=1774961187
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137160 close_a=11.110447 close_b=7.628617 beta_eff=0.9709 beta_s=1.0049 beta_l=0.8915 mean=5.442118 std=0.932820 spread=3.704165 z=-1.8631 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.926 beta_l=0.971 beta=0.939 hl=0.30h p=0.500 eligible=true score=0.608
@@ -8628,6 +8606,8 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137700 close_a=11.112847 close_b=7.633411 beta_eff=0.9326 beta_s=0.9129 beta_l=0.9787 mean=5.331188 std=0.922944 spread=3.993695 z=-1.4492 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137700 close_a=11.112847 close_b=7.633411 beta_eff=0.9326 beta_s=0.9129 beta_l=0.9787 mean=5.331188 std=0.922944 spread=3.993695 z=-1.4492 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137760 close_a=11.115971 close_b=7.635321 beta_eff=0.9326 beta_s=0.9129 beta_l=0.9787 mean=5.319210 std=0.921552 spread=3.995037 z=-1.4369 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0300076144321621611483914043 price_a=67209.65 size_b=0.9518349931074395884243112008 price_b=2069.025 z=0.00 beta=0.93 force=true pnl=-10.859061579134600412626136227 ts=1774964817
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137760 close_a=11.115971 close_b=7.635321 beta_eff=0.9326 beta_s=0.9129 beta_l=0.9787 mean=5.319210 std=0.921552 spread=3.995037 z=-1.4369 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137760 close_a=11.115971 close_b=7.635321 beta_eff=0.9326 beta_s=0.9129 beta_l=0.9787 mean=5.319210 std=0.921552 spread=3.995037 z=-1.4369 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=137820 close_a=11.115428 close_b=7.635678 beta_eff=0.9326 beta_s=0.9129 beta_l=0.9787 mean=5.307231 std=0.920012 spread=3.994161 z=-1.4272 hist=240
@@ -10572,10 +10552,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169020 close_a=11.111814 close_b=7.629201 beta_eff=0.7995 beta_s=0.8037 beta_l=0.7896 mean=6.909105 std=1.178528 spread=5.012522 z=-1.6093 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169020 close_a=11.111814 close_b=7.629201 beta_eff=0.7995 beta_s=0.8037 beta_l=0.7896 mean=6.909105 std=1.178528 spread=5.012522 z=-1.6093 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169080 close_a=11.112547 close_b=7.629995 beta_eff=0.7995 beta_s=0.8037 beta_l=0.7896 mean=6.902572 std=1.184661 spread=5.012620 z=-1.5954 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.832 beta_l=0.807 beta=0.824 hl=0.08h p=0.025 eligible=true score=0.956
-[INFO] - [CIRCUIT_BREAKER] reset after win (was 1 consecutive losses)
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0300181309510944610544769041 price_a=67006.55 size_b=0.7820677215176745357655557987 price_b=2058.855 z=0.00 beta=0.80 force=true pnl=0.180900000064753036266013825 ts=1775158020
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169080 close_a=11.112547 close_b=7.629995 beta_eff=0.7995 beta_s=0.8037 beta_l=0.7896 mean=6.902572 std=1.184661 spread=5.012620 z=-1.5954 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.832 beta_l=0.807 beta=0.824 hl=0.08h p=0.025 eligible=true score=0.956
@@ -10587,7 +10564,6 @@
 [INFO] - [CIRCUIT_BREAKER] reset after win (was 1 consecutive losses)
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0300181309510944610544769041 price_a=67006.55 size_b=0.7820677215176745357655557987 price_b=2058.855 z=0.00 beta=0.80 force=true pnl=0.180900000064753036266013825 ts=1775158020
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169140 close_a=11.110951 close_b=7.629043 beta_eff=0.8241 beta_s=0.8316 beta_l=0.8067 mean=6.895255 std=1.192031 spread=4.823886 z=-1.7377 hist=240
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0298899377766220335170817258 price_a=66912.15 size_b=0.8011180830621284993183027801 price_b=2057.365 z=-1.74 beta=0.82 carry=0.0000 ts=1775158382
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169140 close_a=11.110951 close_b=7.629043 beta_eff=0.8241 beta_s=0.8316 beta_l=0.8067 mean=6.895255 std=1.192031 spread=4.823886 z=-1.7377 hist=240
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0298899377766220335170817258 price_a=66912.15 size_b=0.8011180830621284993183027801 price_b=2057.365 z=-1.74 beta=0.82 carry=0.0000 ts=1775158382
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169140 close_a=11.110951 close_b=7.629043 beta_eff=0.8241 beta_s=0.8316 beta_l=0.8067 mean=6.895255 std=1.192031 spread=4.823886 z=-1.7377 hist=240
@@ -10617,10 +10593,11 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169620 close_a=11.111708 close_b=7.634903 beta_eff=0.8241 beta_s=0.8316 beta_l=0.8067 mean=6.838035 std=1.247654 spread=4.819814 z=-1.6176 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169620 close_a=11.111708 close_b=7.634903 beta_eff=0.8241 beta_s=0.8316 beta_l=0.8067 mean=6.838035 std=1.247654 spread=4.819814 z=-1.6176 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169680 close_a=11.110562 close_b=7.633442 beta_eff=0.8241 beta_s=0.8316 beta_l=0.8067 mean=6.831180 std=1.254186 spread=4.819871 z=-1.6037 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.590 beta_l=0.771 beta=0.644 hl=0.13h p=0.500 eligible=false score=0.654
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.13h beta_gap=0.181)
-[INFO] - [EXIT_CHECK] BTC/ETH reason=ineligible
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0298899377766220335170817258 price_a=66880.9 size_b=0.8011180830621284993183027801 price_b=2066.605 z=0.00 beta=0.64 force=false pnl=-8.336391643013505881109921619 ts=1775161653
+[WARN] - [CIRCUIT_BREAKER] activated after 3 consecutive losses, cooldown 1800s
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0300181309510944610544769041 price_a=66880.9 size_b=0.7820677215176745357655557987 price_b=2066.605 z=0.00 beta=0.82 force=true pnl=-9.651902995702243647412066616 ts=1775161653
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=169680 close_a=11.110562 close_b=7.633442 beta_eff=0.8241 beta_s=0.8316 beta_l=0.8067 mean=6.831180 std=1.254186 spread=4.819871 z=-1.6037 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.590 beta_l=0.771 beta=0.644 hl=0.13h p=0.500 eligible=false score=0.654
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.13h beta_gap=0.181)
@@ -12287,7 +12264,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=195840 close_a=11.117683 close_b=7.629218 beta_eff=1.1685 beta_s=1.2386 beta_l=1.0049 mean=6.707823 std=1.632641 spread=2.202854 z=-2.7593 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.193 beta_l=1.023 beta=1.142 hl=0.51h p=0.500 eligible=true score=0.564
 [INFO] - [ELIGIBILITY] BTC/ETH -> true (p=0.500 hl=0.51h beta_gap=0.170)
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0296944074295407388710928655 price_a=67352.75 size_b=1.1101665632744977957937815606 price_b=2057.43 z=-2.76 beta=1.14 carry=0.0000 ts=1775320548
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=195840 close_a=11.117683 close_b=7.629218 beta_eff=1.1685 beta_s=1.2386 beta_l=1.0049 mean=6.707823 std=1.632641 spread=2.202854 z=-2.7593 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.193 beta_l=1.023 beta=1.142 hl=0.51h p=0.500 eligible=true score=0.564
 [INFO] - [ELIGIBILITY] BTC/ETH -> true (p=0.500 hl=0.51h beta_gap=0.170)
@@ -12351,10 +12327,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=196380 close_a=11.117816 close_b=7.628571 beta_eff=1.1898 beta_s=1.2050 beta_l=1.1545 mean=6.532294 std=1.839709 spread=2.041070 z=-2.4413 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.204 beta_l=1.167 beta=1.193 hl=0.40h p=0.500 eligible=true score=0.585
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=196440 close_a=11.117096 close_b=7.627873 beta_eff=1.1930 beta_s=1.2041 beta_l=1.1669 mean=6.511890 std=1.862375 spread=2.017370 z=-2.4133 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.202 beta_l=1.167 beta=1.192 hl=0.36h p=0.500 eligible=true score=0.595
-[INFO] - [CIRCUIT_BREAKER] reset after win (was 1 consecutive losses)
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0296944074295407388710928655 price_a=67315.95 size_b=1.1101665632744977957937815606 price_b=2054.79 z=0.00 beta=1.19 force=true pnl=1.8380855336375749904393658696 ts=1775324192
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=196440 close_a=11.117096 close_b=7.627873 beta_eff=1.1930 beta_s=1.2041 beta_l=1.1669 mean=6.511890 std=1.862375 spread=2.017370 z=-2.4133 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=1.202 beta_l=1.167 beta=1.192 hl=0.36h p=0.500 eligible=true score=0.595
@@ -12367,7 +12340,6 @@
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0296944074295407388710928655 price_a=67315.95 size_b=1.1101665632744977957937815606 price_b=2054.79 z=0.00 beta=1.19 force=true pnl=1.8380855336375749904393658696 ts=1775324192
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=196500 close_a=11.116937 close_b=7.627615 beta_eff=1.1917 beta_s=1.2023 beta_l=1.1671 mean=6.491720 std=1.884496 spread=2.026827 z=-2.3693 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.198 beta_l=1.185 beta=1.194 hl=0.38h p=0.500 eligible=true score=0.590
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0297169534476495004208663532 price_a=67301.65 size_b=1.1630099804294681498430007545 price_b=2054.15 z=-2.37 beta=1.19 carry=0.0000 ts=1775324558
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=196500 close_a=11.116937 close_b=7.627615 beta_eff=1.1917 beta_s=1.2023 beta_l=1.1671 mean=6.491720 std=1.884496 spread=2.026827 z=-2.3693 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.198 beta_l=1.185 beta=1.194 hl=0.38h p=0.500 eligible=true score=0.590
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0297169534476495004208663532 price_a=67301.65 size_b=1.1630099804294681498430007545 price_b=2054.15 z=-2.37 beta=1.19 carry=0.0000 ts=1775324558
@@ -12376,6 +12348,7 @@
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0297169534476495004208663532 price_a=67301.65 size_b=1.1630099804294681498430007545 price_b=2054.15 z=-2.37 beta=1.19 carry=0.0000 ts=1775324558
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=196560 close_a=11.116803 close_b=7.627980 beta_eff=1.1945 beta_s=1.1985 beta_l=1.1852 mean=6.471460 std=1.906356 spread=2.005193 z=-2.3428 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.196 beta_l=1.195 beta=1.196 hl=0.34h p=0.500 eligible=true score=0.599
+[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0297242849637475189510894322 price_a=67285.05 size_b=1.1638165930617422518587021331 price_b=2054.525 z=-2.34 beta=1.20 carry=0.0000 ts=1775324924
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=196560 close_a=11.116803 close_b=7.627980 beta_eff=1.1945 beta_s=1.1985 beta_l=1.1852 mean=6.471460 std=1.906356 spread=2.005193 z=-2.3428 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=1.196 beta_l=1.195 beta=1.196 hl=0.34h p=0.500 eligible=true score=0.599
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=196560 close_a=11.116803 close_b=7.627980 beta_eff=1.1945 beta_s=1.1985 beta_l=1.1852 mean=6.471460 std=1.906356 spread=2.005193 z=-2.3428 hist=240
@@ -12408,8 +12381,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197040 close_a=11.116328 close_b=7.628124 beta_eff=1.1935 beta_s=1.1893 beta_l=1.2033 mean=6.309568 std=2.065468 spread=2.012180 z=-2.0806 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197040 close_a=11.116328 close_b=7.628124 beta_eff=1.1935 beta_s=1.1893 beta_l=1.2033 mean=6.309568 std=2.065468 spread=2.012180 z=-2.0806 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197100 close_a=11.116384 close_b=7.628063 beta_eff=1.1935 beta_s=1.1893 beta_l=1.2033 mean=6.290911 std=2.083895 spread=2.012309 z=-2.0532 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0297169534476495004208663532 price_a=67261.4 size_b=1.1630099804294681498430007545 price_b=2055.04 z=0.00 beta=1.19 force=true pnl=-2.2311862588501190453001413878 ts=1775328210
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197100 close_a=11.116384 close_b=7.628063 beta_eff=1.1935 beta_s=1.1893 beta_l=1.2033 mean=6.290911 std=2.083895 spread=2.012309 z=-2.0532 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0297169534476495004208663532 price_a=67261.4 size_b=1.1630099804294681498430007545 price_b=2055.04 z=0.00 beta=1.19 force=true pnl=-2.2311862588501190453001413878 ts=1775328210
@@ -12417,7 +12388,6 @@
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0297169534476495004208663532 price_a=67261.4 size_b=1.1630099804294681498430007545 price_b=2055.04 z=0.00 beta=1.19 force=true pnl=-2.2311862588501190453001413878 ts=1775328210
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197160 close_a=11.116282 close_b=7.627798 beta_eff=1.1935 beta_s=1.1893 beta_l=1.2033 mean=6.272660 std=2.102025 spread=2.012523 z=-2.0267 hist=240
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0297367480041066448993671277 price_a=67256.85 size_b=1.1618206095315473611969647574 price_b=2054.53 z=-2.03 beta=1.19 carry=0.0000 ts=1775328575
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197160 close_a=11.116282 close_b=7.627798 beta_eff=1.1935 beta_s=1.1893 beta_l=1.2033 mean=6.272660 std=2.102025 spread=2.012523 z=-2.0267 hist=240
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0297367480041066448993671277 price_a=67256.85 size_b=1.1618206095315473611969647574 price_b=2054.53 z=-2.03 beta=1.19 carry=0.0000 ts=1775328575
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197160 close_a=11.116282 close_b=7.627798 beta_eff=1.1935 beta_s=1.1893 beta_l=1.2033 mean=6.272660 std=2.102025 spread=2.012523 z=-2.0267 hist=240
@@ -12454,7 +12424,8 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197700 close_a=11.116472 close_b=7.632786 beta_eff=1.1682 beta_s=1.1052 beta_l=1.3151 mean=6.114687 std=2.240841 spread=2.200065 z=-1.7469 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197760 close_a=11.116607 close_b=7.632568 beta_eff=1.1682 beta_s=1.1052 beta_l=1.3151 mean=6.103432 std=2.253652 spread=2.200455 z=-1.7318 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0297367480041066448993671277 price_a=67277.8 size_b=1.1618206095315473611969647574 price_b=2064.265 z=0.00 beta=1.17 force=true pnl=-10.687338763103579350610710588 ts=1775332217
+[WARN] - [CIRCUIT_BREAKER] activated after 4 consecutive losses, cooldown 1800s
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0297242849637475189510894322 price_a=67277.8 size_b=1.1638165930617422518587021331 price_b=2064.265 z=0.00 beta=1.17 force=true pnl=-11.551074682408539045499157159 ts=1775332217
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=197760 close_a=11.116607 close_b=7.632568 beta_eff=1.1682 beta_s=1.1052 beta_l=1.3151 mean=6.103432 std=2.253652 spread=2.200455 z=-1.7318 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0297367480041066448993671277 price_a=67277.8 size_b=1.1618206095315473611969647574 price_b=2064.265 z=0.00 beta=1.17 force=true pnl=-10.687338763103579350610710588 ts=1775332217
@@ -13458,10 +13429,7 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=214500 close_a=11.144231 close_b=7.657777 beta_eff=0.8702 beta_s=0.8999 beta_l=0.8009 mean=6.918469 std=0.891536 spread=4.480444 z=-2.7346 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.902 beta_l=0.808 beta=0.874 hl=0.18h p=0.500 eligible=true score=0.640
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=214560 close_a=11.144396 close_b=7.658603 beta_eff=0.8738 beta_s=0.9022 beta_l=0.8076 mean=6.896307 std=0.886446 spread=4.452081 z=-2.7573 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.903 beta_l=0.813 beta=0.876 hl=0.17h p=0.500 eligible=true score=0.641
-[INFO] - [CIRCUIT_BREAKER] reset after win (was 2 consecutive losses)
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0290555141918027130586376596 price_a=69172.95 size_b=0.8014349025108841637995901704 price_b=2118.865 z=0.00 beta=0.87 force=true pnl=5.2113151538089065402712690985 ts=1775434722
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=214560 close_a=11.144396 close_b=7.658603 beta_eff=0.8738 beta_s=0.9022 beta_l=0.8076 mean=6.896307 std=0.886446 spread=4.452081 z=-2.7573 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.903 beta_l=0.813 beta=0.876 hl=0.17h p=0.500 eligible=true score=0.641
@@ -13474,7 +13442,6 @@
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0290555141918027130586376596 price_a=69172.95 size_b=0.8014349025108841637995901704 price_b=2118.865 z=0.00 beta=0.87 force=true pnl=5.2113151538089065402712690985 ts=1775434722
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=214620 close_a=11.144981 close_b=7.660277 beta_eff=0.8757 beta_s=0.9026 beta_l=0.8127 mean=6.874083 std=0.880943 spread=4.437091 z=-2.7663 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.899 beta_l=0.816 beta=0.874 hl=0.17h p=0.500 eligible=true score=0.641
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0288962847324312394844613841 price_a=69213.05 size_b=0.8240083685784611469890418515 price_b=2122.165 z=-2.77 beta=0.87 carry=0.0000 ts=1775435086
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=214620 close_a=11.144981 close_b=7.660277 beta_eff=0.8757 beta_s=0.9026 beta_l=0.8127 mean=6.874083 std=0.880943 spread=4.437091 z=-2.7663 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.899 beta_l=0.816 beta=0.874 hl=0.17h p=0.500 eligible=true score=0.641
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0288962847324312394844613841 price_a=69213.05 size_b=0.8240083685784611469890418515 price_b=2122.165 z=-2.77 beta=0.87 carry=0.0000 ts=1775435086
@@ -13530,15 +13497,16 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215100 close_a=11.140068 close_b=7.657569 beta_eff=0.8516 beta_s=0.8628 beta_l=0.8255 mean=6.710511 std=0.843987 spread=4.618975 z=-2.4782 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.857 beta_l=0.826 beta=0.848 hl=0.15h p=0.500 eligible=true score=0.647
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215160 close_a=11.139403 close_b=7.656344 beta_eff=0.8476 beta_s=0.8568 beta_l=0.8259 mean=6.691030 std=0.837332 spread=4.650247 z=-2.4372 hist=240
+[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.852 beta_l=0.827 beta=0.845 hl=0.14h p=0.500 eligible=true score=0.650
+[WARN] - [CIRCUIT_BREAKER] activated after 5 consecutive losses, cooldown 600s
+[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0290555141918027130586376596 price_a=68830.25 size_b=0.8014349025108841637995901704 price_b=2113.815 z=0.00 beta=0.85 force=true pnl=-0.6987633020419181977359264855 ts=1775438355
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215160 close_a=11.139403 close_b=7.656344 beta_eff=0.8476 beta_s=0.8568 beta_l=0.8259 mean=6.691030 std=0.837332 spread=4.650247 z=-2.4372 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.852 beta_l=0.827 beta=0.845 hl=0.14h p=0.500 eligible=true score=0.650
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215160 close_a=11.139403 close_b=7.656344 beta_eff=0.8476 beta_s=0.8568 beta_l=0.8259 mean=6.691030 std=0.837332 spread=4.650247 z=-2.4372 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.852 beta_l=0.827 beta=0.845 hl=0.14h p=0.500 eligible=true score=0.650
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215220 close_a=11.140471 close_b=7.656808 beta_eff=0.8446 beta_s=0.8520 beta_l=0.8273 mean=6.671646 std=0.829928 spread=4.673664 z=-2.4074 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.849 beta_l=0.830 beta=0.843 hl=0.14h p=0.500 eligible=true score=0.649
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0288962847324312394844613841 price_a=68902.35 size_b=0.8240083685784611469890418515 price_b=2114.995 z=0.00 beta=0.84 force=true pnl=-3.0699356636588196839107219647 ts=1775438718
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215220 close_a=11.140471 close_b=7.656808 beta_eff=0.8446 beta_s=0.8520 beta_l=0.8273 mean=6.671646 std=0.829928 spread=4.673664 z=-2.4074 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.849 beta_l=0.830 beta=0.843 hl=0.14h p=0.500 eligible=true score=0.649
@@ -13549,7 +13517,6 @@
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0288962847324312394844613841 price_a=68902.35 size_b=0.8240083685784611469890418515 price_b=2114.995 z=0.00 beta=0.84 force=true pnl=-3.0699356636588196839107219647 ts=1775438718
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215280 close_a=11.139926 close_b=7.657578 beta_eff=0.8430 beta_s=0.8487 beta_l=0.8297 mean=6.652309 std=0.821899 spread=4.684530 z=-2.3942 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.843 beta_l=0.830 beta=0.839 hl=0.14h p=0.500 eligible=true score=0.650
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0290450074173687692105494371 price_a=68858.65 size_b=0.7930624831325294031479915122 price_b=2116.27 z=-2.39 beta=0.84 carry=0.0000 ts=1775439082
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215280 close_a=11.139926 close_b=7.657578 beta_eff=0.8430 beta_s=0.8487 beta_l=0.8297 mean=6.652309 std=0.821899 spread=4.684530 z=-2.3942 hist=240
 [INFO] - [EVAL] BTC/ETH beta_s=0.843 beta_l=0.830 beta=0.839 hl=0.14h p=0.500 eligible=true score=0.650
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0290450074173687692105494371 price_a=68858.65 size_b=0.7930624831325294031479915122 price_b=2116.27 z=-2.39 beta=0.84 carry=0.0000 ts=1775439082
@@ -13590,8 +13557,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215820 close_a=11.143079 close_b=7.664473 beta_eff=0.8307 beta_s=0.8308 beta_l=0.8305 mean=6.547021 std=0.866964 spread=4.775982 z=-2.0428 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215820 close_a=11.143079 close_b=7.664473 beta_eff=0.8307 beta_s=0.8308 beta_l=0.8305 mean=6.547021 std=0.866964 spread=4.775982 z=-2.0428 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215880 close_a=11.145190 close_b=7.667161 beta_eff=0.8307 beta_s=0.8308 beta_l=0.8305 mean=6.536264 std=0.872838 spread=4.775860 z=-2.0169 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0290450074173687692105494371 price_a=69226.35 size_b=0.7930624831325294031479915122 price_b=2136.43 z=0.00 beta=0.83 force=true pnl=-5.308290432585296328744480864 ts=1775442715
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215880 close_a=11.145190 close_b=7.667161 beta_eff=0.8307 beta_s=0.8308 beta_l=0.8305 mean=6.536264 std=0.872838 spread=4.775860 z=-2.0169 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0290450074173687692105494371 price_a=69226.35 size_b=0.7930624831325294031479915122 price_b=2136.43 z=0.00 beta=0.83 force=true pnl=-5.308290432585296328744480864 ts=1775442715
@@ -13599,7 +13564,6 @@
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0290450074173687692105494371 price_a=69226.35 size_b=0.7930624831325294031479915122 price_b=2136.43 z=0.00 beta=0.83 force=true pnl=-5.308290432585296328744480864 ts=1775442715
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215940 close_a=11.145477 close_b=7.666423 beta_eff=0.8307 beta_s=0.8308 beta_l=0.8305 mean=6.525512 std=0.878534 spread=4.776760 z=-1.9905 hist=240
-[INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0288790523627757678759529185 price_a=69254.35 size_b=0.7780215440219827767865923049 price_b=2135.49 z=-1.99 beta=0.83 carry=0.0000 ts=1775443078
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215940 close_a=11.145477 close_b=7.666423 beta_eff=0.8307 beta_s=0.8308 beta_l=0.8305 mean=6.525512 std=0.878534 spread=4.776760 z=-1.9905 hist=240
 [INFO] - [ENTRY] pair=BTC/ETH direction=LongSpread size_a=0.0288790523627757678759529185 price_a=69254.35 size_b=0.7780215440219827767865923049 price_b=2135.49 z=-1.99 beta=0.83 carry=0.0000 ts=1775443078
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=215940 close_a=11.145477 close_b=7.666423 beta_eff=0.8307 beta_s=0.8308 beta_l=0.8305 mean=6.525512 std=0.878534 spread=4.776760 z=-1.9905 hist=240
@@ -13638,9 +13602,6 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=216480 close_a=11.144325 close_b=7.666131 beta_eff=0.7586 beta_s=0.7393 beta_l=0.8035 mean=6.471753 std=0.909145 spread=5.329051 z=-1.2569 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=216480 close_a=11.144325 close_b=7.666131 beta_eff=0.7586 beta_s=0.7393 beta_l=0.8035 mean=6.471753 std=0.909145 spread=5.329051 z=-1.2569 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=216540 close_a=11.143978 close_b=7.665367 beta_eff=0.7586 beta_s=0.7393 beta_l=0.8035 mean=6.466408 std=0.912071 spread=5.329283 z=-1.2468 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
-[WARN] - [CIRCUIT_BREAKER] activated after 3 consecutive losses, cooldown 1800s
-[INFO] - [EXIT] pair=BTC/ETH direction=LongSpread size_a=0.0288790523627757678759529185 price_a=69143.4 size_b=0.7780215440219827767865923049 price_b=2132.99 z=0.00 beta=0.76 force=true pnl=-1.2590769995950145038704955454 ts=1775446713
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=216540 close_a=11.143978 close_b=7.665367 beta_eff=0.7586 beta_s=0.7393 beta_l=0.8035 mean=6.466408 std=0.912071 spread=5.329283 z=-1.2468 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [WARN] - [CIRCUIT_BREAKER] activated after 3 consecutive losses, cooldown 1800s
@@ -14334,11 +14295,11 @@
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=227460 close_a=11.147598 close_b=7.667294 beta_eff=0.3732 beta_s=0.3501 beta_l=0.4271 mean=5.699099 std=1.252192 spread=8.286153 z=2.0660 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=227460 close_a=11.147598 close_b=7.667294 beta_eff=0.3732 beta_s=0.3501 beta_l=0.4271 mean=5.699099 std=1.252192 spread=8.286153 z=2.0660 hist=240
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=227520 close_a=11.148022 close_b=7.666674 beta_eff=0.3732 beta_s=0.3501 beta_l=0.4271 mean=5.706839 std=1.262381 spread=8.286808 z=2.0437 hist=240
-[INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.588 beta_l=0.399 beta=0.532 hl=0.29h p=0.500 eligible=false score=0.610
 [INFO] - [ELIGIBILITY] BTC/ETH -> false (p=0.500 hl=0.29h beta_gap=0.189)
-[INFO] - [CIRCUIT_BREAKER] reset after win (was 3 consecutive losses)
-[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0286953309109691489323543443 price_a=69426.35 size_b=0.3476508690670309596225413254 price_b=2135.955 z=0.00 beta=0.37 force=true pnl=3.9515854690823403808062255172 ts=1775513248
+[INFO] - [EXIT_CHECK] BTC/ETH reason=ineligible
+[INFO] - [CIRCUIT_BREAKER] reset after win (was 5 consecutive losses)
+[INFO] - [EXIT] pair=BTC/ETH direction=ShortSpread size_a=0.0286953309109691489323543443 price_a=69426.35 size_b=0.3476508690670309596225413254 price_b=2135.955 z=0.00 beta=0.53 force=false pnl=3.9515854690823403808062255172 ts=1775513248
 [INFO] - [ZCHECK] BTC/ETH bucket_ts=227520 close_a=11.148022 close_b=7.666674 beta_eff=0.3732 beta_s=0.3501 beta_l=0.4271 mean=5.706839 std=1.262381 spread=8.286808 z=2.0437 hist=240
 [INFO] - [EXIT_CHECK] BTC/ETH reason=force_close
 [INFO] - [EVAL] BTC/ETH beta_s=0.588 beta_l=0.399 beta=0.532 hl=0.29h p=0.500 eligible=false score=0.610
