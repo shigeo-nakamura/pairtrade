@@ -1439,7 +1439,19 @@ impl PairTradeEngine {
                     .get_mut(&key)
                     .ok_or_else(|| anyhow!("missing state for {}", key))?;
                 if let Some(ref eval) = eval {
-                    state.beta = eval.beta_eff;
+                    if self.cfg.use_kalman_beta {
+                        if let Some(ref kf) = state.kalman {
+                            if kf.is_warm(self.cfg.kalman_min_updates) {
+                                state.beta = kf.beta;
+                            } else {
+                                state.beta = eval.beta_eff;
+                            }
+                        } else {
+                            state.beta = eval.beta_eff;
+                        }
+                    } else {
+                        state.beta = eval.beta_eff;
+                    }
                     state.beta_short = eval.beta_short;
                     state.beta_long = eval.beta_long;
                     state.half_life_hours = eval.half_life_hours;
