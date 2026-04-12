@@ -34,6 +34,7 @@ pub(super) struct Position {
     pub(super) entry_price_b: Option<Decimal>,
     pub(super) entry_size_a: Option<Decimal>,
     pub(super) entry_size_b: Option<Decimal>,
+    pub(super) entry_z: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

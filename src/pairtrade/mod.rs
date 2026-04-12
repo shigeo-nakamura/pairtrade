@@ -1902,6 +1902,7 @@ impl PairTradeEngine {
                             entry_price_b: Some(price_b),
                             entry_size_a: Some(qtys.0),
                             entry_size_b: Some(qtys.1),
+                            entry_z: Some(z),
                         });
                     }
                 } else if self.cfg.observe_only {
@@ -2104,6 +2105,7 @@ impl PairTradeEngine {
                         .as_ref()
                         .map(|p| (p.entered_at, p.entered_ts))
                         .unwrap_or((Instant::now(), now_ts));
+                    let prev_entry_z = state.position.as_ref().and_then(|p| p.entry_z);
                     state.position = Some(Position {
                         direction,
                         entered_at,
@@ -2112,6 +2114,7 @@ impl PairTradeEngine {
                         entry_price_b: q.entry_price,
                         entry_size_a: Some(b.size),
                         entry_size_b: Some(q.size),
+                        entry_z: prev_entry_z,
                     });
                     state.position_guard = false;
                 }
@@ -2550,6 +2553,7 @@ impl PairTradeEngine {
                             }
                         }
                     }
+                    let z_at_entry = state.z_score().map(|(z, _)| z);
                     state.position = Some(Position {
                         direction: pending.direction,
                         entered_at: Instant::now(),
@@ -2558,6 +2562,7 @@ impl PairTradeEngine {
                         entry_price_b: ep_b,
                         entry_size_a: es_a,
                         entry_size_b: es_b,
+                        entry_z: z_at_entry,
                     });
                     state.pending_entry = None;
                 }
@@ -2768,14 +2773,28 @@ impl PairTradeEngine {
                                 if let Some(pnl) =
                                     compute_pnl(pos, p1.price, p2.price).and_then(|p| p.to_f64())
                                 {
+                                    let hold_secs = Some(
+                                        now_ts.saturating_sub(pos.entered_ts).max(0) as f64,
+                                    );
+                                    let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
+                                    let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
+                                    let z_exit = state.z_score().map(|(z, _)| z);
+                                    let beta_val = Some(state.beta);
                                     pnl_record = Some((
                                         PnlLogRecord::new(
                                             base,
                                             quote,
                                             pos.direction,
                                             pnl,
-                                            Utc::now().timestamp(),
+                                            now_ts,
                                             "exit_fill",
+                                        ).with_trade_details(
+                                            entry_a, entry_b,
+                                            p1.price.to_f64(), p2.price.to_f64(),
+                                            beta_val,
+                                            pos.entry_z,
+                                            z_exit,
+                                            hold_secs,
                                         ),
                                         pnl,
                                     ));
