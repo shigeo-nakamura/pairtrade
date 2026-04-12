@@ -215,6 +215,15 @@ impl PairTradeEngine {
             inst_default.exit_z = strategy.exit_z;
             inst_default.stop_loss_z = strategy.stop_loss_z;
             inst_default.max_loss_r_mult = strategy.max_loss_r_mult;
+            if let Some(fc) = strategy.force_close_time_secs {
+                inst_default.force_close_secs = fc;
+            }
+            if let Some(ref w) = strategy.mtf_windows {
+                inst_default.mtf_windows = w.clone();
+            }
+            if let Some(z) = strategy.mtf_z_min {
+                inst_default.mtf_z_min = z;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -222,6 +231,15 @@ impl PairTradeEngine {
                 pp.exit_z = strategy.exit_z;
                 pp.stop_loss_z = strategy.stop_loss_z;
                 pp.max_loss_r_mult = strategy.max_loss_r_mult;
+                if let Some(fc) = strategy.force_close_time_secs {
+                    pp.force_close_secs = fc;
+                }
+                if let Some(ref w) = strategy.mtf_windows {
+                    pp.mtf_windows = w.clone();
+                }
+                if let Some(z) = strategy.mtf_z_min {
+                    pp.mtf_z_min = z;
+                }
                 inst_pair_params.insert(k.clone(), pp);
             }
 

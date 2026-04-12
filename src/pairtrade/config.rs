@@ -313,6 +313,10 @@ pub(super) struct StrategyYaml {
     pub(super) equity_usd_fallback: Option<f64>,
     pub(super) enable_data_dump: Option<bool>,
     pub(super) data_dump_file: Option<String>,
+    // Per-strategy PairParams overrides (None = inherit from top-level)
+    pub(super) force_close_time_secs: Option<u64>,
+    pub(super) mtf_windows: Option<Vec<usize>>,
+    pub(super) mtf_z_min: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -422,6 +426,10 @@ pub struct StrategyConfig {
     pub equity_usd: f64,
     pub enable_data_dump: bool,
     pub data_dump_file: Option<String>,
+    // Per-strategy PairParams overrides (None = inherit from top-level)
+    pub force_close_time_secs: Option<u64>,
+    pub mtf_windows: Option<Vec<usize>>,
+    pub mtf_z_min: Option<f64>,
 }
 
 impl PairTradeConfig {
@@ -1183,6 +1191,9 @@ pub(super) fn resolve_strategies(
                         .data_dump_file
                         .clone()
                         .or_else(|| cfg.data_dump_file.clone()),
+                    force_close_time_secs: s.force_close_time_secs,
+                    mtf_windows: s.mtf_windows.clone(),
+                    mtf_z_min: s.mtf_z_min,
                 }
             })
             .collect(),
@@ -1196,6 +1207,9 @@ pub(super) fn resolve_strategies(
             equity_usd: cfg.equity_usd,
             enable_data_dump: cfg.enable_data_dump,
             data_dump_file: cfg.data_dump_file.clone(),
+            force_close_time_secs: None,
+            mtf_windows: None,
+            mtf_z_min: None,
         }],
     }
 }
