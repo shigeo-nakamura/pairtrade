@@ -50,6 +50,54 @@ pub(super) fn persist_history_to_disk(
     }
 }
 
+/// Load a history snapshot for backtest warm-start. Unlike
+/// `load_history_from_disk`, this skips the stale-guard check (the
+/// snapshot is always older than the replay cursor) and instead accepts
+/// all samples within `max_history_len` bars of the *newest* sample in
+/// each symbol, regardless of `now_ts`.
+pub(super) fn load_history_snapshot_for_bt(
+    history: &mut HashMap<String, VecDeque<PriceSample>>,
+    snapshot_path: &std::path::Path,
+    max_history_len: usize,
+) {
+    let Ok(content) = fs::read_to_string(snapshot_path) else {
+        log::warn!(
+            "[BT_WARM_START] failed to read snapshot {}",
+            snapshot_path.display()
+        );
+        return;
+    };
+    let parsed: Result<HashMap<String, Vec<(f64, i64)>>, _> = serde_json::from_str(&content);
+    let Ok(map) = parsed else {
+        log::warn!(
+            "[BT_WARM_START] failed to parse snapshot {}",
+            snapshot_path.display()
+        );
+        return;
+    };
+    for (sym, entries) in map {
+        if entries.is_empty() {
+            continue;
+        }
+        let newest_ts = entries.iter().map(|(_, ts)| *ts).max().unwrap_or(0);
+        let max_age = (max_history_len as i64) * 60; // assume 60s bars
+        let mut deque = VecDeque::new();
+        for (log_price, ts) in entries {
+            if newest_ts.saturating_sub(ts) <= max_age {
+                deque.push_back(PriceSample { log_price, ts });
+            }
+        }
+        if !deque.is_empty() {
+            log::info!(
+                "[BT_WARM_START] loaded {} bars for {} from snapshot",
+                deque.len(),
+                sym
+            );
+            history.insert(sym, deque);
+        }
+    }
+}
+
 pub(super) fn load_history_from_disk(
     cfg: &PairTradeConfig,
     history: &mut HashMap<String, VecDeque<PriceSample>>,

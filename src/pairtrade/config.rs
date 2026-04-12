@@ -385,6 +385,10 @@ pub struct PairTradeConfig {
     // For backtest feature
     pub backtest_mode: bool,
     pub backtest_file: Option<String>,
+    /// Path to a history snapshot file for BT warm-start. When set,
+    /// the replay loads price history from this file before the first
+    /// tick, giving the BT an identical starting state to a live bot.
+    pub bt_warm_start_snapshot: Option<String>,
     pub circuit_breaker_consecutive_losses: u32,
     pub circuit_breaker_cooldown_secs: u64,
     /// All per-pair tunables — z-score thresholds, hedge gates, lookback
@@ -544,6 +548,7 @@ impl PairTradeConfig {
             history_file,
             backtest_mode: yaml.backtest_mode.unwrap_or(false),
             backtest_file: yaml.backtest_file,
+            bt_warm_start_snapshot: None, // env-only, not in YAML
             circuit_breaker_consecutive_losses: yaml
                 .circuit_breaker_consecutive_losses
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES),
@@ -739,6 +744,7 @@ impl PairTradeConfig {
             history_file,
             backtest_mode,
             backtest_file,
+            bt_warm_start_snapshot: env::var("BT_WARM_START_SNAPSHOT").ok().filter(|v| !v.trim().is_empty()),
             circuit_breaker_consecutive_losses: env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -935,6 +941,11 @@ impl PairTradeConfig {
             return Err(anyhow!(
                 "BACKTEST_FILE must be set if BACKTEST_MODE is true"
             ));
+        }
+        if let Ok(value) = env::var("BT_WARM_START_SNAPSHOT") {
+            if !value.trim().is_empty() {
+                self.bt_warm_start_snapshot = Some(value);
+            }
         }
 
         env_override("SPREAD_TREND_MAX_SLOPE_SIGMA", &mut self.default_pair_params.spread_trend_max_slope_sigma);

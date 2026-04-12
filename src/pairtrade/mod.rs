@@ -457,6 +457,19 @@ impl PairTradeEngine {
             self.should_post_only()
         );
         self.load_history_from_disk();
+        // BT warm-start: load a live history snapshot so the replay starts
+        // with an identical spread_history / beta to the live bot, instead
+        // of building from scratch over the first 4 hours of data.
+        if self.cfg.backtest_mode {
+            if let Some(ref path) = self.cfg.bt_warm_start_snapshot {
+                let max_len = self.max_history_len();
+                history_io::load_history_snapshot_for_bt(
+                    &mut self.history,
+                    std::path::Path::new(path),
+                    max_len,
+                );
+            }
+        }
         self.warm_start_states_from_history();
 
         if self.replay_connector.is_some() {
@@ -4060,6 +4073,7 @@ impl PairTradeEngine {
             history_file: "test-history.json".to_string(),
             backtest_mode: false,
             backtest_file: None,
+            bt_warm_start_snapshot: None,
             circuit_breaker_consecutive_losses: DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES,
             circuit_breaker_cooldown_secs: DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS,
             shutdown_grace_secs: 0,
