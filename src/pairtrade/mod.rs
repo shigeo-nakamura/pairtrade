@@ -23,10 +23,12 @@ mod defaults;
 mod entry;
 mod exit;
 mod history_io;
+mod kalman;
 mod market;
 mod order_pricing;
 mod pair_eval;
 mod pnl_log;
+mod regime;
 mod sizing;
 mod state;
 mod stats;
@@ -229,10 +231,16 @@ impl PairTradeEngine {
                 let pp = inst_pair_params
                     .get(&pair_key)
                     .unwrap_or(&inst_default);
-                states.insert(
-                    pair_key,
-                    PairState::new(cfg.metrics_window, pp.entry_z_base),
-                );
+                let mut ps = PairState::new(cfg.metrics_window, pp.entry_z_base);
+                if cfg.use_kalman_beta {
+                    ps.kalman = Some(kalman::KalmanBeta::new(
+                        1.0,
+                        cfg.kalman_initial_p,
+                        cfg.kalman_q,
+                        cfg.kalman_r,
+                    ));
+                }
+                states.insert(pair_key, ps);
             }
 
             let instance_connector = instance_connectors
@@ -1134,6 +1142,35 @@ impl PairTradeEngine {
         self.sync_positions_from_exchange(inst_idx, price_map).await?;
 
         let vol_median = self.compute_vol_median(inst_idx);
+
+        // Regime filter: compute once per step cycle (not per pair)
+        let regime_state = if self.cfg.regime_vol_max > 0.0 || self.cfg.regime_trend_max > 0.0 {
+            self.history
+                .get(&self.cfg.regime_reference_symbol)
+                .and_then(|h| {
+                    regime::compute_regime(h, self.cfg.regime_vol_window, self.cfg.regime_trend_window)
+                })
+        } else {
+            None
+        };
+        let regime_ok = regime::regime_allows_entry(
+            regime_state,
+            self.cfg.regime_vol_max,
+            self.cfg.regime_trend_max,
+        );
+        if let Some(rs) = regime_state {
+            if !regime_ok {
+                log::info!(
+                    "[REGIME] entry blocked: vol={:.6} (max={:.6}) trend={:.4} (max={:.4}) ref={}",
+                    rs.realized_vol,
+                    self.cfg.regime_vol_max,
+                    rs.trend_strength,
+                    self.cfg.regime_trend_max,
+                    self.cfg.regime_reference_symbol,
+                );
+            }
+        }
+
         let positions_clear = self.open_positions.is_empty();
         let has_pending_orders = self
             .instances[inst_idx]
@@ -1191,6 +1228,21 @@ impl PairTradeEngine {
                     .get_mut(&key)
                     .ok_or_else(|| anyhow!("missing state for {}", key))?;
                 let prev_eligible = state.eligible;
+                // Kalman filter update: feed log-return diffs (dx, dy) per bar
+                if let Some(ref mut kf) = state.kalman {
+                    if state.last_spread.is_some() {
+                        if let (Some(hist_b), Some(hist_a)) = (
+                            self.history.get(&pair.quote),
+                            self.history.get(&pair.base),
+                        ) {
+                            if hist_b.len() >= 2 && hist_a.len() >= 2 {
+                                let dx = log_b - hist_b[hist_b.len() - 2].log_price;
+                                let dy = log_a - hist_a[hist_a.len() - 2].log_price;
+                                kf.update(dx, dy);
+                            }
+                        }
+                    }
+                }
                 let spread = log_a - state.beta * log_b;
                 state.push_spread(spread, self.cfg.metrics_window, &self.cfg);
                 (
@@ -1231,6 +1283,22 @@ impl PairTradeEngine {
                         latest,
                         z,
                         spread_len,
+                    );
+                }
+            }
+
+            // Kalman beta diagnostic log (only when enabled, so golden test is not affected)
+            if self.cfg.use_kalman_beta {
+                let state = &self.instances[inst_idx].states[&key];
+                if let Some(ref kf) = state.kalman {
+                    log::info!(
+                        "[KALMAN] {} kalman_beta={:.4} ols_beta={:.4} diff={:.4} p={:.6} warm={}",
+                        key,
+                        kf.beta,
+                        beta_eff,
+                        kf.beta - beta_eff,
+                        kf.p,
+                        kf.is_warm(self.cfg.kalman_min_updates),
                     );
                 }
             }
@@ -1432,6 +1500,8 @@ impl PairTradeEngine {
                             } else if last_eval_ts.is_none() {
                                 // Block entry until first evaluate_pair() completes,
                                 // because beta is still at its initial value (1.0).
+                            } else if !regime_ok {
+                                // entry blocked by regime filter
                             } else if should_enter(&self.cfg, pp, state, z, std, net_funding, now_ts) {
                                 let direction = if z > 0.0 {
                                     PositionDirection::ShortSpread
@@ -3970,6 +4040,16 @@ impl PairTradeEngine {
                 ..PairParams::default()
             },
             strategies: Vec::new(),
+            use_kalman_beta: DEFAULT_USE_KALMAN_BETA,
+            kalman_q: DEFAULT_KALMAN_Q,
+            kalman_r: DEFAULT_KALMAN_R,
+            kalman_initial_p: DEFAULT_KALMAN_INITIAL_P,
+            kalman_min_updates: DEFAULT_KALMAN_MIN_UPDATES,
+            regime_vol_window: DEFAULT_REGIME_VOL_WINDOW,
+            regime_vol_max: DEFAULT_REGIME_VOL_MAX,
+            regime_trend_window: DEFAULT_REGIME_TREND_WINDOW,
+            regime_trend_max: DEFAULT_REGIME_TREND_MAX,
+            regime_reference_symbol: DEFAULT_REGIME_REFERENCE_SYMBOL.to_string(),
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());

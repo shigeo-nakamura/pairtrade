@@ -1,4 +1,4 @@
-[INFO] - dex-connector git: 3e60a0b485131f2afcd8a80910b4d46fde2c23b5
+[INFO] - dex-connector git: 0ad3f6182cd3323e585778e6e7c53a9e6320a4b8
 [INFO] - Starting pair-trade loop...
 [INFO] - [CONFIG] DEX_NAME is: lighter
 [INFO] - [CONFIG] FEE_BPS=0 SLIPPAGE_BPS=0 post_only_supported=true post_only_enabled=false

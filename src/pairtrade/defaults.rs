@@ -50,3 +50,17 @@ pub(super) const DEFAULT_CB_TIER1_COOLDOWN_SECS: u64 = 0;
 pub(super) const DEFAULT_CB_TIER2_LOSSES: u32 = 0;
 pub(super) const DEFAULT_CB_TIER2_COOLDOWN_SECS: u64 = 0;
 pub(super) const DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS: u64 = 0;
+
+// Kalman filter beta estimation (disabled by default)
+pub(super) const DEFAULT_USE_KALMAN_BETA: bool = false;
+pub(super) const DEFAULT_KALMAN_Q: f64 = 1e-5;
+pub(super) const DEFAULT_KALMAN_R: f64 = 1e-3;
+pub(super) const DEFAULT_KALMAN_INITIAL_P: f64 = 1.0;
+pub(super) const DEFAULT_KALMAN_MIN_UPDATES: u64 = 60;
+
+// Regime filter (disabled by default: thresholds 0.0 → filter inactive)
+pub(super) const DEFAULT_REGIME_VOL_WINDOW: usize = 60;
+pub(super) const DEFAULT_REGIME_VOL_MAX: f64 = 0.0;
+pub(super) const DEFAULT_REGIME_TREND_WINDOW: usize = 60;
+pub(super) const DEFAULT_REGIME_TREND_MAX: f64 = 0.0;
+pub(super) const DEFAULT_REGIME_REFERENCE_SYMBOL: &str = "BTC";

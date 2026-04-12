@@ -279,6 +279,18 @@ pub(super) struct PairTradeYaml {
     /// loader synthesizes a single strategy from the top-level scalars
     /// (legacy single-bot YAML format) so existing configs keep working.
     pub(super) strategies: Option<Vec<StrategyYaml>>,
+    // Kalman filter beta estimation
+    pub(super) use_kalman_beta: Option<bool>,
+    pub(super) kalman_q: Option<f64>,
+    pub(super) kalman_r: Option<f64>,
+    pub(super) kalman_initial_p: Option<f64>,
+    pub(super) kalman_min_updates: Option<u64>,
+    // Regime filter
+    pub(super) regime_vol_window: Option<usize>,
+    pub(super) regime_vol_max: Option<f64>,
+    pub(super) regime_trend_window: Option<usize>,
+    pub(super) regime_trend_max: Option<f64>,
+    pub(super) regime_reference_symbol: Option<String>,
 }
 
 /// Per-strategy override block in the new multi-strategy YAML format.
@@ -378,6 +390,18 @@ pub struct PairTradeConfig {
     /// produces a single entry derived from top-level scalars; new
     /// multi-strategy YAML produces N entries (shigeo-nakamura/bot-strategy#25).
     pub strategies: Vec<StrategyConfig>,
+    // Kalman filter beta estimation (log-only, disabled by default)
+    pub use_kalman_beta: bool,
+    pub kalman_q: f64,
+    pub kalman_r: f64,
+    pub kalman_initial_p: f64,
+    pub kalman_min_updates: u64,
+    // Regime filter (disabled by default: thresholds 0.0 → filter inactive)
+    pub regime_vol_window: usize,
+    pub regime_vol_max: f64,
+    pub regime_trend_window: usize,
+    pub regime_trend_max: f64,
+    pub regime_reference_symbol: String,
 }
 
 /// Resolved per-strategy config for one A/B/C variant. Fields here override
@@ -519,6 +543,19 @@ impl PairTradeConfig {
             pair_params: HashMap::new(),
             default_pair_params,
             strategies: Vec::new(),
+            use_kalman_beta: yaml.use_kalman_beta.unwrap_or(DEFAULT_USE_KALMAN_BETA),
+            kalman_q: yaml.kalman_q.unwrap_or(DEFAULT_KALMAN_Q),
+            kalman_r: yaml.kalman_r.unwrap_or(DEFAULT_KALMAN_R),
+            kalman_initial_p: yaml.kalman_initial_p.unwrap_or(DEFAULT_KALMAN_INITIAL_P),
+            kalman_min_updates: yaml.kalman_min_updates.unwrap_or(DEFAULT_KALMAN_MIN_UPDATES),
+            regime_vol_window: yaml.regime_vol_window.unwrap_or(DEFAULT_REGIME_VOL_WINDOW),
+            regime_vol_max: yaml.regime_vol_max.unwrap_or(DEFAULT_REGIME_VOL_MAX),
+            regime_trend_window: yaml.regime_trend_window.unwrap_or(DEFAULT_REGIME_TREND_WINDOW),
+            regime_trend_max: yaml.regime_trend_max.unwrap_or(DEFAULT_REGIME_TREND_MAX),
+            regime_reference_symbol: yaml
+                .regime_reference_symbol
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REGIME_REFERENCE_SYMBOL.to_string()),
         };
 
         cfg.pair_params = cfg.build_pair_params_map(&yaml.pair_overrides);
@@ -705,6 +742,22 @@ impl PairTradeConfig {
             // Placeholder rebuilt immediately below.
             default_pair_params: PairParams::default(),
             strategies: Vec::new(),
+            use_kalman_beta: env::var("USE_KALMAN_BETA")
+                .ok()
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(DEFAULT_USE_KALMAN_BETA),
+            kalman_q: env_parse("KALMAN_Q", DEFAULT_KALMAN_Q),
+            kalman_r: env_parse("KALMAN_R", DEFAULT_KALMAN_R),
+            kalman_initial_p: env_parse("KALMAN_INITIAL_P", DEFAULT_KALMAN_INITIAL_P),
+            kalman_min_updates: env_parse("KALMAN_MIN_UPDATES", DEFAULT_KALMAN_MIN_UPDATES),
+            regime_vol_window: env_parse("REGIME_VOL_WINDOW", DEFAULT_REGIME_VOL_WINDOW),
+            regime_vol_max: env_parse("REGIME_VOL_MAX", DEFAULT_REGIME_VOL_MAX),
+            regime_trend_window: env_parse("REGIME_TREND_WINDOW", DEFAULT_REGIME_TREND_WINDOW),
+            regime_trend_max: env_parse("REGIME_TREND_MAX", DEFAULT_REGIME_TREND_MAX),
+            regime_reference_symbol: env::var("REGIME_REFERENCE_SYMBOL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_REGIME_REFERENCE_SYMBOL.to_string()),
         };
         cfg.default_pair_params = default_pair_params_from_env();
         if cfg.default_pair_params.warm_start_min_bars == 0 {
@@ -883,6 +936,26 @@ impl PairTradeConfig {
         env_override("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", &mut self.default_pair_params.entry_velocity_block_sigma_per_min);
         env_override("FUNDING_ENTRY_Z_SCALE", &mut self.default_pair_params.funding_entry_z_scale);
         env_override("BETA_GAP_ENTRY_Z_SCALE", &mut self.default_pair_params.beta_gap_entry_z_scale);
+
+        // Kalman filter
+        if let Ok(value) = env::var("USE_KALMAN_BETA") {
+            self.use_kalman_beta = value.to_lowercase() == "true";
+        }
+        env_override("KALMAN_Q", &mut self.kalman_q);
+        env_override("KALMAN_R", &mut self.kalman_r);
+        env_override("KALMAN_INITIAL_P", &mut self.kalman_initial_p);
+        env_override("KALMAN_MIN_UPDATES", &mut self.kalman_min_updates);
+
+        // Regime filter
+        env_override("REGIME_VOL_WINDOW", &mut self.regime_vol_window);
+        env_override("REGIME_VOL_MAX", &mut self.regime_vol_max);
+        env_override("REGIME_TREND_WINDOW", &mut self.regime_trend_window);
+        env_override("REGIME_TREND_MAX", &mut self.regime_trend_max);
+        if let Ok(value) = env::var("REGIME_REFERENCE_SYMBOL") {
+            if !value.trim().is_empty() {
+                self.regime_reference_symbol = value;
+            }
+        }
 
         Ok(())
     }

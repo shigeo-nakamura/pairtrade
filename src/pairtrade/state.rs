@@ -11,6 +11,7 @@ use dex_connector::DexError;
 use rust_decimal::Decimal;
 
 use super::config::PairTradeConfig;
+use super::kalman::KalmanBeta;
 use super::util::mean_std;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +117,7 @@ pub(super) struct PairState {
     pub(super) pending_entry: Option<PendingOrders>,
     pub(super) pending_exit: Option<PendingOrders>,
     pub(super) position_guard: bool,
+    pub(super) kalman: Option<KalmanBeta>,
 }
 
 impl PairState {
@@ -141,6 +143,7 @@ impl PairState {
             pending_entry: None,
             pending_exit: None,
             position_guard: false,
+            kalman: None,
         }
     }
 
