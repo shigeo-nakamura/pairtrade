@@ -408,6 +408,7 @@ impl DexConnector for ReplayConnector {
             exchange_order_id: None,
             ordered_price: fill_price,
             ordered_size: size,
+            client_order_id: None,
         })
     }
 

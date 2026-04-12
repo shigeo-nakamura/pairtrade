@@ -4357,6 +4357,7 @@ mod pending_tests {
                 exchange_order_id: None,
                 ordered_price,
                 ordered_size: size,
+                client_order_id: None,
             })
         }
 
