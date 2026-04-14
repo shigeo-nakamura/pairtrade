@@ -2040,8 +2040,14 @@ impl PairTradeEngine {
                 if err_msg.contains("positions not ready from websocket") {
                     let stale_clear_secs = self.cfg.order_timeout_secs.max(1).saturating_mul(6);
                     self.clear_stale_pending(inst_idx, Duration::from_secs(stale_clear_secs), "ws_not_ready");
+                    // Startup transient: the Lighter WS hasn't pushed the
+                    // initial position snapshot yet. Resolves within seconds
+                    // of the first WS push. Log at INFO so it does not
+                    // inflate error_summary and trigger the error-watch
+                    // workflow (bot-strategy#49) on every restart. Other
+                    // get_positions failures keep WARN below.
                     if self.should_log_position_warn(&self.cfg.dex_name) {
-                        log::warn!(
+                        log::info!(
                             "[POSITION] waiting for initial WS positions on {}",
                             self.cfg.dex_name
                         );
