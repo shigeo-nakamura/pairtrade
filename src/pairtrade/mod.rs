@@ -655,14 +655,14 @@ impl PairTradeEngine {
                             self.shutdown_pending = true;
                             shutdown_deadline = Some(Instant::now() + grace);
                         } else {
-                            log::warn!("[PAIR] Second SIGTERM received, force-closing immediately");
+                            log::info!("[PAIR] Second SIGTERM received, force-closing immediately");
                             force_shutdown = true;
                             break;
                         }
                     }
                     _ = sigint.recv() => {
                         if self.shutdown_pending {
-                            log::warn!("[PAIR] SIGINT received during graceful shutdown, force-closing");
+                            log::info!("[PAIR] SIGINT received during graceful shutdown, force-closing");
                             force_shutdown = true;
                             break;
                         } else {
@@ -675,7 +675,7 @@ impl PairTradeEngine {
             }
 
             if force_shutdown {
-                log::warn!("[PAIR] Force-closing all open positions on shutdown");
+                log::info!("[PAIR] Force-closing all open positions on shutdown");
                 if let Err(e) = self.connector.close_all_positions(None).await {
                     log::error!("[PAIR] close_all_positions on shutdown failed: {:?}", e);
                 }
@@ -1154,7 +1154,7 @@ impl PairTradeEngine {
         // Skip new entries if maintenance is upcoming within 1 hour
         let maintenance_block_entries = self.connector.is_upcoming_maintenance(1).await;
         if maintenance_block_entries {
-            log::warn!("Upcoming maintenance detected; blocking new entries this cycle");
+            log::info!("Upcoming maintenance detected; blocking new entries this cycle");
         }
         if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
             reporter.set_maintenance(if maintenance_block_entries {
@@ -2659,7 +2659,7 @@ impl PairTradeEngine {
                             .cloned()
                             .unwrap_or(Decimal::ZERO);
                         let is_open = status.open_ids.contains(&leg.order_id);
-                        log::warn!(
+                        log::debug!(
                             "[ORDER] {} entry leg status symbol={} order_id={} target={} filled={} open={}",
                             key,
                             leg.symbol,
@@ -2896,7 +2896,7 @@ impl PairTradeEngine {
                             .cloned()
                             .unwrap_or(Decimal::ZERO);
                         let is_open = status.open_ids.contains(&leg.order_id);
-                        log::warn!(
+                        log::debug!(
                             "[ORDER] {} exit leg status symbol={} order_id={} target={} filled={} open={}",
                             key,
                             leg.symbol,

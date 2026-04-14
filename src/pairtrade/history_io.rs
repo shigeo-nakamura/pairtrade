@@ -133,7 +133,7 @@ pub(super) fn load_history_from_disk(
     for (sym, entries) in map {
         let newest_ts = entries.iter().map(|(_, ts)| *ts).max().unwrap_or(0);
         if now_ts.saturating_sub(newest_ts) > stale_threshold_secs {
-            log::warn!(
+            log::debug!(
                 "discarding stale persisted history for {}: newest sample {}s old",
                 sym,
                 now_ts.saturating_sub(newest_ts)

@@ -76,7 +76,7 @@ impl RateLimitNotifier {
         );
 
         EmailClient::new().send(&subject, &body);
-        log::warn!(
+        log::info!(
             "📧 [RateLimit] Email notification sent for '{}' (detail: {})",
             context,
             detail
@@ -105,7 +105,7 @@ impl RateLimitNotifier {
         );
 
         EmailClient::new().send(&subject, &body);
-        log::warn!(
+        log::info!(
             "📧 [RateLimit] Lighter WAF cooldown email sent (until_unix={}, context={})",
             until_unix,
             context
