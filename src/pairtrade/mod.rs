@@ -615,7 +615,6 @@ impl PairTradeEngine {
                             let now_ts = chrono::Utc::now().timestamp();
                             let grace_deadline_ts =
                                 now_ts + self.cfg.shutdown_grace_secs as i64;
-                            let cfg_ref = &self.cfg;
                             let per_instance_positions: Vec<Vec<ShutdownPosition>> = self
                                 .instances
                                 .iter()
@@ -623,7 +622,10 @@ impl PairTradeEngine {
                                     let mut out = Vec::new();
                                     for (key, state) in &inst.states {
                                         if let Some(pos) = &state.position {
-                                            let pp = cfg_ref.params_for(key);
+                                            let pp = inst
+                                                .pair_params
+                                                .get(key)
+                                                .unwrap_or(&inst.default_pair_params);
                                             let elapsed =
                                                 now_ts.saturating_sub(pos.entered_ts).max(0);
                                             let remaining = (pp.force_close_secs as i64)
