@@ -565,10 +565,23 @@ impl PairTradeEngine {
                             log::error!("pairtrade step failed: {:?}", e);
                         }
                         let step_elapsed = step_start.elapsed();
-                        if step_elapsed >= Duration::from_secs(interval_secs) {
+                        let interval = Duration::from_secs(interval_secs);
+                        // Warn only on critical overrun (>=1.5x interval), where a
+                        // wall-clock tick is genuinely skipped and A/B/C bars drift.
+                        // Mild overruns (just past the boundary) are logged at info
+                        // so they stay visible without inflating warn_count.
+                        let critical = interval + interval / 2;
+                        if step_elapsed >= critical {
                             log::warn!(
-                                "[STEP_OVERRUN] step() took {:.2}s >= interval_secs={}; \
-                                 next wall-clock tick will be skipped, A/B/C alignment may drift",
+                                "[STEP_OVERRUN] step() took {:.2}s >= {:.2}s (1.5x interval_secs={}); \
+                                 wall-clock tick skipped, A/B/C alignment may drift",
+                                step_elapsed.as_secs_f64(),
+                                critical.as_secs_f64(),
+                                interval_secs
+                            );
+                        } else if step_elapsed >= interval {
+                            log::info!(
+                                "[STEP_OVERRUN] step() took {:.2}s >= interval_secs={} (mild)",
                                 step_elapsed.as_secs_f64(),
                                 interval_secs
                             );
