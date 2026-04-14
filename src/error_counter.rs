@@ -42,11 +42,16 @@ pub struct ErrorSummary {
     pub last_error_ts: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_warn_ts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_warn_message: Option<String>,
 }
 
 struct Counters {
     recent: Mutex<VecDeque<(i64, Level)>>,
     last_error: Mutex<Option<(i64, String)>>,
+    last_warn: Mutex<Option<(i64, String)>>,
     error_total: AtomicU64,
     warn_total: AtomicU64,
 }
@@ -80,7 +85,11 @@ impl ErrorCounterHandle {
             }
             (e, w)
         };
-        let (last_ts, last_msg) = match self.counters.last_error.lock().unwrap().clone() {
+        let (last_err_ts, last_err_msg) = match self.counters.last_error.lock().unwrap().clone() {
+            Some((ts, msg)) => (Some(ts), Some(msg)),
+            None => (None, None),
+        };
+        let (last_warn_ts, last_warn_msg) = match self.counters.last_warn.lock().unwrap().clone() {
             Some((ts, msg)) => (Some(ts), Some(msg)),
             None => (None, None),
         };
@@ -89,8 +98,10 @@ impl ErrorCounterHandle {
             warn_count_5m: warn_5m,
             error_count_total: self.counters.error_total.load(Ordering::Relaxed),
             warn_count_total: self.counters.warn_total.load(Ordering::Relaxed),
-            last_error_ts: last_ts,
-            last_error_message: last_msg,
+            last_error_ts: last_err_ts,
+            last_error_message: last_err_msg,
+            last_warn_ts,
+            last_warn_message: last_warn_msg,
         }
     }
 }
@@ -105,6 +116,7 @@ impl ErrorCountingLogger {
         let counters = Arc::new(Counters {
             recent: Mutex::new(VecDeque::new()),
             last_error: Mutex::new(None),
+            last_warn: Mutex::new(None),
             error_total: AtomicU64::new(0),
             warn_total: AtomicU64::new(0),
         });
@@ -126,17 +138,18 @@ impl Log for ErrorCountingLogger {
             if level == Level::Error || level == Level::Warn {
                 let ts = chrono::Utc::now().timestamp();
                 self.counters.recent.lock().unwrap().push_back((ts, level));
+                let msg = record.args().to_string();
+                let truncated = if msg.chars().count() > LAST_ERROR_MAX_CHARS {
+                    msg.chars().take(LAST_ERROR_MAX_CHARS).collect::<String>() + "…"
+                } else {
+                    msg
+                };
                 if level == Level::Error {
                     self.counters.error_total.fetch_add(1, Ordering::Relaxed);
-                    let msg = record.args().to_string();
-                    let truncated = if msg.chars().count() > LAST_ERROR_MAX_CHARS {
-                        msg.chars().take(LAST_ERROR_MAX_CHARS).collect::<String>() + "…"
-                    } else {
-                        msg
-                    };
                     *self.counters.last_error.lock().unwrap() = Some((ts, truncated));
                 } else {
                     self.counters.warn_total.fetch_add(1, Ordering::Relaxed);
+                    *self.counters.last_warn.lock().unwrap() = Some((ts, truncated));
                 }
             }
         }
