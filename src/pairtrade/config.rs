@@ -443,6 +443,49 @@ impl PairTradeConfig {
             .unwrap_or(&self.default_pair_params)
     }
 
+    /// Largest `force_close_secs` across the resolved default, per-pair
+    /// overrides, and per-strategy overrides. The graceful-shutdown grace
+    /// window must exceed this, or a position can be prematurely flushed by
+    /// shutdown before its own `force_close` would have closed it.
+    fn max_force_close_secs(&self) -> u64 {
+        let mut m = self.default_pair_params.force_close_secs;
+        for p in self.pair_params.values() {
+            m = m.max(p.force_close_secs);
+        }
+        for s in &self.strategies {
+            if let Some(fc) = s.force_close_time_secs {
+                m = m.max(fc);
+            }
+        }
+        m
+    }
+
+    /// Assert that `shutdown_grace_secs` covers the longest per-strategy /
+    /// per-pair `force_close_secs` plus a small buffer. Catches config drift
+    /// like bot-strategy#50, where a strategy's `force_close_time_secs` was
+    /// extended without raising the global shutdown grace.
+    fn validate(&self) -> Result<()> {
+        const BUFFER_SECS: u64 = 60;
+        // 0 = legacy immediate force-close on SIGTERM; no grace window to
+        // validate.
+        if self.shutdown_grace_secs == 0 {
+            return Ok(());
+        }
+        let max_fc = self.max_force_close_secs();
+        let required = max_fc.saturating_add(BUFFER_SECS);
+        if self.shutdown_grace_secs < required {
+            return Err(anyhow!(
+                "shutdown_grace_secs ({}) is shorter than max force_close_time_secs ({}) + {}s buffer = {}. \
+                 Graceful shutdown would force-close a position before its own force_close window expires (see bot-strategy#50).",
+                self.shutdown_grace_secs,
+                max_fc,
+                BUFFER_SECS,
+                required,
+            ));
+        }
+        Ok(())
+    }
+
     fn build_pair_params_map(
         &self,
         overrides: &Option<HashMap<String, PairOverrideYaml>>,
@@ -585,6 +628,7 @@ impl PairTradeConfig {
         if !pair_params_rebuilt.is_empty() {
             cfg.pair_params = pair_params_rebuilt;
         }
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -783,6 +827,7 @@ impl PairTradeConfig {
             cfg.default_pair_params.warm_start_min_bars = cfg.metrics_window;
         }
         cfg.strategies = resolve_strategies(&cfg, None);
+        cfg.validate()?;
         Ok(cfg)
     }
 

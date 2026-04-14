@@ -4544,25 +4544,58 @@ mod shutdown_grace_tests {
     fn live_btceth_configs_pin_grace_above_force_close() {
         // The -b / -c YAMLs were folded into the single multi-strategy
         // debot-pair-btceth.yaml in commit 7 of #25; only the consolidated
-        // file is checked here.
-        for name in &[
-            "debot-pair-btceth.yaml",
-            "debot-pair-solhype.yaml",
-        ] {
+        // file is checked here. Expected grace values are pinned per-file:
+        // btceth's strategy A has a 7200s force_close override, so the grace
+        // must cover it (see bot-strategy#50).
+        let expected: &[(&str, u64)] = &[
+            ("debot-pair-btceth.yaml", 7260),
+            ("debot-pair-solhype.yaml", 3660),
+        ];
+        for (name, expected_grace) in expected {
             let path = config_path(name);
             let cfg = PairTradeConfig::from_yaml_path(&path)
                 .unwrap_or_else(|e| panic!("failed to load {path}: {e}"));
             assert_eq!(
-                cfg.shutdown_grace_secs, 3660,
-                "{name}: expected shutdown_grace_secs=3660, got {}",
-                cfg.shutdown_grace_secs
-            );
-            assert!(
-                cfg.shutdown_grace_secs >= cfg.default_pair_params.force_close_secs + 60,
-                "{name}: grace ({}) must be >= force_close_secs ({}) + 60",
-                cfg.shutdown_grace_secs,
-                cfg.default_pair_params.force_close_secs
+                cfg.shutdown_grace_secs, *expected_grace,
+                "{name}: expected shutdown_grace_secs={}, got {}",
+                expected_grace, cfg.shutdown_grace_secs
             );
         }
+    }
+
+    /// Regression guard for bot-strategy#50: if any strategy raises
+    /// `force_close_time_secs` above `shutdown_grace_secs - 60s`, config load
+    /// must fail rather than silently shipping a config that would
+    /// prematurely force-close positions on SIGTERM.
+    #[test]
+    fn validate_rejects_strategy_force_close_exceeding_grace() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("pairtrade_validate_regression.yaml");
+        let yaml = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+force_close_time_secs: 3600
+shutdown_grace_secs: 3660
+strategies:
+  - id: a
+    force_close_time_secs: 7200
+"#;
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+        let err = PairTradeConfig::from_yaml_path(&path)
+            .expect_err("validate() must reject grace=3660 when strategy A force_close=7200");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("shutdown_grace_secs"),
+            "error should mention shutdown_grace_secs, got: {msg}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
