@@ -142,9 +142,11 @@ jobs:
 
   deploy:
     runs-on: ubuntu-latest
-    # Pairtrade restarts wait for graceful shutdown (up to ~62 min per bot,
-    # 3 bots serially) so the deploy job needs a long ceiling. See
-    # SSM_DEPLOY_TIMEOUT_SECS in the SSM polling step below.
+    # Pairtrade restart waits for graceful shutdown; only debot-pair-btceth
+    # is restarted by the SSM step below, with shutdown_grace_secs=7260s
+    # (~2h01m, raised from 3660s per bot-strategy#50). Keep a generous
+    # ceiling so a slow SSM poll or backend stall doesn't truncate the
+    # wait. See SSM_DEPLOY_TIMEOUT_SECS below.
     timeout-minutes: 240
     needs: [resolve-ref, build-test]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
@@ -325,14 +327,14 @@ jobs:
             --output text)
 
           # `aws ssm wait command-executed` only polls for ~100s, but the
-          # restart loop above runs `systemctl restart` serially across the
-          # three pairtrade bots, and each restart blocks until graceful
-          # shutdown completes (shutdown_grace_secs ~= 3660s per bot in the
-          # worst case, see pairtrade#4 / pairtrade#12). The built-in waiter
-          # therefore always times out and reports a misleading job failure
-          # even when the deploy is progressing fine on the host. Replace it
+          # restart loop above runs `systemctl restart debot-pair-btceth`
+          # which blocks until graceful shutdown completes
+          # (shutdown_grace_secs = 7260s, ~2h01m, see bot-strategy#50 and
+          # pairtrade#4 / pairtrade#12). The built-in waiter therefore
+          # always times out and reports a misleading job failure even
+          # when the deploy is progressing fine on the host. Replace it
           # with an explicit polling loop bounded by SSM_DEPLOY_TIMEOUT_SECS.
-          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-12000}  # ~3.3h: 3 bots * worst-case grace + slack
+          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-12000}  # ~3.3h: 1 bot * worst-case grace 7260s + slack for SSM/agent latency
           POLL_INTERVAL_SECS=30
           deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))
           while :; do
