@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::config::PairTradeConfig;
 use super::pnl_log::sanitize_pnl_tag;
+use crate::error_counter::{self, ErrorSummary};
 
 use std::env;
 
@@ -86,6 +87,8 @@ pub(super) struct StatusSnapshot {
     pub(super) maintenance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) shutdown: Option<ShutdownStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) error_summary: Option<ErrorSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -422,6 +425,7 @@ impl StatusReporter {
             trade_stats: self.trade_stats.clone(),
             maintenance: self.maintenance.clone(),
             shutdown: self.shutdown.clone(),
+            error_summary: error_counter::global().map(|h| h.snapshot()),
         };
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;

@@ -1,4 +1,5 @@
 use chrono::{DateTime, FixedOffset, Utc};
+use debot::error_counter::{self, ErrorCountingLogger};
 use debot::pairtrade::{PairTradeConfig, PairTradeEngine};
 use debot::ports::replay_dex::ReplayConnector;
 use env_logger::Builder;
@@ -15,7 +16,11 @@ fn init_logger() {
         .parse::<i32>()
         .expect("Invalid TIMEZONE_OFFSET");
     let offset = FixedOffset::east_opt(offset_seconds).expect("Invalid offset");
-    Builder::from_default_env()
+    let filter = LevelFilter::from_str(&env::var("RUST_LOG").unwrap_or_else(|_| {
+        "info,tokio_tungstenite=info,tungstenite=info".to_string()
+    }))
+    .unwrap_or(LevelFilter::Info);
+    let inner = Builder::from_default_env()
         .format(move |buf, record| {
             let utc_now: DateTime<Utc> = Utc::now();
             let local_now = utc_now.with_timezone(&offset);
@@ -27,17 +32,14 @@ fn init_logger() {
                 record.args()
             )
         })
-        .filter(
-            None,
-            LevelFilter::from_str(&env::var("RUST_LOG").unwrap_or_else(|_| {
-                // Default to info: debug-level logs (PRICE_SNAPSHOT, ZCHECK, etc.)
-                // are 50x noisier than info and only useful for ad-hoc debugging.
-                // Override per-service via RUST_LOG env when needed.
-                "info,tokio_tungstenite=info,tungstenite=info".to_string()
-            }))
-            .unwrap_or(LevelFilter::Info),
-        )
-        .init();
+        .filter(None, filter)
+        .build();
+    let max_level = inner.filter();
+    let (logger, handle) = ErrorCountingLogger::wrap(Box::new(inner));
+    error_counter::install_global(handle);
+    if log::set_boxed_logger(Box::new(logger)).is_ok() {
+        log::set_max_level(max_level);
+    }
 }
 
 async fn run_single() -> std::io::Result<()> {
