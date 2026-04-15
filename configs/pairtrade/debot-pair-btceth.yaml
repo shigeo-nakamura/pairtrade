@@ -65,6 +65,16 @@ entry_velocity_block_sigma_per_min: 0.0
 funding_entry_z_scale: 0.0
 beta_gap_entry_z_scale: 3.0
 
+# Std collapse guard (bot-strategy#62). On 2026-04-15 the full-window std
+# collapsed 1.018 → 0.0016 within 2 bars; the resulting z ≈ -15 wiped all 3
+# bots. Observe-only during the #41 A/B/C test window (ends 2026-04-26) so the
+# comparison is not disturbed — guard logs `[STD_COLLAPSE_OBSERVE]` whenever it
+# *would* block (std < 20% of the rolling median of the last 60 bar stds) but
+# lets the entry through. Flip observe_only to false after 4/26 review.
+std_collapse_window_bars: 60
+std_collapse_min_ratio: 0.2
+std_collapse_observe_only: true
+
 # Circuit breaker
 circuit_breaker_tier1_losses: 5
 circuit_breaker_tier1_cooldown_secs: 600

@@ -61,6 +61,19 @@ pub(super) const DEFAULT_KALMAN_R: f64 = 1e-3;
 pub(super) const DEFAULT_KALMAN_INITIAL_P: f64 = 1.0;
 pub(super) const DEFAULT_KALMAN_MIN_UPDATES: u64 = 60;
 
+// Std collapse guard (disabled by default: window=0 or ratio=0.0 → filter inactive).
+// See bot-strategy#62: on 2026-04-15 the BTC/ETH spread std collapsed from
+// 1.018 → 0.0016 within minutes, producing meaningless z-scores that all three
+// bots interpreted as deep mean-reversion signals and lost on. Guard blocks
+// entry when the current full-window std is a small fraction of the rolling
+// median of recent stds, i.e. the z denominator is no longer trustworthy.
+pub(super) const DEFAULT_STD_COLLAPSE_WINDOW_BARS: usize = 0;
+pub(super) const DEFAULT_STD_COLLAPSE_MIN_RATIO: f64 = 0.0;
+/// Observe-only mode: when true, the guard only logs that it *would* block
+/// the entry, but lets the trade through. Lets operators measure trigger
+/// frequency against live data before enabling the block. See bot-strategy#62.
+pub(super) const DEFAULT_STD_COLLAPSE_OBSERVE_ONLY: bool = false;
+
 // Regime filter (disabled by default: thresholds 0.0 → filter inactive)
 pub(super) const DEFAULT_REGIME_VOL_WINDOW: usize = 60;
 pub(super) const DEFAULT_REGIME_VOL_MAX: f64 = 0.0;

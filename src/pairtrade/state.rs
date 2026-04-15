@@ -119,6 +119,12 @@ pub(super) struct PairState {
     pub(super) pending_exit: Option<PendingOrders>,
     pub(super) position_guard: bool,
     pub(super) kalman: Option<KalmanBeta>,
+    /// Rolling history of the most recent full-window spread std values, one
+    /// sample per bar with a valid z-score. Used by the std-collapse guard
+    /// (bot-strategy#62) to detect when the z-score denominator has fallen
+    /// far below its recent median — a sign that the z-score is no longer a
+    /// trustworthy mean-reversion signal.
+    pub(super) std_history: VecDeque<f64>,
 }
 
 impl PairState {
@@ -145,6 +151,7 @@ impl PairState {
             pending_exit: None,
             position_guard: false,
             kalman: None,
+            std_history: VecDeque::new(),
         }
     }
 
@@ -154,6 +161,21 @@ impl PairState {
         }
         self.spread_history.push_back(spread);
         self.last_spread = Some(spread);
+
+        // Record the current full-window std for the std-collapse guard
+        // (bot-strategy#62). Skip degenerate or insufficient samples so the
+        // rolling median only tracks meaningful std values.
+        let std_window = config.default_pair_params.std_collapse_window_bars;
+        if std_window > 0 {
+            if let Some((_z, std)) = self.z_score() {
+                if std > 1e-9 {
+                    if self.std_history.len() >= std_window {
+                        self.std_history.pop_front();
+                    }
+                    self.std_history.push_back(std);
+                }
+            }
+        }
 
         // velocity uses bar-to-bar move (1-minute bars) normalized by std dev
         let k = 1_usize;

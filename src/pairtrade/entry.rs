@@ -1,10 +1,52 @@
 //! Entry-decision helpers extracted from the monolithic pairtrade module.
 //! Pure functions over config, params, and per-pair state.
 
+use std::collections::VecDeque;
+
 use super::config::{PairParams, PairTradeConfig};
 use super::state::PairState;
 use super::stats::spread_slope_sigma;
 use super::util::tail_std;
+
+fn median_of(values: &VecDeque<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut buf: Vec<f64> = values.iter().copied().collect();
+    buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = buf.len() / 2;
+    if buf.len() % 2 == 0 {
+        Some((buf[mid - 1] + buf[mid]) / 2.0)
+    } else {
+        Some(buf[mid])
+    }
+}
+
+/// Returns `true` when the std-collapse guard should block a new entry.
+/// The z-score denominator has fallen far below its own recent median, so
+/// the current |z| is no longer a meaningful mean-reversion signal
+/// (bot-strategy#62).
+pub(super) fn std_collapsed(
+    std: f64,
+    std_history: &VecDeque<f64>,
+    window_bars: usize,
+    min_ratio: f64,
+) -> bool {
+    if window_bars == 0 || min_ratio <= 0.0 {
+        return false;
+    }
+    let min_samples = (window_bars / 2).max(2);
+    if std_history.len() < min_samples {
+        return false;
+    }
+    let Some(median) = median_of(std_history) else {
+        return false;
+    };
+    if median <= 1e-9 {
+        return false;
+    }
+    std / median < min_ratio
+}
 
 /// Lower bound for any dynamic entry-z scaling factor (vol or funding).
 /// Prevents the threshold from collapsing on noisy single-bar inputs.
@@ -53,6 +95,42 @@ pub(super) fn should_enter(
         && state.last_velocity_sigma_per_min.abs() >= pp.entry_velocity_block_sigma_per_min
     {
         return false;
+    }
+
+    // --- Std collapse guard (bot-strategy#62) ---
+    // z = (latest - mean) / std; when std collapses relative to its own recent
+    // history the z-score stops being a meaningful mean-reversion signal.
+    // In observe_only mode the guard logs but lets the entry through — lets
+    // operators measure trigger frequency on live data without disturbing
+    // the #41 A/B/C test window.
+    if std_collapsed(
+        std,
+        &state.std_history,
+        pp.std_collapse_window_bars,
+        pp.std_collapse_min_ratio,
+    ) {
+        let median = median_of(&state.std_history).unwrap_or(0.0);
+        let ratio = if median > 1e-9 { std / median } else { 0.0 };
+        if pp.std_collapse_observe_only {
+            log::warn!(
+                "[STD_COLLAPSE_OBSERVE] z={:.2} std={:.6} median={:.6} ratio={:.4} threshold={:.4} (observe-only, entry allowed)",
+                z,
+                std,
+                median,
+                ratio,
+                pp.std_collapse_min_ratio,
+            );
+        } else {
+            log::warn!(
+                "[STD_COLLAPSE_BLOCK] z={:.2} std={:.6} median={:.6} ratio={:.4} threshold={:.4}",
+                z,
+                std,
+                median,
+                ratio,
+                pp.std_collapse_min_ratio,
+            );
+            return false;
+        }
     }
 
     let mut entry_threshold = if net_funding > 0.0 {
@@ -123,4 +201,71 @@ pub(super) fn should_enter(
     }
 
     z.abs() >= entry_threshold + cost_in_sigma && net_funding >= cfg.net_funding_min_per_hour
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_history(values: &[f64]) -> VecDeque<f64> {
+        values.iter().copied().collect()
+    }
+
+    #[test]
+    fn std_collapsed_disabled_when_window_zero() {
+        let h = make_history(&[1.0, 1.0, 1.0, 1.0]);
+        assert!(!std_collapsed(0.001, &h, 0, 0.2));
+    }
+
+    #[test]
+    fn std_collapsed_disabled_when_ratio_zero() {
+        let h = make_history(&[1.0, 1.0, 1.0, 1.0]);
+        assert!(!std_collapsed(0.001, &h, 30, 0.0));
+    }
+
+    #[test]
+    fn std_collapsed_permissive_before_warmup() {
+        // window=30 → min_samples=15; three samples is well under that
+        let h = make_history(&[1.0, 1.0, 1.0]);
+        assert!(!std_collapsed(0.001, &h, 30, 0.2));
+    }
+
+    #[test]
+    fn std_collapsed_blocks_when_current_far_below_median() {
+        // Replicates bot-strategy#62: median ≈ 1.0, current = 0.0016 → ratio 0.0016
+        let samples: Vec<f64> = vec![1.0; 30];
+        let h = make_history(&samples);
+        assert!(std_collapsed(0.0016, &h, 30, 0.2));
+    }
+
+    #[test]
+    fn std_collapsed_allows_when_current_near_median() {
+        let samples: Vec<f64> = vec![1.0; 30];
+        let h = make_history(&samples);
+        assert!(!std_collapsed(0.9, &h, 30, 0.2));
+    }
+
+    #[test]
+    fn std_collapsed_boundary_inclusive_allows_equal_ratio() {
+        // std / median == min_ratio → not blocked (strict less-than)
+        let samples: Vec<f64> = vec![1.0; 30];
+        let h = make_history(&samples);
+        assert!(!std_collapsed(0.2, &h, 30, 0.2));
+    }
+
+    #[test]
+    fn std_collapsed_handles_zero_median() {
+        let samples: Vec<f64> = vec![0.0; 30];
+        let h = make_history(&samples);
+        assert!(!std_collapsed(0.001, &h, 30, 0.2));
+    }
+
+    #[test]
+    fn median_of_odd_and_even() {
+        let odd = make_history(&[3.0, 1.0, 2.0]);
+        assert_eq!(median_of(&odd), Some(2.0));
+        let even = make_history(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(median_of(&even), Some(2.5));
+        assert_eq!(median_of(&VecDeque::<f64>::new()), None);
+    }
 }

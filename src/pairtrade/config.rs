@@ -48,6 +48,10 @@ pub struct PairParams {
     // Multi-timeframe z-score confluence (empty = disabled)
     pub mtf_windows: Vec<usize>,
     pub mtf_z_min: f64,
+    // Std collapse guard (both 0 = disabled). See bot-strategy#62.
+    pub std_collapse_window_bars: usize,
+    pub std_collapse_min_ratio: f64,
+    pub std_collapse_observe_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +279,9 @@ pub(super) struct PairTradeYaml {
     pub(super) beta_gap_entry_z_scale: Option<f64>,
     pub(super) mtf_windows: Option<Vec<usize>>,
     pub(super) mtf_z_min: Option<f64>,
+    pub(super) std_collapse_window_bars: Option<usize>,
+    pub(super) std_collapse_min_ratio: Option<f64>,
+    pub(super) std_collapse_observe_only: Option<bool>,
     pub(super) pair_overrides: Option<HashMap<String, PairOverrideYaml>>,
     /// Graceful shutdown: max seconds to wait for natural exit on SIGTERM before
     /// force-closing both legs. 0 = immediate force close (legacy behavior).
@@ -1012,6 +1019,19 @@ impl PairTradeConfig {
                 .collect();
         }
         env_override("MTF_Z_MIN", &mut self.default_pair_params.mtf_z_min);
+        env_override(
+            "STD_COLLAPSE_WINDOW_BARS",
+            &mut self.default_pair_params.std_collapse_window_bars,
+        );
+        env_override(
+            "STD_COLLAPSE_MIN_RATIO",
+            &mut self.default_pair_params.std_collapse_min_ratio,
+        );
+        if let Ok(value) = env::var("STD_COLLAPSE_OBSERVE_ONLY") {
+            let lower = value.trim().to_ascii_lowercase();
+            self.default_pair_params.std_collapse_observe_only =
+                matches!(lower.as_str(), "1" | "true" | "yes");
+        }
 
         // Kalman filter
         if let Ok(value) = env::var("USE_KALMAN_BETA") {
@@ -1195,6 +1215,18 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
             .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
             .unwrap_or_default(),
         mtf_z_min: env_parse("MTF_Z_MIN", DEFAULT_MTF_Z_MIN),
+        std_collapse_window_bars: env_parse(
+            "STD_COLLAPSE_WINDOW_BARS",
+            DEFAULT_STD_COLLAPSE_WINDOW_BARS,
+        ),
+        std_collapse_min_ratio: env_parse(
+            "STD_COLLAPSE_MIN_RATIO",
+            DEFAULT_STD_COLLAPSE_MIN_RATIO,
+        ),
+        std_collapse_observe_only: env::var("STD_COLLAPSE_OBSERVE_ONLY")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(DEFAULT_STD_COLLAPSE_OBSERVE_ONLY),
     }
 }
 
@@ -1337,6 +1369,15 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
         mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),
         mtf_z_min: yaml.mtf_z_min.unwrap_or(DEFAULT_MTF_Z_MIN),
+        std_collapse_window_bars: yaml
+            .std_collapse_window_bars
+            .unwrap_or(DEFAULT_STD_COLLAPSE_WINDOW_BARS),
+        std_collapse_min_ratio: yaml
+            .std_collapse_min_ratio
+            .unwrap_or(DEFAULT_STD_COLLAPSE_MIN_RATIO),
+        std_collapse_observe_only: yaml
+            .std_collapse_observe_only
+            .unwrap_or(DEFAULT_STD_COLLAPSE_OBSERVE_ONLY),
     }
 }
 
@@ -1414,6 +1455,9 @@ fn apply_pair_overrides(
             beta_gap_entry_z_scale: default.beta_gap_entry_z_scale,
             mtf_windows: default.mtf_windows.clone(),
             mtf_z_min: default.mtf_z_min,
+            std_collapse_window_bars: default.std_collapse_window_bars,
+            std_collapse_min_ratio: default.std_collapse_min_ratio,
+            std_collapse_observe_only: default.std_collapse_observe_only,
         };
         map.insert(pair_key.clone(), pp);
     }
