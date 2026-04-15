@@ -796,7 +796,7 @@ impl PairTradeEngine {
                 .await
             {
                 Ok(resp) => {
-                    log::warn!(
+                    log::info!(
                         "[ORDER] Reissued {} leg {} size={}",
                         stage,
                         leg.symbol,
@@ -2606,14 +2606,14 @@ impl PairTradeEngine {
                 let max_retries = self.cfg.entry_partial_fill_max_retries;
                 let use_market = max_retries > 0 && next_retry > max_retries;
                 if use_market {
-                    log::warn!(
+                    log::info!(
                         "[ORDER] {} entry leg partially filled, retries exceeded ({} > {}); reissuing remaining legs as MARKET",
                         key,
                         next_retry,
                         max_retries
                     );
                 } else if max_retries > 0 {
-                    log::warn!(
+                    log::info!(
                         "[ORDER] {} entry leg partially filled, reissuing remaining legs (retry {}/{})",
                         key,
                         next_retry,
