@@ -2879,7 +2879,7 @@ impl PairTradeEngine {
                     }
                     return Ok(());
                 }
-                log::warn!(
+                log::info!(
                     "[ORDER] {} exit leg partially filled, reissuing remaining legs",
                     key
                 );
