@@ -6,11 +6,15 @@
 # converts to bin, runs BT, and analyzes PnL excluding the
 # warm-up period (first 4 hours).
 #
-# Set BT_WARM_START_SNAPSHOT to a history JSON file to seed the
-# BT with live bot's spread_history and beta (eliminates warm-up
-# divergence). Example:
+# Recommended (minimum) invocation — ships log_prices + v2 spread_history
+# from the live file, so no separate extraction is needed after the
+# bot-strategy#62 warm_start fix is deployed:
 #   BT_WARM_START_SNAPSHOT=/opt/debot/pairtrade_history_BTC_ETH.json \
 #   scripts/bt_live_data.sh /opt/debot
+#
+# For BYTE-EXACT live reproduction (state.beta trajectory identical),
+# also run `scripts/extract_bt_replay_events.sh` first and pass the
+# produced files via BT_EVAL_TIMESTAMPS_FILE / BT_RESTART_TIMESTAMPS_FILE.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
