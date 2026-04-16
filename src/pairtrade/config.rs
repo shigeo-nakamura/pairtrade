@@ -396,6 +396,32 @@ pub struct PairTradeConfig {
     /// the replay loads price history from this file before the first
     /// tick, giving the BT an identical starting state to a live bot.
     pub bt_warm_start_snapshot: Option<String>,
+    /// Path to a file listing live eval firing timestamps (one UNIX
+    /// second per line). In BT mode, when set, the pair re-evaluation
+    /// gate is overridden to fire ONLY at these exact timestamps —
+    /// replaying the exact wall-clock phase at which the live bot ran
+    /// `evaluate_pair` so that `state.beta` (and therefore every
+    /// subsequent spread = log_a − β·log_b written to
+    /// `spread_history`) follows the live trajectory. Without this
+    /// override, BT and live eval gates desync within a few hours due
+    /// to 1s-level phase drift and the `last_eval_ts`-based interval
+    /// gate, which compounds into a spread_history divergence large
+    /// enough to suppress sub-minute std collapses in replay.
+    /// See bot-strategy#27 comment 2026-04-16.
+    pub bt_eval_timestamps: Option<std::collections::HashSet<i64>>,
+    /// Path to a file listing UNIX seconds at which the live bot was
+    /// restarted (from `systemd` / `journalctl -u ... | grep Started`).
+    /// In BT mode, when `now_ts` equals one of these, the engine fires
+    /// `warm_start_states_from_history` once — re-computing `state.beta`
+    /// via a fresh OLS over the current 240-bar `history` and re-seeding
+    /// `spread_history` with 240 single-beta spreads. That is exactly
+    /// what the live bot does at every service restart, and the
+    /// low-variance seeded spread_history is the mechanism behind the
+    /// 2026-04-15 06:02 UTC "std collapse" incident (bot-strategy#62 is
+    /// now known to be a restart artifact, not a market regime break).
+    /// Firing is one-shot per timestamp: each matched ts is removed
+    /// from the set after firing.
+    pub bt_restart_timestamps: Option<std::collections::HashSet<i64>>,
     pub circuit_breaker_consecutive_losses: u32,
     pub circuit_breaker_cooldown_secs: u64,
     /// All per-pair tunables — z-score thresholds, hedge gates, lookback
@@ -599,6 +625,8 @@ impl PairTradeConfig {
             backtest_mode: yaml.backtest_mode.unwrap_or(false),
             backtest_file: yaml.backtest_file,
             bt_warm_start_snapshot: None, // env-only, not in YAML
+            bt_eval_timestamps: None,     // env-only, not in YAML
+            bt_restart_timestamps: None,  // env-only, not in YAML
             circuit_breaker_consecutive_losses: yaml
                 .circuit_breaker_consecutive_losses
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES),
@@ -796,6 +824,8 @@ impl PairTradeConfig {
             backtest_mode,
             backtest_file,
             bt_warm_start_snapshot: env::var("BT_WARM_START_SNAPSHOT").ok().filter(|v| !v.trim().is_empty()),
+            bt_eval_timestamps: load_bt_eval_timestamps(),
+            bt_restart_timestamps: load_bt_restart_timestamps(),
             circuit_breaker_consecutive_losses: env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -999,6 +1029,14 @@ impl PairTradeConfig {
                 self.bt_warm_start_snapshot = Some(value);
             }
         }
+        // BT eval-timestamp replay — see struct field doc.
+        if env::var("BT_EVAL_TIMESTAMPS_FILE").is_ok() {
+            self.bt_eval_timestamps = load_bt_eval_timestamps();
+        }
+        // BT restart-timestamp replay — see struct field doc.
+        if env::var("BT_RESTART_TIMESTAMPS_FILE").is_ok() {
+            self.bt_restart_timestamps = load_bt_restart_timestamps();
+        }
 
         env_override("SPREAD_TREND_MAX_SLOPE_SIGMA", &mut self.default_pair_params.spread_trend_max_slope_sigma);
         env_override("BETA_DIVERGENCE_MAX", &mut self.default_pair_params.beta_divergence_max);
@@ -1149,6 +1187,44 @@ fn env_override<T: std::str::FromStr>(key: &str, target: &mut T) {
             *target = parsed;
         }
     }
+}
+
+/// Load the BT eval-timestamps file (one UNIX second per line) referenced by
+/// the `BT_EVAL_TIMESTAMPS_FILE` env var. Ignored silently when the env var
+/// is unset, the path is unreadable, or no numeric lines are found — live
+/// mode and vanilla BT (without the override) must stay unchanged.
+fn load_bt_eval_timestamps() -> Option<std::collections::HashSet<i64>> {
+    load_ts_set("BT_EVAL_TIMESTAMPS_FILE", "[BT_EVAL_TIMESTAMPS]")
+}
+
+/// Load BT restart timestamps (one UNIX second per line). See
+/// `PairTradeConfig::bt_restart_timestamps` for semantics.
+fn load_bt_restart_timestamps() -> Option<std::collections::HashSet<i64>> {
+    load_ts_set("BT_RESTART_TIMESTAMPS_FILE", "[BT_RESTART_TIMESTAMPS]")
+}
+
+fn load_ts_set(env_key: &str, tag: &str) -> Option<std::collections::HashSet<i64>> {
+    use std::collections::HashSet;
+    let path = env::var(env_key).ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| log::warn!("{} failed to read {}: {}", tag, path, e))
+        .ok()?;
+    let mut set: HashSet<i64> = HashSet::new();
+    for line in contents.lines() {
+        if let Ok(ts) = line.trim().parse::<i64>() {
+            set.insert(ts);
+        }
+    }
+    if set.is_empty() {
+        log::warn!("{} {} contained no parseable timestamps", tag, path);
+        return None;
+    }
+    log::info!("{} loaded {} timestamps from {}", tag, set.len(), path);
+    Some(set)
 }
 
 /// Resolve global per-pair defaults from environment variables, falling back

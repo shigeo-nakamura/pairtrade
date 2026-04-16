@@ -1127,6 +1127,38 @@ impl PairTradeEngine {
         let max_history_len = self.max_history_len();
         let now_ts = self.current_now_ts();
         self.load_history_from_disk();
+
+        // BT restart simulation (bot-strategy#27 comment 2026-04-16): when
+        // the replay crosses a timestamp listed in
+        // `BT_RESTART_TIMESTAMPS_FILE`, re-run `warm_start_states_from_history`
+        // to mirror what the live bot does at each systemd restart —
+        // re-compute `state.beta` from OLS and re-seed `spread_history`
+        // with 240 single-beta spreads. That seeded low-variance history
+        // is the mechanism behind the 2026-04-15 06:02 UTC "std collapse"
+        // (bot-strategy#62 — now known to be a restart artifact, not a
+        // regime break). We fire on crossing, not exact match, because
+        // the live dump has a gap (WS down) around the restart second, so
+        // the exact `restart_ts` often has no replay record. Each matched
+        // ts is removed from the set, so each restart fires at most once.
+        let restart_passed = self
+            .cfg
+            .bt_restart_timestamps
+            .as_mut()
+            .map(|set| {
+                let passed: Vec<i64> = set.iter().filter(|&&t| t <= now_ts).copied().collect();
+                for t in &passed {
+                    set.remove(t);
+                }
+                !passed.is_empty()
+            })
+            .unwrap_or(false);
+        if restart_passed {
+            log::warn!(
+                "[BT_RESTART] simulating live service restart (now_ts={})",
+                now_ts
+            );
+            self.warm_start_states_from_history();
+        }
         let mut updated = HashSet::new();
         for (symbol, snapshot) in price_map.iter() {
             if let Some(builder) = self.bar_builders.get_mut(symbol) {
@@ -1418,7 +1450,23 @@ impl PairTradeEngine {
             // long-term, move evaluate_pair + spread_history + beta to the
             // shared phase (step_shared) so all instances consume the same
             // evaluation result per tick.
-            let eval = if needs_eval_interval || needs_eval_jump || needs_eval_velocity || vol_spike
+            // BT replay override: when `BT_EVAL_TIMESTAMPS_FILE` is loaded
+            // (bot-strategy#27 comment 2026-04-16), fire eval ONLY at the
+            // exact wall-clock seconds where the live bot ran evaluate_pair.
+            // This reproduces live's state.beta trajectory, which in turn
+            // makes every past spread_history entry match live even when
+            // the interval / z-jump / velocity gates would desync on the
+            // compounded drift.
+            let bt_eval_force = self
+                .cfg
+                .bt_eval_timestamps
+                .as_ref()
+                .map(|set| set.contains(&now_ts));
+            let should_eval = match bt_eval_force {
+                Some(force) => force,
+                None => needs_eval_interval || needs_eval_jump || needs_eval_velocity || vol_spike,
+            };
+            let eval = if should_eval
             {
                 let res = self.evaluate_pair(pair);
                 if let Some(ref e) = res {
@@ -4095,6 +4143,8 @@ impl PairTradeEngine {
             backtest_mode: false,
             backtest_file: None,
             bt_warm_start_snapshot: None,
+            bt_eval_timestamps: None,
+            bt_restart_timestamps: None,
             circuit_breaker_consecutive_losses: DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES,
             circuit_breaker_cooldown_secs: DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS,
             shutdown_grace_secs: 0,
