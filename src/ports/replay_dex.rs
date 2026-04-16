@@ -233,6 +233,14 @@ impl ReplayConnector {
         let current_cursor = self.cursor.load(AtomicOrdering::SeqCst);
         self.data.get(current_cursor).map(|e| e.timestamp / 1000) // stored as ms
     }
+
+    #[cfg(test)]
+    fn from_entries(data: Vec<DumpedDataEntry>) -> Self {
+        Self {
+            data,
+            cursor: AtomicUsize::new(0),
+        }
+    }
 }
 
 #[async_trait]
@@ -284,7 +292,14 @@ impl DexConnector for ReplayConnector {
             open_interest: None,
             funding_rate: Some(symbol_data.funding_rate),
             oracle_price: Some(symbol_data.price),
-            exchange_ts: Some(current_cursor as u64),
+            // Use the dump's real wall-clock timestamp (ms → s) so that
+            // downstream BarBuilder aligns ticks to the same wall-clock
+            // buckets as live. Previously this returned the cursor index,
+            // which made BT treat every 60 records as one "1-minute" bar
+            // (~5 min of real time at the ~5s dump cadence), smoothing out
+            // sub-minute std behavior like the 2026-04-15 collapse. See
+            // bot-strategy#27 comment 2026-04-16.
+            exchange_ts: Some((current_snapshot.timestamp / 1000) as u64),
         })
     }
 
@@ -471,5 +486,60 @@ impl DexConnector for ReplayConnector {
 
     async fn sign_evm_65b_with_eip191(&self, message: &str) -> Result<String, DexError> {
         Ok(format!("signed_eip191:{}", message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_entry(timestamp_ms: i64, price: f64) -> DumpedDataEntry {
+        let mut prices = HashMap::new();
+        prices.insert(
+            "BTC".to_string(),
+            DumpedSymbolSnapshot {
+                price: Decimal::from_f64(price).unwrap(),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+            },
+        );
+        DumpedDataEntry {
+            timestamp: timestamp_ms,
+            prices,
+        }
+    }
+
+    /// Regression test for bot-strategy#27 (2026-04-16): replay was returning
+    /// the cursor index as `exchange_ts`, which the downstream `BarBuilder`
+    /// then used as a wall-clock timestamp for bucket alignment. At the ~5s
+    /// dump cadence that stretched every "1-minute" bar to ~5 minutes of
+    /// real time and smoothed away the 2026-04-15 std collapse. `exchange_ts`
+    /// must be the dump's real UNIX seconds for BT bar bucketing to match
+    /// live.
+    #[tokio::test]
+    async fn ticker_exchange_ts_is_real_seconds_not_cursor_index() {
+        // Two records 5s apart, both far from epoch so any "cursor index"
+        // would be trivially distinguishable (cursor=0 vs timestamp≈1.78e9).
+        let r = ReplayConnector::from_entries(vec![
+            mk_entry(1_776_229_320_000, 71_000.0), // 2026-04-15 05:02:00 UTC
+            mk_entry(1_776_229_325_000, 71_010.0), // +5s
+        ]);
+
+        let t0 = r.get_ticker("BTC", None).await.unwrap();
+        assert_eq!(t0.exchange_ts, Some(1_776_229_320));
+        assert_ne!(t0.exchange_ts, Some(0)); // not cursor index
+
+        assert!(r.tick());
+        let t1 = r.get_ticker("BTC", None).await.unwrap();
+        assert_eq!(t1.exchange_ts, Some(1_776_229_325));
+        // 5-second real delta, not 1-step cursor delta
+        assert_eq!(
+            t1.exchange_ts.unwrap() - t0.exchange_ts.unwrap(),
+            5,
+            "exchange_ts must advance by real elapsed seconds"
+        );
     }
 }
