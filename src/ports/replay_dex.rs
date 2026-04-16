@@ -26,6 +26,14 @@ struct DumpedSymbolSnapshot {
     ask_price: Option<Decimal>,
     bid_size: Decimal,
     ask_size: Decimal,
+    /// Exchange-side tick second (live bot fills this from the DEX response).
+    /// Missing in very old dumps; when absent we fall back to the record's
+    /// top-level `timestamp` in `get_ticker`. The live bot uses this field
+    /// (not `now()`) for bar-bucket assignment, so replaying BT without it
+    /// shifts ticks across bucket boundaries and drifts the OLS history.
+    /// See bot-strategy#27 comment 2026-04-16.
+    #[serde(default)]
+    exchange_ts: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +51,13 @@ struct BincodeSymbolSnapshot {
     ask_price: f64,
     bid_size: f64,
     ask_size: f64,
+    /// Per-symbol exchange tick second mirrored from the JSONL dump.
+    /// bincode 1.x is a positional format, so this field has no
+    /// `serde(default)` safety net — old `.bin` files without it will
+    /// fail to parse. `bt_live_data.sh` always rebuilds `.bin` from
+    /// JSONL before running, so this does not affect the live pipeline.
+    /// `0` is the sentinel for "unknown" (we fall back to top-level ts).
+    exchange_ts: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,6 +83,7 @@ impl From<&DumpedDataEntry> for BincodeDataEntry {
                             ask_price: v.ask_price.and_then(|p| p.to_f64()).unwrap_or(0.0),
                             bid_size: v.bid_size.to_f64().unwrap_or(0.0),
                             ask_size: v.ask_size.to_f64().unwrap_or(0.0),
+                            exchange_ts: v.exchange_ts.unwrap_or(0),
                         },
                     )
                 })
@@ -101,6 +117,11 @@ impl From<BincodeDataEntry> for DumpedDataEntry {
                             },
                             bid_size: Decimal::from_f64(v.bid_size).unwrap_or_default(),
                             ask_size: Decimal::from_f64(v.ask_size).unwrap_or_default(),
+                            exchange_ts: if v.exchange_ts == 0 {
+                                None
+                            } else {
+                                Some(v.exchange_ts)
+                            },
                         },
                     )
                 })
@@ -292,14 +313,20 @@ impl DexConnector for ReplayConnector {
             open_interest: None,
             funding_rate: Some(symbol_data.funding_rate),
             oracle_price: Some(symbol_data.price),
-            // Use the dump's real wall-clock timestamp (ms → s) so that
-            // downstream BarBuilder aligns ticks to the same wall-clock
-            // buckets as live. Previously this returned the cursor index,
-            // which made BT treat every 60 records as one "1-minute" bar
-            // (~5 min of real time at the ~5s dump cadence), smoothing out
-            // sub-minute std behavior like the 2026-04-15 collapse. See
+            // Prefer the per-symbol `exchange_ts` (the DEX-side tick second
+            // the live bot uses for bar bucket assignment). The top-level
+            // `timestamp` is the bot's wall-clock write time and typically
+            // runs ~1s ahead of `exchange_ts`, which shifts the final tick
+            // of a bucket into the next bucket and drifts close prices
+            // across the whole history. Fallback is for ancient dumps
+            // missing the field. Originally this returned the cursor
+            // index — a separate layer of the same bug. See
             // bot-strategy#27 comment 2026-04-16.
-            exchange_ts: Some((current_snapshot.timestamp / 1000) as u64),
+            exchange_ts: Some(
+                symbol_data
+                    .exchange_ts
+                    .unwrap_or(current_snapshot.timestamp / 1000) as u64,
+            ),
         })
     }
 
@@ -493,7 +520,7 @@ impl DexConnector for ReplayConnector {
 mod tests {
     use super::*;
 
-    fn mk_entry(timestamp_ms: i64, price: f64) -> DumpedDataEntry {
+    fn mk_entry(timestamp_ms: i64, price: f64, symbol_exchange_ts: Option<i64>) -> DumpedDataEntry {
         let mut prices = HashMap::new();
         prices.insert(
             "BTC".to_string(),
@@ -504,6 +531,7 @@ mod tests {
                 ask_price: None,
                 bid_size: Decimal::ZERO,
                 ask_size: Decimal::ZERO,
+                exchange_ts: symbol_exchange_ts,
             },
         );
         DumpedDataEntry {
@@ -524,8 +552,8 @@ mod tests {
         // Two records 5s apart, both far from epoch so any "cursor index"
         // would be trivially distinguishable (cursor=0 vs timestamp≈1.78e9).
         let r = ReplayConnector::from_entries(vec![
-            mk_entry(1_776_229_320_000, 71_000.0), // 2026-04-15 05:02:00 UTC
-            mk_entry(1_776_229_325_000, 71_010.0), // +5s
+            mk_entry(1_776_229_320_000, 71_000.0, None), // 2026-04-15 05:02:00 UTC
+            mk_entry(1_776_229_325_000, 71_010.0, None),
         ]);
 
         let t0 = r.get_ticker("BTC", None).await.unwrap();
@@ -540,6 +568,32 @@ mod tests {
             t1.exchange_ts.unwrap() - t0.exchange_ts.unwrap(),
             5,
             "exchange_ts must advance by real elapsed seconds"
+        );
+    }
+
+    /// Regression test for bot-strategy#27 (2026-04-16, follow-up): when the
+    /// dump record carries a per-symbol `exchange_ts` (the DEX-side tick
+    /// second the live bot itself uses for bucket assignment), the replay
+    /// must surface that value — not the record's top-level `timestamp`,
+    /// which is the bot's wall-clock write time and typically runs ~1s
+    /// ahead. At bucket boundaries that 1s offset flips the final tick into
+    /// the next bucket and drifts `close_a` / the OLS history.
+    #[tokio::test]
+    async fn ticker_prefers_per_symbol_exchange_ts_over_top_level_timestamp() {
+        // Exactly the boundary case observed in 4/15 06:02 UTC live dump:
+        // top-level write ts = xxx920119ms (would assign to next bucket);
+        // per-symbol exchange_ts = xxx919 (correctly the last tick of the
+        // closing bucket).
+        let r = ReplayConnector::from_entries(vec![mk_entry(
+            1_776_232_920_119,
+            73_998.15,
+            Some(1_776_232_919),
+        )]);
+        let t = r.get_ticker("BTC", None).await.unwrap();
+        assert_eq!(
+            t.exchange_ts,
+            Some(1_776_232_919),
+            "must use per-symbol exchange_ts, not top-level timestamp/1000",
         );
     }
 }

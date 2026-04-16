@@ -65,7 +65,12 @@ fi
 
 echo ""
 echo "=== Converting to bin ==="
-cargo run --release --bin convert-data -- "$WORK_DIR/combined.jsonl" "$WORK_DIR/live.bin" 5 2>&1
+# interval=0 preserves every dump tick. The ~5s cadence is already the
+# live bot's fetch rate, so downsampling at interval=5s routinely drops
+# the trailing sub-5s tick of a bucket (observed at dump cadence 3.5-6.5s)
+# and flips the bar close to the previous tick, drifting close_a vs live.
+# See bot-strategy#27 comment 2026-04-16.
+cargo run --release --bin convert-data -- "$WORK_DIR/combined.jsonl" "$WORK_DIR/live.bin" 0 2>&1
 
 echo ""
 echo "=== Running backtest ==="
