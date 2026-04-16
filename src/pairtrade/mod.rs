@@ -463,11 +463,21 @@ impl PairTradeEngine {
         if self.cfg.backtest_mode {
             if let Some(ref path) = self.cfg.bt_warm_start_snapshot {
                 let max_len = self.max_history_len();
+                let mut loaded_spreads: HashMap<String, VecDeque<f64>> = HashMap::new();
                 history_io::load_history_snapshot_for_bt(
                     &mut self.history,
+                    &mut loaded_spreads,
                     std::path::Path::new(path),
                     max_len,
                 );
+                for inst in &mut self.instances {
+                    for (pair_key, spreads) in &loaded_spreads {
+                        if let Some(state) = inst.states.get_mut(pair_key) {
+                            state.last_spread = spreads.back().copied();
+                            state.spread_history = spreads.clone();
+                        }
+                    }
+                }
             }
         }
         self.warm_start_states_from_history();
@@ -2507,19 +2517,65 @@ impl PairTradeEngine {
     }
 
     fn persist_history_to_disk(&self) {
-        history_io::persist_history_to_disk(&self.cfg, &self.history, &self.history_path);
+        // Persist the engine's shared log-price history plus the first
+        // instance's per-pair `spread_history`. We pick instance 0 as
+        // the representative: A/B/C instances drift ≤0.3% per the
+        // existing TODO near evaluate_pair, which on reload converges
+        // back to whatever was persisted. Persisting per-instance would
+        // require an instance ID in the schema — over-engineered for
+        // the single-bot-per-process setup this field currently supports.
+        let spread_histories: HashMap<String, VecDeque<f64>> = self
+            .instances
+            .first()
+            .map(|inst| {
+                inst.states
+                    .iter()
+                    .map(|(k, s)| (k.clone(), s.spread_history.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        history_io::persist_history_to_disk(
+            &self.cfg,
+            &self.history,
+            &spread_histories,
+            &self.history_path,
+        );
     }
 
     fn load_history_from_disk(&mut self) {
         let now = self.current_now_ts();
         let max_len = self.max_history_len();
+        let mut loaded_spreads: HashMap<String, VecDeque<f64>> = HashMap::new();
         history_io::load_history_from_disk(
             &self.cfg,
             &mut self.history,
+            &mut loaded_spreads,
             &self.history_path,
             now,
             max_len,
         );
+        if loaded_spreads.is_empty() {
+            return;
+        }
+        // Apply the persisted spread_history only when the instance's own
+        // spread_history is still empty — i.e. on the initial post-restart
+        // load, before any ticks have pushed a live spread. Subsequent
+        // per-tick loads must NOT clobber the instance's accumulating
+        // series, otherwise every step would silently revert the
+        // previous step's push (in single-bot mode) or import another
+        // bot's beta trajectory (in multi-bot mode, which is not the
+        // intended sharing axis — peer bots coordinate on log_prices,
+        // not on state.beta-dependent derived series).
+        for inst in &mut self.instances {
+            for (pair_key, spreads) in &loaded_spreads {
+                if let Some(state) = inst.states.get_mut(pair_key) {
+                    if state.spread_history.is_empty() {
+                        state.last_spread = spreads.back().copied();
+                        state.spread_history = spreads.clone();
+                    }
+                }
+            }
+        }
     }
 
     /// Rebuild each pair's beta and spread_history from the shared on-disk
@@ -2545,21 +2601,38 @@ impl PairTradeEngine {
                 let tail_a = tail_samples(hist_a, take);
                 let tail_b = tail_samples(hist_b, take);
                 let beta = regression_beta(&tail_b, &tail_a);
-                let spreads: VecDeque<f64> = tail_a
-                    .iter()
-                    .zip(tail_b.iter())
-                    .map(|(sa, sb)| sa.log_price - beta * sb.log_price)
-                    .collect();
                 let Some(state) = self.instances[inst_idx].states.get_mut(&key) else { continue };
                 state.beta = beta;
                 state.beta_short = beta;
                 state.beta_long = beta;
-                state.last_spread = spreads.back().copied();
-                state.spread_history = spreads;
-                log::info!(
-                    "[WARM_START] {} seeded spread_history len={} beta={:.4}",
-                    key, state.spread_history.len(), state.beta
-                );
+                // If `load_history_from_disk` / `load_history_snapshot_for_bt`
+                // has already restored the real persisted `spread_history`
+                // (v2 snapshot), keep it as-is. Synthesizing a
+                // single-OLS-beta series here would overwrite a 240-bar
+                // real series with one whose variance is artificially
+                // compressed — the mechanism behind the 2026-04-15 06:02
+                // UTC "std collapse" restart incident (bot-strategy#62).
+                // Only synthesize when the instance has no live spreads
+                // (fresh start with no persisted snapshot, or a v1
+                // snapshot from a pre-fix bot).
+                if state.spread_history.is_empty() {
+                    let spreads: VecDeque<f64> = tail_a
+                        .iter()
+                        .zip(tail_b.iter())
+                        .map(|(sa, sb)| sa.log_price - beta * sb.log_price)
+                        .collect();
+                    state.last_spread = spreads.back().copied();
+                    state.spread_history = spreads;
+                    log::info!(
+                        "[WARM_START] {} synthesized spread_history len={} beta={:.4} (no persisted v2 series)",
+                        key, state.spread_history.len(), state.beta
+                    );
+                } else {
+                    log::info!(
+                        "[WARM_START] {} kept persisted spread_history len={} beta={:.4} (no synthesis)",
+                        key, state.spread_history.len(), state.beta
+                    );
+                }
             }
         }
     }

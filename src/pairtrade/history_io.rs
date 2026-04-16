@@ -4,12 +4,39 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 
+use serde::{Deserialize, Serialize};
+
 use super::config::PairTradeConfig;
 use super::stats::PriceSample;
+
+/// On-disk snapshot schema used by the live bot. Version 2 adds
+/// `spread_histories` — the per-pair `state.spread_history` that the
+/// engine accumulates at runtime — so that at restart we can restore
+/// the real spread series instead of rebuilding a synthetic one via
+/// `warm_start_states_from_history` (which applies a single OLS beta
+/// to the full log_price window and produces an artificially
+/// low-variance spread_history, the mechanism behind the 2026-04-15
+/// 06:02 UTC "std collapse" incident — bot-strategy#62).
+///
+/// Version 1 (no `_v` field) was a bare `HashMap<String,
+/// Vec<(f64, i64)>>`. The loader parses v2 first and falls back to
+/// v1 on failure, so pre-existing history files keep working.
+#[derive(Serialize, Deserialize, Default)]
+struct SnapshotV2 {
+    #[serde(rename = "_v")]
+    version: u32,
+    prices: HashMap<String, Vec<(f64, i64)>>,
+    /// Pair key (e.g. "BTC/ETH") → the live engine's
+    /// `state.spread_history` as a plain `Vec<f64>`. Missing in older
+    /// files; defaulted to empty by `#[serde(default)]`.
+    #[serde(default)]
+    spread_histories: HashMap<String, Vec<f64>>,
+}
 
 pub(super) fn persist_history_to_disk(
     cfg: &PairTradeConfig,
     history: &HashMap<String, VecDeque<PriceSample>>,
+    spread_histories: &HashMap<String, VecDeque<f64>>,
     history_path: &std::path::Path,
 ) {
     if cfg.disable_history_persist {
@@ -23,11 +50,22 @@ pub(super) fn persist_history_to_disk(
     if cfg.backtest_mode {
         return;
     }
-    let mut snapshot: HashMap<String, Vec<(f64, i64)>> = HashMap::new();
-    for (sym, deque) in history {
-        let v: Vec<(f64, i64)> = deque.iter().map(|p| (p.log_price, p.ts)).collect();
-        snapshot.insert(sym.clone(), v);
-    }
+    let prices: HashMap<String, Vec<(f64, i64)>> = history
+        .iter()
+        .map(|(sym, deque)| {
+            let v: Vec<(f64, i64)> = deque.iter().map(|p| (p.log_price, p.ts)).collect();
+            (sym.clone(), v)
+        })
+        .collect();
+    let spread_histories: HashMap<String, Vec<f64>> = spread_histories
+        .iter()
+        .map(|(k, deque)| (k.clone(), deque.iter().copied().collect()))
+        .collect();
+    let snapshot = SnapshotV2 {
+        version: 2,
+        prices,
+        spread_histories,
+    };
     if let Ok(json) = serde_json::to_string(&snapshot) {
         // Atomic write: tmpfile in the same directory + rename. Multiple
         // bots may be writing this shared file concurrently (pairtrade#4);
@@ -50,32 +88,47 @@ pub(super) fn persist_history_to_disk(
     }
 }
 
+/// Parse the persisted history file, accepting both v2 (explicit
+/// `SnapshotV2` struct) and legacy v1 (bare per-symbol map). Returns
+/// (prices, spread_histories) where `spread_histories` is empty for v1.
+fn parse_snapshot_file(
+    path: &std::path::Path,
+) -> Option<(
+    HashMap<String, Vec<(f64, i64)>>,
+    HashMap<String, Vec<f64>>,
+)> {
+    let content = fs::read_to_string(path).ok()?;
+    // Try v2 first (has explicit schema with `_v` and `prices`).
+    if let Ok(v2) = serde_json::from_str::<SnapshotV2>(&content) {
+        if v2.version >= 2 {
+            return Some((v2.prices, v2.spread_histories));
+        }
+    }
+    // Fall back to v1 (bare `HashMap<String, Vec<(f64, i64)>>`).
+    let prices: HashMap<String, Vec<(f64, i64)>> = serde_json::from_str(&content).ok()?;
+    Some((prices, HashMap::new()))
+}
+
 /// Load a history snapshot for backtest warm-start. Unlike
 /// `load_history_from_disk`, this skips the stale-guard check (the
 /// snapshot is always older than the replay cursor) and instead accepts
 /// all samples within `max_history_len` bars of the *newest* sample in
-/// each symbol, regardless of `now_ts`.
+/// each symbol, regardless of `now_ts`. Also populates
+/// `spread_histories_out` when the snapshot is v2.
 pub(super) fn load_history_snapshot_for_bt(
     history: &mut HashMap<String, VecDeque<PriceSample>>,
+    spread_histories_out: &mut HashMap<String, VecDeque<f64>>,
     snapshot_path: &std::path::Path,
     max_history_len: usize,
 ) {
-    let Ok(content) = fs::read_to_string(snapshot_path) else {
+    let Some((prices, spreads)) = parse_snapshot_file(snapshot_path) else {
         log::warn!(
-            "[BT_WARM_START] failed to read snapshot {}",
+            "[BT_WARM_START] failed to read or parse snapshot {}",
             snapshot_path.display()
         );
         return;
     };
-    let parsed: Result<HashMap<String, Vec<(f64, i64)>>, _> = serde_json::from_str(&content);
-    let Ok(map) = parsed else {
-        log::warn!(
-            "[BT_WARM_START] failed to parse snapshot {}",
-            snapshot_path.display()
-        );
-        return;
-    };
-    for (sym, entries) in map {
+    for (sym, entries) in prices {
         if entries.is_empty() {
             continue;
         }
@@ -96,11 +149,25 @@ pub(super) fn load_history_snapshot_for_bt(
             history.insert(sym, deque);
         }
     }
+    for (pair_key, series) in spreads {
+        if series.is_empty() {
+            continue;
+        }
+        let len = series.len();
+        let deque: VecDeque<f64> = series.into_iter().collect();
+        log::info!(
+            "[BT_WARM_START] loaded {} persisted spread_history bars for {}",
+            len,
+            pair_key
+        );
+        spread_histories_out.insert(pair_key, deque);
+    }
 }
 
 pub(super) fn load_history_from_disk(
     cfg: &PairTradeConfig,
     history: &mut HashMap<String, VecDeque<PriceSample>>,
+    spread_histories_out: &mut HashMap<String, VecDeque<f64>>,
     history_path: &std::path::Path,
     now_ts: i64,
     max_history_len: usize,
@@ -116,11 +183,7 @@ pub(super) fn load_history_from_disk(
     if cfg.backtest_mode {
         return;
     }
-    let Ok(content) = std::fs::read_to_string(history_path) else {
-        return;
-    };
-    let parsed: Result<HashMap<String, Vec<(f64, i64)>>, _> = serde_json::from_str(&content);
-    let Ok(map) = parsed else {
+    let Some((prices, spreads)) = parse_snapshot_file(history_path) else {
         return;
     };
     let max_age_secs =
@@ -130,7 +193,8 @@ pub(super) fn load_history_from_disk(
     // and replaying it would freeze a stale rolling window. Drop it and
     // let the live feed warm up from scratch.
     let stale_threshold_secs = (cfg.trading_period_secs as i64).saturating_mul(5).max(60);
-    for (sym, entries) in map {
+    let mut any_stale = false;
+    for (sym, entries) in prices {
         let newest_ts = entries.iter().map(|(_, ts)| *ts).max().unwrap_or(0);
         if now_ts.saturating_sub(newest_ts) > stale_threshold_secs {
             log::debug!(
@@ -138,6 +202,7 @@ pub(super) fn load_history_from_disk(
                 sym,
                 now_ts.saturating_sub(newest_ts)
             );
+            any_stale = true;
             continue;
         }
         let mut deque = VecDeque::new();
@@ -149,6 +214,20 @@ pub(super) fn load_history_from_disk(
         }
         if !deque.is_empty() {
             history.insert(sym, deque);
+        }
+    }
+    // If any symbol was discarded as stale, the persisted spread_history
+    // is also stale — discard it rather than pairing it with a
+    // freshly-built log_price window. This triggers the cold-start
+    // synthesis path in `warm_start_states_from_history`, which is still
+    // the fallback for genuinely stale files.
+    if !any_stale {
+        for (pair_key, series) in spreads {
+            if series.is_empty() {
+                continue;
+            }
+            let deque: VecDeque<f64> = series.into_iter().collect();
+            spread_histories_out.insert(pair_key, deque);
         }
     }
 }
