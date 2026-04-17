@@ -627,7 +627,7 @@ impl PairTradeConfig {
             disable_history_persist: yaml.disable_history_persist.unwrap_or(false),
             history_file,
             history_archive_dir: yaml.history_archive_dir,
-            history_archive_retention_days: yaml.history_archive_retention_days.unwrap_or(14),
+            history_archive_retention_days: yaml.history_archive_retention_days.unwrap_or(360),
             backtest_mode: yaml.backtest_mode.unwrap_or(false),
             backtest_file: yaml.backtest_file,
             bt_warm_start_snapshot: None, // env-only, not in YAML
@@ -831,7 +831,7 @@ impl PairTradeConfig {
             history_archive_retention_days: env::var("HISTORY_ARCHIVE_RETENTION_DAYS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(14),
+                .unwrap_or(360),
             backtest_mode,
             backtest_file,
             bt_warm_start_snapshot: env::var("BT_WARM_START_SNAPSHOT").ok().filter(|v| !v.trim().is_empty()),

@@ -10,8 +10,10 @@ data_dump_file: /opt/debot/market_data_btceth.jsonl
 observe_only: false
 
 # Hourly snapshot archive for BT replay warm-start (#69)
+# 360 days retention ≈ 168 MB / 8640 files — covers year-long replays and
+# ad-hoc historical analysis at trivial disk cost.
 history_archive_dir: /opt/debot/history_archive
-history_archive_retention_days: 14
+history_archive_retention_days: 360
 
 # Fixed pair: BTC/ETH only
 universe_pairs:
