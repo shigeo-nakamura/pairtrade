@@ -3,7 +3,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::path::Path;
+use std::time::{Duration, SystemTime};
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use super::config::PairTradeConfig;
@@ -84,6 +87,57 @@ pub(super) fn persist_history_to_disk(
         if let Err(e) = fs::rename(&tmp, path) {
             log::debug!("persist history rename failed: {:?}", e);
             let _ = fs::remove_file(&tmp);
+        }
+    }
+
+    archive_snapshot_hourly(cfg, history_path);
+}
+
+fn archive_snapshot_hourly(cfg: &PairTradeConfig, history_path: &Path) {
+    let Some(archive_dir) = &cfg.history_archive_dir else {
+        return;
+    };
+    let archive_dir = Path::new(archive_dir);
+    if let Err(e) = fs::create_dir_all(archive_dir) {
+        log::debug!("archive dir create failed: {:?}", e);
+        return;
+    }
+    let stem = history_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let hour_tag = Utc::now().format("%Y%m%dT%H00Z");
+    let archive_path = archive_dir.join(format!("{}.{}.json", stem, hour_tag));
+    if archive_path.exists() {
+        return;
+    }
+    if let Err(e) = fs::copy(history_path, &archive_path) {
+        log::debug!("archive snapshot copy failed: {:?}", e);
+        return;
+    }
+    log::info!(
+        "[HISTORY_ARCHIVE] saved {}",
+        archive_path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    cleanup_old_archives(archive_dir, cfg.history_archive_retention_days);
+}
+
+fn cleanup_old_archives(dir: &Path, retention_days: u32) {
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_days as u64 * 86400))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        if modified < cutoff {
+            let _ = fs::remove_file(entry.path());
+            log::info!(
+                "[HISTORY_ARCHIVE] removed expired {}",
+                entry.file_name().to_string_lossy()
+            );
         }
     }
 }

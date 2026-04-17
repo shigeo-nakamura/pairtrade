@@ -260,6 +260,8 @@ pub(super) struct PairTradeYaml {
     pub(super) observe_only: Option<bool>,
     pub(super) disable_history_persist: Option<bool>,
     pub(super) history_file: Option<String>,
+    pub(super) history_archive_dir: Option<String>,
+    pub(super) history_archive_retention_days: Option<u32>,
     pub(super) backtest_mode: Option<bool>,
     pub(super) backtest_file: Option<String>,
     pub(super) spread_trend_max_slope_sigma: Option<f64>,
@@ -389,6 +391,8 @@ pub struct PairTradeConfig {
     pub observe_only: bool,
     pub disable_history_persist: bool,
     pub history_file: String,
+    pub history_archive_dir: Option<String>,
+    pub history_archive_retention_days: u32,
     // For backtest feature
     pub backtest_mode: bool,
     pub backtest_file: Option<String>,
@@ -622,6 +626,8 @@ impl PairTradeConfig {
             observe_only: yaml.observe_only.unwrap_or(false),
             disable_history_persist: yaml.disable_history_persist.unwrap_or(false),
             history_file,
+            history_archive_dir: yaml.history_archive_dir,
+            history_archive_retention_days: yaml.history_archive_retention_days.unwrap_or(14),
             backtest_mode: yaml.backtest_mode.unwrap_or(false),
             backtest_file: yaml.backtest_file,
             bt_warm_start_snapshot: None, // env-only, not in YAML
@@ -821,6 +827,11 @@ impl PairTradeConfig {
             observe_only,
             disable_history_persist,
             history_file,
+            history_archive_dir: env::var("HISTORY_ARCHIVE_DIR").ok().filter(|v| !v.trim().is_empty()),
+            history_archive_retention_days: env::var("HISTORY_ARCHIVE_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(14),
             backtest_mode,
             backtest_file,
             bt_warm_start_snapshot: env::var("BT_WARM_START_SNAPSHOT").ok().filter(|v| !v.trim().is_empty()),
