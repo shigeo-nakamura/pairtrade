@@ -4213,6 +4213,8 @@ impl PairTradeEngine {
             observe_only: false,
             disable_history_persist: true,
             history_file: "test-history.json".to_string(),
+            history_archive_dir: None,
+            history_archive_retention_days: 14,
             backtest_mode: false,
             backtest_file: None,
             bt_warm_start_snapshot: None,
