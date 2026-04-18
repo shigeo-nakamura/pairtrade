@@ -584,7 +584,7 @@ impl PairTradeEngine {
                         if step_elapsed >= critical {
                             log::warn!(
                                 "[STEP_OVERRUN] step() took {:.2}s >= {:.2}s (1.5x interval_secs={}); \
-                                 wall-clock tick skipped, A/B/C alignment may drift",
+                                 wall-clock tick skipped",
                                 step_elapsed.as_secs_f64(),
                                 critical.as_secs_f64(),
                                 interval_secs
@@ -4071,17 +4071,35 @@ impl PairTradeEngine {
     }
 
     async fn fetch_latest_prices(&mut self) -> Result<HashMap<String, SymbolSnapshot>> {
-        let mut map = HashMap::new();
-        for symbol in self
+        let symbols: Vec<String> = self
             .cfg
             .universe
             .iter()
             .flat_map(|p| [p.base.clone(), p.quote.clone()])
-        {
-            if map.contains_key(&symbol) {
-                continue;
-            }
-            let ticker = match self.connector.get_ticker(&symbol, None).await {
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let connector = self.connector.clone();
+        let mut join_set = tokio::task::JoinSet::new();
+        for sym in symbols.iter().cloned() {
+            let conn = connector.clone();
+            join_set.spawn(async move {
+                let (ticker_res, ob_res) = tokio::join!(
+                    conn.get_ticker(&sym, None),
+                    conn.get_order_book(&sym, 1),
+                );
+                (sym, ticker_res, ob_res)
+            });
+        }
+        let mut results = Vec::new();
+        while let Some(res) = join_set.join_next().await {
+            results.push(res.expect("fetch task panicked"));
+        }
+
+        let mut map = HashMap::new();
+        for (symbol, ticker_res, ob_res) in results {
+            let ticker = match ticker_res {
                 Ok(ticker) => ticker,
                 Err(e) => {
                     let msg = e.to_string();
@@ -4097,28 +4115,27 @@ impl PairTradeEngine {
                     return Err(e).with_context(|| format!("ticker {}", symbol));
                 }
             };
-            let (top_bid_price, top_ask_price, top_bid_size, top_ask_size) =
-                match self.connector.get_order_book(&symbol, 1).await {
-                    Ok(ob) => (
-                        ob.bids.first().map(|l| l.price),
-                        ob.asks.first().map(|l| l.price),
-                        ob.bids.first().map(|l| l.size).unwrap_or(Decimal::ZERO),
-                        ob.asks.first().map(|l| l.size).unwrap_or(Decimal::ZERO),
-                    ),
-                    Err(e) => {
-                        let msg = format!("{:?}", e);
-                        let is_stale = msg.contains("order book snapshot unavailable");
-                        if is_stale {
-                            log::debug!("orderbook {} unavailable: {}", symbol, msg);
-                        } else if self.should_log_ob_warn(&symbol) {
-                            log::warn!("orderbook {} unavailable: {}", symbol, msg);
-                            self.last_ob_warn.insert(symbol.clone(), Instant::now());
-                        } else {
-                            log::debug!("orderbook {} unavailable: {}", symbol, msg);
-                        }
-                        (None, None, Decimal::ZERO, Decimal::ZERO)
+            let (top_bid_price, top_ask_price, top_bid_size, top_ask_size) = match ob_res {
+                Ok(ob) => (
+                    ob.bids.first().map(|l| l.price),
+                    ob.asks.first().map(|l| l.price),
+                    ob.bids.first().map(|l| l.size).unwrap_or(Decimal::ZERO),
+                    ob.asks.first().map(|l| l.size).unwrap_or(Decimal::ZERO),
+                ),
+                Err(e) => {
+                    let msg = format!("{:?}", e);
+                    let is_stale = msg.contains("order book snapshot unavailable");
+                    if is_stale {
+                        log::debug!("orderbook {} unavailable: {}", symbol, msg);
+                    } else if self.should_log_ob_warn(&symbol) {
+                        log::warn!("orderbook {} unavailable: {}", symbol, msg);
+                        self.last_ob_warn.insert(symbol.clone(), Instant::now());
+                    } else {
+                        log::debug!("orderbook {} unavailable: {}", symbol, msg);
                     }
-                };
+                    (None, None, Decimal::ZERO, Decimal::ZERO)
+                }
+            };
             if ticker.min_order.is_none() && !self.min_order_warned.contains(&symbol) {
                 let size_decimals_desc = ticker
                     .size_decimals
@@ -4169,10 +4186,6 @@ impl PairTradeEngine {
                 ticker.min_order,
                 ticker.min_tick
             );
-            // avoid hammering (skipped in backtest: ReplayConnector is synchronous)
-            if !self.cfg.backtest_mode {
-                sleep(Duration::from_millis(50)).await;
-            }
         }
         Ok(map)
     }
