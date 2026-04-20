@@ -426,6 +426,15 @@ pub struct PairTradeConfig {
     /// Firing is one-shot per timestamp: each matched ts is removed
     /// from the set after firing.
     pub bt_restart_timestamps: Option<std::collections::HashSet<i64>>,
+    /// Simulated fill delay for BT exit orders (seconds). In live mode,
+    /// exit orders take 1-5s to fill on the exchange; during that window
+    /// the position is still held and the bot cannot enter a new trade.
+    /// In dry_run BT mode exits are instant, which lets BT enter slightly
+    /// earlier than live and cascades into entry-count mismatches.
+    /// When > 0, the dry_run exit path defers position clearing by this
+    /// many replay-seconds, keeping the position "held" during the delay.
+    /// Env: BT_FILL_DELAY_SECS (default 0 = legacy instant-fill).
+    pub bt_fill_delay_secs: i64,
     pub circuit_breaker_consecutive_losses: u32,
     pub circuit_breaker_cooldown_secs: u64,
     /// All per-pair tunables — z-score thresholds, hedge gates, lookback
@@ -633,6 +642,7 @@ impl PairTradeConfig {
             bt_warm_start_snapshot: None, // env-only, not in YAML
             bt_eval_timestamps: None,     // env-only, not in YAML
             bt_restart_timestamps: None,  // env-only, not in YAML
+            bt_fill_delay_secs: 0,         // env-only, not in YAML
             circuit_breaker_consecutive_losses: yaml
                 .circuit_breaker_consecutive_losses
                 .unwrap_or(DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES),
@@ -837,6 +847,10 @@ impl PairTradeConfig {
             bt_warm_start_snapshot: env::var("BT_WARM_START_SNAPSHOT").ok().filter(|v| !v.trim().is_empty()),
             bt_eval_timestamps: load_bt_eval_timestamps(),
             bt_restart_timestamps: load_bt_restart_timestamps(),
+            bt_fill_delay_secs: env::var("BT_FILL_DELAY_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             circuit_breaker_consecutive_losses: env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1048,6 +1062,7 @@ impl PairTradeConfig {
         if env::var("BT_RESTART_TIMESTAMPS_FILE").is_ok() {
             self.bt_restart_timestamps = load_bt_restart_timestamps();
         }
+        env_override("BT_FILL_DELAY_SECS", &mut self.bt_fill_delay_secs);
 
         env_override("SPREAD_TREND_MAX_SLOPE_SIGMA", &mut self.default_pair_params.spread_trend_max_slope_sigma);
         env_override("BETA_DIVERGENCE_MAX", &mut self.default_pair_params.beta_divergence_max);

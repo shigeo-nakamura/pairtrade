@@ -45,8 +45,8 @@ use config::PairParams;
 use config::PairSpec;
 use defaults::*;
 use state::{
-    PairState, PartialOrderPlacementError, PendingLeg, PendingOrders, PendingStatus, Position,
-    PositionDirection,
+    BtDeferredExit, PairState, PartialOrderPlacementError, PendingLeg, PendingOrders,
+    PendingStatus, Position, PositionDirection,
 };
 use status::{
     PairTradeStats, ShutdownPosition, ShutdownStatus, StatusReporter,
@@ -413,6 +413,7 @@ impl PairTradeEngine {
                 let is_active = state.position.is_some()
                     || state.pending_entry.is_some()
                     || state.pending_exit.is_some()
+                    || state.bt_deferred_exit.is_some()
                     || state.position_guard;
                 if !is_active {
                     continue;
@@ -1282,6 +1283,26 @@ impl PairTradeEngine {
                 continue;
             }
 
+            // Resolve BT deferred exits whose fill delay has elapsed
+            // (bot-strategy#69). Must run before reconcile so the position
+            // is cleared before entry evaluation on the same tick.
+            if self.cfg.bt_fill_delay_secs > 0 {
+                if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                    if let Some(ref deferred) = state.bt_deferred_exit {
+                        if now_ts >= deferred.resolve_at_ts {
+                            log::debug!(
+                                "[BT_FILL_DELAY] {} resolved (delay={}s, now_ts={})",
+                                key, self.cfg.bt_fill_delay_secs, now_ts
+                            );
+                            state.position = None;
+                            state.last_exit_at = Some(Instant::now());
+                            state.last_exit_ts = Some(now_ts);
+                            state.bt_deferred_exit = None;
+                        }
+                    }
+                }
+            }
+
             // First, reconcile any pending entry/exit orders for this pair
             self.reconcile_pending_orders(inst_idx, &key, price_map).await?;
 
@@ -1404,7 +1425,9 @@ impl PairTradeEngine {
                 }
             }
 
-            if self.instances[inst_idx].states[&key].pending_entry.is_some() || self.instances[inst_idx].states[&key].pending_exit.is_some()
+            if self.instances[inst_idx].states[&key].pending_entry.is_some()
+                || self.instances[inst_idx].states[&key].pending_exit.is_some()
+                || self.instances[inst_idx].states[&key].bt_deferred_exit.is_some()
             {
                 if !matches!(action, TradeAction::None) {
                     log::debug!("[ORDER] {} has pending orders; skipping new actions", key);
@@ -1844,9 +1867,20 @@ impl PairTradeEngine {
                         );
                     }
                     if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
-                        state.position = None;
-                        state.last_exit_at = Some(Instant::now());
-                        state.last_exit_ts = Some(now_ts);
+                        if self.cfg.backtest_mode && self.cfg.bt_fill_delay_secs > 0 {
+                            // Defer position clearing to simulate exchange
+                            // fill latency (bot-strategy#69).
+                            let pnl_value = pnl.and_then(|p| p.to_f64()).unwrap_or(0.0);
+                            state.bt_deferred_exit = Some(BtDeferredExit {
+                                resolve_at_ts: now_ts + self.cfg.bt_fill_delay_secs,
+                                pnl: pnl_value,
+                                direction,
+                            });
+                        } else {
+                            state.position = None;
+                            state.last_exit_at = Some(Instant::now());
+                            state.last_exit_ts = Some(now_ts);
+                        }
                     }
                 } else if self.cfg.observe_only {
                     log::info!(
@@ -1888,6 +1922,7 @@ impl PairTradeEngine {
                 let is_active = state.position.is_some()
                     || state.pending_entry.is_some()
                     || state.pending_exit.is_some()
+                    || state.bt_deferred_exit.is_some()
                     || state.position_guard;
                 if is_active {
                     let mut symbols = HashSet::new();

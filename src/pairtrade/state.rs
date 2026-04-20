@@ -125,6 +125,23 @@ pub(super) struct PairState {
     /// far below its recent median — a sign that the z-score is no longer a
     /// trustworthy mean-reversion signal.
     pub(super) std_history: VecDeque<f64>,
+    /// BT fill-delay: when an exit is decided in dry_run + backtest mode with
+    /// `bt_fill_delay_secs > 0`, we defer clearing `position` until the replay
+    /// clock has advanced past this timestamp. While set, the bot considers the
+    /// position still held (blocking new entries). The PnL is already computed
+    /// and stored here so it can be logged when the deferred exit resolves.
+    pub(super) bt_deferred_exit: Option<BtDeferredExit>,
+}
+
+/// Deferred exit info for BT fill-delay simulation.
+#[derive(Debug)]
+pub(super) struct BtDeferredExit {
+    /// Replay timestamp (seconds) at which the position should be cleared.
+    pub(super) resolve_at_ts: i64,
+    /// Pre-computed PnL value (already logged at exit decision time).
+    pub(super) pnl: f64,
+    /// Direction of the closed position.
+    pub(super) direction: PositionDirection,
 }
 
 impl PairState {
@@ -152,6 +169,7 @@ impl PairState {
             position_guard: false,
             kalman: None,
             std_history: VecDeque::new(),
+            bt_deferred_exit: None,
         }
     }
 
