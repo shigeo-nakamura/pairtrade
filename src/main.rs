@@ -81,24 +81,35 @@ async fn init_engine_with_retry(
             }
             Err(e) => {
                 let chain = format!("{:?}", e);
-                let transient = chain.contains("rate-limited")
-                    || chain.contains("Too Many Requests")
+                let transient_429 = chain.contains("Too Many Requests")
                     || chain.contains("\"code\":23000")
-                    || chain.contains(" 429 ")
+                    || chain.contains(" 429 ");
+                let transient = transient_429
+                    || chain.contains("rate-limited")
                     || (chain.contains("Could not find account for api_key_index=")
                         && chain.contains("Set LIGHTER_ACCOUNT_INDEX"));
                 if !transient || attempt >= MAX_ATTEMPTS {
                     return Err(e);
                 }
+                // Lighter's per-IP /account short-window is ~60s. Retrying
+                // inside that window just re-burns the budget; wait past it
+                // on the 429 path before retrying. Other transient shapes
+                // (account-index rediscovery) keep the fast backoff.
+                // See bot-strategy#127.
+                let sleep_for = if transient_429 {
+                    backoff.max(std::time::Duration::from_secs(75))
+                } else {
+                    backoff
+                };
                 log::warn!(
                     "[INIT_RETRY] transient startup error (attempt {}/{}), sleeping {}s. Reason: {}",
                     attempt,
                     MAX_ATTEMPTS,
-                    backoff.as_secs(),
+                    sleep_for.as_secs(),
                     chain.lines().next().unwrap_or(&chain),
                 );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+                tokio::time::sleep(sleep_for).await;
+                backoff = (sleep_for * 2).min(std::time::Duration::from_secs(60));
             }
         }
     }

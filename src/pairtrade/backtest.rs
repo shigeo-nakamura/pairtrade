@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use dex_connector::DexConnector;
@@ -76,7 +77,23 @@ pub(super) async fn create_connector(
             .context("failed to start connector")?;
         instance_connectors.push(Arc::new(conn));
     } else {
+        // Lighter enforces a short-window /account rate limit the sidecar
+        // can't see. The steady-state path paces equity refreshes ≥5.5s
+        // apart (see `MIN_ACCOUNT_SPACING` in pairtrade::mod), but connector
+        // init also fires one /account-shaped call per instance during
+        // start(). Without spacing, 3 back-to-back start()s burst the
+        // window and the 3rd 429s, which INIT_RETRY then re-burns on
+        // retry. Match the steady-state spacing here. See bot-strategy#127.
+        const INIT_ACCOUNT_SPACING: Duration = Duration::from_millis(5_500);
+        let mut last_iter_start: Option<Instant> = None;
         for strategy in &cfg.strategies {
+            if let Some(t) = last_iter_start {
+                let elapsed = t.elapsed();
+                if elapsed < INIT_ACCOUNT_SPACING {
+                    tokio::time::sleep(INIT_ACCOUNT_SPACING - elapsed).await;
+                }
+            }
+            last_iter_start = Some(Instant::now());
             let conn = DexConnectorBox::create(
                 &cfg.dex_name,
                 &cfg.rest_endpoint,
