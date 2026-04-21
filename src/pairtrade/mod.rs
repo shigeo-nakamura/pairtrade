@@ -1870,11 +1870,8 @@ impl PairTradeEngine {
                         if self.cfg.backtest_mode && self.cfg.bt_fill_delay_secs > 0 {
                             // Defer position clearing to simulate exchange
                             // fill latency (bot-strategy#69).
-                            let pnl_value = pnl.and_then(|p| p.to_f64()).unwrap_or(0.0);
                             state.bt_deferred_exit = Some(BtDeferredExit {
                                 resolve_at_ts: now_ts + self.cfg.bt_fill_delay_secs,
-                                pnl: pnl_value,
-                                direction,
                             });
                         } else {
                             state.position = None;

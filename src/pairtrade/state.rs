@@ -138,10 +138,6 @@ pub(super) struct PairState {
 pub(super) struct BtDeferredExit {
     /// Replay timestamp (seconds) at which the position should be cleared.
     pub(super) resolve_at_ts: i64,
-    /// Pre-computed PnL value (already logged at exit decision time).
-    pub(super) pnl: f64,
-    /// Direction of the closed position.
-    pub(super) direction: PositionDirection,
 }
 
 impl PairState {
