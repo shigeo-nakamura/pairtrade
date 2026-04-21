@@ -14,6 +14,13 @@ set -eu
 
 ENV_DIR="${DEBOT_ENV_DIR:-/opt/debot/scripts}"
 
+# `set -a` turns every subsequent variable assignment into an export, which
+# makes plain `VAR=value` lines in the sourced env files visible to the
+# child `debot` process. Without it the bot panics with `EXTENDED_API_KEY
+# must be set` because bash's `source` only populates shell variables, not
+# the environment.
+set -a
+
 # KMS data key shared across all bots on this host.
 if [ -f "$ENV_DIR/debot_secrets_common.env" ]; then
     # shellcheck disable=SC1090
@@ -27,6 +34,8 @@ fi
 # Extended per-account env.
 # shellcheck disable=SC1090
 source "$ENV_DIR/debot-pair-btceth-extended.env"
+
+set +a
 
 export DEBOT_STATUS_DIR="${DEBOT_STATUS_DIR:-/home/ec2-user/debot_status}"
 export DEBOT_STATUS_ID=debot-pair-btceth-ext
