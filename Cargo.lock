@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "dex-connector"
-version = "4.2.35"
+version = "4.2.40"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -842,6 +842,7 @@ dependencies = [
  "debot-utils",
  "ecdsa",
  "ed25519-dalek",
+ "env_logger",
  "ethers",
  "futures",
  "generic-array",
