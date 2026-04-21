@@ -27,7 +27,7 @@ libc = "0.2"
 
 debot-utils = "1.0.*"
 
-dex-connector = { path = "../dex-connector" }
+dex-connector = { path = "../dex-connector", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
