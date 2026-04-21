@@ -6,11 +6,15 @@ use dex_connector::{
 };
 #[cfg(feature = "lighter-sdk")]
 use dex_connector::{create_lighter_connector, LighterConnector, LighterConnectorConfig};
+#[cfg(feature = "extended-sdk")]
+use dex_connector::create_extended_connector;
 
 use rust_decimal::Decimal;
 
 #[cfg(feature = "lighter-sdk")]
 use crate::config::get_lighter_config_from_env;
+#[cfg(feature = "extended-sdk")]
+use crate::config::get_extended_config_from_env;
 use crate::config::{get_hyperliquid_config_from_env, RunMode};
 use crate::rate_limit_notifier::{notify_lighter_waf_cooldown, notify_rate_limit};
 use lazy_static::lazy_static;
@@ -155,6 +159,25 @@ impl DexConnectorBox {
                     let connector = create_lighter_connector(connector_config)?;
                     Ok(DexConnectorBox { inner: connector })
                 }
+            }
+            #[cfg(feature = "extended-sdk")]
+            "extended" => {
+                let extended_config = get_extended_config_from_env()
+                    .await
+                    .map_err(|e| DexError::Other(e.to_string()))?;
+
+                let connector = create_extended_connector(
+                    extended_config.api_key,
+                    extended_config.public_key,
+                    extended_config.private_key,
+                    extended_config.vault,
+                    extended_config.base_url,
+                    extended_config.websocket_url,
+                    token_list.to_vec(),
+                )
+                .await?;
+
+                Ok(DexConnectorBox { inner: connector })
             }
             _ => Err(DexError::Other("Unsupported dex".to_owned())),
         }

@@ -35,6 +35,9 @@ tempfile = "3"
 [features]
 default = ["lighter-sdk"]
 lighter-sdk = ["dex-connector/lighter-sdk"]
+# Tokyo deployments build with `--no-default-features --features extended-sdk`
+# (no Go/libsigner toolchain on ARM). Frankfurt keeps the default.
+extended-sdk = ["dex-connector/extended-sdk"]
 
 [[bin]]
 name = "debot"

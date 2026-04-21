@@ -25,6 +25,17 @@ pub struct HyperliquidConfig {
     pub vault_address: Option<String>,
 }
 
+#[cfg(feature = "extended-sdk")]
+#[derive(Debug)]
+pub struct ExtendedConfig {
+    pub api_key: String,
+    pub public_key: String,
+    pub private_key: String,
+    pub vault: u64,
+    pub base_url: Option<String>,
+    pub websocket_url: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum RunMode {
     Dry,
@@ -243,6 +254,43 @@ pub async fn get_hyperliquid_config_from_env(
         private_key,
         evm_wallet_address,
         vault_address,
+    })
+}
+
+#[cfg(feature = "extended-sdk")]
+pub async fn get_extended_config_from_env() -> Result<ExtendedConfig, ConfigError> {
+    let api_key = env::var("EXTENDED_API_KEY").expect("EXTENDED_API_KEY must be set");
+    let public_key = env::var("EXTENDED_PUBLIC_KEY").expect("EXTENDED_PUBLIC_KEY must be set");
+    let private_key_encrypted =
+        env::var("EXTENDED_PRIVATE_KEY").expect("EXTENDED_PRIVATE_KEY must be set");
+    let vault: u64 = env::var("EXTENDED_VAULT")
+        .expect("EXTENDED_VAULT must be set")
+        .parse()
+        .expect("EXTENDED_VAULT must be a valid u64");
+    let base_url = env::var("REST_ENDPOINT").ok().filter(|v| !v.is_empty());
+    let websocket_url = env::var("WEB_SOCKET_ENDPOINT")
+        .ok()
+        .filter(|v| !v.is_empty());
+
+    let encrypted_data_key = env::var("ENCRYPTED_DATA_KEY")
+        .expect("ENCRYPTED_DATA_KEY must be set")
+        .replace(" ", "");
+    let private_key_vec =
+        debot_utils::decrypt_data_with_kms(&encrypted_data_key, private_key_encrypted, true)
+            .await
+            .map_err(|e| {
+                log::error!("Failed to decrypt EXTENDED_PRIVATE_KEY: {:?}", e);
+                ConfigError::DecimalParseError(DecimalParseError::from("KMS decryption failed"))
+            })?;
+    let private_key = String::from_utf8(private_key_vec).unwrap();
+
+    Ok(ExtendedConfig {
+        api_key,
+        public_key,
+        private_key,
+        vault,
+        base_url,
+        websocket_url,
     })
 }
 

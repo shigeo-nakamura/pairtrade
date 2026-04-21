@@ -3356,7 +3356,7 @@ impl PairTradeEngine {
 
     fn post_only_supported(&self) -> bool {
         let dex = self.cfg.dex_name.to_ascii_lowercase();
-        dex.contains("lighter")
+        dex.contains("lighter") || dex.contains("extended")
     }
 
     fn should_post_only(&self) -> bool {
@@ -3525,7 +3525,15 @@ impl PairTradeEngine {
         side: dex_connector::OrderSide,
         snapshot: &SymbolSnapshot,
     ) -> Decimal {
-        let effective_tick_size = snapshot.min_tick;
+        let mut effective_tick_size = snapshot.min_tick;
+
+        // Extended occasionally returns markets without `min_tick` populated
+        // in the snapshot (dex-connector fills this from the markets cache,
+        // which may lag a reconnect). Fall back to tick=1 so we don't spam
+        // the "No min tick" warning every cycle.
+        if effective_tick_size.is_none() && self.cfg.dex_name.contains("extended") {
+            effective_tick_size = Some(Decimal::ONE);
+        }
 
         let Some(tick_size) = effective_tick_size else {
             if !self.min_tick_warned.contains(symbol) {
