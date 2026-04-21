@@ -4302,6 +4302,7 @@ impl PairTradeEngine {
             regime_trend_window: DEFAULT_REGIME_TREND_WINDOW,
             regime_trend_max: DEFAULT_REGIME_TREND_MAX,
             regime_reference_symbol: DEFAULT_REGIME_REFERENCE_SYMBOL.to_string(),
+            bt_fill_delay_secs: 0,
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
