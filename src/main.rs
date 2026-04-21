@@ -47,13 +47,61 @@ async fn run_single() -> std::io::Result<()> {
     log::info!("dex-connector git: {}", dex_connector_git);
     log::info!("Starting pair-trade loop...");
     let cfg = PairTradeConfig::from_env_or_yaml().expect("invalid pair trade config");
-    let mut engine = PairTradeEngine::new(cfg)
+    let mut engine = init_engine_with_retry(cfg)
         .await
         .expect("failed to initialize pair trade engine");
     engine
         .run()
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+// Startup hardening for transient Lighter errors (bot-strategy#120). If
+// Lighter is rate-limited when the bot comes up (e.g. after a WAF episode),
+// the connector.start() and account-discovery paths surface the error to
+// main.rs and used to panic immediately. Under systemd Restart=on-failure
+// that became a tight crash-loop whose re-login attempts themselves kept
+// the cooldown active. Now we retry the whole engine init with backoff
+// inside the process for transient signatures; permanent errors (bad
+// config, missing keys, unexpected shapes) still propagate straight out.
+async fn init_engine_with_retry(
+    cfg: PairTradeConfig,
+) -> Result<PairTradeEngine, anyhow::Error> {
+    const MAX_ATTEMPTS: u32 = 20;
+    let mut attempt: u32 = 0;
+    let mut backoff = std::time::Duration::from_secs(3);
+    loop {
+        attempt += 1;
+        match PairTradeEngine::new(cfg.clone()).await {
+            Ok(e) => {
+                if attempt > 1 {
+                    log::info!("[INIT_RETRY] engine initialized on attempt {}", attempt);
+                }
+                return Ok(e);
+            }
+            Err(e) => {
+                let chain = format!("{:?}", e);
+                let transient = chain.contains("rate-limited")
+                    || chain.contains("Too Many Requests")
+                    || chain.contains("\"code\":23000")
+                    || chain.contains(" 429 ")
+                    || (chain.contains("Could not find account for api_key_index=")
+                        && chain.contains("Set LIGHTER_ACCOUNT_INDEX"));
+                if !transient || attempt >= MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                log::warn!(
+                    "[INIT_RETRY] transient startup error (attempt {}/{}), sleeping {}s. Reason: {}",
+                    attempt,
+                    MAX_ATTEMPTS,
+                    backoff.as_secs(),
+                    chain.lines().next().unwrap_or(&chain),
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+            }
+        }
+    }
 }
 
 async fn run_batch(batch_file: &str) -> std::io::Result<()> {
