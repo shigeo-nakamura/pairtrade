@@ -109,6 +109,12 @@ pub struct PairTradeEngine {
     min_tick_warned: HashSet<String>,
     positions_ready: bool,
     open_positions: HashMap<String, PositionSnapshot>,
+    /// Last time ANY /account REST call was fired across all instances.
+    /// Used to pace calls ≥ MIN_ACCOUNT_SPACING apart without a blocking
+    /// per-instance sleep; the previous `inst_idx * 5s` stagger blocked
+    /// step() for the full span even when no recent call had been made.
+    /// See bot-strategy#122.
+    last_account_rest_call: Option<Instant>,
     history_path: PathBuf,
     data_dump_writer: Option<data_dump::RotatingDumpWriter>,
     replay_connector: Option<Arc<ReplayConnector>>,
@@ -311,6 +317,7 @@ impl PairTradeEngine {
             min_tick_warned,
             positions_ready: backtest_mode,
             open_positions: HashMap::new(),
+            last_account_rest_call: None,
             history_path,
             data_dump_writer,
             shutdown_pending: false,
@@ -2090,6 +2097,12 @@ impl PairTradeEngine {
 
     async fn refresh_equity_if_needed(&mut self, inst_idx: usize) -> Result<()> {
         const CACHE_SECS: u64 = 300;
+        // Minimum spacing between /account REST calls across all instances.
+        // Lighter enforces a per-IP short-window rate-limit on /account the
+        // sidecar can't see; empirically ~1 call per 5s survives. Shared
+        // across instances so step() only waits when a recent call exists,
+        // not unconditionally on every inst_idx > 0.
+        const MIN_ACCOUNT_SPACING: Duration = Duration::from_millis(5_500);
         if self.instances[inst_idx]
             .last_equity_fetch
             .map(|t| t.elapsed() < Duration::from_secs(CACHE_SECS))
@@ -2097,18 +2110,17 @@ impl PairTradeEngine {
         {
             return Ok(());
         }
-        // Stagger the 3-instance equity refresh burst. Lighter enforces a
-        // per-IP short-window rate limit on /account that the sidecar's
-        // 60k-weight/min bucket cannot see. Empirically the window is
-        // roughly 1 call per 3-5 seconds — 2s was observed insufficient
-        // (second instance 429'd at t=2s while first at t=0 and third at
-        // t=7s succeeded). Bumped to 5s so the three calls land at
-        // 0s / 5s / 10s, comfortably outside the failure zone.
-        // See bot-strategy#122.
-        let stagger_ms = (inst_idx as u64).saturating_mul(5_000);
-        if stagger_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+        // Wait only if a recent /account call needs spacing. In the common
+        // case (only one instance's cache expired, or step() has been idle
+        // long enough between iterations) this is a no-op. See
+        // bot-strategy#122.
+        if let Some(last) = self.last_account_rest_call {
+            let elapsed = last.elapsed();
+            if elapsed < MIN_ACCOUNT_SPACING {
+                tokio::time::sleep(MIN_ACCOUNT_SPACING - elapsed).await;
+            }
         }
+        self.last_account_rest_call = Some(Instant::now());
         match self.connector.get_balance(None).await {
             Ok(resp) => {
                 if let Some(eq) = resp.equity.to_f64() {
@@ -4357,6 +4369,7 @@ impl PairTradeEngine {
             min_tick_warned: HashSet::new(),
             positions_ready: false,
             open_positions: HashMap::new(),
+            last_account_rest_call: None,
             history_path,
             data_dump_writer: None,
             replay_connector: None,
