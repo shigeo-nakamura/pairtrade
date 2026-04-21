@@ -2097,6 +2097,17 @@ impl PairTradeEngine {
         {
             return Ok(());
         }
+        // Stagger the 3-instance equity refresh burst. Lighter enforces a
+        // per-account short-window rate limit on /account that the sidecar's
+        // per-IP weight bucket cannot see; three simultaneous get_balance
+        // calls (one per Pair-A/B/C instance) hit that ~3-call/60s window and
+        // the third returns 429, engaging the #52 cooldown gate. 2-second
+        // gaps keep us under the threshold with minimal extra latency.
+        // See bot-strategy#122.
+        let stagger_ms = (inst_idx as u64).saturating_mul(2_000);
+        if stagger_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+        }
         match self.connector.get_balance(None).await {
             Ok(resp) => {
                 if let Some(eq) = resp.equity.to_f64() {
