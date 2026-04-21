@@ -52,6 +52,12 @@ export DEBOT_STATUS_DIR="${DEBOT_STATUS_DIR:-/home/ec2-user/debot_status}"
 export DEBOT_STATUS_ID=debot-pair-btceth
 export PAIRTRADE_CONFIG_PATH=/opt/debot/configs/pairtrade/debot-pair-btceth.yaml
 
+# Perps-only bot — skip Lighter /api/v1/orderBooks spot fetch at market-cache
+# init. That call right after the heavy orderBookDetails response was the
+# single biggest trigger of the startup 429 / WAF cooldown. See
+# bot-strategy#128 follow-up.
+export LIGHTER_SKIP_SPOT_MARKETS=1
+
 # Make libsigner.so discoverable
 if [ -f /opt/debot/lib/libsigner.so ]; then
     export LIGHTER_GO_PATH=/opt/debot/lib
