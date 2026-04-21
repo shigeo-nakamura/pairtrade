@@ -51,6 +51,9 @@ impl DexConnectorBox {
         }
     }
 
+    // instance_id is only read from the lighter-sdk arm; extended-sdk-only
+    // builds (Tokyo, bot-strategy#123) don't consume it.
+    #[cfg_attr(not(feature = "lighter-sdk"), allow(unused_variables))]
     pub async fn create(
         dex_name: &str,
         rest_endpoint: &str,
