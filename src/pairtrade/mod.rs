@@ -4759,10 +4759,7 @@ mod shutdown_grace_tests {
         // file is checked here. Expected grace values are pinned per-file:
         // btceth's strategy A has a 7200s force_close override, so the grace
         // must cover it (see bot-strategy#50).
-        let expected: &[(&str, u64)] = &[
-            ("debot-pair-btceth.yaml", 7260),
-            ("debot-pair-solhype.yaml", 3660),
-        ];
+        let expected: &[(&str, u64)] = &[("debot-pair-btceth.yaml", 7260)];
         for (name, expected_grace) in expected {
             let path = config_path(name);
             let cfg = PairTradeConfig::from_yaml_path(&path)

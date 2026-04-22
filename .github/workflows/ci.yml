@@ -134,12 +134,11 @@ jobs:
 
   deploy:
     runs-on: ubuntu-latest
-    # Pairtrade restart waits for graceful shutdown; only debot-pair-btceth
-    # is restarted by the SSM step below, with shutdown_grace_secs=7260s
-    # (~2h01m, raised from 3660s per bot-strategy#50). Keep a generous
-    # ceiling so a slow SSM poll or backend stall doesn't truncate the
-    # wait. See SSM_DEPLOY_TIMEOUT_SECS below.
-    timeout-minutes: 240
+    # CI ships new binary + configs but no longer restarts the service
+    # (pairtrade#9). Operators restart debot-pair-btceth manually when
+    # convenient, so the SSM step finishes in seconds and does not need
+    # to cover the 2h graceful-shutdown window.
+    timeout-minutes: 60
     needs: [resolve-ref, build-test]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
@@ -285,7 +284,6 @@ jobs:
             --exclude "*.pyc"
           aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/"
           aws s3 cp debot/deploy/debot-pair-btceth.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth.service"
-          aws s3 cp debot/deploy/debot-pair-solhype.service "s3://${S3_BUCKET}/deploy/debot-pair-solhype.service"
           # Tokyo service unit is packaged alongside Frankfurt's so the
           # deploy-tokyo job can reuse the same `debot/` prefix for configs
           # + scripts and only override the binary under `debot-extended/`.
@@ -307,8 +305,7 @@ jobs:
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
-              "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot-pair-btceth debot-pair-solhype; do aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'",
-              "for svc in debot-pair-btceth; do if systemctl is-active --quiet $svc; then sudo systemctl restart $svc && echo \"Restarted $svc\"; fi; done"
+              "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot-pair-btceth; do aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'"
             ]
           }
           JSON
@@ -322,15 +319,10 @@ jobs:
             --query "Command.CommandId" \
             --output text)
 
-          # `aws ssm wait command-executed` only polls for ~100s, but the
-          # restart loop above runs `systemctl restart debot-pair-btceth`
-          # which blocks until graceful shutdown completes
-          # (shutdown_grace_secs = 7260s, ~2h01m, see bot-strategy#50 and
-          # pairtrade#4 / pairtrade#12). The built-in waiter therefore
-          # always times out and reports a misleading job failure even
-          # when the deploy is progressing fine on the host. Replace it
-          # with an explicit polling loop bounded by SSM_DEPLOY_TIMEOUT_SECS.
-          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-12000}  # ~3.3h: 1 bot * worst-case grace 7260s + slack for SSM/agent latency
+          # No service restart in the SSM commands above, so the command
+          # finishes as soon as the S3 pulls + daemon-reload complete.
+          # 30 minutes is ample for S3 transfers + SSM scheduling latency.
+          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-1800}
           POLL_INTERVAL_SECS=30
           deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))
           while :; do
