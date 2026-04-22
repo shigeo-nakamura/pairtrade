@@ -53,7 +53,12 @@ use status::{
 };
 use util::{round_price_by_tick, tail_std};
 
-
+/// Max age of the per-instance equity cache before `refresh_equity_if_needed`
+/// fetches a fresh value from the exchange. Also used at engine construction
+/// to stagger each instance's first refresh by `EQUITY_REFRESH_CACHE_SECS / N`
+/// so N instances don't bunch up on the same 5-min expiry boundary. See
+/// bot-strategy#142.
+const EQUITY_REFRESH_CACHE_SECS: u64 = 300;
 
 
 struct StrategyInstance {
@@ -280,11 +285,27 @@ impl PairTradeEngine {
                 });
             }
 
+            // Stagger the per-instance equity-refresh cycle so N instances
+            // don't all hit `/account` inside the same 5-min expiry boundary.
+            // Each instance is phase-shifted by i * (CACHE_SECS / N) so over
+            // a 5-min window the N calls are spread evenly (~100s apart for
+            // N=3) instead of back-to-back. Avoids Lighter's short-window
+            // 429 on the burst head (bot-strategy#142).
+            let instance_count = strategies.len();
+            let last_equity_fetch = if i == 0 || instance_count <= 1 {
+                None
+            } else {
+                let offset_secs =
+                    (EQUITY_REFRESH_CACHE_SECS * i as u64) / instance_count as u64;
+                let phase = EQUITY_REFRESH_CACHE_SECS.saturating_sub(offset_secs);
+                Some(Instant::now() - Duration::from_secs(phase))
+            };
+
             built_instances.push(StrategyInstance {
                 id: strategy.id.clone(),
                 connector: instance_connector,
                 equity_cache: strategy.equity_usd,
-                last_equity_fetch: None,
+                last_equity_fetch,
                 equity_usd_fallback: strategy.equity_usd,
                 states,
                 pnl_logger,
@@ -2096,7 +2117,7 @@ impl PairTradeEngine {
     }
 
     async fn refresh_equity_if_needed(&mut self, inst_idx: usize) -> Result<()> {
-        const CACHE_SECS: u64 = 300;
+        const CACHE_SECS: u64 = EQUITY_REFRESH_CACHE_SECS;
         // Minimum spacing between /account REST calls across all instances.
         // Lighter enforces a per-IP short-window rate-limit on /account the
         // sidecar can't see; empirically ~1 call per 5s survives. Shared
