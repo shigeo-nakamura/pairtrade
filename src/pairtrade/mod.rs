@@ -4512,6 +4512,8 @@ mod pending_tests {
     struct DummyConnector {
         calls: Mutex<Vec<(String, Decimal, OrderSide, Option<Decimal>, bool)>>,
         next_id: AtomicUsize,
+        balance_calls: AtomicUsize,
+        balance_equity: Mutex<Option<Decimal>>,
     }
 
     #[async_trait]
@@ -4556,7 +4558,14 @@ mod pending_tests {
         }
 
         async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
-            Ok(BalanceResponse::default())
+            self.balance_calls.fetch_add(1, Ordering::SeqCst);
+            let equity = self.balance_equity.lock().unwrap().unwrap_or_default();
+            Ok(BalanceResponse {
+                equity,
+                balance: equity,
+                position_entry_price: None,
+                position_sign: None,
+            })
         }
 
         async fn get_combined_balance(
@@ -4764,6 +4773,50 @@ mod pending_tests {
         assert_eq!(result.legs.len(), 1);
         assert_eq!(result.legs[0].target, dec("0.05"));
         assert_eq!(result.legs[0].filled, dec("0.02"));
+    }
+
+    #[tokio::test]
+    async fn refresh_equity_if_needed_skips_when_cache_is_fresh() {
+        let connector = Arc::new(DummyConnector::default());
+        *connector.balance_equity.lock().unwrap() = Some(dec("1234.56"));
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        engine.instances[0].last_equity_fetch = Some(Instant::now());
+        let initial_equity = engine.instances[0].equity_cache;
+
+        engine.refresh_equity_if_needed(0).await.unwrap();
+
+        assert_eq!(connector.balance_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.instances[0].equity_cache, initial_equity);
+    }
+
+    #[tokio::test]
+    async fn refresh_equity_if_needed_fetches_when_cache_is_stale() {
+        let connector = Arc::new(DummyConnector::default());
+        *connector.balance_equity.lock().unwrap() = Some(dec("1234.56"));
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        engine.instances[0].last_equity_fetch = Some(
+            Instant::now() - Duration::from_secs(EQUITY_REFRESH_CACHE_SECS + 1),
+        );
+
+        engine.refresh_equity_if_needed(0).await.unwrap();
+
+        assert_eq!(connector.balance_calls.load(Ordering::SeqCst), 1);
+        assert!((engine.instances[0].equity_cache - 1234.56).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn fetch_equity_rest_bypasses_cache() {
+        // Pre-entry path must hit REST regardless of cache age so the
+        // about-to-be-placed order is sized against a current value.
+        let connector = Arc::new(DummyConnector::default());
+        *connector.balance_equity.lock().unwrap() = Some(dec("777.0"));
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        engine.instances[0].last_equity_fetch = Some(Instant::now());
+
+        engine.fetch_equity_rest(0).await;
+
+        assert_eq!(connector.balance_calls.load(Ordering::SeqCst), 1);
+        assert!((engine.instances[0].equity_cache - 777.0).abs() < 1e-6);
     }
 }
 
