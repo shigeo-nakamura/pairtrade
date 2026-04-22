@@ -45,6 +45,12 @@ pub(super) struct PendingLeg {
     pub(super) target: Decimal,
     pub(super) filled: Decimal,
     pub(super) side: dex_connector::OrderSide,
+    /// Limit price posted for this leg, when placed as a limit/post-only
+    /// order. `None` for market orders and for reissue paths that do not
+    /// carry a limit forward. Used by the post-only fallback instrumentation
+    /// ([ORDER_FALLBACK_DETAIL], bot-strategy#165) to compare the posted
+    /// price against the book at timeout.
+    pub(super) limit_price: Option<Decimal>,
 }
 
 #[derive(Debug)]

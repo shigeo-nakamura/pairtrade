@@ -857,6 +857,7 @@ impl PairTradeEngine {
                             target: filled,
                             filled,
                             side: leg.side,
+                            limit_price: None,
                         });
                     }
                     new_legs.push(PendingLeg {
@@ -866,6 +867,7 @@ impl PairTradeEngine {
                         target: quantized_size,
                         filled: Decimal::ZERO,
                         side: leg.side,
+                        limit_price: None,
                     });
                 }
                 Err(e) => {
@@ -961,6 +963,7 @@ impl PairTradeEngine {
                         target: size,
                         filled: Decimal::ZERO,
                         side: leg.side,
+                        limit_price: None,
                     });
                 }
                 Err(e) => {
@@ -2868,6 +2871,58 @@ impl PairTradeEngine {
                     && pending.placed_at.elapsed()
                         >= Duration::from_secs(recon_pp.entry_post_only_timeout_secs)
                 {
+                    // Phase 0 instrumentation (bot-strategy#165): capture per-leg
+                    // fill status, posted limit vs current book, and z-movement
+                    // from entry to timeout so we can tell why the post-only
+                    // legs didn't fill before falling back to taker.
+                    let (z_entry, z_now) = {
+                        let state_ref = self.instances[inst_idx].states.get(key);
+                        let ze = state_ref.map(|s| s.z_entry).unwrap_or(0.0);
+                        let zn = state_ref
+                            .and_then(|s| s.z_score().map(|(z, _)| z))
+                            .unwrap_or(0.0);
+                        (ze, zn)
+                    };
+                    let leg_details: Vec<String> = pending
+                        .legs
+                        .iter()
+                        .map(|leg| {
+                            let filled = status
+                                .fills
+                                .get(&leg.order_id)
+                                .cloned()
+                                .unwrap_or(Decimal::ZERO);
+                            let open = status.open_ids.contains(&leg.order_id);
+                            let snap = price_map.get(&leg.symbol);
+                            let bid = snap.and_then(|s| s.bid_price);
+                            let ask = snap.and_then(|s| s.ask_price);
+                            format!(
+                                "[{}|{:?}|tgt={}|filled={}|open={}|limit={}|bid={}|ask={}]",
+                                leg.symbol,
+                                leg.side,
+                                leg.target,
+                                filled,
+                                open,
+                                leg.limit_price
+                                    .map(|d| d.to_string())
+                                    .unwrap_or_else(|| "none".into()),
+                                bid.map(|d| d.to_string())
+                                    .unwrap_or_else(|| "?".into()),
+                                ask.map(|d| d.to_string())
+                                    .unwrap_or_else(|| "?".into()),
+                            )
+                        })
+                        .collect();
+                    log::info!(
+                        "[ORDER_FALLBACK_DETAIL] {} elapsed={}s dir={:?} z_entry={:.2} z_now={:.2} legs={}",
+                        key,
+                        pending.placed_at.elapsed().as_secs(),
+                        pending.direction,
+                        z_entry,
+                        z_now,
+                        leg_details.join(" ")
+                    );
+
                     // Post-only entry timed out; cancel and reissue as taker
                     log::info!(
                         "[ORDER] {} post-only entry timeout ({}s), falling back to taker",
@@ -3175,6 +3230,7 @@ impl PairTradeEngine {
                                     target: quantized,
                                     filled: Decimal::ZERO,
                                     side: leg.side,
+                                    limit_price: None,
                                 });
                                 log::warn!(
                                     "[ORDER] Retrying exit leg {} size={} mode=MARKET",
@@ -3800,6 +3856,7 @@ impl PairTradeEngine {
             target: target_a,
             filled: Decimal::ZERO,
             side: side_a,
+            limit_price: limit_a,
         });
 
         let res_b = match self
@@ -3841,6 +3898,7 @@ impl PairTradeEngine {
             target: target_b,
             filled: Decimal::ZERO,
             side: side_b,
+            limit_price: limit_b,
         });
         Ok(legs)
     }
@@ -4045,6 +4103,7 @@ impl PairTradeEngine {
                         target: qty_a,
                         filled: Decimal::ZERO,
                         side: side_a,
+                        limit_price: None,
                     });
                     res_a = Some(res);
                 }
@@ -4132,6 +4191,7 @@ impl PairTradeEngine {
                     target: qty_b,
                     filled: Decimal::ZERO,
                     side: side_b,
+                    limit_price: None,
                 });
             }
         }
@@ -4700,6 +4760,7 @@ mod pending_tests {
                 target: dec("0.05"),
                 filled: Decimal::ZERO,
                 side: OrderSide::Long,
+                limit_price: None,
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
@@ -4757,6 +4818,7 @@ mod pending_tests {
                 target: dec("0.05"),
                 filled: Decimal::ZERO,
                 side: OrderSide::Long,
+                limit_price: None,
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
