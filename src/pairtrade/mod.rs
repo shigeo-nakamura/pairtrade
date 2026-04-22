@@ -535,11 +535,17 @@ impl PairTradeEngine {
         } else {
             // --- Live Mode ---
             log::info!("[LIVE] Running in live mode.");
+            // Allow the per-instance WS streams to warm up and populate their
+            // position snapshots BEFORE force_close_on_startup probes them;
+            // otherwise the first get_positions attempts fail with "positions
+            // not ready from websocket" and the retry loop used to call
+            // close_all_positions blindly (which in turn REST-hit /account and
+            // occasionally 429'd during the multi-instance startup burst).
+            // bot-strategy#143.
+            sleep(Duration::from_secs(5)).await;
             if self.cfg.force_close_on_startup {
                 self.force_close_on_startup().await?;
             }
-            // allow connector/WS to warm up before first step to reduce spurious logs
-            sleep(Duration::from_secs(5)).await;
             // Wall-clock aligned ticker: fires at floor(now/interval)*interval + interval boundaries
             // so every bot process observing the same stream ticks at identical wall-clock seconds.
             // This is required on top of the BarBuilder bucket alignment (pairtrade#4): without
@@ -1032,8 +1038,17 @@ impl PairTradeEngine {
                         attempts,
                         Self::format_positions_summary(&positions)
                     );
+                    if let Err(err) = self.connector.close_all_positions(None).await {
+                        log::error!("[Startup] close_all_positions failed: {:?}", err);
+                    }
                 }
                 Err(err) => {
+                    // Don't call close_all_positions when we can't confirm positions
+                    // state from the WS cache — its internal /account REST call would
+                    // burst the startup rate-limit window alongside the other
+                    // instances' connects and 429, producing a spurious RateLimit
+                    // email. Just wait for the WS to populate on the next attempt.
+                    // See bot-strategy#143.
                     log::warn!(
                         "[Startup] get_positions failed on attempt {}/{}: {:?}",
                         attempt,
@@ -1041,10 +1056,6 @@ impl PairTradeEngine {
                         err
                     );
                 }
-            }
-
-            if let Err(err) = self.connector.close_all_positions(None).await {
-                log::error!("[Startup] close_all_positions failed: {:?}", err);
             }
 
             if attempt < attempts && wait_secs > 0 {
