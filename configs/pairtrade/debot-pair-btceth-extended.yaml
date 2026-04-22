@@ -60,7 +60,11 @@ max_dd_pct: 0.10
 cooldown_secs: 60
 slippage_bps: 0
 fee_bps: 2.5
-entry_post_only_timeout_secs: 30
+# Extended BTC tick size is 10 vs Lighter's 1, so the price grid is ~10x
+# coarser and post-only limits take proportionally longer to be crossed.
+# Raised from 30s to 120s (conservative 4x of tick-ratio) to reduce taker
+# fallbacks while keeping the entry signal fresh. See bot-strategy#165.
+entry_post_only_timeout_secs: 120
 
 spread_velocity_max_sigma_per_min: 0.15
 spread_trend_max_slope_sigma: 1.0

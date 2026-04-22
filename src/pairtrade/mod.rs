@@ -2896,8 +2896,9 @@ impl PairTradeEngine {
                             let snap = price_map.get(&leg.symbol);
                             let bid = snap.and_then(|s| s.bid_price);
                             let ask = snap.and_then(|s| s.ask_price);
+                            let tick = snap.and_then(|s| s.min_tick);
                             format!(
-                                "[{}|{:?}|tgt={}|filled={}|open={}|limit={}|bid={}|ask={}]",
+                                "[{}|{:?}|tgt={}|filled={}|open={}|limit={}|bid={}|ask={}|tick={}]",
                                 leg.symbol,
                                 leg.side,
                                 leg.target,
@@ -2909,6 +2910,8 @@ impl PairTradeEngine {
                                 bid.map(|d| d.to_string())
                                     .unwrap_or_else(|| "?".into()),
                                 ask.map(|d| d.to_string())
+                                    .unwrap_or_else(|| "?".into()),
+                                tick.map(|d| d.to_string())
                                     .unwrap_or_else(|| "?".into()),
                             )
                         })
