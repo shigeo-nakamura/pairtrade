@@ -54,11 +54,13 @@ use status::{
 use util::{round_price_by_tick, tail_std};
 
 /// Max age of the per-instance equity cache before `refresh_equity_if_needed`
-/// fetches a fresh value from the exchange. Also used at engine construction
-/// to stagger each instance's first refresh by `EQUITY_REFRESH_CACHE_SECS / N`
-/// so N instances don't bunch up on the same 5-min expiry boundary. See
-/// bot-strategy#142.
-const EQUITY_REFRESH_CACHE_SECS: u64 = 300;
+/// fetches a fresh value from the exchange. Now a low-frequency dashboard tick:
+/// exit/loss-cut uses locally-computed PnL from WS prices, so `equity_cache`
+/// only scales the slowly-drifting R-budget and feeds the status reporter.
+/// Entry sizing forces a fresh fetch inline (see `fetch_equity_rest` call in
+/// the entry branch of `step()`), independent of this cache. See
+/// bot-strategy#156.
+const EQUITY_REFRESH_CACHE_SECS: u64 = 1800;
 
 
 struct StrategyInstance {
@@ -2024,6 +2026,12 @@ impl PairTradeEngine {
         });
         if let Some(plan) = best_entry {
             if let TradeAction::Open { direction, z, beta } = plan.action {
+                // Force-fresh equity immediately before sizing: entries happen
+                // rarely enough that this REST call is cheap, and it keeps
+                // notional sized against the current balance rather than the
+                // 30-min cache used for dashboard / R-budget. See
+                // bot-strategy#156.
+                self.fetch_equity_rest(inst_idx).await;
                 let qtys = self
                     .hedged_sizes(inst_idx, &plan.pair, beta, &plan.p1, &plan.p2)
                     .context("hedged_sizes")?;
@@ -2129,12 +2137,6 @@ impl PairTradeEngine {
 
     async fn refresh_equity_if_needed(&mut self, inst_idx: usize) -> Result<()> {
         const CACHE_SECS: u64 = EQUITY_REFRESH_CACHE_SECS;
-        // Minimum spacing between /account REST calls across all instances.
-        // Lighter enforces a per-IP short-window rate-limit on /account the
-        // sidecar can't see; empirically ~1 call per 5s survives. Shared
-        // across instances so step() only waits when a recent call exists,
-        // not unconditionally on every inst_idx > 0.
-        const MIN_ACCOUNT_SPACING: Duration = Duration::from_millis(5_500);
         if self.instances[inst_idx]
             .last_equity_fetch
             .map(|t| t.elapsed() < Duration::from_secs(CACHE_SECS))
@@ -2142,10 +2144,17 @@ impl PairTradeEngine {
         {
             return Ok(());
         }
-        // Wait only if a recent /account call needs spacing. In the common
-        // case (only one instance's cache expired, or step() has been idle
-        // long enough between iterations) this is a no-op. See
-        // bot-strategy#122.
+        self.fetch_equity_rest(inst_idx).await;
+        Ok(())
+    }
+
+    async fn fetch_equity_rest(&mut self, inst_idx: usize) {
+        // Minimum spacing between /account REST calls across all instances.
+        // Lighter enforces a per-IP short-window rate-limit on /account the
+        // sidecar can't see; empirically ~1 call per 5s survives. Shared
+        // across instances so step() only waits when a recent call exists,
+        // not unconditionally on every inst_idx > 0. See bot-strategy#122.
+        const MIN_ACCOUNT_SPACING: Duration = Duration::from_millis(5_500);
         if let Some(last) = self.last_account_rest_call {
             let elapsed = last.elapsed();
             if elapsed < MIN_ACCOUNT_SPACING {
@@ -2169,7 +2178,6 @@ impl PairTradeEngine {
                 self.instances[inst_idx].last_equity_fetch = Some(Instant::now());
             }
         }
-        Ok(())
     }
 
     async fn sync_positions_from_exchange(
