@@ -359,6 +359,9 @@ jobs:
   # negligible transfer cost). Uses a separate service unit
   # `debot-pair-btceth-extended.service` so the Frankfurt Lighter bot is
   # unaffected even if both regions run simultaneously.
+  # CI ships new binary + configs but does not restart the service (symmetric
+  # with the Frankfurt `deploy` job, pairtrade#9). Operators restart
+  # debot-pair-btceth-extended manually once positions are flat.
   deploy-tokyo:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -483,7 +486,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.TOKYO_REGION }}
 
-      - name: Deploy to Tokyo via SSM
+      - name: Deploy to Tokyo via SSM (no restart)
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           TOKYO_INSTANCE_ID: ${{ secrets.TOKYO_INSTANCE_ID || vars.TOKYO_INSTANCE_ID }}
@@ -497,8 +500,7 @@ jobs:
               "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-extended/scripts __INSTALL_DIR__/scripts",
               "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot-extended/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
-              "/bin/bash -lc 'set -e; aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/deploy/debot-pair-btceth-extended.service /tmp/debot-pair-btceth-extended.service; if [ ! -f /etc/systemd/system/debot-pair-btceth-extended.service ] || ! cmp -s /etc/systemd/system/debot-pair-btceth-extended.service /tmp/debot-pair-btceth-extended.service; then sudo mv /tmp/debot-pair-btceth-extended.service /etc/systemd/system/debot-pair-btceth-extended.service; sudo systemctl daemon-reload; else rm /tmp/debot-pair-btceth-extended.service; fi'",
-              "if systemctl is-active --quiet debot-pair-btceth-extended; then sudo systemctl restart debot-pair-btceth-extended && echo \"Restarted debot-pair-btceth-extended\"; else echo \"debot-pair-btceth-extended is not currently active; skipping restart (start it manually once env files are in place)\"; fi"
+              "/bin/bash -lc 'set -e; aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/deploy/debot-pair-btceth-extended.service /tmp/debot-pair-btceth-extended.service; if [ ! -f /etc/systemd/system/debot-pair-btceth-extended.service ] || ! cmp -s /etc/systemd/system/debot-pair-btceth-extended.service /tmp/debot-pair-btceth-extended.service; then sudo mv /tmp/debot-pair-btceth-extended.service /etc/systemd/system/debot-pair-btceth-extended.service; sudo systemctl daemon-reload; else rm /tmp/debot-pair-btceth-extended.service; fi'"
             ]
           }
           JSON
@@ -512,7 +514,10 @@ jobs:
             --query "Command.CommandId" \
             --output text)
 
-          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-1800}  # 30 min ceiling for a fast restart path (no 2h graceful shutdown)
+          # No service restart in the SSM commands above (symmetric with the
+          # Frankfurt deploy job, pairtrade#9). Operators restart
+          # debot-pair-btceth-extended manually when positions are flat.
+          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-1800}
           POLL_INTERVAL_SECS=15
           deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))
           while :; do
