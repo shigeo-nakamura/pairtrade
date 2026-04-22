@@ -43,8 +43,8 @@ entry_z_score_min: 1.0
 entry_z_score_max: 2.0
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
-force_close_time_secs: 7200  # Strategy A override from the Lighter config
-shutdown_grace_secs: 7260
+force_close_time_secs: 3600  # Halved from 7200 to raise trade frequency during the Extended experiment
+shutdown_grace_secs: 3660
 
 # Phase 3 is a monitor-and-collect run on a tiny Extended balance (~$106 at
 # deploy). equity_usd_fallback stays close to reality so that a transient
