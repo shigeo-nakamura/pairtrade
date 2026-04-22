@@ -81,11 +81,20 @@ async fn init_engine_with_retry(
             }
             Err(e) => {
                 let chain = format!("{:?}", e);
+                // Match:
+                //   - raw Lighter 429 JSON still present in a stringified error
+                //   - dex-connector's `DexError::RateLimited` (Display:
+                //     `Lighter WAF cooldown active until unix=... (rate-limited)`).
+                //     `CheckClient` 429 now returns this variant after
+                //     engaging the shared cooldown (bot-strategy#151), so
+                //     the rate-limit shape is always the full 75s wait
+                //     rather than a 3s retry storm.
                 let transient_429 = chain.contains("Too Many Requests")
                     || chain.contains("\"code\":23000")
-                    || chain.contains(" 429 ");
-                let transient = transient_429
+                    || chain.contains(" 429 ")
                     || chain.contains("rate-limited")
+                    || chain.contains("WAF cooldown");
+                let transient = transient_429
                     || (chain.contains("Could not find account for api_key_index=")
                         && chain.contains("Set LIGHTER_ACCOUNT_INDEX"));
                 if !transient || attempt >= MAX_ATTEMPTS {
