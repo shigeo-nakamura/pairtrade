@@ -42,7 +42,6 @@ while IFS='=' read -r k v; do export "$k=$v"; done < <(vars_for_variant C "$ENV_
 # own suffixed copy or fail loudly.
 unset LIGHTER_PUBLIC_API_KEY LIGHTER_PRIVATE_API_KEY LIGHTER_ACCOUNT_INDEX
 unset LIGHTER_API_KEY_INDEX LIGHTER_WALLET_ADDRESS LIGHTER_EVM_WALLET_PRIVATE_KEY
-unset LIGHTER_MAINTENANCE_TTL_MINS
 
 # Production paths. DEBOT_STATUS_ID=debot-pair-btceth makes the
 # StatusReporter::from_env_for_instance suffix logic produce
