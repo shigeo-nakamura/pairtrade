@@ -66,6 +66,16 @@ export PAIRTRADE_CONFIG_PATH=/opt/debot/configs/pairtrade/debot-pair-btceth.yaml
 # bot-strategy#128 follow-up.
 export LIGHTER_SKIP_SPOT_MARKETS=1
 
+# Disable the per-connector startup random jitter. The consolidated A/B/C
+# deployment uses INIT_ACCOUNT_SPACING in pairtrade's create_connector loop
+# to deterministically space the three CheckClient() hits on /api/v1/apikeys
+# (which throttles per-wallet, and all three sub-accounts share one wallet).
+# The dex-connector default of 0..30s random sleep at start() then collapses
+# that spacing — A=9s + B=5s after the 10s parent gap = both /apikeys hits
+# inside the per-wallet short-window → 429 on every restart. See
+# bot-strategy#163.
+export LIGHTER_STARTUP_JITTER_SECS=0
+
 # Make libsigner.so discoverable
 if [ -f /opt/debot/lib/libsigner.so ]; then
     export LIGHTER_GO_PATH=/opt/debot/lib

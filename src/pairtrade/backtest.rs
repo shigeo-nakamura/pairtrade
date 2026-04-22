@@ -81,12 +81,19 @@ pub(super) async fn create_connector(
         // and /apikeys. Each instance's connector.start() triggers a Go-SDK
         // CheckClient() call that hits /apikeys?account_index=X&api_key_index=Y
         // from inside the FFI, so the shared Rust rate-tracker can't see it.
-        // Space starts at 10s so 3 validation hits spread over ~20s and stay
-        // well below the server-side throttle — even when combined with the
-        // /apikeys bursts B/C's discovery path used to emit before their env
-        // files got LIGHTER_ACCOUNT_INDEX hard-coded. See bot-strategy#127 /
-        // #143.
-        const INIT_ACCOUNT_SPACING: Duration = Duration::from_secs(10);
+        // All three production sub-accounts share one wallet, and /apikeys
+        // is throttled per-wallet, so the three validation hits must stay
+        // spread outside Lighter's per-wallet short-window (~60s, observed
+        // via a 109s Retry-After on 429 in 2026-04-22 startup). 30s here
+        // puts the three calls at t=0, t=30, t=60 — outside the window.
+        // The previous 10s setting still tripped 429 because each
+        // LighterConnector::start() then ran an independent random
+        // LIGHTER_STARTUP_JITTER_SECS jitter (default 30s) that could
+        // collapse the parent's spacing back together; see bot-strategy#127
+        // / #143 / #163. The wrapper now exports
+        // LIGHTER_STARTUP_JITTER_SECS=0 so this constant is the only thing
+        // controlling the cadence.
+        const INIT_ACCOUNT_SPACING: Duration = Duration::from_secs(30);
         let mut last_iter_start: Option<Instant> = None;
         for strategy in &cfg.strategies {
             if let Some(t) = last_iter_start {
