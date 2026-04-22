@@ -18,7 +18,9 @@ source "$ENV_DIR/debot_secrets_common.env"
 source "$ENV_DIR/debot.env"
 
 vars_for_variant() {
-    # Echoes "VAR_<id>=value" lines for the given env file. Runs in a
+    # Echoes "VAR_<id>=value" lines for the given env file's per-account
+    # credentials, plus "VAR=value" lines (no suffix) for process-wide
+    # settings that happen to live in the same per-account file. Runs in a
     # subshell so the sourced exports do not leak into the parent.
     (
         # shellcheck disable=SC1090
@@ -28,6 +30,13 @@ vars_for_variant() {
                    LIGHTER_EVM_WALLET_PRIVATE_KEY LIGHTER_ACCOUNT_INDEX; do
             if [ -n "${!var:-}" ]; then
                 printf '%s_%s=%s\n' "$var" "$1" "${!var}"
+            fi
+        done
+        # Process-wide settings (no _A/_B/_C suffix). All variants define
+        # the same value so order is irrelevant — last writer wins.
+        for var in LIGHTER_MAINTENANCE_TTL_MINS; do
+            if [ -n "${!var:-}" ]; then
+                printf '%s=%s\n' "$var" "${!var}"
             fi
         done
     )
