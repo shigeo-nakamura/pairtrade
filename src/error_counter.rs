@@ -25,8 +25,10 @@ pub fn global() -> Option<&'static ErrorCounterHandle> {
 }
 
 /// Window (seconds) for the short-term rolling counts published in the
-/// status snapshot.
-const ROLLING_WINDOW_SECS: i64 = 300;
+/// status snapshot. Was 300 until bot-strategy#168: GitHub Actions scheduled
+/// runs drift 40–70 min under load so a 5-min window let warns age out
+/// between polls. 1800 (30 min) absorbs typical drift.
+const ROLLING_WINDOW_SECS: i64 = 1800;
 
 /// Keep the last error message truncated to this many chars so the
 /// dashboard can display it without blowing up the JSON payload.
@@ -34,8 +36,8 @@ const LAST_ERROR_MAX_CHARS: usize = 200;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorSummary {
-    pub error_count_5m: u64,
-    pub warn_count_5m: u64,
+    pub error_count_30m: u64,
+    pub warn_count_30m: u64,
     pub error_count_total: u64,
     pub warn_count_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,7 +67,7 @@ impl ErrorCounterHandle {
     pub fn snapshot(&self) -> ErrorSummary {
         let now = chrono::Utc::now().timestamp();
         let cutoff = now - ROLLING_WINDOW_SECS;
-        let (err_5m, warn_5m) = {
+        let (err_window, warn_window) = {
             let mut recent = self.counters.recent.lock().unwrap();
             while let Some(&(ts, _)) = recent.front() {
                 if ts < cutoff {
@@ -94,8 +96,8 @@ impl ErrorCounterHandle {
             None => (None, None),
         };
         ErrorSummary {
-            error_count_5m: err_5m,
-            warn_count_5m: warn_5m,
+            error_count_30m: err_window,
+            warn_count_30m: warn_window,
             error_count_total: self.counters.error_total.load(Ordering::Relaxed),
             warn_count_total: self.counters.warn_total.load(Ordering::Relaxed),
             last_error_ts: last_err_ts,
