@@ -3790,7 +3790,7 @@ impl PairTradeEngine {
             };
             let max_dev = dev_a.max(dev_b);
             if max_dev > pp_for_dev.hedge_ratio_max_deviation {
-                log::info!(
+                log::warn!(
                     "[ORDER_ADJUST][ENTRY] {}/{} BLOCKED: size rounding deviation {:.1}% exceeds limit {:.1}%",
                     pair.base, pair.quote, max_dev * 100.0, pp_for_dev.hedge_ratio_max_deviation * 100.0
                 );
