@@ -27,7 +27,7 @@ permissions:
 env:
   AWS_REGION: eu-central-1
   INSTALL_DIR: /opt/debot
-  DEX_CONNECTOR_REF: v4.2.74
+  DEX_CONNECTOR_REF: v4.2.75
   LIGHTER_GO_REF: v1.0.2
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
 
