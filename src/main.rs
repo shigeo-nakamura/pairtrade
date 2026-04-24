@@ -3,11 +3,9 @@ use debot::error_counter::{self, ErrorCountingLogger};
 use debot::pairtrade::{PairTradeConfig, PairTradeEngine};
 use debot::ports::replay_dex::ReplayConnector;
 use env_logger::Builder;
-use log::LevelFilter;
 use std::collections::HashMap;
 use std::env;
 use std::io::Write;
-use std::str::FromStr;
 use std::sync::Arc;
 
 fn init_logger() {
@@ -16,11 +14,13 @@ fn init_logger() {
         .parse::<i32>()
         .expect("Invalid TIMEZONE_OFFSET");
     let offset = FixedOffset::east_opt(offset_seconds).expect("Invalid offset");
-    let filter = LevelFilter::from_str(&env::var("RUST_LOG").unwrap_or_else(|_| {
-        "info,tokio_tungstenite=info,tungstenite=info".to_string()
-    }))
-    .unwrap_or(LevelFilter::Info);
-    let inner = Builder::from_default_env()
+    // RUST_LOG must go through env_logger's parser to honor per-module specs like
+    // "info,pairtrade=debug". Prior impl parsed it with LevelFilter::from_str
+    // (single-level only → fell back to Info) and then appended .filter(None, _),
+    // which overrode the module directives. See bot-strategy#194.
+    let env = env_logger::Env::default()
+        .filter_or("RUST_LOG", "info,tokio_tungstenite=info,tungstenite=info");
+    let inner = Builder::from_env(env)
         .format(move |buf, record| {
             let utc_now: DateTime<Utc> = Utc::now();
             let local_now = utc_now.with_timezone(&offset);
@@ -32,7 +32,6 @@ fn init_logger() {
                 record.args()
             )
         })
-        .filter(None, filter)
         .build();
     let max_level = inner.filter();
     let (logger, handle) = ErrorCountingLogger::wrap(Box::new(inner));
