@@ -1140,7 +1140,7 @@ impl PairTradeEngine {
         Ok(())
     }
 
-    async fn force_close_all_positions(&self, key: &str, reason: &str) {
+    async fn force_close_all_positions(&mut self, key: &str, reason: &str) {
         if self.cfg.dry_run || self.cfg.observe_only {
             log::warn!(
                 "[EXIT] {} force close skipped (mode) reason={}",
@@ -1148,6 +1148,25 @@ impl PairTradeEngine {
                 reason
             );
             return;
+        }
+        if let Some((base, quote)) = key.split_once('/') {
+            if let Ok(positions) = self.connector.get_positions().await {
+                let has_open = |sym: &str| {
+                    positions
+                        .iter()
+                        .any(|p| p.symbol == sym && p.sign != 0 && p.size > Decimal::ZERO)
+                };
+                if !has_open(base) && !has_open(quote) {
+                    self.open_positions.remove(base);
+                    self.open_positions.remove(quote);
+                    log::info!(
+                        "[EXIT] {} close_all_positions skipped; positions already flat reason={}",
+                        key,
+                        reason
+                    );
+                    return;
+                }
+            }
         }
         log::error!(
             "[EXIT] {} exceeded exit retries; invoking close_all_positions reason={}",
