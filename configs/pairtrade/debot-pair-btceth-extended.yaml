@@ -54,7 +54,6 @@ risk_pct_per_trade: 0.40
 equity_usd_fallback: 100
 max_leverage: 1
 max_loss_r_mult: 1.0
-max_dd_pct: 0.10
 
 # Execution — fee_bps bumped from 0 to 2.5 for Extended's taker.
 cooldown_secs: 60

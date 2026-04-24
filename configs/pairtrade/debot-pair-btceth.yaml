@@ -47,7 +47,6 @@ risk_pct_per_trade: 0.40
 equity_usd_fallback: 1000
 max_leverage: 1
 max_loss_r_mult: 1.0    # Bot C champion value (was 3.0). Swapped 2026-04-07.
-max_dd_pct: 0.10                      # Max drawdown tolerance for auto-sizing
 
 # Execution
 cooldown_secs: 60

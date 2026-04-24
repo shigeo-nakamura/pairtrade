@@ -28,6 +28,7 @@ mod order_pricing;
 mod pair_eval;
 mod pnl_log;
 mod regime;
+mod risk_io;
 mod sizing;
 mod state;
 mod stats;
@@ -61,6 +62,14 @@ use util::{round_price_by_tick, tail_std};
 /// the entry branch of `step()`), independent of this cache. See
 /// bot-strategy#156.
 const EQUITY_REFRESH_CACHE_SECS: u64 = 1800;
+
+/// Sentinel file that, when present, blocks all new entries without
+/// requiring `systemctl stop`. Existing positions still exit normally.
+/// Manage via `ssh debot "sudo touch /opt/debot/KILL_SWITCH"` to engage
+/// and `sudo rm /opt/debot/KILL_SWITCH` to release. Engages at the top
+/// of every `step_shared` tick, so reaction latency matches
+/// `interval_secs`. See bot-strategy#185 Phase 1-2.
+const KILL_SWITCH_PATH: &str = "/opt/debot/KILL_SWITCH";
 
 
 struct StrategyInstance {
@@ -123,6 +132,13 @@ pub struct PairTradeEngine {
     /// See bot-strategy#122.
     last_account_rest_call: Option<Instant>,
     history_path: PathBuf,
+    /// Path for the risk-state persistence file (circuit breaker counters
+    /// + cool-down deadline). Sibling of `history_path`. See bot-strategy#185.
+    risk_state_path: PathBuf,
+    /// Cached result of the most recent `KILL_SWITCH_PATH` existence check.
+    /// Refreshed at the top of every `step_shared` tick. True blocks new
+    /// entries across all instances.
+    kill_switch_active: bool,
     data_dump_writer: Option<data_dump::RotatingDumpWriter>,
     replay_connector: Option<Arc<ReplayConnector>>,
     /// Graceful shutdown flag. When true:
@@ -193,6 +209,7 @@ impl PairTradeEngine {
         }
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
+        let risk_state_path = risk_state_path_for(&history_path);
 
         let min_order_warned = HashSet::new();
         let min_tick_warned = HashSet::new();
@@ -342,6 +359,8 @@ impl PairTradeEngine {
             open_positions: HashMap::new(),
             last_account_rest_call: None,
             history_path,
+            risk_state_path,
+            kill_switch_active: false,
             data_dump_writer,
             shutdown_pending: false,
         })
@@ -488,6 +507,7 @@ impl PairTradeEngine {
             self.should_post_only()
         );
         self.load_history_from_disk();
+        self.load_risk_state();
         // BT warm-start: load a live history snapshot so the replay starts
         // with an identical spread_history / beta to the live bot, instead
         // of building from scratch over the first 4 hours of data.
@@ -1162,6 +1182,8 @@ impl PairTradeEngine {
             return Ok(None);
         }
 
+        self.update_kill_switch_state();
+
         let price_map = self.fetch_latest_prices().await?;
 
         if let Some(writer) = &mut self.data_dump_writer {
@@ -1595,6 +1617,7 @@ impl PairTradeEngine {
 
             let mut log_positions_not_ready = false;
             let circuit_breaker_until_ts_snapshot = self.instances[inst_idx].circuit_breaker_until_ts;
+            let kill_switch_active_snapshot = self.kill_switch_active;
             let consecutive_losses_snapshot = self.instances[inst_idx].consecutive_losses;
             let equity_cache_snapshot = self.instances[inst_idx].equity_cache;
             let equity_fallback_snapshot = self.instances[inst_idx].equity_usd_fallback;
@@ -1671,6 +1694,9 @@ impl PairTradeEngine {
                                 }
                             } else if !self.positions_ready {
                                 log_positions_not_ready = true;
+                            } else if kill_switch_active_snapshot {
+                                // entry blocked by KILL_SWITCH sentinel file;
+                                // engagement/release is logged in step_shared
                             } else if circuit_breaker_until_ts_snapshot
                                 .map_or(false, |until| now_ts < until)
                             {
@@ -1856,8 +1882,10 @@ impl PairTradeEngine {
                                 hold_secs,
                             );
                             self.write_pnl_record(inst_idx, record);
+                            let mut risk_state_dirty = false;
                             if pnl_value < 0.0 {
                                 self.instances[inst_idx].consecutive_losses += 1;
+                                risk_state_dirty = true;
                                 if let Some(cooldown) = self
                                     .cfg
                                     .circuit_breaker_cooldown_for(self.instances[inst_idx].consecutive_losses)
@@ -1873,10 +1901,14 @@ impl PairTradeEngine {
                             } else if pnl_value > 0.0 {
                                 if self.instances[inst_idx].consecutive_losses > 0 {
                                     log::info!("[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)", self.instances[inst_idx].consecutive_losses);
+                                    risk_state_dirty = true;
                                 }
                                 self.instances[inst_idx].consecutive_losses = 0;
                                 self.instances[inst_idx].circuit_breaker_until = None;
                                 self.instances[inst_idx].circuit_breaker_until_ts = None;
+                            }
+                            if risk_state_dirty {
+                                self.persist_risk_state();
                             }
                         }
                         log::info!(
@@ -2677,6 +2709,99 @@ impl PairTradeEngine {
         }
     }
 
+    /// Restore circuit-breaker state from disk so a crash or `systemctl
+    /// restart` during an active cool-down does not silently clear the
+    /// consecutive-loss counter. See bot-strategy#185 Phase 1-3.
+    fn load_risk_state(&mut self) {
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let loaded = risk_io::load_risk_state(&self.risk_state_path);
+        if loaded.is_empty() {
+            return;
+        }
+        let now_ts = self.current_now_ts();
+        for inst in &mut self.instances {
+            let Some(state) = loaded.get(&inst.id) else { continue };
+            inst.consecutive_losses = state.consecutive_losses;
+            match state.circuit_breaker_until_ts {
+                Some(until_ts) if until_ts > now_ts => {
+                    inst.circuit_breaker_until_ts = Some(until_ts);
+                    let remaining_secs = (until_ts - now_ts).max(0) as u64;
+                    inst.circuit_breaker_until =
+                        Some(Instant::now() + Duration::from_secs(remaining_secs));
+                    log::warn!(
+                        "[RISK_STATE] {} restored: consecutive_losses={}, cool-down {}s remaining",
+                        inst.id, inst.consecutive_losses, remaining_secs
+                    );
+                }
+                Some(_) => {
+                    // Persisted cool-down already expired; keep the loss
+                    // counter but leave both `until` fields at None so the
+                    // entry gate stops blocking on a stale deadline.
+                    if inst.consecutive_losses > 0 {
+                        log::info!(
+                            "[RISK_STATE] {} restored: consecutive_losses={}, prior cool-down expired",
+                            inst.id, inst.consecutive_losses
+                        );
+                    }
+                }
+                None => {
+                    if inst.consecutive_losses > 0 {
+                        log::info!(
+                            "[RISK_STATE] {} restored: consecutive_losses={}",
+                            inst.id, inst.consecutive_losses
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn persist_risk_state(&self) {
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let instances: HashMap<String, risk_io::InstanceRiskState> = self
+            .instances
+            .iter()
+            .map(|inst| {
+                (
+                    inst.id.clone(),
+                    risk_io::InstanceRiskState {
+                        consecutive_losses: inst.consecutive_losses,
+                        circuit_breaker_until_ts: inst.circuit_breaker_until_ts,
+                    },
+                )
+            })
+            .collect();
+        risk_io::persist_risk_state(&self.risk_state_path, &instances);
+    }
+
+    /// Refresh `kill_switch_active` from the sentinel file. Called at the
+    /// top of every `step_shared` tick. Logs on state transitions so the
+    /// journal shows exactly when entries were blocked / resumed without
+    /// spamming the log on every check. See bot-strategy#185 Phase 1-2.
+    fn update_kill_switch_state(&mut self) {
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let present = std::path::Path::new(KILL_SWITCH_PATH).exists();
+        if present && !self.kill_switch_active {
+            log::warn!(
+                "[KILL_SWITCH] activated: {} detected; new entries blocked, existing positions will exit normally",
+                KILL_SWITCH_PATH
+            );
+            self.kill_switch_active = true;
+        } else if !present && self.kill_switch_active {
+            log::warn!(
+                "[KILL_SWITCH] cleared: {} removed; new entries resumed",
+                KILL_SWITCH_PATH
+            );
+            self.kill_switch_active = false;
+        }
+    }
+
     /// Rebuild each pair's beta and spread_history from the shared on-disk
     /// price history so A/B/C bots have identical regression windows the
     /// instant they start, instead of waiting metrics_window live bars to
@@ -3119,8 +3244,10 @@ impl PairTradeEngine {
                 log::info!("[ORDER] {} exit orders filled", key);
                 if let Some((record, pnl_value)) = pnl_record {
                     self.write_pnl_record(inst_idx, record);
+                    let mut risk_state_dirty = false;
                     if pnl_value < 0.0 {
                         self.instances[inst_idx].consecutive_losses += 1;
+                        risk_state_dirty = true;
                         if let Some(cooldown) = self
                             .cfg
                             .circuit_breaker_cooldown_for(self.instances[inst_idx].consecutive_losses)
@@ -3139,10 +3266,14 @@ impl PairTradeEngine {
                                 "[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)",
                                 self.instances[inst_idx].consecutive_losses
                             );
+                            risk_state_dirty = true;
                         }
                         self.instances[inst_idx].consecutive_losses = 0;
                         self.instances[inst_idx].circuit_breaker_until = None;
                         self.instances[inst_idx].circuit_breaker_until_ts = None;
+                    }
+                    if risk_state_dirty {
+                        self.persist_risk_state();
                     }
                 }
             } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
@@ -4438,6 +4569,7 @@ impl PairTradeEngine {
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
+        let risk_state_path = risk_state_path_for(&history_path);
 
         Self {
             cfg,
@@ -4474,10 +4606,23 @@ impl PairTradeEngine {
             open_positions: HashMap::new(),
             last_account_rest_call: None,
             history_path,
+            risk_state_path,
+            kill_switch_active: false,
             data_dump_writer: None,
             replay_connector: None,
             shutdown_pending: false,
         }
+    }
+}
+
+/// Compute `risk_state.json` path as a sibling of the history file. When
+/// `history_path` is a bare filename (the production default), this falls
+/// back to a relative path resolved against CWD — which is `/opt/debot/`
+/// under the systemd unit.
+fn risk_state_path_for(history_path: &std::path::Path) -> PathBuf {
+    match history_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => dir.join("risk_state.json"),
+        None => PathBuf::from("risk_state.json"),
     }
 }
 
