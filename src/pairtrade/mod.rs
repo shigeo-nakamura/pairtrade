@@ -1302,6 +1302,15 @@ impl PairTradeEngine {
                 None
             });
         }
+        // Also stop inflating warn/error counters for the duration of the
+        // detected maintenance window (bot-strategy#199). The WS reconnect
+        // bursts / 503s / stale-price WARNs that follow are expected fallout
+        // and — in addition to being filtered out workflow-side in
+        // error-watch.yml — should not accumulate into error_summary.
+        // Process-global flag: all A/B/C instances share the same Lighter
+        // connector, so the last writer in this tick determines the state
+        // and every instance observes the same maintenance verdict.
+        crate::error_counter::set_counting_suppressed(maintenance_block_entries);
 
         self.refresh_equity_if_needed(inst_idx).await?;
         self.sync_positions_from_exchange(inst_idx, price_map).await?;

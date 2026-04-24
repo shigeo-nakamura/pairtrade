@@ -8,7 +8,7 @@
 use log::{Level, Log, Metadata, Record};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Process-global counter handle, populated by the binary's logger
@@ -16,12 +16,29 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// include an `error_summary` section in `status.json`.
 static GLOBAL_HANDLE: OnceLock<ErrorCounterHandle> = OnceLock::new();
 
+/// When true, `ErrorCountingLogger` stops incrementing warn/error counters
+/// and stops updating `last_error`/`last_warn`. Set from the pairtrade loop
+/// whenever an upcoming-maintenance window is detected on the DEX connector
+/// (see bot-strategy#199): WS reconnect bursts, 503s and stale-price WARNs
+/// during a pre-announced outage are expected side effects, not actionable
+/// signal, and should not inflate `error_summary` in `status.json`. Log
+/// emission to the inner logger (journalctl) is unaffected.
+static SUPPRESS_COUNTING: AtomicBool = AtomicBool::new(false);
+
 pub fn install_global(handle: ErrorCounterHandle) {
     let _ = GLOBAL_HANDLE.set(handle);
 }
 
 pub fn global() -> Option<&'static ErrorCounterHandle> {
     GLOBAL_HANDLE.get()
+}
+
+pub fn set_counting_suppressed(suppressed: bool) {
+    SUPPRESS_COUNTING.store(suppressed, Ordering::Relaxed);
+}
+
+pub fn is_counting_suppressed() -> bool {
+    SUPPRESS_COUNTING.load(Ordering::Relaxed)
 }
 
 /// Window (seconds) for the short-term rolling counts published in the
@@ -137,7 +154,7 @@ impl Log for ErrorCountingLogger {
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
             let level = record.level();
-            if level == Level::Error || level == Level::Warn {
+            if (level == Level::Error || level == Level::Warn) && !is_counting_suppressed() {
                 let ts = chrono::Utc::now().timestamp();
                 self.counters.recent.lock().unwrap().push_back((ts, level));
                 let msg = record.args().to_string();
