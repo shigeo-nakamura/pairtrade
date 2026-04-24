@@ -18,6 +18,23 @@ pub(super) struct InstanceRiskState {
     pub consecutive_losses: u32,
     #[serde(default)]
     pub circuit_breaker_until_ts: Option<i64>,
+    /// Instance equity at the start of the current UTC session, captured
+    /// on rollover. Denominator for `max_daily_loss_bps`. Zero until the
+    /// first session reset runs (which the engine always performs on
+    /// load when the persisted `session_start_ts` is in a prior day).
+    /// bot-strategy#185 Phase 2.
+    #[serde(default)]
+    pub session_start_equity: f64,
+    /// UNIX-seconds timestamp of the current session's rollover. Used to
+    /// detect day-boundary crossings; compared against `now_ts` via
+    /// `session_day()` which buckets by `daily_reset_utc_hour`.
+    #[serde(default)]
+    pub session_start_ts: i64,
+    /// Running sum of realized PnL for the current session (closed trades
+    /// only; unrealized mark-to-market is intentionally excluded so the
+    /// threshold is deterministic and independent of /account cadence).
+    #[serde(default)]
+    pub realized_pnl_today: f64,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]

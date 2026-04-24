@@ -54,6 +54,25 @@ pub(super) struct StatusReporter {
     pub(super) trade_stats: Option<PairTradeStats>,
     pub(super) maintenance: Option<String>,
     pub(super) shutdown: Option<ShutdownStatus>,
+    /// Daily DD snapshot surfaced to the dashboard. Set by the engine
+    /// every tick via `set_daily_risk`. None until the first rollover
+    /// runs (i.e. `session_start_equity > 0`). See bot-strategy#185
+    /// Phase 2-4.
+    pub(super) daily_risk: Option<DailyRiskSnapshot>,
+}
+
+/// Per-instance realized daily-DD view emitted in `status.json` so the
+/// dashboard can surface the live halt state without duplicating the
+/// threshold calculation. `daily_pnl` is realized-only (closed trades);
+/// the equity-delta-based `pnl_today` above stays for backward compat.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct DailyRiskSnapshot {
+    pub(super) daily_pnl: f64,
+    pub(super) daily_pnl_bps: f64,
+    pub(super) session_start_equity: f64,
+    pub(super) session_start_ts: i64,
+    pub(super) max_daily_loss_bps: u32,
+    pub(super) risk_halted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +108,8 @@ pub(super) struct StatusSnapshot {
     pub(super) shutdown: Option<ShutdownStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) error_summary: Option<ErrorSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) daily_risk: Option<DailyRiskSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +282,7 @@ impl StatusReporter {
             }),
             maintenance: None,
             shutdown: None,
+            daily_risk: None,
         };
         reporter.load_equity_baseline();
         if let Err(err) = reporter.ensure_status_file() {
@@ -386,6 +408,10 @@ impl StatusReporter {
         self.shutdown = status;
     }
 
+    pub(super) fn set_daily_risk(&mut self, risk: Option<DailyRiskSnapshot>) {
+        self.daily_risk = risk;
+    }
+
     pub(super) fn write_snapshot(
         &mut self,
         open_positions: &HashMap<String, PositionSnapshot>,
@@ -426,6 +452,7 @@ impl StatusReporter {
             maintenance: self.maintenance.clone(),
             shutdown: self.shutdown.clone(),
             error_summary: error_counter::global().map(|h| h.snapshot()),
+            daily_risk: self.daily_risk.clone(),
         };
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;

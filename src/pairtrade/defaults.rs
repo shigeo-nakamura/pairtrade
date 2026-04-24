@@ -80,3 +80,8 @@ pub(super) const DEFAULT_REGIME_VOL_MAX: f64 = 0.0;
 pub(super) const DEFAULT_REGIME_TREND_WINDOW: usize = 60;
 pub(super) const DEFAULT_REGIME_TREND_MAX: f64 = 0.0;
 pub(super) const DEFAULT_REGIME_REFERENCE_SYMBOL: &str = "BTC";
+
+// Daily DD limit — bot-strategy#185 Phase 2. Disabled by default (0 bps →
+// no block). Reset hour is UTC; 0 = UTC midnight rollover.
+pub(super) const DEFAULT_MAX_DAILY_LOSS_BPS: u32 = 0;
+pub(super) const DEFAULT_DAILY_RESET_UTC_HOUR: u32 = 0;

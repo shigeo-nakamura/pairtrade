@@ -305,6 +305,28 @@ pub(super) struct PairTradeYaml {
     pub(super) regime_trend_window: Option<usize>,
     pub(super) regime_trend_max: Option<f64>,
     pub(super) regime_reference_symbol: Option<String>,
+    // Daily drawdown limit (bot-strategy#185 Phase 2)
+    pub(super) risk: Option<RiskYaml>,
+}
+
+/// `risk:` YAML block for cross-session safety limits. Phase 2 fields
+/// only cover daily DD. Session-level DD, HALT ack, and max-notional hard
+/// caps land in Phase 3 as additional sub-fields of the same block.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "snake_case")]
+pub(super) struct RiskYaml {
+    /// Threshold in basis points of `session_start_equity`. 0 disables
+    /// the check (default). A loss of `realized_pnl_today` ≥ this much
+    /// (measured positive) triggers `max_daily_loss_action`.
+    pub(super) max_daily_loss_bps: Option<u32>,
+    /// Action taken once the threshold trips. Phase 2 only implements
+    /// `block` — new entries are refused, existing positions exit
+    /// normally, auto-resume at the next UTC reset. `flatten` (force
+    /// close all positions) lands in Phase 3.
+    pub(super) max_daily_loss_action: Option<String>,
+    /// Hour of day (UTC) at which `realized_pnl_today` resets to zero.
+    /// 0 = UTC midnight (default), matching most prop-firm conventions.
+    pub(super) daily_reset_utc_hour: Option<u32>,
 }
 
 /// Per-strategy override block in the new multi-strategy YAML format.
@@ -461,6 +483,61 @@ pub struct PairTradeConfig {
     pub regime_trend_window: usize,
     pub regime_trend_max: f64,
     pub regime_reference_symbol: String,
+    // Daily drawdown limit (bot-strategy#185 Phase 2)
+    pub risk: RiskConfig,
+}
+
+/// Resolved `risk:` block. See `RiskYaml` for field meanings.
+#[derive(Debug, Clone)]
+pub struct RiskConfig {
+    pub max_daily_loss_bps: u32,
+    pub max_daily_loss_action: DailyLossAction,
+    pub daily_reset_utc_hour: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DailyLossAction {
+    /// Block new entries only, let existing positions exit normally.
+    Block,
+    // Note: `Flatten` (force-close on threshold trip) is Phase 3. The
+    // YAML parser rejects the value today so operators cannot set it
+    // expecting Phase-2 behaviour to match.
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            max_daily_loss_bps: DEFAULT_MAX_DAILY_LOSS_BPS,
+            max_daily_loss_action: DailyLossAction::Block,
+            daily_reset_utc_hour: DEFAULT_DAILY_RESET_UTC_HOUR,
+        }
+    }
+}
+
+fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig> {
+    let Some(y) = yaml else {
+        return Ok(RiskConfig::default());
+    };
+    let action = match y.max_daily_loss_action.as_deref().map(str::trim) {
+        None | Some("") | Some("block") => DailyLossAction::Block,
+        Some("flatten") => {
+            return Err(anyhow!(
+                "risk.max_daily_loss_action=flatten is not implemented yet (Phase 3); use 'block'"
+            ));
+        }
+        Some(other) => {
+            return Err(anyhow!(
+                "risk.max_daily_loss_action: unknown value '{}'", other
+            ));
+        }
+    };
+    Ok(RiskConfig {
+        max_daily_loss_bps: y.max_daily_loss_bps.unwrap_or(DEFAULT_MAX_DAILY_LOSS_BPS),
+        max_daily_loss_action: action,
+        daily_reset_utc_hour: y
+            .daily_reset_utc_hour
+            .unwrap_or(DEFAULT_DAILY_RESET_UTC_HOUR),
+    })
 }
 
 /// Resolved per-strategy config for one A/B/C variant. Fields here override
@@ -668,6 +745,7 @@ impl PairTradeConfig {
                 .regime_reference_symbol
                 .clone()
                 .unwrap_or_else(|| DEFAULT_REGIME_REFERENCE_SYMBOL.to_string()),
+            risk: resolve_risk_config(yaml.risk.as_ref())?,
         };
 
         cfg.pair_params = cfg.build_pair_params_map(&yaml.pair_overrides);
@@ -883,6 +961,7 @@ impl PairTradeConfig {
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_REGIME_REFERENCE_SYMBOL.to_string()),
+            risk: RiskConfig::default(),
         };
         cfg.default_pair_params = default_pair_params_from_env();
         if cfg.default_pair_params.warm_start_min_bars == 0 {

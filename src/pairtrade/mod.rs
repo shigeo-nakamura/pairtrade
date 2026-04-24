@@ -98,6 +98,16 @@ struct StrategyInstance {
     /// the per-step `now_ts` so backtest replays can honour the same
     /// cool-down logic as live.
     circuit_breaker_until_ts: Option<i64>,
+    /// Daily-DD tracking (bot-strategy#185 Phase 2). Zero/None until the
+    /// first `refresh_daily_session` reset populates them.
+    session_start_equity: f64,
+    session_start_ts: i64,
+    realized_pnl_today: f64,
+    /// True once `realized_pnl_today` has breached
+    /// `max_daily_loss_bps`. Used for transition logging only
+    /// (activate/clear); the live gate check is recomputed every tick
+    /// from current state via `daily_loss_blocks`.
+    daily_loss_halted: bool,
     total_trades: u64,
     total_wins: u64,
     total_pnl: f64,
@@ -332,6 +342,10 @@ impl PairTradeEngine {
                 consecutive_losses: 0,
                 circuit_breaker_until: None,
                 circuit_breaker_until_ts: None,
+                session_start_equity: 0.0,
+                session_start_ts: 0,
+                realized_pnl_today: 0.0,
+                daily_loss_halted: false,
                 total_trades: 0,
                 total_wins: 0,
                 total_pnl: 0.0,
@@ -1183,6 +1197,7 @@ impl PairTradeEngine {
         }
 
         self.update_kill_switch_state();
+        self.refresh_daily_session();
 
         let price_map = self.fetch_latest_prices().await?;
 
@@ -1618,6 +1633,7 @@ impl PairTradeEngine {
             let mut log_positions_not_ready = false;
             let circuit_breaker_until_ts_snapshot = self.instances[inst_idx].circuit_breaker_until_ts;
             let kill_switch_active_snapshot = self.kill_switch_active;
+            let daily_loss_blocks_snapshot = self.daily_loss_blocks(&self.instances[inst_idx]);
             let consecutive_losses_snapshot = self.instances[inst_idx].consecutive_losses;
             let equity_cache_snapshot = self.instances[inst_idx].equity_cache;
             let equity_fallback_snapshot = self.instances[inst_idx].equity_usd_fallback;
@@ -1697,6 +1713,12 @@ impl PairTradeEngine {
                             } else if kill_switch_active_snapshot {
                                 // entry blocked by KILL_SWITCH sentinel file;
                                 // engagement/release is logged in step_shared
+                            } else if daily_loss_blocks_snapshot {
+                                // entry blocked by daily DD threshold; the
+                                // exact PnL / bps is surfaced in status.json
+                                // and re-logged on session rollover via
+                                // [DAILY_DD]. Existing positions still exit
+                                // through the usual exit_reason paths.
                             } else if circuit_breaker_until_ts_snapshot
                                 .map_or(false, |until| now_ts < until)
                             {
@@ -1882,7 +1904,8 @@ impl PairTradeEngine {
                                 hold_secs,
                             );
                             self.write_pnl_record(inst_idx, record);
-                            let mut risk_state_dirty = false;
+                            self.instances[inst_idx].realized_pnl_today += pnl_value;
+                            let mut risk_state_dirty = pnl_value != 0.0;
                             if pnl_value < 0.0 {
                                 self.instances[inst_idx].consecutive_losses += 1;
                                 risk_state_dirty = true;
@@ -2153,14 +2176,46 @@ impl PairTradeEngine {
             }
         }
 
-        if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
-            if let Err(err) =
-                reporter.write_snapshot_if_due(&self.open_positions, self.positions_ready)
-            {
-                log::warn!("[STATUS] failed to write status: {:?}", err);
+        {
+            let risk = self.daily_risk_snapshot(inst_idx);
+            if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
+                reporter.set_daily_risk(risk);
+                if let Err(err) =
+                    reporter.write_snapshot_if_due(&self.open_positions, self.positions_ready)
+                {
+                    log::warn!("[STATUS] failed to write status: {:?}", err);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Build a `DailyRiskSnapshot` for the dashboard. Returns `None` when
+    /// the daily-DD threshold is disabled (no point surfacing data nobody
+    /// acts on) or the session hasn't been initialised yet. See
+    /// bot-strategy#185 Phase 2-4.
+    fn daily_risk_snapshot(&self, inst_idx: usize) -> Option<status::DailyRiskSnapshot> {
+        let threshold_bps = self.cfg.risk.max_daily_loss_bps;
+        if threshold_bps == 0 {
+            return None;
+        }
+        let inst = &self.instances[inst_idx];
+        if inst.session_start_ts == 0 {
+            return None;
+        }
+        let daily_pnl_bps = if inst.session_start_equity > 0.0 {
+            (inst.realized_pnl_today / inst.session_start_equity) * 10_000.0
+        } else {
+            0.0
+        };
+        Some(status::DailyRiskSnapshot {
+            daily_pnl: inst.realized_pnl_today,
+            daily_pnl_bps,
+            session_start_equity: inst.session_start_equity,
+            session_start_ts: inst.session_start_ts,
+            max_daily_loss_bps: threshold_bps,
+            risk_halted: inst.daily_loss_halted,
+        })
     }
 
     fn latest_log_price(&self, symbol: &str) -> Option<f64> {
@@ -2711,7 +2766,8 @@ impl PairTradeEngine {
 
     /// Restore circuit-breaker state from disk so a crash or `systemctl
     /// restart` during an active cool-down does not silently clear the
-    /// consecutive-loss counter. See bot-strategy#185 Phase 1-3.
+    /// consecutive-loss counter. See bot-strategy#185 Phase 1-3, extended
+    /// in Phase 2 to restore `session_start_*` / `realized_pnl_today`.
     fn load_risk_state(&mut self) {
         if self.cfg.backtest_mode {
             return;
@@ -2724,6 +2780,9 @@ impl PairTradeEngine {
         for inst in &mut self.instances {
             let Some(state) = loaded.get(&inst.id) else { continue };
             inst.consecutive_losses = state.consecutive_losses;
+            inst.session_start_equity = state.session_start_equity;
+            inst.session_start_ts = state.session_start_ts;
+            inst.realized_pnl_today = state.realized_pnl_today;
             match state.circuit_breaker_until_ts {
                 Some(until_ts) if until_ts > now_ts => {
                     inst.circuit_breaker_until_ts = Some(until_ts);
@@ -2731,26 +2790,23 @@ impl PairTradeEngine {
                     inst.circuit_breaker_until =
                         Some(Instant::now() + Duration::from_secs(remaining_secs));
                     log::warn!(
-                        "[RISK_STATE] {} restored: consecutive_losses={}, cool-down {}s remaining",
-                        inst.id, inst.consecutive_losses, remaining_secs
+                        "[RISK_STATE] {} restored: consecutive_losses={}, cool-down {}s remaining, realized_pnl_today={:.4}",
+                        inst.id, inst.consecutive_losses, remaining_secs, inst.realized_pnl_today
                     );
                 }
                 Some(_) => {
-                    // Persisted cool-down already expired; keep the loss
-                    // counter but leave both `until` fields at None so the
-                    // entry gate stops blocking on a stale deadline.
-                    if inst.consecutive_losses > 0 {
+                    if inst.consecutive_losses > 0 || inst.realized_pnl_today != 0.0 {
                         log::info!(
-                            "[RISK_STATE] {} restored: consecutive_losses={}, prior cool-down expired",
-                            inst.id, inst.consecutive_losses
+                            "[RISK_STATE] {} restored: consecutive_losses={}, prior cool-down expired, realized_pnl_today={:.4}",
+                            inst.id, inst.consecutive_losses, inst.realized_pnl_today
                         );
                     }
                 }
                 None => {
-                    if inst.consecutive_losses > 0 {
+                    if inst.consecutive_losses > 0 || inst.realized_pnl_today != 0.0 {
                         log::info!(
-                            "[RISK_STATE] {} restored: consecutive_losses={}",
-                            inst.id, inst.consecutive_losses
+                            "[RISK_STATE] {} restored: consecutive_losses={}, realized_pnl_today={:.4}",
+                            inst.id, inst.consecutive_losses, inst.realized_pnl_today
                         );
                     }
                 }
@@ -2771,11 +2827,119 @@ impl PairTradeEngine {
                     risk_io::InstanceRiskState {
                         consecutive_losses: inst.consecutive_losses,
                         circuit_breaker_until_ts: inst.circuit_breaker_until_ts,
+                        session_start_equity: inst.session_start_equity,
+                        session_start_ts: inst.session_start_ts,
+                        realized_pnl_today: inst.realized_pnl_today,
                     },
                 )
             })
             .collect();
         risk_io::persist_risk_state(&self.risk_state_path, &instances);
+    }
+
+    /// Cross the UTC session boundary when `now_ts` lands in a different
+    /// day bucket from the persisted `session_start_ts`. Called once per
+    /// `step_shared` tick. On rollover, realized_pnl_today is zeroed and
+    /// `session_start_equity` is reset to the live equity estimate,
+    /// mirroring `exit_reason`'s `max(equity_cache, equity_usd_fallback)`
+    /// pattern so the denominator stays non-zero even before the first
+    /// /account refresh. Also initialises state on the very first tick
+    /// (when `session_start_ts == 0`). See bot-strategy#185 Phase 2.
+    fn refresh_daily_session(&mut self) {
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let reset_hour = self.cfg.risk.daily_reset_utc_hour;
+        let threshold_bps = self.cfg.risk.max_daily_loss_bps;
+        let now_ts = self.current_now_ts();
+        let current_day = session_day(now_ts, reset_hour);
+        let mut dirty = false;
+        for inst in &mut self.instances {
+            let prior_day = if inst.session_start_ts > 0 {
+                Some(session_day(inst.session_start_ts, reset_hour))
+            } else {
+                None
+            };
+            let needs_rollover = match prior_day {
+                None => true,
+                Some(prev) => prev != current_day,
+            };
+            if needs_rollover {
+                let equity_base = inst.equity_cache.max(inst.equity_usd_fallback);
+                let prev_pnl = inst.realized_pnl_today;
+                inst.session_start_ts = now_ts;
+                inst.session_start_equity = equity_base;
+                inst.realized_pnl_today = 0.0;
+                if inst.daily_loss_halted {
+                    log::warn!(
+                        "[DAILY_DD] {} halt cleared by session rollover", inst.id
+                    );
+                }
+                inst.daily_loss_halted = false;
+                dirty = true;
+                if prior_day.is_some() {
+                    log::info!(
+                        "[DAILY_DD] {} session rolled: prev_pnl={:.4} -> reset; new session_start_equity={:.2}",
+                        inst.id, prev_pnl, equity_base
+                    );
+                } else {
+                    log::info!(
+                        "[DAILY_DD] {} session initialised: session_start_equity={:.2}",
+                        inst.id, equity_base
+                    );
+                }
+            }
+
+            // Transition logging for the halt gate. Recomputed each tick so
+            // we catch both the activation (when realized_pnl_today crosses
+            // the threshold after a losing close) and any clear (should be
+            // rare: Phase 2 doesn't expose a manual recovery path, so this
+            // branch fires only after a rollover reset above or a manual
+            // `risk_state.json` edit).
+            let currently_blocks = threshold_bps > 0
+                && inst.session_start_equity > 0.0
+                && inst.realized_pnl_today < 0.0
+                && {
+                    let loss_bps =
+                        (-inst.realized_pnl_today / inst.session_start_equity) * 10_000.0;
+                    loss_bps >= threshold_bps as f64
+                };
+            if currently_blocks && !inst.daily_loss_halted {
+                let loss_bps =
+                    (-inst.realized_pnl_today / inst.session_start_equity) * 10_000.0;
+                log::warn!(
+                    "[DAILY_DD] {} halted: realized_pnl_today={:.4} loss_bps={:.1} threshold={}bps (new entries blocked until UTC {:02}:00)",
+                    inst.id, inst.realized_pnl_today, loss_bps, threshold_bps, reset_hour
+                );
+                inst.daily_loss_halted = true;
+                dirty = true;
+            } else if !currently_blocks && inst.daily_loss_halted {
+                // Usually unreachable in Phase 2; kept so manual edits
+                // to risk_state.json don't leave a stale halt flag.
+                log::warn!("[DAILY_DD] {} halt cleared", inst.id);
+                inst.daily_loss_halted = false;
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.persist_risk_state();
+        }
+    }
+
+    /// Whether `realized_pnl_today` has breached `max_daily_loss_bps`
+    /// against `session_start_equity`. Returns false when the threshold
+    /// is disabled (0 bps), the equity baseline is still zero (pre-first
+    /// rollover), or the running PnL is non-negative.
+    fn daily_loss_blocks(&self, inst: &StrategyInstance) -> bool {
+        let threshold_bps = self.cfg.risk.max_daily_loss_bps;
+        if threshold_bps == 0 || inst.session_start_equity <= 0.0 {
+            return false;
+        }
+        if inst.realized_pnl_today >= 0.0 {
+            return false;
+        }
+        let loss_bps = (-inst.realized_pnl_today / inst.session_start_equity) * 10_000.0;
+        loss_bps >= threshold_bps as f64
     }
 
     /// Refresh `kill_switch_active` from the sentinel file. Called at the
@@ -3244,7 +3408,8 @@ impl PairTradeEngine {
                 log::info!("[ORDER] {} exit orders filled", key);
                 if let Some((record, pnl_value)) = pnl_record {
                     self.write_pnl_record(inst_idx, record);
-                    let mut risk_state_dirty = false;
+                    self.instances[inst_idx].realized_pnl_today += pnl_value;
+                    let mut risk_state_dirty = pnl_value != 0.0;
                     if pnl_value < 0.0 {
                         self.instances[inst_idx].consecutive_losses += 1;
                         risk_state_dirty = true;
@@ -4566,6 +4731,7 @@ impl PairTradeEngine {
             regime_trend_max: DEFAULT_REGIME_TREND_MAX,
             regime_reference_symbol: DEFAULT_REGIME_REFERENCE_SYMBOL.to_string(),
             bt_fill_delay_secs: 0,
+            risk: config::RiskConfig::default(),
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
@@ -4586,6 +4752,10 @@ impl PairTradeEngine {
                 consecutive_losses: 0,
                 circuit_breaker_until: None,
                 circuit_breaker_until_ts: None,
+                session_start_equity: 0.0,
+                session_start_ts: 0,
+                realized_pnl_today: 0.0,
+                daily_loss_halted: false,
                 total_trades: 0,
                 total_wins: 0,
                 total_pnl: 0.0,
@@ -4624,6 +4794,17 @@ fn risk_state_path_for(history_path: &std::path::Path) -> PathBuf {
         Some(dir) => dir.join("risk_state.json"),
         None => PathBuf::from("risk_state.json"),
     }
+}
+
+/// Bucket a UNIX-seconds timestamp into a "session day" where day
+/// boundaries fall at `reset_hour:00` UTC instead of midnight. Two
+/// timestamps share a session day iff the function returns the same
+/// value for both. `div_euclid` keeps the math correct for non-zero
+/// reset hours near pre-epoch timestamps (impossible in practice but
+/// cheap to preserve). See bot-strategy#185 Phase 2.
+fn session_day(ts_secs: i64, reset_hour: u32) -> i64 {
+    let shift = (reset_hour as i64) * 3600;
+    (ts_secs - shift).div_euclid(86400)
 }
 
 
@@ -4693,6 +4874,54 @@ mod tests {
         let step = dec("0.001");
         let quantized = quantize_size_by_step_ceiling(size, step, None);
         assert_eq!(quantized, dec("0.003"));
+    }
+
+    // 2026-04-23 18:29:50 UTC — 1745432990 — Thu of day 20203 (UNIX/86400)
+    const TS_2026_04_23_18_29: i64 = 1_745_432_990;
+    // 2026-04-24 00:00:05 UTC — 1745452805 — Fri of day 20204
+    const TS_2026_04_24_00_00: i64 = 1_745_452_805;
+    // 2026-04-23 23:59:55 UTC — 1745452795 — still Thu of day 20203
+    const TS_2026_04_23_23_59: i64 = 1_745_452_795;
+
+    #[test]
+    fn session_day_midnight_reset_same_bucket_before_boundary() {
+        let a = session_day(TS_2026_04_23_18_29, 0);
+        let b = session_day(TS_2026_04_23_23_59, 0);
+        assert_eq!(a, b, "timestamps within the same UTC day should share bucket");
+    }
+
+    #[test]
+    fn session_day_midnight_reset_boundary_crosses() {
+        let before = session_day(TS_2026_04_23_23_59, 0);
+        let after = session_day(TS_2026_04_24_00_00, 0);
+        assert_eq!(after - before, 1, "UTC midnight should advance bucket by exactly 1");
+    }
+
+    #[test]
+    fn session_day_custom_reset_hour_shifts_boundary() {
+        // reset_hour=6 ⇒ session boundary at UTC 06:00. A timestamp just
+        // before 06:00 and one just after should fall in adjacent buckets.
+        let ts_0400_utc = 1_745_467_200; // 2026-04-24 04:00 UTC
+        let ts_0700_utc = 1_745_478_000; // 2026-04-24 07:00 UTC
+        let bucket_0400 = session_day(ts_0400_utc, 6);
+        let bucket_0700 = session_day(ts_0700_utc, 6);
+        assert_eq!(bucket_0700 - bucket_0400, 1);
+    }
+
+    #[test]
+    fn risk_state_path_falls_back_to_cwd_for_bare_filename() {
+        let p = risk_state_path_for(std::path::Path::new(
+            "pairtrade_history_BTC_ETH.json",
+        ));
+        assert_eq!(p, std::path::PathBuf::from("risk_state.json"));
+    }
+
+    #[test]
+    fn risk_state_path_joined_to_parent_dir_when_absolute() {
+        let p = risk_state_path_for(std::path::Path::new(
+            "/opt/debot/pairtrade_history_BTC_ETH.json",
+        ));
+        assert_eq!(p, std::path::PathBuf::from("/opt/debot/risk_state.json"));
     }
 }
 
