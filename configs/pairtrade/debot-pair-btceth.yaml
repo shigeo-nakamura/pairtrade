@@ -86,6 +86,18 @@ circuit_breaker_tier1_cooldown_secs: 600
 circuit_breaker_tier2_losses: 8
 circuit_breaker_tier2_cooldown_secs: 3600
 
+# Daily drawdown limit (bot-strategy#185 Phase 2 enablement)
+# Rescaled from the issue body's 1x-era 300 bps to 1500 bps to match Round 3's
+# max_leverage=5 (loss in $ scales with leverage; denominator session_start_equity
+# is leverage-invariant). Per-instance evaluation: each A/B/C instance uses its
+# own equity, so A halts at ~$150 realized loss/day, B/C at ~$75 each. Action
+# `block` refuses new entries while existing positions exit normally, auto-resume
+# at next UTC midnight. See #185 leverage-neutrality note (2026-04-25 17:58).
+risk:
+  max_daily_loss_bps: 1500
+  max_daily_loss_action: block
+  daily_reset_utc_hour: 0
+
 # Multi-strategy A/B/C variants for the single-process architecture
 # (shigeo-nakamura/bot-strategy#25). The single `debot-pair-btceth`
 # process spawns one StrategyInstance per entry, sharing the WS feed,
