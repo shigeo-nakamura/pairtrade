@@ -52,7 +52,7 @@ use state::{
 use status::{
     PairTradeStats, ShutdownPosition, ShutdownStatus, StatusReporter,
 };
-use util::{round_price_by_tick, tail_std};
+use util::{enforce_post_only_passive, round_price_by_tick, tail_std};
 
 /// Max age of the per-instance equity cache before `refresh_equity_if_needed`
 /// fetches a fresh value from the exchange. Now a low-frequency dashboard tick:
@@ -3994,7 +3994,22 @@ impl PairTradeEngine {
             return price;
         }
 
-        round_price_by_tick(price, tick_size, side)
+        let rounded = round_price_by_tick(price, tick_size, side);
+
+        // bot-strategy#216: tick rounding is a no-op when the touch price is
+        // already a tick multiple (Extended BTC tick=1 with integer prices),
+        // so post-only limits land at touch and get rejected/crossed.
+        if self.should_post_only() {
+            let touch = match side {
+                dex_connector::OrderSide::Long => snapshot.ask_price,
+                dex_connector::OrderSide::Short => snapshot.bid_price,
+            };
+            if let Some(touch) = touch {
+                return enforce_post_only_passive(rounded, touch, tick_size, side);
+            }
+        }
+
+        rounded
     }
 
     async fn create_order_with_post_only_retry(
@@ -4862,7 +4877,7 @@ struct DataDumpEntry<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::util::{quantize_size_by_step, quantize_size_by_step_ceiling};
+    use super::util::{enforce_post_only_passive, quantize_size_by_step, quantize_size_by_step_ceiling};
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
@@ -4892,6 +4907,69 @@ mod tests {
         let step = dec("0.005");
         let quantized = round_price_by_tick(price, step, dex_connector::OrderSide::Long);
         assert_eq!(quantized, step);
+    }
+
+    // bot-strategy#216: post-only passive enforcement
+    #[test]
+    fn post_only_passive_long_extended_btc_at_touch() {
+        // Extended BTC tick=1, ask=77641, ToNegativeInfinity rounding leaves
+        // limit at touch (no-op). Must shift to ask - 1 tick.
+        let rounded = dec("77641");
+        let touch = dec("77641");
+        let tick = dec("1");
+        let limit = enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Long);
+        assert_eq!(limit, dec("77640"));
+    }
+
+    #[test]
+    fn post_only_passive_short_extended_eth_at_touch() {
+        // Extended ETH tick=0.1, bid=2315.5, ToPositiveInfinity rounding
+        // leaves limit at touch. Must shift to bid + 1 tick.
+        let rounded = dec("2315.5");
+        let touch = dec("2315.5");
+        let tick = dec("0.1");
+        let limit = enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Short);
+        assert_eq!(limit, dec("2315.6"));
+    }
+
+    #[test]
+    fn post_only_passive_long_already_inside_no_op() {
+        // Lighter passive-slippage path: rounded already below ask. Untouched.
+        let rounded = dec("77640.0");
+        let touch = dec("77640.5");
+        let tick = dec("0.1");
+        let limit = enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Long);
+        assert_eq!(limit, dec("77640.0"));
+    }
+
+    #[test]
+    fn post_only_passive_short_already_inside_no_op() {
+        let rounded = dec("2315.6");
+        let touch = dec("2315.5");
+        let tick = dec("0.1");
+        let limit = enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Short);
+        assert_eq!(limit, dec("2315.6"));
+    }
+
+    #[test]
+    fn post_only_passive_long_above_touch_clamps() {
+        // Defensive: if upstream produced a rounded price above ask (e.g.
+        // aggressive slippage_bps>0 with should_post_only true), clamp it
+        // back inside.
+        let rounded = dec("77642");
+        let touch = dec("77641");
+        let tick = dec("1");
+        let limit = enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Long);
+        assert_eq!(limit, dec("77640"));
+    }
+
+    #[test]
+    fn post_only_passive_zero_tick_returns_input() {
+        let rounded = dec("100");
+        let touch = dec("100");
+        let tick = dec("0");
+        let limit = enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Long);
+        assert_eq!(limit, dec("100"));
     }
 
     #[test]

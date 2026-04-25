@@ -154,6 +154,38 @@ pub(super) fn round_price_by_tick(
     rounded.round_dp_with_strategy(step_scale, RoundingStrategy::ToZero)
 }
 
+/// Push a post-only limit price strictly inside the book on the passive side.
+/// `rounded_limit` is the price after tick rounding; `touch` is the opposing
+/// best (ask for Long, bid for Short). When `rounded_limit` already sits
+/// passive of `touch`, the value is returned unchanged. See bot-strategy#216.
+pub(super) fn enforce_post_only_passive(
+    rounded_limit: Decimal,
+    touch: Decimal,
+    tick: Decimal,
+    side: dex_connector::OrderSide,
+) -> Decimal {
+    if tick <= Decimal::ZERO {
+        return rounded_limit;
+    }
+    match side {
+        dex_connector::OrderSide::Long => {
+            if rounded_limit >= touch {
+                let candidate = touch - tick;
+                if candidate > Decimal::ZERO {
+                    return candidate;
+                }
+            }
+            rounded_limit
+        }
+        dex_connector::OrderSide::Short => {
+            if rounded_limit <= touch {
+                return touch + tick;
+            }
+            rounded_limit
+        }
+    }
+}
+
 pub(super) fn quantize_size_by_step(
     size: Decimal,
     step: Decimal,
