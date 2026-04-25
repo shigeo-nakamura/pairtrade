@@ -2187,18 +2187,25 @@ impl PairTradeEngine {
                             return Err(err);
                         }
                     };
-                    let entry_pp = self.pair_params_for(inst_idx, &plan.key).clone();
-                    let entry_pp = &entry_pp;
-                    let hybrid =
-                        entry_pp.entry_post_only_timeout_secs > 0 && self.post_only_supported();
-                    if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
-                        state.pending_entry = Some(PendingOrders {
-                            legs,
-                            direction,
-                            placed_at: Instant::now(),
-                            hedge_retry_count: 0,
-                            post_only_hybrid: hybrid,
-                        });
+                    // place_pair_orders returns Ok(Vec::new()) when the entry is
+                    // gated (hedge-ratio deviation, zero qty). Treat that as
+                    // "skip"; setting pending_entry with empty legs would let
+                    // all_filled() be vacuously true on the next step and
+                    // synthesize a phantom position. See bot-strategy#211.
+                    if !legs.is_empty() {
+                        let entry_pp = self.pair_params_for(inst_idx, &plan.key).clone();
+                        let entry_pp = &entry_pp;
+                        let hybrid = entry_pp.entry_post_only_timeout_secs > 0
+                            && self.post_only_supported();
+                        if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
+                            state.pending_entry = Some(PendingOrders {
+                                legs,
+                                direction,
+                                placed_at: Instant::now(),
+                                hedge_retry_count: 0,
+                                post_only_hybrid: hybrid,
+                            });
+                        }
                     }
                 }
             }
@@ -4079,8 +4086,27 @@ impl PairTradeEngine {
         };
         let ref_price_a = self.order_reference_price(&pair.base, side_a, prices);
         let ref_price_b = self.order_reference_price(&pair.quote, side_b, prices);
-        let qty_a = self.quantize_order_size_exit(&pair.base, qtys.0, prices);
-        let qty_b = self.quantize_order_size_exit(&pair.quote, qtys.1, prices);
+        // Pick the floor/ceiling combination per leg that best preserves the
+        // requested hedge ratio. With Extended's coarse ETH lot (0.01 ≈ $23) and a
+        // small Phase 3 budget (~$25/leg), a single rounding direction routinely
+        // produces 23-82% hedge deviation — searching the 4 combinations finds
+        // the round that keeps the ratio intact. See bot-strategy#211.
+        let qa_floor = self.quantize_order_size(&pair.base, qtys.0, prices);
+        let qa_ceil = self.quantize_order_size_exit(&pair.base, qtys.0, prices);
+        let qb_floor = self.quantize_order_size(&pair.quote, qtys.1, prices);
+        let qb_ceil = self.quantize_order_size_exit(&pair.quote, qtys.1, prices);
+        let (qty_a, qty_b, ratio_dev) = match order_pricing::pick_entry_quantize(
+            qtys, qa_floor, qa_ceil, qb_floor, qb_ceil,
+        ) {
+            Some(x) => x,
+            None => {
+                log::warn!(
+                    "[ORDER_ADJUST][ENTRY] {}/{} BLOCKED: zero qty after quantize (qty_a={}, qty_b={})",
+                    pair.base, pair.quote, qa_floor, qb_floor
+                );
+                return Ok(Vec::new());
+            }
+        };
         if qty_a != qtys.0 {
             log::debug!(
                 "[ORDER_ADJUST][ENTRY] {} settled qty_a {} -> {}",
@@ -4097,29 +4123,17 @@ impl PairTradeEngine {
                 qty_b
             );
         }
-        // Check hedge ratio deviation after size rounding
         let pair_key_for_dev = format!("{}/{}", pair.base, pair.quote);
         let pp_for_dev = self.pair_params_for(inst_idx, &pair_key_for_dev).clone();
         let pp_for_dev = &pp_for_dev;
-        if pp_for_dev.hedge_ratio_max_deviation < 1.0 {
-            let dev_a = if qtys.0.is_zero() {
-                0.0
-            } else {
-                ((qty_a / qtys.0) - Decimal::ONE).abs().to_f64().unwrap_or(0.0)
-            };
-            let dev_b = if qtys.1.is_zero() {
-                0.0
-            } else {
-                ((qty_b / qtys.1) - Decimal::ONE).abs().to_f64().unwrap_or(0.0)
-            };
-            let max_dev = dev_a.max(dev_b);
-            if max_dev > pp_for_dev.hedge_ratio_max_deviation {
-                log::warn!(
-                    "[ORDER_ADJUST][ENTRY] {}/{} BLOCKED: size rounding deviation {:.1}% exceeds limit {:.1}%",
-                    pair.base, pair.quote, max_dev * 100.0, pp_for_dev.hedge_ratio_max_deviation * 100.0
-                );
-                return Ok(Vec::new());
-            }
+        if pp_for_dev.hedge_ratio_max_deviation < 1.0
+            && ratio_dev > pp_for_dev.hedge_ratio_max_deviation
+        {
+            log::warn!(
+                "[ORDER_ADJUST][ENTRY] {}/{} BLOCKED: hedge ratio deviation {:.1}% exceeds limit {:.1}%",
+                pair.base, pair.quote, ratio_dev * 100.0, pp_for_dev.hedge_ratio_max_deviation * 100.0
+            );
+            return Ok(Vec::new());
         }
         let limit_a = self.limit_price_for(&pair.base, side_a, prices);
         let limit_b = self.limit_price_for(&pair.quote, side_b, prices);
