@@ -40,12 +40,12 @@ entry_z_score_max: 2.0
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
 force_close_time_secs: 3600
-shutdown_grace_secs: 7260  # max(force_close_time_secs across strategies) + 60s buffer. Strategy A overrides to 7200 (see `strategies` below), so grace must cover 7200 + 60. See bot-strategy#50.
+shutdown_grace_secs: 7260  # max(force_close_time_secs across strategies) + 60s buffer. Strategies A and C override to 7200 (see `strategies` below), so grace must cover 7200 + 60. See bot-strategy#50.
 
 # Risk
 risk_pct_per_trade: 0.40
 equity_usd_fallback: 1000
-max_leverage: 1
+max_leverage: 5
 max_loss_r_mult: 1.0    # Bot C champion value (was 3.0). Swapped 2026-04-07.
 
 # Execution
@@ -101,13 +101,13 @@ strategies:
     stop_loss_z_score: 4.0
     max_loss_r_mult: 1.0
     equity_usd_fallback: 1000
-    # A/B/C round 2 (2026-04-12): MTF + extended force_close (#20/#40)
+    # A/B/C round 3 (2026-04-25): role-swap, A becomes the stable best (MTF+fc=7200 unchanged from round 2).
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 7200
   - id: b
     agent_name: debot-pair-btceth-b
-    exit_z_score: 0.2
+    exit_z_score: 0.3
     stop_loss_z_score: 6.0
     max_loss_r_mult: 3.0
     equity_usd_fallback: 500
@@ -117,3 +117,9 @@ strategies:
     stop_loss_z_score: 6.0
     max_loss_r_mult: 3.0
     equity_usd_fallback: 500
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 7200
+    entry_z_score_base: 2.0
+    entry_z_score_min: 1.5
+    entry_z_score_max: 2.5
