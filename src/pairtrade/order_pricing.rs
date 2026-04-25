@@ -49,9 +49,10 @@ pub(super) fn quantize_order_size(
     }
     if let Some(snapshot) = prices.get(symbol) {
         let min_order = snapshot.min_order.clone();
-        let step = min_order
-            .clone()
-            .or_else(|| snapshot.size_decimals.map(|d| Decimal::new(1, d.min(28))));
+        let step = snapshot
+            .size_decimals
+            .map(|d| Decimal::new(1, d.min(28)))
+            .or_else(|| min_order.clone());
         if let Some(step) = step {
             let quantized = quantize_size_by_step(size, step, min_order);
             if quantized > Decimal::ZERO {
@@ -72,9 +73,10 @@ pub(super) fn quantize_order_size_exit(
     }
     if let Some(snapshot) = prices.get(symbol) {
         let min_order = snapshot.min_order.clone();
-        let step = min_order
-            .clone()
-            .or_else(|| snapshot.size_decimals.map(|d| Decimal::new(1, d.min(28))));
+        let step = snapshot
+            .size_decimals
+            .map(|d| Decimal::new(1, d.min(28)))
+            .or_else(|| min_order.clone());
         if let Some(step) = step {
             let quantized = quantize_size_by_step_ceiling(size, step, min_order);
             if quantized > Decimal::ZERO {
@@ -212,5 +214,122 @@ mod tests {
             dec("0"),
         );
         assert!(res.is_none());
+    }
+
+    fn snapshot_with(min_order: Option<&str>, size_decimals: Option<u32>) -> SymbolSnapshot {
+        SymbolSnapshot {
+            price: dec("1"),
+            funding_rate: dec("0"),
+            bid_price: None,
+            ask_price: None,
+            bid_size: dec("0"),
+            ask_size: dec("0"),
+            min_order: min_order.map(dec),
+            min_tick: None,
+            size_decimals,
+            exchange_ts: None,
+        }
+    }
+
+    fn prices_for(symbol: &str, snap: SymbolSnapshot) -> HashMap<String, SymbolSnapshot> {
+        let mut m = HashMap::new();
+        m.insert(symbol.to_string(), snap);
+        m
+    }
+
+    // --- step selection: size_decimals takes priority over min_order ---
+
+    #[test]
+    fn quantize_extended_eth_011_keeps_011() {
+        // Extended ETH: min_order=0.01, size_decimals=3 → step 0.001.
+        // 0.011 ETH must stay at 0.011 (above min_order, on 0.001 grid).
+        let prices = prices_for("ETH", snapshot_with(Some("0.01"), Some(3)));
+        assert_eq!(quantize_order_size("ETH", dec("0.011"), &prices), dec("0.011"));
+        assert_eq!(quantize_order_size_exit("ETH", dec("0.011"), &prices), dec("0.011"));
+    }
+
+    #[test]
+    fn quantize_lighter_eth_012_keeps_012() {
+        // Lighter ETH: min_order=0.005, size_decimals=4 → step 0.0001.
+        // 0.012 must stay at 0.012, not floor to 0.010 / ceil to 0.015.
+        let prices = prices_for("ETH", snapshot_with(Some("0.005"), Some(4)));
+        assert_eq!(quantize_order_size("ETH", dec("0.012"), &prices), dec("0.012"));
+        assert_eq!(quantize_order_size_exit("ETH", dec("0.012"), &prices), dec("0.012"));
+    }
+
+    #[test]
+    fn quantize_lighter_btc_00026_keeps_00026() {
+        // Lighter BTC: min_order=0.0002, size_decimals=5 → step 0.00001.
+        // 0.00026 must stay at 0.00026, not snap to 0.0002 / 0.0004.
+        let prices = prices_for("BTC", snapshot_with(Some("0.0002"), Some(5)));
+        assert_eq!(
+            quantize_order_size("BTC", dec("0.00026"), &prices),
+            dec("0.00026")
+        );
+        assert_eq!(
+            quantize_order_size_exit("BTC", dec("0.00026"), &prices),
+            dec("0.00026")
+        );
+    }
+
+    // --- min_order acts as a floor (bump small sizes up) ---
+
+    #[test]
+    fn quantize_size_below_min_order_bumps_to_min_order() {
+        // 0.003 ETH < min_order 0.005 → bump up to 0.005 even on 0.0001 grid.
+        let prices = prices_for("ETH", snapshot_with(Some("0.005"), Some(4)));
+        assert_eq!(quantize_order_size("ETH", dec("0.003"), &prices), dec("0.005"));
+        assert_eq!(
+            quantize_order_size_exit("ETH", dec("0.003"), &prices),
+            dec("0.005")
+        );
+    }
+
+    // --- size_decimals absent: fall back to min_order as step (legacy path) ---
+
+    #[test]
+    fn quantize_falls_back_to_min_order_when_no_size_decimals() {
+        // Snapshots without size_decimals (older connectors) keep current
+        // behavior: step = min_order.
+        let prices = prices_for("ETH", snapshot_with(Some("0.005"), None));
+        // 0.012 → trunc(0.012/0.005)=2 → 0.010
+        assert_eq!(quantize_order_size("ETH", dec("0.012"), &prices), dec("0.010"));
+        // ceiling: ceil(0.012/0.005)=3 → 0.015
+        assert_eq!(
+            quantize_order_size_exit("ETH", dec("0.012"), &prices),
+            dec("0.015")
+        );
+    }
+
+    // --- end-to-end: pick_entry_quantize via real quantize functions ---
+
+    #[test]
+    fn entry_quantize_extended_eth_011_zero_deviation_after_fix() {
+        // bot-strategy#217: with size_decimals-first step, the floor/ceil
+        // search is moot — both directions land on 0.011.
+        let prices = prices_for("ETH", snapshot_with(Some("0.01"), Some(3)));
+        let qb_floor = quantize_order_size("ETH", dec("0.011"), &prices);
+        let qb_ceil = quantize_order_size_exit("ETH", dec("0.011"), &prices);
+        assert_eq!(qb_floor, dec("0.011"));
+        assert_eq!(qb_ceil, dec("0.011"));
+
+        let prices_btc = prices_for("BTC", snapshot_with(Some("0.0001"), Some(5)));
+        let qa_floor = quantize_order_size("BTC", dec("0.00026"), &prices_btc);
+        let qa_ceil = quantize_order_size_exit("BTC", dec("0.00026"), &prices_btc);
+        assert_eq!(qa_floor, dec("0.00026"));
+        assert_eq!(qa_ceil, dec("0.00026"));
+
+        let res = pick_entry_quantize(
+            (dec("0.00026"), dec("0.011")),
+            qa_floor,
+            qa_ceil,
+            qb_floor,
+            qb_ceil,
+        )
+        .expect("non-zero");
+        assert_eq!(res.0, dec("0.00026"));
+        assert_eq!(res.1, dec("0.011"));
+        // Hedge ratio deviation should be ~0 (target ratio == actual ratio).
+        assert!(res.2 < 1e-9, "dev should be ~0, got {}", res.2);
     }
 }
