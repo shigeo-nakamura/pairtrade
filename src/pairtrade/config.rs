@@ -1500,6 +1500,17 @@ pub(super) fn resolve_strategies(
                     .clone()
                     .or_else(|| s.agent_name.clone())
                     .unwrap_or_else(|| format!("strategy-{}", idx));
+                // Per-strategy equity env override: `EQUITY_USD_FALLBACK_<ID>`
+                // (id uppercased) takes precedence over both the per-strategy
+                // yaml field and the top-level fallback. Lets one shared yaml
+                // deploy with different per-instance equity per region.
+                let equity_usd = env::var(format!(
+                    "EQUITY_USD_FALLBACK_{}",
+                    id.to_ascii_uppercase()
+                ))
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or_else(|| s.equity_usd_fallback.unwrap_or(cfg.equity_usd));
                 StrategyConfig {
                     id,
                     agent_name: s.agent_name.clone().or_else(|| cfg.agent_name.clone()),
@@ -1513,7 +1524,7 @@ pub(super) fn resolve_strategies(
                     risk_pct_per_trade: s
                         .risk_pct_per_trade
                         .unwrap_or(cfg.risk_pct_per_trade),
-                    equity_usd: s.equity_usd_fallback.unwrap_or(cfg.equity_usd),
+                    equity_usd,
                     enable_data_dump: s.enable_data_dump.unwrap_or(cfg.enable_data_dump),
                     data_dump_file: s
                         .data_dump_file
@@ -1771,5 +1782,69 @@ mod tests {
             ..RiskYaml::default()
         };
         assert!(resolve_risk_config(Some(&yaml)).is_err());
+    }
+
+    #[test]
+    fn per_strategy_equity_env_override() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("pairtrade_per_strategy_equity_env.yaml");
+        let yaml = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+equity_usd_fallback: 1000
+strategies:
+  - id: a
+    equity_usd_fallback: 1000
+  - id: b
+    equity_usd_fallback: 500
+  - id: c
+    equity_usd_fallback: 500
+"#;
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+
+        let prev_a = std::env::var("EQUITY_USD_FALLBACK_A").ok();
+        let prev_b = std::env::var("EQUITY_USD_FALLBACK_B").ok();
+        let prev_c = std::env::var("EQUITY_USD_FALLBACK_C").ok();
+
+        std::env::set_var("EQUITY_USD_FALLBACK_A", "250");
+        std::env::set_var("EQUITY_USD_FALLBACK_B", "250");
+        std::env::remove_var("EQUITY_USD_FALLBACK_C");
+
+        let cfg = PairTradeConfig::from_yaml_path(&path).expect("yaml load");
+        let by_id = |id: &str| {
+            cfg.strategies
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("missing strategy {id}"))
+                .equity_usd
+        };
+        assert!((by_id("a") - 250.0).abs() < 1e-9, "A env override applied");
+        assert!((by_id("b") - 250.0).abs() < 1e-9, "B env override applied");
+        assert!(
+            (by_id("c") - 500.0).abs() < 1e-9,
+            "C unset env falls through to yaml per-strategy value"
+        );
+
+        // Restore so other tests in the same process see clean state.
+        match prev_a {
+            Some(v) => std::env::set_var("EQUITY_USD_FALLBACK_A", v),
+            None => std::env::remove_var("EQUITY_USD_FALLBACK_A"),
+        }
+        match prev_b {
+            Some(v) => std::env::set_var("EQUITY_USD_FALLBACK_B", v),
+            None => std::env::remove_var("EQUITY_USD_FALLBACK_B"),
+        }
+        if let Some(v) = prev_c {
+            std::env::set_var("EQUITY_USD_FALLBACK_C", v);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
