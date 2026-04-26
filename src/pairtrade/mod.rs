@@ -71,6 +71,12 @@ const EQUITY_REFRESH_CACHE_SECS: u64 = 1800;
 /// `interval_secs`. See bot-strategy#185 Phase 1-2.
 const KILL_SWITCH_PATH: &str = "/opt/debot/KILL_SWITCH";
 
+/// Manual-ack sentinel for clearing a session-DD halt (Phase 3-2). Drop
+/// this file (any contents) on the host to lift the halt; the bot
+/// consumes it at the top of `step_shared` so the file is removed even
+/// if all instances were already clear. See bot-strategy#185 Phase 3-2.
+const RISK_ACK_PATH: &str = "/opt/debot/RISK_ACK";
+
 
 struct StrategyInstance {
     #[allow(dead_code)]
@@ -108,6 +114,17 @@ struct StrategyInstance {
     /// (activate/clear); the live gate check is recomputed every tick
     /// from current state via `daily_loss_blocks`.
     daily_loss_halted: bool,
+    /// Phase 3-1 rolling peak equity samples. Append-only at
+    /// `risk.session_dd_sample_secs` cadence; entries older than
+    /// `risk.session_dd_lookback_secs` are pruned in-place.
+    equity_samples: Vec<risk_io::EquitySample>,
+    /// Phase 3-1/3-2 sticky halt set on session-DD breach. Persists to
+    /// `risk_state.json` so a crash inside the cool-off window does
+    /// not silently re-arm the bot. Cleared only by writing
+    /// `/opt/debot/RISK_ACK`.
+    session_halted: bool,
+    session_halt_reason: Option<String>,
+    session_halt_ts: Option<i64>,
     total_trades: u64,
     total_wins: u64,
     total_pnl: f64,
@@ -346,6 +363,10 @@ impl PairTradeEngine {
                 session_start_ts: 0,
                 realized_pnl_today: 0.0,
                 daily_loss_halted: false,
+                equity_samples: Vec::new(),
+                session_halted: false,
+                session_halt_reason: None,
+                session_halt_ts: None,
                 total_trades: 0,
                 total_wins: 0,
                 total_pnl: 0.0,
@@ -1216,6 +1237,7 @@ impl PairTradeEngine {
         }
 
         self.update_kill_switch_state();
+        self.consume_risk_ack();
         self.refresh_daily_session();
 
         let price_map = self.fetch_latest_prices().await?;
@@ -1332,6 +1354,12 @@ impl PairTradeEngine {
         crate::error_counter::set_counting_suppressed(maintenance_block_entries);
 
         self.refresh_equity_if_needed(inst_idx).await?;
+        // Phase 3-1: sample current equity into the rolling-peak window
+        // and check the session-DD threshold. On breach, this flattens
+        // the instance's positions and sets `session_halted=true`; the
+        // entry gate below picks up the halt.
+        self.update_equity_sample(inst_idx);
+        self.evaluate_session_dd(inst_idx).await;
         self.sync_positions_from_exchange(inst_idx, price_map).await?;
 
         let vol_median = self.compute_vol_median(inst_idx);
@@ -1662,6 +1690,7 @@ impl PairTradeEngine {
             let circuit_breaker_until_ts_snapshot = self.instances[inst_idx].circuit_breaker_until_ts;
             let kill_switch_active_snapshot = self.kill_switch_active;
             let daily_loss_blocks_snapshot = self.daily_loss_blocks(&self.instances[inst_idx]);
+            let session_halted_snapshot = self.instances[inst_idx].session_halted;
             let consecutive_losses_snapshot = self.instances[inst_idx].consecutive_losses;
             let equity_cache_snapshot = self.instances[inst_idx].equity_cache;
             let equity_fallback_snapshot = self.instances[inst_idx].equity_usd_fallback;
@@ -1741,6 +1770,11 @@ impl PairTradeEngine {
                             } else if kill_switch_active_snapshot {
                                 // entry blocked by KILL_SWITCH sentinel file;
                                 // engagement/release is logged in step_shared
+                            } else if session_halted_snapshot {
+                                // entry blocked by Phase 3-1 session-DD halt.
+                                // The trip + flatten was logged in
+                                // evaluate_session_dd; clearing requires a
+                                // manual ack at /opt/debot/RISK_ACK.
                             } else if daily_loss_blocks_snapshot {
                                 // entry blocked by daily DD threshold; the
                                 // exact PnL / bps is surfaced in status.json
@@ -2213,8 +2247,10 @@ impl PairTradeEngine {
 
         {
             let risk = self.daily_risk_snapshot(inst_idx);
+            let session_risk = self.session_risk_snapshot(inst_idx);
             if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
                 reporter.set_daily_risk(risk);
+                reporter.set_session_risk(session_risk);
                 if let Err(err) =
                     reporter.write_snapshot_if_due(&self.open_positions, self.positions_ready)
                 {
@@ -2250,6 +2286,34 @@ impl PairTradeEngine {
             session_start_ts: inst.session_start_ts,
             max_daily_loss_bps: threshold_bps,
             risk_halted: inst.daily_loss_halted,
+        })
+    }
+
+    /// Build a `SessionRiskSnapshot` from the rolling-peak window. Returns
+    /// `None` when the threshold is disabled (no point surfacing data
+    /// nobody acts on) or no equity samples have been taken yet. See
+    /// bot-strategy#185 Phase 3-1.
+    fn session_risk_snapshot(&self, inst_idx: usize) -> Option<status::SessionRiskSnapshot> {
+        let threshold_bps = self.cfg.risk.max_session_loss_bps;
+        if threshold_bps == 0 {
+            return None;
+        }
+        let inst = &self.instances[inst_idx];
+        let current = inst.equity_cache;
+        if current <= 0.0 || inst.equity_samples.is_empty() {
+            return None;
+        }
+        let (peak, dd_bps) = Self::rolling_peak(&inst.equity_samples, current)?;
+        Some(status::SessionRiskSnapshot {
+            current_equity: current,
+            peak_equity: peak,
+            dd_bps,
+            max_session_loss_bps: threshold_bps,
+            lookback_secs: self.cfg.risk.session_dd_lookback_secs,
+            sample_count: inst.equity_samples.len(),
+            session_halted: inst.session_halted,
+            halt_reason: inst.session_halt_reason.clone(),
+            halt_ts: inst.session_halt_ts,
         })
     }
 
@@ -2818,6 +2882,19 @@ impl PairTradeEngine {
             inst.session_start_equity = state.session_start_equity;
             inst.session_start_ts = state.session_start_ts;
             inst.realized_pnl_today = state.realized_pnl_today;
+            inst.equity_samples = state.equity_samples.clone();
+            inst.session_halted = state.session_halted;
+            inst.session_halt_reason = state.session_halt_reason.clone();
+            inst.session_halt_ts = state.session_halt_ts;
+            if inst.session_halted {
+                log::warn!(
+                    "[SESSION_DD] {} restored halt: reason={} since_ts={} (waiting for {} ack)",
+                    inst.id,
+                    inst.session_halt_reason.as_deref().unwrap_or("unknown"),
+                    inst.session_halt_ts.unwrap_or(0),
+                    RISK_ACK_PATH
+                );
+            }
             match state.circuit_breaker_until_ts {
                 Some(until_ts) if until_ts > now_ts => {
                     inst.circuit_breaker_until_ts = Some(until_ts);
@@ -2865,6 +2942,10 @@ impl PairTradeEngine {
                         session_start_equity: inst.session_start_equity,
                         session_start_ts: inst.session_start_ts,
                         realized_pnl_today: inst.realized_pnl_today,
+                        equity_samples: inst.equity_samples.clone(),
+                        session_halted: inst.session_halted,
+                        session_halt_reason: inst.session_halt_reason.clone(),
+                        session_halt_ts: inst.session_halt_ts,
                     },
                 )
             })
@@ -2999,6 +3080,189 @@ impl PairTradeEngine {
             );
             self.kill_switch_active = false;
         }
+    }
+
+    /// Consume `/opt/debot/RISK_ACK` if present and clear `session_halted`
+    /// across all instances. The file is unconditionally removed so a
+    /// stale ack from a prior incident never silently re-arms. See
+    /// bot-strategy#185 Phase 3-2.
+    fn consume_risk_ack(&mut self) {
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let path = std::path::Path::new(RISK_ACK_PATH);
+        if !path.exists() {
+            return;
+        }
+        // Read the file (best-effort) so the ack reason makes it into the
+        // journal — useful when chasing why a halt cleared days later.
+        let payload = std::fs::read_to_string(path).unwrap_or_default();
+        let trimmed = payload.trim();
+        let mut cleared_any = false;
+        for inst in &mut self.instances {
+            if inst.session_halted {
+                log::warn!(
+                    "[SESSION_DD] {} halt cleared by ack at {} (reason was: {}, ack payload: {:?})",
+                    inst.id,
+                    RISK_ACK_PATH,
+                    inst.session_halt_reason.as_deref().unwrap_or("unknown"),
+                    trimmed
+                );
+                inst.session_halted = false;
+                inst.session_halt_reason = None;
+                inst.session_halt_ts = None;
+                cleared_any = true;
+            }
+        }
+        if let Err(e) = std::fs::remove_file(path) {
+            log::warn!("[SESSION_DD] failed to remove {} after ack: {:?}", RISK_ACK_PATH, e);
+        } else {
+            log::info!("[SESSION_DD] {} consumed", RISK_ACK_PATH);
+        }
+        if cleared_any {
+            self.persist_risk_state();
+        }
+    }
+
+    /// Append the current equity to `equity_samples`, prune entries
+    /// outside the rolling window, and update the cached peak. Called
+    /// after a successful equity refresh. No-op when the threshold is
+    /// disabled (0 bps) so disabled instances don't grow disk state.
+    fn update_equity_sample(&mut self, inst_idx: usize) {
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let threshold_bps = self.cfg.risk.max_session_loss_bps;
+        if threshold_bps == 0 {
+            return;
+        }
+        let lookback = self.cfg.risk.session_dd_lookback_secs as i64;
+        let sample_secs = self.cfg.risk.session_dd_sample_secs as i64;
+        let now_ts = self.current_now_ts();
+        let cutoff = now_ts.saturating_sub(lookback);
+        let inst = &mut self.instances[inst_idx];
+        let equity = inst.equity_cache;
+        if equity <= 0.0 {
+            return;
+        }
+        // Keep at most one sample per `sample_secs` window so 30 d at 1 h
+        // cadence ≤ 720 entries (≈ 17 KB JSON). Newer sample replaces an
+        // entry within the same bucket so peak stays current without
+        // unbounded growth.
+        let bucket_start = (now_ts / sample_secs) * sample_secs;
+        let mut replaced = false;
+        if let Some(last) = inst.equity_samples.last_mut() {
+            if last.ts >= bucket_start {
+                last.equity = equity;
+                last.ts = now_ts;
+                replaced = true;
+            }
+        }
+        if !replaced {
+            inst.equity_samples.push(risk_io::EquitySample {
+                ts: now_ts,
+                equity,
+            });
+        }
+        let pre_len = inst.equity_samples.len();
+        inst.equity_samples.retain(|s| s.ts >= cutoff);
+        let pruned = pre_len.saturating_sub(inst.equity_samples.len());
+        if pruned > 0 {
+            log::debug!(
+                "[SESSION_DD] {} pruned {} expired equity samples (window {}s)",
+                inst.id, pruned, lookback
+            );
+        }
+        // Persistence is cheap (atomic rename of a small JSON file) but
+        // we don't write on every tick — only when something changed
+        // materially. Sampling refreshes cadence; `step_shared` calls
+        // `evaluate_session_dd` immediately after, which triggers
+        // persistence on halt transitions.
+    }
+
+    /// Compute the rolling peak from `equity_samples` and return the
+    /// peak / current ratio. Returns `None` when there are no samples
+    /// or the peak is non-positive (cannot define a percentage DD).
+    fn rolling_peak(samples: &[risk_io::EquitySample], current: f64) -> Option<(f64, f64)> {
+        let mut peak = current;
+        for s in samples {
+            if s.equity > peak {
+                peak = s.equity;
+            }
+        }
+        if peak <= 0.0 {
+            return None;
+        }
+        let dd_bps = if current >= peak {
+            0.0
+        } else {
+            ((peak - current) / peak) * 10_000.0
+        };
+        Some((peak, dd_bps))
+    }
+
+    /// Check whether the rolling peak DD has breached the threshold and
+    /// engage the session halt + auto-flatten if so. Idempotent: a
+    /// repeated breach while already halted re-runs `close_all_positions`
+    /// at most once (the second call succeeds quickly if the account is
+    /// already flat). Returns true if the halt is currently active for
+    /// the instance after the check.
+    async fn evaluate_session_dd(&mut self, inst_idx: usize) -> bool {
+        if self.cfg.backtest_mode {
+            return false;
+        }
+        let threshold_bps = self.cfg.risk.max_session_loss_bps;
+        if threshold_bps == 0 {
+            return self.instances[inst_idx].session_halted;
+        }
+        let inst = &self.instances[inst_idx];
+        if inst.session_halted {
+            // Halt is sticky — once tripped, stay halted until ack'd.
+            // No need to re-flatten on every tick; one shot is enough,
+            // and `close_all_positions` was already invoked on trip.
+            return true;
+        }
+        let current = inst.equity_cache;
+        if current <= 0.0 {
+            return false;
+        }
+        let Some((peak, dd_bps)) = Self::rolling_peak(&inst.equity_samples, current) else {
+            return false;
+        };
+        if dd_bps < threshold_bps as f64 {
+            return false;
+        }
+        let now_ts = self.current_now_ts();
+        let reason = format!("session_dd_{}bps", threshold_bps);
+        log::error!(
+            "[SESSION_DD] {} breach: equity={:.2} peak={:.2} dd_bps={:.1} threshold={}bps; flattening positions and halting (ack via {})",
+            inst.id, current, peak, dd_bps, threshold_bps, RISK_ACK_PATH
+        );
+        {
+            let inst_mut = &mut self.instances[inst_idx];
+            inst_mut.session_halted = true;
+            inst_mut.session_halt_reason = Some(reason);
+            inst_mut.session_halt_ts = Some(now_ts);
+        }
+        self.persist_risk_state();
+        // Flatten this instance's positions. `self.connector` was already
+        // pointed at `instances[inst_idx].connector` by the caller in
+        // `step()`, so close_all_positions hits the right sub-account.
+        if !self.cfg.dry_run && !self.cfg.observe_only {
+            if let Err(err) = self.connector.close_all_positions(None).await {
+                log::error!(
+                    "[SESSION_DD] {} close_all_positions failed: {:?}",
+                    self.instances[inst_idx].id,
+                    err
+                );
+            } else {
+                log::warn!(
+                    "[SESSION_DD] {} close_all_positions invoked",
+                    self.instances[inst_idx].id
+                );
+            }
+        }
+        true
     }
 
     /// Rebuild each pair's beta and spread_history from the shared on-disk
@@ -4813,6 +5077,10 @@ impl PairTradeEngine {
                 session_start_ts: 0,
                 realized_pnl_today: 0.0,
                 daily_loss_halted: false,
+                equity_samples: Vec::new(),
+                session_halted: false,
+                session_halt_reason: None,
+                session_halt_ts: None,
                 total_trades: 0,
                 total_wins: 0,
                 total_pnl: 0.0,
@@ -5026,6 +5294,44 @@ mod tests {
         let bucket_0400 = session_day(ts_0400_utc, 6);
         let bucket_0700 = session_day(ts_0700_utc, 6);
         assert_eq!(bucket_0700 - bucket_0400, 1);
+    }
+
+    // bot-strategy#185 Phase 3-1: rolling-peak DD calculations.
+    fn sample(ts: i64, equity: f64) -> risk_io::EquitySample {
+        risk_io::EquitySample { ts, equity }
+    }
+
+    #[test]
+    fn rolling_peak_no_samples_uses_current_as_peak() {
+        // Bot just started: no samples yet, so peak = current and DD = 0.
+        let (peak, dd) = PairTradeEngine::rolling_peak(&[], 1_000.0).unwrap();
+        assert_eq!(peak, 1_000.0);
+        assert_eq!(dd, 0.0);
+    }
+
+    #[test]
+    fn rolling_peak_picks_max_across_samples_and_current() {
+        let s = vec![sample(100, 1_000.0), sample(200, 1_500.0), sample(300, 1_200.0)];
+        let (peak, dd) = PairTradeEngine::rolling_peak(&s, 900.0).unwrap();
+        assert_eq!(peak, 1_500.0);
+        // (1500 - 900)/1500 * 10000 = 4000 bps
+        assert!((dd - 4_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rolling_peak_zero_dd_when_current_is_new_peak() {
+        let s = vec![sample(100, 1_000.0)];
+        let (peak, dd) = PairTradeEngine::rolling_peak(&s, 1_500.0).unwrap();
+        assert_eq!(peak, 1_500.0);
+        assert_eq!(dd, 0.0);
+    }
+
+    #[test]
+    fn rolling_peak_returns_none_for_non_positive_equity() {
+        // Pre-funded account / connector hiccup → equity reads 0; can't
+        // define a percent DD, so caller treats it as "no signal".
+        assert!(PairTradeEngine::rolling_peak(&[], 0.0).is_none());
+        assert!(PairTradeEngine::rolling_peak(&[], -10.0).is_none());
     }
 
     #[test]

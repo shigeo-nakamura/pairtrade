@@ -85,3 +85,15 @@ pub(super) const DEFAULT_REGIME_REFERENCE_SYMBOL: &str = "BTC";
 // no block). Reset hour is UTC; 0 = UTC midnight rollover.
 pub(super) const DEFAULT_MAX_DAILY_LOSS_BPS: u32 = 0;
 pub(super) const DEFAULT_DAILY_RESET_UTC_HOUR: u32 = 0;
+
+// Session DD + max-notional cap — bot-strategy#185 Phase 3. All disabled by
+// default. `max_session_loss_bps` is the threshold against the rolling peak
+// equity over `session_dd_lookback_secs`; on breach the bot flattens the
+// instance's positions and halts entries until `/opt/debot/RISK_ACK` is
+// dropped (manual ack — no auto-resume). `max_notional_usd_per_leg` caps each
+// hedge leg's USD notional regardless of equity inflation; both legs of a
+// trade respect the cap.
+pub(super) const DEFAULT_MAX_SESSION_LOSS_BPS: u32 = 0;
+pub(super) const DEFAULT_SESSION_DD_LOOKBACK_SECS: u64 = 30 * 24 * 60 * 60;
+pub(super) const DEFAULT_SESSION_DD_SAMPLE_SECS: u64 = 3600;
+pub(super) const DEFAULT_MAX_NOTIONAL_USD_PER_LEG: f64 = 0.0;

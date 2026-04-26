@@ -309,9 +309,9 @@ pub(super) struct PairTradeYaml {
     pub(super) risk: Option<RiskYaml>,
 }
 
-/// `risk:` YAML block for cross-session safety limits. Phase 2 fields
-/// only cover daily DD. Session-level DD, HALT ack, and max-notional hard
-/// caps land in Phase 3 as additional sub-fields of the same block.
+/// `risk:` YAML block for cross-session safety limits. Phase 2 covers
+/// daily DD; Phase 3 (bot-strategy#185) adds session-level DD with
+/// auto-flatten + manual ack and an absolute notional cap per hedge leg.
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(rename_all = "snake_case")]
 pub(super) struct RiskYaml {
@@ -327,6 +327,20 @@ pub(super) struct RiskYaml {
     /// Hour of day (UTC) at which `realized_pnl_today` resets to zero.
     /// 0 = UTC midnight (default), matching most prop-firm conventions.
     pub(super) daily_reset_utc_hour: Option<u32>,
+    /// Phase 3-1: drawdown threshold in basis points of the rolling
+    /// peak equity. 0 disables (default). On breach, the engine
+    /// flattens the instance and stays halted until manually ack'd.
+    pub(super) max_session_loss_bps: Option<u32>,
+    /// Window for the rolling peak in seconds. Default 30 days.
+    pub(super) session_dd_lookback_secs: Option<u64>,
+    /// Sampling cadence for `equity_samples` in seconds. Default 1 h.
+    /// Smaller values track the peak more tightly at the cost of more
+    /// disk writes.
+    pub(super) session_dd_sample_secs: Option<u64>,
+    /// Phase 3-4: hard cap on USD notional per hedge leg. 0 disables
+    /// (default). When set, sizing scales the trade so neither leg
+    /// exceeds this notional, regardless of equity / leverage.
+    pub(super) max_notional_usd_per_leg: Option<f64>,
 }
 
 /// Per-strategy override block in the new multi-strategy YAML format.
@@ -493,6 +507,14 @@ pub struct RiskConfig {
     pub max_daily_loss_bps: u32,
     pub max_daily_loss_action: DailyLossAction,
     pub daily_reset_utc_hour: u32,
+    /// Phase 3-1: 0 = disabled.
+    pub max_session_loss_bps: u32,
+    /// Phase 3-1: rolling peak window in seconds.
+    pub session_dd_lookback_secs: u64,
+    /// Phase 3-1: equity sampling cadence in seconds.
+    pub session_dd_sample_secs: u64,
+    /// Phase 3-4: 0.0 = disabled.
+    pub max_notional_usd_per_leg: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,6 +532,10 @@ impl Default for RiskConfig {
             max_daily_loss_bps: DEFAULT_MAX_DAILY_LOSS_BPS,
             max_daily_loss_action: DailyLossAction::Block,
             daily_reset_utc_hour: DEFAULT_DAILY_RESET_UTC_HOUR,
+            max_session_loss_bps: DEFAULT_MAX_SESSION_LOSS_BPS,
+            session_dd_lookback_secs: DEFAULT_SESSION_DD_LOOKBACK_SECS,
+            session_dd_sample_secs: DEFAULT_SESSION_DD_SAMPLE_SECS,
+            max_notional_usd_per_leg: DEFAULT_MAX_NOTIONAL_USD_PER_LEG,
         }
     }
 }
@@ -531,12 +557,45 @@ fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig> {
             ));
         }
     };
+    let max_notional = y
+        .max_notional_usd_per_leg
+        .unwrap_or(DEFAULT_MAX_NOTIONAL_USD_PER_LEG);
+    if max_notional < 0.0 || !max_notional.is_finite() {
+        return Err(anyhow!(
+            "risk.max_notional_usd_per_leg must be ≥ 0 and finite (got {})",
+            max_notional
+        ));
+    }
+    let sample_secs = y
+        .session_dd_sample_secs
+        .unwrap_or(DEFAULT_SESSION_DD_SAMPLE_SECS);
+    if sample_secs == 0 {
+        return Err(anyhow!(
+            "risk.session_dd_sample_secs must be > 0"
+        ));
+    }
+    let lookback_secs = y
+        .session_dd_lookback_secs
+        .unwrap_or(DEFAULT_SESSION_DD_LOOKBACK_SECS);
+    if lookback_secs < sample_secs {
+        return Err(anyhow!(
+            "risk.session_dd_lookback_secs ({}) must be ≥ session_dd_sample_secs ({})",
+            lookback_secs,
+            sample_secs
+        ));
+    }
     Ok(RiskConfig {
         max_daily_loss_bps: y.max_daily_loss_bps.unwrap_or(DEFAULT_MAX_DAILY_LOSS_BPS),
         max_daily_loss_action: action,
         daily_reset_utc_hour: y
             .daily_reset_utc_hour
             .unwrap_or(DEFAULT_DAILY_RESET_UTC_HOUR),
+        max_session_loss_bps: y
+            .max_session_loss_bps
+            .unwrap_or(DEFAULT_MAX_SESSION_LOSS_BPS),
+        session_dd_lookback_secs: lookback_secs,
+        session_dd_sample_secs: sample_secs,
+        max_notional_usd_per_leg: max_notional,
     })
 }
 
@@ -1643,4 +1702,74 @@ fn apply_pair_overrides(
         map.insert(pair_key.clone(), pp);
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn risk_config_defaults_when_block_absent() {
+        let cfg = resolve_risk_config(None).unwrap();
+        assert_eq!(cfg.max_daily_loss_bps, 0);
+        assert_eq!(cfg.max_session_loss_bps, 0);
+        assert_eq!(cfg.max_notional_usd_per_leg, 0.0);
+        assert!(matches!(cfg.max_daily_loss_action, DailyLossAction::Block));
+    }
+
+    #[test]
+    fn risk_config_resolves_phase3_fields() {
+        let yaml = RiskYaml {
+            max_session_loss_bps: Some(500),
+            session_dd_lookback_secs: Some(1_209_600), // 14 d
+            session_dd_sample_secs: Some(1_800),       // 30 m
+            max_notional_usd_per_leg: Some(50_000.0),
+            ..RiskYaml::default()
+        };
+        let cfg = resolve_risk_config(Some(&yaml)).unwrap();
+        assert_eq!(cfg.max_session_loss_bps, 500);
+        assert_eq!(cfg.session_dd_lookback_secs, 1_209_600);
+        assert_eq!(cfg.session_dd_sample_secs, 1_800);
+        assert!((cfg.max_notional_usd_per_leg - 50_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn risk_config_rejects_negative_notional_cap() {
+        let yaml = RiskYaml {
+            max_notional_usd_per_leg: Some(-1.0),
+            ..RiskYaml::default()
+        };
+        assert!(resolve_risk_config(Some(&yaml)).is_err());
+    }
+
+    #[test]
+    fn risk_config_rejects_zero_sample_cadence() {
+        let yaml = RiskYaml {
+            session_dd_sample_secs: Some(0),
+            ..RiskYaml::default()
+        };
+        assert!(resolve_risk_config(Some(&yaml)).is_err());
+    }
+
+    #[test]
+    fn risk_config_rejects_lookback_smaller_than_sample() {
+        let yaml = RiskYaml {
+            session_dd_sample_secs: Some(3_600),
+            session_dd_lookback_secs: Some(60), // would never include even one sample
+            ..RiskYaml::default()
+        };
+        assert!(resolve_risk_config(Some(&yaml)).is_err());
+    }
+
+    #[test]
+    fn risk_config_still_rejects_phase3_flatten_action() {
+        // Sanity check: Phase 3 plumbing didn't accidentally enable
+        // `max_daily_loss_action: flatten` (kept as Phase-3 follow-up
+        // separate from session DD halt; daily DD remains block-only).
+        let yaml = RiskYaml {
+            max_daily_loss_action: Some("flatten".to_string()),
+            ..RiskYaml::default()
+        };
+        assert!(resolve_risk_config(Some(&yaml)).is_err());
+    }
 }

@@ -59,6 +59,9 @@ pub(super) struct StatusReporter {
     /// runs (i.e. `session_start_equity > 0`). See bot-strategy#185
     /// Phase 2-4.
     pub(super) daily_risk: Option<DailyRiskSnapshot>,
+    /// Phase 3-1 session-DD snapshot. None until the threshold is
+    /// enabled and the first equity sample is taken.
+    pub(super) session_risk: Option<SessionRiskSnapshot>,
 }
 
 /// Per-instance realized daily-DD view emitted in `status.json` so the
@@ -73,6 +76,25 @@ pub(super) struct DailyRiskSnapshot {
     pub(super) session_start_ts: i64,
     pub(super) max_daily_loss_bps: u32,
     pub(super) risk_halted: bool,
+}
+
+/// Phase 3-1 rolling-peak DD view. Only present once the bot has at
+/// least one persisted equity sample and the threshold is enabled.
+/// `session_halted` distinguishes the sticky Phase 3 halt (cleared by
+/// manual ack) from the auto-clearing daily-DD halt above.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct SessionRiskSnapshot {
+    pub(super) current_equity: f64,
+    pub(super) peak_equity: f64,
+    pub(super) dd_bps: f64,
+    pub(super) max_session_loss_bps: u32,
+    pub(super) lookback_secs: u64,
+    pub(super) sample_count: usize,
+    pub(super) session_halted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) halt_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) halt_ts: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +132,8 @@ pub(super) struct StatusSnapshot {
     pub(super) error_summary: Option<ErrorSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) daily_risk: Option<DailyRiskSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) session_risk: Option<SessionRiskSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,6 +307,7 @@ impl StatusReporter {
             maintenance: None,
             shutdown: None,
             daily_risk: None,
+            session_risk: None,
         };
         reporter.load_equity_baseline();
         if let Err(err) = reporter.ensure_status_file() {
@@ -412,6 +437,10 @@ impl StatusReporter {
         self.daily_risk = risk;
     }
 
+    pub(super) fn set_session_risk(&mut self, risk: Option<SessionRiskSnapshot>) {
+        self.session_risk = risk;
+    }
+
     pub(super) fn write_snapshot(
         &mut self,
         open_positions: &HashMap<String, PositionSnapshot>,
@@ -453,6 +482,7 @@ impl StatusReporter {
             shutdown: self.shutdown.clone(),
             error_summary: error_counter::global().map(|h| h.snapshot()),
             daily_risk: self.daily_risk.clone(),
+            session_risk: self.session_risk.clone(),
         };
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;

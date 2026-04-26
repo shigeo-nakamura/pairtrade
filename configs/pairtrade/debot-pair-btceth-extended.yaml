@@ -90,6 +90,15 @@ circuit_breaker_tier1_cooldown_secs: 600
 circuit_breaker_tier2_losses: 8
 circuit_breaker_tier2_cooldown_secs: 3600
 
+# Phase 3 risk caps (#185). Tokyo Extended is still in size-rounding
+# verification — keep both disabled until the first post-fix entry has
+# fired and we confirm the new pricing path doesn't drift the equity.
+risk:
+  max_session_loss_bps: 0
+  session_dd_lookback_secs: 2592000
+  session_dd_sample_secs: 3600
+  max_notional_usd_per_leg: 0
+
 # MTF (A/B/C round 2 legacy from Lighter Strategy A)
 mtf_windows: [15]
 mtf_z_min: 0.5

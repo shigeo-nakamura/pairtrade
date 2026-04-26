@@ -97,6 +97,19 @@ risk:
   max_daily_loss_bps: 1500
   max_daily_loss_action: block
   daily_reset_utc_hour: 0
+  # Phase 3-1 (#185): rolling-peak session DD. Sticky halt + auto-flatten
+  # of the breaching instance, cleared only by `sudo touch /opt/debot/RISK_ACK`.
+  # Disabled (0) for the live A/B/C round 3 evaluation window — flip to
+  # e.g. 500 (5%) after 5/17 review so a multi-day adverse run can't
+  # silently chew through more than 5% of the rolling 30 d peak.
+  max_session_loss_bps: 0
+  session_dd_lookback_secs: 2592000  # 30 d
+  session_dd_sample_secs: 3600       # 1 h
+  # Phase 3-4 (#185): per-leg notional hard cap. Disabled (0) until we
+  # decide on a number that survives the largest legitimate signal
+  # without being a perpetual ceiling. Likely target: ~$10k/leg given
+  # current $1k equity × 5x leverage budget.
+  max_notional_usd_per_leg: 0
 
 # Multi-strategy A/B/C variants for the single-process architecture
 # (shigeo-nakamura/bot-strategy#25). The single `debot-pair-btceth`

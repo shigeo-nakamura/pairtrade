@@ -35,6 +35,36 @@ pub(super) struct InstanceRiskState {
     /// threshold is deterministic and independent of /account cadence).
     #[serde(default)]
     pub realized_pnl_today: f64,
+    /// Periodic equity samples used to compute the rolling peak for
+    /// `max_session_loss_bps` (Phase 3-1). One sample per
+    /// `session_dd_sample_secs`; entries older than
+    /// `session_dd_lookback_secs` are pruned on every update so the
+    /// vec stays bounded (≤ lookback / sample ≈ 720 entries at the
+    /// default 30 d / 1 h cadence).
+    #[serde(default)]
+    pub equity_samples: Vec<EquitySample>,
+    /// Sticky halt flag set when the rolling-peak DD threshold trips.
+    /// Persists across restarts so a crash inside the cooling-off
+    /// window does not silently re-arm the bot. Cleared only by the
+    /// `/opt/debot/RISK_ACK` sentinel — there is no auto-resume.
+    #[serde(default)]
+    pub session_halted: bool,
+    /// Free-form tag identifying which guard tripped the halt
+    /// (e.g. `"session_dd_500bps"`). Surfaced in logs and status.json
+    /// so an operator can tell at a glance why the bot stopped.
+    #[serde(default)]
+    pub session_halt_reason: Option<String>,
+    /// UNIX-seconds timestamp at which the halt engaged. Used purely
+    /// for human inspection; the gate itself only consults
+    /// `session_halted`.
+    #[serde(default)]
+    pub session_halt_ts: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub(super) struct EquitySample {
+    pub ts: i64,
+    pub equity: f64,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
