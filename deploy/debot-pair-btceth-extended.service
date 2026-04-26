@@ -3,8 +3,12 @@ Description="debot-pair-btceth-extended (Tokyo, bot-strategy#123)"
 After=network.target
 
 [Service]
-WorkingDirectory=/opt/debot
-ExecStart=/bin/bash /opt/debot/scripts/debot-pair-btceth-extended.sh
+# Tokyo Extended is isolated under /opt/debot-extended so Tokyo Lighter
+# (bot-strategy#218) can install its own binary at /opt/debot/bin/debot
+# on the same instance without colliding.
+Environment=DEBOT_HOME=/opt/debot-extended
+WorkingDirectory=/opt/debot-extended
+ExecStart=/bin/bash /opt/debot-extended/scripts/debot-pair-btceth-extended.sh
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5

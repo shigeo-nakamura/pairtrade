@@ -284,9 +284,10 @@ jobs:
             --exclude "*.pyc"
           aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/"
           aws s3 cp debot/deploy/debot-pair-btceth.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth.service"
-          # Tokyo service unit is packaged alongside Frankfurt's so the
-          # deploy-tokyo job can reuse the same `debot/` prefix for configs
-          # + scripts and only override the binary under `debot-extended/`.
+          # Tokyo Extended unit ships from this job too — deploy-tokyo-extended
+          # only overrides binary + service-unit consumers but keeps the same
+          # build pipeline. Tokyo Lighter (bot-strategy#218) reuses the
+          # `debot-pair-btceth.service` uploaded above.
           aws s3 cp debot/deploy/debot-pair-btceth-extended.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth-extended.service"
 
       - name: Deploy via SSM (no restart)
@@ -362,7 +363,11 @@ jobs:
   # CI ships new binary + configs but does not restart the service (symmetric
   # with the Frankfurt `deploy` job, pairtrade#9). Operators restart
   # debot-pair-btceth-extended manually once positions are flat.
-  deploy-tokyo:
+  #
+  # Install path is /opt/debot-extended (overrides the global INSTALL_DIR)
+  # so Tokyo Lighter (bot-strategy#218) can coexist at /opt/debot on the
+  # same instance.
+  deploy-tokyo-extended:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     needs: [resolve-ref, build-test]
@@ -375,6 +380,7 @@ jobs:
       # for the Tokyo instance.
       AWS_REGION: eu-central-1
       TOKYO_REGION: ap-northeast-1
+      INSTALL_DIR: /opt/debot-extended
     steps:
       - name: Checkout debot
         uses: actions/checkout@v4

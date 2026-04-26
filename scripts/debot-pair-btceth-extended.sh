@@ -12,7 +12,12 @@
 
 set -eu
 
-ENV_DIR="${DEBOT_ENV_DIR:-/opt/debot/scripts}"
+# Tokyo Extended installs to /opt/debot-extended (set via systemd
+# Environment=DEBOT_HOME=...) so it can coexist with Tokyo Lighter at
+# /opt/debot. Default keeps the legacy /opt/debot path for hosts that
+# have not been migrated yet.
+DEBOT_HOME="${DEBOT_HOME:-/opt/debot}"
+ENV_DIR="${DEBOT_ENV_DIR:-${DEBOT_HOME}/scripts}"
 
 # `set -a` turns every subsequent variable assignment into an export, which
 # makes plain `VAR=value` lines in the sourced env files visible to the
@@ -39,9 +44,9 @@ set +a
 
 export DEBOT_STATUS_DIR="${DEBOT_STATUS_DIR:-/home/ec2-user/debot_status}"
 export DEBOT_STATUS_ID=debot-pair-btceth-ext
-export PAIRTRADE_CONFIG_PATH=/opt/debot/configs/pairtrade/debot-pair-btceth-extended.yaml
+export PAIRTRADE_CONFIG_PATH="${PAIRTRADE_CONFIG_PATH:-${DEBOT_HOME}/configs/pairtrade/debot-pair-btceth-extended.yaml}"
 
 mkdir -p "$DEBOT_STATUS_DIR"
 
 # No libsigner: extended-sdk is pure Rust (no Go cgo dep).
-exec /opt/debot/bin/debot
+exec "${DEBOT_HOME}/bin/debot"
