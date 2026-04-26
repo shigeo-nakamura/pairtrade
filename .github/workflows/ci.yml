@@ -552,3 +552,89 @@ jobs:
             echo "tokyo deploy in progress (status=${STATUS}), sleeping ${POLL_INTERVAL_SECS}s..."
             sleep ${POLL_INTERVAL_SECS}
           done
+
+  # Tokyo Lighter pairtrade (bot-strategy#218). Reuses the Lighter binary
+  # the `deploy` job built and uploaded to s3://.../debot/, so this job is
+  # SSM-only — no second arm64 build needed. Installs to /opt/debot on the
+  # Tokyo instance, where Tokyo Extended no longer lives (it was relocated
+  # to /opt/debot-extended in Phase A).
+  #
+  # CI ships binary + scripts + configs + service unit but does not start
+  # the service. The first launch is operator-driven so env files
+  # (debot-pair-btceth{,-b,-c}.env) and DRY_RUN gating can be set up
+  # explicitly. Subsequent updates are picked up on the next operator
+  # restart, matching the Frankfurt pattern.
+  deploy-tokyo-lighter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [resolve-ref, deploy]
+    if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    environment: debot
+    env:
+      AWS_REGION: ap-northeast-1
+    steps:
+      - name: Configure AWS credentials (ap-northeast-1 for SSM)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy Lighter to Tokyo via SSM (no restart)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          TOKYO_INSTANCE_ID: ${{ secrets.TOKYO_INSTANCE_ID || vars.TOKYO_INSTANCE_ID }}
+        run: |
+          cat > /tmp/ssm-tokyo-lighter-params.json <<'JSON'
+          {
+            "commands": [
+              "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/lib __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
+              "aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/debot/debot __INSTALL_DIR__/bin/debot",
+              "sudo chmod 755 __INSTALL_DIR__/bin/debot",
+              "aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/debot/libsigner.so __INSTALL_DIR__/lib/libsigner.so",
+              "sudo chmod 644 __INSTALL_DIR__/lib/libsigner.so",
+              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts",
+              "aws s3 sync --region eu-central-1 s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
+              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
+              "/bin/bash -lc 'set -e; aws s3 cp --region eu-central-1 s3://__S3_BUCKET__/deploy/debot-pair-btceth.service /tmp/debot-pair-btceth.service; if [ ! -f /etc/systemd/system/debot-pair-btceth.service ] || ! cmp -s /etc/systemd/system/debot-pair-btceth.service /tmp/debot-pair-btceth.service; then sudo mv /tmp/debot-pair-btceth.service /etc/systemd/system/debot-pair-btceth.service; sudo systemctl daemon-reload; else rm /tmp/debot-pair-btceth.service; fi'"
+            ]
+          }
+          JSON
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g" /tmp/ssm-tokyo-lighter-params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${TOKYO_INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy debot Lighter (Tokyo)" \
+            --parameters file:///tmp/ssm-tokyo-lighter-params.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-1800}
+          POLL_INTERVAL_SECS=15
+          deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))
+          while :; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${TOKYO_INSTANCE_ID}" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            case "${STATUS}" in
+              Success)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${TOKYO_INSTANCE_ID}" --output text
+                exit 0 ;;
+              Cancelled|TimedOut|Failed)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${TOKYO_INSTANCE_ID}" --output text
+                echo "##[error]Tokyo Lighter SSM command finished with status ${STATUS}"
+                exit 1 ;;
+              Pending|InProgress|Delayed)
+                : ;;
+              *)
+                echo "Unexpected SSM status: ${STATUS}" ;;
+            esac
+            if [ $(date +%s) -ge ${deadline} ]; then
+              aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${TOKYO_INSTANCE_ID}" --output text || true
+              echo "##[error]Tokyo Lighter deploy polling timed out after ${SSM_DEPLOY_TIMEOUT_SECS}s (last status: ${STATUS})"
+              exit 1
+            fi
+            echo "tokyo lighter deploy in progress (status=${STATUS}), sleeping ${POLL_INTERVAL_SECS}s..."
+            sleep ${POLL_INTERVAL_SECS}
+          done

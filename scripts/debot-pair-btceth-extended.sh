@@ -45,6 +45,10 @@ set +a
 export DEBOT_STATUS_DIR="${DEBOT_STATUS_DIR:-/home/ec2-user/debot_status}"
 export DEBOT_STATUS_ID=debot-pair-btceth-ext
 export PAIRTRADE_CONFIG_PATH="${PAIRTRADE_CONFIG_PATH:-${DEBOT_HOME}/configs/pairtrade/debot-pair-btceth-extended.yaml}"
+# Override the absolute paths baked into the shared yaml so dumps and
+# the history archive land under the same DEBOT_HOME as the binary.
+export DATA_DUMP_FILE="${DATA_DUMP_FILE:-${DEBOT_HOME}/market_data_btceth_extended.jsonl}"
+export HISTORY_ARCHIVE_DIR="${HISTORY_ARCHIVE_DIR:-${DEBOT_HOME}/history_archive}"
 
 mkdir -p "$DEBOT_STATUS_DIR"
 
