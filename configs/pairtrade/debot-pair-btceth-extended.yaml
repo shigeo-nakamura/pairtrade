@@ -35,12 +35,15 @@ metrics_window_length: 240
 warm_start_mode: relaxed
 warm_start_min_bars: 60
 
-# Strategy A champion params (exit_z=0.2, sl_z=4, mlr=1) — see
-# debot-pair-btceth.yaml strategies[0]. Flat (no A/B/C split) because Phase 3
-# runs a single bot to collect Extended-specific data.
-entry_z_score_base: 1.5
-entry_z_score_min: 1.0
-entry_z_score_max: 2.0
+# Round 1 challenger params (bot-strategy#123 Phase 4 BT, 2026-04-27).
+# entry_z lifted from Lighter A's 1.5 because Extended's std runs ~50% wider
+# than Lighter's (different history regime), making Lighter's z=1.5 fall in
+# Extended's noise band. BT on Apr 23–27 dump showed entry_z=2.0 was the
+# lowest setting profitable at fee=2.5bp (5 trades, Win=60%, Sharpe=1.77,
+# Calmar=8.26 in BT). exit/sl/fc unchanged from Phase 3.
+entry_z_score_base: 2.0
+entry_z_score_min: 1.5
+entry_z_score_max: 2.5
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
 force_close_time_secs: 3600  # Halved from 7200 to raise trade frequency during the Extended experiment
