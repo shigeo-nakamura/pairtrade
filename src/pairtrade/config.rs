@@ -234,7 +234,7 @@ pub(super) struct PairTradeYaml {
     pub(super) notional_per_leg_usd: Option<f64>,
     pub(super) risk_pct_per_trade: Option<f64>,
     pub(super) max_loss_r_mult: Option<f64>,
-    pub(super) equity_usd_fallback: Option<f64>,
+    pub(super) equity_usd_reference: Option<f64>,
     pub(super) universe_pairs: Option<StringOrVec>,
     pub(super) universe_symbols: Option<StringOrVec>,
     pub(super) pair_selection_lookback_hours_short: Option<u64>,
@@ -355,7 +355,7 @@ pub(super) struct StrategyYaml {
     pub(super) stop_loss_z_score: Option<f64>,
     pub(super) max_loss_r_mult: Option<f64>,
     pub(super) risk_pct_per_trade: Option<f64>,
-    pub(super) equity_usd_fallback: Option<f64>,
+    pub(super) equity_usd_reference: Option<f64>,
     pub(super) enable_data_dump: Option<bool>,
     pub(super) data_dump_file: Option<String>,
     // Per-strategy PairParams overrides (None = inherit from top-level)
@@ -408,7 +408,7 @@ pub struct PairTradeConfig {
     pub net_funding_min_per_hour: f64,
     pub notional_per_leg: f64,
     pub risk_pct_per_trade: f64,
-    pub equity_usd: f64,
+    pub equity_reference_usd: f64,
     pub universe: Vec<PairSpec>,
     pub slippage_bps: i32,
     pub fee_bps: f64,
@@ -609,7 +609,7 @@ pub struct StrategyConfig {
     pub stop_loss_z: f64,
     pub max_loss_r_mult: f64,
     pub risk_pct_per_trade: f64,
-    pub equity_usd: f64,
+    pub equity_reference_usd: f64,
     pub enable_data_dump: bool,
     pub data_dump_file: Option<String>,
     // Per-strategy PairParams overrides (None = inherit from top-level)
@@ -744,7 +744,7 @@ impl PairTradeConfig {
             risk_pct_per_trade: yaml
                 .risk_pct_per_trade
                 .unwrap_or(DEFAULT_RISK_PCT_PER_TRADE),
-            equity_usd: yaml.equity_usd_fallback.unwrap_or(DEFAULT_EQUITY_USD),
+            equity_reference_usd: yaml.equity_usd_reference.unwrap_or(DEFAULT_EQUITY_USD),
             universe,
             slippage_bps: yaml.slippage_bps.unwrap_or(DEFAULT_SLIPPAGE_BPS),
             fee_bps: yaml.fee_bps.unwrap_or(DEFAULT_FEE_BPS),
@@ -855,7 +855,7 @@ impl PairTradeConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_RISK_PCT_PER_TRADE);
-        let equity_usd = env::var("EQUITY_USD_FALLBACK")
+        let equity_reference_usd = env::var("EQUITY_REFERENCE_USD")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_EQUITY_USD);
@@ -957,7 +957,7 @@ impl PairTradeConfig {
             net_funding_min_per_hour,
             notional_per_leg,
             risk_pct_per_trade,
-            equity_usd,
+            equity_reference_usd,
             universe,
             slippage_bps,
             fee_bps,
@@ -1076,7 +1076,7 @@ impl PairTradeConfig {
         env_override("NOTIONAL_PER_LEG_USD", &mut self.notional_per_leg);
         env_override("RISK_PCT_PER_TRADE", &mut self.risk_pct_per_trade);
         env_override("MAX_LOSS_R_MULT", &mut self.default_pair_params.max_loss_r_mult);
-        env_override("EQUITY_USD_FALLBACK", &mut self.equity_usd);
+        env_override("EQUITY_REFERENCE_USD", &mut self.equity_reference_usd);
         env_override("PAIR_SELECTION_LOOKBACK_HOURS_SHORT", &mut self.default_pair_params.lookback_hours_short);
         env_override("PAIR_SELECTION_LOOKBACK_HOURS_LONG", &mut self.default_pair_params.lookback_hours_long);
         env_override("HALF_LIFE_MAX_HOURS", &mut self.default_pair_params.half_life_max_hours);
@@ -1500,17 +1500,18 @@ pub(super) fn resolve_strategies(
                     .clone()
                     .or_else(|| s.agent_name.clone())
                     .unwrap_or_else(|| format!("strategy-{}", idx));
-                // Per-strategy equity env override: `EQUITY_USD_FALLBACK_<ID>`
-                // (id uppercased) takes precedence over both the per-strategy
-                // yaml field and the top-level fallback. Lets one shared yaml
-                // deploy with different per-instance equity per region.
-                let equity_usd = env::var(format!(
-                    "EQUITY_USD_FALLBACK_{}",
+                // Per-strategy equity reference env override:
+                // `EQUITY_REFERENCE_USD_<ID>` (id uppercased) takes precedence
+                // over both the per-strategy yaml field and the top-level
+                // reference. Lets one shared yaml deploy with different
+                // per-instance reference equity per region.
+                let equity_reference_usd = env::var(format!(
+                    "EQUITY_REFERENCE_USD_{}",
                     id.to_ascii_uppercase()
                 ))
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or_else(|| s.equity_usd_fallback.unwrap_or(cfg.equity_usd));
+                .unwrap_or_else(|| s.equity_usd_reference.unwrap_or(cfg.equity_reference_usd));
                 StrategyConfig {
                     id,
                     agent_name: s.agent_name.clone().or_else(|| cfg.agent_name.clone()),
@@ -1524,7 +1525,7 @@ pub(super) fn resolve_strategies(
                     risk_pct_per_trade: s
                         .risk_pct_per_trade
                         .unwrap_or(cfg.risk_pct_per_trade),
-                    equity_usd,
+                    equity_reference_usd,
                     enable_data_dump: s.enable_data_dump.unwrap_or(cfg.enable_data_dump),
                     data_dump_file: s
                         .data_dump_file
@@ -1543,7 +1544,7 @@ pub(super) fn resolve_strategies(
             stop_loss_z: cfg.default_pair_params.stop_loss_z,
             max_loss_r_mult: cfg.default_pair_params.max_loss_r_mult,
             risk_pct_per_trade: cfg.risk_pct_per_trade,
-            equity_usd: cfg.equity_usd,
+            equity_reference_usd: cfg.equity_reference_usd,
             enable_data_dump: cfg.enable_data_dump,
             data_dump_file: cfg.data_dump_file.clone(),
             force_close_time_secs: None,
@@ -1796,27 +1797,27 @@ web_socket_endpoint: wss://example
 dry_run: true
 universe_pairs:
 - BTC/ETH
-equity_usd_fallback: 1000
+equity_usd_reference: 1000
 strategies:
   - id: a
-    equity_usd_fallback: 1000
+    equity_usd_reference: 1000
   - id: b
-    equity_usd_fallback: 500
+    equity_usd_reference: 500
   - id: c
-    equity_usd_fallback: 500
+    equity_usd_reference: 500
 "#;
         std::fs::File::create(&path)
             .unwrap()
             .write_all(yaml.as_bytes())
             .unwrap();
 
-        let prev_a = std::env::var("EQUITY_USD_FALLBACK_A").ok();
-        let prev_b = std::env::var("EQUITY_USD_FALLBACK_B").ok();
-        let prev_c = std::env::var("EQUITY_USD_FALLBACK_C").ok();
+        let prev_a = std::env::var("EQUITY_REFERENCE_USD_A").ok();
+        let prev_b = std::env::var("EQUITY_REFERENCE_USD_B").ok();
+        let prev_c = std::env::var("EQUITY_REFERENCE_USD_C").ok();
 
-        std::env::set_var("EQUITY_USD_FALLBACK_A", "250");
-        std::env::set_var("EQUITY_USD_FALLBACK_B", "250");
-        std::env::remove_var("EQUITY_USD_FALLBACK_C");
+        std::env::set_var("EQUITY_REFERENCE_USD_A", "250");
+        std::env::set_var("EQUITY_REFERENCE_USD_B", "250");
+        std::env::remove_var("EQUITY_REFERENCE_USD_C");
 
         let cfg = PairTradeConfig::from_yaml_path(&path).expect("yaml load");
         let by_id = |id: &str| {
@@ -1824,7 +1825,7 @@ strategies:
                 .iter()
                 .find(|s| s.id == id)
                 .unwrap_or_else(|| panic!("missing strategy {id}"))
-                .equity_usd
+                .equity_reference_usd
         };
         assert!((by_id("a") - 250.0).abs() < 1e-9, "A env override applied");
         assert!((by_id("b") - 250.0).abs() < 1e-9, "B env override applied");
@@ -1835,15 +1836,15 @@ strategies:
 
         // Restore so other tests in the same process see clean state.
         match prev_a {
-            Some(v) => std::env::set_var("EQUITY_USD_FALLBACK_A", v),
-            None => std::env::remove_var("EQUITY_USD_FALLBACK_A"),
+            Some(v) => std::env::set_var("EQUITY_REFERENCE_USD_A", v),
+            None => std::env::remove_var("EQUITY_REFERENCE_USD_A"),
         }
         match prev_b {
-            Some(v) => std::env::set_var("EQUITY_USD_FALLBACK_B", v),
-            None => std::env::remove_var("EQUITY_USD_FALLBACK_B"),
+            Some(v) => std::env::set_var("EQUITY_REFERENCE_USD_B", v),
+            None => std::env::remove_var("EQUITY_REFERENCE_USD_B"),
         }
         if let Some(v) = prev_c {
-            std::env::set_var("EQUITY_USD_FALLBACK_C", v);
+            std::env::set_var("EQUITY_REFERENCE_USD_C", v);
         }
         let _ = std::fs::remove_file(&path);
     }

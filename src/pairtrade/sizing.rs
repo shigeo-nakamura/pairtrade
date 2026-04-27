@@ -33,9 +33,10 @@ pub(super) fn hedged_sizes(
     p1: &SymbolSnapshot,
     p2: &SymbolSnapshot,
 ) -> Result<(Decimal, Decimal)> {
-    // `equity` is expected to be pre-floored by the caller with the
-    // per-instance equity_usd_fallback so each variant sizes against
-    // its own sub-account capacity. See StrategyInstance.equity_usd_fallback.
+    // `equity` is the per-instance fixed `equity_reference_usd` so each
+    // variant sizes against its own declared capital. Live equity is no
+    // longer mixed in here — see StrategyInstance.equity_reference_usd
+    // and bot-strategy#222.
     let total_risk = equity * cfg.risk_pct_per_trade * cfg.max_leverage;
     let mut leg_notional = (total_risk / 2.0).max(10.0);
     if let Some(capped) = cap_leg_notional(leg_notional, beta, cfg.risk.max_notional_usd_per_leg) {

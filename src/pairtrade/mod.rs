@@ -90,11 +90,15 @@ struct StrategyInstance {
     /// Per-instance live equity from the instance's connector.
     equity_cache: f64,
     last_equity_fetch: Option<Instant>,
-    /// Per-strategy equity floor from the YAML `equity_usd_fallback`.
-    /// Used as the min-floor for sizing and exit decisions instead of
-    /// the engine-wide `cfg.equity_usd` so each variant sizes against
-    /// its own sub-account capacity (A=1000, B=500, C=500).
-    equity_usd_fallback: f64,
+    /// Per-strategy fixed equity reference from the YAML
+    /// `equity_usd_reference`. Used as the base for risk thresholds
+    /// (daily DD, exit risk_budget) AND position sizing so each
+    /// variant operates against its own declared capital. Revised
+    /// manually at the same monthly cadence as A/B/C parameter updates;
+    /// `equity_cache` is kept separately for live monitoring only and
+    /// is no longer mixed into the threshold/sizing math. See
+    /// bot-strategy#222.
+    equity_reference_usd: f64,
     states: HashMap<String, PairState>,
     pnl_logger: Option<PnlLogger>,
     status_reporter: Option<StatusReporter>,
@@ -350,9 +354,9 @@ impl PairTradeEngine {
             built_instances.push(StrategyInstance {
                 id: strategy.id.clone(),
                 connector: instance_connector,
-                equity_cache: strategy.equity_usd,
+                equity_cache: strategy.equity_reference_usd,
                 last_equity_fetch,
-                equity_usd_fallback: strategy.equity_usd,
+                equity_reference_usd: strategy.equity_reference_usd,
                 states,
                 pnl_logger,
                 status_reporter,
@@ -1692,8 +1696,7 @@ impl PairTradeEngine {
             let daily_loss_blocks_snapshot = self.daily_loss_blocks(&self.instances[inst_idx]);
             let session_halted_snapshot = self.instances[inst_idx].session_halted;
             let consecutive_losses_snapshot = self.instances[inst_idx].consecutive_losses;
-            let equity_cache_snapshot = self.instances[inst_idx].equity_cache;
-            let equity_fallback_snapshot = self.instances[inst_idx].equity_usd_fallback;
+            let equity_reference_snapshot = self.instances[inst_idx].equity_reference_usd;
             {
                 let state = self
                     .instances[inst_idx]
@@ -1744,7 +1747,7 @@ impl PairTradeEngine {
                         if let Some((z, std, mean, latest_spread)) = z_snapshot {
                             let net_funding = net_funding_for_direction(z, p1, p2);
                             if let Some(pos) = &state.position {
-                                let equity_base = equity_cache_snapshot.max(equity_fallback_snapshot);
+                                let equity_base = equity_reference_snapshot;
                                 if let Some(reason) =
                                     exit_reason(&self.cfg, pp, state, z, std, p1, p2, equity_base, now_ts)
                                 {
@@ -2956,11 +2959,13 @@ impl PairTradeEngine {
     /// Cross the UTC session boundary when `now_ts` lands in a different
     /// day bucket from the persisted `session_start_ts`. Called once per
     /// `step_shared` tick. On rollover, realized_pnl_today is zeroed and
-    /// `session_start_equity` is reset to the live equity estimate,
-    /// mirroring `exit_reason`'s `max(equity_cache, equity_usd_fallback)`
-    /// pattern so the denominator stays non-zero even before the first
-    /// /account refresh. Also initialises state on the very first tick
-    /// (when `session_start_ts == 0`). See bot-strategy#185 Phase 2.
+    /// `session_start_equity` is reset to the fixed `equity_reference_usd`
+    /// so the daily-DD denominator stays constant within (and across)
+    /// sessions, regardless of intra-session live equity drift. Also
+    /// initialises state on the very first tick (when
+    /// `session_start_ts == 0`). See bot-strategy#185 Phase 2 and
+    /// bot-strategy#222 (semantic switch from live floor to fixed
+    /// reference).
     fn refresh_daily_session(&mut self) {
         if self.cfg.backtest_mode {
             return;
@@ -2981,7 +2986,7 @@ impl PairTradeEngine {
                 Some(prev) => prev != current_day,
             };
             if needs_rollover {
-                let equity_base = inst.equity_cache.max(inst.equity_usd_fallback);
+                let equity_base = inst.equity_reference_usd;
                 let prev_pnl = inst.realized_pnl_today;
                 inst.session_start_ts = now_ts;
                 inst.session_start_equity = equity_base;
@@ -4056,7 +4061,7 @@ impl PairTradeEngine {
         p2: &SymbolSnapshot,
     ) -> Result<(Decimal, Decimal)> {
         let inst = &self.instances[inst_idx];
-        let equity = inst.equity_cache.max(inst.equity_usd_fallback);
+        let equity = inst.equity_reference_usd;
         sizing::hedged_sizes(&self.cfg, equity, beta, p1, p2)
     }
 
@@ -4990,7 +4995,7 @@ impl PairTradeEngine {
             net_funding_min_per_hour: 0.0,
             notional_per_leg: 1.0,
             risk_pct_per_trade: 0.01,
-            equity_usd: DEFAULT_EQUITY_USD,
+            equity_reference_usd: DEFAULT_EQUITY_USD,
             universe: vec![PairSpec {
                 base: "AAA".to_string(),
                 quote: "BBB".to_string(),
@@ -5066,7 +5071,7 @@ impl PairTradeEngine {
                 connector,
                 equity_cache: DEFAULT_EQUITY_USD,
                 last_equity_fetch: None,
-                equity_usd_fallback: DEFAULT_EQUITY_USD,
+                equity_reference_usd: DEFAULT_EQUITY_USD,
                 states: HashMap::new(),
                 pnl_logger: None,
                 status_reporter: None,

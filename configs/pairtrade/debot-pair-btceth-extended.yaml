@@ -46,12 +46,11 @@ stop_loss_z_score: 4.0
 force_close_time_secs: 3600  # Halved from 7200 to raise trade frequency during the Extended experiment
 shutdown_grace_secs: 3660
 
-# Phase 3 is a monitor-and-collect run on a tiny Extended balance (~$106 at
-# deploy). equity_usd_fallback stays close to reality so that a transient
-# balance-query failure can't trigger an oversized order the account
-# can't cover.
+# bot-strategy#222: fixed equity reference for thresholds and sizing.
+# Tokyo Extended single-bot is funded to $500; reference revised on the
+# same monthly cadence as the Lighter A/B/C parameter rounds.
 risk_pct_per_trade: 0.40
-equity_usd_fallback: 100
+equity_usd_reference: 500
 max_leverage: 1
 max_loss_r_mult: 1.0
 

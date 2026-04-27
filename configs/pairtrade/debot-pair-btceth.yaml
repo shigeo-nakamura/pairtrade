@@ -44,7 +44,13 @@ shutdown_grace_secs: 7260  # max(force_close_time_secs across strategies) + 60s 
 
 # Risk
 risk_pct_per_trade: 0.40
-equity_usd_fallback: 1000
+# Fixed equity reference for thresholds and sizing (bot-strategy#222). Revised
+# at the same monthly cadence as A/B/C parameter updates; live equity drift is
+# no longer mixed into the calculation, so daily-DD denominator and risk_budget
+# stay constant within the month. Top-level value is only the fallback for any
+# strategy that omits the per-instance field — each Frankfurt instance overrides
+# it below.
+equity_usd_reference: 1000
 max_leverage: 5
 max_loss_r_mult: 1.0    # Bot C champion value (was 3.0). Swapped 2026-04-07.
 
@@ -125,7 +131,9 @@ strategies:
     exit_z_score: 0.2
     stop_loss_z_score: 4.0
     max_loss_r_mult: 1.0
-    equity_usd_fallback: 1000
+    # bot-strategy#222: Frankfurt A/B/C reference levelled to $1000 each.
+    # B and C require deposit top-up from $500 → $1000 before redeploy.
+    equity_usd_reference: 1000
     # A/B/C round 3 (2026-04-25): role-swap, A becomes the stable best (MTF+fc=7200 unchanged from round 2).
     mtf_windows: [15]
     mtf_z_min: 0.5
@@ -135,13 +143,13 @@ strategies:
     exit_z_score: 0.3
     stop_loss_z_score: 6.0
     max_loss_r_mult: 3.0
-    equity_usd_fallback: 500
+    equity_usd_reference: 1000
   - id: c
     agent_name: debot-pair-btceth-c
     exit_z_score: 0.3
     stop_loss_z_score: 6.0
     max_loss_r_mult: 3.0
-    equity_usd_fallback: 500
+    equity_usd_reference: 1000
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 7200
