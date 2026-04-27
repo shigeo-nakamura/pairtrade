@@ -68,6 +68,12 @@ pub(super) struct StatusReporter {
 /// dashboard can surface the live halt state without duplicating the
 /// threshold calculation. `daily_pnl` is realized-only (closed trades);
 /// the equity-delta-based `pnl_today` above stays for backward compat.
+///
+/// `max_daily_loss_bps` is the raw config value (1x-equivalent market-move
+/// bps); `effective_max_daily_loss_bps` is the value after the
+/// `× max_leverage` scaling that the bot actually compares `daily_pnl_bps`
+/// against. Dashboards comparing dd-vs-threshold should use the effective
+/// field.
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct DailyRiskSnapshot {
     pub(super) daily_pnl: f64,
@@ -75,6 +81,7 @@ pub(super) struct DailyRiskSnapshot {
     pub(super) session_start_equity: f64,
     pub(super) session_start_ts: i64,
     pub(super) max_daily_loss_bps: u32,
+    pub(super) effective_max_daily_loss_bps: f64,
     pub(super) risk_halted: bool,
 }
 
@@ -82,12 +89,19 @@ pub(super) struct DailyRiskSnapshot {
 /// least one persisted equity sample and the threshold is enabled.
 /// `session_halted` distinguishes the sticky Phase 3 halt (cleared by
 /// manual ack) from the auto-clearing daily-DD halt above.
+///
+/// `max_session_loss_bps` is the raw config value (1x-equivalent
+/// market-move bps); `effective_max_session_loss_bps` is the value after
+/// the `× max_leverage` scaling that the bot actually compares `dd_bps`
+/// against. Dashboards comparing dd-vs-threshold should use the
+/// effective field.
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct SessionRiskSnapshot {
     pub(super) current_equity: f64,
     pub(super) peak_equity: f64,
     pub(super) dd_bps: f64,
     pub(super) max_session_loss_bps: u32,
+    pub(super) effective_max_session_loss_bps: f64,
     pub(super) lookback_secs: u64,
     pub(super) sample_count: usize,
     pub(super) session_halted: bool,

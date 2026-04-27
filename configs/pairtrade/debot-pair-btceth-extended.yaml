@@ -89,14 +89,21 @@ circuit_breaker_tier1_cooldown_secs: 600
 circuit_breaker_tier2_losses: 8
 circuit_breaker_tier2_cooldown_secs: 3600
 
-# Phase 3 risk caps (#185). Tokyo Extended is still in size-rounding
-# verification — keep both disabled until the first post-fix entry has
-# fired and we confirm the new pricing path doesn't drift the equity.
+# Risk gates (bot-strategy#185). All bps fields are leverage-invariant
+# (multiplied by max_leverage internally), typical 100–500 bps. Tokyo
+# Extended is still in size-rounding verification — keep all disabled
+# until the first post-fix entry has fired and the new pricing path
+# doesn't drift equity.
 risk:
+  # Phase 2: daily DD. Disabled until verification clears (see #229).
+  max_daily_loss_bps: 0
+  max_daily_loss_action: block
+  daily_reset_utc_hour: 0
+  # Phase 3-1: rolling-peak session DD. Disabled until verification clears.
   max_session_loss_bps: 0
   session_dd_lookback_secs: 2592000
   session_dd_sample_secs: 3600
-  # Phase 3-4 (#185): per-leg notional cap as a multiplier of
+  # Phase 3-4: per-leg notional cap as a multiplier of
   # equity_reference_usd × max_leverage (1.0 = intended leverage, 1.1 =
   # 10% slack). Disabled (0) until size-rounding verification clears.
   max_notional_headroom: 0

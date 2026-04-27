@@ -315,9 +315,14 @@ pub(super) struct PairTradeYaml {
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(rename_all = "snake_case")]
 pub(super) struct RiskYaml {
-    /// Threshold in basis points of `session_start_equity`. 0 disables
-    /// the check (default). A loss of `realized_pnl_today` ≥ this much
-    /// (measured positive) triggers `max_daily_loss_action`.
+    /// Threshold in basis points of `session_start_equity`, expressed in
+    /// 1x-equivalent (market-move) units. The bot multiplies this by
+    /// `max_leverage` at comparison time, so a single value covers any
+    /// leverage and changing `max_leverage` does not require rewriting
+    /// the bps. Typical 100–500 bps. 0 disables (default). A loss of
+    /// `realized_pnl_today` ≥ effective threshold triggers
+    /// `max_daily_loss_action`. See bot-strategy#185 leverage-
+    /// neutralization amendment.
     pub(super) max_daily_loss_bps: Option<u32>,
     /// Action taken once the threshold trips. Phase 2 only implements
     /// `block` — new entries are refused, existing positions exit
@@ -328,8 +333,14 @@ pub(super) struct RiskYaml {
     /// 0 = UTC midnight (default), matching most prop-firm conventions.
     pub(super) daily_reset_utc_hour: Option<u32>,
     /// Phase 3-1: drawdown threshold in basis points of the rolling
-    /// peak equity. 0 disables (default). On breach, the engine
+    /// peak equity, expressed in 1x-equivalent (market-move) units.
+    /// The bot multiplies this by `max_leverage` at comparison time so
+    /// the halt fires at the same underlying market move regardless of
+    /// leverage; equity DD scales ~linearly with leverage so the
+    /// scaled threshold tracks observed dd_bps consistently. Typical
+    /// 100–500 bps. 0 disables (default). On breach, the engine
     /// flattens the instance and stays halted until manually ack'd.
+    /// See bot-strategy#185 leverage-neutralization amendment.
     pub(super) max_session_loss_bps: Option<u32>,
     /// Window for the rolling peak in seconds. Default 30 days.
     pub(super) session_dd_lookback_secs: Option<u64>,
@@ -508,12 +519,20 @@ pub struct PairTradeConfig {
 }
 
 /// Resolved `risk:` block. See `RiskYaml` for field meanings.
+///
+/// `max_daily_loss_bps` and `max_session_loss_bps` are stored as the raw
+/// 1x-equivalent values from YAML; the comparison sites multiply by
+/// `PairTradeConfig::max_leverage` at evaluation time so the gates stay
+/// leverage-invariant (bot-strategy#185 amendment).
 #[derive(Debug, Clone)]
 pub struct RiskConfig {
+    /// 1x-equivalent (market-move) bps; effective threshold at runtime is
+    /// this × `PairTradeConfig::max_leverage`.
     pub max_daily_loss_bps: u32,
     pub max_daily_loss_action: DailyLossAction,
     pub daily_reset_utc_hour: u32,
-    /// Phase 3-1: 0 = disabled.
+    /// Phase 3-1: 1x-equivalent (market-move) bps; effective threshold at
+    /// runtime is this × `PairTradeConfig::max_leverage`. 0 = disabled.
     pub max_session_loss_bps: u32,
     /// Phase 3-1: rolling peak window in seconds.
     pub session_dd_lookback_secs: u64,
@@ -604,15 +623,40 @@ fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig> {
             sample_secs
         ));
     }
+    let max_daily_loss_bps = y.max_daily_loss_bps.unwrap_or(DEFAULT_MAX_DAILY_LOSS_BPS);
+    let max_session_loss_bps = y
+        .max_session_loss_bps
+        .unwrap_or(DEFAULT_MAX_SESSION_LOSS_BPS);
+    // Both bps fields are interpreted as 1x-equivalent market-move bps and
+    // multiplied by `max_leverage` at comparison time. Typical values are
+    // 100–500 bps (1–5% of equivalent 1x equity). Anything materially above
+    // that is almost certainly a leftover from the pre-leverage-neutral
+    // schema where operators rescaled by leverage manually (e.g. 300 × 5 =
+    // 1500). Flag those as a parse-time warning so the operator notices
+    // before deploy.
+    if max_daily_loss_bps > 1000 {
+        log::warn!(
+            "risk.max_daily_loss_bps={} is unusually high; the field is now leverage-invariant \
+             (multiplied by max_leverage internally), so typical values are 100–500 bps. \
+             Did you copy a pre-amendment leverage-aware value? See bot-strategy#185.",
+            max_daily_loss_bps
+        );
+    }
+    if max_session_loss_bps > 1000 {
+        log::warn!(
+            "risk.max_session_loss_bps={} is unusually high; the field is now leverage-invariant \
+             (multiplied by max_leverage internally), so typical values are 100–500 bps. \
+             Did you copy a pre-amendment leverage-aware value? See bot-strategy#185.",
+            max_session_loss_bps
+        );
+    }
     Ok(RiskConfig {
-        max_daily_loss_bps: y.max_daily_loss_bps.unwrap_or(DEFAULT_MAX_DAILY_LOSS_BPS),
+        max_daily_loss_bps,
         max_daily_loss_action: action,
         daily_reset_utc_hour: y
             .daily_reset_utc_hour
             .unwrap_or(DEFAULT_DAILY_RESET_UTC_HOUR),
-        max_session_loss_bps: y
-            .max_session_loss_bps
-            .unwrap_or(DEFAULT_MAX_SESSION_LOSS_BPS),
+        max_session_loss_bps,
         session_dd_lookback_secs: lookback_secs,
         session_dd_sample_secs: sample_secs,
         max_notional_headroom,

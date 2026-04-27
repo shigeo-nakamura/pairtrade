@@ -92,26 +92,28 @@ circuit_breaker_tier1_cooldown_secs: 600
 circuit_breaker_tier2_losses: 8
 circuit_breaker_tier2_cooldown_secs: 3600
 
-# Daily drawdown limit (bot-strategy#185 Phase 2 enablement)
-# Rescaled from the issue body's 1x-era 300 bps to 1500 bps to match Round 3's
-# max_leverage=5 (loss in $ scales with leverage; denominator session_start_equity
-# is leverage-invariant). Per-instance evaluation: each A/B/C instance uses its
-# own equity, so A halts at ~$150 realized loss/day, B/C at ~$75 each. Action
-# `block` refuses new entries while existing positions exit normally, auto-resume
-# at next UTC midnight. See #185 leverage-neutrality note (2026-04-25 17:58).
+# Risk gates (bot-strategy#185). All bps fields are now leverage-invariant:
+# the bot multiplies them by max_leverage internally so a single value covers
+# any leverage and changing max_leverage does not require rewriting the bps.
+# Typical 100–500 bps. See #185 leverage-neutralization amendment.
 risk:
-  max_daily_loss_bps: 1500
+  # Phase 2: daily DD cap. 300 bps = halt at 3% equivalent 1x market move
+  # (= 15% realized loss against session_start_equity at max_leverage=5,
+  # behaviourally equivalent to the pre-amendment 1500 bps). Action `block`
+  # refuses new entries while existing positions exit normally, auto-resume
+  # at next UTC midnight.
+  max_daily_loss_bps: 300
   max_daily_loss_action: block
   daily_reset_utc_hour: 0
-  # Phase 3-1 (#185): rolling-peak session DD. Sticky halt + auto-flatten
-  # of the breaching instance, cleared only by `sudo touch /opt/debot/RISK_ACK`.
+  # Phase 3-1: rolling-peak session DD. Sticky halt + auto-flatten of the
+  # breaching instance, cleared only by `sudo touch /opt/debot/RISK_ACK`.
   # Disabled (0) for the live A/B/C round 3 evaluation window — flip to
-  # e.g. 500 (5%) after 5/17 review so a multi-day adverse run can't
-  # silently chew through more than 5% of the rolling 30 d peak.
+  # ~100 (~1% market move; ~5% equity DD at max_leverage=5) after 5/17
+  # review per #228.
   max_session_loss_bps: 0
   session_dd_lookback_secs: 2592000  # 30 d
   session_dd_sample_secs: 3600       # 1 h
-  # Phase 3-4 (#185): per-leg notional cap, expressed as a multiplier of
+  # Phase 3-4: per-leg notional cap, expressed as a multiplier of
   # equity_reference_usd × max_leverage. 0 disables, 1.0 = exactly the
   # intended leverage, 1.1 = 10% slack for slippage/rounding while still
   # rejecting bug-driven oversizing. The multiplicative form lets the same

@@ -2288,6 +2288,7 @@ impl PairTradeEngine {
             session_start_equity: inst.session_start_equity,
             session_start_ts: inst.session_start_ts,
             max_daily_loss_bps: threshold_bps,
+            effective_max_daily_loss_bps: threshold_bps as f64 * self.cfg.max_leverage,
             risk_halted: inst.daily_loss_halted,
         })
     }
@@ -2312,6 +2313,7 @@ impl PairTradeEngine {
             peak_equity: peak,
             dd_bps,
             max_session_loss_bps: threshold_bps,
+            effective_max_session_loss_bps: threshold_bps as f64 * self.cfg.max_leverage,
             lookback_secs: self.cfg.risk.session_dd_lookback_secs,
             sample_count: inst.equity_samples.len(),
             session_halted: inst.session_halted,
@@ -2972,6 +2974,12 @@ impl PairTradeEngine {
         }
         let reset_hour = self.cfg.risk.daily_reset_utc_hour;
         let threshold_bps = self.cfg.risk.max_daily_loss_bps;
+        let leverage = self.cfg.max_leverage;
+        // Threshold is configured in 1x-equivalent (market-move) units and
+        // scaled by max_leverage at comparison time so a `max_leverage`
+        // change doesn't silently relax the gate. See
+        // `daily_loss_blocks` for the full rationale.
+        let effective_threshold_bps = threshold_bps as f64 * leverage;
         let now_ts = self.current_now_ts();
         let current_day = session_day(now_ts, reset_hour);
         let mut dirty = false;
@@ -3023,14 +3031,14 @@ impl PairTradeEngine {
                 && {
                     let loss_bps =
                         (-inst.realized_pnl_today / inst.session_start_equity) * 10_000.0;
-                    loss_bps >= threshold_bps as f64
+                    loss_bps >= effective_threshold_bps
                 };
             if currently_blocks && !inst.daily_loss_halted {
                 let loss_bps =
                     (-inst.realized_pnl_today / inst.session_start_equity) * 10_000.0;
                 log::warn!(
-                    "[DAILY_DD] {} halted: realized_pnl_today={:.4} loss_bps={:.1} threshold={}bps (new entries blocked until UTC {:02}:00)",
-                    inst.id, inst.realized_pnl_today, loss_bps, threshold_bps, reset_hour
+                    "[DAILY_DD] {} halted: realized_pnl_today={:.4} loss_bps={:.1} threshold={}bps × leverage={:.1} = effective={:.1}bps (new entries blocked until UTC {:02}:00)",
+                    inst.id, inst.realized_pnl_today, loss_bps, threshold_bps, leverage, effective_threshold_bps, reset_hour
                 );
                 inst.daily_loss_halted = true;
                 dirty = true;
@@ -3051,16 +3059,20 @@ impl PairTradeEngine {
     /// against `session_start_equity`. Returns false when the threshold
     /// is disabled (0 bps), the equity baseline is still zero (pre-first
     /// rollover), or the running PnL is non-negative.
+    ///
+    /// The configured `max_daily_loss_bps` is interpreted as a 1x-equivalent
+    /// market-move threshold and multiplied by `max_leverage` internally,
+    /// so `realized_pnl_today` (which scales linearly with leverage) is
+    /// compared against an equivalently-scaled threshold. Net effect: the
+    /// halt fires at the same underlying market move regardless of leverage,
+    /// so changing `max_leverage` does not require rewriting the bps value.
     fn daily_loss_blocks(&self, inst: &StrategyInstance) -> bool {
-        let threshold_bps = self.cfg.risk.max_daily_loss_bps;
-        if threshold_bps == 0 || inst.session_start_equity <= 0.0 {
-            return false;
-        }
-        if inst.realized_pnl_today >= 0.0 {
-            return false;
-        }
-        let loss_bps = (-inst.realized_pnl_today / inst.session_start_equity) * 10_000.0;
-        loss_bps >= threshold_bps as f64
+        daily_loss_breaches_threshold(
+            inst.realized_pnl_today,
+            inst.session_start_equity,
+            self.cfg.risk.max_daily_loss_bps,
+            self.cfg.max_leverage,
+        )
     }
 
     /// Refresh `kill_switch_active` from the sentinel file. Called at the
@@ -3234,14 +3246,25 @@ impl PairTradeEngine {
         let Some((peak, dd_bps)) = Self::rolling_peak(&inst.equity_samples, current) else {
             return false;
         };
-        if dd_bps < threshold_bps as f64 {
+        // Threshold is interpreted in 1x-equivalent (market-move) bps and
+        // multiplied by max_leverage so the halt fires at the same
+        // underlying market move regardless of leverage. Equity DD scales
+        // ~linearly with leverage, so the multiplied threshold tracks
+        // observed dd_bps consistently. See bot-strategy#185 leverage-
+        // neutralization amendment.
+        let leverage = self.cfg.max_leverage;
+        let effective_threshold_bps = threshold_bps as f64 * leverage;
+        if !session_dd_breaches_threshold(dd_bps, threshold_bps, leverage) {
             return false;
         }
         let now_ts = self.current_now_ts();
-        let reason = format!("session_dd_{}bps", threshold_bps);
+        let reason = format!(
+            "session_dd_{}bps_lev{:.1}",
+            threshold_bps, leverage
+        );
         log::error!(
-            "[SESSION_DD] {} breach: equity={:.2} peak={:.2} dd_bps={:.1} threshold={}bps; flattening positions and halting (ack via {})",
-            inst.id, current, peak, dd_bps, threshold_bps, RISK_ACK_PATH
+            "[SESSION_DD] {} breach: equity={:.2} peak={:.2} dd_bps={:.1} threshold={}bps × leverage={:.1} = effective={:.1}bps; flattening positions and halting (ack via {})",
+            inst.id, current, peak, dd_bps, threshold_bps, leverage, effective_threshold_bps, RISK_ACK_PATH
         );
         {
             let inst_mut = &mut self.instances[inst_idx];
@@ -5137,6 +5160,46 @@ fn session_day(ts_secs: i64, reset_hour: u32) -> i64 {
     (ts_secs - shift).div_euclid(86400)
 }
 
+/// Pure-fn split of the daily DD threshold check (`daily_loss_blocks`),
+/// exposed so unit tests can verify the leverage-invariance property
+/// without wiring up a full engine. `threshold_bps` is the 1x-equivalent
+/// market-move bps from YAML; the comparison multiplies it by
+/// `max_leverage` so the same value covers any leverage. See
+/// bot-strategy#185 leverage-neutralization amendment.
+fn daily_loss_breaches_threshold(
+    realized_pnl_today: f64,
+    session_start_equity: f64,
+    threshold_bps: u32,
+    max_leverage: f64,
+) -> bool {
+    if threshold_bps == 0 || session_start_equity <= 0.0 {
+        return false;
+    }
+    if realized_pnl_today >= 0.0 {
+        return false;
+    }
+    let loss_bps = (-realized_pnl_today / session_start_equity) * 10_000.0;
+    let effective_threshold = threshold_bps as f64 * max_leverage;
+    loss_bps >= effective_threshold
+}
+
+/// Pure-fn split of the session-DD threshold check (`evaluate_session_dd`),
+/// exposed so unit tests can verify the leverage-invariance property
+/// without wiring up a full engine. Same scaling rule as
+/// `daily_loss_breaches_threshold`: configured `threshold_bps` is
+/// 1x-equivalent and is multiplied by `max_leverage` at comparison time.
+fn session_dd_breaches_threshold(
+    dd_bps: f64,
+    threshold_bps: u32,
+    max_leverage: f64,
+) -> bool {
+    if threshold_bps == 0 {
+        return false;
+    }
+    let effective_threshold = threshold_bps as f64 * max_leverage;
+    dd_bps >= effective_threshold
+}
+
 
 #[derive(Serialize)]
 struct DataDumpEntry<'a> {
@@ -5337,6 +5400,118 @@ mod tests {
         // define a percent DD, so caller treats it as "no signal".
         assert!(PairTradeEngine::rolling_peak(&[], 0.0).is_none());
         assert!(PairTradeEngine::rolling_peak(&[], -10.0).is_none());
+    }
+
+    // bot-strategy#185 leverage-neutralization amendment:
+    // `max_daily_loss_bps` and `max_session_loss_bps` are interpreted as
+    // 1x-equivalent market-move bps and multiplied by `max_leverage` at
+    // comparison time. Same YAML value should produce the same trip
+    // behaviour at any leverage, so changing leverage doesn't silently
+    // relax the gates.
+
+    #[test]
+    fn daily_loss_disabled_when_threshold_zero() {
+        // 0 bps means "disabled" regardless of how big the loss is.
+        assert!(!daily_loss_breaches_threshold(-1_000.0, 1_000.0, 0, 5.0));
+    }
+
+    #[test]
+    fn daily_loss_no_trip_when_pnl_non_negative() {
+        // A profitable or flat day never trips the halt.
+        assert!(!daily_loss_breaches_threshold(0.0, 1_000.0, 300, 5.0));
+        assert!(!daily_loss_breaches_threshold(50.0, 1_000.0, 300, 5.0));
+    }
+
+    #[test]
+    fn daily_loss_no_trip_when_equity_baseline_zero() {
+        // Pre-first-rollover state: session_start_equity=0, no comparison
+        // is meaningful.
+        assert!(!daily_loss_breaches_threshold(-100.0, 0.0, 300, 5.0));
+    }
+
+    #[test]
+    fn daily_loss_leverage_invariance_3pct_market_move() {
+        // 3% adverse market move on a fully-leveraged position. Same
+        // YAML threshold (300 bps = 3% market-move equivalent) should
+        // trip identically at 1x and 5x leverage.
+        //
+        // At 1x: 3% market move → -3% equity → realized_pnl = -30 against
+        // session_start_equity = 1000. loss_bps = 300, threshold × 1 = 300,
+        // breach = true (boundary).
+        let trips_1x = daily_loss_breaches_threshold(-30.0, 1_000.0, 300, 1.0);
+        // At 5x: same 3% market move → -15% equity → realized_pnl = -150.
+        // loss_bps = 1500, threshold × 5 = 1500, breach = true (boundary).
+        let trips_5x = daily_loss_breaches_threshold(-150.0, 1_000.0, 300, 5.0);
+        assert!(trips_1x);
+        assert!(trips_5x);
+    }
+
+    #[test]
+    fn daily_loss_leverage_invariance_2pct_market_move_under_threshold() {
+        // 2% adverse market move with a 300 bps (3% equivalent) threshold
+        // should NOT trip at any leverage — the gate is leverage-invariant
+        // in market-move units.
+        let trips_1x = daily_loss_breaches_threshold(-20.0, 1_000.0, 300, 1.0);
+        let trips_5x = daily_loss_breaches_threshold(-100.0, 1_000.0, 300, 5.0);
+        assert!(!trips_1x);
+        assert!(!trips_5x);
+    }
+
+    #[test]
+    fn daily_loss_pre_amendment_value_loosens_the_gate_5x() {
+        // Migration trap documented: if an operator copy-pastes the
+        // pre-amendment 1500 bps into the new leverage-invariant schema
+        // at max_leverage=5, the effective threshold becomes 1500 × 5 =
+        // 7500 bps, so the gate now requires a 15% equivalent market
+        // move (vs the pre-amendment 3%) before halting. This is a 5×
+        // loosening, not a silent disable, but still bad — the parser
+        // warning at config-resolution time exists to catch this.
+        //
+        // Pre-amendment intent (= 3% market move at 5x = 15% equity loss):
+        // observed loss_bps = 1500 against equity = 1000.
+        let pre_amendment_trip_zone = daily_loss_breaches_threshold(-150.0, 1_000.0, 1_500, 5.0);
+        // 15% market move at 5x = 75% equity loss = observed 7500 bps =
+        // boundary of the new (looser) effective threshold.
+        let new_effective_trip_zone = daily_loss_breaches_threshold(-750.0, 1_000.0, 1_500, 5.0);
+        assert!(
+            !pre_amendment_trip_zone,
+            "pre-amendment 1500 bps no longer trips at the original 3% market move; \
+             the gate has loosened by 5x — operator must rewrite to 300 bps"
+        );
+        assert!(
+            new_effective_trip_zone,
+            "with stale 1500 bps the gate still fires at the new 15% market-move boundary"
+        );
+    }
+
+    #[test]
+    fn session_dd_disabled_when_threshold_zero() {
+        assert!(!session_dd_breaches_threshold(5_000.0, 0, 5.0));
+    }
+
+    #[test]
+    fn session_dd_leverage_invariance() {
+        // A 500 bps (5% market-move equivalent) threshold trips at the
+        // same underlying market move at any leverage. Equity DD scales
+        // ~linearly with leverage, so observed dd_bps at 5x is roughly
+        // 5x the dd_bps at 1x for the same trajectory.
+        //
+        // 1x trajectory: peak 1000, current 950 → dd_bps = 500.
+        let trips_1x = session_dd_breaches_threshold(500.0, 500, 1.0);
+        // 5x trajectory of same 5% market move: peak 1500, current 750
+        // (compounded leveraged moves). dd_bps = 5000, threshold × 5 = 2500.
+        let trips_5x = session_dd_breaches_threshold(2_500.0, 500, 5.0);
+        assert!(trips_1x);
+        assert!(trips_5x);
+    }
+
+    #[test]
+    fn session_dd_no_trip_below_threshold() {
+        // 1% market move with 500 bps (5%) threshold should never trip.
+        let trips_1x = session_dd_breaches_threshold(100.0, 500, 1.0);
+        let trips_5x = session_dd_breaches_threshold(500.0, 500, 5.0);
+        assert!(!trips_1x);
+        assert!(!trips_5x);
     }
 
     #[test]
