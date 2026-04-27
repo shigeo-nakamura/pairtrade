@@ -2454,6 +2454,18 @@ impl PairTradeEngine {
         if self.replay_connector.is_some() {
             return Ok(());
         }
+        if self.cfg.dry_run {
+            // DRY_RUN keeps a synthetic position locally (entry path
+            // populates state.position without placing an order). The
+            // exchange snapshot will never reflect those synthetic
+            // positions, so reconciliation would clear them on the next
+            // tick and re-trigger entry evaluation every cycle —
+            // driving STEP_OVERRUN through repeated A/B/C balance fetches
+            // (bot-strategy#218 Tokyo Lighter rollout). Skip entirely
+            // and mark positions_ready so the entry gate is not blocked.
+            self.positions_ready = true;
+            return Ok(());
+        }
         let now_ts = self.current_now_ts();
         let positions = match self.connector.get_positions().await {
             Ok(v) => v,
