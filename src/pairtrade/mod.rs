@@ -689,13 +689,20 @@ impl PairTradeEngine {
                     _ = sigterm.recv() => {
                         if !self.shutdown_pending {
                             let flat = self.all_instances_flat();
-                            if flat || self.cfg.shutdown_grace_secs == 0 {
+                            // DRY_RUN holds only synthetic in-memory positions
+                            // (#237 paper-fill); there is nothing on the
+                            // exchange to protect, so the grace period adds
+                            // restart latency for no benefit. Treat SIGTERM
+                            // as immediate exit and skip the close_all_positions
+                            // REST call (force_shutdown=false). See bot-strategy#239.
+                            if flat || self.cfg.shutdown_grace_secs == 0 || self.cfg.dry_run {
                                 log::info!(
-                                    "[PAIR] SIGTERM received, shutting down (flat={}, grace={}s)",
+                                    "[PAIR] SIGTERM received, shutting down (flat={}, grace={}s, dry_run={})",
                                     flat,
-                                    self.cfg.shutdown_grace_secs
+                                    self.cfg.shutdown_grace_secs,
+                                    self.cfg.dry_run
                                 );
-                                force_shutdown = !flat;
+                                force_shutdown = !flat && !self.cfg.dry_run;
                                 break;
                             }
                             log::info!(
