@@ -90,10 +90,12 @@ pub(super) const DEFAULT_DAILY_RESET_UTC_HOUR: u32 = 0;
 // default. `max_session_loss_bps` is the threshold against the rolling peak
 // equity over `session_dd_lookback_secs`; on breach the bot flattens the
 // instance's positions and halts entries until `/opt/debot/RISK_ACK` is
-// dropped (manual ack — no auto-resume). `max_notional_usd_per_leg` caps each
-// hedge leg's USD notional regardless of equity inflation; both legs of a
-// trade respect the cap.
+// dropped (manual ack — no auto-resume). `max_notional_headroom` caps each
+// hedge leg's USD notional at `equity_reference_usd × max_leverage × headroom`
+// so the same value works across hosts with different equity / leverage
+// (Frankfurt $1k×5x, Tokyo Lighter $150×5x, etc.). Both legs of a trade
+// respect the cap.
 pub(super) const DEFAULT_MAX_SESSION_LOSS_BPS: u32 = 0;
 pub(super) const DEFAULT_SESSION_DD_LOOKBACK_SECS: u64 = 30 * 24 * 60 * 60;
 pub(super) const DEFAULT_SESSION_DD_SAMPLE_SECS: u64 = 3600;
-pub(super) const DEFAULT_MAX_NOTIONAL_USD_PER_LEG: f64 = 0.0;
+pub(super) const DEFAULT_MAX_NOTIONAL_HEADROOM: f64 = 0.0;

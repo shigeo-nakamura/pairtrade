@@ -7,12 +7,17 @@ use rust_decimal::Decimal;
 use super::config::PairTradeConfig;
 use super::market::SymbolSnapshot;
 
-/// Apply the `risk.max_notional_usd_per_leg` hard cap to the leg-A target
-/// notional. The intended hedge is `(leg_notional, leg_notional · |beta|)`,
-/// so when `|beta| > 1` the leg-B notional is the binding constraint —
-/// dividing by `max(1, |beta|)` keeps the hedge ratio intact while ensuring
-/// NEITHER leg exceeds the cap. Returns `None` when the cap is disabled
-/// (≤ 0) or the leg is already within budget. bot-strategy#185 Phase 3-4.
+/// Apply the resolved per-leg notional cap to the leg-A target notional.
+/// The cap itself is computed by the caller as
+/// `equity_reference_usd × max_leverage × risk.max_notional_headroom`
+/// so the dollar threshold tracks per-instance equity and per-host leverage
+/// automatically (bot-strategy#185 Phase 3-4 amendment).
+///
+/// The intended hedge is `(leg_notional, leg_notional · |beta|)`, so when
+/// `|beta| > 1` the leg-B notional is the binding constraint — dividing by
+/// `max(1, |beta|)` keeps the hedge ratio intact while ensuring NEITHER leg
+/// exceeds the cap. Returns `None` when the cap is disabled (≤ 0) or the
+/// leg is already within budget.
 pub(super) fn cap_leg_notional(leg_notional: f64, beta: f64, cap: f64) -> Option<f64> {
     if cap <= 0.0 {
         return None;
@@ -39,12 +44,16 @@ pub(super) fn hedged_sizes(
     // and bot-strategy#222.
     let total_risk = equity * cfg.risk_pct_per_trade * cfg.max_leverage;
     let mut leg_notional = (total_risk / 2.0).max(10.0);
-    if let Some(capped) = cap_leg_notional(leg_notional, beta, cfg.risk.max_notional_usd_per_leg) {
+    let notional_cap = equity * cfg.max_leverage * cfg.risk.max_notional_headroom;
+    if let Some(capped) = cap_leg_notional(leg_notional, beta, notional_cap) {
         log::warn!(
-            "[RISK_NOTIONAL_CAP] leg_notional {:.2} → {:.2} (cap={:.2}, |beta|={:.4})",
+            "[RISK_NOTIONAL_CAP] leg_notional {:.2} → {:.2} (cap={:.2}, equity={:.2}, max_leverage={:.2}, headroom={:.3}, |beta|={:.4})",
             leg_notional,
             capped,
-            cfg.risk.max_notional_usd_per_leg,
+            notional_cap,
+            equity,
+            cfg.max_leverage,
+            cfg.risk.max_notional_headroom,
             beta.abs()
         );
         leg_notional = capped;

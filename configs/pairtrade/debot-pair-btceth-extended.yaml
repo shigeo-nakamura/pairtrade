@@ -96,7 +96,10 @@ risk:
   max_session_loss_bps: 0
   session_dd_lookback_secs: 2592000
   session_dd_sample_secs: 3600
-  max_notional_usd_per_leg: 0
+  # Phase 3-4 (#185): per-leg notional cap as a multiplier of
+  # equity_reference_usd × max_leverage (1.0 = intended leverage, 1.1 =
+  # 10% slack). Disabled (0) until size-rounding verification clears.
+  max_notional_headroom: 0
 
 # MTF (A/B/C round 2 legacy from Lighter Strategy A)
 mtf_windows: [15]

@@ -111,11 +111,14 @@ risk:
   max_session_loss_bps: 0
   session_dd_lookback_secs: 2592000  # 30 d
   session_dd_sample_secs: 3600       # 1 h
-  # Phase 3-4 (#185): per-leg notional hard cap. Disabled (0) until we
-  # decide on a number that survives the largest legitimate signal
-  # without being a perpetual ceiling. Likely target: ~$10k/leg given
-  # current $1k equity × 5x leverage budget.
-  max_notional_usd_per_leg: 0
+  # Phase 3-4 (#185): per-leg notional cap, expressed as a multiplier of
+  # equity_reference_usd × max_leverage. 0 disables, 1.0 = exactly the
+  # intended leverage, 1.1 = 10% slack for slippage/rounding while still
+  # rejecting bug-driven oversizing. The multiplicative form lets the same
+  # value work across A/B/C with different equity and across hosts
+  # (Frankfurt $1k×5x → $5k cap, Tokyo Lighter $150×5x → $750 cap at
+  # headroom=1.0). Disabled until Round 4 enablement.
+  max_notional_headroom: 0
 
 # Multi-strategy A/B/C variants for the single-process architecture
 # (shigeo-nakamura/bot-strategy#25). The single `debot-pair-btceth`

@@ -337,10 +337,16 @@ pub(super) struct RiskYaml {
     /// Smaller values track the peak more tightly at the cost of more
     /// disk writes.
     pub(super) session_dd_sample_secs: Option<u64>,
-    /// Phase 3-4: hard cap on USD notional per hedge leg. 0 disables
-    /// (default). When set, sizing scales the trade so neither leg
-    /// exceeds this notional, regardless of equity / leverage.
-    pub(super) max_notional_usd_per_leg: Option<f64>,
+    /// Phase 3-4: hard cap on per-leg USD notional, expressed as a
+    /// multiplier of `equity_reference_usd × max_leverage`. 0 disables
+    /// (default). 1.0 means "exactly the intended leverage"; values in
+    /// 1.0–1.2 give slippage / rounding headroom while still rejecting
+    /// the bug-driven oversizing the cap is meant to defend against.
+    /// The multiplicative form auto-scales across A/B/C with different
+    /// `equity_reference_usd` and across hosts (Frankfurt vs Tokyo
+    /// Lighter) with different equity or `max_leverage`, so a single
+    /// YAML value covers the whole fleet without env split.
+    pub(super) max_notional_headroom: Option<f64>,
 }
 
 /// Per-strategy override block in the new multi-strategy YAML format.
@@ -513,8 +519,11 @@ pub struct RiskConfig {
     pub session_dd_lookback_secs: u64,
     /// Phase 3-1: equity sampling cadence in seconds.
     pub session_dd_sample_secs: u64,
-    /// Phase 3-4: 0.0 = disabled.
-    pub max_notional_usd_per_leg: f64,
+    /// Phase 3-4: per-leg notional cap multiplier. 0.0 = disabled.
+    /// Resolved cap = `equity_reference_usd × max_leverage × headroom`
+    /// at sizing time, so the dollar threshold tracks per-instance
+    /// equity and per-host leverage automatically.
+    pub max_notional_headroom: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,7 +544,7 @@ impl Default for RiskConfig {
             max_session_loss_bps: DEFAULT_MAX_SESSION_LOSS_BPS,
             session_dd_lookback_secs: DEFAULT_SESSION_DD_LOOKBACK_SECS,
             session_dd_sample_secs: DEFAULT_SESSION_DD_SAMPLE_SECS,
-            max_notional_usd_per_leg: DEFAULT_MAX_NOTIONAL_USD_PER_LEG,
+            max_notional_headroom: DEFAULT_MAX_NOTIONAL_HEADROOM,
         }
     }
 }
@@ -557,13 +566,24 @@ fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig> {
             ));
         }
     };
-    let max_notional = y
-        .max_notional_usd_per_leg
-        .unwrap_or(DEFAULT_MAX_NOTIONAL_USD_PER_LEG);
-    if max_notional < 0.0 || !max_notional.is_finite() {
+    let max_notional_headroom = y
+        .max_notional_headroom
+        .unwrap_or(DEFAULT_MAX_NOTIONAL_HEADROOM);
+    if max_notional_headroom < 0.0 || !max_notional_headroom.is_finite() {
         return Err(anyhow!(
-            "risk.max_notional_usd_per_leg must be ≥ 0 and finite (got {})",
-            max_notional
+            "risk.max_notional_headroom must be ≥ 0 and finite (got {})",
+            max_notional_headroom
+        ));
+    }
+    // 10x is well above any sane belt-and-suspenders multiplier (typical
+    // 1.0–1.2) — flag config drift early. Anything above this is almost
+    // certainly someone misreading the field as an absolute USD value.
+    if max_notional_headroom > 10.0 {
+        return Err(anyhow!(
+            "risk.max_notional_headroom={} looks like an absolute USD value; \
+             this field is a multiplier of equity_reference_usd × max_leverage \
+             (typical 1.0–1.2)",
+            max_notional_headroom
         ));
     }
     let sample_secs = y
@@ -595,7 +615,7 @@ fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig> {
             .unwrap_or(DEFAULT_MAX_SESSION_LOSS_BPS),
         session_dd_lookback_secs: lookback_secs,
         session_dd_sample_secs: sample_secs,
-        max_notional_usd_per_leg: max_notional,
+        max_notional_headroom,
     })
 }
 
@@ -1725,7 +1745,7 @@ mod tests {
         let cfg = resolve_risk_config(None).unwrap();
         assert_eq!(cfg.max_daily_loss_bps, 0);
         assert_eq!(cfg.max_session_loss_bps, 0);
-        assert_eq!(cfg.max_notional_usd_per_leg, 0.0);
+        assert_eq!(cfg.max_notional_headroom, 0.0);
         assert!(matches!(cfg.max_daily_loss_action, DailyLossAction::Block));
     }
 
@@ -1735,20 +1755,31 @@ mod tests {
             max_session_loss_bps: Some(500),
             session_dd_lookback_secs: Some(1_209_600), // 14 d
             session_dd_sample_secs: Some(1_800),       // 30 m
-            max_notional_usd_per_leg: Some(50_000.0),
+            max_notional_headroom: Some(1.1),
             ..RiskYaml::default()
         };
         let cfg = resolve_risk_config(Some(&yaml)).unwrap();
         assert_eq!(cfg.max_session_loss_bps, 500);
         assert_eq!(cfg.session_dd_lookback_secs, 1_209_600);
         assert_eq!(cfg.session_dd_sample_secs, 1_800);
-        assert!((cfg.max_notional_usd_per_leg - 50_000.0).abs() < 1e-9);
+        assert!((cfg.max_notional_headroom - 1.1).abs() < 1e-9);
     }
 
     #[test]
-    fn risk_config_rejects_negative_notional_cap() {
+    fn risk_config_rejects_negative_headroom() {
         let yaml = RiskYaml {
-            max_notional_usd_per_leg: Some(-1.0),
+            max_notional_headroom: Some(-1.0),
+            ..RiskYaml::default()
+        };
+        assert!(resolve_risk_config(Some(&yaml)).is_err());
+    }
+
+    #[test]
+    fn risk_config_rejects_headroom_that_looks_like_dollars() {
+        // Old schema took an absolute USD cap (e.g. 5000). Catch operators
+        // copy-pasting the old value into the new field name.
+        let yaml = RiskYaml {
+            max_notional_headroom: Some(5_000.0),
             ..RiskYaml::default()
         };
         assert!(resolve_risk_config(Some(&yaml)).is_err());
