@@ -66,7 +66,44 @@ pub(super) struct StatusReporter {
     /// present once the engine has run at least one tick on the
     /// instance; the field is None only briefly at startup.
     pub(super) circuit_breaker: Option<CircuitBreakerSnapshot>,
+    /// Bounded ring buffer (capacity 200) of recent halt transitions
+    /// across all gates. Filled on startup from `risk_history_path`,
+    /// pushed on each `record_risk_event` call, and serialised inline
+    /// into `status.json` so the dashboard renders the strip without
+    /// an extra SSM round trip. See bot-strategy#231 Phase B.
+    pub(super) risk_history: std::collections::VecDeque<RiskHistoryEvent>,
+    /// Sibling jsonl file storing a longer audit log of halt events.
+    /// Append-only — bot startup re-loads the tail into `risk_history`
+    /// so a restart preserves recent context.
+    pub(super) risk_history_path: PathBuf,
 }
+
+/// Halt-history entry emitted in `status.json` and persisted to
+/// `risk_history.jsonl`. One row per state transition (activate /
+/// clear / ack) for any of the four risk gates. See bot-strategy#231
+/// Phase B.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct RiskHistoryEvent {
+    pub(super) ts: i64,
+    pub(super) instance_id: String,
+    /// Which gate fired: "kill_switch" | "daily_dd" | "session_dd"
+    /// | "circuit_breaker".
+    pub(super) kind: String,
+    /// State transition direction: "activated" | "cleared" | "ack".
+    /// "ack" applies only to session_dd (manual clear via RISK_ACK).
+    pub(super) event_type: String,
+    /// Human-readable reason where one is available (e.g. session DD
+    /// reason string, KILL_SWITCH path). Optional so circuit-breaker
+    /// auto-clear can omit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<String>,
+    /// Free-form JSON detail (observed bps, threshold, cooldown_secs,
+    /// etc.). Renderer is best-effort; missing fields don't break.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) detail: Option<serde_json::Value>,
+}
+
+const RISK_HISTORY_BUFFER_CAP: usize = 200;
 
 /// Per-instance realized daily-DD view emitted in `status.json` so the
 /// dashboard can surface the live halt state without duplicating the
@@ -175,6 +212,8 @@ pub(super) struct StatusSnapshot {
     pub(super) session_risk: Option<SessionRiskSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) circuit_breaker: Option<CircuitBreakerSnapshot>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(super) risk_history: Vec<RiskHistoryEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -258,14 +297,23 @@ impl StatusReporter {
                 .unwrap_or_else(|| "status.json".to_string());
             reporter.path = new_parent.join(file_name);
         }
-        // Keep auxiliary files (`equity.json`, `equity_history.jsonl`)
-        // co-located with the rewritten status.json.
+        // Keep auxiliary files (`equity.json`, `equity_history.jsonl`,
+        // `risk_history.jsonl`) co-located with the rewritten status.json.
         reporter.equity_baseline_path = reporter.path.with_extension("equity.json");
         reporter.equity_history_path = reporter.path.with_extension("equity_history.jsonl");
+        reporter.risk_history_path = reporter
+            .path
+            .parent()
+            .map(|dir| dir.join("risk_history.jsonl"))
+            .unwrap_or_else(|| PathBuf::from("risk_history.jsonl"));
         reporter.id = Some(match reporter.id.take() {
             Some(prev) if !prev.is_empty() => format!("{prev}-{suffix}"),
             _ => suffix,
         });
+        // Reload risk history from the rewritten path so each instance's
+        // jsonl populates its own ring buffer (not the shared parent's).
+        reporter.risk_history.clear();
+        reporter.load_risk_history();
         Some(reporter)
     }
 
@@ -313,6 +361,10 @@ impl StatusReporter {
 
         let equity_baseline_path = path.with_extension("equity.json");
         let equity_history_path = path.with_extension("equity_history.jsonl");
+        let risk_history_path = path
+            .parent()
+            .map(|dir| dir.join("risk_history.jsonl"))
+            .unwrap_or_else(|| PathBuf::from("risk_history.jsonl"));
         let interval_secs = cfg.interval_secs.max(1);
         let snapshot_every = {
             let target_secs = 60_u64;
@@ -350,8 +402,11 @@ impl StatusReporter {
             daily_risk: None,
             session_risk: None,
             circuit_breaker: None,
+            risk_history: std::collections::VecDeque::with_capacity(RISK_HISTORY_BUFFER_CAP),
+            risk_history_path,
         };
         reporter.load_equity_baseline();
+        reporter.load_risk_history();
         if let Err(err) = reporter.ensure_status_file() {
             log::warn!(
                 "[STATUS] failed to create status file {}: {:?}",
@@ -452,6 +507,66 @@ impl StatusReporter {
         }
     }
 
+    /// Append a single risk history event to the in-memory ring buffer
+    /// and the on-disk jsonl. Caller is responsible for not emitting
+    /// duplicate events for the same transition (we don't dedupe here
+    /// — call sites are gated on edge-triggered "old != new" checks).
+    /// See bot-strategy#231 Phase B.
+    pub(super) fn record_risk_event(&mut self, event: RiskHistoryEvent) {
+        // Bounded ring buffer: drop the oldest when full.
+        if self.risk_history.len() >= RISK_HISTORY_BUFFER_CAP {
+            self.risk_history.pop_front();
+        }
+        // Best-effort persistence: serialise as a single JSON line.
+        // Failures are warned but do not block the in-memory path so
+        // the dashboard still gets the live event.
+        if let Err(err) = self.append_risk_history_line(&event) {
+            log::warn!(
+                "[STATUS] failed to persist risk_history event: {:?}",
+                err
+            );
+        }
+        self.risk_history.push_back(event);
+    }
+
+    fn append_risk_history_line(
+        &self,
+        event: &RiskHistoryEvent,
+    ) -> std::io::Result<()> {
+        if let Some(parent) = self.risk_history_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let line = serde_json::to_string(event)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.risk_history_path)?;
+        writeln!(file, "{line}")
+    }
+
+    /// Load the tail of `risk_history.jsonl` into the ring buffer on
+    /// startup so a bot restart preserves recent halt context. Best
+    /// effort — file missing / parse errors are silent (the buffer
+    /// just starts empty in that case).
+    fn load_risk_history(&mut self) {
+        let raw = match fs::read_to_string(&self.risk_history_path) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Take the last RISK_HISTORY_BUFFER_CAP non-empty lines.
+        let mut lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        let drop_n = lines.len().saturating_sub(RISK_HISTORY_BUFFER_CAP);
+        if drop_n > 0 {
+            lines.drain(..drop_n);
+        }
+        for line in lines {
+            if let Ok(event) = serde_json::from_str::<RiskHistoryEvent>(line) {
+                self.risk_history.push_back(event);
+            }
+        }
+    }
+
     pub(super) fn update_equity(&mut self, equity: f64) {
         let today = Utc::now().date_naive();
         self.pnl_total = equity;
@@ -530,6 +645,7 @@ impl StatusReporter {
             daily_risk: self.daily_risk.clone(),
             session_risk: self.session_risk.clone(),
             circuit_breaker: self.circuit_breaker.clone(),
+            risk_history: self.risk_history.iter().cloned().collect(),
         };
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;

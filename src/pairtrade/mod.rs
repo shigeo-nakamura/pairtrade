@@ -1971,6 +1971,11 @@ impl PairTradeEngine {
                             self.write_pnl_record(inst_idx, record);
                             self.instances[inst_idx].realized_pnl_today += pnl_value;
                             let mut risk_state_dirty = pnl_value != 0.0;
+                            // Collect circuit-breaker history events here
+                            // and emit them after the borrow on
+                            // self.instances releases, since
+                            // record_risk_event_for_instance needs &mut self.
+                            let mut cb_event: Option<(&'static str, u32, Option<u64>)> = None;
                             if pnl_value < 0.0 {
                                 self.instances[inst_idx].consecutive_losses += 1;
                                 risk_state_dirty = true;
@@ -1985,11 +1990,25 @@ impl PairTradeEngine {
                                         "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
                                         self.instances[inst_idx].consecutive_losses, cooldown.as_secs()
                                     );
+                                    cb_event = Some((
+                                        "activated",
+                                        self.instances[inst_idx].consecutive_losses,
+                                        Some(cooldown.as_secs()),
+                                    ));
                                 }
                             } else if pnl_value > 0.0 {
                                 if self.instances[inst_idx].consecutive_losses > 0 {
                                     log::info!("[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)", self.instances[inst_idx].consecutive_losses);
                                     risk_state_dirty = true;
+                                    let was_active =
+                                        self.instances[inst_idx].circuit_breaker_until_ts.is_some();
+                                    if was_active {
+                                        cb_event = Some((
+                                            "cleared",
+                                            self.instances[inst_idx].consecutive_losses,
+                                            None,
+                                        ));
+                                    }
                                 }
                                 self.instances[inst_idx].consecutive_losses = 0;
                                 self.instances[inst_idx].circuit_breaker_until = None;
@@ -1997,6 +2016,27 @@ impl PairTradeEngine {
                             }
                             if risk_state_dirty {
                                 self.persist_risk_state();
+                            }
+                            if let Some((event_type, prior_losses, cooldown_secs)) = cb_event {
+                                let detail = match cooldown_secs {
+                                    Some(secs) => Some(serde_json::json!({
+                                        "consecutive_losses": prior_losses,
+                                        "cooldown_secs": secs,
+                                        "pnl_value": pnl_value,
+                                    })),
+                                    None => Some(serde_json::json!({
+                                        "prior_losses": prior_losses,
+                                        "pnl_value": pnl_value,
+                                        "trigger": "winning_trade",
+                                    })),
+                                };
+                                self.record_risk_event_for_instance(
+                                    inst_idx,
+                                    "circuit_breaker",
+                                    event_type,
+                                    None,
+                                    detail,
+                                );
                             }
                         }
                         log::info!(
@@ -3015,7 +3055,12 @@ impl PairTradeEngine {
         let now_ts = self.current_now_ts();
         let current_day = session_day(now_ts, reset_hour);
         let mut dirty = false;
-        for inst in &mut self.instances {
+        // Collect transitions during the &mut iter so we can call
+        // record_risk_event_for_instance after the loop ends (the
+        // recorder needs &mut self, conflicting with the iter borrow).
+        let mut transitions: Vec<(usize, &'static str, Option<String>, Option<serde_json::Value>)> =
+            Vec::new();
+        for (inst_idx, inst) in self.instances.iter_mut().enumerate() {
             let prior_day = if inst.session_start_ts > 0 {
                 Some(session_day(inst.session_start_ts, reset_hour))
             } else {
@@ -3035,6 +3080,12 @@ impl PairTradeEngine {
                     log::warn!(
                         "[DAILY_DD] {} halt cleared by session rollover", inst.id
                     );
+                    transitions.push((
+                        inst_idx,
+                        "cleared",
+                        Some("session_rollover".to_string()),
+                        None,
+                    ));
                 }
                 inst.daily_loss_halted = false;
                 dirty = true;
@@ -3074,13 +3125,35 @@ impl PairTradeEngine {
                 );
                 inst.daily_loss_halted = true;
                 dirty = true;
+                transitions.push((
+                    inst_idx,
+                    "activated",
+                    Some(format!("{:.0}_bps_loss", loss_bps)),
+                    Some(serde_json::json!({
+                        "loss_bps": loss_bps,
+                        "threshold_bps": threshold_bps,
+                        "leverage": leverage,
+                        "effective_threshold_bps": effective_threshold_bps,
+                        "realized_pnl_today": inst.realized_pnl_today,
+                    })),
+                ));
             } else if !currently_blocks && inst.daily_loss_halted {
                 // Usually unreachable in Phase 2; kept so manual edits
                 // to risk_state.json don't leave a stale halt flag.
                 log::warn!("[DAILY_DD] {} halt cleared", inst.id);
                 inst.daily_loss_halted = false;
                 dirty = true;
+                transitions.push((inst_idx, "cleared", None, None));
             }
+        }
+        for (inst_idx, event_type, reason, detail) in transitions {
+            self.record_risk_event_for_instance(
+                inst_idx,
+                "daily_dd",
+                event_type,
+                reason,
+                detail,
+            );
         }
         if dirty {
             self.persist_risk_state();
@@ -3122,12 +3195,83 @@ impl PairTradeEngine {
                 KILL_SWITCH_PATH
             );
             self.kill_switch_active = true;
+            self.record_risk_event_all_instances(
+                "kill_switch",
+                "activated",
+                Some(KILL_SWITCH_PATH.to_string()),
+                None,
+            );
         } else if !present && self.kill_switch_active {
             log::warn!(
                 "[KILL_SWITCH] cleared: {} removed; new entries resumed",
                 KILL_SWITCH_PATH
             );
             self.kill_switch_active = false;
+            self.record_risk_event_all_instances(
+                "kill_switch",
+                "cleared",
+                Some(KILL_SWITCH_PATH.to_string()),
+                None,
+            );
+        }
+    }
+
+    /// Record a risk-history event on every instance's status_reporter.
+    /// Used for fleet-level transitions (KILL_SWITCH file flag) where
+    /// the gate affects all instances at once. See bot-strategy#231
+    /// Phase B.
+    fn record_risk_event_all_instances(
+        &mut self,
+        kind: &str,
+        event_type: &str,
+        reason: Option<String>,
+        detail: Option<serde_json::Value>,
+    ) {
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let now_ts = self.current_now_ts();
+        for inst in &mut self.instances {
+            let id = inst.id.clone();
+            if let Some(reporter) = &mut inst.status_reporter {
+                reporter.record_risk_event(status::RiskHistoryEvent {
+                    ts: now_ts,
+                    instance_id: id,
+                    kind: kind.to_string(),
+                    event_type: event_type.to_string(),
+                    reason: reason.clone(),
+                    detail: detail.clone(),
+                });
+            }
+        }
+    }
+
+    /// Record a risk-history event for a single instance. Used for
+    /// per-instance transitions (daily/session DD, circuit breaker)
+    /// where the gate fires on one variant without affecting peers.
+    fn record_risk_event_for_instance(
+        &mut self,
+        inst_idx: usize,
+        kind: &str,
+        event_type: &str,
+        reason: Option<String>,
+        detail: Option<serde_json::Value>,
+    ) {
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let now_ts = self.current_now_ts();
+        let inst = &mut self.instances[inst_idx];
+        let id = inst.id.clone();
+        if let Some(reporter) = &mut inst.status_reporter {
+            reporter.record_risk_event(status::RiskHistoryEvent {
+                ts: now_ts,
+                instance_id: id,
+                kind: kind.to_string(),
+                event_type: event_type.to_string(),
+                reason,
+                detail,
+            });
         }
     }
 
@@ -3148,20 +3292,37 @@ impl PairTradeEngine {
         let payload = std::fs::read_to_string(path).unwrap_or_default();
         let trimmed = payload.trim();
         let mut cleared_any = false;
-        for inst in &mut self.instances {
+        let mut cleared_indices: Vec<(usize, String)> = Vec::new();
+        for (inst_idx, inst) in self.instances.iter_mut().enumerate() {
             if inst.session_halted {
+                let prior_reason = inst.session_halt_reason.clone().unwrap_or_else(|| "unknown".to_string());
                 log::warn!(
                     "[SESSION_DD] {} halt cleared by ack at {} (reason was: {}, ack payload: {:?})",
                     inst.id,
                     RISK_ACK_PATH,
-                    inst.session_halt_reason.as_deref().unwrap_or("unknown"),
+                    prior_reason,
                     trimmed
                 );
                 inst.session_halted = false;
                 inst.session_halt_reason = None;
                 inst.session_halt_ts = None;
                 cleared_any = true;
+                cleared_indices.push((inst_idx, prior_reason));
             }
+        }
+        let ack_payload = if trimmed.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({ "ack_payload": trimmed }))
+        };
+        for (inst_idx, prior_reason) in cleared_indices {
+            self.record_risk_event_for_instance(
+                inst_idx,
+                "session_dd",
+                "ack",
+                Some(prior_reason),
+                ack_payload.clone(),
+            );
         }
         if let Err(e) = std::fs::remove_file(path) {
             log::warn!("[SESSION_DD] failed to remove {} after ack: {:?}", RISK_ACK_PATH, e);
@@ -3301,9 +3462,23 @@ impl PairTradeEngine {
         {
             let inst_mut = &mut self.instances[inst_idx];
             inst_mut.session_halted = true;
-            inst_mut.session_halt_reason = Some(reason);
+            inst_mut.session_halt_reason = Some(reason.clone());
             inst_mut.session_halt_ts = Some(now_ts);
         }
+        self.record_risk_event_for_instance(
+            inst_idx,
+            "session_dd",
+            "activated",
+            Some(reason),
+            Some(serde_json::json!({
+                "current_equity": current,
+                "peak_equity": peak,
+                "dd_bps": dd_bps,
+                "threshold_bps": threshold_bps,
+                "leverage": leverage,
+                "effective_threshold_bps": effective_threshold_bps,
+            })),
+        );
         self.persist_risk_state();
         // Flatten this instance's positions. `self.connector` was already
         // pointed at `instances[inst_idx].connector` by the caller in
