@@ -2251,9 +2251,11 @@ impl PairTradeEngine {
         {
             let risk = self.daily_risk_snapshot(inst_idx);
             let session_risk = self.session_risk_snapshot(inst_idx);
+            let circuit_breaker = self.circuit_breaker_snapshot(inst_idx);
             if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
                 reporter.set_daily_risk(risk);
                 reporter.set_session_risk(session_risk);
+                reporter.set_circuit_breaker(circuit_breaker);
                 if let Err(err) =
                     reporter.write_snapshot_if_due(&self.open_positions, self.positions_ready)
                 {
@@ -2290,6 +2292,36 @@ impl PairTradeEngine {
             max_daily_loss_bps: threshold_bps,
             effective_max_daily_loss_bps: threshold_bps as f64 * self.cfg.max_leverage,
             risk_halted: inst.daily_loss_halted,
+        })
+    }
+
+    /// Build a `CircuitBreakerSnapshot` for the dashboard. Always returns
+    /// a value (even when no losses have occurred yet) so the dashboard
+    /// can display "0 / N losses, no cooldown" as a steady-state — the
+    /// alternative would be an Option that flips to Some only at the
+    /// first loss, making the field appear-on-fire instead of always-on.
+    fn circuit_breaker_snapshot(
+        &self,
+        inst_idx: usize,
+    ) -> Option<status::CircuitBreakerSnapshot> {
+        let inst = &self.instances[inst_idx];
+        let now_ts = self.current_now_ts();
+        let cooldown_remaining_secs = inst.circuit_breaker_until_ts.and_then(|until| {
+            let remaining = until - now_ts;
+            if remaining > 0 {
+                Some(remaining)
+            } else {
+                None
+            }
+        });
+        let active = cooldown_remaining_secs.is_some();
+        Some(status::CircuitBreakerSnapshot {
+            consecutive_losses: inst.consecutive_losses,
+            active,
+            until_ts: inst.circuit_breaker_until_ts,
+            cooldown_remaining_secs,
+            tier1_threshold: self.cfg.default_pair_params.circuit_breaker_tier1_losses,
+            tier2_threshold: self.cfg.default_pair_params.circuit_breaker_tier2_losses,
         })
     }
 

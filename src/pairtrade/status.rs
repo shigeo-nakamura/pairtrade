@@ -62,6 +62,10 @@ pub(super) struct StatusReporter {
     /// Phase 3-1 session-DD snapshot. None until the threshold is
     /// enabled and the first equity sample is taken.
     pub(super) session_risk: Option<SessionRiskSnapshot>,
+    /// Circuit-breaker view (consecutive losses + cooldown). Always
+    /// present once the engine has run at least one tick on the
+    /// instance; the field is None only briefly at startup.
+    pub(super) circuit_breaker: Option<CircuitBreakerSnapshot>,
 }
 
 /// Per-instance realized daily-DD view emitted in `status.json` so the
@@ -83,6 +87,27 @@ pub(super) struct DailyRiskSnapshot {
     pub(super) max_daily_loss_bps: u32,
     pub(super) effective_max_daily_loss_bps: f64,
     pub(super) risk_halted: bool,
+}
+
+/// Per-instance circuit-breaker view emitted in `status.json` so the
+/// dashboard can render the live cooldown countdown without duplicating
+/// the threshold logic. `consecutive_losses` resets on a winning trade
+/// (early de-arming) and `until_ts` is set on threshold breach with the
+/// configured cooldown. `active=true` when `until_ts` is in the future
+/// — entries are blocked until either cooldown expires (auto) or a
+/// winning trade resets the counter (rare in single-position-per-instance
+/// mode; usually cooldown is the only path back). See bot-strategy#185
+/// Phase 1-3.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct CircuitBreakerSnapshot {
+    pub(super) consecutive_losses: u32,
+    pub(super) active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) until_ts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cooldown_remaining_secs: Option<i64>,
+    pub(super) tier1_threshold: u32,
+    pub(super) tier2_threshold: u32,
 }
 
 /// Phase 3-1 rolling-peak DD view. Only present once the bot has at
@@ -148,6 +173,8 @@ pub(super) struct StatusSnapshot {
     pub(super) daily_risk: Option<DailyRiskSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) session_risk: Option<SessionRiskSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) circuit_breaker: Option<CircuitBreakerSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -322,6 +349,7 @@ impl StatusReporter {
             shutdown: None,
             daily_risk: None,
             session_risk: None,
+            circuit_breaker: None,
         };
         reporter.load_equity_baseline();
         if let Err(err) = reporter.ensure_status_file() {
@@ -455,6 +483,10 @@ impl StatusReporter {
         self.session_risk = risk;
     }
 
+    pub(super) fn set_circuit_breaker(&mut self, cb: Option<CircuitBreakerSnapshot>) {
+        self.circuit_breaker = cb;
+    }
+
     pub(super) fn write_snapshot(
         &mut self,
         open_positions: &HashMap<String, PositionSnapshot>,
@@ -497,6 +529,7 @@ impl StatusReporter {
             error_summary: error_counter::global().map(|h| h.snapshot()),
             daily_risk: self.daily_risk.clone(),
             session_risk: self.session_risk.clone(),
+            circuit_breaker: self.circuit_breaker.clone(),
         };
         let payload = serde_json::to_string(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
