@@ -58,9 +58,9 @@ use util::{enforce_post_only_passive, round_price_by_tick, tail_std};
 /// fetches a fresh value from the exchange. Now a low-frequency dashboard tick:
 /// exit/loss-cut uses locally-computed PnL from WS prices, so `equity_cache`
 /// only scales the slowly-drifting R-budget and feeds the status reporter.
-/// Entry sizing forces a fresh fetch inline (see `fetch_equity_rest` call in
-/// the entry branch of `step()`), independent of this cache. See
-/// bot-strategy#156.
+/// Entry sizing fetches inline (see `fetch_equity_rest` call in the entry
+/// branch of `step()`), which after dex-connector v4.2.83 is a WS-derived
+/// cache hit in steady state. See bot-strategy#156, #239.
 const EQUITY_REFRESH_CACHE_SECS: u64 = 1800;
 
 /// Sentinel file that, when present, blocks all new entries without
@@ -156,12 +156,6 @@ pub struct PairTradeEngine {
     min_tick_warned: HashSet<String>,
     positions_ready: bool,
     open_positions: HashMap<String, PositionSnapshot>,
-    /// Last time ANY /account REST call was fired across all instances.
-    /// Used to pace calls ≥ MIN_ACCOUNT_SPACING apart without a blocking
-    /// per-instance sleep; the previous `inst_idx * 5s` stagger blocked
-    /// step() for the full span even when no recent call had been made.
-    /// See bot-strategy#122.
-    last_account_rest_call: Option<Instant>,
     history_path: PathBuf,
     /// Path for the risk-state persistence file (circuit breaker counters
     /// + cool-down deadline). Sibling of `history_path`. See bot-strategy#185.
@@ -396,7 +390,6 @@ impl PairTradeEngine {
             min_tick_warned,
             positions_ready: backtest_mode,
             open_positions: HashMap::new(),
-            last_account_rest_call: None,
             history_path,
             risk_state_path,
             kill_switch_active: false,
@@ -2415,19 +2408,16 @@ impl PairTradeEngine {
     }
 
     async fn fetch_equity_rest(&mut self, inst_idx: usize) {
-        // Minimum spacing between /account REST calls across all instances.
-        // Lighter enforces a per-IP short-window rate-limit on /account the
-        // sidecar can't see; empirically ~1 call per 5s survives. Shared
-        // across instances so step() only waits when a recent call exists,
-        // not unconditionally on every inst_idx > 0. See bot-strategy#122.
-        const MIN_ACCOUNT_SPACING: Duration = Duration::from_millis(5_500);
-        if let Some(last) = self.last_account_rest_call {
-            let elapsed = last.elapsed();
-            if elapsed < MIN_ACCOUNT_SPACING {
-                tokio::time::sleep(MIN_ACCOUNT_SPACING - elapsed).await;
-            }
-        }
-        self.last_account_rest_call = Some(Instant::now());
+        // No pairtrade-side throttle: dex-connector v4.2.83 (#239) populates
+        // `balance_cache` from WS-derived equity (assets[USDC].margin_balance
+        // + sum(positions.unrealized_pnl)), so `get_balance(None)` is a cache
+        // hit in steady state — sub-millisecond, no REST call. The previous
+        // `MIN_ACCOUNT_SPACING=5.5s` sleep across A/B/C variants was added
+        // (#122) to dodge Lighter's per-wallet short-window throttle on
+        // /account; with WS-derived equity that REST path is rarely
+        // exercised and the connector's existing 429 retry handles the
+        // transient case. Removing the sleep eliminates the 11s entry burst
+        // that drove STEP_OVERRUN warnings on every trade (#235, #236, #238).
         match self.connector.get_balance(None).await {
             Ok(resp) => {
                 if let Some(eq) = resp.equity.to_f64() {
@@ -5376,7 +5366,6 @@ impl PairTradeEngine {
             min_tick_warned: HashSet::new(),
             positions_ready: false,
             open_positions: HashMap::new(),
-            last_account_rest_call: None,
             history_path,
             risk_state_path,
             kill_switch_active: false,
