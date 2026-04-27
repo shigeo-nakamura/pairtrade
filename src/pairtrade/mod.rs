@@ -4527,6 +4527,8 @@ impl PairTradeEngine {
         let max_elapsed = Duration::from_millis(POST_ONLY_RETRY_MAX_ELAPSED_MS);
         let start = Instant::now();
         let mut attempt = 0usize;
+        #[allow(unused_assignments)]
+        let mut last_limit: Option<Decimal> = None;
 
         let last_err = loop {
             attempt += 1;
@@ -4541,6 +4543,7 @@ impl PairTradeEngine {
                     symbol
                 )));
             }
+            last_limit = limit;
             let spread = self.order_spread_param(limit, use_post_only);
             match self
                 .connector
@@ -4555,21 +4558,48 @@ impl PairTradeEngine {
                     if attempt >= max_attempts || start.elapsed() >= max_elapsed {
                         break err;
                     }
+                    // bot-strategy#165 Phase 0: capture per-attempt context so we
+                    // can tell whether the exchange rejected for would-cross
+                    // (post-only crossing the touch) vs. some other reason. Tag
+                    // is grep-friendly alongside [ORDER_FALLBACK_DETAIL].
+                    let snap = prices.get(symbol);
+                    log::info!(
+                        "[ORDER_REJECT_DETAIL] {} attempt={} side={:?} size={} limit={} bid={} ask={} err={}",
+                        symbol,
+                        attempt,
+                        side,
+                        size,
+                        limit.map(|d| d.to_string()).unwrap_or_else(|| "none".into()),
+                        snap.and_then(|s| s.bid_price)
+                            .map(|d| d.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        snap.and_then(|s| s.ask_price)
+                            .map(|d| d.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        format!("{:?}", err).chars().take(160).collect::<String>(),
+                    );
                 }
             }
-
-            log::info!(
-                "[ORDER] {} post-only attempt {} failed; retrying",
-                symbol,
-                attempt
-            );
             sleep(Duration::from_millis(POST_ONLY_RETRY_DELAY_MS)).await;
         };
 
         if use_post_only && fallback_to_taker {
+            let snap = prices.get(symbol);
             log::warn!(
-                "[ORDER] {} post-only attempts exhausted; falling back to taker",
-                symbol
+                "[ORDER] {} post-only attempts exhausted ({} attempts, elapsed={}ms); falling back to taker side={:?} size={} last_limit={} bid={} ask={} last_err={}",
+                symbol,
+                attempt,
+                start.elapsed().as_millis(),
+                side,
+                size,
+                last_limit.map(|d| d.to_string()).unwrap_or_else(|| "none".into()),
+                snap.and_then(|s| s.bid_price)
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                snap.and_then(|s| s.ask_price)
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                format!("{:?}", last_err).chars().take(160).collect::<String>(),
             );
             return self
                 .connector
