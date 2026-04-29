@@ -888,6 +888,23 @@ impl PairTradeEngine {
                 continue;
             }
             let spread = self.order_spread_param(limit, false);
+            // Pre-flight position check on the exit reissue path: if a prior
+            // reissue tick already filled the leg flat, sending another
+            // reduce-only HTTP just races and gets rejected with Extended
+            // code 1137. The post-error handler below catches that, but
+            // skipping the round-trip here is cleaner and avoids the auto-
+            // error workflow trip on the upstream HTTP WARN.
+            if reduce_only && self.confirm_reduce_only_position_missing(&leg.symbol).await {
+                log::info!(
+                    "[ORDER] {} leg {} already closed; skipping reissue",
+                    stage,
+                    leg.symbol
+                );
+                let mut kept = leg.clone();
+                kept.filled = leg.target;
+                new_legs.push(kept);
+                continue;
+            }
             match self
                 .connector
                 .create_order(
@@ -4974,6 +4991,7 @@ impl PairTradeEngine {
         );
         let mut legs: Vec<PendingLeg> = Vec::new();
         let mut res_a = None;
+        let mut skipped_already_closed = false;
         if qty_a > Decimal::ZERO {
             let res = if use_market {
                 self.connector
@@ -5021,6 +5039,7 @@ impl PairTradeEngine {
                                 "[ORDER] {} reduce-only close skipped; position already closed",
                                 symbol
                             );
+                            skipped_already_closed = true;
                         } else {
                             return Err(err).context("close leg A");
                         }
@@ -5061,6 +5080,7 @@ impl PairTradeEngine {
                                 symbol
                             );
                             skip = true;
+                            skipped_already_closed = true;
                         }
                     }
                     if skip {
@@ -5103,13 +5123,21 @@ impl PairTradeEngine {
         }
 
         if legs.is_empty() {
-            log::warn!(
-                "[ORDER] No exit legs placed for {}/{} (qty_a={}, qty_b={})",
-                pair.base,
-                pair.quote,
-                qty_a,
-                qty_b
-            );
+            if skipped_already_closed {
+                log::info!(
+                    "[ORDER] No exit legs placed for {}/{}; positions already flat",
+                    pair.base,
+                    pair.quote
+                );
+            } else {
+                log::warn!(
+                    "[ORDER] No exit legs placed for {}/{} (qty_a={}, qty_b={})",
+                    pair.base,
+                    pair.quote,
+                    qty_a,
+                    qty_b
+                );
+            }
         }
         Ok(legs)
     }
