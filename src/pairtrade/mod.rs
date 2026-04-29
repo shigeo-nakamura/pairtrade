@@ -3699,10 +3699,22 @@ impl PairTradeEngine {
             } else if pending.post_only_hybrid {
                 let recon_pp = self.pair_params_for(inst_idx, key).clone();
                 let recon_pp = &recon_pp;
-                if recon_pp.entry_post_only_timeout_secs > 0
+                let timeout_elapsed = recon_pp.entry_post_only_timeout_secs > 0
                     && pending.placed_at.elapsed()
-                        >= Duration::from_secs(recon_pp.entry_post_only_timeout_secs)
-                {
+                        >= Duration::from_secs(recon_pp.entry_post_only_timeout_secs);
+                if !timeout_elapsed {
+                    // Post-only entry still within timeout window — keep pending
+                    // alive so the next ENTRY signal sees active_symbols and
+                    // doesn't fire a duplicate. Fires when
+                    // entry_post_only_timeout_secs > trading_period_secs (e.g.
+                    // Tokyo Extended 120s vs 60s tick): the first reconcile
+                    // tick after ENTRY hits this branch with elapsed < timeout
+                    // and the catch-all at the end of the if-chain is
+                    // unreachable. See bot-strategy#243.
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                        state.pending_entry = Some(pending);
+                    }
+                } else {
                     // Phase 0 instrumentation (bot-strategy#165): capture per-leg
                     // fill status, posted limit vs current book, and z-movement
                     // from entry to timeout so we can tell why the post-only
