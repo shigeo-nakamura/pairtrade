@@ -93,23 +93,24 @@ circuit_breaker_tier2_losses: 8
 circuit_breaker_tier2_cooldown_secs: 3600
 
 # Risk gates (bot-strategy#185). All bps fields are leverage-invariant
-# (multiplied by max_leverage internally), typical 100–500 bps. Tokyo
-# Extended is still in size-rounding verification — keep all disabled
-# until the first post-fix entry has fired and the new pricing path
-# doesn't drift equity.
+# (multiplied by max_leverage internally), typical 100–500 bps.
+# Enabled per bot-strategy#229 once #216/#217 size-rounding verification
+# cleared. max_leverage=1 here, so the bps fields apply at face value
+# against equity_usd_reference=$500.
 risk:
-  # Phase 2: daily DD. Disabled until verification clears (see #229).
-  max_daily_loss_bps: 0
+  # Phase 2: 3% daily DD = $15 cap.
+  max_daily_loss_bps: 300
   max_daily_loss_action: block
   daily_reset_utc_hour: 0
-  # Phase 3-1: rolling-peak session DD. Disabled until verification clears.
-  max_session_loss_bps: 0
+  # Phase 3-1: 5% rolling-peak session DD over 30d = $25 cap.
+  max_session_loss_bps: 500
   session_dd_lookback_secs: 2592000
   session_dd_sample_secs: 3600
   # Phase 3-4: per-leg notional cap as a multiplier of
-  # equity_reference_usd × max_leverage (1.0 = intended leverage, 1.1 =
-  # 10% slack). Disabled (0) until size-rounding verification clears.
-  max_notional_headroom: 0
+  # equity_reference_usd × max_leverage. 1.0 = intended notional with no
+  # slack; protects against sizing-math bugs without restricting the
+  # strategy.
+  max_notional_headroom: 1.0
 
 # MTF (A/B/C round 2 legacy from Lighter Strategy A)
 mtf_windows: [15]
