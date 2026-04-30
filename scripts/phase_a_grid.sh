@@ -15,6 +15,14 @@
 #      MTF on, 4 grid dims env-overridable)
 #   3. BT_WARM_START_SNAPSHOT path set (v2 snapshot)
 #
+# Optional (BYTE-EXACT mode — required for filter / regime / per-trade studies
+# per #250 / #70 2026-04-30 correction):
+#   4. BT_EVAL_TIMESTAMPS_FILE  : eval_ts.txt from extract/fetch_bt_replay_events.sh
+#   5. BT_RESTART_TIMESTAMPS_FILE: restart_ts.txt from same
+#   When BOTH are set, every cell runs in byte-exact mode; absent either, all
+#   cells run in minimum-execution mode (back-compat with pre-2026-04-30 sweeps;
+#   only valid for grid-level cumulative-PnL ranking).
+#
 # Outputs:
 #   /tmp/phase_a_grid/cell_NNN.log       — per-cell BT log
 #   /tmp/phase_a_grid/results.csv        — one row per cell with metrics
@@ -35,6 +43,21 @@ ANALYZER="$SCRIPT_DIR/log_analyzer.py"
 for req in "$BINARY" "$CONFIG" "$BT_BIN" "$SNAPSHOT"; do
   [ -e "$req" ] || { echo "ERROR: missing $req" >&2; exit 1; }
 done
+
+EVAL_TS_FILE="${BT_EVAL_TIMESTAMPS_FILE:-}"
+RESTART_TS_FILE="${BT_RESTART_TIMESTAMPS_FILE:-}"
+BT_MODE="minimum-execution"
+if [ -n "$EVAL_TS_FILE" ] && [ -n "$RESTART_TS_FILE" ]; then
+  for req in "$EVAL_TS_FILE" "$RESTART_TS_FILE"; do
+    [ -e "$req" ] || { echo "ERROR: missing $req" >&2; exit 1; }
+  done
+  BT_MODE="byte-exact"
+  export BT_EVAL_TIMESTAMPS_FILE="$EVAL_TS_FILE"
+  export BT_RESTART_TIMESTAMPS_FILE="$RESTART_TS_FILE"
+elif [ -n "$EVAL_TS_FILE" ] || [ -n "$RESTART_TS_FILE" ]; then
+  echo "ERROR: BT_EVAL_TIMESTAMPS_FILE and BT_RESTART_TIMESTAMPS_FILE must be set together (got only one)" >&2
+  exit 1
+fi
 
 mkdir -p "$OUT_DIR"
 RESULTS_CSV="$OUT_DIR/results.csv"
@@ -60,13 +83,20 @@ for ez in $ENTRY_Z_VALUES; do
 done
 TOTAL_CELLS=$cell_idx
 echo "=== Phase A grid: $TOTAL_CELLS cells, $PARALLEL_JOBS-way parallel ==="
+echo "Mode: $BT_MODE"
 echo "Data: $BT_BIN  Snapshot: $SNAPSHOT"
+if [ "$BT_MODE" = "byte-exact" ]; then
+  echo "Eval ts: $EVAL_TS_FILE ($(wc -l < "$EVAL_TS_FILE") entries)"
+  echo "Restart ts: $RESTART_TS_FILE ($(wc -l < "$RESTART_TS_FILE") entries)"
+fi
 echo "Output: $OUT_DIR/"
 echo ""
 
 run_cell() {
   local tag="$1" ez="$2" fc="$3" xz="$4" sl="$5"
   local log="$OUT_DIR/cell_${tag}.log"
+  # BT_EVAL_TIMESTAMPS_FILE / BT_RESTART_TIMESTAMPS_FILE are inherited from
+  # the parent env when in byte-exact mode (exported by the caller).
   PAIRTRADE_CONFIG_PATH="$CONFIG" \
     BACKTEST_MODE=true BACKTEST_FILE="$BT_BIN" DRY_RUN=true ENABLE_DATA_DUMP=false \
     RUST_LOG="warn,debot::pairtrade=info" UNIVERSE_PAIRS="BTC/ETH" \
