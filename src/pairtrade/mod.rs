@@ -948,7 +948,7 @@ impl PairTradeEngine {
                 }
                 Err(e) => {
                     let symbol = leg.symbol.clone();
-                    if reduce_only && Self::is_reduce_only_position_missing_error(&e) {
+                    if reduce_only && Self::is_reduce_only_rejection(&e) {
                         if self.confirm_reduce_only_position_missing(&symbol).await {
                             log::info!(
                                 "[ORDER] {} leg {} already closed; skipping reissue",
@@ -2717,7 +2717,7 @@ impl PairTradeEngine {
                 }
             }
             Err(err) => {
-                if Self::is_reduce_only_position_missing_error(&err)
+                if Self::is_reduce_only_rejection(&err)
                     && self.confirm_reduce_only_position_missing(symbol).await
                 {
                     log::info!(
@@ -2871,6 +2871,46 @@ impl PairTradeEngine {
         let lower = msg.to_ascii_lowercase();
         lower.contains("position is missing for reduce-only order")
             || lower.contains("position is missing for reduce only order")
+    }
+
+    fn is_reduce_only_size_mismatch_error(err: &DexError) -> bool {
+        let msg = match err {
+            DexError::ServerResponse(message) | DexError::Other(message) => message,
+            _ => return false,
+        };
+        let lower = msg.to_ascii_lowercase();
+        lower.contains("reduce-only order size exceeds position size")
+            || lower.contains("reduce only order size exceeds position size")
+    }
+
+    fn is_reduce_only_rejection(err: &DexError) -> bool {
+        Self::is_reduce_only_position_missing_error(err)
+            || Self::is_reduce_only_size_mismatch_error(err)
+    }
+
+    async fn fetch_residual_position_size(&mut self, symbol: &str) -> Option<Decimal> {
+        match self.connector.get_positions().await {
+            Ok(positions) => {
+                let pos = positions
+                    .iter()
+                    .find(|p| p.symbol == symbol && p.sign != 0 && p.size > Decimal::ZERO);
+                match pos {
+                    Some(p) => Some(p.size),
+                    None => {
+                        self.open_positions.remove(symbol);
+                        Some(Decimal::ZERO)
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "[ORDER] residual-size check failed for {}: {:?}",
+                    symbol,
+                    err
+                );
+                None
+            }
+        }
     }
 
     async fn confirm_reduce_only_position_missing(&mut self, symbol: &str) -> bool {
@@ -4109,6 +4149,79 @@ impl PairTradeEngine {
                                     quantized
                                 );
                             }
+                            Err(e) if Self::is_reduce_only_rejection(&e) => {
+                                // Extended code 1136/1137: bot-side qty exceeds the actual
+                                // residual position. Query the exchange for residual size
+                                // and resubmit with min(quantized, actual). 0 → already flat.
+                                match self
+                                    .fetch_residual_position_size(&leg.symbol)
+                                    .await
+                                {
+                                    Some(actual) if actual == Decimal::ZERO => {
+                                        log::info!(
+                                            "[ORDER] {} retry skipped; positions already flat",
+                                            leg.symbol
+                                        );
+                                    }
+                                    Some(actual) => {
+                                        let target = quantized.min(actual);
+                                        let downsized = self.quantize_order_size_exit(
+                                            &leg.symbol,
+                                            target,
+                                            price_map,
+                                        );
+                                        if downsized <= Decimal::ZERO {
+                                            log::info!(
+                                                "[ORDER] {} retry skipped; residual {} below min lot",
+                                                leg.symbol,
+                                                actual
+                                            );
+                                            continue;
+                                        }
+                                        match self
+                                            .connector
+                                            .create_order(
+                                                &leg.symbol,
+                                                downsized,
+                                                leg.side,
+                                                None,
+                                                None,
+                                                true,
+                                                None,
+                                            )
+                                            .await
+                                        {
+                                            Ok(resp) => {
+                                                new_legs.push(PendingLeg {
+                                                    symbol: leg.symbol.clone(),
+                                                    order_id: resp.order_id,
+                                                    exchange_order_id: resp.exchange_order_id,
+                                                    target: downsized,
+                                                    filled: Decimal::ZERO,
+                                                    side: leg.side,
+                                                    limit_price: None,
+                                                });
+                                                log::warn!(
+                                                    "[ORDER] Retrying exit leg {} size={} mode=MARKET (sized down from {})",
+                                                    leg.symbol,
+                                                    downsized,
+                                                    quantized
+                                                );
+                                            }
+                                            Err(e2) => log::error!(
+                                                "[ORDER] Failed to retry sized-down exit leg {}: {:?}",
+                                                leg.symbol,
+                                                e2
+                                            ),
+                                        }
+                                    }
+                                    None => log::error!(
+                                        "[ORDER] Failed to retry exit leg {}: {:?} (residual check failed)",
+                                        leg.symbol,
+                                        e
+                                    ),
+                                }
+                            }
                             Err(e) => log::error!(
                                 "[ORDER] Failed to retry exit leg {}: {:?}",
                                 leg.symbol,
@@ -4992,7 +5105,21 @@ impl PairTradeEngine {
         let mut legs: Vec<PendingLeg> = Vec::new();
         let mut res_a = None;
         let mut skipped_already_closed = false;
-        if qty_a > Decimal::ZERO {
+        // The pre-flight reduce-only check below is only useful on Extended,
+        // which exhibits cache/exchange state drift that yields HTTP 400 / code
+        // 1137 noise. Lighter does not — skipping the extra get_positions RPC
+        // there avoids unnecessary load against Lighter's stricter rate limit.
+        let preflight_reduce_only = self.cfg.dex_name.contains("extended");
+        if qty_a > Decimal::ZERO && preflight_reduce_only {
+            if self.confirm_reduce_only_position_missing(&pair.base).await {
+                log::info!(
+                    "[ORDER] {} reduce-only close skipped (preflight); position already closed",
+                    pair.base
+                );
+                skipped_already_closed = true;
+            }
+        }
+        if qty_a > Decimal::ZERO && !skipped_already_closed {
             let res = if use_market {
                 self.connector
                     .create_order(&pair.base, qty_a, side_a, None, None, true, None)
@@ -5032,7 +5159,7 @@ impl PairTradeEngine {
                     res_a = Some(res);
                 }
                 Err(err) => {
-                    if Self::is_reduce_only_position_missing_error(&err) {
+                    if Self::is_reduce_only_rejection(&err) {
                         let symbol = pair.base.clone();
                         if self.confirm_reduce_only_position_missing(&symbol).await {
                             log::info!(
@@ -5050,7 +5177,18 @@ impl PairTradeEngine {
             }
         }
 
-        if qty_b > Decimal::ZERO {
+        let mut quote_already_flat = false;
+        if qty_b > Decimal::ZERO && preflight_reduce_only {
+            if self.confirm_reduce_only_position_missing(&pair.quote).await {
+                log::info!(
+                    "[ORDER] {} reduce-only close skipped (preflight); position already closed",
+                    pair.quote
+                );
+                quote_already_flat = true;
+                skipped_already_closed = true;
+            }
+        }
+        if qty_b > Decimal::ZERO && !quote_already_flat {
             let res_b = if use_market {
                 self.connector
                     .create_order(&pair.quote, qty_b, side_b, None, None, true, None)
@@ -5072,7 +5210,7 @@ impl PairTradeEngine {
                 Ok(res) => Some(res),
                 Err(e) => {
                     let mut skip = false;
-                    if Self::is_reduce_only_position_missing_error(&e) {
+                    if Self::is_reduce_only_rejection(&e) {
                         let symbol = pair.quote.clone();
                         if self.confirm_reduce_only_position_missing(&symbol).await {
                             log::info!(
@@ -5591,6 +5729,35 @@ mod tests {
         let tick = dec("0");
         let limit = enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Long);
         assert_eq!(limit, dec("100"));
+    }
+
+    // bot-strategy#258: Extended reduce-only error classification
+    #[test]
+    fn reduce_only_position_missing_matches_code_1137_message() {
+        let err = DexError::ServerResponse(
+            "Position is missing for reduce-only order".to_string(),
+        );
+        assert!(PairTradeEngine::is_reduce_only_position_missing_error(&err));
+        assert!(!PairTradeEngine::is_reduce_only_size_mismatch_error(&err));
+        assert!(PairTradeEngine::is_reduce_only_rejection(&err));
+    }
+
+    #[test]
+    fn reduce_only_size_mismatch_matches_code_1136_message() {
+        let err = DexError::ServerResponse(
+            "Reduce-only order size exceeds position size".to_string(),
+        );
+        assert!(!PairTradeEngine::is_reduce_only_position_missing_error(&err));
+        assert!(PairTradeEngine::is_reduce_only_size_mismatch_error(&err));
+        assert!(PairTradeEngine::is_reduce_only_rejection(&err));
+    }
+
+    #[test]
+    fn reduce_only_classifiers_ignore_unrelated_errors() {
+        let err = DexError::ServerResponse("Insufficient balance".to_string());
+        assert!(!PairTradeEngine::is_reduce_only_position_missing_error(&err));
+        assert!(!PairTradeEngine::is_reduce_only_size_mismatch_error(&err));
+        assert!(!PairTradeEngine::is_reduce_only_rejection(&err));
     }
 
     #[test]
