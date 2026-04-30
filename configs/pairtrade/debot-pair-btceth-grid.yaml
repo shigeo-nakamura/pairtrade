@@ -32,7 +32,7 @@ entry_z_score_max: 5.0
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
 force_close_time_secs: 7200
-shutdown_grace_secs: 7260
+shutdown_grace_secs: 14460  # max(grid fc_secs)=14400 + 60s buffer (#50)
 
 risk_pct_per_trade: 0.40
 equity_usd_reference: 1000
