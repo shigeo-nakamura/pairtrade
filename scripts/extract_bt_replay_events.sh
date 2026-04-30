@@ -9,11 +9,16 @@
 # matching live's evaluate_pair firing phase.
 #
 # Usage:
-#   scripts/extract_bt_replay_events.sh SERVICE SINCE UNTIL OUT_DIR
+#   scripts/extract_bt_replay_events.sh SERVICE SINCE UNTIL OUT_DIR [SSH_HOST]
 #
 # Example:
 #   scripts/extract_bt_replay_events.sh debot-pair-btceth \
 #     '2026-04-12 13:00:00' '2026-04-16 18:00:00' /tmp/bt_events/
+#   scripts/extract_bt_replay_events.sh debot-pair-btceth-extended \
+#     '2026-04-23 00:00:00' '2026-04-29 23:59:59' /tmp/bt_events_ext/ debot-tokyo
+#
+# SSH_HOST defaults to `debot` (Frankfurt). Use `debot-tokyo` for Tokyo
+# Lighter / Tokyo Extended.
 #
 # Writes:
 #   OUT_DIR/eval_ts.txt     — UNIX seconds of [EVAL] BTC/ETH firings
@@ -25,15 +30,16 @@
 #   scripts/bt_live_data.sh ...
 set -e
 
-SERVICE="${1:?usage: $0 SERVICE SINCE UNTIL OUT_DIR}"
-SINCE="${2:?usage: $0 SERVICE SINCE UNTIL OUT_DIR}"
-UNTIL="${3:?usage: $0 SERVICE SINCE UNTIL OUT_DIR}"
-OUT_DIR="${4:?usage: $0 SERVICE SINCE UNTIL OUT_DIR}"
+SERVICE="${1:?usage: $0 SERVICE SINCE UNTIL OUT_DIR [SSH_HOST]}"
+SINCE="${2:?usage: $0 SERVICE SINCE UNTIL OUT_DIR [SSH_HOST]}"
+UNTIL="${3:?usage: $0 SERVICE SINCE UNTIL OUT_DIR [SSH_HOST]}"
+OUT_DIR="${4:?usage: $0 SERVICE SINCE UNTIL OUT_DIR [SSH_HOST]}"
+SSH_HOST="${5:-debot}"
 
 mkdir -p "$OUT_DIR"
 
-echo "=== Extracting [EVAL] BTC/ETH timestamps from $SERVICE ==="
-ssh debot "sudo journalctl -u $SERVICE --since '$SINCE' --until '$UNTIL' --no-pager | grep -E '\\[EVAL\\] BTC/ETH'" \
+echo "=== Extracting [EVAL] BTC/ETH timestamps from $SERVICE ($SSH_HOST) ==="
+ssh "$SSH_HOST" "sudo journalctl -u $SERVICE --since '$SINCE' --until '$UNTIL' --no-pager | grep -E '\\[EVAL\\] BTC/ETH'" \
     > "$OUT_DIR/eval_raw.txt" || true
 
 # The inline per-line stamp (`2026-04-15T07:02:05+0100`) is authoritative;
@@ -58,8 +64,8 @@ print(f"wrote {len(seen)} eval timestamps to {out}")
 PYEOF
 
 echo
-echo "=== Extracting systemd restart timestamps for $SERVICE ==="
-ssh debot "sudo journalctl -u $SERVICE --since '$SINCE' --until '$UNTIL' --no-pager | grep -E 'systemd\\[1\\]: Started $SERVICE'" \
+echo "=== Extracting systemd restart timestamps for $SERVICE ($SSH_HOST) ==="
+ssh "$SSH_HOST" "sudo journalctl -u $SERVICE --since '$SINCE' --until '$UNTIL' --no-pager | grep -E 'systemd\\[1\\]: Started $SERVICE'" \
     > "$OUT_DIR/restart_raw.txt" || true
 
 # journalctl's outer stamp (`Apr 15 06:00:14`) has no year. Use the year
