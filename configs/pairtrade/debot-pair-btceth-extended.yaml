@@ -35,25 +35,26 @@ metrics_window_length: 240
 warm_start_mode: relaxed
 warm_start_min_bars: 60
 
-# Round 1 challenger params (bot-strategy#123 Phase 4 BT, 2026-04-27).
-# entry_z lifted from Lighter A's 1.5 because Extended's std runs ~50% wider
-# than Lighter's (different history regime), making Lighter's z=1.5 fall in
-# Extended's noise band. BT on Apr 23–27 dump showed entry_z=2.0 was the
-# lowest setting profitable at fee=2.5bp (5 trades, Win=60%, Sharpe=1.77,
-# Calmar=8.26 in BT). exit/sl/fc unchanged from Phase 3.
+# Round 2 params (bot-strategy#123 Phase 4 grid, 2026-04-30).
+# entry_z=2.0 retained (only profitable zone in the 7-day Apr 23–29 grid).
+# fc raised 3600 → 10800: at fc=3600 the live bot exited 80% of trades via
+# force_close before MR completed (avg pnl_25bp -$0.54 across the fc=3600
+# row). fc=10800 was the most robust cell in the grid (4/4 cells profitable,
+# avg pnl_25bp +$0.26, FC% 10%). exit/sl unchanged.
 entry_z_score_base: 2.0
 entry_z_score_min: 1.5
 entry_z_score_max: 2.5
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
-force_close_time_secs: 3600  # Halved from 7200 to raise trade frequency during the Extended experiment
-shutdown_grace_secs: 3660
+force_close_time_secs: 10800
+shutdown_grace_secs: 10860
 
 # bot-strategy#222: fixed equity reference for thresholds and sizing.
-# Tokyo Extended single-bot is funded to $500; reference revised on the
-# same monthly cadence as the Lighter A/B/C parameter rounds.
+# Reduced 500 → 300 on 2026-04-30 to better align with actual deposited
+# capital (~$45 observed on-account); Round 2 size-down before raising
+# fc gives MR longer to play out without scaling notional risk.
 risk_pct_per_trade: 0.40
-equity_usd_reference: 500
+equity_usd_reference: 300
 max_leverage: 1
 max_loss_r_mult: 1.0
 
