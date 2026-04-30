@@ -4409,18 +4409,32 @@ impl PairTradeEngine {
     ) -> Result<(Decimal, Decimal)> {
         let base_snapshot = self.open_positions.get(&pair.base);
         let quote_snapshot = self.open_positions.get(&pair.quote);
+        let recorded = self
+            .instances[inst_idx]
+            .states
+            .get(key)
+            .and_then(|s| s.position.as_ref());
+        let recorded_a = recorded.and_then(|p| p.entry_size_a);
+        let recorded_b = recorded.and_then(|p| p.entry_size_b);
+
         if base_snapshot.is_some() || quote_snapshot.is_some() {
-            let qty_a = base_snapshot.map(|p| p.size).unwrap_or(Decimal::ZERO);
-            let qty_b = quote_snapshot.map(|p| p.size).unwrap_or(Decimal::ZERO);
+            let qty_a = Self::cap_exit_qty(
+                key,
+                &pair.base,
+                base_snapshot.map(|p| p.size),
+                recorded_a,
+            );
+            let qty_b = Self::cap_exit_qty(
+                key,
+                &pair.quote,
+                quote_snapshot.map(|p| p.size),
+                recorded_b,
+            );
             return Ok((qty_a, qty_b));
         }
 
-        let mut qty_a = Decimal::ZERO;
-        let mut qty_b = Decimal::ZERO;
-        if let Some(state) = self.instances[inst_idx].states.get(key).and_then(|s| s.position.as_ref()) {
-            qty_a = state.entry_size_a.unwrap_or(Decimal::ZERO);
-            qty_b = state.entry_size_b.unwrap_or(Decimal::ZERO);
-        }
+        let qty_a = recorded_a.unwrap_or(Decimal::ZERO);
+        let qty_b = recorded_b.unwrap_or(Decimal::ZERO);
 
         if qty_a <= Decimal::ZERO && qty_b <= Decimal::ZERO {
             log::warn!(
@@ -4431,6 +4445,42 @@ impl PairTradeEngine {
         }
 
         Ok((qty_a, qty_b))
+    }
+
+    /// Defensive cap for exit-leg sizing on Extended (and any other venue
+    /// where `get_positions` can momentarily over-report after partial-fill
+    /// retry recovery). When the exchange-reported size exceeds the
+    /// bot-recorded entry size by more than 5%, log a WARN with both values
+    /// and use the recorded size. Below 5% drift or when no recorded size
+    /// exists (legacy startup), pass the exchange size through unchanged.
+    /// See bot-strategy#259 for the original observation (LongSpread on
+    /// Tokyo Extended exiting 2x the entry qty after partial-fill retry).
+    fn cap_exit_qty(
+        key: &str,
+        symbol: &str,
+        exchange: Option<Decimal>,
+        recorded: Option<Decimal>,
+    ) -> Decimal {
+        match (exchange, recorded) {
+            (Some(exch), Some(rec)) if rec > Decimal::ZERO => {
+                let cap = rec * Decimal::new(105, 2); // 1.05
+                if exch > cap {
+                    log::warn!(
+                        "[EXIT_CAP] {} {} exchange size {} exceeds recorded entry {} by >5%; capping to recorded",
+                        key,
+                        symbol,
+                        exch,
+                        rec
+                    );
+                    rec
+                } else {
+                    exch
+                }
+            }
+            (Some(exch), _) => exch,
+            (None, Some(rec)) => rec,
+            (None, None) => Decimal::ZERO,
+        }
     }
 
     fn hedged_sizes(
@@ -5980,6 +6030,65 @@ mod tests {
             "/opt/debot/pairtrade_history_BTC_ETH.json",
         ));
         assert_eq!(p, std::path::PathBuf::from("/opt/debot/risk_state.json"));
+    }
+
+    // bot-strategy#259: defensive cap on exit qty when exchange position
+    // size momentarily over-reports vs the bot-recorded entry size after
+    // partial-fill retry recovery on Tokyo Extended LongSpread.
+    #[test]
+    fn cap_exit_qty_caps_exchange_size_when_over_recorded() {
+        let exch = Some(dec("0.092"));
+        let recorded = Some(dec("0.046"));
+        let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", exch, recorded);
+        assert_eq!(q, dec("0.046"), "must cap to recorded entry size when exchange is 2x");
+    }
+
+    #[test]
+    fn cap_exit_qty_passes_exchange_within_5pct_tolerance() {
+        // 0.046 * 1.04 = 0.04784 — under 5% threshold, exchange wins.
+        let exch = Some(dec("0.04784"));
+        let recorded = Some(dec("0.046"));
+        let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", exch, recorded);
+        assert_eq!(q, dec("0.04784"), "small drift (<5%) should pass through");
+    }
+
+    #[test]
+    fn cap_exit_qty_caps_at_5pct_boundary() {
+        // 0.046 * 1.06 = 0.04876 — over 5% threshold, cap.
+        let exch = Some(dec("0.04876"));
+        let recorded = Some(dec("0.046"));
+        let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", exch, recorded);
+        assert_eq!(q, dec("0.046"), "drift just over 5% must cap");
+    }
+
+    #[test]
+    fn cap_exit_qty_falls_back_to_recorded_when_exchange_missing() {
+        // Exchange snapshot absent (e.g. WS lag): use recorded entry size.
+        let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", None, Some(dec("0.046")));
+        assert_eq!(q, dec("0.046"));
+    }
+
+    #[test]
+    fn cap_exit_qty_passes_exchange_when_no_recorded() {
+        // Recovery on startup: recorded entry size unknown, trust exchange.
+        let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", Some(dec("0.05")), None);
+        assert_eq!(q, dec("0.05"));
+    }
+
+    #[test]
+    fn cap_exit_qty_zero_when_both_missing() {
+        let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", None, None);
+        assert_eq!(q, Decimal::ZERO);
+    }
+
+    #[test]
+    fn cap_exit_qty_passes_when_exchange_smaller_than_recorded() {
+        // Partial close already happened on exchange — exit should use the
+        // smaller exchange-reported residual, not the original recorded entry.
+        let exch = Some(dec("0.020"));
+        let recorded = Some(dec("0.046"));
+        let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", exch, recorded);
+        assert_eq!(q, dec("0.020"), "exchange-side close already happened; trust the smaller residual");
     }
 }
 
