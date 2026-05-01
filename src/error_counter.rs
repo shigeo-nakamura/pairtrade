@@ -54,6 +54,15 @@ const ROLLING_WINDOW_SECS: i64 = 1800;
 /// reconnects without ageing out a real persistent disconnect.
 const WS_DEFER_WINDOW_SECS: i64 = 60;
 
+/// Defer-window for `[STEP_OVERRUN]` warns. STEP_OVERRUN typically fires
+/// when step() blocks on a partial-fill chain during entry / exit; the
+/// `[ORDER] ... orders filled` recovery marker arrives within seconds-to-
+/// minutes after the warn. Bot-strategy#267 observed a 48s gap between
+/// STEP_OVERRUN and `entry orders filled` for a normal LongSpread fill, so
+/// 180s gives ~3-4× headroom while still committing genuinely stuck steps
+/// (e.g. deadlock, runaway REST loop) before the next status poll cycle.
+const STEP_OVERRUN_DEFER_WINDOW_SECS: i64 = 180;
+
 /// Keep the last error message truncated to this many chars so the
 /// dashboard can display it without blowing up the JSON payload.
 const LAST_ERROR_MAX_CHARS: usize = 200;
@@ -84,11 +93,15 @@ struct Counters {
     /// stays here until either (a) a recovery log line drains it before
     /// `WS_DEFER_WINDOW_SECS` elapses, or (b) `snapshot()` flushes it into
     /// `recent` once its deadline passes. See bot-strategy#261.
-    pending_ws: Mutex<VecDeque<PendingWsEntry>>,
+    pending_ws: Mutex<VecDeque<PendingEntry>>,
+    /// `[STEP_OVERRUN]` warns queued for deferred commit. Drained by
+    /// `[ORDER] ... entry/exit orders filled` recovery markers within
+    /// `STEP_OVERRUN_DEFER_WINDOW_SECS`. See bot-strategy#267.
+    pending_step_overrun: Mutex<VecDeque<PendingEntry>>,
 }
 
 #[derive(Debug, Clone)]
-struct PendingWsEntry {
+struct PendingEntry {
     ts: i64,
     level: Level,
     message: String,
@@ -115,6 +128,24 @@ fn is_ws_recovery_event(msg: &str) -> bool {
         || msg.contains("WebSocket subscriptions sent successfully")
 }
 
+/// Match the critical `[STEP_OVERRUN]` warn (mild overruns log at INFO and
+/// don't reach this path). Bot-strategy#267 traced one such warn to a
+/// normal partial-fill chain: ENTRY started, ETH leg full-filled, BTC leg
+/// chained 8 partial fills + reissues, step() returned 12s late, but the
+/// trade itself completed cleanly. The warn is observational rather than a
+/// failure signal — defer it until the matching completion log lands.
+fn is_step_overrun_event(msg: &str) -> bool {
+    msg.contains("[STEP_OVERRUN]")
+}
+
+/// Match the `[ORDER] X entry orders filled` / `[ORDER] X exit orders filled`
+/// log lines that drain pending STEP_OVERRUN entries. A successful trade
+/// completion within the defer window is taken as proof the slow step()
+/// was waiting on order management (not a real stall).
+fn is_step_overrun_recovery_event(msg: &str) -> bool {
+    msg.contains("entry orders filled") || msg.contains("exit orders filled")
+}
+
 #[derive(Clone)]
 pub struct ErrorCounterHandle {
     counters: Arc<Counters>,
@@ -123,10 +154,11 @@ pub struct ErrorCounterHandle {
 impl ErrorCounterHandle {
     pub fn snapshot(&self) -> ErrorSummary {
         let now = chrono::Utc::now().timestamp();
-        // Flush any pending WS-defer entries whose recovery window has
-        // expired. Lock order: pending_ws → recent → last_error/last_warn,
-        // matching the order in `log()` so no deadlock is possible.
-        flush_expired_pending_ws(&self.counters, now);
+        // Flush any pending entries whose recovery window has expired.
+        // Lock order: pending_ws → pending_step_overrun → recent →
+        // last_error/last_warn, matching the order in `log()` so no
+        // deadlock is possible.
+        flush_all_expired_pending(&self.counters, now);
         let cutoff = now - ROLLING_WINDOW_SECS;
         let (err_window, warn_window) = {
             let mut recent = self.counters.recent.lock().unwrap();
@@ -183,6 +215,7 @@ impl ErrorCountingLogger {
             error_total: AtomicU64::new(0),
             warn_total: AtomicU64::new(0),
             pending_ws: Mutex::new(VecDeque::new()),
+            pending_step_overrun: Mutex::new(VecDeque::new()),
         });
         let handle = ErrorCounterHandle {
             counters: Arc::clone(&counters),
@@ -191,14 +224,19 @@ impl ErrorCountingLogger {
     }
 }
 
-/// Move pending WS-defer entries whose recovery window has expired into
+/// Move pending entries from `queue` whose defer window has expired into
 /// the durable `recent` queue (and update last_error/last_warn + totals).
 /// Called from both `snapshot()` and `log()` so the counts stay current
 /// regardless of whether the dashboard is polling.
-fn flush_expired_pending_ws(counters: &Counters, now: i64) {
-    let cutoff = now - WS_DEFER_WINDOW_SECS;
-    let mut pending = counters.pending_ws.lock().unwrap();
-    let mut to_commit: Vec<PendingWsEntry> = Vec::new();
+fn flush_expired_pending(
+    queue: &Mutex<VecDeque<PendingEntry>>,
+    counters: &Counters,
+    now: i64,
+    window: i64,
+) {
+    let cutoff = now - window;
+    let mut pending = queue.lock().unwrap();
+    let mut to_commit: Vec<PendingEntry> = Vec::new();
     while let Some(front) = pending.front() {
         if front.ts <= cutoff {
             to_commit.push(pending.pop_front().unwrap());
@@ -230,6 +268,16 @@ fn flush_expired_pending_ws(counters: &Counters, now: i64) {
     }
 }
 
+fn flush_all_expired_pending(counters: &Counters, now: i64) {
+    flush_expired_pending(&counters.pending_ws, counters, now, WS_DEFER_WINDOW_SECS);
+    flush_expired_pending(
+        &counters.pending_step_overrun,
+        counters,
+        now,
+        STEP_OVERRUN_DEFER_WINDOW_SECS,
+    );
+}
+
 impl Log for ErrorCountingLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         self.inner.enabled(metadata)
@@ -240,7 +288,7 @@ impl Log for ErrorCountingLogger {
             let ts = chrono::Utc::now().timestamp();
             let msg = record.args().to_string();
             // Recovery markers fire at INFO; check before the level gate so
-            // they can drain pending entries from any preceding WS reset.
+            // they can drain pending entries from any preceding transient.
             if is_ws_recovery_event(&msg) {
                 let cutoff = ts - WS_DEFER_WINDOW_SECS;
                 self.counters
@@ -249,11 +297,19 @@ impl Log for ErrorCountingLogger {
                     .unwrap()
                     .retain(|e| e.ts < cutoff);
             }
+            if is_step_overrun_recovery_event(&msg) {
+                let cutoff = ts - STEP_OVERRUN_DEFER_WINDOW_SECS;
+                self.counters
+                    .pending_step_overrun
+                    .lock()
+                    .unwrap()
+                    .retain(|e| e.ts < cutoff);
+            }
             // Always flush any pending entries whose deadline passed before
             // we count anything new — keeps the counter monotone in real
             // time even when snapshot() isn't being called (e.g. dashboard
             // poll lag).
-            flush_expired_pending_ws(&self.counters, ts);
+            flush_all_expired_pending(&self.counters, ts);
             let level = record.level();
             if (level == Level::Error || level == Level::Warn) && !is_counting_suppressed() {
                 let truncated = if msg.chars().count() > LAST_ERROR_MAX_CHARS {
@@ -263,12 +319,22 @@ impl Log for ErrorCountingLogger {
                 };
                 if is_ws_transient_event(&truncated) {
                     // Defer: held in pending_ws until either drained by a
-                    // recovery marker or expired by flush_expired_pending_ws.
+                    // recovery marker or expired by flush_all_expired_pending.
                     self.counters
                         .pending_ws
                         .lock()
                         .unwrap()
-                        .push_back(PendingWsEntry {
+                        .push_back(PendingEntry {
+                            ts,
+                            level,
+                            message: truncated,
+                        });
+                } else if is_step_overrun_event(&truncated) {
+                    self.counters
+                        .pending_step_overrun
+                        .lock()
+                        .unwrap()
+                        .push_back(PendingEntry {
                             ts,
                             level,
                             message: truncated,
@@ -307,6 +373,7 @@ mod tests {
             error_total: AtomicU64::new(0),
             warn_total: AtomicU64::new(0),
             pending_ws: Mutex::new(VecDeque::new()),
+            pending_step_overrun: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -318,7 +385,15 @@ mod tests {
             let cutoff = ts - WS_DEFER_WINDOW_SECS;
             counters.pending_ws.lock().unwrap().retain(|e| e.ts < cutoff);
         }
-        flush_expired_pending_ws(counters, ts);
+        if is_step_overrun_recovery_event(msg) {
+            let cutoff = ts - STEP_OVERRUN_DEFER_WINDOW_SECS;
+            counters
+                .pending_step_overrun
+                .lock()
+                .unwrap()
+                .retain(|e| e.ts < cutoff);
+        }
+        flush_all_expired_pending(counters, ts);
         if level != Level::Error && level != Level::Warn {
             return;
         }
@@ -327,11 +402,21 @@ mod tests {
         }
         let truncated = msg.to_string();
         if is_ws_transient_event(&truncated) {
-            counters.pending_ws.lock().unwrap().push_back(PendingWsEntry {
+            counters.pending_ws.lock().unwrap().push_back(PendingEntry {
                 ts,
                 level,
                 message: truncated,
             });
+        } else if is_step_overrun_event(&truncated) {
+            counters
+                .pending_step_overrun
+                .lock()
+                .unwrap()
+                .push_back(PendingEntry {
+                    ts,
+                    level,
+                    message: truncated,
+                });
         } else {
             counters.recent.lock().unwrap().push_back((ts, level));
             if level == Level::Error {
@@ -345,7 +430,7 @@ mod tests {
     }
 
     fn snap_counts(counters: &Counters, now: i64) -> (u64, u64) {
-        flush_expired_pending_ws(counters, now);
+        flush_all_expired_pending(counters, now);
         let recent = counters.recent.lock().unwrap();
         let cutoff = now - ROLLING_WINDOW_SECS;
         let mut e = 0u64;
@@ -480,5 +565,130 @@ mod tests {
         fake_log(&c, t0 + 10, Level::Info, "WebSocket connected successfully");
         let (e, w) = snap_counts(&c, t0 + 15);
         assert_eq!((e, w), (0, 0), "pairtrade orderbook WARN suppressed too");
+    }
+
+    // bot-strategy#267: STEP_OVERRUN warn during normal partial-fill
+    // chain must NOT inflate the rolling counter once the matching
+    // `[ORDER] ... orders filled` recovery log lands within
+    // STEP_OVERRUN_DEFER_WINDOW_SECS.
+
+    #[test]
+    fn step_overrun_with_entry_completion_is_suppressed() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 7_000_000;
+        // Verbatim shape from #267 (Frankfurt 2026-05-01 14:01:17 UTC):
+        // STEP_OVERRUN warn followed 48s later by entry completion.
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 12.18s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        fake_log(&c, t0 + 48, Level::Info, "[ORDER] BTC/ETH entry orders filled");
+        assert!(
+            c.pending_step_overrun.lock().unwrap().is_empty(),
+            "entry completion must drain pending STEP_OVERRUN"
+        );
+        let (e, w) = snap_counts(&c, t0 + 60);
+        assert_eq!((e, w), (0, 0), "STEP_OVERRUN with completion must not commit");
+    }
+
+    #[test]
+    fn step_overrun_with_exit_completion_is_suppressed() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 8_000_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 8.02s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        fake_log(&c, t0 + 30, Level::Info, "[ORDER] BTC/ETH exit orders filled");
+        let (_, w) = snap_counts(&c, t0 + 60);
+        assert_eq!(w, 0, "STEP_OVERRUN paired with exit completion must not commit");
+    }
+
+    #[test]
+    fn step_overrun_without_completion_commits_after_deadline() {
+        // No recovery log → genuinely stalled step() should still surface
+        // as a real warn after the defer deadline. Protects against
+        // deadlock / runaway REST patterns hiding behind suppression.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 9_000_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 30.00s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        // Before deadline: still pending.
+        let (_, w0) = snap_counts(&c, t0 + 60);
+        assert_eq!(w0, 0, "pre-deadline must not commit");
+        // After deadline: committed.
+        let (_, w1) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 10);
+        assert_eq!(w1, 1, "stalled STEP_OVERRUN must commit after deadline");
+    }
+
+    #[test]
+    fn step_overrun_late_completion_does_not_uncommit() {
+        // Symmetry with `ws_reset_with_late_recovery_does_not_uncommit`:
+        // a completion log arriving past the defer deadline must not
+        // retroactively cancel an already-committed warn.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 10_000_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 30.00s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        // Promote past deadline.
+        let (_, w0) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 1);
+        assert_eq!(w0, 1, "post-deadline WARN commits");
+        // Late completion arrives; counter must stay at 1.
+        fake_log(
+            &c,
+            t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 60,
+            Level::Info,
+            "[ORDER] BTC/ETH entry orders filled",
+        );
+        let (_, w1) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 70);
+        assert_eq!(w1, 1, "late completion cannot uncommit");
+    }
+
+    #[test]
+    fn step_overrun_and_ws_reset_independent() {
+        // Both kinds of pending entries can coexist; recovery for one
+        // must not drain the other.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 11_000_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 12.18s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        fake_log(&c, t0 + 5, Level::Error, "WebSocket error: IO error: Connection reset by peer");
+        // WS recovery only — STEP_OVERRUN entry must remain pending.
+        fake_log(&c, t0 + 15, Level::Info, "WebSocket connected successfully");
+        assert!(
+            c.pending_ws.lock().unwrap().is_empty(),
+            "WS reset drained by WS recovery"
+        );
+        assert_eq!(
+            c.pending_step_overrun.lock().unwrap().len(),
+            1,
+            "STEP_OVERRUN must NOT be drained by WS recovery"
+        );
+        // Now the entry completion drains STEP_OVERRUN.
+        fake_log(&c, t0 + 50, Level::Info, "[ORDER] BTC/ETH entry orders filled");
+        assert!(c.pending_step_overrun.lock().unwrap().is_empty());
+        let (e, w) = snap_counts(&c, t0 + 60);
+        assert_eq!((e, w), (0, 0));
     }
 }
