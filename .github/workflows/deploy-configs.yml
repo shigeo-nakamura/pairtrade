@@ -27,6 +27,17 @@ jobs:
         with:
           path: debot
 
+      - name: Forbid bot auto-restart in CI workflows
+        # bot-strategy#269: the trading bot must be restarted manually only.
+        # Auto-restart from CI force-closes open positions inside systemd's
+        # 90s TimeoutStopSec window. Sidecar `lighter-ratelimit` is exempt
+        # and intentionally not matched.
+        run: |
+          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+debot-pair-' debot/.github/workflows/*.yml; then
+            echo "::error::CI workflow contains forbidden 'systemctl restart/start debot-pair-*' — bot must be restarted manually only (bot-strategy#269)"
+            exit 1
+          fi
+
       - name: Package artifacts
         run: |
           mkdir -p dist/scripts dist/configs

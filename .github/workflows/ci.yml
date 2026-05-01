@@ -8,7 +8,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
-      - ".github/workflows/ci.yml"
+      - ".github/workflows/**"
   workflow_dispatch:
     inputs:
       dex_connector_ref:
@@ -32,6 +32,23 @@ env:
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
 
 jobs:
+  # bot-strategy#269: the trading bot must be restarted manually only.
+  # Auto-restart from CI force-closes open positions inside systemd's 90s
+  # TimeoutStopSec window. Lint every workflow file on every push so a
+  # regression here fails the build before deploy can run. The sidecar
+  # `lighter-ratelimit` (no exchange position) is exempt and intentionally
+  # not matched by this pattern.
+  lint-no-bot-restart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Forbid bot auto-restart in CI workflows
+        run: |
+          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+debot-pair-' .github/workflows/*.yml; then
+            echo "::error::CI workflow contains forbidden 'systemctl restart/start debot-pair-*' — bot must be restarted manually only (bot-strategy#269)"
+            exit 1
+          fi
+
   resolve-ref:
     runs-on: ubuntu-latest
     outputs:
@@ -139,7 +156,7 @@ jobs:
     # convenient, so the SSM step finishes in seconds and does not need
     # to cover the 2h graceful-shutdown window.
     timeout-minutes: 60
-    needs: [resolve-ref, build-test]
+    needs: [resolve-ref, build-test, lint-no-bot-restart]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
     env:
@@ -370,7 +387,7 @@ jobs:
   deploy-tokyo-extended:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    needs: [resolve-ref, build-test]
+    needs: [resolve-ref, build-test, lint-no-bot-restart]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
     env:
@@ -567,7 +584,7 @@ jobs:
   deploy-tokyo-lighter:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    needs: [resolve-ref, deploy]
+    needs: [resolve-ref, deploy, lint-no-bot-restart]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
     env:
