@@ -130,6 +130,26 @@ impl From<BincodeDataEntry> for DumpedDataEntry {
     }
 }
 
+/// Threshold separating Unix-seconds timestamps from Unix-ms timestamps in
+/// dump records. Any value below this is interpreted as seconds and lifted to
+/// ms by `× 1000`; any value at or above is assumed to already be ms. The
+/// boundary corresponds to ~year 2033 in seconds and ~1970-01-24 in ms, so the
+/// classification is unambiguous for any realistic trading dump.
+///
+/// Live-data dumps written before bot-strategy#274 / #276 stored
+/// `prices.{sym}.exchange_ts` in seconds; post-bump dumps store ms. Per-record
+/// classification means a dump file straddling a deploy boundary still
+/// replays correctly.
+const SECS_VS_MS_BOUNDARY: i64 = 2_000_000_000;
+
+fn normalize_exchange_ts_to_ms(ts: i64) -> i64 {
+    if ts > 0 && ts < SECS_VS_MS_BOUNDARY {
+        ts.saturating_mul(1000)
+    } else {
+        ts
+    }
+}
+
 #[derive(Debug)]
 pub struct ReplayConnector {
     data: Vec<DumpedDataEntry>,
@@ -313,20 +333,25 @@ impl DexConnector for ReplayConnector {
             open_interest: None,
             funding_rate: Some(symbol_data.funding_rate),
             oracle_price: Some(symbol_data.price),
-            // Prefer the per-symbol `exchange_ts` (the DEX-side tick second
+            // Prefer the per-symbol `exchange_ts` (the DEX-side tick stamp
             // the live bot uses for bar bucket assignment). The top-level
-            // `timestamp` is the bot's wall-clock write time and typically
-            // runs ~1s ahead of `exchange_ts`, which shifts the final tick
-            // of a bucket into the next bucket and drifts close prices
-            // across the whole history. Fallback is for ancient dumps
-            // missing the field. Originally this returned the cursor
-            // index — a separate layer of the same bug. See
+            // `timestamp` is the bot's wall-clock write time (already ms,
+            // and typically runs ~1s ahead of `exchange_ts`, which shifts
+            // the final tick of a bucket into the next bucket and drifts
+            // close prices across the whole history). Fallback is for
+            // ancient dumps missing the field. Originally this returned
+            // the cursor index — a separate layer of the same bug. See
             // bot-strategy#27 comment 2026-04-16.
-            exchange_ts: Some(
+            //
+            // Live bot now emits `exchange_ts` in ms (bot-strategy#274 /
+            // #276); pre-bump dumps stored seconds. Auto-detect via
+            // `normalize_exchange_ts_to_ms` so existing live-data dumps
+            // keep replaying through the post-bump BarBuilder.
+            exchange_ts: Some(normalize_exchange_ts_to_ms(
                 symbol_data
                     .exchange_ts
-                    .unwrap_or(current_snapshot.timestamp / 1000) as u64,
-            ),
+                    .unwrap_or(current_snapshot.timestamp / 1000),
+            ) as u64),
         })
     }
 
@@ -545,44 +570,50 @@ mod tests {
     /// then used as a wall-clock timestamp for bucket alignment. At the ~5s
     /// dump cadence that stretched every "1-minute" bar to ~5 minutes of
     /// real time and smoothed away the 2026-04-15 std collapse. `exchange_ts`
-    /// must be the dump's real UNIX seconds for BT bar bucketing to match
-    /// live.
+    /// must be the dump's real timestamp for BT bar bucketing to match live.
+    ///
+    /// Post bot-strategy#274 / #276 the BarBuilder consumes ms, so the replay
+    /// surfaces ms regardless of which precision the underlying dump used —
+    /// older seconds-precision dumps are auto-detected and lifted by × 1000.
     #[tokio::test]
-    async fn ticker_exchange_ts_is_real_seconds_not_cursor_index() {
+    async fn ticker_exchange_ts_is_real_timestamp_not_cursor_index() {
         // Two records 5s apart, both far from epoch so any "cursor index"
-        // would be trivially distinguishable (cursor=0 vs timestamp≈1.78e9).
+        // would be trivially distinguishable (cursor=0 vs ts≈1.78e9).
         let r = ReplayConnector::from_entries(vec![
             mk_entry(1_776_229_320_000, 71_000.0, None), // 2026-04-15 05:02:00 UTC
             mk_entry(1_776_229_325_000, 71_010.0, None),
         ]);
 
         let t0 = r.get_ticker("BTC", None).await.unwrap();
-        assert_eq!(t0.exchange_ts, Some(1_776_229_320));
+        assert_eq!(t0.exchange_ts, Some(1_776_229_320_000));
         assert_ne!(t0.exchange_ts, Some(0)); // not cursor index
 
         assert!(r.tick());
         let t1 = r.get_ticker("BTC", None).await.unwrap();
-        assert_eq!(t1.exchange_ts, Some(1_776_229_325));
-        // 5-second real delta, not 1-step cursor delta
+        assert_eq!(t1.exchange_ts, Some(1_776_229_325_000));
+        // 5-second real delta = 5_000ms, not 1-step cursor delta.
         assert_eq!(
             t1.exchange_ts.unwrap() - t0.exchange_ts.unwrap(),
-            5,
-            "exchange_ts must advance by real elapsed seconds"
+            5_000,
+            "exchange_ts must advance by real elapsed time in ms"
         );
     }
 
     /// Regression test for bot-strategy#27 (2026-04-16, follow-up): when the
     /// dump record carries a per-symbol `exchange_ts` (the DEX-side tick
-    /// second the live bot itself uses for bucket assignment), the replay
-    /// must surface that value — not the record's top-level `timestamp`,
-    /// which is the bot's wall-clock write time and typically runs ~1s
-    /// ahead. At bucket boundaries that 1s offset flips the final tick into
-    /// the next bucket and drifts `close_a` / the OLS history.
+    /// the live bot itself uses for bucket assignment), the replay must
+    /// surface that value — not the record's top-level `timestamp`, which is
+    /// the bot's wall-clock write time and typically runs ~1s ahead. At
+    /// bucket boundaries that 1s offset flips the final tick into the next
+    /// bucket and drifts `close_a` / the OLS history.
+    ///
+    /// Pre-#276 dumps stored `exchange_ts` in seconds; the auto-detect lifts
+    /// such values into ms before they reach BarBuilder.
     #[tokio::test]
     async fn ticker_prefers_per_symbol_exchange_ts_over_top_level_timestamp() {
         // Exactly the boundary case observed in 4/15 06:02 UTC live dump:
         // top-level write ts = xxx920119ms (would assign to next bucket);
-        // per-symbol exchange_ts = xxx919 (correctly the last tick of the
+        // per-symbol exchange_ts = xxx919s (correctly the last tick of the
         // closing bucket).
         let r = ReplayConnector::from_entries(vec![mk_entry(
             1_776_232_920_119,
@@ -592,8 +623,46 @@ mod tests {
         let t = r.get_ticker("BTC", None).await.unwrap();
         assert_eq!(
             t.exchange_ts,
-            Some(1_776_232_919),
-            "must use per-symbol exchange_ts, not top-level timestamp/1000",
+            Some(1_776_232_919_000),
+            "must use per-symbol exchange_ts (lifted to ms), not top-level timestamp",
         );
+    }
+
+    /// Post bot-strategy#274 / #276: a dump straddling the deploy boundary
+    /// can interleave seconds-precision and ms-precision `exchange_ts`
+    /// values. The per-record auto-detect must classify each correctly.
+    #[tokio::test]
+    async fn ticker_handles_mixed_seconds_and_ms_exchange_ts() {
+        let r = ReplayConnector::from_entries(vec![
+            // Pre-bump record: exchange_ts in seconds (1.78e9-ish).
+            mk_entry(1_776_232_920_000, 73_998.15, Some(1_776_232_919)),
+            // Post-bump record: exchange_ts already in ms (1.78e12-ish).
+            mk_entry(1_776_232_980_500, 73_999.20, Some(1_776_232_980_400)),
+        ]);
+        let t0 = r.get_ticker("BTC", None).await.unwrap();
+        assert_eq!(t0.exchange_ts, Some(1_776_232_919_000));
+        assert!(r.tick());
+        let t1 = r.get_ticker("BTC", None).await.unwrap();
+        assert_eq!(
+            t1.exchange_ts,
+            Some(1_776_232_980_400),
+            "ms-precision values must pass through unchanged",
+        );
+    }
+
+    #[test]
+    fn normalize_exchange_ts_classifies_correctly() {
+        // Realistic seconds value (year 2026) → lifted to ms.
+        assert_eq!(
+            normalize_exchange_ts_to_ms(1_776_232_919),
+            1_776_232_919_000
+        );
+        // Realistic ms value (year 2026) → unchanged.
+        assert_eq!(
+            normalize_exchange_ts_to_ms(1_776_232_919_000),
+            1_776_232_919_000
+        );
+        // Sentinel zero → unchanged (preserves "unknown" semantics).
+        assert_eq!(normalize_exchange_ts_to_ms(0), 0);
     }
 }

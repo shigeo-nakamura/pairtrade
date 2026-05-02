@@ -1329,7 +1329,12 @@ impl PairTradeEngine {
         let mut updated = HashSet::new();
         for (symbol, snapshot) in price_map.iter() {
             if let Some(builder) = self.bar_builders.get_mut(symbol) {
-                let tick_ts = snapshot.exchange_ts.unwrap_or(now_ts);
+                // `snapshot.exchange_ts` is ms post bot-strategy#274 / #276;
+                // `now_ts` is wall-clock seconds, lift it to ms when the
+                // connector did not surface an exchange timestamp.
+                let tick_ts = snapshot
+                    .exchange_ts
+                    .unwrap_or_else(|| now_ts.saturating_mul(1000));
                 if let Some((close_price, close_ts)) = builder.push(tick_ts, snapshot.price) {
                     let entry = self
                         .history

@@ -12,20 +12,29 @@ use serde::{Deserialize, Serialize};
 use super::config::PairTradeConfig;
 use super::stats::PriceSample;
 
-/// On-disk snapshot schema used by the live bot. Version 2 adds
-/// `spread_histories` — the per-pair `state.spread_history` that the
-/// engine accumulates at runtime — so that at restart we can restore
-/// the real spread series instead of rebuilding a synthetic one via
-/// `warm_start_states_from_history` (which applies a single OLS beta
-/// to the full log_price window and produces an artificially
-/// low-variance spread_history, the mechanism behind the 2026-04-15
-/// 06:02 UTC "std collapse" incident — bot-strategy#62).
+/// On-disk snapshot schema used by the live bot.
 ///
-/// Version 1 (no `_v` field) was a bare `HashMap<String,
-/// Vec<(f64, i64)>>`. The loader parses v2 first and falls back to
-/// v1 on failure, so pre-existing history files keep working.
+/// Version 1 (no `_v` field) was a bare `HashMap<String, Vec<(f64, i64)>>`
+/// with `ts` in Unix seconds.
+///
+/// Version 2 added `spread_histories` — the per-pair `state.spread_history`
+/// that the engine accumulates at runtime — so that at restart we can restore
+/// the real spread series instead of rebuilding a synthetic one via
+/// `warm_start_states_from_history` (which applies a single OLS beta to the
+/// full log_price window and produces an artificially low-variance
+/// spread_history, the mechanism behind the 2026-04-15 06:02 UTC "std
+/// collapse" incident — bot-strategy#62). v2 still stored `ts` in seconds.
+///
+/// Version 3 (bot-strategy#274 / #276) bumps `ts` to Unix milliseconds so
+/// the on-disk timestamps match the BarBuilder bucketing layer after its
+/// ms-precision migration. Older v1 / v2 snapshots are auto-detected and
+/// migrated (`ts × 1000`) on load. This file is rewritten as v3 on the next
+/// `persist_history_to_disk` call, so the migration is one-way.
+///
+/// The loader parses the explicit struct first and falls back to v1 (bare
+/// per-symbol map) on failure, so pre-existing history files keep working.
 #[derive(Serialize, Deserialize, Default)]
-struct SnapshotV2 {
+struct SnapshotV3 {
     #[serde(rename = "_v")]
     version: u32,
     prices: HashMap<String, Vec<(f64, i64)>>,
@@ -35,6 +44,8 @@ struct SnapshotV2 {
     #[serde(default)]
     spread_histories: HashMap<String, Vec<f64>>,
 }
+
+const SNAPSHOT_VERSION: u32 = 3;
 
 pub(super) fn persist_history_to_disk(
     cfg: &PairTradeConfig,
@@ -64,8 +75,8 @@ pub(super) fn persist_history_to_disk(
         .iter()
         .map(|(k, deque)| (k.clone(), deque.iter().copied().collect()))
         .collect();
-    let snapshot = SnapshotV2 {
-        version: 2,
+    let snapshot = SnapshotV3 {
+        version: SNAPSHOT_VERSION,
         prices,
         spread_histories,
     };
@@ -142,9 +153,10 @@ fn cleanup_old_archives(dir: &Path, retention_days: u32) {
     }
 }
 
-/// Parse the persisted history file, accepting both v2 (explicit
-/// `SnapshotV2` struct) and legacy v1 (bare per-symbol map). Returns
-/// (prices, spread_histories) where `spread_histories` is empty for v1.
+/// Parse the persisted history file, accepting v3 (explicit struct with
+/// ms-precision `ts`), v2 (explicit struct with seconds `ts`, auto-migrated
+/// by × 1000) and legacy v1 (bare per-symbol map, also seconds, auto-migrated).
+/// Returns (prices, spread_histories) with `ts` always normalized to ms.
 fn parse_snapshot_file(
     path: &std::path::Path,
 ) -> Option<(
@@ -152,15 +164,38 @@ fn parse_snapshot_file(
     HashMap<String, Vec<f64>>,
 )> {
     let content = fs::read_to_string(path).ok()?;
-    // Try v2 first (has explicit schema with `_v` and `prices`).
-    if let Ok(v2) = serde_json::from_str::<SnapshotV2>(&content) {
-        if v2.version >= 2 {
-            return Some((v2.prices, v2.spread_histories));
+    // Try the explicit struct first (has `_v` and `prices`).
+    if let Ok(snap) = serde_json::from_str::<SnapshotV3>(&content) {
+        if snap.version >= 2 {
+            let prices = if snap.version < SNAPSHOT_VERSION {
+                migrate_prices_seconds_to_ms(snap.prices)
+            } else {
+                snap.prices
+            };
+            return Some((prices, snap.spread_histories));
         }
     }
-    // Fall back to v1 (bare `HashMap<String, Vec<(f64, i64)>>`).
+    // Fall back to v1 (bare `HashMap<String, Vec<(f64, i64)>>` in seconds).
     let prices: HashMap<String, Vec<(f64, i64)>> = serde_json::from_str(&content).ok()?;
-    Some((prices, HashMap::new()))
+    Some((migrate_prices_seconds_to_ms(prices), HashMap::new()))
+}
+
+/// Convert a per-symbol price history whose `ts` field is in Unix seconds
+/// into the ms representation expected post bot-strategy#274 / #276. Used
+/// for one-way migration of v1 / v2 snapshot files at load time.
+fn migrate_prices_seconds_to_ms(
+    prices: HashMap<String, Vec<(f64, i64)>>,
+) -> HashMap<String, Vec<(f64, i64)>> {
+    prices
+        .into_iter()
+        .map(|(sym, samples)| {
+            let migrated = samples
+                .into_iter()
+                .map(|(lp, ts)| (lp, ts.saturating_mul(1000)))
+                .collect();
+            (sym, migrated)
+        })
+        .collect()
 }
 
 /// Load a history snapshot for backtest warm-start. Unlike
@@ -187,10 +222,11 @@ pub(super) fn load_history_snapshot_for_bt(
             continue;
         }
         let newest_ts = entries.iter().map(|(_, ts)| *ts).max().unwrap_or(0);
-        let max_age = (max_history_len as i64) * 60; // assume 60s bars
+        // Snapshot ts is ms post bot-strategy#274 / #276; assume 60s bars.
+        let max_age_ms = (max_history_len as i64) * 60 * 1000;
         let mut deque = VecDeque::new();
         for (log_price, ts) in entries {
-            if newest_ts.saturating_sub(ts) <= max_age {
+            if newest_ts.saturating_sub(ts) <= max_age_ms {
                 deque.push_back(PriceSample { log_price, ts });
             }
         }
@@ -240,28 +276,35 @@ pub(super) fn load_history_from_disk(
     let Some((prices, spreads)) = parse_snapshot_file(history_path) else {
         return;
     };
-    let max_age_secs =
-        (max_history_len as i64).saturating_mul(cfg.trading_period_secs as i64);
+    // Snapshot ts is ms post bot-strategy#274 / #276; lift `now_ts` (wall-clock
+    // seconds) into the same unit before comparing.
+    let now_ts_ms = now_ts.saturating_mul(1000);
+    let max_age_ms = (max_history_len as i64)
+        .saturating_mul(cfg.trading_period_secs as i64)
+        .saturating_mul(1000);
     // Stale-history guard (pairtrade#4): if the newest sample for a symbol
     // is older than a few bars, the persisted file is from a stopped bot
     // and replaying it would freeze a stale rolling window. Drop it and
     // let the live feed warm up from scratch.
-    let stale_threshold_secs = (cfg.trading_period_secs as i64).saturating_mul(5).max(60);
+    let stale_threshold_ms = (cfg.trading_period_secs as i64)
+        .saturating_mul(5)
+        .max(60)
+        .saturating_mul(1000);
     let mut any_stale = false;
     for (sym, entries) in prices {
         let newest_ts = entries.iter().map(|(_, ts)| *ts).max().unwrap_or(0);
-        if now_ts.saturating_sub(newest_ts) > stale_threshold_secs {
+        if now_ts_ms.saturating_sub(newest_ts) > stale_threshold_ms {
             log::debug!(
-                "discarding stale persisted history for {}: newest sample {}s old",
+                "discarding stale persisted history for {}: newest sample {}ms old",
                 sym,
-                now_ts.saturating_sub(newest_ts)
+                now_ts_ms.saturating_sub(newest_ts)
             );
             any_stale = true;
             continue;
         }
         let mut deque = VecDeque::new();
         for (log_price, ts) in entries {
-            if now_ts.saturating_sub(ts) > max_age_secs {
+            if now_ts_ms.saturating_sub(ts) > max_age_ms {
                 continue;
             }
             deque.push_back(PriceSample { log_price, ts });
@@ -283,5 +326,67 @@ pub(super) fn load_history_from_disk(
             let deque: VecDeque<f64> = series.into_iter().collect();
             spread_histories_out.insert(pair_key, deque);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn write_snapshot(content: &str) -> NamedTempFile {
+        let f = NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), content).unwrap();
+        f
+    }
+
+    #[test]
+    fn parse_v3_snapshot_passes_ts_through_unchanged() {
+        let json = r#"{
+            "_v": 3,
+            "prices": {"BTC": [[10.5, 1776232919000], [10.6, 1776232979000]]},
+            "spread_histories": {"BTC/ETH": [0.1, 0.2]}
+        }"#;
+        let f = write_snapshot(json);
+        let (prices, spreads) = parse_snapshot_file(f.path()).unwrap();
+        assert_eq!(
+            prices.get("BTC").unwrap(),
+            &vec![(10.5, 1776232919000), (10.6, 1776232979000)]
+        );
+        assert_eq!(spreads.get("BTC/ETH").unwrap(), &vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn parse_v2_snapshot_migrates_ts_seconds_to_ms() {
+        // v2 stored ts in seconds. After bot-strategy#274 / #276 the loader
+        // must lift each (log_price, ts) pair into ms by × 1000 so it lines
+        // up with the post-bump BarBuilder bucket math.
+        let json = r#"{
+            "_v": 2,
+            "prices": {"BTC": [[10.5, 1776232919], [10.6, 1776232979]]},
+            "spread_histories": {"BTC/ETH": [0.1, 0.2]}
+        }"#;
+        let f = write_snapshot(json);
+        let (prices, spreads) = parse_snapshot_file(f.path()).unwrap();
+        assert_eq!(
+            prices.get("BTC").unwrap(),
+            &vec![(10.5, 1776232919000), (10.6, 1776232979000)],
+            "v2 ts must be migrated to ms",
+        );
+        // spread_histories carry no timestamp, just pass through.
+        assert_eq!(spreads.get("BTC/ETH").unwrap(), &vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn parse_v1_snapshot_migrates_ts_seconds_to_ms() {
+        // v1 was a bare per-symbol map with seconds ts. Same migration path.
+        let json = r#"{"BTC": [[10.5, 1776232919], [10.6, 1776232979]]}"#;
+        let f = write_snapshot(json);
+        let (prices, spreads) = parse_snapshot_file(f.path()).unwrap();
+        assert_eq!(
+            prices.get("BTC").unwrap(),
+            &vec![(10.5, 1776232919000), (10.6, 1776232979000)]
+        );
+        assert!(spreads.is_empty());
     }
 }

@@ -15,10 +15,13 @@ pub(super) struct SymbolSnapshot {
     pub(super) min_order: Option<Decimal>,
     pub(super) min_tick: Option<Decimal>,
     pub(super) size_decimals: Option<u32>,
-    /// Exchange-side timestamp (Unix seconds) for the most recent price update
-    /// from the connector. When `Some`, all bots observing the same feed see
-    /// identical values for the same update — used to align bar buckets across
-    /// processes (pairtrade#4).
+    /// Exchange-side timestamp (Unix milliseconds) for the most recent price
+    /// update from the connector. When `Some`, all bots observing the same feed
+    /// see identical values for the same update — used to align bar buckets
+    /// across processes (pairtrade#4). Bumped from seconds to ms in
+    /// bot-strategy#274 / #276 so within-second tick orderings survive into the
+    /// bar bucketing layer. Pre-bump dumps and snapshots that store seconds
+    /// values are auto-detected and migrated at load time.
     #[serde(default)]
     pub(super) exchange_ts: Option<i64>,
 }
