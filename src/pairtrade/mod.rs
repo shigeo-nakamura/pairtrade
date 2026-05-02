@@ -2881,6 +2881,14 @@ impl PairTradeEngine {
             || lower.contains("expected value at line 1 column 1")
     }
 
+    fn is_ticker_rate_limited(err: &DexError, msg: &str) -> bool {
+        if matches!(err, DexError::RateLimited { .. }) {
+            return true;
+        }
+        let lower = msg.to_ascii_lowercase();
+        lower.contains("too many requests") || lower.contains("http 429")
+    }
+
     fn is_reduce_only_position_missing_error(err: &DexError) -> bool {
         let msg = match err {
             DexError::ServerResponse(message) | DexError::Other(message) => message,
@@ -5416,6 +5424,23 @@ impl PairTradeEngine {
                         }
                         continue;
                     }
+                    if Self::is_ticker_rate_limited(&e, &msg) {
+                        if self.should_log_ticker_warn(&symbol) {
+                            log::warn!(
+                                "ticker {} rate-limited (cooling down): {}",
+                                symbol,
+                                msg
+                            );
+                            self.last_ticker_warn.insert(symbol.clone(), Instant::now());
+                        } else {
+                            log::debug!(
+                                "ticker {} rate-limited (cooling down): {}",
+                                symbol,
+                                msg
+                            );
+                        }
+                        continue;
+                    }
                     return Err(e).with_context(|| format!("ticker {}", symbol));
                 }
             };
@@ -5826,6 +5851,43 @@ mod tests {
         assert!(!PairTradeEngine::is_reduce_only_position_missing_error(&err));
         assert!(!PairTradeEngine::is_reduce_only_size_mismatch_error(&err));
         assert!(!PairTradeEngine::is_reduce_only_rejection(&err));
+    }
+
+    // bot-strategy#281: classify Lighter REST 429 / DexError::RateLimited so
+    // the step skips quietly instead of erroring out per cycle.
+    #[test]
+    fn ticker_rate_limited_matches_dex_error_variant() {
+        let err = DexError::RateLimited { until_unix: 0 };
+        let msg = err.to_string();
+        assert!(PairTradeEngine::is_ticker_rate_limited(&err, &msg));
+        assert!(!PairTradeEngine::is_ticker_auth_error(&msg));
+    }
+
+    #[test]
+    fn ticker_rate_limited_matches_http_429_message() {
+        let err = DexError::Other(
+            "HTTP 429 Too Many Requests: {\"code\":23000,\"message\":\"Too Many Requests!\"}"
+                .to_string(),
+        );
+        let msg = err.to_string();
+        assert!(PairTradeEngine::is_ticker_rate_limited(&err, &msg));
+    }
+
+    #[test]
+    fn ticker_rate_limited_matches_too_many_requests_substring() {
+        let err = DexError::Other("Other error: Too Many Requests!".to_string());
+        let msg = err.to_string();
+        assert!(PairTradeEngine::is_ticker_rate_limited(&err, &msg));
+    }
+
+    #[test]
+    fn ticker_rate_limited_ignores_unrelated_errors() {
+        let err = DexError::Other("HTTP 500 Internal Server Error".to_string());
+        let msg = err.to_string();
+        assert!(!PairTradeEngine::is_ticker_rate_limited(&err, &msg));
+        let auth = DexError::Other("HTTP 403 Forbidden".to_string());
+        let auth_msg = auth.to_string();
+        assert!(!PairTradeEngine::is_ticker_rate_limited(&auth, &auth_msg));
     }
 
     #[test]
