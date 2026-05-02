@@ -3712,15 +3712,12 @@ impl PairTradeEngine {
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     let (mut ep_a, mut ep_b, mut es_a, mut es_b) = (None, None, None, None);
                     if let Some((base, quote)) = key.split_once('/') {
-                        for leg in &pending.legs {
-                            if leg.symbol == base {
-                                ep_a = price_map.get(base).map(|s| s.price);
-                                es_a = Some(leg.target);
-                            } else if leg.symbol == quote {
-                                ep_b = price_map.get(quote).map(|s| s.price);
-                                es_b = Some(leg.target);
-                            }
-                        }
+                        ep_a = price_map.get(base).map(|s| s.price);
+                        ep_b = price_map.get(quote).map(|s| s.price);
+                        let (sum_a, sum_b) =
+                            Self::sum_entry_sizes_by_symbol(&pending.legs, base, quote);
+                        es_a = sum_a;
+                        es_b = sum_b;
                     }
                     let z_at_entry = state.z_score().map(|(z, _)| z);
                     state.position = Some(Position {
@@ -4471,6 +4468,33 @@ impl PairTradeEngine {
         }
 
         Ok((qty_a, qty_b))
+    }
+
+    /// Sum `target` across `pending.legs` per symbol so partial-fill
+    /// reissue (which leaves a kept leg with `target=filled` and a new
+    /// leg with `target=remaining` for the same symbol) records the full
+    /// entry size. Returning the assignment-only last leg under-records
+    /// and breaks the `cap_exit_qty` invariant (recorded ≈ true position).
+    fn sum_entry_sizes_by_symbol(
+        legs: &[PendingLeg],
+        base: &str,
+        quote: &str,
+    ) -> (Option<Decimal>, Option<Decimal>) {
+        let (mut acc_a, mut acc_b) = (Decimal::ZERO, Decimal::ZERO);
+        let (mut has_a, mut has_b) = (false, false);
+        for leg in legs {
+            if leg.symbol == base {
+                acc_a += leg.target;
+                has_a = true;
+            } else if leg.symbol == quote {
+                acc_b += leg.target;
+                has_b = true;
+            }
+        }
+        (
+            if has_a { Some(acc_a) } else { None },
+            if has_b { Some(acc_b) } else { None },
+        )
     }
 
     /// Defensive cap for exit-leg sizing on Extended (and any other venue
@@ -6169,6 +6193,88 @@ mod tests {
         let recorded = Some(dec("0.046"));
         let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", exch, recorded);
         assert_eq!(q, dec("0.020"), "exchange-side close already happened; trust the smaller residual");
+    }
+
+    fn make_leg(symbol: &str, target: Decimal) -> PendingLeg {
+        PendingLeg {
+            symbol: symbol.to_string(),
+            order_id: format!("oid-{}-{}", symbol, target),
+            exchange_order_id: None,
+            target,
+            filled: target,
+            side: dex_connector::OrderSide::Long,
+            limit_price: None,
+        }
+    }
+
+    // Pairtrade entry-size under-record fix (companion to bot-strategy#259):
+    // post-reissue pending.legs can hold two legs per symbol (kept + new);
+    // assignment-only recording leaks only the last leg's target into
+    // entry_size_a/b and breaks the cap_exit_qty invariant.
+    #[test]
+    fn sum_entry_sizes_simple_one_leg_per_symbol() {
+        let legs = vec![make_leg("BTC", dec("0.0013")), make_leg("ETH", dec("0.046"))];
+        let (a, b) = PairTradeEngine::sum_entry_sizes_by_symbol(&legs, "BTC", "ETH");
+        assert_eq!(a, Some(dec("0.0013")));
+        assert_eq!(b, Some(dec("0.046")));
+    }
+
+    #[test]
+    fn sum_entry_sizes_partial_fill_reissue_two_legs_same_symbol() {
+        // Real shape after reissue_partial_legs: BTC partial-filled then
+        // reissued, so pending.legs has the kept leg (target=filled) plus
+        // the new leg (target=remaining quantized). ETH was full-filled in
+        // one shot, so a single leg.
+        let legs = vec![
+            make_leg("BTC", dec("0.0008")), // kept leg, filled portion
+            make_leg("BTC", dec("0.0005")), // reissued leg, remaining
+            make_leg("ETH", dec("0.046")),
+        ];
+        let (a, b) = PairTradeEngine::sum_entry_sizes_by_symbol(&legs, "BTC", "ETH");
+        assert_eq!(
+            a,
+            Some(dec("0.0013")),
+            "BTC must sum kept (0.0008) + reissued (0.0005), not last-write-wins to 0.0005"
+        );
+        assert_eq!(b, Some(dec("0.046")));
+    }
+
+    #[test]
+    fn sum_entry_sizes_both_symbols_reissued() {
+        // Pathological case: both legs partial-filled and reissued.
+        let legs = vec![
+            make_leg("BTC", dec("0.0008")),
+            make_leg("BTC", dec("0.0005")),
+            make_leg("ETH", dec("0.030")),
+            make_leg("ETH", dec("0.016")),
+        ];
+        let (a, b) = PairTradeEngine::sum_entry_sizes_by_symbol(&legs, "BTC", "ETH");
+        assert_eq!(a, Some(dec("0.0013")));
+        assert_eq!(b, Some(dec("0.046")));
+    }
+
+    #[test]
+    fn sum_entry_sizes_returns_none_for_missing_symbol() {
+        // Defensive: if a symbol has zero legs (shouldn't happen in
+        // practice), preserve the previous Option::None semantics rather
+        // than silently writing Decimal::ZERO into entry_size.
+        let legs = vec![make_leg("BTC", dec("0.0013"))];
+        let (a, b) = PairTradeEngine::sum_entry_sizes_by_symbol(&legs, "BTC", "ETH");
+        assert_eq!(a, Some(dec("0.0013")));
+        assert_eq!(b, None);
+    }
+
+    #[test]
+    fn sum_entry_sizes_unknown_symbol_ignored() {
+        // Legs for symbols outside the base/quote pair are not summed.
+        let legs = vec![
+            make_leg("BTC", dec("0.0013")),
+            make_leg("SOL", dec("1.0")),
+            make_leg("ETH", dec("0.046")),
+        ];
+        let (a, b) = PairTradeEngine::sum_entry_sizes_by_symbol(&legs, "BTC", "ETH");
+        assert_eq!(a, Some(dec("0.0013")));
+        assert_eq!(b, Some(dec("0.046")));
     }
 }
 
