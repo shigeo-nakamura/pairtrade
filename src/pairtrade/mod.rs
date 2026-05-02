@@ -1119,6 +1119,19 @@ impl PairTradeEngine {
                         attempts,
                         Self::format_positions_summary(&positions)
                     );
+                    if attempt == 1 {
+                        // bot-strategy#269 Phase 3: record what is about to be
+                        // force-closed so the kill event is visible beyond
+                        // journalctl's 7-day retention. Only on the first
+                        // attempt — subsequent retries see partial / shrinking
+                        // residue of the same position set and would double-count.
+                        if let Err(err) = pnl_log::log_startup_force_close(&self.cfg, &positions) {
+                            log::warn!(
+                                "[Startup] log_startup_force_close failed: {:?}",
+                                err
+                            );
+                        }
+                    }
                     if let Err(err) = self.connector.close_all_positions(None).await {
                         log::error!("[Startup] close_all_positions failed: {:?}", err);
                     }

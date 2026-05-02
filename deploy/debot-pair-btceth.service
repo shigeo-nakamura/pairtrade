@@ -8,6 +8,11 @@ ExecStart=/bin/bash /opt/debot/scripts/debot-pair-btceth.sh
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5
+# bot-strategy#269: match the longest configured shutdown_grace_secs across
+# live + grid YAMLs (live=7260, grid=14460). Without this systemd defaults
+# to 90s and SIGKILLs the bot mid graceful close, leaving positions to be
+# adverse-priced by the next process's `[Startup] Force closing` path.
+TimeoutStopSec=14460
 StandardOutput=journal
 StandardError=journal
 

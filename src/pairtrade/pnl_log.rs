@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use chrono::Utc;
+use dex_connector::PositionSnapshot;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 
@@ -41,6 +43,13 @@ pub(super) struct PnlLogRecord {
     pub(super) z_exit: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) hold_secs: Option<f64>,
+    /// Position size at the time of the trade. Set for `startup_force_close`
+    /// records (single-leg positions detected at boot) so operators can
+    /// reconcile against the DEX-side `realized_pnl.csv`. None for normal
+    /// strategy entries/exits since size is implied by the strategy state.
+    /// bot-strategy#269 Phase 3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) size: Option<f64>,
 }
 
 pub(super) struct PnlLogger {
@@ -179,6 +188,101 @@ impl PnlLogger {
     }
 }
 
+/// Append one record per pre-existing position to a dedicated
+/// `pnl-startup_close-<tag>-<date>.jsonl` file (bot-strategy#269 Phase 3).
+///
+/// `[Startup] Force closing` runs before the strategy loop and uses the
+/// connector's bulk `close_all_positions` path, which does not flow through
+/// `write_pnl_record`. As a result kill events were invisible to anything
+/// downstream of the strategy pnl log, and only surfaced via the DEX-side
+/// `realized_pnl.csv`. This helper records what was about to be killed so
+/// the event is durable beyond journalctl's 7-day retention.
+///
+/// The output filename matches the `pnl-*.jsonl` glob, so it is picked up
+/// by `is_pnl_log_file` for retention cleanup and by any tooling that
+/// already aggregates `debot_pnl/pnl-*.jsonl`. Records carry
+/// `source = "startup_force_close"` so downstream filters can split them
+/// from strategy-driven trades.
+pub(super) fn log_startup_force_close(
+    cfg: &PairTradeConfig,
+    positions: &[PositionSnapshot],
+) -> std::io::Result<()> {
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let enabled = env::var("DEBOT_PNL_LOG")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "no")
+        })
+        .unwrap_or(true);
+    if !enabled {
+        return Ok(());
+    }
+
+    let dir = env::var("DEBOT_PNL_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var("HOME")
+                .ok()
+                .map(|home| PathBuf::from(home).join("debot_pnl"))
+        })
+        .unwrap_or_else(|| PathBuf::from("debot_pnl"));
+    let tag = env::var("DEBOT_PNL_TAG")
+        .ok()
+        .or_else(|| env::var("AGENT_NAME").ok())
+        .or_else(|| cfg.agent_name.clone())
+        .or_else(|| env::var("DEX_NAME").ok())
+        .or_else(|| Some(cfg.dex_name.clone()))
+        .map(|v| sanitize_pnl_tag(&v))
+        .filter(|v| !v.is_empty());
+
+    fs::create_dir_all(&dir)?;
+    let date = Utc::now().format("%Y%m%d").to_string();
+    let mut name = String::from("pnl-startup_close");
+    if let Some(t) = &tag {
+        name.push('-');
+        name.push_str(t);
+    }
+    name.push('-');
+    name.push_str(&date);
+    name.push_str(".jsonl");
+    let path = dir.join(name);
+
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let ts = Utc::now().timestamp();
+    for p in positions {
+        let direction = if p.sign >= 0 { "long" } else { "short" };
+        let entry = p.entry_price.and_then(|d| d.to_f64());
+        let size = p.size.to_f64().unwrap_or(0.0);
+        let record = PnlLogRecord {
+            ts,
+            pair: p.symbol.clone(),
+            base: p.symbol.clone(),
+            quote: String::new(),
+            direction: direction.to_string(),
+            pnl: 0.0,
+            source: "startup_force_close".to_string(),
+            entry_price_a: entry,
+            entry_price_b: None,
+            exit_price_a: None,
+            exit_price_b: None,
+            beta: None,
+            z_entry: None,
+            z_exit: None,
+            hold_secs: None,
+            size: Some(size),
+        };
+        let line = serde_json::to_string(&record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
+}
+
 pub(super) fn sanitize_pnl_tag(raw: &str) -> String {
     raw.chars()
         .map(|ch| {
@@ -230,6 +334,7 @@ impl PnlLogRecord {
             z_entry: None,
             z_exit: None,
             hold_secs: None,
+            size: None,
         }
     }
 
