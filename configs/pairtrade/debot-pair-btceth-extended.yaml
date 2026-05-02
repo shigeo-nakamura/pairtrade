@@ -82,10 +82,15 @@ entry_velocity_block_sigma_per_min: 0.0
 funding_entry_z_scale: 0.0
 beta_gap_entry_z_scale: 3.0
 
-# Std collapse guard — observe-only (same as Frankfurt config).
+# Std collapse guard (bot-strategy#62). Frankfurt flipped to block on
+# 2026-04-27 after 11-day observe data confirmed no real entries were
+# blocked. Tokyo Extended saw zero STD_COLLAPSE_OBSERVE emissions in the
+# journalctl retention window since deployment, so flip-to-block is at
+# least as safe here as on Frankfurt. Blocks entries when std < 20% of
+# the rolling median of the last 60 bar stds.
 std_collapse_window_bars: 60
 std_collapse_min_ratio: 0.2
-std_collapse_observe_only: true
+std_collapse_observe_only: false
 
 # Circuit breaker
 circuit_breaker_tier1_losses: 5
