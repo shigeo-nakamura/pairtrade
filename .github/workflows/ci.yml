@@ -46,7 +46,7 @@ jobs:
   lint-no-bot-restart:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Forbid bot auto-restart in CI workflows
         run: |
           if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+debot-pair-' .github/workflows/*.yml; then
@@ -109,12 +109,12 @@ jobs:
         working-directory: debot
     steps:
       - name: Checkout debot
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: debot
 
       - name: Checkout dex-connector
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: shigeo-nakamura/dex-connector
           ref: ${{ env.DEX_CONNECTOR_REF }}
@@ -122,14 +122,14 @@ jobs:
           token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
 
       - name: Checkout lighter-go
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: elliottech/lighter-go
           ref: ${{ env.LIGHTER_GO_REF }}
           path: lighter-go
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.21.x"
           cache: true
@@ -168,7 +168,7 @@ jobs:
       DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
     steps:
       - name: Checkout debot
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: debot
 
@@ -178,7 +178,7 @@ jobs:
           platforms: arm64
 
       - name: Checkout dex-connector
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: shigeo-nakamura/dex-connector
           ref: ${{ env.DEX_CONNECTOR_REF }}
@@ -186,7 +186,7 @@ jobs:
           token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
 
       - name: Checkout lighter-go
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: elliottech/lighter-go
           ref: ${{ env.LIGHTER_GO_REF }}
@@ -194,7 +194,7 @@ jobs:
 
       - name: Cache libsigner (linux/arm64)
         id: cache_libsigner
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: lighter-go/build/libsigner.so
           key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
@@ -213,14 +213,14 @@ jobs:
 
       - name: Save libsigner cache (linux/arm64)
         if: steps.cache_libsigner.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: lighter-go/build/libsigner.so
           key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
 
       - name: Cache cargo (linux/arm64)
         id: cache_cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .cache/cargo/registry
@@ -262,7 +262,7 @@ jobs:
 
       - name: Save cargo cache (linux/arm64)
         if: steps.build_debot.outcome == 'success' && steps.cache_cargo.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: |
             .cache/cargo/registry
@@ -405,7 +405,7 @@ jobs:
       INSTALL_DIR: /opt/debot-extended
     steps:
       - name: Checkout debot
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: debot
 
@@ -415,7 +415,7 @@ jobs:
           platforms: arm64
 
       - name: Checkout dex-connector
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: shigeo-nakamura/dex-connector
           ref: ${{ env.DEX_CONNECTOR_REF }}
@@ -424,7 +424,7 @@ jobs:
 
       - name: Cache cargo extended (linux/arm64)
         id: cache_cargo_ext
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .cache/cargo/registry
@@ -465,7 +465,7 @@ jobs:
 
       - name: Save cargo cache extended (linux/arm64)
         if: steps.build_debot_ext.outcome == 'success' && steps.cache_cargo_ext.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: |
             .cache/cargo/registry
