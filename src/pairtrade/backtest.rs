@@ -63,10 +63,7 @@ pub(super) async fn create_connector(
     if cfg.strategies.len() <= 1 {
         let conn = DexConnectorBox::create(
             &cfg.dex_name,
-            &cfg.rest_endpoint,
-            &cfg.web_socket_endpoint,
             cfg.dry_run,
-            cfg.agent_name.clone(),
             &tokens,
             None,
         )
@@ -105,10 +102,7 @@ pub(super) async fn create_connector(
             last_iter_start = Some(Instant::now());
             let conn = DexConnectorBox::create(
                 &cfg.dex_name,
-                &cfg.rest_endpoint,
-                &cfg.web_socket_endpoint,
                 cfg.dry_run,
-                strategy.agent_name.clone().or_else(|| cfg.agent_name.clone()),
                 &tokens,
                 Some(strategy.id.as_str()),
             )

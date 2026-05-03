@@ -785,13 +785,9 @@ impl PairTradeConfig {
         }
 
         let mut cfg = PairTradeConfig {
-            dex_name: yaml.dex_name.unwrap_or_else(|| "hyperliquid".to_string()),
-            rest_endpoint: yaml
-                .rest_endpoint
-                .unwrap_or_else(|| "https://api.hyperliquid.xyz".to_string()),
-            web_socket_endpoint: yaml
-                .web_socket_endpoint
-                .unwrap_or_else(|| "wss://api.hyperliquid.xyz/ws".to_string()),
+            dex_name: yaml.dex_name.unwrap_or_else(|| "lighter".to_string()),
+            rest_endpoint: yaml.rest_endpoint.unwrap_or_default(),
+            web_socket_endpoint: yaml.web_socket_endpoint.unwrap_or_default(),
             dry_run: yaml.dry_run.unwrap_or(true),
             agent_name: yaml.agent_name,
             interval_secs: yaml.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS),
@@ -885,11 +881,9 @@ impl PairTradeConfig {
     }
 
     pub fn from_env() -> Result<Self> {
-        let dex_name = env::var("DEX_NAME").unwrap_or_else(|_| "hyperliquid".to_string());
-        let rest_endpoint =
-            env::var("REST_ENDPOINT").unwrap_or_else(|_| "https://api.hyperliquid.xyz".to_string());
-        let web_socket_endpoint = env::var("WEB_SOCKET_ENDPOINT")
-            .unwrap_or_else(|_| "wss://api.hyperliquid.xyz/ws".to_string());
+        let dex_name = env::var("DEX_NAME").unwrap_or_else(|_| "lighter".to_string());
+        let rest_endpoint = env::var("REST_ENDPOINT").unwrap_or_default();
+        let web_socket_endpoint = env::var("WEB_SOCKET_ENDPOINT").unwrap_or_default();
         let dry_run = env::var("DRY_RUN")
             .unwrap_or_else(|_| "true".to_string())
             .to_lowercase()
