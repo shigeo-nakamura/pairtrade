@@ -6627,7 +6627,7 @@ mod shutdown_grace_tests {
         let prev = std::env::var("SHUTDOWN_GRACE_SECS").ok();
         std::env::remove_var("SHUTDOWN_GRACE_SECS");
         // Also ensure required env vars have sensible fallbacks.
-        std::env::set_var("DEX_NAME", "hyperliquid");
+        std::env::set_var("DEX_NAME", "lighter");
         std::env::set_var("UNIVERSE_PAIRS", "BTC/ETH");
         let cfg = PairTradeConfig::from_env().expect("from_env failed");
         assert_eq!(cfg.shutdown_grace_secs, DEFAULT_SHUTDOWN_GRACE_SECS);

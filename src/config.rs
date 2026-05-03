@@ -18,13 +18,6 @@ pub struct LighterConfig {
     pub websocket_url: String,
 }
 
-#[derive(Debug)]
-pub struct HyperliquidConfig {
-    pub private_key: String,
-    pub evm_wallet_address: String,
-    pub vault_address: Option<String>,
-}
-
 #[cfg(feature = "extended-sdk")]
 #[derive(Debug)]
 pub struct ExtendedConfig {
@@ -34,14 +27,6 @@ pub struct ExtendedConfig {
     pub vault: u64,
     pub base_url: Option<String>,
     pub websocket_url: Option<String>,
-}
-
-#[derive(Debug)]
-pub enum RunMode {
-    Dry,
-    RealTrade,
-    #[allow(dead_code)]
-    RealTradeTest,
 }
 
 #[derive(Debug)]
@@ -210,50 +195,6 @@ pub async fn get_lighter_config_from_env(
         wallet_address,
         base_url,
         websocket_url,
-    })
-}
-
-pub async fn get_hyperliquid_config_from_env(
-    mode: RunMode,
-) -> Result<HyperliquidConfig, ConfigError> {
-    let private_key_encrypted = match mode {
-        RunMode::Dry | RunMode::RealTradeTest => env::var("HYPERLIQUID_DRYRUN_PRIVATE_KEY")
-            .expect("HYPERLIQUID_DRYRUN_PRIVATE_KEY must be set"),
-        RunMode::RealTrade => {
-            env::var("HYPERLIQUID_PRIVATE_KEY").expect("HYPERLIQUID_PRIVATE_KEY must be set")
-        }
-    };
-
-    let evm_wallet_address = match mode {
-        RunMode::Dry | RunMode::RealTradeTest => env::var("HYPERLIQUID_DRYRUN_EVM_WALLET_ADDRESS")
-            .expect("HYPERLIQUID_DRYRUN_EVM_WALLET_ADDRESS must be set"),
-        RunMode::RealTrade => env::var("HYPERLIQUID_EVM_WALLET_ADDRESS")
-            .expect("HYPERLIQUID_EVM_WALLET_ADDRESS must be set"),
-    };
-
-    let vault_address = match mode {
-        RunMode::Dry | RunMode::RealTradeTest => env::var("HYPERLIQUID_DRYRUN_VAULT_ADDRESS").ok(),
-        RunMode::RealTrade => env::var("HYPERLIQUID_VAULT_ADDRESS").ok(),
-    };
-
-    // Decrypt private key using KMS
-    let encrypted_data_key = env::var("ENCRYPTED_DATA_KEY")
-        .expect("ENCRYPTED_DATA_KEY must be set")
-        .replace(" ", ""); // Remove whitespace characters
-
-    let private_key_vec =
-        debot_utils::decrypt_data_with_kms(&encrypted_data_key, private_key_encrypted, true)
-            .await
-            .map_err(|e| {
-                log::error!("Failed to decrypt private key: {:?}", e);
-                ConfigError::DecimalParseError(DecimalParseError::from("KMS decryption failed"))
-            })?;
-    let private_key = String::from_utf8(private_key_vec).unwrap();
-
-    Ok(HyperliquidConfig {
-        private_key,
-        evm_wallet_address,
-        vault_address,
     })
 }
 
