@@ -119,6 +119,9 @@ fn is_ws_transient_event(msg: &str) -> bool {
         || msg.contains("tick error: read_mid")
         || msg.contains("order book snapshot unavailable")
         || msg.contains("waiting for websocket data")
+        || msg.starts_with("orderbook stream error:")
+        || msg.starts_with("public trades stream error:")
+        || msg.starts_with("account stream error:")
 }
 
 /// Match log lines that signal a successful WS reconnect. Drains pending
@@ -565,6 +568,90 @@ mod tests {
         fake_log(&c, t0 + 10, Level::Info, "WebSocket connected successfully");
         let (e, w) = snap_counts(&c, t0 + 15);
         assert_eq!((e, w), (0, 0), "pairtrade orderbook WARN suppressed too");
+    }
+
+    #[test]
+    fn extended_ws_reset_three_streams_drained_by_first_recovery() {
+        // bot-strategy#261 / #301 (Tokyo Extended 2026-05-03 12:36:58 UTC):
+        // a single Extended WS reset surfaces as three concurrent WARN
+        // lines (orderbook BTC, public trades BTC, orderbook ETH). The
+        // dex-connector reconnect is silent until the new
+        // `WebSocket connected successfully (stream=...)` info line is
+        // emitted; once it arrives the entire pending pool drains.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 8_000_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "orderbook stream error: Other error: ws error: WebSocket protocol error: Connection reset without closing handshake (stream=orderbook symbol=BTC ...)",
+        );
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "public trades stream error: Other error: ws error: WebSocket protocol error: Connection reset without closing handshake (stream=trades symbol=BTC ...)",
+        );
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "orderbook stream error: Other error: ws error: WebSocket protocol error: Connection reset without closing handshake (stream=orderbook symbol=ETH ...)",
+        );
+        fake_log(
+            &c,
+            t0 + 2,
+            Level::Info,
+            "WebSocket connected successfully (stream=orderbook symbol=BTC ...)",
+        );
+        assert!(
+            c.pending_ws.lock().unwrap().is_empty(),
+            "first recovery must drain all three pending Extended stream errors"
+        );
+        let (e, w) = snap_counts(&c, t0 + 5);
+        assert_eq!((e, w), (0, 0), "Extended WS reset triplet must commit zero");
+    }
+
+    #[test]
+    fn extended_account_stream_error_is_deferred() {
+        // The account stream error has a different prefix from the
+        // public ones; verify it still rides the same defer machinery.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 8_500_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "account stream error: ws error: WebSocket protocol error: Connection reset without closing handshake",
+        );
+        fake_log(
+            &c,
+            t0 + 3,
+            Level::Info,
+            "WebSocket connected successfully (stream=account ...)",
+        );
+        let (e, w) = snap_counts(&c, t0 + 5);
+        assert_eq!((e, w), (0, 0), "account stream WARN must suppress on recovery");
+    }
+
+    #[test]
+    fn extended_ws_reset_without_recovery_commits_after_deadline() {
+        // If reconnect never lands within WS_DEFER_WINDOW_SECS, the
+        // Extended stream-error WARNs must surface so a real persistent
+        // disconnect still reaches the auto-error workflow.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 9_000_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "orderbook stream error: Other error: ws error: WebSocket protocol error: Connection reset (stream=orderbook symbol=BTC ...)",
+        );
+        let (_, w) = snap_counts(&c, t0 + WS_DEFER_WINDOW_SECS + 5);
+        assert_eq!(w, 1, "expired Extended transient must commit");
     }
 
     // bot-strategy#267: STEP_OVERRUN warn during normal partial-fill
