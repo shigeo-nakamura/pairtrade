@@ -462,4 +462,10 @@ impl DexConnector for DexConnectorBox {
     async fn get_positions(&self) -> Result<Vec<dex_connector::PositionSnapshot>, DexError> {
         self.inner.get_positions().await
     }
+
+    fn subscribe_price_updates(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>, DexError> {
+        self.inner.subscribe_price_updates()
+    }
 }
