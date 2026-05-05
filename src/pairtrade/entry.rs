@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 
 use super::config::{PairParams, PairTradeConfig};
-use super::state::PairState;
+use super::state::{PairState, PositionDirection};
 use super::stats::spread_slope_sigma;
 use super::util::tail_std;
 
@@ -73,6 +73,42 @@ pub(super) fn entry_z_for_pair(
     z.clamp(pp.entry_z_min, pp.entry_z_max)
 }
 
+/// Per-direction post-stop_loss_z cool-down (bot-strategy#316). Returns
+/// `false` (blocks entry) when `stop_loss_cooldown_secs` is set, the most
+/// recent exit was a `stop_loss_z`, the proposed direction matches that
+/// stop, and the elapsed time is still inside the window. Reverse-direction
+/// entries are NOT blocked — they're reversal trades on a different signal.
+///
+/// 2026-05-04 Frankfurt DD: 100% of post-stop same-direction re-entries
+/// within 30 min were losers (n=2/2 live, plus a long-gap n=1 that was
+/// also a loser). A follow-up entry into a still-widening spread piles
+/// loss on loss because beta is actively breaking down.
+pub(super) fn post_stop_cooldown_allows(
+    pp: &PairParams,
+    state: &PairState,
+    now_ts: i64,
+    proposed_direction: PositionDirection,
+) -> bool {
+    if pp.stop_loss_cooldown_secs == 0 {
+        return true;
+    }
+    let Some((stop_dir, stop_ts)) = state.last_stop_loss_at else {
+        return true;
+    };
+    if stop_dir != proposed_direction {
+        return true;
+    }
+    let elapsed = now_ts.saturating_sub(stop_ts);
+    if elapsed >= pp.stop_loss_cooldown_secs as i64 {
+        return true;
+    }
+    log::info!(
+        "[STOP_COOLDOWN] {:?} blocked, elapsed={}s of {}s",
+        proposed_direction, elapsed, pp.stop_loss_cooldown_secs,
+    );
+    false
+}
+
 pub(super) fn should_enter(
     cfg: &PairTradeConfig,
     pp: &PairParams,
@@ -81,11 +117,16 @@ pub(super) fn should_enter(
     std: f64,
     net_funding: f64,
     now_ts: i64,
+    proposed_direction: PositionDirection,
 ) -> bool {
     if let Some(last_exit_ts) = state.last_exit_ts {
         if now_ts.saturating_sub(last_exit_ts) < pp.cooldown_secs as i64 {
             return false;
         }
+    }
+
+    if !post_stop_cooldown_allows(pp, state, now_ts, proposed_direction) {
+        return false;
     }
 
     // --- Phase 2 filter: spread momentum block ---
@@ -258,6 +299,78 @@ mod tests {
         let samples: Vec<f64> = vec![0.0; 30];
         let h = make_history(&samples);
         assert!(!std_collapsed(0.001, &h, 30, 0.2));
+    }
+
+    // ---- bot-strategy#316: post-stop_loss_z cool-down ----
+
+    fn cooldown_state(stop: Option<(PositionDirection, i64)>) -> PairState {
+        let mut s = PairState::new(240, 2.0);
+        s.last_stop_loss_at = stop;
+        s
+    }
+
+    fn cooldown_params(stop_loss_cooldown_secs: u64) -> PairParams {
+        let mut p = PairParams::default();
+        p.stop_loss_cooldown_secs = stop_loss_cooldown_secs;
+        p
+    }
+
+    #[test]
+    fn stop_cooldown_blocks_same_direction_within_window() {
+        let pp = cooldown_params(1800);
+        let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
+        // Re-attempt at t=1300 (5 min after the stop, well inside 1800s).
+        assert!(!post_stop_cooldown_allows(
+            &pp, &s, 1300, PositionDirection::LongSpread
+        ));
+    }
+
+    #[test]
+    fn stop_cooldown_allows_opposite_direction() {
+        let pp = cooldown_params(1800);
+        let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
+        // ShortSpread reversal is on a different signal — must not be blocked.
+        assert!(post_stop_cooldown_allows(
+            &pp, &s, 1300, PositionDirection::ShortSpread
+        ));
+    }
+
+    #[test]
+    fn stop_cooldown_allows_after_window_elapses() {
+        let pp = cooldown_params(1800);
+        let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
+        // 1s past the 1800s window.
+        assert!(post_stop_cooldown_allows(
+            &pp, &s, 1000 + 1801, PositionDirection::LongSpread
+        ));
+    }
+
+    #[test]
+    fn stop_cooldown_boundary_inclusive_at_window_end() {
+        // elapsed == cooldown → allowed (>= comparison in the helper).
+        let pp = cooldown_params(1800);
+        let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
+        assert!(post_stop_cooldown_allows(
+            &pp, &s, 1000 + 1800, PositionDirection::LongSpread
+        ));
+    }
+
+    #[test]
+    fn stop_cooldown_disabled_when_zero_secs() {
+        let pp = cooldown_params(0); // legacy / disabled
+        let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
+        assert!(post_stop_cooldown_allows(
+            &pp, &s, 1300, PositionDirection::LongSpread
+        ));
+    }
+
+    #[test]
+    fn stop_cooldown_no_prior_stop_allows() {
+        let pp = cooldown_params(1800);
+        let s = cooldown_state(None);
+        assert!(post_stop_cooldown_allows(
+            &pp, &s, 1_000_000, PositionDirection::LongSpread
+        ));
     }
 
     #[test]

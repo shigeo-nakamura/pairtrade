@@ -9,12 +9,13 @@ use std::time::Instant;
 
 use dex_connector::DexError;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use super::config::PairTradeConfig;
 use super::kalman::KalmanBeta;
 use super::util::mean_std;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum PositionDirection {
     LongSpread,
     ShortSpread,
@@ -137,6 +138,18 @@ pub(super) struct PairState {
     /// position still held (blocking new entries). The PnL is already computed
     /// and stored here so it can be logged when the deferred exit resolves.
     pub(super) bt_deferred_exit: Option<BtDeferredExit>,
+    /// Reason classifier for the in-flight exit, set when `exit_reason()`
+    /// decides a close and consumed at the exit-fill site so we can tag
+    /// post-stop state without plumbing the reason through `TradeAction`
+    /// + `PendingOrders` + reconcile. Cleared after consumption.
+    /// bot-strategy#316.
+    pub(super) pending_exit_reason: Option<&'static str>,
+    /// Direction + replay timestamp of the most recent stop_loss_z exit.
+    /// Drives the post-stop cool-down guard in `should_enter`. Per-direction
+    /// so that a LongSpread stop does not block a ShortSpread reversal.
+    /// Persisted via `InstanceRiskState.last_stop_loss_per_pair` so the
+    /// guard survives restart. bot-strategy#316.
+    pub(super) last_stop_loss_at: Option<(PositionDirection, i64)>,
 }
 
 /// Deferred exit info for BT fill-delay simulation.
@@ -172,6 +185,8 @@ impl PairState {
             kalman: None,
             std_history: VecDeque::new(),
             bt_deferred_exit: None,
+            pending_exit_reason: None,
+            last_stop_loss_at: None,
         }
     }
 

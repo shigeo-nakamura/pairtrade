@@ -12,6 +12,10 @@ pub(super) const DEFAULT_STOP_LOSS_Z: f64 = 3.3;
 pub(super) const DEFAULT_FORCE_CLOSE_SECS: u64 = 3600;
 pub(super) const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 3660; // DEFAULT_FORCE_CLOSE_SECS + 60s buffer
 pub(super) const DEFAULT_COOLDOWN_SECS: u64 = 30;
+/// Per-direction post-stop_loss_z cool-down (seconds). 0 = disabled (legacy
+/// behavior). Independent of `DEFAULT_COOLDOWN_SECS` and the global circuit
+/// breaker. See bot-strategy#316.
+pub(super) const DEFAULT_STOP_LOSS_COOLDOWN_SECS: u64 = 0;
 pub(super) const MAX_EXIT_RETRIES: u32 = 3;
 pub(super) const DEFAULT_NET_FUNDING_MIN_PER_HOUR: f64 = -0.005;
 pub(super) const DEFAULT_SPREAD_VELOCITY_MAX_SIGMA_PER_MIN: f64 = 0.1;

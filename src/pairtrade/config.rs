@@ -22,6 +22,12 @@ pub struct PairParams {
     pub stop_loss_z: f64,
     pub force_close_secs: u64,
     pub cooldown_secs: u64,
+    /// Per-direction post-stop_loss_z cool-down (seconds). When > 0, blocks
+    /// new entries in the same direction as the most recent stop_loss_z exit
+    /// for this many seconds. Independent of the generic `cooldown_secs` and
+    /// the global circuit breaker. 0 = disabled (legacy behavior).
+    /// bot-strategy#316.
+    pub stop_loss_cooldown_secs: u64,
     pub max_loss_r_mult: f64,
     pub half_life_max_hours: f64,
     pub adf_p_threshold: f64,
@@ -229,6 +235,7 @@ pub(super) struct PairTradeYaml {
     pub(super) stop_loss_z_score: Option<f64>,
     pub(super) force_close_time_secs: Option<u64>,
     pub(super) cooldown_secs: Option<u64>,
+    pub(super) stop_loss_cooldown_secs: Option<u64>,
     pub(super) net_funding_min_per_hour: Option<f64>,
     pub(super) spread_velocity_max_sigma_per_min: Option<f64>,
     pub(super) notional_per_leg_usd: Option<f64>,
@@ -391,6 +398,7 @@ pub(super) struct PairOverrideYaml {
     pub(super) stop_loss_z_score: Option<f64>,
     pub(super) force_close_time_secs: Option<u64>,
     pub(super) cooldown_secs: Option<u64>,
+    pub(super) stop_loss_cooldown_secs: Option<u64>,
     pub(super) max_loss_r_mult: Option<f64>,
     pub(super) half_life_max_hours: Option<f64>,
     pub(super) adf_p_threshold: Option<f64>,
@@ -1129,6 +1137,10 @@ impl PairTradeConfig {
         env_override("STOP_LOSS_Z_SCORE", &mut self.default_pair_params.stop_loss_z);
         env_override("FORCE_CLOSE_TIME_SECS", &mut self.default_pair_params.force_close_secs);
         env_override("COOLDOWN_SECS", &mut self.default_pair_params.cooldown_secs);
+        env_override(
+            "STOP_LOSS_COOLDOWN_SECS",
+            &mut self.default_pair_params.stop_loss_cooldown_secs,
+        );
         env_override("NET_FUNDING_MIN_PER_HOUR", &mut self.net_funding_min_per_hour);
         env_override("SPREAD_VELOCITY_MAX_SIGMA_PER_MIN", &mut self.default_pair_params.spread_velocity_max_sigma_per_min);
         env_override("NOTIONAL_PER_LEG_USD", &mut self.notional_per_leg);
@@ -1460,6 +1472,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         stop_loss_z: env_parse("STOP_LOSS_Z_SCORE", DEFAULT_STOP_LOSS_Z),
         force_close_secs: env_parse("FORCE_CLOSE_TIME_SECS", DEFAULT_FORCE_CLOSE_SECS),
         cooldown_secs: env_parse("COOLDOWN_SECS", DEFAULT_COOLDOWN_SECS),
+        stop_loss_cooldown_secs: env_parse(
+            "STOP_LOSS_COOLDOWN_SECS",
+            DEFAULT_STOP_LOSS_COOLDOWN_SECS,
+        ),
         max_loss_r_mult: env_parse("MAX_LOSS_R_MULT", DEFAULT_MAX_LOSS_R_MULT),
         half_life_max_hours: env_parse("HALF_LIFE_MAX_HOURS", DEFAULT_HALF_LIFE_MAX_HOURS),
         adf_p_threshold: env_parse("ADF_P_THRESHOLD", DEFAULT_ADF_P_THRESHOLD),
@@ -1625,6 +1641,9 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
             .force_close_time_secs
             .unwrap_or(DEFAULT_FORCE_CLOSE_SECS),
         cooldown_secs: yaml.cooldown_secs.unwrap_or(DEFAULT_COOLDOWN_SECS),
+        stop_loss_cooldown_secs: yaml
+            .stop_loss_cooldown_secs
+            .unwrap_or(DEFAULT_STOP_LOSS_COOLDOWN_SECS),
         max_loss_r_mult: yaml.max_loss_r_mult.unwrap_or(DEFAULT_MAX_LOSS_R_MULT),
         half_life_max_hours: yaml
             .half_life_max_hours
@@ -1711,6 +1730,9 @@ fn apply_pair_overrides(
             stop_loss_z: ovr.stop_loss_z_score.unwrap_or(default.stop_loss_z),
             force_close_secs: ovr.force_close_time_secs.unwrap_or(default.force_close_secs),
             cooldown_secs: ovr.cooldown_secs.unwrap_or(default.cooldown_secs),
+            stop_loss_cooldown_secs: ovr
+                .stop_loss_cooldown_secs
+                .unwrap_or(default.stop_loss_cooldown_secs),
             max_loss_r_mult: ovr.max_loss_r_mult.unwrap_or(default.max_loss_r_mult),
             half_life_max_hours: ovr
                 .half_life_max_hours

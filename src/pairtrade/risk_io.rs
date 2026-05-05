@@ -12,12 +12,21 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::state::PositionDirection;
+
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub(super) struct InstanceRiskState {
     #[serde(default)]
     pub consecutive_losses: u32,
     #[serde(default)]
     pub circuit_breaker_until_ts: Option<i64>,
+    /// Per-pair last stop_loss_z exit (direction + timestamp) so the
+    /// post-stop cool-down (`stop_loss_cooldown_secs`, bot-strategy#316)
+    /// survives restart. Key = pair key (e.g. "BTC/ETH"). Stale entries
+    /// (older than the cool-down window) are harmless — `should_enter`
+    /// computes elapsed at check time.
+    #[serde(default)]
+    pub last_stop_loss_per_pair: HashMap<String, StopLossMark>,
     /// Instance equity at the start of the current UTC session, captured
     /// on rollover. Denominator for `max_daily_loss_bps`. Zero until the
     /// first session reset runs (which the engine always performs on
@@ -65,6 +74,14 @@ pub(super) struct InstanceRiskState {
 pub(super) struct EquitySample {
     pub ts: i64,
     pub equity: f64,
+}
+
+/// Persisted record of the most recent stop_loss_z exit for a single pair.
+/// Drives the post-stop cool-down restore on engine startup. bot-strategy#316.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub(super) struct StopLossMark {
+    pub direction: PositionDirection,
+    pub ts: i64,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]

@@ -77,6 +77,27 @@ const KILL_SWITCH_PATH: &str = "/opt/debot/KILL_SWITCH";
 /// if all instances were already clear. See bot-strategy#185 Phase 3-2.
 const RISK_ACK_PATH: &str = "/opt/debot/RISK_ACK";
 
+/// Apply the post-exit state transition: clear position, stamp
+/// last_exit_{at,ts}, and — if the exit reason stashed by `exit_reason()`
+/// is `stop_loss_z` — set `last_stop_loss_at` so the per-direction
+/// post-stop cool-down (`stop_loss_cooldown_secs`) blocks an immediate
+/// same-direction re-entry. The tag is dropped after consumption so a
+/// later non-stop exit (force_close / exit_z) does not refresh it.
+/// bot-strategy#316.
+fn apply_post_exit_state(state: &mut PairState, direction: PositionDirection, now_ts: i64) {
+    state.position = None;
+    state.last_exit_at = Some(Instant::now());
+    state.last_exit_ts = Some(now_ts);
+    if let Some(reason) = state.pending_exit_reason.take() {
+        if reason == "stop_loss_z" {
+            state.last_stop_loss_at = Some((direction, now_ts));
+            log::info!(
+                "[STOP_COOLDOWN] armed direction={:?} now_ts={}",
+                direction, now_ts
+            );
+        }
+    }
+}
 
 struct StrategyInstance {
     #[allow(dead_code)]
@@ -1619,9 +1640,16 @@ impl PairTradeEngine {
                                 "[BT_FILL_DELAY] {} resolved (delay={}s, now_ts={})",
                                 key, self.cfg.bt_fill_delay_secs, now_ts
                             );
-                            state.position = None;
-                            state.last_exit_at = Some(Instant::now());
-                            state.last_exit_ts = Some(now_ts);
+                            // The deferred exit is the resolution of an
+                            // earlier exit decision; pending_exit_reason
+                            // is still set on state from that decision.
+                            // bot-strategy#316.
+                            let dir = state
+                                .position
+                                .as_ref()
+                                .map(|p| p.direction)
+                                .unwrap_or(PositionDirection::LongSpread);
+                            apply_post_exit_state(state, dir, now_ts);
                             state.bt_deferred_exit = None;
                         }
                     }
@@ -1945,6 +1973,11 @@ impl PairTradeEngine {
                                     state.last_velocity_sigma_per_min,
                                     pp.spread_velocity_max_sigma_per_min
                                 );
+                                    // Stash the reason so the exit-fill site
+                                    // can tag last_stop_loss_at without
+                                    // plumbing the reason through TradeAction
+                                    // + PendingOrders. bot-strategy#316.
+                                    state.pending_exit_reason = Some(reason);
                                     action = TradeAction::Close {
                                         direction: pos.direction,
                                         z,
@@ -1977,17 +2010,21 @@ impl PairTradeEngine {
                                 // because beta is still at its initial value (1.0).
                             } else if !regime_ok {
                                 // entry blocked by regime filter
-                            } else if should_enter(&self.cfg, pp, state, z, std, net_funding, now_ts) {
+                            } else {
                                 let direction = if z > 0.0 {
                                     PositionDirection::ShortSpread
                                 } else {
                                     PositionDirection::LongSpread
                                 };
-                                action = TradeAction::Open {
-                                    direction,
-                                    z,
-                                    beta: state.beta,
-                                };
+                                if should_enter(
+                                    &self.cfg, pp, state, z, std, net_funding, now_ts, direction,
+                                ) {
+                                    action = TradeAction::Open {
+                                        direction,
+                                        z,
+                                        beta: state.beta,
+                                    };
+                                }
                             }
                             let slope_sig =
                                 spread_slope_sigma(&state.spread_history, self.cfg.metrics_window);
@@ -2257,14 +2294,14 @@ impl PairTradeEngine {
                     if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         if self.cfg.backtest_mode && self.cfg.bt_fill_delay_secs > 0 {
                             // Defer position clearing to simulate exchange
-                            // fill latency (bot-strategy#69).
+                            // fill latency (bot-strategy#69). The deferred
+                            // resolve site reads pending_exit_reason to
+                            // tag last_stop_loss_at for #316.
                             state.bt_deferred_exit = Some(BtDeferredExit {
                                 resolve_at_ts: now_ts + self.cfg.bt_fill_delay_secs,
                             });
                         } else {
-                            state.position = None;
-                            state.last_exit_at = Some(Instant::now());
-                            state.last_exit_ts = Some(now_ts);
+                            apply_post_exit_state(state, direction, now_ts);
                         }
                     }
                 } else if self.cfg.observe_only {
@@ -3204,6 +3241,21 @@ impl PairTradeEngine {
             inst.session_halted = state.session_halted;
             inst.session_halt_reason = state.session_halt_reason.clone();
             inst.session_halt_ts = state.session_halt_ts;
+            for (pair_key, mark) in &state.last_stop_loss_per_pair {
+                if let Some(pair_state) = inst.states.get_mut(pair_key) {
+                    pair_state.last_stop_loss_at = Some((mark.direction, mark.ts));
+                    let elapsed = now_ts.saturating_sub(mark.ts).max(0);
+                    log::info!(
+                        "[STOP_COOLDOWN] {} restored: direction={:?} elapsed={}s",
+                        pair_key, mark.direction, elapsed
+                    );
+                } else {
+                    log::debug!(
+                        "[STOP_COOLDOWN] {} restore skipped (no PairState yet); will not block re-entry on first eval",
+                        pair_key
+                    );
+                }
+            }
             if inst.session_halted {
                 log::warn!(
                     "[SESSION_DD] {} restored halt: reason={} since_ts={} (waiting for {} ack)",
@@ -3252,6 +3304,19 @@ impl PairTradeEngine {
             .instances
             .iter()
             .map(|inst| {
+                let last_stop_loss_per_pair = inst
+                    .states
+                    .iter()
+                    .filter_map(|(key, st)| {
+                        st.last_stop_loss_at
+                            .map(|(direction, ts)| {
+                                (
+                                    key.clone(),
+                                    risk_io::StopLossMark { direction, ts },
+                                )
+                            })
+                    })
+                    .collect();
                 (
                     inst.id.clone(),
                     risk_io::InstanceRiskState {
@@ -3264,6 +3329,7 @@ impl PairTradeEngine {
                         session_halted: inst.session_halted,
                         session_halt_reason: inst.session_halt_reason.clone(),
                         session_halt_ts: inst.session_halt_ts,
+                        last_stop_loss_per_pair,
                     },
                 )
             })
@@ -4184,9 +4250,7 @@ impl PairTradeEngine {
                             }
                         }
                     }
-                    state.position = None;
-                    state.last_exit_at = Some(Instant::now());
-                    state.last_exit_ts = Some(now_ts);
+                    apply_post_exit_state(state, pending.direction, now_ts);
                     state.pending_exit = None;
                 }
                 log::info!("[ORDER] {} exit orders filled", key);
