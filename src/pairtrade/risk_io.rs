@@ -68,6 +68,20 @@ pub(super) struct InstanceRiskState {
     /// `session_halted`.
     #[serde(default)]
     pub session_halt_ts: Option<i64>,
+    /// Lifetime trade-stats counters surfaced on the dashboard. Persisted
+    /// here so `total_trades` / `total_wins` survive restart and stay in
+    /// scope with `consecutive_losses` (otherwise the dashboard can show
+    /// `consecutive_losses > total_trades` after a restart). bot-strategy#320.
+    #[serde(default)]
+    pub total_trades: u64,
+    #[serde(default)]
+    pub total_wins: u64,
+    #[serde(default)]
+    pub total_pnl: f64,
+    #[serde(default)]
+    pub peak_pnl: f64,
+    #[serde(default)]
+    pub max_dd: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]

@@ -2191,7 +2191,10 @@ impl PairTradeEngine {
                             );
                             self.write_pnl_record(inst_idx, record);
                             self.instances[inst_idx].realized_pnl_today += pnl_value;
-                            let mut risk_state_dirty = pnl_value != 0.0;
+                            // write_pnl_record always bumps total_trades / total_pnl
+                            // (now persisted, bot-strategy#320), so the snapshot is
+                            // dirty regardless of pnl sign.
+                            let mut risk_state_dirty = true;
                             // Collect circuit-breaker history events here
                             // and emit them after the borrow on
                             // self.instances releases, since
@@ -3241,6 +3244,11 @@ impl PairTradeEngine {
             inst.session_halted = state.session_halted;
             inst.session_halt_reason = state.session_halt_reason.clone();
             inst.session_halt_ts = state.session_halt_ts;
+            inst.total_trades = state.total_trades;
+            inst.total_wins = state.total_wins;
+            inst.total_pnl = state.total_pnl;
+            inst.peak_pnl = state.peak_pnl;
+            inst.max_dd = state.max_dd;
             for (pair_key, mark) in &state.last_stop_loss_per_pair {
                 if let Some(pair_state) = inst.states.get_mut(pair_key) {
                     pair_state.last_stop_loss_at = Some((mark.direction, mark.ts));
@@ -3329,6 +3337,11 @@ impl PairTradeEngine {
                         session_halted: inst.session_halted,
                         session_halt_reason: inst.session_halt_reason.clone(),
                         session_halt_ts: inst.session_halt_ts,
+                        total_trades: inst.total_trades,
+                        total_wins: inst.total_wins,
+                        total_pnl: inst.total_pnl,
+                        peak_pnl: inst.peak_pnl,
+                        max_dd: inst.max_dd,
                         last_stop_loss_per_pair,
                     },
                 )
@@ -4257,7 +4270,10 @@ impl PairTradeEngine {
                 if let Some((record, pnl_value)) = pnl_record {
                     self.write_pnl_record(inst_idx, record);
                     self.instances[inst_idx].realized_pnl_today += pnl_value;
-                    let mut risk_state_dirty = pnl_value != 0.0;
+                    // write_pnl_record always bumps total_trades / total_pnl
+                    // (now persisted, bot-strategy#320), so the snapshot is
+                    // dirty regardless of pnl sign.
+                    let mut risk_state_dirty = true;
                     if pnl_value < 0.0 {
                         self.instances[inst_idx].consecutive_losses += 1;
                         risk_state_dirty = true;
@@ -6333,6 +6349,63 @@ mod tests {
         let trips_5x = session_dd_breaches_threshold(500.0, 500, 5.0);
         assert!(!trips_1x);
         assert!(!trips_5x);
+    }
+
+    // bot-strategy#320: trade-stats fields round-trip through risk_state.json.
+    #[test]
+    fn risk_state_persists_trade_stats_round_trip() {
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("risk_state.json");
+
+        let mut instances = HashMap::new();
+        instances.insert(
+            "inst-a".to_string(),
+            risk_io::InstanceRiskState {
+                consecutive_losses: 3,
+                total_trades: 42,
+                total_wins: 25,
+                total_pnl: 12.34,
+                peak_pnl: 15.0,
+                max_dd: 2.66,
+                ..Default::default()
+            },
+        );
+
+        risk_io::persist_risk_state(&path, &instances);
+        let loaded = risk_io::load_risk_state(&path);
+
+        let restored = loaded.get("inst-a").expect("instance restored");
+        assert_eq!(restored.total_trades, 42);
+        assert_eq!(restored.total_wins, 25);
+        assert!((restored.total_pnl - 12.34).abs() < 1e-9);
+        assert!((restored.peak_pnl - 15.0).abs() < 1e-9);
+        assert!((restored.max_dd - 2.66).abs() < 1e-9);
+        assert_eq!(restored.consecutive_losses, 3);
+    }
+
+    // bot-strategy#320: an older snapshot without the trade-stats fields
+    // must load cleanly with zeros, not panic on missing keys.
+    #[test]
+    fn risk_state_loads_pre_320_snapshot_with_default_trade_stats() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("risk_state.json");
+        // v1 snapshot shape from before bot-strategy#320.
+        let legacy = r#"{"_v":1,"instances":{"inst-a":{"consecutive_losses":7}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let loaded = risk_io::load_risk_state(&path);
+        let restored = loaded.get("inst-a").expect("instance restored");
+        assert_eq!(restored.consecutive_losses, 7);
+        assert_eq!(restored.total_trades, 0);
+        assert_eq!(restored.total_wins, 0);
+        assert_eq!(restored.total_pnl, 0.0);
+        assert_eq!(restored.peak_pnl, 0.0);
+        assert_eq!(restored.max_dd, 0.0);
     }
 
     #[test]
