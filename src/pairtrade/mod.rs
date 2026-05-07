@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use dex_connector::{DexConnector, DexError, PositionSnapshot, PriceUpdate};
+use dex_connector::{DexConnector, DexError, PositionSnapshot};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -192,20 +192,6 @@ pub struct PairTradeEngine {
     ///   - existing exit logic (exit_z / stop_loss_z / force_close_secs) runs normally
     ///   - live loop exits as soon as open_positions is empty, or after shutdown_grace_secs
     shutdown_pending: bool,
-    /// True once the live loop has successfully subscribed to the connector's
-    /// WebSocket price-update broadcast (Lighter today). When set, BarBuilder
-    /// is fed by the WS arm of the main `tokio::select!` and `step_shared`
-    /// skips its own BarBuilder.push so the two paths never compete for the
-    /// same bucket. False for non-Lighter connectors (Extended / Hyperliquid)
-    /// and for backtest, where the polling fallback drives BarBuilder. See
-    /// bot-strategy#276 Phase 2.
-    ws_bars_active: bool,
-    /// Symbols whose BarBuilder emitted a fresh close since the last
-    /// `step_shared` drain. Populated by the WS arm via
-    /// `ingest_price_update`; consumed (and cleared) by `step_shared` so the
-    /// per-instance phase still receives the same `updated` HashSet semantics
-    /// it had under polling. bot-strategy#276 Phase 2.
-    pending_bar_updates: HashSet<String>,
 }
 
 struct PlannedAction {
@@ -430,8 +416,6 @@ impl PairTradeEngine {
             kill_switch_active: false,
             data_dump_writer,
             shutdown_pending: false,
-            ws_bars_active: false,
-            pending_bar_updates: HashSet::new(),
         })
     }
 
@@ -637,38 +621,6 @@ impl PairTradeEngine {
             if self.cfg.force_close_on_startup {
                 self.force_close_on_startup().await?;
             }
-            // Subscribe to the connector's real-time price-update broadcast.
-            // Lighter publishes one PriceUpdate per WS order-book change; on
-            // success we flip `ws_bars_active` so `step_shared` stops feeding
-            // BarBuilder from the polled snapshot and the WS arm below owns
-            // bar building. Connectors without a push channel (Extended /
-            // Hyperliquid today) return Err here and the polling fallback
-            // remains in charge. See bot-strategy#276 Phase 2.
-            let primary_connector = if !self.instances.is_empty() {
-                self.instances[0].connector.clone()
-            } else {
-                self.connector.clone()
-            };
-            let mut price_rx: Option<
-                tokio::sync::broadcast::Receiver<PriceUpdate>,
-            > = match primary_connector.subscribe_price_updates() {
-                Ok(rx) => {
-                    log::info!(
-                        "[WS_BARS] subscribed to connector price-update broadcast; \
-                         BarBuilder will be fed from WS ticks"
-                    );
-                    self.ws_bars_active = true;
-                    Some(rx)
-                }
-                Err(e) => {
-                    log::info!(
-                        "[WS_BARS] connector does not publish price updates ({}); \
-                         falling back to polling-driven BarBuilder",
-                        e
-                    );
-                    None
-                }
-            };
             // Wall-clock aligned ticker: fires at floor(now/interval)*interval + interval boundaries
             // so every bot process observing the same stream ticks at identical wall-clock seconds.
             // This is required on top of the BarBuilder bucket alignment (pairtrade#4): without
@@ -721,45 +673,6 @@ impl PairTradeEngine {
                 }
 
                 tokio::select! {
-                    // WS price-update arm. Resolves whenever the connector
-                    // pushes a PriceUpdate; routes the tick to BarBuilder
-                    // via `ingest_price_update`. Uses an inline async block
-                    // so the borrow on `price_rx` is released at the end of
-                    // each select iteration. When the connector did not
-                    // publish a channel (Extended / Hyperliquid), the inner
-                    // `pending()` future never resolves and the arm is
-                    // effectively disabled. bot-strategy#276 Phase 2.
-                    recv_result = async {
-                        match price_rx.as_mut() {
-                            Some(rx) => Some(rx.recv().await),
-                            None => {
-                                std::future::pending::<()>().await;
-                                None
-                            }
-                        }
-                    } => {
-                        match recv_result {
-                            Some(Ok(update)) => {
-                                self.ingest_price_update(update);
-                            }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
-                                log::warn!(
-                                    "[WS_BARS] dropped {} ticks (slow consumer); \
-                                     bucket close may briefly fall back to a polled snapshot",
-                                    n
-                                );
-                            }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                                log::error!(
-                                    "[WS_BARS] connector broadcast channel closed; \
-                                     reverting to polling-driven BarBuilder"
-                                );
-                                price_rx = None;
-                                self.ws_bars_active = false;
-                            }
-                            None => {}
-                        }
-                    }
                     _ = tokio::time::sleep_until(next_tick) => {
                         next_tick = next_wall_clock_boundary(interval_secs);
                         // Monitor step() execution time. If it exceeds interval_secs,
@@ -1434,104 +1347,42 @@ impl PairTradeEngine {
             );
             self.warm_start_states_from_history();
         }
-        // When the WS push path (bot-strategy#276 Phase 2) is feeding
-        // BarBuilder, every bucket close has already been recorded into
-        // `self.history` by `ingest_price_update`, which also tagged the
-        // affected symbols in `pending_bar_updates`. We must not re-feed
-        // the builders from polled snapshots: those lag the WS feed by up
-        // to `interval_secs`, often carry an `exchange_ts` older than the
-        // last WS update, and would only re-emit a duplicate close anyway
-        // (BarBuilder dedupes via `entry.back().ts != close_ts`). Drain
-        // the pending set so the per-instance phase still gets the same
-        // `updated` semantics it had under pure polling.
-        let mut updated: HashSet<String> = if self.ws_bars_active {
-            for symbol in price_map.keys() {
-                if !self.bar_builders.contains_key(symbol) {
-                    log::debug!("no bar builder for {}", symbol);
-                }
-            }
-            std::mem::take(&mut self.pending_bar_updates)
-        } else {
-            HashSet::new()
-        };
-        if !self.ws_bars_active {
-            for (symbol, snapshot) in price_map.iter() {
-                if let Some(builder) = self.bar_builders.get_mut(symbol) {
-                    // `snapshot.exchange_ts` is ms post bot-strategy#274 / #276;
-                    // `now_ts` is wall-clock seconds, lift it to ms when the
-                    // connector did not surface an exchange timestamp.
-                    let tick_ts = snapshot
-                        .exchange_ts
-                        .unwrap_or_else(|| now_ts.saturating_mul(1000));
-                    if let Some((close_price, close_ts)) = builder.push(tick_ts, snapshot.price) {
-                        let entry = self
-                            .history
-                            .entry(symbol.clone())
-                            .or_insert_with(VecDeque::new);
-                        let log_price = close_price
-                            .to_f64()
-                            .ok_or_else(|| anyhow!("invalid price for {}", symbol))?
-                            .ln();
-                        if entry.back().map(|s| s.ts) != Some(close_ts) {
-                            if entry.len() >= max_history_len {
-                                entry.pop_front();
-                            }
-                            entry.push_back(PriceSample {
-                                log_price,
-                                ts: close_ts,
-                            });
+        let mut updated = HashSet::new();
+        for (symbol, snapshot) in price_map.iter() {
+            if let Some(builder) = self.bar_builders.get_mut(symbol) {
+                // `snapshot.exchange_ts` is ms post bot-strategy#274 / #276;
+                // `now_ts` is wall-clock seconds, lift it to ms when the
+                // connector did not surface an exchange timestamp.
+                let tick_ts = snapshot
+                    .exchange_ts
+                    .unwrap_or_else(|| now_ts.saturating_mul(1000));
+                if let Some((close_price, close_ts)) = builder.push(tick_ts, snapshot.price) {
+                    let entry = self
+                        .history
+                        .entry(symbol.clone())
+                        .or_insert_with(VecDeque::new);
+                    let log_price = close_price
+                        .to_f64()
+                        .ok_or_else(|| anyhow!("invalid price for {}", symbol))?
+                        .ln();
+                    if entry.back().map(|s| s.ts) != Some(close_ts) {
+                        if entry.len() >= max_history_len {
+                            entry.pop_front();
                         }
-                        updated.insert(symbol.clone());
+                        entry.push_back(PriceSample {
+                            log_price,
+                            ts: close_ts,
+                        });
                     }
-                } else {
-                    log::debug!("no bar builder for {}", symbol);
+                    updated.insert(symbol.clone());
                 }
+            } else {
+                log::debug!("no bar builder for {}", symbol);
             }
         }
         self.persist_history_to_disk();
 
         Ok(Some((price_map, updated)))
-    }
-
-    /// Feed a single WebSocket price tick into the BarBuilder for `symbol`
-    /// and append the bucket close to `self.history` when the builder emits.
-    /// Called from the live loop's WS arm (bot-strategy#276 Phase 2). Symbols
-    /// that emit a fresh close are tagged in `pending_bar_updates` so the
-    /// next `step_shared` drains them into the per-instance `updated` set
-    /// and OLS / Kalman state advances exactly once per bar.
-    fn ingest_price_update(&mut self, update: PriceUpdate) {
-        let symbol = update.symbol;
-        let Some(builder) = self.bar_builders.get_mut(&symbol) else {
-            log::debug!("[WS_BARS] no bar builder for {}", symbol);
-            return;
-        };
-        let tick_ts = update.timestamp as i64;
-        let Some((close_price, close_ts)) = builder.push(tick_ts, update.mid_price) else {
-            return;
-        };
-        let log_price = match close_price.to_f64() {
-            Some(p) if p > 0.0 => p.ln(),
-            _ => {
-                log::warn!(
-                    "[WS_BARS] invalid close price for {}: {}",
-                    symbol,
-                    close_price
-                );
-                return;
-            }
-        };
-        let max_history_len = self.max_history_len();
-        let entry = self.history.entry(symbol.clone()).or_default();
-        if entry.back().map(|s| s.ts) != Some(close_ts) {
-            if entry.len() >= max_history_len {
-                entry.pop_front();
-            }
-            entry.push_back(PriceSample {
-                log_price,
-                ts: close_ts,
-            });
-        }
-        self.pending_bar_updates.insert(symbol);
     }
 
     async fn step_for_instance(
@@ -5903,8 +5754,6 @@ impl PairTradeEngine {
             data_dump_writer: None,
             replay_connector: None,
             shutdown_pending: false,
-            ws_bars_active: false,
-            pending_bar_updates: HashSet::new(),
         }
     }
 }
@@ -6897,74 +6746,6 @@ mod pending_tests {
 
         assert_eq!(connector.balance_calls.load(Ordering::SeqCst), 1);
         assert!((engine.instances[0].equity_cache - 777.0).abs() < 1e-6);
-    }
-
-    /// bot-strategy#276 Phase 2: WS push tick should drive BarBuilder and
-    /// emit a history entry exactly once per bucket close. The largest-ts
-    /// tick wins inside the bucket; the bucket close timestamp is the
-    /// bucket boundary, not the last-tick ts.
-    #[test]
-    fn ingest_price_update_emits_history_on_bucket_close() {
-        let connector = Arc::new(DummyConnector::default());
-        let mut engine = PairTradeEngine::test_instance(connector);
-        engine.bar_builders.insert("AAA".to_string(), BarBuilder::new(60));
-
-        // Tick 1: bucket [1_777_680_120_000, 1_777_680_180_000)
-        engine.ingest_price_update(PriceUpdate {
-            symbol: "AAA".to_string(),
-            mid_price: dec("100.0"),
-            best_bid: dec("99.9"),
-            best_ask: dec("100.1"),
-            timestamp: 1_777_680_125_400,
-        });
-        assert!(
-            engine.history.get("AAA").map(|v| v.is_empty()).unwrap_or(true),
-            "no bar emitted yet on first tick"
-        );
-        assert!(engine.pending_bar_updates.is_empty());
-
-        // Tick 2: same bucket, larger ms — overwrites close.
-        engine.ingest_price_update(PriceUpdate {
-            symbol: "AAA".to_string(),
-            mid_price: dec("101.0"),
-            best_bid: dec("100.9"),
-            best_ask: dec("101.1"),
-            timestamp: 1_777_680_175_900,
-        });
-        assert!(engine.pending_bar_updates.is_empty());
-
-        // Tick 3: crosses bucket boundary — emits prev bucket close = 101.0.
-        engine.ingest_price_update(PriceUpdate {
-            symbol: "AAA".to_string(),
-            mid_price: dec("102.0"),
-            best_bid: dec("101.9"),
-            best_ask: dec("102.1"),
-            timestamp: 1_777_680_180_500,
-        });
-        let history = engine.history.get("AAA").expect("history populated");
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].ts, 1_777_680_180_000);
-        assert!((history[0].log_price - 101.0_f64.ln()).abs() < 1e-12);
-        assert!(engine.pending_bar_updates.contains("AAA"));
-    }
-
-    /// Symbols absent from `bar_builders` should be ignored without
-    /// panicking — non-universe ticks (if the connector ever delivers
-    /// them) must not crash the engine.
-    #[test]
-    fn ingest_price_update_ignores_unknown_symbol() {
-        let connector = Arc::new(DummyConnector::default());
-        let mut engine = PairTradeEngine::test_instance(connector);
-
-        engine.ingest_price_update(PriceUpdate {
-            symbol: "ZZZ".to_string(),
-            mid_price: dec("100.0"),
-            best_bid: dec("99.9"),
-            best_ask: dec("100.1"),
-            timestamp: 1_777_680_125_400,
-        });
-        assert!(engine.history.get("ZZZ").is_none());
-        assert!(engine.pending_bar_updates.is_empty());
     }
 }
 
