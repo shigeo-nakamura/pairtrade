@@ -61,7 +61,7 @@ use util::{enforce_post_only_passive, round_price_by_tick, tail_std};
 /// Entry sizing fetches inline (see `fetch_equity_rest` call in the entry
 /// branch of `step()`), which after dex-connector v4.2.83 is a WS-derived
 /// cache hit in steady state. See bot-strategy#156, #239.
-const EQUITY_REFRESH_CACHE_SECS: u64 = 1800;
+const EQUITY_REFRESH_CACHE_SECS: u64 = 300;
 
 /// Sentinel file that, when present, blocks all new entries without
 /// requiring `systemctl stop`. Existing positions still exit normally.
