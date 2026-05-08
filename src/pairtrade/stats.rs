@@ -16,6 +16,16 @@ pub(super) fn tail_samples(history: &VecDeque<PriceSample>, len: usize) -> Vec<P
     v
 }
 
+/// Lower bound for OLS beta on BTC/ETH (and other major-major pairs).
+/// Observed live entry betas have ranged 0.45-1.03 over months of running.
+pub(super) const BETA_CLAMP_MIN: f64 = 0.1;
+/// Upper bound for OLS beta. Tightened from 10.0 (bot-strategy#346): a
+/// single corrupt tick had pushed beta to 6.15, still inside the old clamp.
+/// 5.0 is ~5x the historical entry max while keeping a wide safety margin
+/// for legitimate regime shifts; the tick-sanity filter is the primary
+/// defense and this clamp is a backstop for anything that slips through.
+pub(super) const BETA_CLAMP_MAX: f64 = 5.0;
+
 pub(super) fn regression_beta(x: &[PriceSample], y: &[PriceSample]) -> f64 {
     let n = x.len().min(y.len());
     if n < 2 {
@@ -39,7 +49,7 @@ pub(super) fn regression_beta(x: &[PriceSample], y: &[PriceSample]) -> f64 {
     if var_x.abs() < 1e-9 {
         1.0
     } else {
-        (cov / var_x).clamp(0.1, 10.0)
+        (cov / var_x).clamp(BETA_CLAMP_MIN, BETA_CLAMP_MAX)
     }
 }
 

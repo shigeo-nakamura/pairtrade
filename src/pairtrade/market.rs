@@ -4,6 +4,19 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+/// Maximum bid/ask spread (bps of mid) we accept on an inbound tick before
+/// treating it as a corrupt orderbook snapshot. Normal Lighter BTC/ETH
+/// spreads sit at 1-15 bps; the bot-strategy#346 incident produced a
+/// 6,680 bps spread (ask=$159,598 vs bid=$79,650 with ask_size=0). 200 bps
+/// is >10x normal noise and >30x below the observed bad tick.
+pub(super) const MAX_TICK_SPREAD_BPS: f64 = 200.0;
+
+/// Maximum distance from the bid/ask touch (bps) we tolerate for the
+/// `price` (mid) field. Lighter occasionally prints last-trade slightly
+/// outside touch; 50 bps is well above that without admitting a price
+/// half-way between a real bid and a phantom ask.
+pub(super) const MAX_TICK_PRICE_ENVELOPE_BPS: f64 = 50.0;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct SymbolSnapshot {
     pub(super) price: Decimal,
@@ -44,4 +57,231 @@ pub(super) fn liquidity_score(p1: &SymbolSnapshot, p2: &SymbolSnapshot) -> f64 {
     let s1 = p1.bid_size.min(p1.ask_size).to_f64().unwrap_or(0.0);
     let s2 = p2.bid_size.min(p2.ask_size).to_f64().unwrap_or(0.0);
     (s1 + s2).max(0.0)
+}
+
+/// Reason a snapshot was rejected by `tick_sanity_check`. Used by the
+/// caller to emit a diagnostic-rich WARN without forcing the helper to
+/// format strings on the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TickRejectReason {
+    EmptyBidSize,
+    EmptyAskSize,
+    MissingBid,
+    MissingAsk,
+    NonPositiveQuote,
+    CrossedBook,
+    SpreadTooWide,
+    PriceOutsideEnvelope,
+}
+
+impl TickRejectReason {
+    pub(super) fn as_str(&self) -> &'static str {
+        match self {
+            Self::EmptyBidSize => "empty_bid_size",
+            Self::EmptyAskSize => "empty_ask_size",
+            Self::MissingBid => "missing_bid",
+            Self::MissingAsk => "missing_ask",
+            Self::NonPositiveQuote => "nonpositive_quote",
+            Self::CrossedBook => "crossed_book",
+            Self::SpreadTooWide => "spread_too_wide",
+            Self::PriceOutsideEnvelope => "price_outside_envelope",
+        }
+    }
+}
+
+/// Validate that a snapshot's quoted bid/ask/price are mutually consistent
+/// before we admit them into the rolling regression. Returns `Ok(())` if
+/// the tick is sane, `Err(reason)` otherwise.
+///
+/// Catches the bot-strategy#346 failure mode: Lighter occasionally emits
+/// orderbook frames with `ask_size=0` and a phantom ask at ~2x mid, which
+/// the old code passed straight to `bar_builder.push(snapshot.price)`,
+/// committing a corrupt close to the price history and blowing up the
+/// rolling-OLS beta on the next regression update.
+pub(super) fn tick_sanity_check(
+    snap: &SymbolSnapshot,
+    max_spread_bps: f64,
+    max_envelope_bps: f64,
+) -> Result<(), TickRejectReason> {
+    if snap.bid_size <= Decimal::ZERO {
+        return Err(TickRejectReason::EmptyBidSize);
+    }
+    if snap.ask_size <= Decimal::ZERO {
+        return Err(TickRejectReason::EmptyAskSize);
+    }
+    let bid = snap.bid_price.ok_or(TickRejectReason::MissingBid)?;
+    let ask = snap.ask_price.ok_or(TickRejectReason::MissingAsk)?;
+    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || snap.price <= Decimal::ZERO {
+        return Err(TickRejectReason::NonPositiveQuote);
+    }
+    if ask < bid {
+        return Err(TickRejectReason::CrossedBook);
+    }
+    let bid_f = bid.to_f64().unwrap_or(0.0);
+    let ask_f = ask.to_f64().unwrap_or(0.0);
+    let mid = (bid_f + ask_f) * 0.5;
+    if mid <= 0.0 {
+        return Err(TickRejectReason::NonPositiveQuote);
+    }
+    let spread_bps = (ask_f - bid_f) / mid * 10_000.0;
+    if spread_bps > max_spread_bps {
+        return Err(TickRejectReason::SpreadTooWide);
+    }
+    let price_f = snap.price.to_f64().unwrap_or(0.0);
+    let envelope = max_envelope_bps / 10_000.0;
+    let lower = bid_f * (1.0 - envelope);
+    let upper = ask_f * (1.0 + envelope);
+    if price_f < lower || price_f > upper {
+        return Err(TickRejectReason::PriceOutsideEnvelope);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn snap(
+        price: Decimal,
+        bid: Option<Decimal>,
+        ask: Option<Decimal>,
+        bid_size: Decimal,
+        ask_size: Decimal,
+    ) -> SymbolSnapshot {
+        SymbolSnapshot {
+            price,
+            funding_rate: dec!(0),
+            bid_price: bid,
+            ask_price: ask,
+            bid_size,
+            ask_size,
+            min_order: None,
+            min_tick: None,
+            size_decimals: None,
+            exchange_ts: None,
+        }
+    }
+
+    #[test]
+    fn accepts_normal_btc_quote() {
+        // From real Lighter dump: ts=1778198400005
+        let s = snap(
+            dec!(79963.1),
+            Some(dec!(79884.4)),
+            Some(dec!(79974.3)),
+            dec!(0.00700),
+            dec!(0.00375),
+        );
+        assert_eq!(
+            tick_sanity_check(&s, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_bot_strategy_346_corrupt_tick() {
+        // The exact failure: Lighter dump 2026-05-08T09:21:00Z BTC frame.
+        // ask_size=0 with a phantom ask 2x normal -> mid prints at $119,775.
+        let s = snap(
+            dec!(119775.9),
+            Some(dec!(79650.4)),
+            Some(dec!(159598.8)),
+            dec!(0.82506),
+            dec!(0),
+        );
+        assert_eq!(
+            tick_sanity_check(&s, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS),
+            Err(TickRejectReason::EmptyAskSize)
+        );
+    }
+
+    #[test]
+    fn rejects_wide_spread_even_with_sizes() {
+        // Construct a tick with both sides present but spread far too wide
+        // to be a real BTC quote (would distort OLS even without ask_size=0).
+        let s = snap(
+            dec!(85000),
+            Some(dec!(80000)),
+            Some(dec!(90000)),
+            dec!(1),
+            dec!(1),
+        );
+        assert_eq!(
+            tick_sanity_check(&s, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS),
+            Err(TickRejectReason::SpreadTooWide)
+        );
+    }
+
+    #[test]
+    fn rejects_crossed_book() {
+        let s = snap(
+            dec!(80000),
+            Some(dec!(80100)),
+            Some(dec!(79900)),
+            dec!(1),
+            dec!(1),
+        );
+        assert_eq!(
+            tick_sanity_check(&s, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS),
+            Err(TickRejectReason::CrossedBook)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_bid_size() {
+        let s = snap(
+            dec!(80000),
+            Some(dec!(79990)),
+            Some(dec!(80010)),
+            dec!(0),
+            dec!(1),
+        );
+        assert_eq!(
+            tick_sanity_check(&s, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS),
+            Err(TickRejectReason::EmptyBidSize)
+        );
+    }
+
+    #[test]
+    fn rejects_price_far_outside_touch() {
+        // bid/ask sane but reported mid is 5% above ask -> reject (defensive).
+        let s = snap(
+            dec!(84000),
+            Some(dec!(79990)),
+            Some(dec!(80010)),
+            dec!(1),
+            dec!(1),
+        );
+        assert_eq!(
+            tick_sanity_check(&s, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS),
+            Err(TickRejectReason::PriceOutsideEnvelope)
+        );
+    }
+
+    #[test]
+    fn accepts_price_just_outside_touch_within_envelope() {
+        // last-trade prints at bid - ~25bps. Should still pass with the
+        // 50 bps envelope.
+        let s = snap(
+            dec!(79790),
+            Some(dec!(79800)),
+            Some(dec!(79820)),
+            dec!(1),
+            dec!(1),
+        );
+        assert_eq!(
+            tick_sanity_check(&s, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_missing_quote() {
+        let s = snap(dec!(80000), None, Some(dec!(80010)), dec!(1), dec!(1));
+        assert_eq!(
+            tick_sanity_check(&s, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS),
+            Err(TickRejectReason::MissingBid)
+        );
+    }
 }

@@ -37,7 +37,10 @@ mod util;
 use bar::BarBuilder;
 use entry::{entry_z_for_pair, should_enter};
 use exit::{compute_pnl, exit_reason};
-use market::{liquidity_score, net_funding_for_direction, SymbolSnapshot};
+use market::{
+    liquidity_score, net_funding_for_direction, tick_sanity_check, SymbolSnapshot,
+    MAX_TICK_PRICE_ENVELOPE_BPS, MAX_TICK_SPREAD_BPS,
+};
 use pair_eval::PairEvaluation;
 use pnl_log::{PnlLogRecord, PnlLogger};
 use stats::{regression_beta, spread_slope_sigma, tail_samples, PriceSample};
@@ -1349,6 +1352,26 @@ impl PairTradeEngine {
         }
         let mut updated = HashSet::new();
         for (symbol, snapshot) in price_map.iter() {
+            // bot-strategy#346: drop corrupt orderbook frames before they
+            // poison the bar builder / regression history. The data dump
+            // above already recorded the raw frame for diagnostics.
+            if let Err(reason) = tick_sanity_check(
+                snapshot,
+                MAX_TICK_SPREAD_BPS,
+                MAX_TICK_PRICE_ENVELOPE_BPS,
+            ) {
+                log::warn!(
+                    "[TICK_FILTER] rejected {} reason={} price={} bid={:?} ask={:?} bid_size={} ask_size={}",
+                    symbol,
+                    reason.as_str(),
+                    snapshot.price,
+                    snapshot.bid_price,
+                    snapshot.ask_price,
+                    snapshot.bid_size,
+                    snapshot.ask_size,
+                );
+                continue;
+            }
             if let Some(builder) = self.bar_builders.get_mut(symbol) {
                 // `snapshot.exchange_ts` is ms post bot-strategy#274 / #276;
                 // `now_ts` is wall-clock seconds, lift it to ms when the
