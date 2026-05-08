@@ -93,9 +93,22 @@ pub(super) struct StatusReporter {
     /// snapshot so the dashboard can show service-uptime without an
     /// SSM `systemctl ActiveEnterTimestamp` round-trip (#343).
     pub(super) process_started_at: i64,
+    /// Cached value of the most recent KILL_SWITCH sentinel-file
+    /// existence check, mirrored from `PairTradeEngine::kill_switch_active`
+    /// via `set_kill_switch`. Replaces the dashboard's
+    /// `cat /opt/debot/KILL_SWITCH` SSM probe (#343).
+    pub(super) kill_switch_active: bool,
     /// Optional S3 mirror; populated when STATUS_S3_BUCKET /
     /// STATUS_S3_KEY_PREFIX are set (#343). None → local-only writes.
     pub(super) s3_mirror: Option<Arc<S3Mirror>>,
+    /// Byte length of `equity_history.jsonl` at the most recent
+    /// successful S3 put. Re-uploads only fire when the file has grown,
+    /// avoiding wasted bytes on the per-tick write_snapshot cadence.
+    /// `None` until the first put. See bot-strategy#343 Phase 3.
+    pub(super) last_equity_history_uploaded_len: Option<u64>,
+    /// Same idea as `last_equity_history_uploaded_len`, for the rare
+    /// `backtest_alert.json` sibling file.
+    pub(super) last_backtest_alert_uploaded_len: Option<u64>,
 }
 
 /// Halt-history entry emitted in `status.json` and persisted to
@@ -231,6 +244,13 @@ pub(super) struct StatusSnapshot {
     pub(super) shutdown: Option<ShutdownStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) error_summary: Option<ErrorSummary>,
+    /// Mirror of the dashboard's old journalctl `Connection reset...`
+    /// counter, sampled from `error_counter::ws_reset_24h_count` at
+    /// snapshot time (#343).
+    pub(super) ws_reset_24h_count: u64,
+    /// Mirror of the dashboard's old `cat /opt/debot/KILL_SWITCH` probe
+    /// (#343). Set by the engine via `set_kill_switch` once per tick.
+    pub(super) kill_switch_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) daily_risk: Option<DailyRiskSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -416,7 +436,10 @@ impl StatusReporter {
             last_equity_history_ts: None,
             last_snapshot: None,
             process_started_at: process_started_at(),
+            kill_switch_active: false,
             s3_mirror: S3Mirror::from_env(),
+            last_equity_history_uploaded_len: None,
+            last_backtest_alert_uploaded_len: None,
             trade_stats: Some(PairTradeStats {
                 trades: 0,
                 wins: 0,
@@ -629,6 +652,13 @@ impl StatusReporter {
         self.circuit_breaker = cb;
     }
 
+    /// Mirror the engine's KILL_SWITCH sentinel-file state into the
+    /// next status snapshot. Called once per tick alongside the other
+    /// risk setters. See bot-strategy#343.
+    pub(super) fn set_kill_switch(&mut self, active: bool) {
+        self.kill_switch_active = active;
+    }
+
     pub(super) fn write_snapshot(
         &mut self,
         open_positions: &HashMap<String, PositionSnapshot>,
@@ -670,6 +700,10 @@ impl StatusReporter {
             maintenance: self.maintenance.clone(),
             shutdown: self.shutdown.clone(),
             error_summary: error_counter::global().map(|h| h.snapshot()),
+            ws_reset_24h_count: error_counter::global()
+                .map(|h| h.ws_reset_24h_count())
+                .unwrap_or(0),
+            kill_switch_active: self.kill_switch_active,
             daily_risk: self.daily_risk.clone(),
             session_risk: self.session_risk.clone(),
             circuit_breaker: self.circuit_breaker.clone(),
@@ -687,11 +721,81 @@ impl StatusReporter {
         // are logged but never block the local write. Skipped silently
         // when the reporter has no `id` because the S3 key shape (one
         // object per per-instance status) requires a stable identifier.
-        if let (Some(mirror), Some(id)) = (&self.s3_mirror, self.id.as_deref()) {
-            let file_name = format!("{id}.json");
-            mirror.put_async(&file_name, payload.into_bytes());
+        if let (Some(mirror), Some(id)) = (&self.s3_mirror, self.id.clone()) {
+            let mirror = Arc::clone(mirror);
+            mirror.put_async(&format!("{id}.json"), payload.into_bytes());
+            // Phase 3: sibling files. Re-uploaded only when their byte
+            // length changed since the last successful put, so we keep
+            // S3 in sync without paying for an upload every minute.
+            self.maybe_mirror_sibling(
+                &mirror,
+                &id,
+                "equity_history.jsonl",
+                "application/x-ndjson",
+                self.equity_history_path.clone(),
+                |this| &mut this.last_equity_history_uploaded_len,
+            );
+            let alert_path = self
+                .path
+                .parent()
+                .map(|d| d.join("backtest_alert.json"))
+                .unwrap_or_else(|| PathBuf::from("backtest_alert.json"));
+            self.maybe_mirror_sibling(
+                &mirror,
+                &id,
+                "backtest_alert.json",
+                "application/json",
+                alert_path,
+                |this| &mut this.last_backtest_alert_uploaded_len,
+            );
         }
         Ok(())
+    }
+
+    /// Read `local_path` and PutObject it to `<key_prefix>/<id>.<suffix>`
+    /// when (a) the file exists and (b) its byte length differs from the
+    /// last successful upload tracked via `len_field`. Missing files and
+    /// empty files are silently skipped — equity_history.jsonl exists
+    /// only after the first equity sample, and backtest_alert.json only
+    /// in the rare BT-replay alert path. See bot-strategy#343 Phase 3.
+    fn maybe_mirror_sibling(
+        &mut self,
+        mirror: &Arc<S3Mirror>,
+        id: &str,
+        suffix: &'static str,
+        content_type: &'static str,
+        local_path: PathBuf,
+        len_field: impl FnOnce(&mut Self) -> &mut Option<u64>,
+    ) {
+        let meta = match fs::metadata(&local_path) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let len = meta.len();
+        if len == 0 {
+            return;
+        }
+        let slot = len_field(self);
+        if *slot == Some(len) {
+            return;
+        }
+        let body = match fs::read(&local_path) {
+            Ok(b) => b,
+            Err(err) => {
+                log::warn!(
+                    "[STATUS_S3] read sibling {} failed: {:?}",
+                    local_path.display(),
+                    err
+                );
+                return;
+            }
+        };
+        // We optimistically commit `last_..._uploaded_len = len` before
+        // the spawn returns: a put failure logs but does not roll back
+        // (next change re-uploads). Avoids holding `&mut self` across
+        // an awaitable.
+        *slot = Some(len);
+        mirror.put_async_with_content_type(&format!("{id}.{suffix}"), body, content_type);
     }
 
     pub(super) fn write_snapshot_if_due(

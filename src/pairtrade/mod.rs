@@ -2391,10 +2391,12 @@ impl PairTradeEngine {
             let risk = self.daily_risk_snapshot(inst_idx);
             let session_risk = self.session_risk_snapshot(inst_idx);
             let circuit_breaker = self.circuit_breaker_snapshot(inst_idx);
+            let kill_switch_active = self.kill_switch_active;
             if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
                 reporter.set_daily_risk(risk);
                 reporter.set_session_risk(session_risk);
                 reporter.set_circuit_breaker(circuit_breaker);
+                reporter.set_kill_switch(kill_switch_active);
                 if let Err(err) =
                     reporter.write_snapshot_if_due(&self.open_positions, self.positions_ready)
                 {

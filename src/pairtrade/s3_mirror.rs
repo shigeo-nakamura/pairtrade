@@ -90,14 +90,27 @@ impl S3Mirror {
         })
     }
 
-    /// Fire-and-forget put. Spawns a tokio task on the current runtime
-    /// and returns immediately. When no runtime is current (e.g. unit
-    /// tests calling `write_snapshot` directly) the call becomes a
-    /// no-op so non-tokio paths keep working.
+    /// Fire-and-forget put with `Content-Type: application/json`.
+    /// Spawns a tokio task on the current runtime and returns
+    /// immediately. When no runtime is current (e.g. unit tests calling
+    /// `write_snapshot` directly) the call becomes a no-op so non-tokio
+    /// paths keep working.
     ///
     /// `file_name` is appended to `key_prefix` with a `/` separator —
     /// it must NOT include a leading slash.
     pub(crate) fn put_async(self: &Arc<Self>, file_name: &str, body: Vec<u8>) {
+        self.put_async_with_content_type(file_name, body, "application/json");
+    }
+
+    /// Like `put_async`, but with an explicit `Content-Type`. Used by
+    /// sibling-file mirrors (`equity_history.jsonl`, `backtest_alert.json`)
+    /// — see bot-strategy#343 Phase 3.
+    pub(crate) fn put_async_with_content_type(
+        self: &Arc<Self>,
+        file_name: &str,
+        body: Vec<u8>,
+        content_type: &'static str,
+    ) {
         let handle = match Handle::try_current() {
             Ok(h) => h,
             Err(_) => return,
@@ -112,7 +125,7 @@ impl S3Mirror {
                 .bucket(&me.bucket)
                 .key(&key)
                 .cache_control("max-age=2")
-                .content_type("application/json")
+                .content_type(content_type)
                 .body(ByteStream::from(body))
                 .send()
                 .await;
