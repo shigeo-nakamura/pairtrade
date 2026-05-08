@@ -160,7 +160,11 @@ jobs:
     # (pairtrade#9). Operators restart debot-pair-btceth manually when
     # convenient, so the SSM step finishes in seconds and does not need
     # to cover the 2h graceful-shutdown window.
-    timeout-minutes: 60
+    #
+    # bot-strategy#343 added aws-sdk-s3 to the dep tree which inflated
+    # the QEMU emulated arm64 cargo build past the original 60min cap;
+    # bumped to 180 to leave headroom for future SDK-sized additions.
+    timeout-minutes: 180
     needs: [resolve-ref, build-test, lint-no-bot-restart]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
@@ -391,7 +395,9 @@ jobs:
   # same instance.
   deploy-tokyo-extended:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # See `deploy` timeout note — bumped from 120 to 180 after #343
+    # added aws-sdk-s3 to the dep tree (QEMU arm64 build slower).
+    timeout-minutes: 180
     needs: [resolve-ref, build-test, lint-no-bot-restart]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
@@ -588,7 +594,9 @@ jobs:
   # restart, matching the Frankfurt pattern.
   deploy-tokyo-lighter:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # See `deploy` timeout note — bumped from 60 to 180 after #343 added
+    # aws-sdk-s3 (QEMU arm64 build slower).
+    timeout-minutes: 180
     needs: [resolve-ref, deploy, lint-no-bot-restart]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
