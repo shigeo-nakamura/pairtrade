@@ -56,6 +56,13 @@ max_loss_r_mult: 1.0    # Bot C champion value (was 3.0). Swapped 2026-04-07.
 
 # Execution
 cooldown_secs: 60
+# Post-stop-loss cool-down: block same-direction re-entry within this window
+# after a stop_loss_z exit (bot-strategy#316). 1800s = 30 min. BT (7d byte-exact,
+# 04-28 → 05-05) showed +$1.82 PnL / +3.5pp win rate / -18% MaxDD vs disabled
+# baseline at unchanged trade count. Activated for Frankfurt A/B/C during the
+# #278 Round 3 eval window (2026-05-10 onward) to prevent recurrence of the
+# 2026-05-04 B/C stop-cluster (-$89/-$72 bps each).
+stop_loss_cooldown_secs: 1800
 slippage_bps: 0
 fee_bps: 0
 entry_post_only_timeout_secs: 30
