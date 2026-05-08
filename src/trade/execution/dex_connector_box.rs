@@ -462,4 +462,14 @@ impl DexConnector for DexConnectorBox {
     async fn get_positions(&self) -> Result<Vec<dex_connector::PositionSnapshot>, DexError> {
         self.inner.get_positions().await
     }
+
+    fn subscribe_price_updates(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>, DexError> {
+        // bot-strategy#341 (re-introducing #276 Phase 2 followup #6ddf818):
+        // forward to the wrapped connector so Lighter's broadcast channel
+        // surfaces through the box. Without this override the trait
+        // default returns Err and the engine falls back to polling-only.
+        self.inner.subscribe_price_updates()
+    }
 }

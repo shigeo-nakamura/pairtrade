@@ -254,6 +254,22 @@ pub(super) fn load_history_snapshot_for_bt(
     }
 }
 
+/// Stale-history guard (pairtrade#4 / bot-strategy#341): if the newest
+/// sample for a symbol is older than this many ms, the persisted file is
+/// from a stopped bot and replaying it would freeze a stale rolling
+/// window. v2 (#341) lifted the formula from `5 × trading_period_secs` to
+/// `max(5min, 30 × trading_period_secs)` so routine restart-induced gaps
+/// (CI deploy + manual restart routinely exceed 5 min) keep their warm
+/// snapshot — under the hybrid WS+polling bar driver a cold cold-start
+/// ballooned beta warmup to 18–20 hours. Genuinely stale files (hours /
+/// days old) still get rejected.
+fn stale_history_threshold_ms(trading_period_secs: u64) -> i64 {
+    (trading_period_secs as i64)
+        .saturating_mul(30)
+        .max(300)
+        .saturating_mul(1000)
+}
+
 pub(super) fn load_history_from_disk(
     cfg: &PairTradeConfig,
     history: &mut HashMap<String, VecDeque<PriceSample>>,
@@ -282,14 +298,7 @@ pub(super) fn load_history_from_disk(
     let max_age_ms = (max_history_len as i64)
         .saturating_mul(cfg.trading_period_secs as i64)
         .saturating_mul(1000);
-    // Stale-history guard (pairtrade#4): if the newest sample for a symbol
-    // is older than a few bars, the persisted file is from a stopped bot
-    // and replaying it would freeze a stale rolling window. Drop it and
-    // let the live feed warm up from scratch.
-    let stale_threshold_ms = (cfg.trading_period_secs as i64)
-        .saturating_mul(5)
-        .max(60)
-        .saturating_mul(1000);
+    let stale_threshold_ms = stale_history_threshold_ms(cfg.trading_period_secs);
     let mut any_stale = false;
     for (sym, entries) in prices {
         let newest_ts = entries.iter().map(|(_, ts)| *ts).max().unwrap_or(0);
@@ -388,5 +397,30 @@ mod tests {
             &vec![(10.5, 1776232919000), (10.6, 1776232979000)]
         );
         assert!(spreads.is_empty());
+    }
+
+    #[test]
+    fn stale_threshold_admits_8min_old_snapshot_for_60s_bars() {
+        // bot-strategy#341: routine restart gaps (5–10 min) must keep
+        // the warm snapshot so beta doesn't cold-start under the hybrid
+        // bar driver. With trading_period_secs=60, threshold = 30 min.
+        let threshold_ms = stale_history_threshold_ms(60);
+        assert_eq!(threshold_ms, 30 * 60 * 1000);
+        let eight_min_ms = 8 * 60 * 1000;
+        assert!(
+            eight_min_ms < threshold_ms,
+            "8 min stale must be accepted under v2 threshold ({}ms)",
+            threshold_ms,
+        );
+        // Sanity-check the floor: even with a 1s trading period the
+        // threshold stays >= 5 min so we don't regress on rare config.
+        assert_eq!(stale_history_threshold_ms(1), 300 * 1000);
+    }
+
+    #[test]
+    fn stale_threshold_rejects_hours_old_snapshot() {
+        let threshold_ms = stale_history_threshold_ms(60);
+        let two_hours_ms = 2 * 3600 * 1000;
+        assert!(two_hours_ms > threshold_ms);
     }
 }
