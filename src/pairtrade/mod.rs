@@ -29,6 +29,7 @@ mod pair_eval;
 mod pnl_log;
 mod regime;
 mod risk_io;
+mod s3_mirror;
 mod sizing;
 mod state;
 mod stats;

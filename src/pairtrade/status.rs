@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
@@ -16,9 +17,20 @@ use serde::{Deserialize, Serialize};
 
 use super::config::PairTradeConfig;
 use super::pnl_log::sanitize_pnl_tag;
+use super::s3_mirror::S3Mirror;
 use crate::error_counter::{self, ErrorSummary};
 
 use std::env;
+
+/// Process-wide capture of bot start time. Lazily initialized on the
+/// first `StatusReporter::from_env` call (= during engine boot) and
+/// shared across all per-instance reporters so every status object
+/// reports the same value. See bot-strategy#343.
+static PROCESS_STARTED_AT: OnceLock<i64> = OnceLock::new();
+
+fn process_started_at() -> i64 {
+    *PROCESS_STARTED_AT.get_or_init(|| Utc::now().timestamp())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct EquityBaseline {
@@ -76,6 +88,14 @@ pub(super) struct StatusReporter {
     /// Append-only — bot startup re-loads the tail into `risk_history`
     /// so a restart preserves recent context.
     pub(super) risk_history_path: PathBuf,
+    /// Epoch seconds at which `from_env` constructed this reporter
+    /// (= process startup). Surfaced as `process_started_at` in the
+    /// snapshot so the dashboard can show service-uptime without an
+    /// SSM `systemctl ActiveEnterTimestamp` round-trip (#343).
+    pub(super) process_started_at: i64,
+    /// Optional S3 mirror; populated when STATUS_S3_BUCKET /
+    /// STATUS_S3_KEY_PREFIX are set (#343). None → local-only writes.
+    pub(super) s3_mirror: Option<Arc<S3Mirror>>,
 }
 
 /// Halt-history entry emitted in `status.json` and persisted to
@@ -185,6 +205,11 @@ pub(super) struct StatusPosition {
 pub(super) struct StatusSnapshot {
     pub(super) ts: i64,
     pub(super) updated_at: String,
+    /// Epoch seconds at which the bot process booted. Replaces the
+    /// dashboard's `systemctl ActiveEnterTimestamp` SSM probe — see
+    /// bot-strategy#343. Captured once at `StatusReporter` construction
+    /// (process startup).
+    pub(super) process_started_at: i64,
     pub(super) id: Option<String>,
     pub(super) agent: Option<String>,
     pub(super) dex: String,
@@ -390,6 +415,8 @@ impl StatusReporter {
             equity_history_path,
             last_equity_history_ts: None,
             last_snapshot: None,
+            process_started_at: process_started_at(),
+            s3_mirror: S3Mirror::from_env(),
             trade_stats: Some(PairTradeStats {
                 trades: 0,
                 wins: 0,
@@ -625,6 +652,7 @@ impl StatusReporter {
         let snapshot = StatusSnapshot {
             ts: Utc::now().timestamp(),
             updated_at: Utc::now().to_rfc3339(),
+            process_started_at: self.process_started_at,
             id: self.id.clone(),
             agent: self.agent.clone(),
             dex: self.dex.clone(),
@@ -653,8 +681,16 @@ impl StatusReporter {
             fs::create_dir_all(parent)?;
         }
         let tmp_path = self.path.with_extension("json.tmp");
-        fs::write(&tmp_path, payload)?;
+        fs::write(&tmp_path, &payload)?;
         fs::rename(tmp_path, &self.path)?;
+        // Mirror to S3 when configured (#343). Fire-and-forget — failures
+        // are logged but never block the local write. Skipped silently
+        // when the reporter has no `id` because the S3 key shape (one
+        // object per per-instance status) requires a stable identifier.
+        if let (Some(mirror), Some(id)) = (&self.s3_mirror, self.id.as_deref()) {
+            let file_name = format!("{id}.json");
+            mirror.put_async(&file_name, payload.into_bytes());
+        }
         Ok(())
     }
 
