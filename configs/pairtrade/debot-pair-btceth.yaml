@@ -40,7 +40,14 @@ entry_z_score_max: 2.0
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
 force_close_time_secs: 3600
-shutdown_grace_secs: 7260  # max(force_close_time_secs across strategies) + 60s buffer. Strategies A and C override to 7200 (see `strategies` below), so grace must cover 7200 + 60. See bot-strategy#50.
+shutdown_grace_secs: 10860  # max(force_close_time_secs across strategies) + 60s buffer. Round 4 (#278): B overrides to 10800 (FC%-attack from #70 Phase A 5d signal); A and C stay at 7200. Grace must cover 10800 + 60. See bot-strategy#50.
+
+# Post-stop cool-down (#316). 600 s blocks immediate re-entry after a
+# stop_loss_z exit on the same direction — Round 4 BT sweep on 5/3-5/8
+# byte-exact (#278): Calmar 1.330 vs 0/1800/3600/7200 baselines
+# (1.109/1.104/1.055/0.760), MaxDD -25%, PnL -9.4%. Catches the 6-min
+# re-entry pathology observed on 2026-05-04 regime shift.
+stop_loss_cooldown_secs: 600
 
 # Risk
 risk_pct_per_trade: 0.40
@@ -51,7 +58,7 @@ risk_pct_per_trade: 0.40
 # strategy that omits the per-instance field — each Frankfurt instance overrides
 # it below.
 equity_usd_reference: 1000
-max_leverage: 5
+max_leverage: 10  # Round 4 (#278) bumped from 5. bps-based risk gates are leverage-invariant.
 max_loss_r_mult: 1.0    # Bot C champion value (was 3.0). Swapped 2026-04-07.
 
 # Execution
@@ -107,10 +114,11 @@ risk:
   daily_reset_utc_hour: 0
   # Phase 3-1: rolling-peak session DD. Sticky halt + auto-flatten of the
   # breaching instance, cleared only by `sudo touch /opt/debot/RISK_ACK`.
-  # Disabled (0) for the live A/B/C round 3 evaluation window — flip to
-  # ~100 (~1% market move; ~5% equity DD at max_leverage=5) after 5/17
-  # review per #228.
-  max_session_loss_bps: 0
+  # Round 4 (#278): activated at 50 bps. Effective threshold = 50 × max_leverage(10)
+  # = 500 bps DD = 5% equity. Catches the 5/4 cluster (B 448 bps obs at 5x → 896 bps
+  # proj at 10x; C 271 → 542 bps proj) while leaving A's normal vol (49 → 98 bps) at 5x
+  # headroom. Strawman 100 (= 1000 bps gate) was too loose — would miss B's 5/4.
+  max_session_loss_bps: 50
   session_dd_lookback_secs: 2592000  # 30 d
   session_dd_sample_secs: 3600       # 1 h
   # Phase 3-4: per-leg notional cap, expressed as a multiplier of
@@ -118,9 +126,9 @@ risk:
   # intended leverage, 1.1 = 10% slack for slippage/rounding while still
   # rejecting bug-driven oversizing. The multiplicative form lets the same
   # value work across A/B/C with different equity and across hosts
-  # (Frankfurt $1k×5x → $5k cap, Tokyo Lighter $150×5x → $750 cap at
-  # headroom=1.0). Disabled until Round 4 enablement.
-  max_notional_headroom: 0
+  # (Frankfurt $1k×10x → $10k cap, Tokyo Lighter $150×5x → $750 cap at
+  # headroom=1.0). Round 4 (#278) flipped from 0 → 1.0.
+  max_notional_headroom: 1.0
 
 # Multi-strategy A/B/C variants for the single-process architecture
 # (shigeo-nakamura/bot-strategy#25). The single `debot-pair-btceth`
@@ -145,19 +153,31 @@ strategies:
     force_close_time_secs: 7200
   - id: b
     agent_name: debot-pair-btceth-b
-    exit_z_score: 0.3
-    stop_loss_z_score: 6.0
-    max_loss_r_mult: 3.0
+    # Round 4 (#278): B becomes A clone + force_close_time_secs=10800 (FC%-attack).
+    # Round 3 B config (no MTF, fc=3600, ez=0.3, sl=6, mlr=3) was a structural
+    # loser (-$8.35 over 13d, Calmar -0.64). 5d byte-exact BT showed fc=10800
+    # gives Calmar 1.75x baseline (4.36 vs 2.49) and FC% 32% → 18%.
+    exit_z_score: 0.2
+    stop_loss_z_score: 4.0
+    max_loss_r_mult: 1.0
     equity_usd_reference: 1000
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 10800
   - id: c
     agent_name: debot-pair-btceth-c
-    exit_z_score: 0.3
-    stop_loss_z_score: 6.0
-    max_loss_r_mult: 3.0
+    # Round 4 (#278): C becomes A clone + entry_z_score_base=2.5 (selectivity
+    # hypothesis #41 backlog). Round 3 C with ez=2.0 produced Calmar 1.17 (vs
+    # A's 2.90) — failed to validate. Hill-climb to 2.5 per #41 "if 2.0 doesn't
+    # beat baseline, try 2.5". sl/ez/mlr aligned with A so the eval signal is
+    # purely on entry_z effect.
+    exit_z_score: 0.2
+    stop_loss_z_score: 4.0
+    max_loss_r_mult: 1.0
     equity_usd_reference: 1000
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 7200
-    entry_z_score_base: 2.0
-    entry_z_score_min: 1.5
-    entry_z_score_max: 2.5
+    entry_z_score_base: 2.5
+    entry_z_score_min: 2.0
+    entry_z_score_max: 3.0
