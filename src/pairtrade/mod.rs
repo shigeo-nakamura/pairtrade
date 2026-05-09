@@ -1356,12 +1356,21 @@ impl PairTradeEngine {
             // bot-strategy#346: drop corrupt orderbook frames before they
             // poison the bar builder / regression history. The data dump
             // above already recorded the raw frame for diagnostics.
+            //
+            // Logged at INFO (not WARN) because trips are designed-
+            // informational — the filter is *protecting* against bad ticks,
+            // not raising an actionable alarm. WARN-level was polluting the
+            // dashboard's `warn_count_30m` (200-500/30min on Frankfurt due
+            // to Lighter's hourly funding-cycle orderbook noise) and
+            // burying genuinely-actionable WARNs. error-watch's TICK_FILTER
+            // skip pattern (bot-strategy#356) becomes redundant after this
+            // but is left in place as a safety net.
             if let Err(reason) = tick_sanity_check(
                 snapshot,
                 MAX_TICK_SPREAD_BPS,
                 MAX_TICK_PRICE_ENVELOPE_BPS,
             ) {
-                log::warn!(
+                log::info!(
                     "[TICK_FILTER] rejected {} reason={} price={} bid={:?} ask={:?} bid_size={} ask_size={}",
                     symbol,
                     reason.as_str(),
