@@ -73,6 +73,33 @@ pub(super) fn entry_z_for_pair(
     z.clamp(pp.entry_z_min, pp.entry_z_max)
 }
 
+/// Asymmetric entry-threshold scaling for the short side (bot-strategy#358).
+///
+/// The BTC/ETH log-spread is left-skewed, so a direction-symmetric |z| gate
+/// samples short entries from the noisier middle of the distribution while
+/// long entries come from the deeper tail. Multiplying the short-side
+/// threshold pushes both sides to a comparable tail percentile.
+///
+/// Semantics:
+/// - `entry_z_short_multiplier <= 0.0` → disabled (no scaling). Matches the
+///   auto-derived `f64` default of 0.0 used in test constructors with
+///   `..PairParams::default()` — without this gate, those constructors would
+///   silently zero out the short-side threshold and let any |z| through.
+/// - `entry_z_short_multiplier == 1.0` → no-op (production default).
+/// - `entry_z_short_multiplier > 1.0` → harder threshold for short entries.
+/// - Very large values (e.g. 9999.0) effectively disable shorts entirely.
+pub(super) fn apply_short_multiplier(
+    threshold: f64,
+    pp: &PairParams,
+    direction: PositionDirection,
+) -> f64 {
+    if direction == PositionDirection::ShortSpread && pp.entry_z_short_multiplier > 0.0 {
+        threshold * pp.entry_z_short_multiplier
+    } else {
+        threshold
+    }
+}
+
 /// Per-direction post-stop_loss_z cool-down (bot-strategy#316). Returns
 /// `false` (blocks entry) when `stop_loss_cooldown_secs` is set, the most
 /// recent exit was a `stop_loss_z`, the proposed direction matches that
@@ -199,6 +226,9 @@ pub(super) fn should_enter(
     if pp.beta_gap_entry_z_scale > 0.0 {
         entry_threshold *= 1.0 + pp.beta_gap_entry_z_scale * state.beta_gap;
     }
+
+    // --- Asymmetric entry threshold (bot-strategy#358) ---
+    entry_threshold = apply_short_multiplier(entry_threshold, pp, proposed_direction);
 
     // Avoid entering when the current z already triggers stop-loss exit.
     if z.abs() >= pp.stop_loss_z {
@@ -371,6 +401,88 @@ mod tests {
         assert!(post_stop_cooldown_allows(
             &pp, &s, 1_000_000, PositionDirection::LongSpread
         ));
+    }
+
+    // ---- bot-strategy#358: asymmetric entry_z (short multiplier) ----
+
+    fn short_mult_params(entry_z_short_multiplier: f64) -> PairParams {
+        let mut p = PairParams::default();
+        p.entry_z_short_multiplier = entry_z_short_multiplier;
+        p
+    }
+
+    #[test]
+    fn short_multiplier_no_op_at_one() {
+        // 1.0 = production default = symmetric.
+        let pp = short_mult_params(1.0);
+        assert_eq!(
+            apply_short_multiplier(2.0, &pp, PositionDirection::ShortSpread),
+            2.0,
+        );
+        assert_eq!(
+            apply_short_multiplier(2.0, &pp, PositionDirection::LongSpread),
+            2.0,
+        );
+    }
+
+    #[test]
+    fn short_multiplier_scales_short_only() {
+        // 2.0 → short threshold doubles, long threshold untouched.
+        let pp = short_mult_params(2.0);
+        assert_eq!(
+            apply_short_multiplier(1.5, &pp, PositionDirection::ShortSpread),
+            3.0,
+        );
+        assert_eq!(
+            apply_short_multiplier(1.5, &pp, PositionDirection::LongSpread),
+            1.5,
+        );
+    }
+
+    #[test]
+    fn short_multiplier_disabled_when_nonpositive() {
+        // 0.0 (auto-derived `f64` default) and any negative value are treated as
+        // disabled rather than zeroing the threshold — guards `..PairParams::default()`
+        // test constructors from accidentally passing every short |z|.
+        for sentinel in [0.0_f64, -1.0_f64] {
+            let pp = short_mult_params(sentinel);
+            assert_eq!(
+                apply_short_multiplier(1.5, &pp, PositionDirection::ShortSpread),
+                1.5,
+                "multiplier {} should be treated as disabled",
+                sentinel
+            );
+        }
+    }
+
+    #[test]
+    fn short_multiplier_disables_shorts_at_huge_value() {
+        // Variant C in the issue's grid: entry_z_short_multiplier=9999.0
+        // produces a threshold no realistic |z| can clear → shorts disabled.
+        let pp = short_mult_params(9999.0);
+        let threshold = apply_short_multiplier(1.5, &pp, PositionDirection::ShortSpread);
+        assert!(threshold > 1000.0, "expected huge threshold, got {}", threshold);
+    }
+
+    #[test]
+    fn short_multiplier_emulates_should_enter_decision() {
+        // Issue acceptance: with entry_z_short_multiplier=2.0 and base
+        // threshold 1.5, |z|=2.0 enters long but NOT short; |z|=3.5 enters
+        // both. We assert the threshold-vs-|z| decision the same way
+        // should_enter does (line: `z.abs() < entry_threshold` early
+        // return).
+        let pp = short_mult_params(2.0);
+        let base = 1.5;
+
+        let long_thr = apply_short_multiplier(base, &pp, PositionDirection::LongSpread);
+        let short_thr = apply_short_multiplier(base, &pp, PositionDirection::ShortSpread);
+
+        // |z| = 2.0
+        assert!(2.0_f64 >= long_thr, "long: should enter at |z|=2.0");
+        assert!(2.0_f64 < short_thr, "short: should NOT enter at |z|=2.0");
+        // |z| = 3.5
+        assert!(3.5_f64 >= long_thr, "long: should enter at |z|=3.5");
+        assert!(3.5_f64 >= short_thr, "short: should enter at |z|=3.5");
     }
 
     #[test]

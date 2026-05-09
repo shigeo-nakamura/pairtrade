@@ -56,6 +56,15 @@ pub struct PairParams {
     pub entry_velocity_block_sigma_per_min: f64,
     pub funding_entry_z_scale: f64,
     pub beta_gap_entry_z_scale: f64,
+    /// Multiplicative scale applied to `entry_threshold` when the proposed
+    /// direction is `ShortSpread`. 1.0 keeps the current direction-symmetric
+    /// behavior; values > 1.0 require a deeper |z| for short entries (gates
+    /// short-side sampling at a comparable tail percentile to the long side
+    /// when the spread distribution is left-skewed). Use a very large value
+    /// (e.g. 9999.0) to disable shorts entirely. <= 0.0 is treated as
+    /// disabled / symmetric, matching the auto-derived `f64` default in
+    /// non-production constructors. bot-strategy#358.
+    pub entry_z_short_multiplier: f64,
     // Multi-timeframe z-score confluence (empty = disabled)
     pub mtf_windows: Vec<usize>,
     pub mtf_z_min: f64,
@@ -292,6 +301,7 @@ pub(super) struct PairTradeYaml {
     pub(super) entry_velocity_block_sigma_per_min: Option<f64>,
     pub(super) funding_entry_z_scale: Option<f64>,
     pub(super) beta_gap_entry_z_scale: Option<f64>,
+    pub(super) entry_z_short_multiplier: Option<f64>,
     pub(super) mtf_windows: Option<Vec<usize>>,
     pub(super) mtf_z_min: Option<f64>,
     pub(super) std_collapse_window_bars: Option<usize>,
@@ -1292,6 +1302,10 @@ impl PairTradeConfig {
         env_override("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", &mut self.default_pair_params.entry_velocity_block_sigma_per_min);
         env_override("FUNDING_ENTRY_Z_SCALE", &mut self.default_pair_params.funding_entry_z_scale);
         env_override("BETA_GAP_ENTRY_Z_SCALE", &mut self.default_pair_params.beta_gap_entry_z_scale);
+        env_override(
+            "ENTRY_Z_SHORT_MULTIPLIER",
+            &mut self.default_pair_params.entry_z_short_multiplier,
+        );
         if let Ok(value) = env::var("MTF_WINDOWS") {
             self.default_pair_params.mtf_windows = value
                 .split(',')
@@ -1536,6 +1550,7 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         entry_velocity_block_sigma_per_min: env_parse("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", 0.0),
         funding_entry_z_scale: env_parse("FUNDING_ENTRY_Z_SCALE", 0.0),
         beta_gap_entry_z_scale: env_parse("BETA_GAP_ENTRY_Z_SCALE", 0.0),
+        entry_z_short_multiplier: env_parse("ENTRY_Z_SHORT_MULTIPLIER", 1.0),
         mtf_windows: env::var("MTF_WINDOWS")
             .ok()
             .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
@@ -1711,6 +1726,7 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
             .unwrap_or(0.0),
         funding_entry_z_scale: yaml.funding_entry_z_scale.unwrap_or(0.0),
         beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
+        entry_z_short_multiplier: yaml.entry_z_short_multiplier.unwrap_or(1.0),
         mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),
         mtf_z_min: yaml.mtf_z_min.unwrap_or(DEFAULT_MTF_Z_MIN),
         std_collapse_window_bars: yaml
@@ -1803,6 +1819,7 @@ fn apply_pair_overrides(
             entry_velocity_block_sigma_per_min: default.entry_velocity_block_sigma_per_min,
             funding_entry_z_scale: default.funding_entry_z_scale,
             beta_gap_entry_z_scale: default.beta_gap_entry_z_scale,
+            entry_z_short_multiplier: default.entry_z_short_multiplier,
             mtf_windows: default.mtf_windows.clone(),
             mtf_z_min: default.mtf_z_min,
             std_collapse_window_bars: default.std_collapse_window_bars,
