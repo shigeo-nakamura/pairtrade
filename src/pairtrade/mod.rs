@@ -6813,18 +6813,42 @@ mod shutdown_grace_tests {
     fn live_btceth_configs_pin_grace_above_force_close() {
         // The -b / -c YAMLs were folded into the single multi-strategy
         // debot-pair-btceth.yaml in commit 7 of #25; only the consolidated
-        // file is checked here. Expected grace values are pinned per-file:
-        // btceth's strategy A has a 7200s force_close override, so the grace
-        // must cover it (see bot-strategy#50).
-        let expected: &[(&str, u64)] = &[("debot-pair-btceth.yaml", 7260)];
-        for (name, expected_grace) in expected {
+        // file is checked here.
+        //
+        // Asserts the bot-strategy#50 invariant directly:
+        //   shutdown_grace_secs >= max(force_close_time_secs across resolved
+        //                              default + per-pair + per-strategy)
+        //                          + 60s buffer
+        // (Or shutdown_grace_secs == 0, the legacy immediate-close mode that
+        // validate() also accepts.)
+        //
+        // The same check runs inside PairTradeConfig::validate() during
+        // from_yaml_path, so a YAML drift will already block load. Asserting
+        // here serves as documentation and a defense against accidental
+        // validate() bypass. Pinning the literal expected value (e.g. 7260,
+        // 10860) was the prior implementation but coupled the test to YAML
+        // edits — every per-strategy fc bump (#278 Round 4 fc=10800 was the
+        // first to hit this) needed a matching test edit. The invariant
+        // form survives any YAML change that respects the rule.
+        const BUFFER_SECS: u64 = 60;
+        let configs = &["debot-pair-btceth.yaml"];
+        for name in configs {
             let path = config_path(name);
             let cfg = PairTradeConfig::from_yaml_path(&path)
                 .unwrap_or_else(|e| panic!("failed to load {path}: {e}"));
-            assert_eq!(
-                cfg.shutdown_grace_secs, *expected_grace,
-                "{name}: expected shutdown_grace_secs={}, got {}",
-                expected_grace, cfg.shutdown_grace_secs
+            if cfg.shutdown_grace_secs == 0 {
+                continue;
+            }
+            let max_fc = std::iter::once(cfg.default_pair_params.force_close_secs)
+                .chain(cfg.pair_params.values().map(|p| p.force_close_secs))
+                .chain(cfg.strategies.iter().filter_map(|s| s.force_close_time_secs))
+                .max()
+                .expect("at least default_pair_params.force_close_secs");
+            let required = max_fc + BUFFER_SECS;
+            assert!(
+                cfg.shutdown_grace_secs >= required,
+                "{name}: shutdown_grace_secs={} must be >= max(force_close_time_secs)={} + {}s buffer = {}",
+                cfg.shutdown_grace_secs, max_fc, BUFFER_SECS, required
             );
         }
     }
