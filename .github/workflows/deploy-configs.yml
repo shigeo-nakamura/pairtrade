@@ -59,6 +59,12 @@ jobs:
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
         run: |
+          # Env files are intentionally NOT in the repo (per-variant *.env
+          # carry Lighter wallet KMS keys; debot.env is currently secret-free
+          # but the policy is "no env files in git" to keep operator review
+          # mandatory before any secret enters the repo). Excluding them from
+          # the upload prevents an empty/stale dist tree from racing the
+          # host-managed copies. See bot-strategy#357.
           aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot/scripts/" \
             --exact-timestamps \
             --exclude "venv/*" \
@@ -66,7 +72,8 @@ jobs:
             --exclude "__pycache__/*" \
             --exclude "__pycache__/**" \
             --exclude "*.log" \
-            --exclude "*.pyc"
+            --exclude "*.pyc" \
+            --exclude "*.env"
           aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/" --exact-timestamps
           aws s3 cp debot/deploy/debot-pair-btceth.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth.service"
           aws s3 cp debot/deploy/pair-data-collector.service "s3://${S3_BUCKET}/deploy/pair-data-collector.service"
@@ -80,7 +87,7 @@ jobs:
           {
             "commands": [
               "sudo mkdir -p __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
-              "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exact-timestamps",
+              "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exact-timestamps --exclude '*.env'",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs --exact-timestamps",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
               "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot-pair-btceth pair-data-collector; do aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'"
