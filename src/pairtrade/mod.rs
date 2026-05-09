@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use dex_connector::{DexConnector, DexError, PositionSnapshot};
+use dex_connector::{DexConnector, DexError, PositionSnapshot, PriceUpdate};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -201,6 +201,15 @@ pub struct PairTradeEngine {
     ///   - existing exit logic (exit_z / stop_loss_z / force_close_secs) runs normally
     ///   - live loop exits as soon as open_positions is empty, or after shutdown_grace_secs
     shutdown_pending: bool,
+    /// Recent bar-emit timestamps per symbol, for the [BAR_RATE] canary
+    /// (bot-strategy#341). Trimmed to the trailing 120 s; the canary warns
+    /// if sustained < 0.8 emits/min, which would have caught the original
+    /// Phase 2 β-freeze in <30 min instead of 78 h.
+    bar_emit_log: HashMap<String, VecDeque<Instant>>,
+    /// Last time a [BAR_RATE] WARN fired per symbol, used to rate-limit
+    /// the warning to ~once per minute so a sustained low rate doesn't
+    /// flood the journal.
+    last_bar_rate_warn: HashMap<String, Instant>,
 }
 
 struct PlannedAction {
@@ -426,6 +435,8 @@ impl PairTradeEngine {
             data_dump_writer,
             funding_history: funding_history::FundingHistory::new(),
             shutdown_pending: false,
+            bar_emit_log: HashMap::new(),
+            last_bar_rate_warn: HashMap::new(),
         })
     }
 
@@ -631,6 +642,39 @@ impl PairTradeEngine {
             if self.cfg.force_close_on_startup {
                 self.force_close_on_startup().await?;
             }
+            // Subscribe to the connector's real-time price-update broadcast
+            // (bot-strategy#341 Phase 2 v2). On Lighter the connector emits
+            // one PriceUpdate per orderbook change; the WS arm in the main
+            // tokio::select drains them and feeds `update_close_only` so
+            // bots subscribed to the same feed converge on the same close.
+            // The polling arm in step_shared retains exclusive bucket-emit
+            // authority. Connectors without a push channel (Extended /
+            // Hyperliquid today) return Err here and ws_price_rx stays
+            // None, leaving step_shared as the sole bar driver.
+            let primary_connector = if !self.instances.is_empty() {
+                self.instances[0].connector.clone()
+            } else {
+                self.connector.clone()
+            };
+            let mut ws_price_rx: Option<
+                tokio::sync::broadcast::Receiver<PriceUpdate>,
+            > = match primary_connector.subscribe_price_updates() {
+                Ok(rx) => {
+                    log::info!(
+                        "[WS_BARS] subscribed to connector price-update broadcast; \
+                         bar closes will be refined by WS ticks (polling still emits)"
+                    );
+                    Some(rx)
+                }
+                Err(e) => {
+                    log::info!(
+                        "[WS_BARS] connector does not publish price updates ({}); \
+                         polling arm is the sole bar driver",
+                        e
+                    );
+                    None
+                }
+            };
             // Wall-clock aligned ticker: fires at floor(now/interval)*interval + interval boundaries
             // so every bot process observing the same stream ticks at identical wall-clock seconds.
             // This is required on top of the BarBuilder bucket alignment (pairtrade#4): without
@@ -683,6 +727,42 @@ impl PairTradeEngine {
                 }
 
                 tokio::select! {
+                    // WS price-update arm (bot-strategy#341 Phase 2 v2).
+                    // Refines BarBuilder close fields via update_close_only;
+                    // does NOT emit. Inline async block releases the borrow
+                    // on ws_price_rx each iteration. When the connector
+                    // doesn't publish price updates, the inner pending()
+                    // never resolves and this arm is effectively disabled.
+                    recv_result = async {
+                        match ws_price_rx.as_mut() {
+                            Some(rx) => Some(rx.recv().await),
+                            None => {
+                                std::future::pending::<()>().await;
+                                None
+                            }
+                        }
+                    } => {
+                        match recv_result {
+                            Some(Ok(update)) => {
+                                self.ingest_price_update(update);
+                            }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                                log::warn!(
+                                    "[WS_BARS] dropped {} ticks (slow consumer); \
+                                     bucket close may briefly fall back to a polled snapshot",
+                                    n
+                                );
+                            }
+                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                                log::error!(
+                                    "[WS_BARS] connector broadcast channel closed; \
+                                     polling arm continues to drive bars"
+                                );
+                                ws_price_rx = None;
+                            }
+                            None => {}
+                        }
+                    }
                     _ = tokio::time::sleep_until(next_tick) => {
                         next_tick = next_wall_clock_boundary(interval_secs);
                         // Monitor step() execution time. If it exceeds interval_secs,
@@ -1402,7 +1482,30 @@ impl PairTradeEngine {
                 let tick_ts = snapshot
                     .exchange_ts
                     .unwrap_or_else(|| now_ts.saturating_mul(1000));
-                if let Some((close_price, close_ts)) = builder.push(tick_ts, snapshot.price) {
+                let mut emits: Vec<(Decimal, i64)> = Vec::new();
+                if let Some(close) = builder.push(tick_ts, snapshot.price) {
+                    emits.push(close);
+                }
+                // Defensive backstop (bot-strategy#341): if the bucket has
+                // been open longer than 1.5 × window without an emit (e.g.,
+                // both WS and polling went quiet), force-close so the bar
+                // stream doesn't stall. Live-only — backtest replays must
+                // reproduce live-at-the-time behavior byte-exactly, and a
+                // synthetic bar in BT would not match a pre-v2 production
+                // run.
+                if !self.cfg.backtest_mode {
+                    let now_ms = now_ts.saturating_mul(1000);
+                    if let Some(close) = builder.force_close_if_stale(now_ms) {
+                        log::warn!(
+                            "[BAR_FORCE_CLOSE] {} synthetic close at ts={} \
+                             (no tick advanced bucket within 1.5 × window)",
+                            symbol,
+                            close.1
+                        );
+                        emits.push(close);
+                    }
+                }
+                for (close_price, close_ts) in emits {
                     let entry = self
                         .history
                         .entry(symbol.clone())
@@ -1421,14 +1524,105 @@ impl PairTradeEngine {
                         });
                     }
                     updated.insert(symbol.clone());
+                    if !self.cfg.backtest_mode {
+                        self.bar_emit_log
+                            .entry(symbol.clone())
+                            .or_insert_with(VecDeque::new)
+                            .push_back(Instant::now());
+                    }
                 }
             } else {
                 log::debug!("no bar builder for {}", symbol);
             }
         }
+        if !self.cfg.backtest_mode {
+            self.check_bar_rate_canary();
+        }
         self.persist_history_to_disk();
 
         Ok(Some((price_map, updated)))
+    }
+
+    /// Feed a single WebSocket price tick into the BarBuilder for `symbol`,
+    /// refining the in-progress bucket close via `update_close_only`. The
+    /// polling arm in `step_shared` retains exclusive bucket-emit authority
+    /// — this fn never appends to `self.history` and never advances the
+    /// builder past the current bucket.
+    ///
+    /// Phase 2 v2 (bot-strategy#341): keeping bucket-emit single-sourced
+    /// avoids the original Phase 2 class of bugs where the WS arm could
+    /// silently fail to emit across a bucket boundary while the polling
+    /// arm was disabled, freezing β for hours.
+    fn ingest_price_update(&mut self, update: PriceUpdate) {
+        let Some(builder) = self.bar_builders.get_mut(&update.symbol) else {
+            log::debug!("[WS_BARS] no bar builder for {}", update.symbol);
+            return;
+        };
+        builder.update_close_only(update.timestamp as i64, update.mid_price);
+    }
+
+    /// Sustained bar-emit-rate canary (bot-strategy#341). Walks
+    /// `bar_emit_log`, drops entries older than 120 s, and warns if any
+    /// tracked symbol is below 0.8 emits/min over the trailing window.
+    /// Rate-limited to one WARN per symbol per 60 s. Designed to surface
+    /// the original Phase 2 β-freeze symptom (≤1 bar / 4 min for 78 h)
+    /// inside half an hour rather than days.
+    fn check_bar_rate_canary(&mut self) {
+        let now = Instant::now();
+        let window = Duration::from_secs(120);
+        let warn_cooldown = Duration::from_secs(60);
+        // Avoid noisy warnings while bars are warming up: require at least
+        // 90 s of observation before declaring a sustained low rate.
+        let min_observation = Duration::from_secs(90);
+
+        // Bar period in seconds drives the "expected" rate. With
+        // trading_period_secs = 60, expected = 1 bar/min, threshold = 0.8.
+        let period_secs = self.cfg.trading_period_secs.max(1);
+        let expected_per_min = 60.0 / period_secs as f64;
+        let threshold_per_min = (expected_per_min * 0.8).max(0.05);
+
+        let symbols: Vec<String> = self.bar_emit_log.keys().cloned().collect();
+        for symbol in symbols {
+            let log = self.bar_emit_log.get_mut(&symbol).expect("just enumerated");
+            while let Some(front) = log.front() {
+                if now.duration_since(*front) > window {
+                    log.pop_front();
+                } else {
+                    break;
+                }
+            }
+            let count = log.len();
+            let oldest = log.front().copied();
+            let observed_for = oldest
+                .map(|t| now.duration_since(t))
+                .unwrap_or_default();
+            if observed_for < min_observation {
+                continue;
+            }
+            let rate_per_min =
+                count as f64 / (observed_for.as_secs_f64() / 60.0).max(1e-9);
+            if rate_per_min >= threshold_per_min {
+                continue;
+            }
+            let last_warn = self.last_bar_rate_warn.get(&symbol).copied();
+            if last_warn
+                .map(|t| now.duration_since(t) < warn_cooldown)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            log::warn!(
+                "[BAR_RATE] {} rate={:.2}/min over {:.0}s (n={}, threshold={:.2}/min, \
+                 expected={:.2}/min) — bar emission stalled, investigate WS/polling",
+                symbol,
+                rate_per_min,
+                observed_for.as_secs_f64(),
+                count,
+                threshold_per_min,
+                expected_per_min,
+            );
+            self.last_bar_rate_warn.insert(symbol, now);
+        }
     }
 
     async fn step_for_instance(
@@ -6046,6 +6240,8 @@ impl PairTradeEngine {
             replay_connector: None,
             funding_history: funding_history::FundingHistory::new(),
             shutdown_pending: false,
+            bar_emit_log: HashMap::new(),
+            last_bar_rate_warn: HashMap::new(),
         }
     }
 }

@@ -285,10 +285,13 @@ pub(super) fn load_history_from_disk(
     // Stale-history guard (pairtrade#4): if the newest sample for a symbol
     // is older than a few bars, the persisted file is from a stopped bot
     // and replaying it would freeze a stale rolling window. Drop it and
-    // let the live feed warm up from scratch.
+    // let the live feed warm up from scratch. bot-strategy#341 widened the
+    // window from 5×period to max(5min, 30×period) so a routine restart
+    // (CI deploy + manual stop typically takes 5-15min) admits the warm
+    // start; only genuinely hours-old files fall through.
     let stale_threshold_ms = (cfg.trading_period_secs as i64)
-        .saturating_mul(5)
-        .max(60)
+        .saturating_mul(30)
+        .max(300)
         .saturating_mul(1000);
     let mut any_stale = false;
     for (sym, entries) in prices {
