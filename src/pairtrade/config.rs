@@ -47,6 +47,11 @@ pub struct PairParams {
     pub circuit_breaker_tier2_losses: u32,
     pub circuit_breaker_tier2_cooldown_secs: u64,
     pub entry_post_only_timeout_secs: u64,
+    /// Per-leg fill timeout for exit post-only orders (seconds). 0 disables
+    /// the monitor (legacy behavior: post-only legs rest until filled). On
+    /// venues with `fee_bps == 0` this knob has no effect because exits do
+    /// not enter the post-only path. See bot-strategy#306.
+    pub exit_post_only_timeout_secs: u64,
     // Phase 2 filters (0.0 = disabled)
     pub entry_velocity_block_sigma_per_min: f64,
     pub funding_entry_z_scale: f64,
@@ -282,6 +287,7 @@ pub(super) struct PairTradeYaml {
     pub(super) circuit_breaker_tier2_losses: Option<u32>,
     pub(super) circuit_breaker_tier2_cooldown_secs: Option<u64>,
     pub(super) entry_post_only_timeout_secs: Option<u64>,
+    pub(super) exit_post_only_timeout_secs: Option<u64>,
     // Phase 2 filters (default off: 0.0 disables)
     pub(super) entry_velocity_block_sigma_per_min: Option<f64>,
     pub(super) funding_entry_z_scale: Option<f64>,
@@ -418,6 +424,7 @@ pub(super) struct PairOverrideYaml {
     pub(super) circuit_breaker_tier2_losses: Option<u32>,
     pub(super) circuit_breaker_tier2_cooldown_secs: Option<u64>,
     pub(super) entry_post_only_timeout_secs: Option<u64>,
+    pub(super) exit_post_only_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1281,6 +1288,7 @@ impl PairTradeConfig {
         env_override("CIRCUIT_BREAKER_TIER2_LOSSES", &mut self.default_pair_params.circuit_breaker_tier2_losses);
         env_override("CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS", &mut self.default_pair_params.circuit_breaker_tier2_cooldown_secs);
         env_override("ENTRY_POST_ONLY_TIMEOUT_SECS", &mut self.default_pair_params.entry_post_only_timeout_secs);
+        env_override("EXIT_POST_ONLY_TIMEOUT_SECS", &mut self.default_pair_params.exit_post_only_timeout_secs);
         env_override("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", &mut self.default_pair_params.entry_velocity_block_sigma_per_min);
         env_override("FUNDING_ENTRY_Z_SCALE", &mut self.default_pair_params.funding_entry_z_scale);
         env_override("BETA_GAP_ENTRY_Z_SCALE", &mut self.default_pair_params.beta_gap_entry_z_scale);
@@ -1521,6 +1529,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
             "ENTRY_POST_ONLY_TIMEOUT_SECS",
             DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS,
         ),
+        exit_post_only_timeout_secs: env_parse(
+            "EXIT_POST_ONLY_TIMEOUT_SECS",
+            DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS,
+        ),
         entry_velocity_block_sigma_per_min: env_parse("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", 0.0),
         funding_entry_z_scale: env_parse("FUNDING_ENTRY_Z_SCALE", 0.0),
         beta_gap_entry_z_scale: env_parse("BETA_GAP_ENTRY_Z_SCALE", 0.0),
@@ -1691,6 +1703,9 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         entry_post_only_timeout_secs: yaml
             .entry_post_only_timeout_secs
             .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
+        exit_post_only_timeout_secs: yaml
+            .exit_post_only_timeout_secs
+            .unwrap_or(DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS),
         entry_velocity_block_sigma_per_min: yaml
             .entry_velocity_block_sigma_per_min
             .unwrap_or(0.0),
@@ -1782,6 +1797,9 @@ fn apply_pair_overrides(
             entry_post_only_timeout_secs: ovr
                 .entry_post_only_timeout_secs
                 .unwrap_or(default.entry_post_only_timeout_secs),
+            exit_post_only_timeout_secs: ovr
+                .exit_post_only_timeout_secs
+                .unwrap_or(default.exit_post_only_timeout_secs),
             entry_velocity_block_sigma_per_min: default.entry_velocity_block_sigma_per_min,
             funding_entry_z_scale: default.funding_entry_z_scale,
             beta_gap_entry_z_scale: default.beta_gap_entry_z_scale,
