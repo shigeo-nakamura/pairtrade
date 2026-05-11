@@ -39,6 +39,12 @@ pub(super) struct SymbolSnapshot {
     pub(super) exchange_ts: Option<i64>,
 }
 
+/// Net per-hour funding the strategy will *receive* (positive) or *pay*
+/// (negative) on the planned pair position. Lighter settles funding every
+/// hour (verified bot-strategy#352 / #363: WS `market_stats.funding_rate`
+/// updates on every 1h boundary, magnitude matches the per-hour realized
+/// rate exposed by `/api/v1/fundings?resolution=1h`). The input is already
+/// per-hour, so no unit conversion is applied here.
 pub(super) fn net_funding_for_direction(
     z: f64,
     p1: &SymbolSnapshot,
@@ -46,10 +52,10 @@ pub(super) fn net_funding_for_direction(
 ) -> f64 {
     if z > 0.0 {
         // plan to short base (p1) and long quote (p2)
-        (p2.funding_rate - p1.funding_rate).to_f64().unwrap_or(0.0) / 24.0
+        (p2.funding_rate - p1.funding_rate).to_f64().unwrap_or(0.0)
     } else {
         // plan to long base (p1) and short quote (p2)
-        (p1.funding_rate - p2.funding_rate).to_f64().unwrap_or(0.0) / 24.0
+        (p1.funding_rate - p2.funding_rate).to_f64().unwrap_or(0.0)
     }
 }
 
@@ -283,5 +289,35 @@ mod tests {
             tick_sanity_check(&s, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS),
             Err(TickRejectReason::MissingBid)
         );
+    }
+
+    fn snap_with_funding(funding_rate: Decimal) -> SymbolSnapshot {
+        SymbolSnapshot {
+            price: dec!(0),
+            funding_rate,
+            bid_price: None,
+            ask_price: None,
+            bid_size: dec!(0),
+            ask_size: dec!(0),
+            min_order: None,
+            min_tick: None,
+            size_decimals: None,
+            exchange_ts: None,
+        }
+    }
+
+    #[test]
+    fn net_funding_passes_per_hour_through_unchanged() {
+        // Lighter delivers funding_rate as a per-hour realized rate
+        // (bot-strategy#352 / #363). Verify both direction branches return
+        // the raw delta without any unit conversion.
+        let p1 = snap_with_funding(dec!(0.0012)); // BTC pays 0.12%/h
+        let p2 = snap_with_funding(dec!(-0.0003)); // ETH pays -0.03%/h
+        // z > 0: short p1, long p2 → receive p1's funding, pay p2's → p2 - p1
+        let z_pos = net_funding_for_direction(1.0, &p1, &p2);
+        // z < 0: long p1, short p2 → pay p1's funding, receive p2's → p1 - p2
+        let z_neg = net_funding_for_direction(-1.0, &p1, &p2);
+        assert!((z_pos - (-0.0015)).abs() < 1e-12, "z_pos was {}", z_pos);
+        assert!((z_neg - 0.0015).abs() < 1e-12, "z_neg was {}", z_neg);
     }
 }
