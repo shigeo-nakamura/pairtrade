@@ -116,6 +116,14 @@ struct StrategyInstance {
     /// Per-instance live equity from the instance's connector.
     equity_cache: f64,
     last_equity_fetch: Option<Instant>,
+    /// False until the first successful `fetch_equity_rest` writes a
+    /// connector-sourced balance into `equity_cache`. Not persisted —
+    /// always starts false on engine boot. Gates session-DD evaluation
+    /// and equity sampling so a restart whose `equity_samples` deque
+    /// already holds a real peak does not trip a phantom halt against
+    /// the stale `equity_reference_usd` seed before the first WS
+    /// account dump propagates. See bot-strategy#366.
+    equity_initialized: bool,
     /// Per-strategy fixed equity reference from the YAML
     /// `equity_usd_reference`. Used as the base for risk thresholds
     /// (daily DD, exit risk_budget) AND position sizing so each
@@ -389,6 +397,7 @@ impl PairTradeEngine {
                 connector: instance_connector,
                 equity_cache: strategy.equity_reference_usd,
                 last_equity_fetch,
+                equity_initialized: false,
                 equity_reference_usd: strategy.equity_reference_usd,
                 states,
                 pnl_logger,
@@ -2748,6 +2757,13 @@ impl PairTradeEngine {
             return None;
         }
         let inst = &self.instances[inst_idx];
+        // bot-strategy#366: suppress the snapshot until the connector
+        // balance has landed, matching the gate inside
+        // `evaluate_session_dd`. Dashboards/error-watch would otherwise
+        // render a phantom 50% DD against the seeded `equity_cache`.
+        if !inst.equity_initialized {
+            return None;
+        }
         let current = inst.equity_cache;
         if current <= 0.0 || inst.equity_samples.is_empty() {
             return None;
@@ -2804,6 +2820,19 @@ impl PairTradeEngine {
                     let inst = &mut self.instances[inst_idx];
                     inst.equity_cache = eq.max(0.0);
                     inst.last_equity_fetch = Some(Instant::now());
+                    // bot-strategy#366: arm the session-DD gate only after a
+                    // connector-sourced balance has actually landed. Before
+                    // this point `equity_cache` is still the YAML
+                    // `equity_reference_usd` seed, which can race the
+                    // first WS account dump against the persisted
+                    // `equity_samples` peak and synthesise a 50% DD.
+                    if !inst.equity_initialized {
+                        log::info!(
+                            "[SESSION_DD] {} equity initialized: cache={:.2}",
+                            inst.id, inst.equity_cache
+                        );
+                        inst.equity_initialized = true;
+                    }
                     if let Some(reporter) = &mut inst.status_reporter {
                         reporter.update_equity(inst.equity_cache);
                     }
@@ -3858,6 +3887,14 @@ impl PairTradeEngine {
         let now_ts = self.current_now_ts();
         let cutoff = now_ts.saturating_sub(lookback);
         let inst = &mut self.instances[inst_idx];
+        // bot-strategy#366: do not pollute the rolling-peak deque with the
+        // `equity_reference_usd` seed before the first connector-sourced
+        // balance lands. Sampling a synthetic equity would skew later
+        // peak computations and defeat the gate added in
+        // `evaluate_session_dd`.
+        if !inst.equity_initialized {
+            return;
+        }
         let equity = inst.equity_cache;
         if equity <= 0.0 {
             return;
@@ -3938,6 +3975,13 @@ impl PairTradeEngine {
             // No need to re-flatten on every tick; one shot is enough,
             // and `close_all_positions` was already invoked on trip.
             return true;
+        }
+        // bot-strategy#366: refuse to trip until the connector has fed at
+        // least one real balance into `equity_cache`. Otherwise the seed
+        // `equity_reference_usd` races the persisted-peak `equity_samples`
+        // for the first 5–60s after restart and synthesises a 50% DD.
+        if !inst.equity_initialized {
+            return false;
         }
         let current = inst.equity_cache;
         if current <= 0.0 {
@@ -6239,6 +6283,7 @@ impl PairTradeEngine {
                 connector,
                 equity_cache: DEFAULT_EQUITY_USD,
                 last_equity_fetch: None,
+                equity_initialized: false,
                 equity_reference_usd: DEFAULT_EQUITY_USD,
                 states: HashMap::new(),
                 pnl_logger: None,
@@ -7292,6 +7337,100 @@ mod pending_tests {
 
         assert_eq!(connector.balance_calls.load(Ordering::SeqCst), 1);
         assert!((engine.instances[0].equity_cache - 777.0).abs() < 1e-6);
+    }
+
+    // bot-strategy#366: reproduce the restart race that synthesised a 50%
+    // DD on Frankfurt Round 4 Step 4 partial. Persisted `equity_samples`
+    // hold yesterday's intraday peak (~$1003) but `equity_cache` is the
+    // seed `equity_reference_usd` (~$500) until the first WS account
+    // dump propagates. Pre-fix, `evaluate_session_dd` would trip
+    // `session_halted=true` against the synthetic 5018 bps reading.
+    // Post-fix, the `equity_initialized` gate suppresses the gate and
+    // sampling until a connector-sourced balance lands.
+    #[tokio::test]
+    async fn session_dd_gated_until_equity_initialized() {
+        use tempfile::TempDir;
+
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        // Match the live config that produced the incident.
+        engine.cfg.risk.max_session_loss_bps = 500;
+        engine.cfg.max_leverage = 10.0;
+        // Redirect risk-state persistence to a temp dir so the test does
+        // not litter the working directory if a trip ever does fire.
+        let dir = TempDir::new().unwrap();
+        engine.risk_state_path = dir.path().join("risk_state.json");
+
+        // Simulate restart state: persisted samples carry a $1003 peak,
+        // `equity_cache` is still the $500 seed, and the connector has
+        // not yet pushed a balance update (`equity_initialized=false`).
+        // Sample ts is anchored close to "now" so the lookback prune
+        // inside `update_equity_sample` does not discard it.
+        let now_ts = engine.current_now_ts();
+        {
+            let inst = &mut engine.instances[0];
+            inst.equity_samples = vec![
+                risk_io::EquitySample { ts: now_ts - 60, equity: 1003.45 },
+            ];
+            inst.equity_cache = 500.0;
+            inst.equity_initialized = false;
+            inst.session_halted = false;
+        }
+
+        // Phase 1: pre-WS-dump tick. Without the gate, peak=1003.45 vs
+        // current=500 would compute dd_bps ≈ 5018 against an effective
+        // threshold of 5000 bps and trip the halt. The gate must
+        // suppress the evaluation entirely.
+        let halted = engine.evaluate_session_dd(0).await;
+        assert!(!halted, "session_dd must not trip while equity_initialized=false");
+        assert!(!engine.instances[0].session_halted);
+        assert!(engine.instances[0].session_halt_reason.is_none());
+
+        // Sampling must also be suppressed so the deque is not polluted
+        // with the seed equity, which would distort post-init peaks.
+        let pre_len = engine.instances[0].equity_samples.len();
+        engine.update_equity_sample(0);
+        assert_eq!(
+            engine.instances[0].equity_samples.len(),
+            pre_len,
+            "update_equity_sample must not append while equity_initialized=false"
+        );
+
+        // The status snapshot path is gated identically so dashboards
+        // do not render a phantom 50% DD card during the race window.
+        assert!(engine.session_risk_snapshot(0).is_none());
+
+        // Phase 2: WS dump lands. `equity_cache` is now the real wallet
+        // balance and the gate releases.
+        {
+            let inst = &mut engine.instances[0];
+            inst.equity_cache = 1000.84;
+            inst.equity_initialized = true;
+        }
+        let halted = engine.evaluate_session_dd(0).await;
+        assert!(!halted, "real equity ($1000.84 vs peak $1003.45) is well below threshold");
+        assert!(!engine.instances[0].session_halted);
+
+        // The snapshot now exposes the real, non-phantom DD reading,
+        // computed against the persisted peak. Check this before
+        // `update_equity_sample` runs so the hourly-bucket replacement
+        // in the sampler does not rewrite the persisted entry.
+        let snapshot = engine.session_risk_snapshot(0).expect("snapshot should exist post-init");
+        assert!((snapshot.current_equity - 1000.84).abs() < 1e-6);
+        assert!((snapshot.peak_equity - 1003.45).abs() < 1e-6);
+        assert!(snapshot.dd_bps < 100.0);
+
+        // Sampling now records the real value (possibly by replacing
+        // the persisted entry if it falls in the same bucket).
+        engine.update_equity_sample(0);
+        assert!(
+            engine
+                .instances[0]
+                .equity_samples
+                .iter()
+                .any(|s| (s.equity - 1000.84).abs() < 1e-6),
+            "post-init sample with real equity must be persisted to the deque"
+        );
     }
 
     // bot-strategy#354: configured round_id != persisted round_id triggers a
