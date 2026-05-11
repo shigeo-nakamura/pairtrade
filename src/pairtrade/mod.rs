@@ -21,6 +21,7 @@ mod data_dump;
 mod defaults;
 mod entry;
 mod exit;
+mod funding_history;
 mod history_io;
 mod kalman;
 mod market;
@@ -191,6 +192,10 @@ pub struct PairTradeEngine {
     kill_switch_active: bool,
     data_dump_writer: Option<data_dump::RotatingDumpWriter>,
     replay_connector: Option<Arc<ReplayConnector>>,
+    /// Rolling per-symbol funding-rate history observed from WS, used by
+    /// `exit_fill` to compute `funding_carry_usd` on each cycle without an
+    /// external REST fetch. bot-strategy#364.
+    funding_history: funding_history::FundingHistory,
     /// Graceful shutdown flag. When true:
     ///   - new entries are blocked
     ///   - existing exit logic (exit_z / stop_loss_z / force_close_secs) runs normally
@@ -419,6 +424,7 @@ impl PairTradeEngine {
             risk_state_path,
             kill_switch_active: false,
             data_dump_writer,
+            funding_history: funding_history::FundingHistory::new(),
             shutdown_pending: false,
         })
     }
@@ -1382,6 +1388,13 @@ impl PairTradeEngine {
                 );
                 continue;
             }
+            // bot-strategy#364: record realized funding rate into the
+            // rolling history so exit_fill can attribute per-cycle carry
+            // without an external REST fetch. Lighter settles funding
+            // hourly; `observe` dedupes unchanged rates so the buffer
+            // averages 1 push per symbol per hour.
+            self.funding_history
+                .observe(symbol, now_ts, snapshot.funding_rate);
             if let Some(builder) = self.bar_builders.get_mut(symbol) {
                 // `snapshot.exchange_ts` is ms post bot-strategy#274 / #276;
                 // `now_ts` is wall-clock seconds, lift it to ms when the
@@ -2058,7 +2071,32 @@ impl PairTradeEngine {
                             let entry_b = pos_ref
                                 .and_then(|p| p.entry_price_b)
                                 .and_then(|v| v.to_f64());
-                            let record = PnlLogRecord::new(
+                            let (carry_usd, ticks_observed) = match pos_ref {
+                                Some(p) => match (
+                                    p.entry_size_a,
+                                    p.entry_price_a,
+                                    p.entry_size_b,
+                                    p.entry_price_b,
+                                ) {
+                                    (Some(sa), Some(pa), Some(sb), Some(pb)) => {
+                                        funding_history::compute_carry_usd(
+                                            &self.funding_history,
+                                            &plan.pair.base,
+                                            &plan.pair.quote,
+                                            p.entered_ts,
+                                            now_ts,
+                                            direction,
+                                            sa,
+                                            pa,
+                                            sb,
+                                            pb,
+                                        )
+                                    }
+                                    _ => (0.0, 0),
+                                },
+                                None => (0.0, 0),
+                            };
+                            let mut record = PnlLogRecord::new(
                                 &plan.pair.base,
                                 &plan.pair.quote,
                                 direction,
@@ -2073,6 +2111,9 @@ impl PairTradeEngine {
                                     .and_then(|s| s.last_spread.map(|_| z)),
                                 hold_secs,
                             );
+                            if ticks_observed > 0 {
+                                record = record.with_funding(carry_usd, ticks_observed);
+                            }
                             self.write_pnl_record(inst_idx, record);
                             self.instances[inst_idx].realized_pnl_today += pnl_value;
                             // write_pnl_record always bumps total_trades / total_pnl
@@ -4127,24 +4168,47 @@ impl PairTradeEngine {
                                     let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
                                     let z_exit = state.z_score().map(|(z, _)| z);
                                     let beta_val = Some(state.beta);
-                                    pnl_record = Some((
-                                        PnlLogRecord::new(
-                                            base,
-                                            quote,
-                                            pos.direction,
-                                            pnl,
-                                            now_ts,
-                                            "exit_fill",
-                                        ).with_trade_details(
-                                            entry_a, entry_b,
-                                            p1.price.to_f64(), p2.price.to_f64(),
-                                            beta_val,
-                                            pos.entry_z,
-                                            z_exit,
-                                            hold_secs,
-                                        ),
+                                    let (carry_usd, ticks_observed) = match (
+                                        pos.entry_size_a,
+                                        pos.entry_price_a,
+                                        pos.entry_size_b,
+                                        pos.entry_price_b,
+                                    ) {
+                                        (Some(sa), Some(pa), Some(sb), Some(pb)) => {
+                                            funding_history::compute_carry_usd(
+                                                &self.funding_history,
+                                                base,
+                                                quote,
+                                                pos.entered_ts,
+                                                now_ts,
+                                                pos.direction,
+                                                sa,
+                                                pa,
+                                                sb,
+                                                pb,
+                                            )
+                                        }
+                                        _ => (0.0, 0),
+                                    };
+                                    let mut record = PnlLogRecord::new(
+                                        base,
+                                        quote,
+                                        pos.direction,
                                         pnl,
-                                    ));
+                                        now_ts,
+                                        "exit_fill",
+                                    ).with_trade_details(
+                                        entry_a, entry_b,
+                                        p1.price.to_f64(), p2.price.to_f64(),
+                                        beta_val,
+                                        pos.entry_z,
+                                        z_exit,
+                                        hold_secs,
+                                    );
+                                    if ticks_observed > 0 {
+                                        record = record.with_funding(carry_usd, ticks_observed);
+                                    }
+                                    pnl_record = Some((record, pnl));
                                 }
                             }
                         }
@@ -5788,6 +5852,7 @@ impl PairTradeEngine {
             kill_switch_active: false,
             data_dump_writer: None,
             replay_connector: None,
+            funding_history: funding_history::FundingHistory::new(),
             shutdown_pending: false,
         }
     }
