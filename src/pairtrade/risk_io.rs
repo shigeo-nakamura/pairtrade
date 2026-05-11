@@ -102,16 +102,25 @@ pub(super) struct StopLossMark {
 pub(super) struct RiskStateSnapshot {
     #[serde(rename = "_v")]
     pub version: u32,
+    /// Round identifier from the YAML config at the time this snapshot was
+    /// written. On startup the engine compares this against the configured
+    /// `round_id` and, on transition, resets round-bound per-instance fields
+    /// (trade stats, equity samples, stop-loss cool-down anchors, session
+    /// halt). bot-strategy#354.
+    #[serde(default)]
+    pub round_id: Option<String>,
     #[serde(default)]
     pub instances: HashMap<String, InstanceRiskState>,
 }
 
 pub(super) fn persist_risk_state(
     path: &Path,
+    round_id: Option<&str>,
     instances: &HashMap<String, InstanceRiskState>,
 ) {
     let snapshot = RiskStateSnapshot {
-        version: 1,
+        version: 2,
+        round_id: round_id.map(|s| s.to_string()),
         instances: instances.clone(),
     };
     let Ok(json) = serde_json::to_string(&snapshot) else {
@@ -135,20 +144,20 @@ pub(super) fn persist_risk_state(
     }
 }
 
-pub(super) fn load_risk_state(path: &Path) -> HashMap<String, InstanceRiskState> {
+pub(super) fn load_risk_state(path: &Path) -> RiskStateSnapshot {
     let content = match fs::read_to_string(path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RiskStateSnapshot::default(),
         Err(e) => {
             log::warn!("[RISK_STATE] read failed ({}): {:?}", path.display(), e);
-            return HashMap::new();
+            return RiskStateSnapshot::default();
         }
     };
     match serde_json::from_str::<RiskStateSnapshot>(&content) {
-        Ok(snap) => snap.instances,
+        Ok(snap) => snap,
         Err(e) => {
             log::warn!("[RISK_STATE] parse failed ({}): {:?}", path.display(), e);
-            HashMap::new()
+            RiskStateSnapshot::default()
         }
     }
 }

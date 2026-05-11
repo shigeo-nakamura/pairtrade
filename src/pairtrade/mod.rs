@@ -3374,14 +3374,48 @@ impl PairTradeEngine {
     /// restart` during an active cool-down does not silently clear the
     /// consecutive-loss counter. See bot-strategy#185 Phase 1-3, extended
     /// in Phase 2 to restore `session_start_*` / `realized_pnl_today`.
+    ///
+    /// On round transition (configured `round_id` differs from the value
+    /// persisted in the snapshot), round-bound per-instance fields are
+    /// zeroed before assignment so a Round N → N+1 restart starts from a
+    /// clean baseline without the operator running `reset-round-state.sh`.
+    /// bot-strategy#354.
     fn load_risk_state(&mut self) {
         if self.cfg.backtest_mode {
             return;
         }
-        let loaded = risk_io::load_risk_state(&self.risk_state_path);
-        if loaded.is_empty() {
+        let mut snapshot = risk_io::load_risk_state(&self.risk_state_path);
+        if snapshot.instances.is_empty() {
             return;
         }
+        let configured = self.cfg.round_id.as_deref();
+        let persisted = snapshot.round_id.as_deref();
+        let transition = matches!((configured, persisted),
+            (Some(new), Some(old)) if new != old);
+        if transition {
+            let inst_ids: Vec<String> = snapshot.instances.keys().cloned().collect();
+            log::warn!(
+                "[ROUND_ID] transition {:?} -> {:?}; resetting round-bound state for instances={:?}",
+                persisted.unwrap_or(""),
+                configured.unwrap_or(""),
+                inst_ids,
+            );
+            for state in snapshot.instances.values_mut() {
+                state.consecutive_losses = 0;
+                state.circuit_breaker_until_ts = None;
+                state.last_stop_loss_per_pair.clear();
+                state.equity_samples.clear();
+                state.session_halted = false;
+                state.session_halt_reason = None;
+                state.session_halt_ts = None;
+                state.total_trades = 0;
+                state.total_wins = 0;
+                state.total_pnl = 0.0;
+                state.peak_pnl = 0.0;
+                state.max_dd = 0.0;
+            }
+        }
+        let loaded = snapshot.instances;
         let now_ts = self.current_now_ts();
         for inst in &mut self.instances {
             let Some(state) = loaded.get(&inst.id) else { continue };
@@ -3496,7 +3530,11 @@ impl PairTradeEngine {
                 )
             })
             .collect();
-        risk_io::persist_risk_state(&self.risk_state_path, &instances);
+        risk_io::persist_risk_state(
+            &self.risk_state_path,
+            self.cfg.round_id.as_deref(),
+            &instances,
+        );
     }
 
     /// Cross the UTC session boundary when `now_ts` lands in a different
@@ -6187,6 +6225,7 @@ impl PairTradeEngine {
             regime_reference_symbol: DEFAULT_REGIME_REFERENCE_SYMBOL.to_string(),
             bt_fill_delay_secs: 0,
             risk: config::RiskConfig::default(),
+            round_id: None,
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
@@ -6711,10 +6750,10 @@ mod tests {
             },
         );
 
-        risk_io::persist_risk_state(&path, &instances);
-        let loaded = risk_io::load_risk_state(&path);
+        risk_io::persist_risk_state(&path, None, &instances);
+        let snapshot = risk_io::load_risk_state(&path);
 
-        let restored = loaded.get("inst-a").expect("instance restored");
+        let restored = snapshot.instances.get("inst-a").expect("instance restored");
         assert_eq!(restored.total_trades, 42);
         assert_eq!(restored.total_wins, 25);
         assert!((restored.total_pnl - 12.34).abs() < 1e-9);
@@ -6735,14 +6774,33 @@ mod tests {
         let legacy = r#"{"_v":1,"instances":{"inst-a":{"consecutive_losses":7}}}"#;
         std::fs::write(&path, legacy).unwrap();
 
-        let loaded = risk_io::load_risk_state(&path);
-        let restored = loaded.get("inst-a").expect("instance restored");
+        let snapshot = risk_io::load_risk_state(&path);
+        let restored = snapshot.instances.get("inst-a").expect("instance restored");
         assert_eq!(restored.consecutive_losses, 7);
         assert_eq!(restored.total_trades, 0);
         assert_eq!(restored.total_wins, 0);
         assert_eq!(restored.total_pnl, 0.0);
         assert_eq!(restored.peak_pnl, 0.0);
         assert_eq!(restored.max_dd, 0.0);
+        // v1 snapshots have no round_id; default reads as None.
+        assert!(snapshot.round_id.is_none());
+    }
+
+    // bot-strategy#354: round_id round-trips through persist/load.
+    #[test]
+    fn risk_state_round_id_round_trip() {
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("risk_state.json");
+        let instances: HashMap<String, risk_io::InstanceRiskState> = HashMap::new();
+
+        risk_io::persist_risk_state(&path, Some("round-4"), &instances);
+        let snapshot = risk_io::load_risk_state(&path);
+
+        assert_eq!(snapshot.round_id.as_deref(), Some("round-4"));
+        assert_eq!(snapshot.version, 2);
     }
 
     #[test]
@@ -7234,6 +7292,137 @@ mod pending_tests {
 
         assert_eq!(connector.balance_calls.load(Ordering::SeqCst), 1);
         assert!((engine.instances[0].equity_cache - 777.0).abs() < 1e-6);
+    }
+
+    // bot-strategy#354: configured round_id != persisted round_id triggers a
+    // reset of round-bound per-instance fields at engine startup, while
+    // session-rolling fields (session_start_*, realized_pnl_today) survive.
+    #[test]
+    fn round_id_transition_zeros_round_bound_fields() {
+        use tempfile::TempDir;
+
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("risk_state.json");
+        engine.risk_state_path = path.clone();
+        engine.cfg.round_id = Some("round-4".to_string());
+
+        let mut instances = HashMap::new();
+        instances.insert(
+            "default".to_string(),
+            risk_io::InstanceRiskState {
+                consecutive_losses: 5,
+                circuit_breaker_until_ts: Some(9_999_999_999),
+                session_start_equity: 1234.5,
+                session_start_ts: 4242,
+                realized_pnl_today: -12.0,
+                equity_samples: vec![risk_io::EquitySample { ts: 10, equity: 100.0 }],
+                session_halted: true,
+                session_halt_reason: Some("session_dd_500bps".to_string()),
+                session_halt_ts: Some(8888),
+                total_trades: 42,
+                total_wins: 24,
+                total_pnl: 99.9,
+                peak_pnl: 150.0,
+                max_dd: 30.0,
+                ..Default::default()
+            },
+        );
+        risk_io::persist_risk_state(&path, Some("round-3"), &instances);
+
+        engine.load_risk_state();
+
+        let inst = &engine.instances[0];
+        // Round-bound fields zeroed.
+        assert_eq!(inst.consecutive_losses, 0);
+        assert!(inst.circuit_breaker_until_ts.is_none());
+        assert!(inst.equity_samples.is_empty());
+        assert!(!inst.session_halted);
+        assert!(inst.session_halt_reason.is_none());
+        assert!(inst.session_halt_ts.is_none());
+        assert_eq!(inst.total_trades, 0);
+        assert_eq!(inst.total_wins, 0);
+        assert_eq!(inst.total_pnl, 0.0);
+        assert_eq!(inst.peak_pnl, 0.0);
+        assert_eq!(inst.max_dd, 0.0);
+        // Session-rolling fields survive — UTC midnight rolls them, not the
+        // round boundary.
+        assert!((inst.session_start_equity - 1234.5).abs() < 1e-9);
+        assert_eq!(inst.session_start_ts, 4242);
+        assert!((inst.realized_pnl_today - (-12.0)).abs() < 1e-9);
+    }
+
+    // bot-strategy#354: configured round_id == persisted round_id preserves
+    // all fields (the common in-round restart case).
+    #[test]
+    fn round_id_match_preserves_round_bound_fields() {
+        use tempfile::TempDir;
+
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("risk_state.json");
+        engine.risk_state_path = path.clone();
+        engine.cfg.round_id = Some("round-4".to_string());
+
+        let mut instances = HashMap::new();
+        instances.insert(
+            "default".to_string(),
+            risk_io::InstanceRiskState {
+                consecutive_losses: 3,
+                total_trades: 7,
+                total_wins: 4,
+                total_pnl: 11.5,
+                peak_pnl: 20.0,
+                max_dd: 8.5,
+                ..Default::default()
+            },
+        );
+        risk_io::persist_risk_state(&path, Some("round-4"), &instances);
+
+        engine.load_risk_state();
+
+        let inst = &engine.instances[0];
+        assert_eq!(inst.consecutive_losses, 3);
+        assert_eq!(inst.total_trades, 7);
+        assert_eq!(inst.total_wins, 4);
+        assert!((inst.total_pnl - 11.5).abs() < 1e-9);
+        assert!((inst.peak_pnl - 20.0).abs() < 1e-9);
+        assert!((inst.max_dd - 8.5).abs() < 1e-9);
+    }
+
+    // bot-strategy#354: unset configured round_id (legacy mode) never resets.
+    // Hosts without `round_id` in YAML (Tokyo Lighter / Extended /
+    // xvenue-arb at v2 launch) must not lose state on restart.
+    #[test]
+    fn round_id_unset_skips_auto_reset() {
+        use tempfile::TempDir;
+
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("risk_state.json");
+        engine.risk_state_path = path.clone();
+        engine.cfg.round_id = None;
+
+        let mut instances = HashMap::new();
+        instances.insert(
+            "default".to_string(),
+            risk_io::InstanceRiskState {
+                total_trades: 9,
+                ..Default::default()
+            },
+        );
+        risk_io::persist_risk_state(&path, Some("round-3"), &instances);
+
+        engine.load_risk_state();
+
+        let inst = &engine.instances[0];
+        assert_eq!(inst.total_trades, 9);
     }
 }
 

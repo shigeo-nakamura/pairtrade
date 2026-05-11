@@ -330,6 +330,14 @@ pub(super) struct PairTradeYaml {
     pub(super) regime_reference_symbol: Option<String>,
     // Daily drawdown limit (bot-strategy#185 Phase 2)
     pub(super) risk: Option<RiskYaml>,
+    /// Round identifier (e.g. `"round-4"`). When set, the engine compares
+    /// this against the value persisted in `risk_state.json` at startup,
+    /// and on transition (configured `Some(new)` != persisted `Some(old)`)
+    /// resets round-bound per-instance fields (trade stats, equity samples,
+    /// stop-loss cool-down anchors, session halt). Unset = legacy behavior
+    /// (no auto-reset; operator runs `scripts/reset-round-state.sh` between
+    /// rounds). bot-strategy#354.
+    pub(super) round_id: Option<String>,
 }
 
 /// `risk:` YAML block for cross-session safety limits. Phase 2 covers
@@ -541,6 +549,9 @@ pub struct PairTradeConfig {
     pub regime_reference_symbol: String,
     // Daily drawdown limit (bot-strategy#185 Phase 2)
     pub risk: RiskConfig,
+    /// Round identifier from YAML. Drives the round-boundary auto-reset
+    /// in `load_risk_state` (bot-strategy#354). None = legacy mode.
+    pub round_id: Option<String>,
 }
 
 /// Resolved `risk:` block. See `RiskYaml` for field meanings.
@@ -890,6 +901,7 @@ impl PairTradeConfig {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_REGIME_REFERENCE_SYMBOL.to_string()),
             risk: resolve_risk_config(yaml.risk.as_ref())?,
+            round_id: yaml.round_id.clone(),
         };
 
         cfg.pair_params = cfg.build_pair_params_map(&yaml.pair_overrides);
@@ -1104,6 +1116,7 @@ impl PairTradeConfig {
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_REGIME_REFERENCE_SYMBOL.to_string()),
             risk: RiskConfig::default(),
+            round_id: env::var("ROUND_ID").ok().filter(|v| !v.trim().is_empty()),
         };
         cfg.default_pair_params = default_pair_params_from_env();
         if cfg.default_pair_params.warm_start_min_bars == 0 {
