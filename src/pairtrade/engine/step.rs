@@ -429,6 +429,11 @@ impl PairTradeEngine {
         }
         for inst in self.instances.iter_mut() {
             if let Some(reporter) = &mut inst.status_reporter {
+                // Scope the snapshot read + any failure WARN to this
+                // variant so the `error_summary` it embeds (and any
+                // `[STATUS] failed` warn that would follow) attributes
+                // correctly. See bot-strategy#367.
+                let _attr = crate::error_counter::CurrentInstanceGuard::enter(&inst.id);
                 if let Err(err) = reporter.write_snapshot(&self.open_positions, self.positions_ready) {
                     log::warn!("[STATUS] failed to write status: {:?}", err);
                 }
@@ -451,6 +456,12 @@ impl PairTradeEngine {
         };
         for inst_idx in 0..self.instances.len() {
             self.connector = self.instances[inst_idx].connector.clone();
+            // Per-instance attribution scope: every WARN/ERROR emitted by
+            // session_dd / daily_dd / equity-fetch / position-sync code
+            // paths lands in this variant's bucket rather than spilling
+            // across A/B/C. See bot-strategy#367.
+            let _attr =
+                crate::error_counter::CurrentInstanceGuard::enter(&self.instances[inst_idx].id);
             self.step_for_instance(inst_idx, &price_map, &updated).await?;
         }
         Ok(())

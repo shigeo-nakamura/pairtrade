@@ -699,7 +699,16 @@ impl StatusReporter {
             trade_stats: self.trade_stats.clone(),
             maintenance: self.maintenance.clone(),
             shutdown: self.shutdown.clone(),
-            error_summary: error_counter::global().map(|h| h.snapshot()),
+            // Per-instance error attribution (bot-strategy#367): the
+            // engine wraps `step_for_instance` and the status-writer
+            // loop with a `CurrentInstanceGuard`, so reading
+            // `snapshot_for(self.id)` here returns this variant's
+            // bucket merged with the shared/None bucket (connector
+            // WS resets, account refresh failures, …). Variants that
+            // never logged anything stay clean even when a sibling
+            // is tripping risk halts.
+            error_summary: error_counter::global()
+                .map(|h| h.snapshot_for(self.id.as_deref())),
             ws_reset_24h_count: error_counter::global()
                 .map(|h| h.ws_reset_24h_count())
                 .unwrap_or(0),

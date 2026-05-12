@@ -1,13 +1,25 @@
 //! Error / warn counter layered over an inner `log::Log`.
 //!
-//! Used by the Status Dashboard to surface log-level anomalies that don't
-//! cause the service to fail (see bot-strategy#45). Counters are maintained
-//! in-process; snapshot via `ErrorCounterHandle::snapshot()` and embed in
-//! `status.json`.
+//! Counters are kept in per-instance buckets, attributed via the
+//! `CurrentInstance` thread-local that the pairtrade engine installs
+//! around `step_for_instance`. Each variant's `status.json` reads its
+//! own bucket merged with the shared (None) bucket — events emitted
+//! outside any instance scope (connector WS resets, account refresh
+//! failures, …) land in the shared bucket and surface on every
+//! variant, while variant-specific events (e.g. `[SESSION_DD] c …`)
+//! only inflate the offending variant's counters. See bot-strategy#367
+//! for the leak this replaces.
+//!
+//! `pending_ws`, `pending_step_overrun`, and `ws_resets_24h` stay
+//! process-global: WS recovery / order-completion markers are shared
+//! signals that drain queues regardless of which variant logged the
+//! deferred entry, and `ws_reset_24h_count` is a fleet-level health
+//! readout that doesn't fragment per variant.
 
 use log::{Level, Log, Metadata, Record};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -39,6 +51,47 @@ pub fn set_counting_suppressed(suppressed: bool) {
 
 pub fn is_counting_suppressed() -> bool {
     SUPPRESS_COUNTING.load(Ordering::Relaxed)
+}
+
+thread_local! {
+    /// Current variant id whose code path is executing on this thread.
+    /// Set by `CurrentInstanceGuard::enter` around `step_for_instance`
+    /// and read by `ErrorCountingLogger::log` to attribute the record.
+    /// `None` means the log line originated outside any instance scope
+    /// (connector callbacks, startup, status writes between instances).
+    static CURRENT_INSTANCE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// RAII guard that installs `id` as the current instance for this
+/// thread, restoring the previous value on drop. Pairtrade wraps the
+/// body of `step_for_instance` with one of these so every log line
+/// emitted by per-instance code paths (session DD, daily DD, equity
+/// fetch, position sync, …) lands in that variant's bucket.
+pub struct CurrentInstanceGuard {
+    prev: Option<String>,
+}
+
+impl CurrentInstanceGuard {
+    pub fn enter(id: &str) -> Self {
+        let prev = CURRENT_INSTANCE.with(|c| {
+            let mut slot = c.borrow_mut();
+            std::mem::replace(&mut *slot, Some(id.to_string()))
+        });
+        Self { prev }
+    }
+}
+
+impl Drop for CurrentInstanceGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        CURRENT_INSTANCE.with(|c| {
+            *c.borrow_mut() = prev;
+        });
+    }
+}
+
+fn current_instance() -> Option<String> {
+    CURRENT_INSTANCE.with(|c| c.borrow().clone())
 }
 
 /// Window (seconds) for the short-term rolling counts published in the
@@ -95,16 +148,40 @@ pub struct ErrorSummary {
     pub last_warn_message: Option<String>,
 }
 
-struct Counters {
+/// Per-instance committed state. One bucket per variant id, plus a
+/// shared `None`-keyed bucket for unattributed events.
+struct Bucket {
     recent: Mutex<VecDeque<(i64, Level)>>,
     last_error: Mutex<Option<(i64, String)>>,
     last_warn: Mutex<Option<(i64, String)>>,
     error_total: AtomicU64,
     warn_total: AtomicU64,
+}
+
+impl Bucket {
+    fn new() -> Self {
+        Self {
+            recent: Mutex::new(VecDeque::new()),
+            last_error: Mutex::new(None),
+            last_warn: Mutex::new(None),
+            error_total: AtomicU64::new(0),
+            warn_total: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Top-level counter state. Holds the per-instance committed buckets
+/// keyed on `Option<String>` (None = shared/unattributed) plus the
+/// process-global defer queues and ws-reset ring.
+struct Counters {
+    /// Per-instance committed state. Lazily inserted on first matching
+    /// log record so we don't need to know variant ids at install time.
+    buckets: Mutex<HashMap<Option<String>, Arc<Bucket>>>,
     /// Transient WS-reset events queued for deferred commit. Each entry
     /// stays here until either (a) a recovery log line drains it before
-    /// `WS_DEFER_WINDOW_SECS` elapses, or (b) `snapshot()` flushes it into
-    /// `recent` once its deadline passes. See bot-strategy#261.
+    /// `WS_DEFER_WINDOW_SECS` elapses, or (b) `snapshot()` flushes it
+    /// into the captured-instance's bucket once its deadline passes.
+    /// See bot-strategy#261.
     pending_ws: Mutex<VecDeque<PendingEntry>>,
     /// `[STEP_OVERRUN]` warns queued for deferred commit. Drained by
     /// `[ORDER] ... entry/exit orders filled` recovery markers within
@@ -113,9 +190,30 @@ struct Counters {
     /// Timestamps (epoch seconds) of WS reset events in the last 24h —
     /// any log line that contains `Connection reset without closing
     /// handshake`. Surfaced as `ws_reset_24h_count` in `status.json` so
-    /// the dashboard does not need a journalctl SSM probe. See
-    /// bot-strategy#343.
+    /// the dashboard does not need a journalctl SSM probe. Stays
+    /// process-global because the metric represents fleet-level WS
+    /// health, not per-variant attribution. See bot-strategy#343.
     ws_resets_24h: Mutex<VecDeque<i64>>,
+}
+
+impl Counters {
+    fn new() -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            pending_ws: Mutex::new(VecDeque::new()),
+            pending_step_overrun: Mutex::new(VecDeque::new()),
+            ws_resets_24h: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn bucket(&self, instance: Option<&str>) -> Arc<Bucket> {
+        let key = instance.map(|s| s.to_string());
+        let mut map = self.buckets.lock().unwrap();
+        Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| Arc::new(Bucket::new())),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +221,11 @@ struct PendingEntry {
     ts: i64,
     level: Level,
     message: String,
+    /// Instance id active when the entry was deferred. On expiry the
+    /// entry commits to this bucket; recovery markers drain the entire
+    /// queue regardless of attribution (recovery is a connector-level
+    /// signal shared across variants).
+    instance: Option<String>,
 }
 
 /// Match log lines that signal a transient connectivity event whose effect
@@ -191,52 +294,105 @@ impl ErrorCounterHandle {
         q.len() as u64
     }
 
+    /// Snapshot view merged across every bucket. Retained for callers
+    /// that have no variant context (or want a fleet-wide rollup).
     pub fn snapshot(&self) -> ErrorSummary {
         let now = chrono::Utc::now().timestamp();
-        // Flush any pending entries whose recovery window has expired.
-        // Lock order: pending_ws → pending_step_overrun → recent →
-        // last_error/last_warn, matching the order in `log()` so no
-        // deadlock is possible.
         flush_all_expired_pending(&self.counters, now);
         let cutoff = now - ROLLING_WINDOW_SECS;
-        let (err_window, warn_window) = {
-            let mut recent = self.counters.recent.lock().unwrap();
-            while let Some(&(ts, _)) = recent.front() {
-                if ts < cutoff {
-                    recent.pop_front();
-                } else {
-                    break;
-                }
-            }
-            let mut e = 0u64;
-            let mut w = 0u64;
-            for (_, lvl) in recent.iter() {
-                match lvl {
-                    Level::Error => e += 1,
-                    Level::Warn => w += 1,
-                    _ => {}
-                }
-            }
-            (e, w)
-        };
-        let (last_err_ts, last_err_msg) = match self.counters.last_error.lock().unwrap().clone() {
-            Some((ts, msg)) => (Some(ts), Some(msg)),
-            None => (None, None),
-        };
-        let (last_warn_ts, last_warn_msg) = match self.counters.last_warn.lock().unwrap().clone() {
-            Some((ts, msg)) => (Some(ts), Some(msg)),
-            None => (None, None),
-        };
-        ErrorSummary {
-            error_count_30m: err_window,
-            warn_count_30m: warn_window,
-            error_count_total: self.counters.error_total.load(Ordering::Relaxed),
-            warn_count_total: self.counters.warn_total.load(Ordering::Relaxed),
-            last_error_ts: last_err_ts,
-            last_error_message: last_err_msg,
-            last_warn_ts,
-            last_warn_message: last_warn_msg,
+        let buckets: Vec<Arc<Bucket>> = self
+            .counters
+            .buckets
+            .lock()
+            .unwrap()
+            .values()
+            .map(Arc::clone)
+            .collect();
+        merge_buckets(&buckets, cutoff)
+    }
+
+    /// Snapshot view for a specific variant. Merges the shared (None)
+    /// bucket with the `instance` bucket so connector-layer events
+    /// (WS reset, startup) still show up on every variant's status,
+    /// while variant-specific events (SESSION_DD, daily DD, …) only
+    /// inflate the bucket that emitted them. See bot-strategy#367.
+    pub fn snapshot_for(&self, instance: Option<&str>) -> ErrorSummary {
+        let now = chrono::Utc::now().timestamp();
+        flush_all_expired_pending(&self.counters, now);
+        let cutoff = now - ROLLING_WINDOW_SECS;
+        let key = instance.map(|s| s.to_string());
+        let mut buckets: Vec<Arc<Bucket>> = Vec::with_capacity(2);
+        let map = self.counters.buckets.lock().unwrap();
+        if let Some(b) = map.get(&None) {
+            buckets.push(Arc::clone(b));
         }
+        if key.is_some() {
+            if let Some(b) = map.get(&key) {
+                buckets.push(Arc::clone(b));
+            }
+        }
+        drop(map);
+        merge_buckets(&buckets, cutoff)
+    }
+}
+
+/// Build an `ErrorSummary` over the supplied buckets, honouring the
+/// 30-minute rolling window for `*_count_30m`. Totals are summed.
+/// `last_error` / `last_warn` pick the most recent across buckets.
+fn merge_buckets(buckets: &[Arc<Bucket>], cutoff: i64) -> ErrorSummary {
+    let mut err_window = 0u64;
+    let mut warn_window = 0u64;
+    let mut error_total = 0u64;
+    let mut warn_total = 0u64;
+    let mut last_error: Option<(i64, String)> = None;
+    let mut last_warn: Option<(i64, String)> = None;
+    for b in buckets {
+        let mut recent = b.recent.lock().unwrap();
+        while let Some(&(ts, _)) = recent.front() {
+            if ts < cutoff {
+                recent.pop_front();
+            } else {
+                break;
+            }
+        }
+        for (_, lvl) in recent.iter() {
+            match lvl {
+                Level::Error => err_window += 1,
+                Level::Warn => warn_window += 1,
+                _ => {}
+            }
+        }
+        drop(recent);
+        error_total += b.error_total.load(Ordering::Relaxed);
+        warn_total += b.warn_total.load(Ordering::Relaxed);
+        if let Some(entry) = b.last_error.lock().unwrap().clone() {
+            if last_error.as_ref().map_or(true, |cur| entry.0 > cur.0) {
+                last_error = Some(entry);
+            }
+        }
+        if let Some(entry) = b.last_warn.lock().unwrap().clone() {
+            if last_warn.as_ref().map_or(true, |cur| entry.0 > cur.0) {
+                last_warn = Some(entry);
+            }
+        }
+    }
+    let (last_error_ts, last_error_message) = match last_error {
+        Some((ts, msg)) => (Some(ts), Some(msg)),
+        None => (None, None),
+    };
+    let (last_warn_ts, last_warn_message) = match last_warn {
+        Some((ts, msg)) => (Some(ts), Some(msg)),
+        None => (None, None),
+    };
+    ErrorSummary {
+        error_count_30m: err_window,
+        warn_count_30m: warn_window,
+        error_count_total: error_total,
+        warn_count_total: warn_total,
+        last_error_ts,
+        last_error_message,
+        last_warn_ts,
+        last_warn_message,
     }
 }
 
@@ -247,16 +403,7 @@ pub struct ErrorCountingLogger {
 
 impl ErrorCountingLogger {
     pub fn wrap(inner: Box<dyn Log>) -> (Self, ErrorCounterHandle) {
-        let counters = Arc::new(Counters {
-            recent: Mutex::new(VecDeque::new()),
-            last_error: Mutex::new(None),
-            last_warn: Mutex::new(None),
-            error_total: AtomicU64::new(0),
-            warn_total: AtomicU64::new(0),
-            pending_ws: Mutex::new(VecDeque::new()),
-            pending_step_overrun: Mutex::new(VecDeque::new()),
-            ws_resets_24h: Mutex::new(VecDeque::new()),
-        });
+        let counters = Arc::new(Counters::new());
         let handle = ErrorCounterHandle {
             counters: Arc::clone(&counters),
         };
@@ -264,10 +411,28 @@ impl ErrorCountingLogger {
     }
 }
 
+/// Commit a single record into the bucket identified by `instance`.
+/// Used both by the live log path and by the deferred-pending flush.
+fn commit_to_bucket(counters: &Counters, instance: Option<&str>, ts: i64, level: Level, msg: String) {
+    let bucket = counters.bucket(instance);
+    bucket.recent.lock().unwrap().push_back((ts, level));
+    match level {
+        Level::Error => {
+            bucket.error_total.fetch_add(1, Ordering::Relaxed);
+            *bucket.last_error.lock().unwrap() = Some((ts, msg));
+        }
+        Level::Warn => {
+            bucket.warn_total.fetch_add(1, Ordering::Relaxed);
+            *bucket.last_warn.lock().unwrap() = Some((ts, msg));
+        }
+        _ => {}
+    }
+}
+
 /// Move pending entries from `queue` whose defer window has expired into
-/// the durable `recent` queue (and update last_error/last_warn + totals).
-/// Called from both `snapshot()` and `log()` so the counts stay current
-/// regardless of whether the dashboard is polling.
+/// the durable per-instance buckets (and update last_error/last_warn +
+/// totals). Called from both `snapshot()` and `log()` so the counts stay
+/// current regardless of whether the dashboard is polling.
 fn flush_expired_pending(
     queue: &Mutex<VecDeque<PendingEntry>>,
     counters: &Counters,
@@ -275,36 +440,19 @@ fn flush_expired_pending(
     window: i64,
 ) {
     let cutoff = now - window;
-    let mut pending = queue.lock().unwrap();
     let mut to_commit: Vec<PendingEntry> = Vec::new();
-    while let Some(front) = pending.front() {
-        if front.ts <= cutoff {
-            to_commit.push(pending.pop_front().unwrap());
-        } else {
-            break;
+    {
+        let mut pending = queue.lock().unwrap();
+        while let Some(front) = pending.front() {
+            if front.ts <= cutoff {
+                to_commit.push(pending.pop_front().unwrap());
+            } else {
+                break;
+            }
         }
     }
-    drop(pending);
-    if to_commit.is_empty() {
-        return;
-    }
-    let mut recent = counters.recent.lock().unwrap();
-    for entry in &to_commit {
-        recent.push_back((entry.ts, entry.level));
-    }
-    drop(recent);
     for entry in to_commit {
-        match entry.level {
-            Level::Error => {
-                counters.error_total.fetch_add(1, Ordering::Relaxed);
-                *counters.last_error.lock().unwrap() = Some((entry.ts, entry.message));
-            }
-            Level::Warn => {
-                counters.warn_total.fetch_add(1, Ordering::Relaxed);
-                *counters.last_warn.lock().unwrap() = Some((entry.ts, entry.message));
-            }
-            _ => {}
-        }
+        commit_to_bucket(counters, entry.instance.as_deref(), entry.ts, entry.level, entry.message);
     }
 }
 
@@ -347,6 +495,9 @@ impl Log for ErrorCountingLogger {
             }
             // Recovery markers fire at INFO; check before the level gate so
             // they can drain pending entries from any preceding transient.
+            // Recovery drains across all instances — the connector layer is
+            // shared, and a fresh WS connection invalidates anyone's pending
+            // transient regardless of which variant noticed it.
             if is_ws_recovery_event(&msg) {
                 let cutoff = ts - WS_DEFER_WINDOW_SECS;
                 self.counters
@@ -375,9 +526,8 @@ impl Log for ErrorCountingLogger {
                 } else {
                     msg
                 };
+                let instance = current_instance();
                 if is_ws_transient_event(&truncated) {
-                    // Defer: held in pending_ws until either drained by a
-                    // recovery marker or expired by flush_all_expired_pending.
                     self.counters
                         .pending_ws
                         .lock()
@@ -386,6 +536,7 @@ impl Log for ErrorCountingLogger {
                             ts,
                             level,
                             message: truncated,
+                            instance,
                         });
                 } else if is_step_overrun_event(&truncated) {
                     self.counters
@@ -396,16 +547,10 @@ impl Log for ErrorCountingLogger {
                             ts,
                             level,
                             message: truncated,
+                            instance,
                         });
                 } else {
-                    self.counters.recent.lock().unwrap().push_back((ts, level));
-                    if level == Level::Error {
-                        self.counters.error_total.fetch_add(1, Ordering::Relaxed);
-                        *self.counters.last_error.lock().unwrap() = Some((ts, truncated));
-                    } else {
-                        self.counters.warn_total.fetch_add(1, Ordering::Relaxed);
-                        *self.counters.last_warn.lock().unwrap() = Some((ts, truncated));
-                    }
+                    commit_to_bucket(&self.counters, instance.as_deref(), ts, level, truncated);
                 }
             }
         }
@@ -422,24 +567,22 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    /// Test-only: build a Counters in isolation (no inner Log dependency).
     fn make_counters() -> Arc<Counters> {
-        Arc::new(Counters {
-            recent: Mutex::new(VecDeque::new()),
-            last_error: Mutex::new(None),
-            last_warn: Mutex::new(None),
-            error_total: AtomicU64::new(0),
-            warn_total: AtomicU64::new(0),
-            pending_ws: Mutex::new(VecDeque::new()),
-            pending_step_overrun: Mutex::new(VecDeque::new()),
-            ws_resets_24h: Mutex::new(VecDeque::new()),
-        })
+        Arc::new(Counters::new())
     }
 
     /// Test-only: simulate `log()` without going through the real `log!()`
-    /// macro / global logger, so each test controls timestamps and
-    /// pattern matching directly. Mirrors the real `log()` body.
-    fn fake_log(counters: &Counters, ts: i64, level: Level, msg: &str) {
+    /// macro / global logger, so each test controls timestamps, pattern
+    /// matching, and instance attribution directly. Mirrors the real
+    /// `log()` body. `instance = None` matches the shared / unattributed
+    /// path the connector layer takes today.
+    fn fake_log_for(
+        counters: &Counters,
+        instance: Option<&str>,
+        ts: i64,
+        level: Level,
+        msg: &str,
+    ) {
         if msg.contains(WS_RESET_PHRASE) {
             let cutoff = ts - WS_RESET_24H_WINDOW_SECS;
             let mut q = counters.ws_resets_24h.lock().unwrap();
@@ -472,11 +615,13 @@ mod tests {
             return;
         }
         let truncated = msg.to_string();
+        let instance_owned = instance.map(|s| s.to_string());
         if is_ws_transient_event(&truncated) {
             counters.pending_ws.lock().unwrap().push_back(PendingEntry {
                 ts,
                 level,
                 message: truncated,
+                instance: instance_owned,
             });
         } else if is_step_overrun_event(&truncated) {
             counters
@@ -487,36 +632,53 @@ mod tests {
                     ts,
                     level,
                     message: truncated,
+                    instance: instance_owned,
                 });
         } else {
-            counters.recent.lock().unwrap().push_back((ts, level));
-            if level == Level::Error {
-                counters.error_total.fetch_add(1, Ordering::Relaxed);
-                *counters.last_error.lock().unwrap() = Some((ts, truncated));
-            } else {
-                counters.warn_total.fetch_add(1, Ordering::Relaxed);
-                *counters.last_warn.lock().unwrap() = Some((ts, truncated));
-            }
+            commit_to_bucket(counters, instance, ts, level, truncated);
         }
     }
 
+    fn fake_log(counters: &Counters, ts: i64, level: Level, msg: &str) {
+        fake_log_for(counters, None, ts, level, msg)
+    }
+
+    /// Count over all buckets — mirrors the legacy `snapshot()` view used
+    /// by the existing tests, which never cared about per-instance
+    /// attribution.
     fn snap_counts(counters: &Counters, now: i64) -> (u64, u64) {
         flush_all_expired_pending(counters, now);
-        let recent = counters.recent.lock().unwrap();
         let cutoff = now - ROLLING_WINDOW_SECS;
-        let mut e = 0u64;
-        let mut w = 0u64;
-        for &(ts, lvl) in recent.iter() {
-            if ts < cutoff {
-                continue;
-            }
-            match lvl {
-                Level::Error => e += 1,
-                Level::Warn => w += 1,
-                _ => {}
+        let buckets: Vec<Arc<Bucket>> = counters
+            .buckets
+            .lock()
+            .unwrap()
+            .values()
+            .map(Arc::clone)
+            .collect();
+        let s = merge_buckets(&buckets, cutoff);
+        (s.error_count_30m, s.warn_count_30m)
+    }
+
+    /// Count for a specific instance bucket — used by the per-instance
+    /// attribution tests below.
+    fn snap_counts_for(counters: &Counters, instance: Option<&str>, now: i64) -> (u64, u64) {
+        flush_all_expired_pending(counters, now);
+        let cutoff = now - ROLLING_WINDOW_SECS;
+        let key = instance.map(|s| s.to_string());
+        let mut buckets: Vec<Arc<Bucket>> = Vec::new();
+        let map = counters.buckets.lock().unwrap();
+        if let Some(b) = map.get(&None) {
+            buckets.push(Arc::clone(b));
+        }
+        if key.is_some() {
+            if let Some(b) = map.get(&key) {
+                buckets.push(Arc::clone(b));
             }
         }
-        (e, w)
+        drop(map);
+        let s = merge_buckets(&buckets, cutoff);
+        (s.error_count_30m, s.warn_count_30m)
     }
 
     // bot-strategy#261: WS reset that auto-recovers within
@@ -944,5 +1106,140 @@ mod tests {
         fake_log(&c, t0 + 1, Level::Warn, "WebSocket reset");
         fake_log(&c, t0 + 2, Level::Warn, "Connection reset without graceful close");
         assert_eq!(ws_reset_count(&c, t0 + 5), 0);
+    }
+
+    // bot-strategy#367: per-instance attribution. A WARN emitted inside
+    // variant B's scope must inflate only B's bucket; variants A and C
+    // must stay clean. Connector-layer events (no instance scope) land
+    // in the shared bucket and surface on every variant.
+
+    #[test]
+    fn per_instance_event_isolates_to_emitting_variant() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 16_000_000;
+        // B logs a SESSION_DD breach — the variant-tagged messages today
+        // all carry the variant id in the body, but attribution now comes
+        // from the CurrentInstance scope rather than string parsing.
+        fake_log_for(
+            &c,
+            Some("b"),
+            t0,
+            Level::Warn,
+            "[SESSION_DD] b breach: equity=148.0 peak=150.0 dd_bps=133.3 ...",
+        );
+        // A and C are clean (no log activity in their scope).
+        let (a_e, a_w) = snap_counts_for(&c, Some("a"), t0 + 5);
+        let (b_e, b_w) = snap_counts_for(&c, Some("b"), t0 + 5);
+        let (c_e, c_w) = snap_counts_for(&c, Some("c"), t0 + 5);
+        assert_eq!((a_e, a_w), (0, 0), "A must stay clean when only B errors");
+        assert_eq!((b_e, b_w), (0, 1), "B must see its own warn");
+        assert_eq!((c_e, c_w), (0, 0), "C must stay clean when only B errors");
+    }
+
+    #[test]
+    fn shared_event_surfaces_on_every_variant() {
+        // Connector-layer event (no CurrentInstance) goes into the None
+        // bucket. Each variant's snapshot merges its own bucket with
+        // None, so the shared event shows up everywhere — matching today's
+        // semantics for genuinely shared signals (account refresh failure,
+        // non-transient connector error, …).
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 17_000_000;
+        fake_log_for(
+            &c,
+            None,
+            t0,
+            Level::Error,
+            "Account refresh failed: rpc error from upstream",
+        );
+        let (a_e, _) = snap_counts_for(&c, Some("a"), t0 + 5);
+        let (b_e, _) = snap_counts_for(&c, Some("b"), t0 + 5);
+        let (c_e, _) = snap_counts_for(&c, Some("c"), t0 + 5);
+        assert_eq!(a_e, 1, "shared event surfaces on A");
+        assert_eq!(b_e, 1, "shared event surfaces on B");
+        assert_eq!(c_e, 1, "shared event surfaces on C");
+    }
+
+    #[test]
+    fn snapshot_for_merges_shared_and_instance() {
+        // The exact scenario the issue describes: B trips SESSION_DD, a
+        // shared connector ERROR fires separately. B sees both, A and C
+        // see only the shared one.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 18_000_000;
+        fake_log_for(&c, None, t0, Level::Error, "shared connector failure");
+        fake_log_for(
+            &c,
+            Some("b"),
+            t0 + 1,
+            Level::Warn,
+            "[SESSION_DD] b breach: …",
+        );
+        let (a_e, a_w) = snap_counts_for(&c, Some("a"), t0 + 5);
+        let (b_e, b_w) = snap_counts_for(&c, Some("b"), t0 + 5);
+        assert_eq!((a_e, a_w), (1, 0), "A sees shared error only");
+        assert_eq!((b_e, b_w), (1, 1), "B sees shared error + own warn");
+    }
+
+    #[test]
+    fn deferred_pending_commits_into_captured_instance_bucket() {
+        // STEP_OVERRUN fired inside instance C's scope must, on expiry,
+        // commit to C's bucket — not bleed into A or B even though the
+        // pending queue is process-global.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 19_000_000;
+        fake_log_for(
+            &c,
+            Some("c"),
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 30.00s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        let now = t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 10;
+        let (_, a_w) = snap_counts_for(&c, Some("a"), now);
+        let (_, b_w) = snap_counts_for(&c, Some("b"), now);
+        let (_, c_w) = snap_counts_for(&c, Some("c"), now);
+        assert_eq!(a_w, 0, "STEP_OVERRUN from C must not commit into A");
+        assert_eq!(b_w, 0, "STEP_OVERRUN from C must not commit into B");
+        assert_eq!(c_w, 1, "STEP_OVERRUN must commit into the emitting variant");
+    }
+
+    #[test]
+    fn snapshot_for_unknown_variant_returns_shared_only() {
+        // Querying a variant id that never logged anything is fine —
+        // we just don't create a bucket for it. Shared events still
+        // show through.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 20_000_000;
+        fake_log_for(&c, None, t0, Level::Warn, "shared warn");
+        let (_, w) = snap_counts_for(&c, Some("never-existed"), t0 + 5);
+        assert_eq!(w, 1, "shared events visible regardless of which variant queries");
+    }
+
+    #[test]
+    fn current_instance_guard_restores_previous() {
+        // Nested guards must restore the outer scope on drop so the
+        // logger can never leak attribution across consecutive
+        // per-instance steps.
+        assert_eq!(current_instance(), None);
+        {
+            let _outer = CurrentInstanceGuard::enter("a");
+            assert_eq!(current_instance().as_deref(), Some("a"));
+            {
+                let _inner = CurrentInstanceGuard::enter("b");
+                assert_eq!(current_instance().as_deref(), Some("b"));
+            }
+            assert_eq!(
+                current_instance().as_deref(),
+                Some("a"),
+                "drop must restore the outer scope"
+            );
+        }
+        assert_eq!(current_instance(), None, "drop must restore None");
     }
 }
