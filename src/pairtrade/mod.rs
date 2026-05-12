@@ -1674,6 +1674,34 @@ impl PairTradeEngine {
                     };
                 }
             }
+            // Maintenance pre-flatten: the entry-blocker only suppresses Open
+            // actions, so a position whose remaining hold (force_close_secs −
+            // age) extends past the next maintenance window would otherwise
+            // ride through the venue outage. Variant B's fc=10800s (3h) vs
+            // the 1h entry block leaves a ~2h overlap. We reuse the existing
+            // bool window API; granularity is 1h, so we may close up to ~1h
+            // earlier than strictly required.
+            if !force_close_due {
+                if let Some(pos) = &position_state {
+                    let position_age = now_ts.saturating_sub(pos.entered_ts).max(0);
+                    let remaining_hold = (pp.force_close_secs as i64).saturating_sub(position_age);
+                    if remaining_hold > 0 {
+                        let hours_to_check = ((remaining_hold + 3599) / 3600).max(1);
+                        if self.connector.is_upcoming_maintenance(hours_to_check).await {
+                            log::info!(
+                                "[EXIT_CHECK] {} reason=maintenance_preempt remaining_hold_s={} window_h={}",
+                                key, remaining_hold, hours_to_check
+                            );
+                            action = TradeAction::Close {
+                                direction: pos.direction,
+                                z: 0.0,
+                                beta: beta_eff,
+                                force: true,
+                            };
+                        }
+                    }
+                }
+            }
 
             if self.instances[inst_idx].states[&key].pending_entry.is_some()
                 || self.instances[inst_idx].states[&key].pending_exit.is_some()
