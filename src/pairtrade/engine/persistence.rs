@@ -53,6 +53,7 @@ impl PairTradeEngine {
             &self.history_path,
             now,
             max_len,
+            &mut self.last_warm_start_key,
         );
         if loaded_spreads.is_empty() {
             return;

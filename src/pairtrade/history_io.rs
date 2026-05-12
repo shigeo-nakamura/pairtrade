@@ -293,6 +293,7 @@ pub(super) fn load_history_from_disk(
     history_path: &std::path::Path,
     now_ts: i64,
     max_history_len: usize,
+    last_logged_key: &mut Option<String>,
 ) {
     if cfg.disable_history_persist {
         return;
@@ -421,13 +422,27 @@ pub(super) fn load_history_from_disk(
             snap.version,
         );
     } else {
-        log::info!(
-            "[WARM_START] snapshot loaded from {}: v{}, prices={:?}, spread_histories={:?}",
-            history_path.display(),
-            snap.version,
-            loaded_summary,
-            spreads_loaded,
+        // bot-strategy#370 follow-up: dedup the success-path INFO so the
+        // per-tick reload in `engine/step.rs:511` doesn't fire ~12 lines/min
+        // on the 5 s polling cadence. Snapshot rollback / restart still
+        // surface in journalctl because `loaded_summary` / `spreads_loaded`
+        // counts change on the new content, flipping `key` away from the
+        // last logged one. Stale-guard and parse-error paths above stay
+        // unconditional so operator-facing failure modes never get muted.
+        let key = format!(
+            "v{} {:?} {:?}",
+            snap.version, loaded_summary, spreads_loaded
         );
+        if last_logged_key.as_deref() != Some(key.as_str()) {
+            log::info!(
+                "[WARM_START] snapshot loaded from {}: v{}, prices={:?}, spread_histories={:?}",
+                history_path.display(),
+                snap.version,
+                loaded_summary,
+                spreads_loaded,
+            );
+            *last_logged_key = Some(key);
+        }
     }
 }
 

@@ -211,6 +211,15 @@ pub struct PairTradeEngine {
     /// the warning to ~once per minute so a sustained low rate doesn't
     /// flood the journal.
     last_bar_rate_warn: HashMap<String, Instant>,
+    /// Fingerprint of the most recently emitted `[WARM_START] snapshot
+    /// loaded ...` INFO line. `load_history_from_disk` runs on every
+    /// polling tick (engine/step.rs:511), so a naive INFO emit fires
+    /// ~12×/min on the typical 5 s polling cadence. We dedup on this
+    /// key so an operator rolling back a snapshot still sees the
+    /// "loaded" line in journalctl (content changes → key differs →
+    /// emit) while steady-state per-tick reloads stay quiet. WARN
+    /// paths (stale-guard, parse-error, partial) are always emitted.
+    last_warm_start_key: Option<String>,
 }
 
 impl PairTradeEngine {
@@ -413,6 +422,7 @@ impl PairTradeEngine {
             shutdown_pending: false,
             bar_emit_log: HashMap::new(),
             last_bar_rate_warn: HashMap::new(),
+            last_warm_start_key: None,
         })
     }
 
@@ -1202,6 +1212,7 @@ impl PairTradeEngine {
             shutdown_pending: false,
             bar_emit_log: HashMap::new(),
             last_bar_rate_warn: HashMap::new(),
+            last_warm_start_key: None,
         }
     }
 }
