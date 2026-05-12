@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::config::PairTradeConfig;
 use super::kalman::KalmanBeta;
+use super::stats::PriceSample;
 use super::util::mean_std;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +191,47 @@ impl PairState {
         }
     }
 
+    /// Rebuild `spread_history` from the trailing `window` bars of the base
+    /// and quote symbol histories, evaluated against the supplied `new_beta`.
+    ///
+    /// Motivation (bot-strategy#274): `push_spread` records each spread with
+    /// whatever `state.beta` was active at push time. Across A/B/C instances
+    /// (or across hosts) the eval-fire timestamps drift, so the 240-entry
+    /// rolling window ends up as a mix of historical β regimes — and the
+    /// resulting mean/std/z diverge even when both processes observe the same
+    /// bar series. Calling this fn immediately after `state.beta` is updated
+    /// by `evaluate_pair` collapses that mix back to "240 bars × current β",
+    /// removing the trajectory term as a source of cross-host divergence.
+    ///
+    /// `std_history` is intentionally left untouched. It is the time series
+    /// of past full-window std observations used by the std-collapse guard
+    /// (bot-strategy#62); rewriting it with synthetic stds from the rebuilt
+    /// spread series would erase the very signal the guard exists to detect.
+    pub(super) fn rebuild_spread_history_with_beta(
+        &mut self,
+        hist_a: &VecDeque<PriceSample>,
+        hist_b: &VecDeque<PriceSample>,
+        window: usize,
+        new_beta: f64,
+    ) {
+        let take = window.min(hist_a.len()).min(hist_b.len());
+        if take == 0 {
+            self.spread_history.clear();
+            self.last_spread = None;
+            return;
+        }
+        let start_a = hist_a.len() - take;
+        let start_b = hist_b.len() - take;
+        let mut rebuilt = VecDeque::with_capacity(take);
+        for i in 0..take {
+            let log_a = hist_a[start_a + i].log_price;
+            let log_b = hist_b[start_b + i].log_price;
+            rebuilt.push_back(log_a - new_beta * log_b);
+        }
+        self.last_spread = rebuilt.back().copied();
+        self.spread_history = rebuilt;
+    }
+
     pub(super) fn push_spread(&mut self, spread: f64, window: usize, config: &PairTradeConfig) {
         if self.spread_history.len() >= window {
             self.spread_history.pop_front();
@@ -272,5 +314,168 @@ impl PairState {
         }
         let latest = *self.spread_history.back().unwrap();
         Some((latest - mean) / std)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(log_price: f64, ts: i64) -> PriceSample {
+        PriceSample { log_price, ts }
+    }
+
+    fn assert_close(a: f64, b: f64, eps: f64) {
+        assert!(
+            (a - b).abs() < eps,
+            "expected {} ≈ {} (within {})",
+            a,
+            b,
+            eps
+        );
+    }
+
+    #[test]
+    fn rebuild_uses_supplied_beta_for_every_bar() {
+        let mut state = PairState::new(240, 2.0);
+        // Pre-seed with garbage values to prove rebuild overwrites them.
+        state.spread_history.extend([99.0, -42.0, 0.0]);
+        state.last_spread = Some(99.0);
+
+        let hist_a: VecDeque<PriceSample> = (0..10)
+            .map(|i| sample(10.0 + i as f64 * 0.01, 1_000 + i))
+            .collect();
+        let hist_b: VecDeque<PriceSample> = (0..10)
+            .map(|i| sample(7.0 + i as f64 * 0.005, 1_000 + i))
+            .collect();
+
+        state.rebuild_spread_history_with_beta(&hist_a, &hist_b, 240, 0.5);
+
+        assert_eq!(state.spread_history.len(), 10);
+        for (i, spread) in state.spread_history.iter().enumerate() {
+            let expected = hist_a[i].log_price - 0.5 * hist_b[i].log_price;
+            assert_close(*spread, expected, 1e-12);
+        }
+        assert_eq!(state.last_spread, state.spread_history.back().copied());
+    }
+
+    #[test]
+    fn rebuild_clips_to_window_keeping_most_recent_bars() {
+        let mut state = PairState::new(240, 2.0);
+        let hist_a: VecDeque<PriceSample> = (0..500)
+            .map(|i| sample(10.0 + i as f64 * 0.001, 1_000 + i))
+            .collect();
+        let hist_b: VecDeque<PriceSample> = (0..500)
+            .map(|i| sample(7.0 + i as f64 * 0.0005, 1_000 + i))
+            .collect();
+
+        state.rebuild_spread_history_with_beta(&hist_a, &hist_b, 240, 0.8);
+
+        assert_eq!(state.spread_history.len(), 240);
+        // First entry of the rebuilt window should align with the 240-th
+        // bar from the end of the supplied history.
+        let first_idx = hist_a.len() - 240;
+        let expected_first =
+            hist_a[first_idx].log_price - 0.8 * hist_b[first_idx].log_price;
+        assert_close(state.spread_history[0], expected_first, 1e-12);
+        // Last entry aligns with the newest bar.
+        let last = hist_a.len() - 1;
+        let expected_last = hist_a[last].log_price - 0.8 * hist_b[last].log_price;
+        assert_close(*state.spread_history.back().unwrap(), expected_last, 1e-12);
+    }
+
+    #[test]
+    fn rebuild_uses_min_of_two_histories_when_misaligned() {
+        let mut state = PairState::new(240, 2.0);
+        let hist_a: VecDeque<PriceSample> = (0..5)
+            .map(|i| sample(10.0 + i as f64, 1_000 + i))
+            .collect();
+        let hist_b: VecDeque<PriceSample> = (0..3)
+            .map(|i| sample(7.0 + i as f64, 1_000 + i))
+            .collect();
+
+        state.rebuild_spread_history_with_beta(&hist_a, &hist_b, 240, 1.0);
+
+        // Both histories tail-aligned at len=3. So we take the LAST 3 of
+        // each: hist_a[2..5] vs hist_b[0..3].
+        assert_eq!(state.spread_history.len(), 3);
+        let start_a = hist_a.len() - 3;
+        let start_b = hist_b.len() - 3;
+        for i in 0..3 {
+            let expected = hist_a[start_a + i].log_price
+                - 1.0 * hist_b[start_b + i].log_price;
+            assert_close(state.spread_history[i], expected, 1e-12);
+        }
+    }
+
+    #[test]
+    fn rebuild_with_empty_history_clears_state() {
+        let mut state = PairState::new(240, 2.0);
+        state.spread_history.extend([1.0, 2.0, 3.0]);
+        state.last_spread = Some(3.0);
+
+        let empty: VecDeque<PriceSample> = VecDeque::new();
+        let hist_b: VecDeque<PriceSample> = (0..3).map(|i| sample(7.0, i)).collect();
+
+        state.rebuild_spread_history_with_beta(&empty, &hist_b, 240, 0.7);
+
+        assert!(state.spread_history.is_empty());
+        assert_eq!(state.last_spread, None);
+    }
+
+    #[test]
+    fn rebuild_removes_beta_trajectory_mix() {
+        // Reproduce the bot-strategy#274 scenario: push_spread captured
+        // each bar with whatever β was active at push time (mixed-β),
+        // then we re-evaluate β and rebuild. The rebuilt window should
+        // be a pure function of (bars, new β), not of the historical
+        // push-time betas.
+        let mut state = PairState::new(240, 2.0);
+        let hist_a: VecDeque<PriceSample> = (0..6)
+            .map(|i| sample(10.0 + i as f64 * 0.1, 1_000 + i))
+            .collect();
+        let hist_b: VecDeque<PriceSample> = (0..6)
+            .map(|i| sample(7.0 + i as f64 * 0.05, 1_000 + i))
+            .collect();
+
+        // Simulate mixed-β push history: half pushed with β=0.5, half with
+        // β=1.0 (the trajectory bot-strategy#274 observed cross-host).
+        for i in 0..3 {
+            let s = hist_a[i].log_price - 0.5 * hist_b[i].log_price;
+            state.spread_history.push_back(s);
+        }
+        for i in 3..6 {
+            let s = hist_a[i].log_price - 1.0 * hist_b[i].log_price;
+            state.spread_history.push_back(s);
+        }
+
+        // Now rebuild with the "current" β = 0.8. Every entry should
+        // re-evaluate against 0.8, dropping the 0.5/1.0 mix.
+        state.rebuild_spread_history_with_beta(&hist_a, &hist_b, 240, 0.8);
+        for i in 0..6 {
+            let expected = hist_a[i].log_price - 0.8 * hist_b[i].log_price;
+            assert_close(state.spread_history[i], expected, 1e-12);
+        }
+    }
+
+    #[test]
+    fn rebuild_leaves_std_history_untouched() {
+        // std_history is the std-collapse guard's time series of past
+        // full-window stds (bot-strategy#62). Option A explicitly does
+        // NOT touch it — the past observations stay even when we
+        // reinterpret the spread series under a new β.
+        let mut state = PairState::new(240, 2.0);
+        state.std_history.extend([0.1, 0.2, 0.3, 0.4]);
+        let hist_a: VecDeque<PriceSample> = (0..3)
+            .map(|i| sample(10.0 + i as f64, 1_000 + i))
+            .collect();
+        let hist_b: VecDeque<PriceSample> = (0..3)
+            .map(|i| sample(7.0 + i as f64, 1_000 + i))
+            .collect();
+
+        state.rebuild_spread_history_with_beta(&hist_a, &hist_b, 240, 0.9);
+
+        assert_eq!(state.std_history.len(), 4);
+        assert_eq!(state.std_history.iter().copied().collect::<Vec<_>>(), vec![0.1, 0.2, 0.3, 0.4]);
     }
 }
