@@ -150,7 +150,7 @@ def parse_cell(log_path):
                 continue
             m = ZCHECK_RE.search(line)
             if m:
-                zchecks.append((int(m["bts"]), float(m["be"]), float(m["std"])))
+                zchecks.append((int(m["bts"]) // 1000, float(m["be"]), float(m["std"])))
     entries.sort(key=lambda x: x["entry_ts"])
     exits.sort(key=lambda x: x["exit_ts"])
     zchecks.sort(key=lambda x: x[0])
