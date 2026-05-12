@@ -666,24 +666,30 @@ impl PairTradeEngine {
     }
 
     /// Sustained bar-emit-rate canary (bot-strategy#341). Walks
-    /// `bar_emit_log`, drops entries older than 120 s, and warns if any
-    /// tracked symbol is below 0.8 emits/min over the trailing window.
-    /// Rate-limited to one WARN per symbol per 60 s. Designed to surface
-    /// the original Phase 2 β-freeze symptom (≤1 bar / 4 min for 78 h)
-    /// inside half an hour rather than days.
+    /// `bar_emit_log`, drops entries older than the rolling window, and
+    /// warns when emit-rate falls below the jitter floor. Rate-limited
+    /// to one WARN per symbol per 60 s. Designed to surface the original
+    /// Phase 2 β-freeze symptom (≤1 bar / 4 min for 78 h) within
+    /// minutes, but tuned wider than 0.8× expected to ride out 60 s-bar
+    /// cadence jitter (Tokyo Lighter Phase B canary on master 3e997d4,
+    /// 2026-05-12 13:43–15:13 UTC, 2 spurious WARNs at n=1 over 90 s,
+    /// no [BAR_FORCE_CLOSE]).
     pub(in crate::pairtrade) fn check_bar_rate_canary(&mut self) {
         let now = Instant::now();
-        let window = Duration::from_secs(120);
+        // 180 s window + 180 s minimum observation: with Lighter polling
+        // jitter (3.5–6.5 s) the bucket-crossing tick does not always
+        // arrive in the same 60 s slice, so a 120 s window observes n=1
+        // at the jitter floor. 180 s ⇒ jitter floor is n=2 (≈ 0.67 /min).
+        let window = Duration::from_secs(180);
         let warn_cooldown = Duration::from_secs(60);
-        // Avoid noisy warnings while bars are warming up: require at least
-        // 90 s of observation before declaring a sustained low rate.
-        let min_observation = Duration::from_secs(90);
+        let min_observation = Duration::from_secs(180);
 
-        // Bar period in seconds drives the "expected" rate. With
-        // trading_period_secs = 60, expected = 1 bar/min, threshold = 0.8.
+        // Threshold is 2/3 of expected: n=2 over 180 s ≈ 0.67 /min ⇒
+        // healthy (jitter floor); n=1 over 180 s ≈ 0.33 /min ⇒ WARN
+        // (real stall — would also trigger [BAR_FORCE_CLOSE] downstream).
         let period_secs = self.cfg.trading_period_secs.max(1);
         let expected_per_min = 60.0 / period_secs as f64;
-        let threshold_per_min = (expected_per_min * 0.8).max(0.05);
+        let threshold_per_min = (expected_per_min * 2.0 / 3.0).max(0.05);
 
         let symbols: Vec<String> = self.bar_emit_log.keys().cloned().collect();
         for symbol in symbols {
