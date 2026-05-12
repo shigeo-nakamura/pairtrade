@@ -67,6 +67,15 @@ fee_bps: 2.5
 # Raised from 30s to 120s (conservative 4x of tick-ratio) to reduce taker
 # fallbacks while keeping the entry signal fresh. See bot-strategy#165.
 entry_post_only_timeout_secs: 120
+# bot-strategy#306: cap exit-leg fill wait at 30s. After both exit legs are
+# placed as post-only limits, any leg still resting unfilled at this deadline
+# is canceled and re-submitted as a taker. Live audit (4/30-5/9, 16 trades)
+# observed a 29s mean exit leg-sync gap on Extended vs 1-4s on Frankfurt; the
+# unhedged window costs ~3 bps/pair in slippage which dominates the 1.5 bps
+# avg taker-fee saving from waiting. Disabled (=0) reproduces legacy resting-
+# limit behavior. Frankfurt (fee_bps=0) does not enter the post-only path so
+# this knob is a no-op there regardless of value.
+exit_post_only_timeout_secs: 30
 
 spread_velocity_max_sigma_per_min: 0.15
 spread_trend_max_slope_sigma: 1.0
