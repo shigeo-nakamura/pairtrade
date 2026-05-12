@@ -424,24 +424,41 @@ pub(super) fn load_history_from_disk(
     } else {
         // bot-strategy#370 follow-up: dedup the success-path INFO so the
         // per-tick reload in `engine/step.rs:511` doesn't fire ~12 lines/min
-        // on the 5 s polling cadence. Snapshot rollback / restart still
-        // surface in journalctl because `loaded_summary` / `spreads_loaded`
-        // counts change on the new content, flipping `key` away from the
-        // last logged one. Stale-guard and parse-error paths above stay
-        // unconditional so operator-facing failure modes never get muted.
+        // on the 5 s polling cadence. Stale-guard and parse-error paths
+        // above stay unconditional so operator-facing failure modes never
+        // get muted; only the steady-state success spam is suppressed.
         //
-        // The fingerprint must be stable across HashMap iteration order —
-        // `snap.prices` / `snap.spread_histories` are `HashMap`s, so the
-        // raw Debug representation rotates symbol order tick-to-tick and
-        // would defeat the dedup. Sort the summary vectors by key before
-        // serialising so identical content always produces the same key.
+        // Two sources of fingerprint instability defeat a naive dedup:
+        //
+        //   1. HashMap iteration order — `snap.prices` /
+        //      `snap.spread_histories` are `HashMap`s, so the raw Debug
+        //      representation rotates symbol order tick-to-tick. Sort by
+        //      symbol before serialising.
+        //
+        //   2. Per-tick count drift — `load_history_from_disk` filters
+        //      samples by `max_age_ms`, so as wall-clock advances the
+        //      oldest sample slides out of the window and the loaded
+        //      count oscillates by ±1 between persists. Bucket the count
+        //      to the nearest 10 in the fingerprint so this micro-drift
+        //      doesn't keep flipping the key. The emitted log line still
+        //      shows the actual count for operator visibility — only the
+        //      dedup decision uses the bucket.
+        //
+        // A meaningful rollback (e.g. 240-sample → 50-sample snapshot,
+        // or symbol set change) crosses bucket boundaries and emits as
+        // intended; routine ±1 wobble stays quiet.
         let mut sorted_prices = loaded_summary.clone();
         sorted_prices.sort_by(|a, b| a.0.cmp(&b.0));
         let mut sorted_spreads = spreads_loaded.clone();
         sorted_spreads.sort_by(|a, b| a.0.cmp(&b.0));
+        let bucket = |v: &[(String, usize)]| -> Vec<(String, usize)> {
+            v.iter().map(|(s, c)| (s.clone(), c / 10 * 10)).collect()
+        };
         let key = format!(
             "v{} {:?} {:?}",
-            snap.version, sorted_prices, sorted_spreads
+            snap.version,
+            bucket(&sorted_prices),
+            bucket(&sorted_spreads),
         );
         if last_logged_key.as_deref() != Some(key.as_str()) {
             log::info!(
