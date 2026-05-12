@@ -153,17 +153,23 @@ fn cleanup_old_archives(dir: &Path, retention_days: u32) {
     }
 }
 
+/// Result of a successful snapshot parse, carrying the detected schema
+/// version so the caller can include it in its `[WARM_START]` log line.
+#[derive(Debug)]
+struct ParsedSnapshot {
+    version: u32,
+    prices: HashMap<String, Vec<(f64, i64)>>,
+    spread_histories: HashMap<String, Vec<f64>>,
+}
+
 /// Parse the persisted history file, accepting v3 (explicit struct with
 /// ms-precision `ts`), v2 (explicit struct with seconds `ts`, auto-migrated
 /// by × 1000) and legacy v1 (bare per-symbol map, also seconds, auto-migrated).
-/// Returns (prices, spread_histories) with `ts` always normalized to ms.
-fn parse_snapshot_file(
-    path: &std::path::Path,
-) -> Option<(
-    HashMap<String, Vec<(f64, i64)>>,
-    HashMap<String, Vec<f64>>,
-)> {
-    let content = fs::read_to_string(path).ok()?;
+/// Returns a `ParsedSnapshot` with `ts` always normalized to ms, or a
+/// human-readable error string for the caller to log (bot-strategy#370 —
+/// every load outcome must be greppable from journalctl).
+fn parse_snapshot_file(path: &std::path::Path) -> Result<ParsedSnapshot, String> {
+    let content = fs::read_to_string(path).map_err(|e| format!("read failed: {}", e))?;
     // Try the explicit struct first (has `_v` and `prices`).
     if let Ok(snap) = serde_json::from_str::<SnapshotV3>(&content) {
         if snap.version >= 2 {
@@ -172,12 +178,29 @@ fn parse_snapshot_file(
             } else {
                 snap.prices
             };
-            return Some((prices, snap.spread_histories));
+            return Ok(ParsedSnapshot {
+                version: snap.version,
+                prices,
+                spread_histories: snap.spread_histories,
+            });
         }
+        return Err(format!(
+            "schema _v={} not supported (expected 2 or 3, or v1 bare-map)",
+            snap.version
+        ));
     }
     // Fall back to v1 (bare `HashMap<String, Vec<(f64, i64)>>` in seconds).
-    let prices: HashMap<String, Vec<(f64, i64)>> = serde_json::from_str(&content).ok()?;
-    Some((migrate_prices_seconds_to_ms(prices), HashMap::new()))
+    match serde_json::from_str::<HashMap<String, Vec<(f64, i64)>>>(&content) {
+        Ok(prices) => Ok(ParsedSnapshot {
+            version: 1,
+            prices: migrate_prices_seconds_to_ms(prices),
+            spread_histories: HashMap::new(),
+        }),
+        Err(e) => Err(format!(
+            "JSON did not match v2/v3 struct or v1 bare-map shape: {}",
+            e
+        )),
+    }
 }
 
 /// Convert a per-symbol price history whose `ts` field is in Unix seconds
@@ -210,14 +233,23 @@ pub(super) fn load_history_snapshot_for_bt(
     snapshot_path: &std::path::Path,
     max_history_len: usize,
 ) {
-    let Some((prices, spreads)) = parse_snapshot_file(snapshot_path) else {
-        log::warn!(
-            "[BT_WARM_START] failed to read or parse snapshot {}",
-            snapshot_path.display()
-        );
-        return;
+    let snap = match parse_snapshot_file(snapshot_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!(
+                "[BT_WARM_START] failed to read or parse snapshot {}: {}",
+                snapshot_path.display(),
+                e,
+            );
+            return;
+        }
     };
-    for (sym, entries) in prices {
+    log::info!(
+        "[BT_WARM_START] parsed v{} snapshot from {}",
+        snap.version,
+        snapshot_path.display()
+    );
+    for (sym, entries) in snap.prices {
         if entries.is_empty() {
             continue;
         }
@@ -239,7 +271,7 @@ pub(super) fn load_history_snapshot_for_bt(
             history.insert(sym, deque);
         }
     }
-    for (pair_key, series) in spreads {
+    for (pair_key, series) in snap.spread_histories {
         if series.is_empty() {
             continue;
         }
@@ -273,8 +305,29 @@ pub(super) fn load_history_from_disk(
     if cfg.backtest_mode {
         return;
     }
-    let Some((prices, spreads)) = parse_snapshot_file(history_path) else {
+    // bot-strategy#370: every load outcome (no-file / parse-error /
+    // stale-guard rejection / success) must emit an explicit log line, so
+    // operators rolling back a snapshot can confirm at a glance whether
+    // it took. Pre-#370 the success path was silent and the stale-guard
+    // used `log::debug!`, making a rejected rollback indistinguishable
+    // from a successful one without comparing `[ZCHECK] hist=` over time.
+    if !history_path.exists() {
+        log::info!(
+            "[WARM_START] no snapshot at {} — cold start",
+            history_path.display()
+        );
         return;
+    }
+    let snap = match parse_snapshot_file(history_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!(
+                "[WARM_START] snapshot at {} could not be loaded: {} — cold start",
+                history_path.display(),
+                e,
+            );
+            return;
+        }
     };
     // Snapshot ts is ms post bot-strategy#274 / #276; lift `now_ts` (wall-clock
     // seconds) into the same unit before comparing.
@@ -294,14 +347,13 @@ pub(super) fn load_history_from_disk(
         .max(300)
         .saturating_mul(1000);
     let mut any_stale = false;
-    for (sym, entries) in prices {
+    let mut loaded_summary: Vec<(String, usize)> = Vec::new();
+    let mut stale_summary: Vec<(String, i64)> = Vec::new();
+    for (sym, entries) in snap.prices {
         let newest_ts = entries.iter().map(|(_, ts)| *ts).max().unwrap_or(0);
-        if now_ts_ms.saturating_sub(newest_ts) > stale_threshold_ms {
-            log::debug!(
-                "discarding stale persisted history for {}: newest sample {}ms old",
-                sym,
-                now_ts_ms.saturating_sub(newest_ts)
-            );
+        let age_ms = now_ts_ms.saturating_sub(newest_ts);
+        if age_ms > stale_threshold_ms {
+            stale_summary.push((sym, age_ms));
             any_stale = true;
             continue;
         }
@@ -313,6 +365,7 @@ pub(super) fn load_history_from_disk(
             deque.push_back(PriceSample { log_price, ts });
         }
         if !deque.is_empty() {
+            loaded_summary.push((sym.clone(), deque.len()));
             history.insert(sym, deque);
         }
     }
@@ -321,14 +374,60 @@ pub(super) fn load_history_from_disk(
     // freshly-built log_price window. This triggers the cold-start
     // synthesis path in `warm_start_states_from_history`, which is still
     // the fallback for genuinely stale files.
+    let mut spreads_loaded: Vec<(String, usize)> = Vec::new();
     if !any_stale {
-        for (pair_key, series) in spreads {
+        for (pair_key, series) in snap.spread_histories {
             if series.is_empty() {
                 continue;
             }
+            let len = series.len();
             let deque: VecDeque<f64> = series.into_iter().collect();
+            spreads_loaded.push((pair_key.clone(), len));
             spread_histories_out.insert(pair_key, deque);
         }
+    }
+    // bot-strategy#370: emit one of three terminal log lines so operators
+    // can grep on `[WARM_START]` to confirm intent.
+    if !stale_summary.is_empty() && loaded_summary.is_empty() {
+        // Every symbol failed the stale-guard — the canonical failure
+        // mode behind the 2026-05-12 03:51 UTC silent-reject incident.
+        let oldest_min = stale_summary
+            .iter()
+            .map(|(_, a)| *a)
+            .max()
+            .unwrap_or(0)
+            / 60_000;
+        let threshold_min = stale_threshold_ms / 60_000;
+        log::warn!(
+            "[WARM_START] snapshot at {} rejected as stale: v{}, {} symbol(s) all older than {}min (oldest {}min) — cold start. \
+             Roll-back beyond stale-guard is intentional but loses warm start; restart with a fresher backup or accept the warm-up cost.",
+            history_path.display(),
+            snap.version,
+            stale_summary.len(),
+            threshold_min,
+            oldest_min,
+        );
+    } else if !stale_summary.is_empty() {
+        log::warn!(
+            "[WARM_START] snapshot at {} partial-stale: kept {} fresh symbol(s), dropped {} stale; spread_histories discarded (would mismatch refreshed bars)",
+            history_path.display(),
+            loaded_summary.len(),
+            stale_summary.len(),
+        );
+    } else if loaded_summary.is_empty() && spreads_loaded.is_empty() {
+        log::warn!(
+            "[WARM_START] snapshot at {} parsed (v{}) but contained no usable bars — cold start",
+            history_path.display(),
+            snap.version,
+        );
+    } else {
+        log::info!(
+            "[WARM_START] snapshot loaded from {}: v{}, prices={:?}, spread_histories={:?}",
+            history_path.display(),
+            snap.version,
+            loaded_summary,
+            spreads_loaded,
+        );
     }
 }
 
@@ -351,12 +450,16 @@ mod tests {
             "spread_histories": {"BTC/ETH": [0.1, 0.2]}
         }"#;
         let f = write_snapshot(json);
-        let (prices, spreads) = parse_snapshot_file(f.path()).unwrap();
+        let snap = parse_snapshot_file(f.path()).unwrap();
+        assert_eq!(snap.version, 3);
         assert_eq!(
-            prices.get("BTC").unwrap(),
+            snap.prices.get("BTC").unwrap(),
             &vec![(10.5, 1776232919000), (10.6, 1776232979000)]
         );
-        assert_eq!(spreads.get("BTC/ETH").unwrap(), &vec![0.1, 0.2]);
+        assert_eq!(
+            snap.spread_histories.get("BTC/ETH").unwrap(),
+            &vec![0.1, 0.2]
+        );
     }
 
     #[test]
@@ -370,14 +473,18 @@ mod tests {
             "spread_histories": {"BTC/ETH": [0.1, 0.2]}
         }"#;
         let f = write_snapshot(json);
-        let (prices, spreads) = parse_snapshot_file(f.path()).unwrap();
+        let snap = parse_snapshot_file(f.path()).unwrap();
+        assert_eq!(snap.version, 2);
         assert_eq!(
-            prices.get("BTC").unwrap(),
+            snap.prices.get("BTC").unwrap(),
             &vec![(10.5, 1776232919000), (10.6, 1776232979000)],
             "v2 ts must be migrated to ms",
         );
         // spread_histories carry no timestamp, just pass through.
-        assert_eq!(spreads.get("BTC/ETH").unwrap(), &vec![0.1, 0.2]);
+        assert_eq!(
+            snap.spread_histories.get("BTC/ETH").unwrap(),
+            &vec![0.1, 0.2]
+        );
     }
 
     #[test]
@@ -385,11 +492,44 @@ mod tests {
         // v1 was a bare per-symbol map with seconds ts. Same migration path.
         let json = r#"{"BTC": [[10.5, 1776232919], [10.6, 1776232979]]}"#;
         let f = write_snapshot(json);
-        let (prices, spreads) = parse_snapshot_file(f.path()).unwrap();
+        let snap = parse_snapshot_file(f.path()).unwrap();
+        assert_eq!(snap.version, 1);
         assert_eq!(
-            prices.get("BTC").unwrap(),
+            snap.prices.get("BTC").unwrap(),
             &vec![(10.5, 1776232919000), (10.6, 1776232979000)]
         );
-        assert!(spreads.is_empty());
+        assert!(snap.spread_histories.is_empty());
+    }
+
+    #[test]
+    fn parse_unsupported_struct_version_returns_err() {
+        // A struct-shaped file with _v=0 (or any explicit version < 2)
+        // must surface a parse error so the WARM_START log records why.
+        let json = r#"{
+            "_v": 0,
+            "prices": {"BTC": [[10.5, 1776232919]]}
+        }"#;
+        let f = write_snapshot(json);
+        let err = parse_snapshot_file(f.path()).unwrap_err();
+        assert!(err.contains("_v=0"), "got: {}", err);
+    }
+
+    #[test]
+    fn parse_garbage_returns_err() {
+        let f = write_snapshot("not json at all");
+        let err = parse_snapshot_file(f.path()).unwrap_err();
+        assert!(
+            err.contains("JSON did not match"),
+            "expected v1/v2/v3-shape error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_missing_file_returns_err() {
+        let path = std::path::Path::new("/tmp/pairtrade_history_io_test_missing_xyz.json");
+        let _ = std::fs::remove_file(path);
+        let err = parse_snapshot_file(path).unwrap_err();
+        assert!(err.contains("read failed"), "got: {}", err);
     }
 }
