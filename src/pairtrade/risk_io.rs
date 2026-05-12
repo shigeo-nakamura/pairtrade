@@ -44,6 +44,14 @@ pub(super) struct InstanceRiskState {
     /// threshold is deterministic and independent of /account cadence).
     #[serde(default)]
     pub realized_pnl_today: f64,
+    /// Running sum of `funding_carry_usd` from cycles closed during the
+    /// current UTC session (bot-strategy#371). Mirrors `realized_pnl_today`
+    /// in cadence: incremented at exit_fill / exit_dry_run, zeroed on the
+    /// session rollover that also resets `realized_pnl_today`. Surfaced
+    /// in status.json so the dashboard can show today's funding next to
+    /// `pnl_today` for at-a-glance attribution.
+    #[serde(default)]
+    pub funding_carry_today: f64,
     /// Periodic equity samples used to compute the rolling peak for
     /// `max_session_loss_bps` (Phase 3-1). One sample per
     /// `session_dd_sample_secs`; entries older than
@@ -159,5 +167,72 @@ pub(super) fn load_risk_state(path: &Path) -> RiskStateSnapshot {
             log::warn!("[RISK_STATE] parse failed ({}): {:?}", path.display(), e);
             RiskStateSnapshot::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_preserves_funding_carry_today() {
+        // bot-strategy#371: funding_carry_today must persist across restart
+        // alongside realized_pnl_today so the dashboard's per-day funding
+        // attribution survives a bot bounce mid-session.
+        let mut instances = HashMap::new();
+        instances.insert(
+            "a".to_string(),
+            InstanceRiskState {
+                realized_pnl_today: -4.20,
+                funding_carry_today: -0.85,
+                ..InstanceRiskState::default()
+            },
+        );
+        let tmpdir = std::env::temp_dir().join(format!(
+            "risk_io_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::create_dir_all(&tmpdir);
+        let path = tmpdir.join("risk_state.json");
+        persist_risk_state(&path, Some("test-round"), &instances);
+
+        let loaded = load_risk_state(&path);
+        let restored = loaded.instances.get("a").expect("instance present");
+        assert!(
+            (restored.funding_carry_today - (-0.85)).abs() < 1e-9,
+            "funding_carry_today round-trip mismatch: {}",
+            restored.funding_carry_today
+        );
+        assert!(
+            (restored.realized_pnl_today - (-4.20)).abs() < 1e-9,
+            "realized_pnl_today round-trip mismatch: {}",
+            restored.realized_pnl_today
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&tmpdir);
+    }
+
+    #[test]
+    fn missing_funding_carry_field_defaults_to_zero() {
+        // Older risk_state.json written by binaries before #371 lands.
+        // The new field must read as 0.0 via #[serde(default)] so the
+        // first post-upgrade restart isn't a parse failure.
+        let json = r#"{
+            "_v": 2,
+            "round_id": "test",
+            "instances": {
+                "a": {
+                    "consecutive_losses": 0,
+                    "realized_pnl_today": -1.5
+                }
+            }
+        }"#;
+        let snap: RiskStateSnapshot = serde_json::from_str(json)
+            .expect("legacy snapshot parses with new field defaulted");
+        let inst = snap.instances.get("a").expect("instance present");
+        assert_eq!(inst.funding_carry_today, 0.0);
+        assert!((inst.realized_pnl_today - (-1.5)).abs() < 1e-9);
     }
 }

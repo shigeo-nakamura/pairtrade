@@ -132,6 +132,7 @@ impl PairTradeEngine {
             inst.session_start_equity = state.session_start_equity;
             inst.session_start_ts = state.session_start_ts;
             inst.realized_pnl_today = state.realized_pnl_today;
+            inst.funding_carry_today = state.funding_carry_today;
             inst.equity_samples = state.equity_samples.clone();
             inst.session_halted = state.session_halted;
             inst.session_halt_reason = state.session_halt_reason.clone();
@@ -225,6 +226,7 @@ impl PairTradeEngine {
                         session_start_equity: inst.session_start_equity,
                         session_start_ts: inst.session_start_ts,
                         realized_pnl_today: inst.realized_pnl_today,
+                        funding_carry_today: inst.funding_carry_today,
                         equity_samples: inst.equity_samples.clone(),
                         session_halted: inst.session_halted,
                         session_halt_reason: inst.session_halt_reason.clone(),

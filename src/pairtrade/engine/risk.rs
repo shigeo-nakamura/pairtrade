@@ -234,6 +234,7 @@ impl PairTradeEngine {
                 inst.session_start_ts = now_ts;
                 inst.session_start_equity = equity_base;
                 inst.realized_pnl_today = 0.0;
+                inst.funding_carry_today = 0.0;
                 if inst.daily_loss_halted {
                     log::warn!(
                         "[DAILY_DD] {} halt cleared by session rollover", inst.id

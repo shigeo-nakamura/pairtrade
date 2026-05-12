@@ -140,6 +140,15 @@ struct StrategyInstance {
     session_start_equity: f64,
     session_start_ts: i64,
     realized_pnl_today: f64,
+    /// Running sum of `funding_carry_usd` from cycles closed during the
+    /// current UTC session. Updated at exit_fill / exit_dry_run when the
+    /// cycle's funding carry was measured (`with_funding(...)` was called
+    /// on the PnlLogRecord). Reset at the same session rollover as
+    /// `realized_pnl_today`. Persisted via `InstanceRiskState` so it
+    /// survives restarts within a single UTC day. Surfaced on
+    /// status.json as `funding_carry_today` for dashboard attribution.
+    /// bot-strategy#371.
+    funding_carry_today: f64,
     /// True once `realized_pnl_today` has breached
     /// `max_daily_loss_bps`. Used for transition logging only
     /// (activate/clear); the live gate check is recomputed every tick
@@ -384,6 +393,7 @@ impl PairTradeEngine {
                 session_start_equity: 0.0,
                 session_start_ts: 0,
                 realized_pnl_today: 0.0,
+                funding_carry_today: 0.0,
                 daily_loss_halted: false,
                 equity_samples: Vec::new(),
                 session_halted: false,
@@ -1180,6 +1190,7 @@ impl PairTradeEngine {
                 session_start_equity: 0.0,
                 session_start_ts: 0,
                 realized_pnl_today: 0.0,
+                funding_carry_today: 0.0,
                 daily_loss_halted: false,
                 equity_samples: Vec::new(),
                 session_halted: false,

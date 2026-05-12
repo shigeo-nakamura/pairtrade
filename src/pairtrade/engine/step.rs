@@ -1442,6 +1442,7 @@ impl PairTradeEngine {
                             }
                             self.write_pnl_record(inst_idx, record);
                             self.instances[inst_idx].realized_pnl_today += pnl_value;
+                            self.instances[inst_idx].funding_carry_today += carry_usd;
                             // write_pnl_record always bumps total_trades / total_pnl
                             // (now persisted, bot-strategy#320), so the snapshot is
                             // dirty regardless of pnl sign.
@@ -1768,11 +1769,13 @@ impl PairTradeEngine {
             let session_risk = self.session_risk_snapshot(inst_idx);
             let circuit_breaker = self.circuit_breaker_snapshot(inst_idx);
             let kill_switch_active = self.kill_switch_active;
+            let funding_today = self.instances[inst_idx].funding_carry_today;
             if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
                 reporter.set_daily_risk(risk);
                 reporter.set_session_risk(session_risk);
                 reporter.set_circuit_breaker(circuit_breaker);
                 reporter.set_kill_switch(kill_switch_active);
+                reporter.set_funding_today(funding_today);
                 if let Err(err) =
                     reporter.write_snapshot_if_due(&self.open_positions, self.positions_ready)
                 {

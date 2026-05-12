@@ -57,6 +57,11 @@ pub(super) struct StatusReporter {
     pub(super) pnl_total: f64,
     pub(super) pnl_today: f64,
     pub(super) pnl_today_date: NaiveDate,
+    /// Today's per-cycle funding carry sum, pushed each tick by the
+    /// engine from `StrategyInstance.funding_carry_today`. Surfaced on
+    /// status.json so the dashboard can render funding attribution
+    /// alongside `pnl_today`. bot-strategy#371.
+    pub(super) funding_carry_today: f64,
     pub(super) equity_day_start: f64,
     pub(super) equity_day_start_set: bool,
     pub(super) equity_baseline_path: PathBuf,
@@ -236,6 +241,11 @@ pub(super) struct StatusSnapshot {
     pub(super) pnl_total: f64,
     pub(super) pnl_today: f64,
     pub(super) pnl_source: String,
+    /// Today's per-cycle funding carry sum. Same UTC-day window as
+    /// `pnl_today`. Always emitted (defaults to 0.0 when no cycles have
+    /// closed today) so the dashboard distinguishes "0 funding today"
+    /// from "field missing on an older binary". bot-strategy#371.
+    pub(super) funding_carry_today: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) trade_stats: Option<PairTradeStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -429,6 +439,7 @@ impl StatusReporter {
             pnl_total: 0.0,
             pnl_today: 0.0,
             pnl_today_date: Utc::now().date_naive(),
+            funding_carry_today: 0.0,
             equity_day_start: 0.0,
             equity_day_start_set: false,
             equity_baseline_path,
@@ -659,6 +670,14 @@ impl StatusReporter {
         self.kill_switch_active = active;
     }
 
+    /// Push today's per-cycle funding carry sum from
+    /// `StrategyInstance.funding_carry_today` into the next status
+    /// snapshot. Called once per tick from the engine. See
+    /// bot-strategy#371.
+    pub(super) fn set_funding_today(&mut self, value: f64) {
+        self.funding_carry_today = value;
+    }
+
     pub(super) fn write_snapshot(
         &mut self,
         open_positions: &HashMap<String, PositionSnapshot>,
@@ -696,6 +715,7 @@ impl StatusReporter {
             pnl_total: self.pnl_total,
             pnl_today: self.pnl_today,
             pnl_source: "equity".to_string(),
+            funding_carry_today: self.funding_carry_today,
             trade_stats: self.trade_stats.clone(),
             maintenance: self.maintenance.clone(),
             shutdown: self.shutdown.clone(),

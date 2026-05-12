@@ -348,7 +348,10 @@ impl PairTradeEngine {
             let mut pending = pending;
             self.update_pending_fills(&mut pending, &status.fills);
             let filled_qtys = self.filled_by_leg(&pending, &status.fills);
-            let mut pnl_record: Option<(PnlLogRecord, f64)> = None;
+            // (record, realized_pnl, funding_carry_usd) — the third element
+            // is folded into `inst.funding_carry_today` at the same site as
+            // `realized_pnl_today` below. 0.0 when no ticks were observed.
+            let mut pnl_record: Option<(PnlLogRecord, f64, f64)> = None;
             if status.open_remaining == 0 && self.all_filled(&pending, &status.fills) {
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     if let Some(pos) = state.position.as_ref() {
@@ -406,7 +409,7 @@ impl PairTradeEngine {
                                     if ticks_observed > 0 {
                                         record = record.with_funding(carry_usd, ticks_observed);
                                     }
-                                    pnl_record = Some((record, pnl));
+                                    pnl_record = Some((record, pnl, carry_usd));
                                 }
                             }
                         }
@@ -415,9 +418,10 @@ impl PairTradeEngine {
                     state.pending_exit = None;
                 }
                 log::info!("[ORDER] {} exit orders filled", key);
-                if let Some((record, pnl_value)) = pnl_record {
+                if let Some((record, pnl_value, funding_value)) = pnl_record {
                     self.write_pnl_record(inst_idx, record);
                     self.instances[inst_idx].realized_pnl_today += pnl_value;
+                    self.instances[inst_idx].funding_carry_today += funding_value;
                     // write_pnl_record always bumps total_trades / total_pnl
                     // (now persisted, bot-strategy#320), so the snapshot is
                     // dirty regardless of pnl sign.
