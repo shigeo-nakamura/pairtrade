@@ -921,16 +921,33 @@ impl PairTradeEngine {
             // comparison across A/B/C bots running the same pair: if buckets are
             // properly aligned, identical bucket_ts rows should show identical
             // close/beta/mean/std/z values across processes. See pairtrade#4.
+            // bar_first_a / bar_first_b expose the rolling deque's front bucket_ts
+            // for both symbols so cross-host divergence (bot-strategy#274) can be
+            // attributed to bar-window misalignment vs. β-trajectory drift.
+            let base_first_ts = self
+                .history
+                .get(&pair.base)
+                .and_then(|h| h.front())
+                .map(|s| s.ts);
+            let quote_first_ts = self
+                .history
+                .get(&pair.quote)
+                .and_then(|h| h.front())
+                .map(|s| s.ts);
             let base_bar = self.history.get(&pair.base).and_then(|h| h.back()).cloned();
             let quote_bar = self.history.get(&pair.quote).and_then(|h| h.back()).cloned();
             if let (Some(ba), Some(bq)) = (base_bar, quote_bar) {
                 if let Some((z, std, mean, latest)) = z_snapshot {
                     log::info!(
-                        "[ZCHECK] {} bucket_ts={} close_a={:.6} close_b={:.6} \
+                        "[ZCHECK] {} bucket_ts={} bar_first_a={} bar_first_b={} bar_last_b={} \
+                         close_a={:.6} close_b={:.6} \
                          beta_eff={:.4} beta_s={:.4} beta_l={:.4} mean={:.6} std={:.6} \
                          spread={:.6} z={:.4} hist={}",
                         key,
                         ba.ts,
+                        base_first_ts.unwrap_or(0),
+                        quote_first_ts.unwrap_or(0),
+                        bq.ts,
                         ba.log_price,
                         bq.log_price,
                         beta_eff,
