@@ -429,17 +429,27 @@ pub(super) fn load_history_from_disk(
         // counts change on the new content, flipping `key` away from the
         // last logged one. Stale-guard and parse-error paths above stay
         // unconditional so operator-facing failure modes never get muted.
+        //
+        // The fingerprint must be stable across HashMap iteration order —
+        // `snap.prices` / `snap.spread_histories` are `HashMap`s, so the
+        // raw Debug representation rotates symbol order tick-to-tick and
+        // would defeat the dedup. Sort the summary vectors by key before
+        // serialising so identical content always produces the same key.
+        let mut sorted_prices = loaded_summary.clone();
+        sorted_prices.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut sorted_spreads = spreads_loaded.clone();
+        sorted_spreads.sort_by(|a, b| a.0.cmp(&b.0));
         let key = format!(
             "v{} {:?} {:?}",
-            snap.version, loaded_summary, spreads_loaded
+            snap.version, sorted_prices, sorted_spreads
         );
         if last_logged_key.as_deref() != Some(key.as_str()) {
             log::info!(
                 "[WARM_START] snapshot loaded from {}: v{}, prices={:?}, spread_histories={:?}",
                 history_path.display(),
                 snap.version,
-                loaded_summary,
-                spreads_loaded,
+                sorted_prices,
+                sorted_spreads,
             );
             *last_logged_key = Some(key);
         }
