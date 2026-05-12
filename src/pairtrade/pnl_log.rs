@@ -50,6 +50,21 @@ pub(super) struct PnlLogRecord {
     /// bot-strategy#269 Phase 3.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) size: Option<f64>,
+    /// Net funding paid (negative) or received (positive) over the cycle.
+    /// Computed by walking the rolling WS funding-rate history per leg
+    /// during `[entry_ts, exit_ts)`; per-leg notionals captured at entry.
+    /// Sign convention follows `market::net_funding_for_direction` (the
+    /// bot's existing per-tick log line) so they reconcile. Field is added
+    /// at exit time only — `None` on records that pre-date the cycle's
+    /// entry or on `startup_force_close`. bot-strategy#364.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) funding_carry_usd: Option<f64>,
+    /// Number of hourly funding ticks observed across both legs during the
+    /// hold (`base_ticks + quote_ticks`). Divide by 2 to approximate hours
+    /// of coverage. Useful for spotting cycles where the WS lost ticks and
+    /// `funding_carry_usd` undercounts. bot-strategy#364.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) funding_ticks_observed: Option<u32>,
 }
 
 pub(super) struct PnlLogger {
@@ -275,6 +290,8 @@ pub(super) fn log_startup_force_close(
             z_exit: None,
             hold_secs: None,
             size: Some(size),
+            funding_carry_usd: None,
+            funding_ticks_observed: None,
         };
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -335,7 +352,19 @@ impl PnlLogRecord {
             z_exit: None,
             hold_secs: None,
             size: None,
+            funding_carry_usd: None,
+            funding_ticks_observed: None,
         }
+    }
+
+    pub(super) fn with_funding(
+        mut self,
+        carry_usd: f64,
+        ticks_observed: u32,
+    ) -> Self {
+        self.funding_carry_usd = Some(carry_usd);
+        self.funding_ticks_observed = Some(ticks_observed);
+        self
     }
 
     pub(super) fn with_trade_details(
