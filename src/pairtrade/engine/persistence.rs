@@ -98,31 +98,15 @@ impl PairTradeEngine {
             return;
         }
         let configured = self.cfg.round_id.as_deref();
-        let persisted = snapshot.round_id.as_deref();
-        let transition = matches!((configured, persisted),
-            (Some(new), Some(old)) if new != old);
-        if transition {
+        let persisted_for_log = snapshot.round_id.clone();
+        if snapshot.apply_round_transition(configured) {
             let inst_ids: Vec<String> = snapshot.instances.keys().cloned().collect();
             log::warn!(
                 "[ROUND_ID] transition {:?} -> {:?}; resetting round-bound state for instances={:?}",
-                persisted.unwrap_or(""),
+                persisted_for_log.as_deref().unwrap_or(""),
                 configured.unwrap_or(""),
                 inst_ids,
             );
-            for state in snapshot.instances.values_mut() {
-                state.consecutive_losses = 0;
-                state.circuit_breaker_until_ts = None;
-                state.last_stop_loss_per_pair.clear();
-                state.equity_samples.clear();
-                state.session_halted = false;
-                state.session_halt_reason = None;
-                state.session_halt_ts = None;
-                state.total_trades = 0;
-                state.total_wins = 0;
-                state.total_pnl = 0.0;
-                state.peak_pnl = 0.0;
-                state.max_dd = 0.0;
-            }
         }
         let loaded = snapshot.instances;
         let now_ts = self.current_now_ts();

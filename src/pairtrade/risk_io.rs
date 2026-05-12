@@ -92,6 +92,27 @@ pub(super) struct InstanceRiskState {
     pub max_dd: f64,
 }
 
+impl InstanceRiskState {
+    /// Clear fields that should not survive a Round N → N+1 transition.
+    /// Session-rolling fields (`session_start_*`, `realized_pnl_today`,
+    /// `funding_carry_today`) are deliberately not reset — those have
+    /// their own daily-rolling lifecycle. bot-strategy#354.
+    pub(super) fn reset_round_bound(&mut self) {
+        self.consecutive_losses = 0;
+        self.circuit_breaker_until_ts = None;
+        self.last_stop_loss_per_pair.clear();
+        self.equity_samples.clear();
+        self.session_halted = false;
+        self.session_halt_reason = None;
+        self.session_halt_ts = None;
+        self.total_trades = 0;
+        self.total_wins = 0;
+        self.total_pnl = 0.0;
+        self.peak_pnl = 0.0;
+        self.max_dd = 0.0;
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub(super) struct EquitySample {
     pub ts: i64,
@@ -119,6 +140,29 @@ pub(super) struct RiskStateSnapshot {
     pub round_id: Option<String>,
     #[serde(default)]
     pub instances: HashMap<String, InstanceRiskState>,
+}
+
+impl RiskStateSnapshot {
+    /// If a Round N → N+1 transition is implied by the configured vs
+    /// persisted `round_id` (both `Some` and different), clear round-bound
+    /// fields on every persisted instance and return `true`. Returns
+    /// `false` (no-op) in every other case — including initial opt-in
+    /// (`persisted = None`, `configured = Some`) and operator backing out
+    /// the field (`configured = None`). For the initial opt-in path the
+    /// operator must run `scripts/reset-round-state.sh` once. bot-strategy#354.
+    pub(super) fn apply_round_transition(&mut self, configured: Option<&str>) -> bool {
+        let persisted = self.round_id.as_deref();
+        let transition = matches!(
+            (configured, persisted),
+            (Some(new), Some(old)) if new != old
+        );
+        if transition {
+            for state in self.instances.values_mut() {
+                state.reset_round_bound();
+            }
+        }
+        transition
+    }
 }
 
 pub(super) fn persist_risk_state(
@@ -212,6 +256,123 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&tmpdir);
+    }
+
+    fn populated_instance() -> InstanceRiskState {
+        let mut s = InstanceRiskState::default();
+        s.consecutive_losses = 3;
+        s.circuit_breaker_until_ts = Some(1_234_567_890);
+        s.last_stop_loss_per_pair.insert(
+            "BTC/ETH".to_string(),
+            StopLossMark { direction: PositionDirection::LongSpread, ts: 1_234_567_000 },
+        );
+        s.session_start_equity = 500.0;
+        s.session_start_ts = 1_700_000_000;
+        s.realized_pnl_today = -4.20;
+        s.funding_carry_today = -0.85;
+        s.equity_samples.push(EquitySample { ts: 1_700_000_000, equity: 500.0 });
+        s.session_halted = true;
+        s.session_halt_reason = Some("session_dd_500bps".to_string());
+        s.session_halt_ts = Some(1_700_000_500);
+        s.total_trades = 42;
+        s.total_wins = 30;
+        s.total_pnl = 12.5;
+        s.peak_pnl = 18.0;
+        s.max_dd = -5.5;
+        s
+    }
+
+    #[test]
+    fn reset_round_bound_clears_round_fields_preserves_session_fields() {
+        // bot-strategy#354: the round-transition reset must zero
+        // round-lifetime state (trade stats, halt flags, cool-down anchors,
+        // equity samples) but leave session-rolling fields alone so a
+        // mid-session round flip doesn't lose today's PnL accounting.
+        let mut s = populated_instance();
+        s.reset_round_bound();
+
+        // round-bound fields zeroed
+        assert_eq!(s.consecutive_losses, 0);
+        assert_eq!(s.circuit_breaker_until_ts, None);
+        assert!(s.last_stop_loss_per_pair.is_empty());
+        assert!(s.equity_samples.is_empty());
+        assert!(!s.session_halted);
+        assert_eq!(s.session_halt_reason, None);
+        assert_eq!(s.session_halt_ts, None);
+        assert_eq!(s.total_trades, 0);
+        assert_eq!(s.total_wins, 0);
+        assert_eq!(s.total_pnl, 0.0);
+        assert_eq!(s.peak_pnl, 0.0);
+        assert_eq!(s.max_dd, 0.0);
+
+        // session-rolling fields preserved (have their own daily lifecycle)
+        assert_eq!(s.session_start_equity, 500.0);
+        assert_eq!(s.session_start_ts, 1_700_000_000);
+        assert!((s.realized_pnl_today - (-4.20)).abs() < 1e-9);
+        assert!((s.funding_carry_today - (-0.85)).abs() < 1e-9);
+    }
+
+    fn make_snapshot(round_id: Option<&str>) -> RiskStateSnapshot {
+        let mut snap = RiskStateSnapshot::default();
+        snap.version = 2;
+        snap.round_id = round_id.map(|s| s.to_string());
+        snap.instances.insert("a".to_string(), populated_instance());
+        snap.instances.insert("b".to_string(), populated_instance());
+        snap
+    }
+
+    #[test]
+    fn apply_round_transition_matrix() {
+        // bot-strategy#354 conservative transition policy: reset fires ONLY
+        // when configured and persisted are both Some and differ. Initial
+        // opt-in (persisted=None) and operator backing out (configured=None)
+        // are no-ops; in those cases the operator runs reset-round-state.sh
+        // explicitly.
+        for (configured, persisted, expected_fire, label) in [
+            (None,       None,      false, "(None, None)"),
+            (Some("a"),  None,      false, "(Some(a), None) — initial opt-in"),
+            (None,       Some("a"), false, "(None, Some(a)) — operator removed round_id"),
+            (Some("a"),  Some("a"), false, "(Some(a), Some(a)) — same round"),
+            (Some("a"),  Some("b"), true,  "(Some(a), Some(b)) — transition"),
+        ] {
+            let mut snap = make_snapshot(persisted);
+            let fired = snap.apply_round_transition(configured);
+            assert_eq!(fired, expected_fire, "case {label}: fired mismatch");
+
+            let inst = snap.instances.get("a").expect("instance present");
+            if expected_fire {
+                assert_eq!(inst.total_trades, 0, "case {label}: round fields not reset");
+                assert_eq!(inst.consecutive_losses, 0, "case {label}: counter not reset");
+            } else {
+                assert_eq!(inst.total_trades, 42, "case {label}: round fields wrongly reset");
+                assert_eq!(inst.consecutive_losses, 3, "case {label}: counter wrongly reset");
+            }
+            // round_id itself is not touched by the reset — only instance
+            // fields are. Caller (engine/persistence.rs) rewrites round_id
+            // on the next persist_risk_state.
+            assert_eq!(
+                snap.round_id.as_deref(),
+                persisted,
+                "case {label}: round_id should not be mutated by transition",
+            );
+        }
+    }
+
+    #[test]
+    fn apply_round_transition_resets_every_instance() {
+        // Multi-instance snapshot (A/B/C-style live deployment): the reset
+        // must hit every instance, not just one. Otherwise inheritance
+        // pollution survives on the un-reset instance.
+        let mut snap = make_snapshot(Some("round-3"));
+        let fired = snap.apply_round_transition(Some("round-4"));
+        assert!(fired);
+        for (id, inst) in &snap.instances {
+            assert_eq!(inst.total_trades, 0, "instance {id}: not reset");
+            assert_eq!(inst.total_wins, 0, "instance {id}: not reset");
+            assert_eq!(inst.consecutive_losses, 0, "instance {id}: not reset");
+            assert!(inst.last_stop_loss_per_pair.is_empty(), "instance {id}: stop-loss anchors not cleared");
+            assert!(inst.equity_samples.is_empty(), "instance {id}: equity samples not cleared");
+        }
     }
 
     #[test]
