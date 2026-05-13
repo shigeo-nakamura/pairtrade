@@ -161,6 +161,22 @@ impl PairTradeEngine {
             Ok(resp) => {
                 if let Some(eq) = resp.equity.to_f64() {
                     let inst = &mut self.instances[inst_idx];
+                    // bot-strategy#382: a 0-valued reading during the pre-init
+                    // warm-up window is the dex-connector's WS-derived balance
+                    // cache being empty (no account dump yet), not a real
+                    // wallet balance. Pre-fix this raced `update_equity(0)`
+                    // into the status reporter, which locked
+                    // `equity_day_start = 0` for the rest of the UTC day and
+                    // surfaced `pnl_today = +<full equity>` on the dashboard
+                    // (observed on Tokyo Lighter B/C after the 2026-05-13
+                    // 06:50 UTC restart: pnl_today = +$150 with no trades).
+                    // Skip writes until the first positive equity lands.
+                    // Post-init zero readings ARE accepted — a genuinely
+                    // rekt bot should still surface on dashboards.
+                    if eq <= 0.0 && !inst.equity_initialized {
+                        inst.last_equity_fetch = Some(Instant::now());
+                        return;
+                    }
                     inst.equity_cache = eq.max(0.0);
                     inst.last_equity_fetch = Some(Instant::now());
                     // bot-strategy#366: arm the session-DD gate only after a

@@ -1994,6 +1994,87 @@ mod pending_tests {
         );
     }
 
+    // bot-strategy#382: dex-connector's WS-derived balance cache can return
+    // Ok(equity=0) for the first few `get_balance` calls after restart,
+    // before the first account dump lands. Pre-fix this propagated to
+    // `reporter.update_equity(0)`, locking `equity_day_start = 0` for the
+    // rest of the UTC day, and surfacing `pnl_today = +<full equity>` on
+    // the dashboard once the real balance arrived. Observed live on Tokyo
+    // Lighter B/C after the 2026-05-13 06:50 UTC restart: pnl_today=+$150
+    // with no trades executed.
+    //
+    // The companion to bot-strategy#366 is to drop the 0-valued reading
+    // entirely during the pre-init window; once the gate flips on the
+    // first positive equity, subsequent 0 readings ARE accepted (a
+    // genuinely rekt bot should be reflected on dashboards).
+    #[tokio::test]
+    async fn fetch_equity_rest_drops_zero_reading_before_init() {
+        let connector = Arc::new(DummyConnector::default());
+        // Phase 1: WS cache empty — connector returns equity=0.
+        *connector.balance_equity.lock().unwrap() = Some(Decimal::from(0));
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        let seed_cache = engine.instances[0].equity_cache;
+        assert!(
+            !engine.instances[0].equity_initialized,
+            "test_instance must start uninitialized"
+        );
+
+        engine.fetch_equity_rest(0).await;
+
+        // The connector was hit (the function did not short-circuit), but
+        // the 0 reading must not have armed the init flag, must not have
+        // overwritten the seed cache, and must have left `last_equity_fetch`
+        // populated so the refresh-cooldown timer still advances.
+        assert_eq!(
+            connector.balance_calls.load(Ordering::SeqCst),
+            1,
+            "fetch_equity_rest must hit the connector"
+        );
+        assert!(
+            !engine.instances[0].equity_initialized,
+            "0-valued reading must not arm equity_initialized"
+        );
+        assert!(
+            (engine.instances[0].equity_cache - seed_cache).abs() < 1e-9,
+            "0-valued reading must not overwrite equity_cache"
+        );
+        assert!(
+            engine.instances[0].last_equity_fetch.is_some(),
+            "last_equity_fetch must still be updated to advance the cooldown",
+        );
+
+        // Phase 2: WS dump lands — connector returns equity=150. The gate
+        // releases and the normal init path runs.
+        *connector.balance_equity.lock().unwrap() = Some(Decimal::from(150));
+        engine.fetch_equity_rest(0).await;
+
+        assert_eq!(
+            connector.balance_calls.load(Ordering::SeqCst),
+            2,
+            "second call also hits the connector"
+        );
+        assert!(
+            engine.instances[0].equity_initialized,
+            "post-init: equity_initialized must arm on first positive equity"
+        );
+        assert!(
+            (engine.instances[0].equity_cache - 150.0).abs() < 1e-9,
+            "equity_cache must hold the real balance"
+        );
+
+        // Phase 3: post-init, a 0 reading IS accepted — a rekt bot's
+        // dashboard must reflect the loss rather than silently pin to
+        // the last positive value.
+        *connector.balance_equity.lock().unwrap() = Some(Decimal::from(0));
+        engine.fetch_equity_rest(0).await;
+
+        assert_eq!(connector.balance_calls.load(Ordering::SeqCst), 3);
+        assert!(
+            (engine.instances[0].equity_cache - 0.0).abs() < 1e-9,
+            "post-init: 0-valued reading IS accepted (bot may legitimately be at 0)"
+        );
+    }
+
     // bot-strategy#354: configured round_id != persisted round_id triggers a
     // reset of round-bound per-instance fields at engine startup, while
     // session-rolling fields (session_start_*, realized_pnl_today) survive.
