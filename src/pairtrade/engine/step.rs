@@ -1162,30 +1162,18 @@ impl PairTradeEngine {
                     .get_mut(&key)
                     .ok_or_else(|| anyhow!("missing state for {}", key))?;
                 if let Some(ref eval) = eval {
-                    let chosen_beta = if self.cfg.use_kalman_beta {
-                        match state.kalman.as_ref() {
-                            Some(kf) if kf.is_warm(self.cfg.kalman_min_updates) => kf.beta,
-                            _ => eval.beta_eff,
+                    if self.cfg.use_kalman_beta {
+                        if let Some(ref kf) = state.kalman {
+                            if kf.is_warm(self.cfg.kalman_min_updates) {
+                                state.beta = kf.beta;
+                            } else {
+                                state.beta = eval.beta_eff;
+                            }
+                        } else {
+                            state.beta = eval.beta_eff;
                         }
                     } else {
-                        eval.beta_eff
-                    };
-                    state.beta = chosen_beta;
-                    // bot-strategy#274 Option A: rebuild spread_history with the
-                    // freshly-chosen β so the rolling window stops accumulating
-                    // β-trajectory drift between evaluate_pair fires (which fire
-                    // on independent cadence across A/B/C instances and across
-                    // hosts).
-                    if let (Some(ha), Some(hb)) = (
-                        self.history.get(&pair.base),
-                        self.history.get(&pair.quote),
-                    ) {
-                        state.rebuild_spread_history_with_beta(
-                            ha,
-                            hb,
-                            self.cfg.metrics_window,
-                            chosen_beta,
-                        );
+                        state.beta = eval.beta_eff;
                     }
                     state.beta_short = eval.beta_short;
                     state.beta_long = eval.beta_long;
