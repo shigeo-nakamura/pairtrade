@@ -313,20 +313,37 @@ pub(super) fn load_history_from_disk(
     // used `log::debug!`, making a rejected rollback indistinguishable
     // from a successful one without comparing `[ZCHECK] hist=` over time.
     if !history_path.exists() {
-        log::info!(
-            "[WARM_START] no snapshot at {} — cold start",
-            history_path.display()
-        );
+        // bot-strategy#377: dedup the no-file INFO. On a fresh state dir
+        // the file does not exist until the first persist tick lands, so
+        // the per-tick loader would emit this INFO every 5 s in between
+        // (≥ once before the first save). Operators only need one
+        // "starting cold" line per missing-file episode.
+        let key = String::from("no_snapshot");
+        if last_logged_key.as_deref() != Some(key.as_str()) {
+            log::info!(
+                "[WARM_START] no snapshot at {} — cold start",
+                history_path.display()
+            );
+            *last_logged_key = Some(key);
+        }
         return;
     }
     let snap = match parse_snapshot_file(history_path) {
         Ok(s) => s,
         Err(e) => {
-            log::warn!(
-                "[WARM_START] snapshot at {} could not be loaded: {} — cold start",
-                history_path.display(),
-                e,
-            );
+            // bot-strategy#377: dedup parse-error WARN. The function runs
+            // per-tick (engine/step.rs:511) so a corrupt file would emit
+            // 12 lines/min until manually replaced; only re-emit when the
+            // error text actually changes.
+            let key = format!("parse_error:{}", e);
+            if last_logged_key.as_deref() != Some(key.as_str()) {
+                log::warn!(
+                    "[WARM_START] snapshot at {} could not be loaded: {} — cold start",
+                    history_path.display(),
+                    e,
+                );
+                *last_logged_key = Some(key);
+            }
             return;
         }
     };
@@ -389,38 +406,66 @@ pub(super) fn load_history_from_disk(
     }
     // bot-strategy#370: emit one of three terminal log lines so operators
     // can grep on `[WARM_START]` to confirm intent.
+    // bot-strategy#377: dedup non-success WARNs the same way as the
+    // success path below. `load_history_from_disk` runs per-tick, so a
+    // cold-start / partial-stale / empty-snapshot state would otherwise
+    // emit 12 lines/min × hours until a fresher snapshot lands. Each
+    // outcome picks a fingerprint that captures the operationally
+    // meaningful signal (outcome category + version + symbol counts)
+    // so a genuine transition still re-emits.
     if !stale_summary.is_empty() && loaded_summary.is_empty() {
         // Every symbol failed the stale-guard — the canonical failure
         // mode behind the 2026-05-12 03:51 UTC silent-reject incident.
-        let oldest_min = stale_summary
-            .iter()
-            .map(|(_, a)| *a)
-            .max()
-            .unwrap_or(0)
-            / 60_000;
-        let threshold_min = stale_threshold_ms / 60_000;
-        log::warn!(
-            "[WARM_START] snapshot at {} rejected as stale: v{}, {} symbol(s) all older than {}min (oldest {}min) — cold start. \
-             Roll-back beyond stale-guard is intentional but loses warm start; restart with a fresher backup or accept the warm-up cost.",
-            history_path.display(),
+        let key = format!(
+            "rejected_all:v{}:n{}",
             snap.version,
             stale_summary.len(),
-            threshold_min,
-            oldest_min,
         );
+        if last_logged_key.as_deref() != Some(key.as_str()) {
+            let oldest_min = stale_summary
+                .iter()
+                .map(|(_, a)| *a)
+                .max()
+                .unwrap_or(0)
+                / 60_000;
+            let threshold_min = stale_threshold_ms / 60_000;
+            log::warn!(
+                "[WARM_START] snapshot at {} rejected as stale: v{}, {} symbol(s) all older than {}min (oldest {}min) — cold start. \
+                 Roll-back beyond stale-guard is intentional but loses warm start; restart with a fresher backup or accept the warm-up cost.",
+                history_path.display(),
+                snap.version,
+                stale_summary.len(),
+                threshold_min,
+                oldest_min,
+            );
+            *last_logged_key = Some(key);
+        }
     } else if !stale_summary.is_empty() {
-        log::warn!(
-            "[WARM_START] snapshot at {} partial-stale: kept {} fresh symbol(s), dropped {} stale; spread_histories discarded (would mismatch refreshed bars)",
-            history_path.display(),
+        let key = format!(
+            "partial_stale:v{}:k{}:d{}",
+            snap.version,
             loaded_summary.len(),
             stale_summary.len(),
         );
+        if last_logged_key.as_deref() != Some(key.as_str()) {
+            log::warn!(
+                "[WARM_START] snapshot at {} partial-stale: kept {} fresh symbol(s), dropped {} stale; spread_histories discarded (would mismatch refreshed bars)",
+                history_path.display(),
+                loaded_summary.len(),
+                stale_summary.len(),
+            );
+            *last_logged_key = Some(key);
+        }
     } else if loaded_summary.is_empty() && spreads_loaded.is_empty() {
-        log::warn!(
-            "[WARM_START] snapshot at {} parsed (v{}) but contained no usable bars — cold start",
-            history_path.display(),
-            snap.version,
-        );
+        let key = format!("empty:v{}", snap.version);
+        if last_logged_key.as_deref() != Some(key.as_str()) {
+            log::warn!(
+                "[WARM_START] snapshot at {} parsed (v{}) but contained no usable bars — cold start",
+                history_path.display(),
+                snap.version,
+            );
+            *last_logged_key = Some(key);
+        }
     } else {
         // bot-strategy#370 follow-up: dedup the success-path INFO so the
         // per-tick reload in `engine/step.rs:511` doesn't fire ~12 lines/min
