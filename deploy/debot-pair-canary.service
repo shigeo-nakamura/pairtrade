@@ -1,0 +1,22 @@
+[Unit]
+Description="debot-pair-canary (bot-strategy#376 binary-regression canary)"
+After=network.target debot-pair-btceth.service
+Wants=network.target
+
+[Service]
+WorkingDirectory=/opt/debot-canary
+# bot-strategy#163 deterministic spacing: wait 30s after the main bot started
+# (and is past its INIT_ACCOUNT_SPACING phase) before hitting /apikeys for
+# the canary sub-account. Prevents per-wallet 429 storms at boot.
+ExecStartPre=/bin/sleep 30
+ExecStart=/bin/bash /opt/debot/scripts/debot-pair-canary.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+# Single-variant bot, max force_close_time_secs = 7200, +60s buffer.
+TimeoutStopSec=7260
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
