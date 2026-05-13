@@ -28,13 +28,17 @@ jobs:
           path: debot
 
       - name: Forbid bot auto-restart in CI workflows
-        # bot-strategy#269: the trading bot must be restarted manually only.
+        # bot-strategy#269: main trading bots (debot-pair-btceth,
+        # debot-pair-btceth-extended) must be restarted manually only.
         # Auto-restart from CI force-closes open positions inside systemd's
         # 90s TimeoutStopSec window. Sidecar `lighter-ratelimit` is exempt
         # and intentionally not matched.
+        # bot-strategy#376 exception: debot-pair-canary is the only
+        # debot-pair-* unit allowed to auto-restart on every deploy. Keep
+        # this regex aligned with the matching guard in `ci.yml`.
         run: |
-          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+debot-pair-' debot/.github/workflows/*.yml; then
-            echo "::error::CI workflow contains forbidden 'systemctl restart/start debot-pair-*' — bot must be restarted manually only (bot-strategy#269)"
+          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+debot-pair-(btceth|extended)([[:space:]]|$)' debot/.github/workflows/*.yml; then
+            echo "::error::CI workflow contains forbidden 'systemctl restart/start debot-pair-(btceth|extended)' — main bots must be restarted manually only (bot-strategy#269). Canary (debot-pair-canary) is the only exception."
             exit 1
           fi
 
