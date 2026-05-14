@@ -231,6 +231,21 @@ impl StringOrVec {
     }
 }
 
+/// Raw YAML schema for the top-level pairtrade config.
+///
+/// Every field is `Option<T>` so the loader can apply a tiered fallback:
+/// YAML value → `apply_env_overrides` env var → compile-time `DEFAULT_*`
+/// constant. Operators set only the knobs they want to override in YAML
+/// and leave the rest unset; missing fields are not an error.
+///
+/// Audit note (bot-strategy#398, 2026-05-14): obviously-dead fields from
+/// past experiments (`notional_per_leg_usd`, `pair_overrides`, legacy
+/// non-tiered circuit breaker) were pruned. Remaining `Option<T>` fields
+/// are deliberately kept: each is either set in prod YAML today, or is
+/// the surface for a feature-flagged code path (Kalman beta, regime
+/// filter, `entry_z_short_multiplier`, `round_id`) where leaving the
+/// YAML knob in place keeps the operator-facing schema and the engine
+/// code path symmetrical.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) struct PairTradeYaml {
@@ -252,7 +267,6 @@ pub(super) struct PairTradeYaml {
     pub(super) stop_loss_cooldown_secs: Option<u64>,
     pub(super) net_funding_min_per_hour: Option<f64>,
     pub(super) spread_velocity_max_sigma_per_min: Option<f64>,
-    pub(super) notional_per_leg_usd: Option<f64>,
     pub(super) risk_pct_per_trade: Option<f64>,
     pub(super) max_loss_r_mult: Option<f64>,
     pub(super) equity_usd_reference: Option<f64>,
@@ -289,8 +303,6 @@ pub(super) struct PairTradeYaml {
     pub(super) beta_divergence_max: Option<f64>,
     pub(super) beta_min: Option<f64>,
     pub(super) hedge_ratio_max_deviation: Option<f64>,
-    pub(super) circuit_breaker_consecutive_losses: Option<u32>,
-    pub(super) circuit_breaker_cooldown_secs: Option<u64>,
     pub(super) circuit_breaker_tier1_losses: Option<u32>,
     pub(super) circuit_breaker_tier1_cooldown_secs: Option<u64>,
     pub(super) circuit_breaker_tier2_losses: Option<u32>,
@@ -307,7 +319,6 @@ pub(super) struct PairTradeYaml {
     pub(super) std_collapse_window_bars: Option<usize>,
     pub(super) std_collapse_min_ratio: Option<f64>,
     pub(super) std_collapse_observe_only: Option<bool>,
-    pub(super) pair_overrides: Option<HashMap<String, PairOverrideYaml>>,
     /// Graceful shutdown: max seconds to wait for natural exit on SIGTERM before
     /// force-closing both legs. 0 = immediate force close (legacy behavior).
     pub(super) shutdown_grace_secs: Option<u64>,
@@ -391,9 +402,13 @@ pub(super) struct RiskYaml {
     pub(super) max_notional_headroom: Option<f64>,
 }
 
-/// Per-strategy override block in the new multi-strategy YAML format.
-/// Every field is optional; unset fields fall back to the corresponding
-/// top-level scalar (or its compile-time default).
+/// Per-strategy override block in the multi-strategy YAML format
+/// (shigeo-nakamura/bot-strategy#25). Every field is `Option<T>`: unset
+/// fields inherit the corresponding top-level resolved value at instance
+/// build time. Only the knobs that actually differ between A/B/C live
+/// here — adding a new per-strategy override means (1) add the field as
+/// `Option<T>` here, (2) carry it into `StrategyConfig`, (3) consume it
+/// in `pairtrade::mod` when building each `StrategyInstance`.
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(rename_all = "snake_case")]
 pub(super) struct StrategyYaml {
@@ -402,47 +417,11 @@ pub(super) struct StrategyYaml {
     pub(super) exit_z_score: Option<f64>,
     pub(super) stop_loss_z_score: Option<f64>,
     pub(super) max_loss_r_mult: Option<f64>,
-    pub(super) risk_pct_per_trade: Option<f64>,
     pub(super) equity_usd_reference: Option<f64>,
-    pub(super) enable_data_dump: Option<bool>,
-    pub(super) data_dump_file: Option<String>,
     // Per-strategy PairParams overrides (None = inherit from top-level)
     pub(super) force_close_time_secs: Option<u64>,
     pub(super) mtf_windows: Option<Vec<usize>>,
     pub(super) mtf_z_min: Option<f64>,
-}
-
-#[derive(Debug, Deserialize, Clone, Default)]
-#[serde(rename_all = "snake_case")]
-pub(super) struct PairOverrideYaml {
-    pub(super) entry_z_score_base: Option<f64>,
-    pub(super) entry_z_score_min: Option<f64>,
-    pub(super) entry_z_score_max: Option<f64>,
-    pub(super) exit_z_score: Option<f64>,
-    pub(super) stop_loss_z_score: Option<f64>,
-    pub(super) force_close_time_secs: Option<u64>,
-    pub(super) cooldown_secs: Option<u64>,
-    pub(super) stop_loss_cooldown_secs: Option<u64>,
-    pub(super) max_loss_r_mult: Option<f64>,
-    pub(super) half_life_max_hours: Option<f64>,
-    pub(super) adf_p_threshold: Option<f64>,
-    pub(super) spread_velocity_max_sigma_per_min: Option<f64>,
-    pub(super) spread_trend_max_slope_sigma: Option<f64>,
-    pub(super) beta_divergence_max: Option<f64>,
-    pub(super) beta_min: Option<f64>,
-    pub(super) hedge_ratio_max_deviation: Option<f64>,
-    pub(super) pair_selection_lookback_hours_short: Option<u64>,
-    pub(super) pair_selection_lookback_hours_long: Option<u64>,
-    pub(super) entry_vol_lookback_hours: Option<u64>,
-    pub(super) warm_start_min_bars: Option<usize>,
-    pub(super) reeval_jump_z_mult: Option<f64>,
-    pub(super) vol_spike_mult: Option<f64>,
-    pub(super) circuit_breaker_tier1_losses: Option<u32>,
-    pub(super) circuit_breaker_tier1_cooldown_secs: Option<u64>,
-    pub(super) circuit_breaker_tier2_losses: Option<u32>,
-    pub(super) circuit_breaker_tier2_cooldown_secs: Option<u64>,
-    pub(super) entry_post_only_timeout_secs: Option<u64>,
-    pub(super) exit_post_only_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -456,7 +435,6 @@ pub struct PairTradeConfig {
     pub trading_period_secs: u64,
     pub metrics_window: usize,
     pub net_funding_min_per_hour: f64,
-    pub notional_per_leg: f64,
     pub risk_pct_per_trade: f64,
     pub equity_reference_usd: f64,
     pub universe: Vec<PairSpec>,
@@ -521,11 +499,12 @@ pub struct PairTradeConfig {
     /// many replay-seconds, keeping the position "held" during the delay.
     /// Env: BT_FILL_DELAY_SECS (default 0 = legacy instant-fill).
     pub bt_fill_delay_secs: i64,
-    pub circuit_breaker_consecutive_losses: u32,
-    pub circuit_breaker_cooldown_secs: u64,
     /// All per-pair tunables — z-score thresholds, hedge gates, lookback
     /// windows, circuit-breaker tiers, Phase 2 filters — live here. Engine
     /// reads them via `params_for(key)` so per-pair YAML overrides win.
+    /// Currently always empty (no production YAML sets per-pair overrides);
+    /// kept as the per-pair extension point so re-introducing pair-level
+    /// tuning does not require re-wiring the engine.
     pub pair_params: HashMap<String, PairParams>,
     pub default_pair_params: PairParams,
     /// Graceful shutdown: max seconds to wait for natural pair exit on SIGTERM
@@ -704,15 +683,17 @@ fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig> {
 #[derive(Debug, Clone)]
 pub struct StrategyConfig {
     pub id: String,
+    /// Per-instance agent name. Optional because legacy single-bot YAML
+    /// (no `strategies:` block) inherits the top-level `agent_name`, which
+    /// itself is optional. Drives status-file and PnL-log directory naming.
     pub agent_name: Option<String>,
     pub exit_z: f64,
     pub stop_loss_z: f64,
     pub max_loss_r_mult: f64,
-    pub risk_pct_per_trade: f64,
     pub equity_reference_usd: f64,
-    pub enable_data_dump: bool,
-    pub data_dump_file: Option<String>,
-    // Per-strategy PairParams overrides (None = inherit from top-level)
+    // Per-strategy PairParams overrides. `None` = inherit from top-level
+    // resolved value; `Some` wins over the top-level scalar at instance build
+    // time (see `pairtrade::mod::build_instance_default_params`).
     pub force_close_time_secs: Option<u64>,
     pub mtf_windows: Option<Vec<usize>>,
     pub mtf_z_min: Option<f64>,
@@ -731,6 +712,9 @@ impl PairTradeConfig {
     /// shutdown before its own `force_close` would have closed it.
     fn max_force_close_secs(&self) -> u64 {
         let mut m = self.default_pair_params.force_close_secs;
+        // `pair_params` is currently always empty in prod, but keep the
+        // sweep so re-introducing per-pair overrides cannot silently break
+        // shutdown_grace validation.
         for p in self.pair_params.values() {
             m = m.max(p.force_close_secs);
         }
@@ -766,13 +750,6 @@ impl PairTradeConfig {
             ));
         }
         Ok(())
-    }
-
-    fn build_pair_params_map(
-        &self,
-        overrides: &Option<HashMap<String, PairOverrideYaml>>,
-    ) -> HashMap<String, PairParams> {
-        apply_pair_overrides(&self.default_pair_params, overrides)
     }
 
     pub fn from_env_or_yaml() -> Result<Self> {
@@ -834,9 +811,6 @@ impl PairTradeConfig {
             net_funding_min_per_hour: yaml
                 .net_funding_min_per_hour
                 .unwrap_or(DEFAULT_NET_FUNDING_MIN_PER_HOUR),
-            notional_per_leg: yaml
-                .notional_per_leg_usd
-                .unwrap_or(DEFAULT_NOTIONAL_PER_LEG),
             risk_pct_per_trade: yaml
                 .risk_pct_per_trade
                 .unwrap_or(DEFAULT_RISK_PCT_PER_TRADE),
@@ -875,12 +849,6 @@ impl PairTradeConfig {
             bt_eval_timestamps: None,     // env-only, not in YAML
             bt_restart_timestamps: None,  // env-only, not in YAML
             bt_fill_delay_secs: 0,         // env-only, not in YAML
-            circuit_breaker_consecutive_losses: yaml
-                .circuit_breaker_consecutive_losses
-                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES),
-            circuit_breaker_cooldown_secs: yaml
-                .circuit_breaker_cooldown_secs
-                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS),
             shutdown_grace_secs: yaml
                 .shutdown_grace_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
@@ -904,15 +872,8 @@ impl PairTradeConfig {
             round_id: yaml.round_id.clone(),
         };
 
-        cfg.pair_params = cfg.build_pair_params_map(&yaml.pair_overrides);
         cfg.apply_env_overrides(history_file_from_yaml, warm_start_min_from_yaml)?;
         cfg.strategies = resolve_strategies(&cfg, yaml.strategies.as_deref());
-        // apply_env_overrides mutates cfg.default_pair_params in place; re-merge
-        // pair-specific overrides on top so YAML pair_overrides still win.
-        let pair_params_rebuilt = cfg.build_pair_params_map(&yaml.pair_overrides);
-        if !pair_params_rebuilt.is_empty() {
-            cfg.pair_params = pair_params_rebuilt;
-        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -942,10 +903,6 @@ impl PairTradeConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_NET_FUNDING_MIN_PER_HOUR);
-        let notional_per_leg = env::var("NOTIONAL_PER_LEG_USD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_NOTIONAL_PER_LEG);
         let risk_pct_per_trade = env::var("RISK_PCT_PER_TRADE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1050,7 +1007,6 @@ impl PairTradeConfig {
             trading_period_secs,
             metrics_window,
             net_funding_min_per_hour,
-            notional_per_leg,
             risk_pct_per_trade,
             equity_reference_usd,
             universe,
@@ -1083,14 +1039,6 @@ impl PairTradeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
-            circuit_breaker_consecutive_losses: env::var("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES),
-            circuit_breaker_cooldown_secs: env::var("CIRCUIT_BREAKER_COOLDOWN_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS),
             shutdown_grace_secs: env::var("SHUTDOWN_GRACE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1173,7 +1121,6 @@ impl PairTradeConfig {
         );
         env_override("NET_FUNDING_MIN_PER_HOUR", &mut self.net_funding_min_per_hour);
         env_override("SPREAD_VELOCITY_MAX_SIGMA_PER_MIN", &mut self.default_pair_params.spread_velocity_max_sigma_per_min);
-        env_override("NOTIONAL_PER_LEG_USD", &mut self.notional_per_leg);
         env_override("RISK_PCT_PER_TRADE", &mut self.risk_pct_per_trade);
         env_override("MAX_LOSS_R_MULT", &mut self.default_pair_params.max_loss_r_mult);
         env_override("EQUITY_REFERENCE_USD", &mut self.equity_reference_usd);
@@ -1304,8 +1251,6 @@ impl PairTradeConfig {
 
         env_override("SPREAD_TREND_MAX_SLOPE_SIGMA", &mut self.default_pair_params.spread_trend_max_slope_sigma);
         env_override("BETA_DIVERGENCE_MAX", &mut self.default_pair_params.beta_divergence_max);
-        env_override("CIRCUIT_BREAKER_CONSECUTIVE_LOSSES", &mut self.circuit_breaker_consecutive_losses);
-        env_override("CIRCUIT_BREAKER_COOLDOWN_SECS", &mut self.circuit_breaker_cooldown_secs);
         env_override("CIRCUIT_BREAKER_TIER1_LOSSES", &mut self.default_pair_params.circuit_breaker_tier1_losses);
         env_override("CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS", &mut self.default_pair_params.circuit_breaker_tier1_cooldown_secs);
         env_override("CIRCUIT_BREAKER_TIER2_LOSSES", &mut self.default_pair_params.circuit_breaker_tier2_losses);
@@ -1375,12 +1320,6 @@ impl PairTradeConfig {
         }
         if dpp.circuit_breaker_tier1_losses > 0 && losses >= dpp.circuit_breaker_tier1_losses {
             return Some(Duration::from_secs(dpp.circuit_breaker_tier1_cooldown_secs));
-        }
-        // Legacy fallback
-        if self.circuit_breaker_consecutive_losses > 0
-            && losses >= self.circuit_breaker_consecutive_losses
-        {
-            return Some(Duration::from_secs(self.circuit_breaker_cooldown_secs));
         }
         None
     }
@@ -1636,15 +1575,7 @@ pub(super) fn resolve_strategies(
                     max_loss_r_mult: s
                         .max_loss_r_mult
                         .unwrap_or(cfg.default_pair_params.max_loss_r_mult),
-                    risk_pct_per_trade: s
-                        .risk_pct_per_trade
-                        .unwrap_or(cfg.risk_pct_per_trade),
                     equity_reference_usd,
-                    enable_data_dump: s.enable_data_dump.unwrap_or(cfg.enable_data_dump),
-                    data_dump_file: s
-                        .data_dump_file
-                        .clone()
-                        .or_else(|| cfg.data_dump_file.clone()),
                     force_close_time_secs: s.force_close_time_secs,
                     mtf_windows: s.mtf_windows.clone(),
                     mtf_z_min: s.mtf_z_min,
@@ -1657,10 +1588,7 @@ pub(super) fn resolve_strategies(
             exit_z: cfg.default_pair_params.exit_z,
             stop_loss_z: cfg.default_pair_params.stop_loss_z,
             max_loss_r_mult: cfg.default_pair_params.max_loss_r_mult,
-            risk_pct_per_trade: cfg.risk_pct_per_trade,
             equity_reference_usd: cfg.equity_reference_usd,
-            enable_data_dump: cfg.enable_data_dump,
-            data_dump_file: cfg.data_dump_file.clone(),
             force_close_time_secs: None,
             mtf_windows: None,
             mtf_z_min: None,
@@ -1752,96 +1680,6 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
             .std_collapse_observe_only
             .unwrap_or(DEFAULT_STD_COLLAPSE_OBSERVE_ONLY),
     }
-}
-
-/// Build the resolved per-pair params map from the resolved global defaults
-/// plus any per-pair YAML overrides. Free function so it does not depend on
-/// `PairTradeConfig`'s currently-duplicated per-pair fields.
-fn apply_pair_overrides(
-    default: &PairParams,
-    overrides: &Option<HashMap<String, PairOverrideYaml>>,
-) -> HashMap<String, PairParams> {
-    let mut map = HashMap::new();
-    let Some(overrides) = overrides else {
-        return map;
-    };
-    for (pair_key, ovr) in overrides {
-        let pp = PairParams {
-            entry_z_base: ovr.entry_z_score_base.unwrap_or(default.entry_z_base),
-            entry_z_min: ovr.entry_z_score_min.unwrap_or(default.entry_z_min),
-            entry_z_max: ovr.entry_z_score_max.unwrap_or(default.entry_z_max),
-            exit_z: ovr.exit_z_score.unwrap_or(default.exit_z),
-            stop_loss_z: ovr.stop_loss_z_score.unwrap_or(default.stop_loss_z),
-            force_close_secs: ovr.force_close_time_secs.unwrap_or(default.force_close_secs),
-            cooldown_secs: ovr.cooldown_secs.unwrap_or(default.cooldown_secs),
-            stop_loss_cooldown_secs: ovr
-                .stop_loss_cooldown_secs
-                .unwrap_or(default.stop_loss_cooldown_secs),
-            max_loss_r_mult: ovr.max_loss_r_mult.unwrap_or(default.max_loss_r_mult),
-            half_life_max_hours: ovr
-                .half_life_max_hours
-                .unwrap_or(default.half_life_max_hours),
-            adf_p_threshold: ovr.adf_p_threshold.unwrap_or(default.adf_p_threshold),
-            spread_velocity_max_sigma_per_min: ovr
-                .spread_velocity_max_sigma_per_min
-                .unwrap_or(default.spread_velocity_max_sigma_per_min),
-            spread_trend_max_slope_sigma: ovr
-                .spread_trend_max_slope_sigma
-                .unwrap_or(default.spread_trend_max_slope_sigma),
-            beta_divergence_max: ovr
-                .beta_divergence_max
-                .unwrap_or(default.beta_divergence_max),
-            beta_min: ovr.beta_min.unwrap_or(default.beta_min),
-            hedge_ratio_max_deviation: ovr
-                .hedge_ratio_max_deviation
-                .unwrap_or(default.hedge_ratio_max_deviation),
-            lookback_hours_short: ovr
-                .pair_selection_lookback_hours_short
-                .unwrap_or(default.lookback_hours_short),
-            lookback_hours_long: ovr
-                .pair_selection_lookback_hours_long
-                .unwrap_or(default.lookback_hours_long),
-            entry_vol_lookback_hours: ovr
-                .entry_vol_lookback_hours
-                .unwrap_or(default.entry_vol_lookback_hours),
-            warm_start_min_bars: ovr
-                .warm_start_min_bars
-                .unwrap_or(default.warm_start_min_bars),
-            reeval_jump_z_mult: ovr
-                .reeval_jump_z_mult
-                .unwrap_or(default.reeval_jump_z_mult),
-            vol_spike_mult: ovr.vol_spike_mult.unwrap_or(default.vol_spike_mult),
-            circuit_breaker_tier1_losses: ovr
-                .circuit_breaker_tier1_losses
-                .unwrap_or(default.circuit_breaker_tier1_losses),
-            circuit_breaker_tier1_cooldown_secs: ovr
-                .circuit_breaker_tier1_cooldown_secs
-                .unwrap_or(default.circuit_breaker_tier1_cooldown_secs),
-            circuit_breaker_tier2_losses: ovr
-                .circuit_breaker_tier2_losses
-                .unwrap_or(default.circuit_breaker_tier2_losses),
-            circuit_breaker_tier2_cooldown_secs: ovr
-                .circuit_breaker_tier2_cooldown_secs
-                .unwrap_or(default.circuit_breaker_tier2_cooldown_secs),
-            entry_post_only_timeout_secs: ovr
-                .entry_post_only_timeout_secs
-                .unwrap_or(default.entry_post_only_timeout_secs),
-            exit_post_only_timeout_secs: ovr
-                .exit_post_only_timeout_secs
-                .unwrap_or(default.exit_post_only_timeout_secs),
-            entry_velocity_block_sigma_per_min: default.entry_velocity_block_sigma_per_min,
-            funding_entry_z_scale: default.funding_entry_z_scale,
-            beta_gap_entry_z_scale: default.beta_gap_entry_z_scale,
-            entry_z_short_multiplier: default.entry_z_short_multiplier,
-            mtf_windows: default.mtf_windows.clone(),
-            mtf_z_min: default.mtf_z_min,
-            std_collapse_window_bars: default.std_collapse_window_bars,
-            std_collapse_min_ratio: default.std_collapse_min_ratio,
-            std_collapse_observe_only: default.std_collapse_observe_only,
-        };
-        map.insert(pair_key.clone(), pp);
-    }
-    map
 }
 
 #[cfg(test)]
