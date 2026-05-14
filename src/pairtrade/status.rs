@@ -369,6 +369,25 @@ impl StatusReporter {
         // jsonl populates its own ring buffer (not the shared parent's).
         reporter.risk_history.clear();
         reporter.load_risk_history();
+        // bot-strategy#382 follow-up: discard any baseline loaded by
+        // `from_env` from the pre-suffix parent directory and reload from
+        // the per-instance subdir. Without this reset, a stale parent
+        // `status.equity.json` (left from a pre-multi-instance deployment)
+        // populates `equity_day_start_set=true` with an old `pnl_today_date`,
+        // and the first `write_snapshot_if_due` — which can race
+        // `fetch_equity_rest` on the per-account stagger — fires
+        // `reset_daily_if_needed`'s reset block with `pnl_total=0`,
+        // poisoning the per-instance subdir baseline with `equity=0` for
+        // the rest of the UTC day. Observed live on Tokyo Lighter B/C on
+        // 2026-05-14 after a 4/9-era parent baseline survived the
+        // single-instance → A/B/C cutover: dashboard showed pnl_today=+$150
+        // each (sum +$300) with no trades. Frankfurt was unaffected because
+        // its parent baseline does not exist.
+        reporter.equity_day_start = 0.0;
+        reporter.equity_day_start_set = false;
+        reporter.pnl_today = 0.0;
+        reporter.pnl_today_date = Utc::now().date_naive();
+        reporter.load_equity_baseline();
         Some(reporter)
     }
 
