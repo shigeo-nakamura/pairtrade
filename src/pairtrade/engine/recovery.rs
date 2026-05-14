@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use dex_connector::PositionSnapshot;
+use dex_connector::{DexError, PositionSnapshot};
 use rust_decimal::Decimal;
 use tokio::time::sleep;
 
@@ -54,6 +54,48 @@ impl PairTradeEngine {
         parts.join(", ")
     }
 
+    /// Poll `get_positions()` until the WS account snapshot has arrived or
+    /// `timeout` elapses. Lighter's connector returns
+    /// `DexError::Transient("positions not ready from websocket")` until the
+    /// `subscribed/account_all` frame populates the cache; cold-start
+    /// typically takes 20-30 s on Frankfurt (market catalog load + WS
+    /// handshake), so the legacy `attempts × wait_secs` retry budget on the
+    /// caller side fires its 3 WARNs and an ERROR before WS is even
+    /// connected (bot-strategy#405). Treating WS-not-ready as a wait state
+    /// here keeps the WARN/ERROR for genuine failures only.
+    ///
+    /// Returns `Ok(())` when the connector returns positions (or any other
+    /// non-WS-not-ready outcome — including a different `Err`, which the
+    /// subsequent force-close loop will surface). Returns `Err` only on
+    /// timeout.
+    async fn wait_for_ws_ready(&self, timeout: Duration) -> Result<(), ()> {
+        const POLL_INTERVAL: Duration = Duration::from_secs(2);
+        const LOG_INTERVAL: Duration = Duration::from_secs(10);
+        let start = Instant::now();
+        let mut next_log = start + LOG_INTERVAL;
+        loop {
+            match self.connector.get_positions().await {
+                Err(DexError::Transient(ref msg))
+                    if msg.contains("not ready from websocket") =>
+                {
+                    let now = Instant::now();
+                    if now.duration_since(start) >= timeout {
+                        return Err(());
+                    }
+                    if now >= next_log {
+                        log::info!(
+                            "[Startup] waiting for WS positions snapshot ({}s elapsed)",
+                            now.duration_since(start).as_secs()
+                        );
+                        next_log = now + LOG_INTERVAL;
+                    }
+                    sleep(POLL_INTERVAL).await;
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
     pub(in crate::pairtrade) async fn force_close_on_startup(&self) -> Result<()> {
         if self.cfg.dry_run || self.cfg.observe_only {
             log::info!(
@@ -70,6 +112,15 @@ impl PairTradeEngine {
         );
         if let Err(err) = self.connector.cancel_all_orders(None).await {
             log::warn!("[Startup] cancel_all_orders failed: {:?}", err);
+        }
+        if self
+            .wait_for_ws_ready(Duration::from_secs(60))
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "[Startup] WS positions snapshot not ready after 60s; proceeding to retry loop"
+            );
         }
         for attempt in 1..=attempts {
             let positions_result = self.connector.get_positions().await;
