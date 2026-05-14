@@ -61,6 +61,13 @@ pub(super) struct PendingOrders {
     pub(super) placed_at: Instant,
     pub(super) hedge_retry_count: u32,
     pub(super) post_only_hybrid: bool,
+    /// Set only for post-only exits on fee-bearing venues (Extended).
+    /// When `Instant::now() >= t`, the reconcile loop cancels the resting
+    /// post-only legs and reissues as taker even though
+    /// `order_timeout_secs` (typically 120s) has not yet elapsed. Replaces
+    /// the synchronous `monitor_exit_legs_with_timeout` flow that blocked
+    /// `step()` for the full timeout (bot-strategy#408).
+    pub(super) exit_taker_takeover_at: Option<Instant>,
 }
 
 #[derive(Debug)]

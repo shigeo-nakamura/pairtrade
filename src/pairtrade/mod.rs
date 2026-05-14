@@ -1800,6 +1800,7 @@ mod pending_tests {
             placed_at: Instant::now(),
             hedge_retry_count: 0,
             post_only_hybrid: false,
+            exit_taker_takeover_at: None,
         };
         let mut price_map = HashMap::new();
         price_map.insert(
@@ -1858,6 +1859,7 @@ mod pending_tests {
             placed_at: Instant::now(),
             hedge_retry_count: 0,
             post_only_hybrid: false,
+            exit_taker_takeover_at: None,
         };
         let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
 

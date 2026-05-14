@@ -482,7 +482,31 @@ impl PairTradeEngine {
                     state.pending_exit = None;
                 }
                 return Ok(());
-            } else if pending.placed_at.elapsed() >= timeout || status.open_remaining == 0 {
+            } else if pending.placed_at.elapsed() >= timeout
+                || pending
+                    .exit_taker_takeover_at
+                    .map_or(false, |t| Instant::now() >= t)
+                || status.open_remaining == 0
+            {
+                let takeover_fired = pending
+                    .exit_taker_takeover_at
+                    .map_or(false, |t| Instant::now() >= t)
+                    && pending.placed_at.elapsed() < timeout
+                    && status.open_remaining > 0;
+                if takeover_fired {
+                    // bot-strategy#408: post-only exit hit its dedicated taker-
+                    // takeover deadline (Extended `exit_post_only_timeout_secs`)
+                    // before `order_timeout_secs` elapsed. Drop one
+                    // grep-friendly WARN that mirrors the legacy in-step
+                    // monitor's `[EXIT_FILL_TIMEOUT]` log so error-watch /
+                    // dashboards keep working.
+                    log::warn!(
+                        "[EXIT_FILL_TIMEOUT] {} post-only takeover after {}s; cancelling {} legs and reissuing as taker",
+                        key,
+                        pending.placed_at.elapsed().as_secs(),
+                        status.open_remaining,
+                    );
+                }
                 let next_retry = pending.hedge_retry_count.saturating_add(1);
                 if next_retry > MAX_EXIT_RETRIES {
                     self.force_close_all_positions(key, "timeout").await;
@@ -491,7 +515,7 @@ impl PairTradeEngine {
                     }
                     return Ok(());
                 }
-                if status.open_remaining > 0 {
+                if status.open_remaining > 0 && !takeover_fired {
                     log::warn!(
                         "[ORDER] {} exit orders stale ({}s), cancelling {} legs",
                         key,
@@ -645,6 +669,11 @@ impl PairTradeEngine {
                             placed_at: Instant::now(),
                             hedge_retry_count: next_retry,
                             post_only_hybrid: false,
+                            // This branch reissues remaining exit legs (post-
+                            // only retry, not taker); the dedicated post-only
+                            // takeover deadline does not apply here — the
+                            // generic `order_timeout_secs` will govern.
+                            exit_taker_takeover_at: None,
                         });
                     }
                 }
@@ -859,6 +888,7 @@ mod tests {
             placed_at: Instant::now(),
             hedge_retry_count: 0,
             post_only_hybrid: false,
+            exit_taker_takeover_at: None,
         }
     }
 

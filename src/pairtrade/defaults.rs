@@ -61,8 +61,12 @@ pub(super) const DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS: u64 = 0;
 /// (fee_bps=0) this knob has no effect regardless of the configured value.
 /// See bot-strategy#306.
 pub(super) const DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS: u64 = 0;
-pub(super) const EXIT_FILL_POLL_MS: u64 = 500;
-pub(super) const EXIT_CANCEL_SETTLE_MS: u64 = 200;
+// EXIT_FILL_POLL_MS / EXIT_CANCEL_SETTLE_MS were the in-step
+// `monitor_exit_legs_with_timeout` polling constants and were removed when
+// the post-only-exit taker takeover moved to the reconcile loop
+// (bot-strategy#408). The reconcile loop polls at step cadence
+// (`interval_secs`, typically 5s) and reuses `cancel_pending_orders` for
+// cancellation, so these knobs no longer have a use site.
 
 // Multi-timeframe z-score confluence (disabled by default)
 pub(super) const DEFAULT_MTF_Z_MIN: f64 = 0.0;

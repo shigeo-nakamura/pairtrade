@@ -26,7 +26,6 @@ use tokio::time::sleep;
 
 use super::super::config::PairSpec;
 use super::super::defaults::{
-    EXIT_CANCEL_SETTLE_MS, EXIT_FILL_POLL_MS,
     POST_ONLY_ENTRY_ATTEMPTS, POST_ONLY_EXIT_ATTEMPTS, POST_ONLY_RETRY_DELAY_MS,
     POST_ONLY_RETRY_MAX_ELAPSED_MS,
 };
@@ -220,6 +219,10 @@ impl PairTradeEngine {
             placed_at: Instant::now(),
             hedge_retry_count: retry_count,
             post_only_hybrid: false,
+            // The reissue is itself the taker-takeover step (either market or
+            // a fresh post-only attempt budgeted by `order_timeout_secs`);
+            // no further dedicated post-only takeover deadline applies.
+            exit_taker_takeover_at: None,
         }))
     }
 
@@ -289,6 +292,8 @@ impl PairTradeEngine {
             placed_at: Instant::now(),
             hedge_retry_count: 0,
             post_only_hybrid: false,
+            // Entry path — no exit takeover deadline.
+            exit_taker_takeover_at: None,
         }))
     }
 
@@ -706,7 +711,7 @@ impl PairTradeEngine {
         qtys: (Decimal, Decimal),
         prices: &HashMap<String, SymbolSnapshot>,
         use_market: bool,
-    ) -> Result<Vec<PendingLeg>> {
+    ) -> Result<(Vec<PendingLeg>, Option<Instant>)> {
         let (side_a, side_b) = Self::exit_sides_for(direction);
         let ref_price_a = self.order_reference_price(&pair.base, side_a, prices);
         let ref_price_b = self.order_reference_price(&pair.quote, side_b, prices);
@@ -929,170 +934,22 @@ impl PairTradeEngine {
             }
         }
 
-        // bot-strategy#306: when post-only is in effect (Extended-style fee_bps>0),
-        // optionally cap the time exit legs may rest unfilled before falling back
-        // to a taker retake. Frankfurt (fee_bps=0) takes the use_market / non-
-        // post-only path above, so post_only=false here and this block is a no-op
-        // — Frankfurt behavior is unchanged regardless of the configured timeout.
+        // bot-strategy#306 / #408: on fee-bearing venues (Extended) where the
+        // exit went out post-only, schedule a deadline at which the reconcile
+        // loop will cancel the resting legs and reissue as taker. Frankfurt
+        // (fee_bps=0) takes the use_market / non-post-only path above, so
+        // post_only=false here and `takeover_at` stays None — Frankfurt
+        // behavior is unchanged regardless of the configured timeout. Prior
+        // to #408 this was a synchronous in-step monitor that blocked
+        // `step()` for the full timeout and caused STEP_OVERRUN warns.
         let exit_timeout = self.cfg.default_pair_params.exit_post_only_timeout_secs;
-        if post_only && exit_timeout > 0 && !legs.is_empty() {
-            self.monitor_exit_legs_with_timeout(pair, &mut legs, exit_timeout)
-                .await;
-        }
+        let takeover_at = if post_only && exit_timeout > 0 && !legs.is_empty() {
+            Some(Instant::now() + Duration::from_secs(exit_timeout))
+        } else {
+            None
+        };
 
-        Ok(legs)
-    }
-
-    /// After both exit legs are placed as post-only limits, poll their fill
-    /// state. For any leg still resting unfilled past `timeout_secs`, cancel
-    /// the order and re-place the remaining size as a taker (market) order
-    /// so the pair flattens promptly. Frankfurt (fee_bps=0) does not enter
-    /// this path because the caller gates on `post_only=true`. Default
-    /// `exit_post_only_timeout_secs=0` keeps the monitor disabled (legacy
-    /// behavior). See bot-strategy#306.
-    async fn monitor_exit_legs_with_timeout(
-        &mut self,
-        pair: &PairSpec,
-        legs: &mut [PendingLeg],
-        timeout_secs: u64,
-    ) {
-        if legs.is_empty() || timeout_secs == 0 {
-            return;
-        }
-        let timeout = Duration::from_secs(timeout_secs);
-        let poll = Duration::from_millis(EXIT_FILL_POLL_MS);
-        let start = Instant::now();
-
-        // Phase 1: poll fills until all legs filled or timeout.
-        loop {
-            // Refresh fills for each leg's symbol.
-            for leg in legs.iter_mut() {
-                if leg.filled >= leg.target {
-                    continue;
-                }
-                if let Ok(resp) = self.connector.get_filled_orders(&leg.symbol).await {
-                    let matches = |order_id: &str| {
-                        order_id == leg.order_id
-                            || leg
-                                .exchange_order_id
-                                .as_ref()
-                                .map_or(false, |id| order_id == id.as_str())
-                    };
-                    for order in resp.orders.iter() {
-                        if matches(&order.order_id) {
-                            leg.filled = order.filled_size.unwrap_or(Decimal::ZERO);
-                            break;
-                        }
-                    }
-                }
-            }
-            let all_filled = legs.iter().all(|l| l.filled >= l.target);
-            if all_filled {
-                return;
-            }
-            if start.elapsed() >= timeout {
-                break;
-            }
-            sleep(poll).await;
-        }
-
-        // Phase 2: timeout reached. Cancel each unfilled leg and re-place
-        // remainder as a taker. We process legs sequentially to keep the
-        // existing single-`&mut self` borrow flow; placement is fast (no
-        // post-only retry budget on taker), so the per-leg cost is small.
-        for leg in legs.iter_mut() {
-            if leg.filled >= leg.target {
-                continue;
-            }
-            let symbol = leg.symbol.clone();
-            let order_id = leg.order_id.clone();
-            log::warn!(
-                "[EXIT_FILL_TIMEOUT] {}/{} {} unfilled after {}s (target={} filled={}); canceling and retaking with taker",
-                pair.base,
-                pair.quote,
-                symbol,
-                timeout_secs,
-                leg.target,
-                leg.filled,
-            );
-            if let Err(err) = self.connector.cancel_order(&symbol, &order_id).await {
-                log::warn!(
-                    "[EXIT_FILL_TIMEOUT] cancel_order failed for {} order_id={}: {:?}",
-                    symbol,
-                    order_id,
-                    err,
-                );
-            }
-            // Brief settle window for any in-flight fill to land before we
-            // measure remaining size.
-            sleep(Duration::from_millis(EXIT_CANCEL_SETTLE_MS)).await;
-            if let Ok(resp) = self.connector.get_filled_orders(&symbol).await {
-                let matches = |order_id_str: &str| {
-                    order_id_str == leg.order_id
-                        || leg
-                            .exchange_order_id
-                            .as_ref()
-                            .map_or(false, |id| order_id_str == id.as_str())
-                };
-                for order in resp.orders.iter() {
-                    if matches(&order.order_id) {
-                        leg.filled = order.filled_size.unwrap_or(Decimal::ZERO);
-                        break;
-                    }
-                }
-            }
-            let remaining = leg.target - leg.filled;
-            if remaining <= Decimal::ZERO {
-                log::info!(
-                    "[EXIT_FILL_TIMEOUT] {} filled during cancel race; no taker retake needed",
-                    symbol,
-                );
-                continue;
-            }
-            match self
-                .connector
-                .create_order(&symbol, remaining, leg.side, None, None, true, None)
-                .await
-            {
-                Ok(resp) => {
-                    log::info!(
-                        "[EXIT_FILL_TIMEOUT] {} taker retake placed: order_id={} qty={} (post-only filled={}/{})",
-                        symbol,
-                        resp.order_id,
-                        remaining,
-                        leg.filled,
-                        leg.target,
-                    );
-                    // Replace the post-only order_id with the taker retake's
-                    // so downstream fill monitors track the new order. Reset
-                    // `filled` to zero against the new `target=remaining`
-                    // since the prior post-only fills are now stranded under
-                    // the old order_id (downstream code aggregates fills via
-                    // get_filled_orders by symbol+order_id, so the fills
-                    // already realised on the post-only leg stay accounted
-                    // for in the position state).
-                    leg.order_id = resp.order_id;
-                    leg.exchange_order_id = resp.exchange_order_id;
-                    leg.target = remaining;
-                    leg.filled = Decimal::ZERO;
-                    leg.limit_price = None;
-                }
-                Err(err) => {
-                    if engine::error_class::is_reduce_only_rejection(&err) {
-                        log::info!(
-                            "[EXIT_FILL_TIMEOUT] {} taker retake rejected reduce_only; position already flat",
-                            symbol,
-                        );
-                    } else {
-                        log::error!(
-                            "[EXIT_FILL_TIMEOUT] {} taker retake FAILED: {:?}",
-                            symbol,
-                            err,
-                        );
-                    }
-                }
-            }
-        }
+        Ok((legs, takeover_at))
     }
 
     pub(in crate::pairtrade) fn register_partial_leg_failure(
@@ -1111,6 +968,9 @@ impl PairTradeEngine {
                     placed_at: Instant::now(),
                     hedge_retry_count: 0,
                     post_only_hybrid: false,
+                    // Partial-failure recovery — let the next reconcile tick
+                    // decide normal-timeout behavior; no fast takeover.
+                    exit_taker_takeover_at: None,
                 };
                 if is_exit {
                     state.pending_exit = Some(pending);

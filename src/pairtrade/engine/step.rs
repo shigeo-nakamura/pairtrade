@@ -1645,11 +1645,11 @@ impl PairTradeEngine {
                         plan.pair.quote
                     );
                 } else {
-                    let legs = match self
+                    let (legs, exit_taker_takeover_at) = match self
                         .close_pair_orders(&plan.pair, direction, qtys, price_map, force)
                         .await
                     {
-                        Ok(legs) => legs,
+                        Ok(out) => out,
                         Err(err) => {
                             self.register_partial_leg_failure(inst_idx, &plan.key, direction, &err, true);
                             return Err(err);
@@ -1662,6 +1662,7 @@ impl PairTradeEngine {
                             placed_at: Instant::now(),
                             hedge_retry_count: 0,
                             post_only_hybrid: false,
+                            exit_taker_takeover_at,
                         });
                     }
                 }
@@ -1845,6 +1846,9 @@ impl PairTradeEngine {
                                 placed_at: Instant::now(),
                                 hedge_retry_count: 0,
                                 post_only_hybrid: hybrid,
+                                // Entry path — exit_taker_takeover_at only
+                                // applies to exit pending orders (#408).
+                                exit_taker_takeover_at: None,
                             });
                         }
                     }
