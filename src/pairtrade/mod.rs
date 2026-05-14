@@ -1100,7 +1100,6 @@ impl PairTradeEngine {
             trading_period_secs: 1,
             metrics_window: 1,
             net_funding_min_per_hour: 0.0,
-            notional_per_leg: 1.0,
             risk_pct_per_trade: 0.01,
             equity_reference_usd: DEFAULT_EQUITY_USD,
             universe: vec![PairSpec {
@@ -1129,8 +1128,6 @@ impl PairTradeEngine {
             bt_warm_start_snapshot: None,
             bt_eval_timestamps: None,
             bt_restart_timestamps: None,
-            circuit_breaker_consecutive_losses: DEFAULT_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES,
-            circuit_breaker_cooldown_secs: DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECS,
             shutdown_grace_secs: 0,
             pair_params: HashMap::new(),
             default_pair_params: PairParams {
