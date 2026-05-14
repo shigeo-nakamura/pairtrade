@@ -83,6 +83,14 @@ struct DataDumpEntry<'a> {
     prices: &'a HashMap<String, SymbolSnapshot>,
 }
 
+#[derive(Clone, Copy)]
+struct StepSetup {
+    maintenance_block_entries: bool,
+    vol_median: f64,
+    regime_ok: bool,
+    positions_clear: bool,
+}
+
 impl PairTradeEngine {
 
     pub async fn run(&mut self) -> Result<()> {
@@ -741,6 +749,25 @@ impl PairTradeEngine {
         price_map: &HashMap<String, SymbolSnapshot>,
         updated: &HashSet<String>,
     ) -> Result<()> {
+        let setup = self.step_setup(inst_idx, price_map).await?;
+        let now_ts = self.current_now_ts();
+        let planned = self
+            .step_plan_pair_actions(inst_idx, price_map, updated, setup, now_ts)
+            .await?;
+        self.maybe_log_metrics(inst_idx);
+        self.step_execute_exits(inst_idx, &planned, price_map, now_ts)
+            .await?;
+        self.step_execute_entry(inst_idx, &planned, price_map, now_ts)
+            .await?;
+        self.step_write_status_snapshot(inst_idx);
+        Ok(())
+    }
+
+    async fn step_setup(
+        &mut self,
+        inst_idx: usize,
+        price_map: &HashMap<String, SymbolSnapshot>,
+    ) -> Result<StepSetup> {
         // Skip new entries if maintenance is upcoming within 1 hour
         let maintenance_block_entries = self.connector.is_upcoming_maintenance(1).await;
         if maintenance_block_entries {
@@ -816,8 +843,29 @@ impl PairTradeEngine {
             self.last_position_warn
                 .insert("entry_block".to_string(), Instant::now());
         }
+        Ok(StepSetup {
+            maintenance_block_entries,
+            vol_median,
+            regime_ok,
+            positions_clear,
+        })
+    }
+
+    async fn step_plan_pair_actions(
+        &mut self,
+        inst_idx: usize,
+        price_map: &HashMap<String, SymbolSnapshot>,
+        updated: &HashSet<String>,
+        setup: StepSetup,
+        now_ts: i64,
+    ) -> Result<Vec<PlannedAction>> {
+        let StepSetup {
+            maintenance_block_entries,
+            vol_median,
+            regime_ok,
+            positions_clear,
+        } = setup;
         let mut planned: Vec<PlannedAction> = Vec::new();
-        let now_ts = self.current_now_ts();
 
         let universe = self.cfg.universe.clone();
         for pair in &universe {
@@ -1357,8 +1405,16 @@ impl PairTradeEngine {
                 });
             }
         }
+        Ok(planned)
+    }
 
-        self.maybe_log_metrics(inst_idx);
+    async fn step_execute_exits(
+        &mut self,
+        inst_idx: usize,
+        planned: &[PlannedAction],
+        price_map: &HashMap<String, SymbolSnapshot>,
+        now_ts: i64,
+    ) -> Result<()> {
         // Process exits first
         for plan in planned.iter() {
             if let TradeAction::Close {
@@ -1611,7 +1667,16 @@ impl PairTradeEngine {
                 }
             }
         }
+        Ok(())
+    }
 
+    async fn step_execute_entry(
+        &mut self,
+        inst_idx: usize,
+        planned: &[PlannedAction],
+        price_map: &HashMap<String, SymbolSnapshot>,
+        now_ts: i64,
+    ) -> Result<()> {
         let mut active_symbols: HashSet<String> = self
             .cfg
             .universe
@@ -1787,6 +1852,10 @@ impl PairTradeEngine {
             }
         }
 
+        Ok(())
+    }
+
+    fn step_write_status_snapshot(&mut self, inst_idx: usize) {
         {
             let risk = self.daily_risk_snapshot(inst_idx);
             let session_risk = self.session_risk_snapshot(inst_idx);
@@ -1806,6 +1875,5 @@ impl PairTradeEngine {
                 }
             }
         }
-        Ok(())
     }
 }
