@@ -365,6 +365,38 @@ impl DexConnector for DexConnectorBox {
         result
     }
 
+    // bot-strategy#397: explicit forward so the wrapper does not silently
+    // fall back to the trait default (`DexError::Permanent("not
+    // implemented for this connector")`) the moment pairtrade wires this
+    // path in. No active caller in pairtrade today — Extended-only at the
+    // connector layer (bot-strategy#302) — but the latent trap is
+    // exactly the class of bug flagged by feedback_dex_connector_box_forward.md
+    // (auto-memory).
+    async fn create_order_taker_ioc(
+        &self,
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        slippage_bps: u32,
+        reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        let result = self
+            .inner
+            .create_order_taker_ioc(symbol, size, side, slippage_bps, reduce_only)
+            .await;
+        if let Err(ref err) = result {
+            self.report_rate_limit(
+                "create_order_taker_ioc",
+                &format!(
+                    "{} | side={:?} size={} slippage_bps={}",
+                    symbol, side, size, slippage_bps
+                ),
+                err,
+            );
+        }
+        result
+    }
+
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
         let result = self.inner.cancel_order(symbol, order_id).await;
         if let Err(ref err) = result {
