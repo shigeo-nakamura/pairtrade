@@ -16,12 +16,23 @@
 //! deferred entry, and `ws_reset_24h_count` is a fleet-level health
 //! readout that doesn't fragment per variant.
 
+mod classification;
+mod deferral;
+
 use log::{Level, Log, Metadata, Record};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+use classification::{
+    is_step_overrun_event, is_step_overrun_recovery_event, is_ws_recovery_event,
+    is_ws_transient_event, WS_RESET_PHRASE,
+};
+use deferral::{
+    flush_all_expired_pending, PendingEntry, STEP_OVERRUN_DEFER_WINDOW_SECS, WS_DEFER_WINDOW_SECS,
+};
 
 /// Process-global counter handle, populated by the binary's logger
 /// initialization. Library code (e.g. `StatusReporter`) reads it to
@@ -105,28 +116,6 @@ const ROLLING_WINDOW_SECS: i64 = 1800;
 /// a self-reported field in `status.json` (bot-strategy#343). Threshold
 /// for alerting is 10/day per #47.
 const WS_RESET_24H_WINDOW_SECS: i64 = 24 * 60 * 60;
-
-/// Substring used to identify a WS reset event in the log stream. The
-/// dashboard's old journalctl probe matched the same exact phrase, so
-/// the bot-self-reported counter and the journalctl-derived counter
-/// are interchangeable.
-const WS_RESET_PHRASE: &str = "Connection reset without closing handshake";
-
-/// Defer-window for transient WebSocket reset events. A WS reset that
-/// auto-recovers within this window does not contribute to the rolling
-/// counts (see bot-strategy#261). Sized for typical Lighter / Extended
-/// reconnect cycles (~5–30s observed); 60s gives headroom for slow
-/// reconnects without ageing out a real persistent disconnect.
-const WS_DEFER_WINDOW_SECS: i64 = 60;
-
-/// Defer-window for `[STEP_OVERRUN]` warns. STEP_OVERRUN typically fires
-/// when step() blocks on a partial-fill chain during entry / exit; the
-/// `[ORDER] ... orders filled` recovery marker arrives within seconds-to-
-/// minutes after the warn. Bot-strategy#267 observed a 48s gap between
-/// STEP_OVERRUN and `entry orders filled` for a normal LongSpread fill, so
-/// 180s gives ~3-4× headroom while still committing genuinely stuck steps
-/// (e.g. deadlock, runaway REST loop) before the next status poll cycle.
-const STEP_OVERRUN_DEFER_WINDOW_SECS: i64 = 180;
 
 /// Keep the last error message truncated to this many chars so the
 /// dashboard can display it without blowing up the JSON payload.
@@ -214,60 +203,6 @@ impl Counters {
                 .or_insert_with(|| Arc::new(Bucket::new())),
         )
     }
-}
-
-#[derive(Debug, Clone)]
-struct PendingEntry {
-    ts: i64,
-    level: Level,
-    message: String,
-    /// Instance id active when the entry was deferred. On expiry the
-    /// entry commits to this bucket; recovery markers drain the entire
-    /// queue regardless of attribution (recovery is a connector-level
-    /// signal shared across variants).
-    instance: Option<String>,
-}
-
-/// Match log lines that signal a transient connectivity event whose effect
-/// should be suppressed if the bot recovers within `WS_DEFER_WINDOW_SECS`.
-/// Covers (1) the connector ERROR raised by the tungstenite WS layer when
-/// the upstream RST-resets, and (2) the WARN downstream of that — the
-/// xvenue-arb tick error and the pairtrade orderbook-stale signals — that
-/// fire while the reconnect is in progress.
-fn is_ws_transient_event(msg: &str) -> bool {
-    msg.starts_with("WebSocket error:")
-        || msg.starts_with("WebSocket IO error detail:")
-        || msg.contains("tick error: read_mid")
-        || msg.contains("order book snapshot unavailable")
-        || msg.contains("waiting for websocket data")
-        || msg.starts_with("orderbook stream error:")
-        || msg.starts_with("public trades stream error:")
-        || msg.starts_with("account stream error:")
-}
-
-/// Match log lines that signal a successful WS reconnect. Drains pending
-/// transient entries logged within the past `WS_DEFER_WINDOW_SECS`.
-fn is_ws_recovery_event(msg: &str) -> bool {
-    msg.starts_with("WebSocket connected successfully")
-        || msg.contains("WebSocket subscriptions sent successfully")
-}
-
-/// Match the critical `[STEP_OVERRUN]` warn (mild overruns log at INFO and
-/// don't reach this path). Bot-strategy#267 traced one such warn to a
-/// normal partial-fill chain: ENTRY started, ETH leg full-filled, BTC leg
-/// chained 8 partial fills + reissues, step() returned 12s late, but the
-/// trade itself completed cleanly. The warn is observational rather than a
-/// failure signal — defer it until the matching completion log lands.
-fn is_step_overrun_event(msg: &str) -> bool {
-    msg.contains("[STEP_OVERRUN]")
-}
-
-/// Match the `[ORDER] X entry orders filled` / `[ORDER] X exit orders filled`
-/// log lines that drain pending STEP_OVERRUN entries. A successful trade
-/// completion within the defer window is taken as proof the slow step()
-/// was waiting on order management (not a real stall).
-fn is_step_overrun_recovery_event(msg: &str) -> bool {
-    msg.contains("entry orders filled") || msg.contains("exit orders filled")
 }
 
 #[derive(Clone)]
@@ -427,43 +362,6 @@ fn commit_to_bucket(counters: &Counters, instance: Option<&str>, ts: i64, level:
         }
         _ => {}
     }
-}
-
-/// Move pending entries from `queue` whose defer window has expired into
-/// the durable per-instance buckets (and update last_error/last_warn +
-/// totals). Called from both `snapshot()` and `log()` so the counts stay
-/// current regardless of whether the dashboard is polling.
-fn flush_expired_pending(
-    queue: &Mutex<VecDeque<PendingEntry>>,
-    counters: &Counters,
-    now: i64,
-    window: i64,
-) {
-    let cutoff = now - window;
-    let mut to_commit: Vec<PendingEntry> = Vec::new();
-    {
-        let mut pending = queue.lock().unwrap();
-        while let Some(front) = pending.front() {
-            if front.ts <= cutoff {
-                to_commit.push(pending.pop_front().unwrap());
-            } else {
-                break;
-            }
-        }
-    }
-    for entry in to_commit {
-        commit_to_bucket(counters, entry.instance.as_deref(), entry.ts, entry.level, entry.message);
-    }
-}
-
-fn flush_all_expired_pending(counters: &Counters, now: i64) {
-    flush_expired_pending(&counters.pending_ws, counters, now, WS_DEFER_WINDOW_SECS);
-    flush_expired_pending(
-        &counters.pending_step_overrun,
-        counters,
-        now,
-        STEP_OVERRUN_DEFER_WINDOW_SECS,
-    );
 }
 
 impl Log for ErrorCountingLogger {
