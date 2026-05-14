@@ -488,3 +488,84 @@ impl PairTradeEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the static `format_positions_summary` log helper used
+    //! by `force_close_on_startup`. The string this builds is the only
+    //! surviving log evidence of a startup force-close (journalctl 7d
+    //! retention; see feedback_no_cloudwatch and feedback_pairtrade_restart_force_closes),
+    //! so its shape — direction tag + size + entry — is load-bearing for
+    //! post-incident reconstruction. bot-strategy#396.
+    use rust_decimal::Decimal;
+
+    use dex_connector::PositionSnapshot;
+
+    use super::PairTradeEngine;
+
+    fn dec(v: &str) -> Decimal {
+        v.parse().unwrap()
+    }
+
+    fn pos(symbol: &str, size: &str, sign: i32, entry: Option<&str>) -> PositionSnapshot {
+        PositionSnapshot {
+            symbol: symbol.to_string(),
+            size: dec(size),
+            sign,
+            entry_price: entry.map(dec),
+        }
+    }
+
+    #[test]
+    fn format_empty_positions_produces_empty_string() {
+        let s = PairTradeEngine::format_positions_summary(&[]);
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn format_long_position_renders_direction_and_entry() {
+        let positions = vec![pos("BTC", "0.05", 1, Some("70000"))];
+        let s = PairTradeEngine::format_positions_summary(&positions);
+        assert_eq!(s, "BTC LONG size=0.05 entry=70000");
+    }
+
+    #[test]
+    fn format_short_position_renders_direction_and_entry() {
+        let positions = vec![pos("ETH", "1.2", -1, Some("3500"))];
+        let s = PairTradeEngine::format_positions_summary(&positions);
+        assert_eq!(s, "ETH SHORT size=1.2 entry=3500");
+    }
+
+    #[test]
+    fn format_flat_position_renders_flat_tag() {
+        // sign==0 is unusual but should fall under the FLAT branch
+        // (defensive: a dust-skipped snapshot would be filtered before
+        // reaching the log helper, but `force_close_on_startup` calls
+        // this on the raw exchange list).
+        let positions = vec![pos("BTC", "0.0", 0, None)];
+        let s = PairTradeEngine::format_positions_summary(&positions);
+        assert_eq!(s, "BTC FLAT size=0.0 entry=n/a");
+    }
+
+    #[test]
+    fn format_missing_entry_price_renders_na() {
+        let positions = vec![pos("BTC", "0.05", 1, None)];
+        let s = PairTradeEngine::format_positions_summary(&positions);
+        assert_eq!(s, "BTC LONG size=0.05 entry=n/a");
+    }
+
+    #[test]
+    fn format_multiple_positions_joins_with_comma() {
+        // Multi-pair format on a single line keeps the journalctl entry
+        // greppable: one `[Startup]` line per attempt with all legs.
+        let positions = vec![
+            pos("BTC", "0.05", 1, Some("70000")),
+            pos("ETH", "1.5", -1, Some("3500")),
+        ];
+        let s = PairTradeEngine::format_positions_summary(&positions);
+        assert_eq!(
+            s,
+            "BTC LONG size=0.05 entry=70000, ETH SHORT size=1.5 entry=3500"
+        );
+    }
+}

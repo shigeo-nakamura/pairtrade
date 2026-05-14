@@ -59,9 +59,9 @@ impl PairTradeEngine {
 
         if let Some(mut pending) = pending_entry {
             let status = self.pending_status(&pending).await?;
-            self.update_pending_fills(&mut pending, &status.fills);
-            let filled_qtys = self.filled_by_leg(&pending, &status.fills);
-            if self.all_filled(&pending, &status.fills) {
+            Self::update_pending_fills(&mut pending, &status.fills);
+            let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
+            if Self::all_filled(&pending, &status.fills) {
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     let (mut ep_a, mut ep_b, mut es_a, mut es_b) = (None, None, None, None);
                     if let Some((base, quote)) = key.split_once('/') {
@@ -244,7 +244,7 @@ impl PairTradeEngine {
                     }
                     self.cancel_pending_orders(&pending).await?;
                 }
-                let filled_qtys = self.filled_by_leg(&pending, &status.fills);
+                let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
                 let mut flattened_any = false;
                 let mut hedge_failed = false;
                 let mut retry_count = pending.hedge_retry_count;
@@ -346,13 +346,13 @@ impl PairTradeEngine {
         if let Some(pending) = pending_exit {
             let status = self.pending_status(&pending).await?;
             let mut pending = pending;
-            self.update_pending_fills(&mut pending, &status.fills);
-            let filled_qtys = self.filled_by_leg(&pending, &status.fills);
+            Self::update_pending_fills(&mut pending, &status.fills);
+            let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
             // (record, realized_pnl, funding_carry_usd) — the third element
             // is folded into `inst.funding_carry_today` at the same site as
             // `realized_pnl_today` below. 0.0 when no ticks were observed.
             let mut pnl_record: Option<(PnlLogRecord, f64, f64)> = None;
-            if status.open_remaining == 0 && self.all_filled(&pending, &status.fills) {
+            if status.open_remaining == 0 && Self::all_filled(&pending, &status.fills) {
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     if let Some(pos) = state.position.as_ref() {
                         if let Some((base, quote)) = key.split_once('/') {
@@ -752,7 +752,11 @@ impl PairTradeEngine {
         })
     }
 
-    fn leg_fill_from_map(&self, leg: &PendingLeg, fills: &HashMap<String, Decimal>) -> Decimal {
+    /// Look up the per-order-id fill, falling back to the exchange-side
+    /// order id when present. `&self` is not needed — promoted to an
+    /// associated fn so unit tests can exercise the lookup without
+    /// constructing an engine. bot-strategy#396.
+    fn leg_fill_from_map(leg: &PendingLeg, fills: &HashMap<String, Decimal>) -> Decimal {
         fills
             .get(&leg.order_id)
             .cloned()
@@ -764,37 +768,241 @@ impl PairTradeEngine {
             .unwrap_or(Decimal::ZERO)
     }
 
-    fn update_pending_fills(&self, pending: &mut PendingOrders, fills: &HashMap<String, Decimal>) {
+    fn update_pending_fills(pending: &mut PendingOrders, fills: &HashMap<String, Decimal>) {
         for leg in &mut pending.legs {
-            let filled = self.leg_fill_from_map(leg, fills);
+            let filled = Self::leg_fill_from_map(leg, fills);
             if filled > leg.filled {
                 leg.filled = filled.min(leg.target);
             }
         }
     }
 
-    fn filled_for_leg(&self, leg: &PendingLeg, fills: &HashMap<String, Decimal>) -> Decimal {
-        let filled = self.leg_fill_from_map(leg, fills);
+    fn filled_for_leg(leg: &PendingLeg, fills: &HashMap<String, Decimal>) -> Decimal {
+        let filled = Self::leg_fill_from_map(leg, fills);
         filled.max(leg.filled).min(leg.target)
     }
 
     fn filled_by_leg(
-        &self,
         pending: &PendingOrders,
         fills: &HashMap<String, Decimal>,
     ) -> HashMap<String, Decimal> {
         let mut map = HashMap::new();
         for leg in &pending.legs {
-            let filled = self.filled_for_leg(leg, fills);
+            let filled = Self::filled_for_leg(leg, fills);
             map.insert(leg.order_id.clone(), filled);
         }
         map
     }
 
-    fn all_filled(&self, pending: &PendingOrders, fills: &HashMap<String, Decimal>) -> bool {
+    fn all_filled(pending: &PendingOrders, fills: &HashMap<String, Decimal>) -> bool {
         pending
             .legs
             .iter()
-            .all(|leg| self.filled_for_leg(leg, fills) >= leg.target)
+            .all(|leg| Self::filled_for_leg(leg, fills) >= leg.target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the fill-aggregation helpers used by
+    //! `reconcile_pending_orders`. These do not read engine state, so we
+    //! exercise them directly through `PairTradeEngine::<helper>(...)`
+    //! without standing up an engine. Reaches the leg-fill aggregation
+    //! that drives partial / full / fallback branching in the reconcile
+    //! loop. bot-strategy#396.
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    use dex_connector::OrderSide;
+    use rust_decimal::Decimal;
+
+    use super::super::super::state::{PendingLeg, PendingOrders, PositionDirection};
+    use super::PairTradeEngine;
+
+    fn dec(v: &str) -> Decimal {
+        v.parse().unwrap()
+    }
+
+    fn leg(symbol: &str, order_id: &str, target: &str, filled: &str) -> PendingLeg {
+        PendingLeg {
+            symbol: symbol.to_string(),
+            order_id: order_id.to_string(),
+            exchange_order_id: None,
+            target: dec(target),
+            filled: dec(filled),
+            side: OrderSide::Long,
+            limit_price: None,
+        }
+    }
+
+    fn leg_with_exchange(
+        symbol: &str,
+        order_id: &str,
+        exchange_id: &str,
+        target: &str,
+    ) -> PendingLeg {
+        PendingLeg {
+            symbol: symbol.to_string(),
+            order_id: order_id.to_string(),
+            exchange_order_id: Some(exchange_id.to_string()),
+            target: dec(target),
+            filled: Decimal::ZERO,
+            side: OrderSide::Long,
+            limit_price: None,
+        }
+    }
+
+    fn pending(legs: Vec<PendingLeg>) -> PendingOrders {
+        PendingOrders {
+            legs,
+            direction: PositionDirection::LongSpread,
+            placed_at: Instant::now(),
+            hedge_retry_count: 0,
+            post_only_hybrid: false,
+        }
+    }
+
+    #[test]
+    fn leg_fill_returns_zero_when_neither_id_present() {
+        let l = leg("BTC", "ord-1", "1.0", "0.0");
+        let fills: HashMap<String, Decimal> = HashMap::new();
+        assert_eq!(
+            PairTradeEngine::leg_fill_from_map(&l, &fills),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn leg_fill_prefers_internal_order_id_over_exchange_id() {
+        // When both ids are present in the fills map, the internal
+        // bot-assigned id wins. Locks the "primary key" invariant the
+        // reconcile loop relies on when reissuing partial legs.
+        let l = leg_with_exchange("BTC", "ord-1", "exch-9", "1.0");
+        let mut fills = HashMap::new();
+        fills.insert("ord-1".to_string(), dec("0.3"));
+        fills.insert("exch-9".to_string(), dec("0.7"));
+        assert_eq!(
+            PairTradeEngine::leg_fill_from_map(&l, &fills),
+            dec("0.3")
+        );
+    }
+
+    #[test]
+    fn leg_fill_falls_back_to_exchange_order_id_when_internal_missing() {
+        // Extended often surfaces fills under its own exchange-side id;
+        // the reconcile loop must still aggregate them onto the right leg.
+        let l = leg_with_exchange("BTC", "ord-1", "exch-9", "1.0");
+        let mut fills = HashMap::new();
+        fills.insert("exch-9".to_string(), dec("0.5"));
+        assert_eq!(
+            PairTradeEngine::leg_fill_from_map(&l, &fills),
+            dec("0.5")
+        );
+    }
+
+    #[test]
+    fn filled_for_leg_caps_at_target_when_exchange_overreports() {
+        // Exchange briefly reports a filled qty larger than the order
+        // target (Extended idempotency-retry artifact). Cap at target so
+        // downstream `target - filled` arithmetic in reissue_partial_legs
+        // doesn't underflow to negative remaining and skip the reissue.
+        let l = leg("BTC", "ord-1", "1.0", "0.0");
+        let mut fills = HashMap::new();
+        fills.insert("ord-1".to_string(), dec("1.5"));
+        assert_eq!(PairTradeEngine::filled_for_leg(&l, &fills), dec("1.0"));
+    }
+
+    #[test]
+    fn filled_for_leg_never_regresses_below_leg_filled() {
+        // If the in-memory `leg.filled` is already higher than the
+        // exchange map (e.g. between two polls only the older value is
+        // still in flight), keep the higher value. Monotonic per-leg fill
+        // accounting prevents the reconcile loop from re-reissuing a leg
+        // it has already accepted as further-along.
+        let l = leg("BTC", "ord-1", "1.0", "0.6");
+        let mut fills = HashMap::new();
+        fills.insert("ord-1".to_string(), dec("0.4"));
+        assert_eq!(PairTradeEngine::filled_for_leg(&l, &fills), dec("0.6"));
+    }
+
+    #[test]
+    fn update_pending_fills_advances_leg_filled_monotonically() {
+        // The reconcile loop's first action: roll the exchange's fill
+        // view into `leg.filled` if it has advanced. Must not regress.
+        let mut p = pending(vec![
+            leg("BTC", "ord-1", "1.0", "0.2"), // stays at 0.6 from map
+            leg("ETH", "ord-2", "2.0", "1.5"), // map shows 0.0 → unchanged
+        ]);
+        let mut fills = HashMap::new();
+        fills.insert("ord-1".to_string(), dec("0.6"));
+        // ord-2 deliberately missing from map.
+        PairTradeEngine::update_pending_fills(&mut p, &fills);
+        assert_eq!(p.legs[0].filled, dec("0.6"));
+        assert_eq!(p.legs[1].filled, dec("1.5"));
+    }
+
+    #[test]
+    fn update_pending_fills_clamps_advance_at_target() {
+        // Same overreport scenario as filled_for_leg, but through the
+        // in-place update path that mutates the engine's pending state.
+        let mut p = pending(vec![leg("BTC", "ord-1", "1.0", "0.0")]);
+        let mut fills = HashMap::new();
+        fills.insert("ord-1".to_string(), dec("1.7"));
+        PairTradeEngine::update_pending_fills(&mut p, &fills);
+        assert_eq!(p.legs[0].filled, dec("1.0"));
+    }
+
+    #[test]
+    fn filled_by_leg_keys_by_internal_order_id() {
+        // Downstream reissue path looks up by internal id only — the
+        // aggregator must therefore also surface fills under the internal
+        // id even when the source row carried only an exchange id.
+        let p = pending(vec![
+            leg_with_exchange("BTC", "ord-1", "exch-9", "1.0"),
+            leg("ETH", "ord-2", "2.0", "0.0"),
+        ]);
+        let mut fills = HashMap::new();
+        fills.insert("exch-9".to_string(), dec("0.5"));
+        fills.insert("ord-2".to_string(), dec("2.0"));
+        let by_leg = PairTradeEngine::filled_by_leg(&p, &fills);
+        assert_eq!(by_leg.get("ord-1"), Some(&dec("0.5")));
+        assert_eq!(by_leg.get("ord-2"), Some(&dec("2.0")));
+    }
+
+    #[test]
+    fn all_filled_true_when_every_leg_meets_target() {
+        let p = pending(vec![
+            leg("BTC", "ord-1", "1.0", "0.0"),
+            leg("ETH", "ord-2", "2.0", "0.0"),
+        ]);
+        let mut fills = HashMap::new();
+        fills.insert("ord-1".to_string(), dec("1.0"));
+        fills.insert("ord-2".to_string(), dec("2.0"));
+        assert!(PairTradeEngine::all_filled(&p, &fills));
+    }
+
+    #[test]
+    fn all_filled_false_when_any_leg_short() {
+        // The reconcile partial-fill branch fires when this returns false
+        // *and* at least one leg has non-zero fill. Exactly-zero fills
+        // route to the stale / timeout branch instead.
+        let p = pending(vec![
+            leg("BTC", "ord-1", "1.0", "0.0"),
+            leg("ETH", "ord-2", "2.0", "0.0"),
+        ]);
+        let mut fills = HashMap::new();
+        fills.insert("ord-1".to_string(), dec("1.0"));
+        fills.insert("ord-2".to_string(), dec("1.9")); // short
+        assert!(!PairTradeEngine::all_filled(&p, &fills));
+    }
+
+    #[test]
+    fn all_filled_uses_in_memory_filled_when_map_silent() {
+        // After an `update_pending_fills` advance, the next reconcile poll
+        // may see no map entry for an already-completed leg. The
+        // aggregator must still treat it as filled to avoid reissuing.
+        let p = pending(vec![leg("BTC", "ord-1", "1.0", "1.0")]);
+        let fills: HashMap<String, Decimal> = HashMap::new();
+        assert!(PairTradeEngine::all_filled(&p, &fills));
     }
 }

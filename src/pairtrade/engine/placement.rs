@@ -391,15 +391,15 @@ impl PairTradeEngine {
         Err(last_err)
     }
 
-    pub(in crate::pairtrade) async fn place_pair_orders(
-        &mut self,
-        inst_idx: usize,
-        pair: &PairSpec,
+    /// Map a spread `direction` to the (base, quote) leg sides used when
+    /// **opening** a pair position. LongSpread = long base / short quote;
+    /// ShortSpread = short base / long quote. Extracted from the inline
+    /// match in `place_pair_orders` so the leg-shape invariant is
+    /// independently testable. bot-strategy#396.
+    pub(in crate::pairtrade) fn entry_sides_for(
         direction: PositionDirection,
-        qtys: (Decimal, Decimal),
-        prices: &HashMap<String, SymbolSnapshot>,
-    ) -> Result<Vec<PendingLeg>> {
-        let (side_a, side_b) = match direction {
+    ) -> (dex_connector::OrderSide, dex_connector::OrderSide) {
+        match direction {
             PositionDirection::LongSpread => (
                 dex_connector::OrderSide::Long,
                 dex_connector::OrderSide::Short,
@@ -408,7 +408,37 @@ impl PairTradeEngine {
                 dex_connector::OrderSide::Short,
                 dex_connector::OrderSide::Long,
             ),
-        };
+        }
+    }
+
+    /// Map a spread `direction` to the (base, quote) leg sides used when
+    /// **closing** the pair. Inverse of `entry_sides_for`. Bugs here
+    /// double-the-leverage instead of flattening — the kind of failure
+    /// that should never escape unit tests.
+    pub(in crate::pairtrade) fn exit_sides_for(
+        direction: PositionDirection,
+    ) -> (dex_connector::OrderSide, dex_connector::OrderSide) {
+        match direction {
+            PositionDirection::LongSpread => (
+                dex_connector::OrderSide::Short,
+                dex_connector::OrderSide::Long,
+            ),
+            PositionDirection::ShortSpread => (
+                dex_connector::OrderSide::Long,
+                dex_connector::OrderSide::Short,
+            ),
+        }
+    }
+
+    pub(in crate::pairtrade) async fn place_pair_orders(
+        &mut self,
+        inst_idx: usize,
+        pair: &PairSpec,
+        direction: PositionDirection,
+        qtys: (Decimal, Decimal),
+        prices: &HashMap<String, SymbolSnapshot>,
+    ) -> Result<Vec<PendingLeg>> {
+        let (side_a, side_b) = Self::entry_sides_for(direction);
         let ref_price_a = self.order_reference_price(&pair.base, side_a, prices);
         let ref_price_b = self.order_reference_price(&pair.quote, side_b, prices);
         // Pick the floor/ceiling combination per leg that best preserves the
@@ -677,16 +707,7 @@ impl PairTradeEngine {
         prices: &HashMap<String, SymbolSnapshot>,
         use_market: bool,
     ) -> Result<Vec<PendingLeg>> {
-        let (side_a, side_b) = match direction {
-            PositionDirection::LongSpread => (
-                dex_connector::OrderSide::Short,
-                dex_connector::OrderSide::Long,
-            ),
-            PositionDirection::ShortSpread => (
-                dex_connector::OrderSide::Long,
-                dex_connector::OrderSide::Short,
-            ),
-        };
+        let (side_a, side_b) = Self::exit_sides_for(direction);
         let ref_price_a = self.order_reference_price(&pair.base, side_a, prices);
         let ref_price_b = self.order_reference_price(&pair.quote, side_b, prices);
         let qty_a = self.quantize_order_size_close(&pair.base, qtys.0, prices);
@@ -1098,5 +1119,54 @@ impl PairTradeEngine {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the static leg-side maps used by
+    //! `place_pair_orders` / `close_pair_orders`. A wrong side here
+    //! doubles leverage on close instead of flattening; the inverse-pair
+    //! invariant is therefore worth pinning at the unit level
+    //! independent of the engine. bot-strategy#396.
+    use dex_connector::OrderSide;
+
+    use super::super::super::state::PositionDirection;
+    use super::PairTradeEngine;
+
+    #[test]
+    fn entry_sides_long_spread() {
+        let (a, b) = PairTradeEngine::entry_sides_for(PositionDirection::LongSpread);
+        assert_eq!(a, OrderSide::Long);
+        assert_eq!(b, OrderSide::Short);
+    }
+
+    #[test]
+    fn entry_sides_short_spread() {
+        let (a, b) = PairTradeEngine::entry_sides_for(PositionDirection::ShortSpread);
+        assert_eq!(a, OrderSide::Short);
+        assert_eq!(b, OrderSide::Long);
+    }
+
+    #[test]
+    fn exit_sides_invert_entry_sides_long_spread() {
+        // Exit must reverse both legs; otherwise a "close" doubles
+        // leverage instead of flattening.
+        let (ea, eb) = PairTradeEngine::entry_sides_for(PositionDirection::LongSpread);
+        let (xa, xb) = PairTradeEngine::exit_sides_for(PositionDirection::LongSpread);
+        assert_ne!(ea, xa);
+        assert_ne!(eb, xb);
+        assert_eq!(xa, OrderSide::Short);
+        assert_eq!(xb, OrderSide::Long);
+    }
+
+    #[test]
+    fn exit_sides_invert_entry_sides_short_spread() {
+        let (ea, eb) = PairTradeEngine::entry_sides_for(PositionDirection::ShortSpread);
+        let (xa, xb) = PairTradeEngine::exit_sides_for(PositionDirection::ShortSpread);
+        assert_ne!(ea, xa);
+        assert_ne!(eb, xb);
+        assert_eq!(xa, OrderSide::Long);
+        assert_eq!(xb, OrderSide::Short);
     }
 }

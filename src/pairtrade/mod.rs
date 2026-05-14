@@ -1089,7 +1089,15 @@ impl PairTradeEngine {
 
 #[cfg(test)]
 impl PairTradeEngine {
-    fn test_instance(connector: Arc<dyn DexConnector + Send + Sync>) -> Self {
+    /// Construct a single-instance, no-state engine wired to `connector`.
+    /// Universe = AAA/BBB, dry_run=true, default PairParams. Tests that
+    /// need pair state seed `engine.instances[0].states` directly.
+    /// `pub(in crate::pairtrade)` so cluster-module tests under
+    /// `engine/<x>.rs` can drive engine state-mutation paths without
+    /// duplicating the constructor. bot-strategy#396.
+    pub(in crate::pairtrade) fn test_instance(
+        connector: Arc<dyn DexConnector + Send + Sync>,
+    ) -> Self {
         let cfg = PairTradeConfig {
             dex_name: "test".to_string(),
             rest_endpoint: "http://localhost".to_string(),
@@ -1590,6 +1598,13 @@ mod pending_tests {
         next_id: AtomicUsize,
         balance_calls: AtomicUsize,
         balance_equity: Mutex<Option<Decimal>>,
+        /// bot-strategy#396: observe whether `force_close_on_startup` /
+        /// `force_close_all_positions` reach the connector. Used to lock
+        /// the dry_run short-circuit so a future refactor cannot silently
+        /// turn it into a side-effecting path.
+        positions_calls: AtomicUsize,
+        close_all_calls: AtomicUsize,
+        cancel_all_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -1651,6 +1666,7 @@ mod pending_tests {
         }
 
         async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
+            self.positions_calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![])
         }
 
@@ -1732,6 +1748,7 @@ mod pending_tests {
         }
 
         async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
+            self.cancel_all_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1744,6 +1761,7 @@ mod pending_tests {
         }
 
         async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
+            self.close_all_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -2201,6 +2219,268 @@ mod pending_tests {
 
         let inst = &engine.instances[0];
         assert_eq!(inst.total_trades, 9);
+    }
+
+    // ------------------------------------------------------------------
+    // bot-strategy#396: state-mutation coverage for engine cluster paths
+    // that previously had zero tests (reconcile / recovery / placement).
+    // ------------------------------------------------------------------
+
+    fn seed_state(engine: &mut PairTradeEngine, key: &str) {
+        // Inserts an empty PairState for `key` on instance 0 so the
+        // reconcile loop can find it. Mirrors the production state-build
+        // path in `new_inner` (one PairState per universe pair).
+        engine.instances[0].states.insert(
+            key.to_string(),
+            state::PairState::new(8, 2.0),
+        );
+    }
+
+    /// `reconcile_pending_orders` keys off the per-pair `states` map. A
+    /// missing key is a configuration / build-order bug, not a transient
+    /// runtime condition, and must surface loudly rather than silently
+    /// skip.
+    #[tokio::test]
+    async fn reconcile_pending_orders_errors_when_state_missing() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        let price_map: HashMap<String, SymbolSnapshot> = HashMap::new();
+
+        let result = engine
+            .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+            .await;
+
+        assert!(result.is_err(), "missing state key must surface as error");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("AAA/BBB"),
+            "error message must name the missing pair key: {msg}"
+        );
+    }
+
+    /// With state present but no pending orders, reconcile is a no-op
+    /// (no connector calls, no state mutation). This is the steady-state
+    /// path on every tick when the bot is flat — must stay free of
+    /// side-effects, otherwise the per-tick connector RPC budget gets
+    /// burned for nothing.
+    #[tokio::test]
+    async fn reconcile_pending_orders_noop_when_no_pendings() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        seed_state(&mut engine, "AAA/BBB");
+        let price_map: HashMap<String, SymbolSnapshot> = HashMap::new();
+
+        engine
+            .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+            .await
+            .expect("no pending = Ok");
+
+        assert_eq!(
+            connector.calls.lock().unwrap().len(),
+            0,
+            "no create_order calls"
+        );
+        assert_eq!(
+            connector.cancel_all_calls.load(Ordering::SeqCst),
+            0,
+            "no cancel_all calls"
+        );
+        let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+        assert!(state.pending_entry.is_none());
+        assert!(state.pending_exit.is_none());
+        assert!(state.position.is_none());
+    }
+
+    /// `register_partial_leg_failure` is the bridge from the engine's
+    /// place-leg error path back into per-pair pending state. An entry
+    /// failure must land in `pending_entry` so the next reconcile tick
+    /// can clean up the orphaned leg-A.
+    #[test]
+    fn register_partial_leg_failure_writes_pending_entry() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        seed_state(&mut engine, "AAA/BBB");
+        let placed_legs = vec![PendingLeg {
+            symbol: "AAA".to_string(),
+            order_id: "leg-a".to_string(),
+            exchange_order_id: None,
+            target: dec("0.05"),
+            filled: Decimal::ZERO,
+            side: OrderSide::Long,
+            limit_price: None,
+        }];
+        let partial_err: anyhow::Error = state::PartialOrderPlacementError::new(
+            placed_legs.clone(),
+            DexError::Transient("leg B failed".to_string()),
+        )
+        .into();
+
+        engine.register_partial_leg_failure(
+            0,
+            "AAA/BBB",
+            PositionDirection::LongSpread,
+            &partial_err,
+            false, // is_exit
+        );
+
+        let pending = engine.instances[0]
+            .states
+            .get("AAA/BBB")
+            .unwrap()
+            .pending_entry
+            .as_ref()
+            .expect("pending_entry must be populated");
+        assert_eq!(pending.legs.len(), 1);
+        assert_eq!(pending.legs[0].symbol, "AAA");
+        assert_eq!(pending.legs[0].order_id, "leg-a");
+        assert_eq!(pending.direction, PositionDirection::LongSpread);
+    }
+
+    /// Same surface, exit side: must land in `pending_exit` so the next
+    /// tick re-attempts to close the orphan leg, not re-open a fresh
+    /// entry.
+    #[test]
+    fn register_partial_leg_failure_writes_pending_exit() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        seed_state(&mut engine, "AAA/BBB");
+        let placed_legs = vec![PendingLeg {
+            symbol: "AAA".to_string(),
+            order_id: "exit-leg-a".to_string(),
+            exchange_order_id: None,
+            target: dec("0.05"),
+            filled: Decimal::ZERO,
+            side: OrderSide::Short,
+            limit_price: None,
+        }];
+        let partial_err: anyhow::Error = state::PartialOrderPlacementError::new(
+            placed_legs,
+            DexError::Transient("leg B failed".to_string()),
+        )
+        .into();
+
+        engine.register_partial_leg_failure(
+            0,
+            "AAA/BBB",
+            PositionDirection::ShortSpread,
+            &partial_err,
+            true, // is_exit
+        );
+
+        let state_ref = engine.instances[0].states.get("AAA/BBB").unwrap();
+        assert!(state_ref.pending_entry.is_none(), "exit must not touch pending_entry");
+        let pending = state_ref
+            .pending_exit
+            .as_ref()
+            .expect("pending_exit must be populated");
+        assert_eq!(pending.direction, PositionDirection::ShortSpread);
+        assert_eq!(pending.legs[0].order_id, "exit-leg-a");
+    }
+
+    /// Errors that aren't `PartialOrderPlacementError` carry no leg list
+    /// to recover (e.g. a pre-flight reference-price miss). The function
+    /// silently no-ops — *not* writing a synthetic empty `PendingOrders`
+    /// that the reconcile loop would then try to cancel.
+    #[test]
+    fn register_partial_leg_failure_ignores_non_partial_errors() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        seed_state(&mut engine, "AAA/BBB");
+        let plain_err: anyhow::Error = anyhow::anyhow!("missing reference price");
+
+        engine.register_partial_leg_failure(
+            0,
+            "AAA/BBB",
+            PositionDirection::LongSpread,
+            &plain_err,
+            false,
+        );
+
+        let state_ref = engine.instances[0].states.get("AAA/BBB").unwrap();
+        assert!(state_ref.pending_entry.is_none());
+        assert!(state_ref.pending_exit.is_none());
+    }
+
+    /// Unknown state key: write must be silently skipped (the function
+    /// uses `if let Some(state) = ... get_mut(key)`). Better to no-op
+    /// than panic — a stale pair key in flight should not crash a live
+    /// bot. Verifies no other instance's state is mutated.
+    #[test]
+    fn register_partial_leg_failure_silently_skips_unknown_pair() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        seed_state(&mut engine, "AAA/BBB");
+        let partial_err: anyhow::Error = state::PartialOrderPlacementError::new(
+            vec![],
+            DexError::Transient("placement failed".to_string()),
+        )
+        .into();
+
+        engine.register_partial_leg_failure(
+            0,
+            "CCC/DDD",
+            PositionDirection::LongSpread,
+            &partial_err,
+            false,
+        );
+
+        // Sibling key untouched.
+        let other = engine.instances[0].states.get("AAA/BBB").unwrap();
+        assert!(other.pending_entry.is_none());
+        assert!(other.pending_exit.is_none());
+    }
+
+    /// `force_close_on_startup` is a no-op when `dry_run=true`
+    /// (matches DRY_RUN windows used during live-readiness validation).
+    /// The connector must not be touched — getting positions /
+    /// canceling / closing during DRY_RUN burns rate limit and pollutes
+    /// the live bot's order book if the same wallet is shared.
+    #[tokio::test]
+    async fn force_close_on_startup_dry_run_skips_connector_calls() {
+        let connector = Arc::new(DummyConnector::default());
+        let engine = PairTradeEngine::test_instance(connector.clone());
+        // test_instance defaults dry_run=true.
+
+        engine.force_close_on_startup().await.unwrap();
+
+        assert_eq!(
+            connector.positions_calls.load(Ordering::SeqCst),
+            0,
+            "dry_run must not query positions"
+        );
+        assert_eq!(
+            connector.cancel_all_calls.load(Ordering::SeqCst),
+            0,
+            "dry_run must not issue cancel_all_orders"
+        );
+        assert_eq!(
+            connector.close_all_calls.load(Ordering::SeqCst),
+            0,
+            "dry_run must not issue close_all_positions"
+        );
+    }
+
+    /// `force_close_all_positions` (reconcile-loop emergency path) is
+    /// also gated by dry_run / observe_only. The reconcile loop calls
+    /// it after exit retries exhaust; on DRY_RUN we must not pretend
+    /// to flatten on the exchange.
+    #[tokio::test]
+    async fn force_close_all_positions_dry_run_skips_connector_calls() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+
+        engine.force_close_all_positions("AAA/BBB", "timeout").await;
+
+        assert_eq!(
+            connector.positions_calls.load(Ordering::SeqCst),
+            0,
+            "dry_run must not query positions"
+        );
+        assert_eq!(
+            connector.close_all_calls.load(Ordering::SeqCst),
+            0,
+            "dry_run must not invoke close_all_positions"
+        );
     }
 }
 
