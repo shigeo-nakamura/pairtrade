@@ -1618,7 +1618,7 @@ mod pending_tests {
             _symbol: &str,
             _test_price: Option<Decimal>,
         ) -> Result<TickerResponse, DexError> {
-            Err(DexError::Other("not used".to_string()))
+            Err(DexError::Permanent("not used".to_string()))
         }
 
         async fn get_filled_orders(&self, _symbol: &str) -> Result<FilledOrdersResponse, DexError> {
@@ -1727,7 +1727,7 @@ mod pending_tests {
             _reduce_only: bool,
             _expiry_secs: Option<u64>,
         ) -> Result<CreateOrderResponse, DexError> {
-            Err(DexError::Other("not used".to_string()))
+            Err(DexError::Permanent("not used".to_string()))
         }
 
         async fn cancel_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {

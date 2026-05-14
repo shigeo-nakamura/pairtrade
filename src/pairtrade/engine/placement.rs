@@ -319,7 +319,7 @@ impl PairTradeEngine {
                 self.limit_price_for(symbol, side, prices)
             };
             if use_post_only && limit.is_none() {
-                return Err(DexError::Other(format!(
+                return Err(DexError::Transient(format!(
                     "[ORDER] Missing reference price for post-only {}",
                     symbol
                 )));

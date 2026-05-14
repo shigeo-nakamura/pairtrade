@@ -26,7 +26,9 @@ pub(in crate::pairtrade) fn is_ticker_rate_limited(err: &DexError, msg: &str) ->
 
 pub(in crate::pairtrade) fn is_reduce_only_position_missing_error(err: &DexError) -> bool {
     let msg = match err {
-        DexError::ServerResponse(message) | DexError::Other(message) => message,
+        DexError::ServerResponse(message)
+        | DexError::Transient(message)
+        | DexError::Permanent(message) => message,
         _ => return false,
     };
     let lower = msg.to_ascii_lowercase();
@@ -36,7 +38,9 @@ pub(in crate::pairtrade) fn is_reduce_only_position_missing_error(err: &DexError
 
 pub(in crate::pairtrade) fn is_reduce_only_size_mismatch_error(err: &DexError) -> bool {
     let msg = match err {
-        DexError::ServerResponse(message) | DexError::Other(message) => message,
+        DexError::ServerResponse(message)
+        | DexError::Transient(message)
+        | DexError::Permanent(message) => message,
         _ => return false,
     };
     let lower = msg.to_ascii_lowercase();
@@ -204,7 +208,7 @@ mod tests {
 
     #[test]
     fn ticker_rate_limited_matches_http_429_message() {
-        let err = DexError::Other(
+        let err = DexError::Transient(
             "HTTP 429 Too Many Requests: {\"code\":23000,\"message\":\"Too Many Requests!\"}"
                 .to_string(),
         );
@@ -214,17 +218,17 @@ mod tests {
 
     #[test]
     fn ticker_rate_limited_matches_too_many_requests_substring() {
-        let err = DexError::Other("Other error: Too Many Requests!".to_string());
+        let err = DexError::Transient("Too Many Requests!".to_string());
         let msg = err.to_string();
         assert!(is_ticker_rate_limited(&err, &msg));
     }
 
     #[test]
     fn ticker_rate_limited_ignores_unrelated_errors() {
-        let err = DexError::Other("HTTP 500 Internal Server Error".to_string());
+        let err = DexError::Transient("HTTP 500 Internal Server Error".to_string());
         let msg = err.to_string();
         assert!(!is_ticker_rate_limited(&err, &msg));
-        let auth = DexError::Other("HTTP 403 Forbidden".to_string());
+        let auth = DexError::Transient("HTTP 403 Forbidden".to_string());
         let auth_msg = auth.to_string();
         assert!(!is_ticker_rate_limited(&auth, &auth_msg));
     }
