@@ -9,7 +9,8 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 use std::env;
 use std::net::SocketAddr;
@@ -47,6 +48,20 @@ fn register_int_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVe
         .register(Box::new(c.clone()))
         .expect("prometheus registry rejected duplicate metric");
     c
+}
+
+fn register_histogram(
+    name: &str,
+    help: &str,
+    labels: &[&str],
+    buckets: Vec<f64>,
+) -> HistogramVec {
+    let h = HistogramVec::new(HistogramOpts::new(name, help).buckets(buckets), labels)
+        .expect("prometheus HistogramVec construction never fails for static names");
+    REGISTRY
+        .register(Box::new(h.clone()))
+        .expect("prometheus registry rejected duplicate metric");
+    h
 }
 
 // === Signal / cointegration ===
@@ -165,6 +180,39 @@ pub static CLOSE_REASON_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
         "pairtrade_close_reason_total",
         "Cumulative count of position closes broken down by exit reason.",
         &["variant", "pair", "reason"],
+    )
+});
+
+// === Execution quality (#314 Group 4) ===
+//
+// Observed at the exit_fill site (engine/reconcile.rs). `gross_pnl_bps` is
+// the price-move PnL `compute_pnl()` returns, normalized by the sum of
+// per-leg notionals at entry. `funding_carry_bps` is the WS-derived funding
+// over the hold from the same site, in the same denominator. Fees and
+// slippage are not yet observable in-process (would need a dex-connector
+// trait extension); BT/live gap analysis (#306) should compare BT gross to
+// live gross until that lands.
+
+pub static CLOSE_GROSS_PNL_BPS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram(
+        "pairtrade_close_gross_pnl_bps",
+        "Gross PnL per close, in bps of (|size_a*price_a| + |size_b*price_b|) at entry.",
+        &["variant", "pair"],
+        vec![
+            -200.0, -100.0, -50.0, -25.0, -15.0, -10.0, -5.0, -2.0, 0.0, 2.0, 5.0, 10.0, 15.0,
+            25.0, 50.0, 100.0, 200.0,
+        ],
+    )
+});
+
+pub static CLOSE_FUNDING_BPS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram(
+        "pairtrade_close_funding_bps",
+        "Net funding paid (-) or received (+) over the hold, in bps of entry notional.",
+        &["variant", "pair"],
+        vec![
+            -50.0, -20.0, -10.0, -5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0,
+        ],
     )
 });
 
