@@ -218,38 +218,10 @@
       }
     },
     {
-      "id": 13,
-      "type": "state-timeline",
-      "title": "Risk halts (kill / session_dd / daily_dd / circuit_breaker)",
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 44 },
-      "targets": [
-        { "expr": "pairtrade_kill_switch_active{variant!=\"\"}",     "legendFormat": "{{instance}} {{variant}} kill_switch", "refId": "A" },
-        { "expr": "pairtrade_session_dd_halt_active{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} session_dd",  "refId": "B" },
-        { "expr": "pairtrade_daily_dd_halt_active{variant!=\"\"}",   "legendFormat": "{{instance}} {{variant}} daily_dd",    "refId": "C" },
-        { "expr": "pairtrade_circuit_breaker_active{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} cb",          "refId": "D" }
-      ],
-      "options": {
-        "mergeValues": true,
-        "showValue": "auto",
-        "rowHeight": 0.9
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            { "type": "value", "options": {
-                "0": { "color": "transparent" },
-                "1": { "color": "red", "text": "HALTED" }
-            } }
-          ]
-        },
-        "overrides": []
-      }
-    },
-    {
       "id": 5,
       "type": "timeseries",
       "title": "Time since last trade (seconds, -1 before first trade)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 51 },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 44 },
       "targets": [
         { "expr": "pairtrade_time_since_last_trade_seconds{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
       ],
@@ -262,7 +234,7 @@
       "id": 6,
       "type": "table",
       "title": "Close reasons (count last 24h)",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 51 },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 44 },
       "targets": [
         {
           "expr": "sum by (instance, variant, reason) (increase(pairtrade_close_reason_total{variant!=\"\"}[24h]))",
@@ -311,24 +283,10 @@
       }
     },
     {
-      "id": 7,
-      "type": "stat",
-      "title": "Bot version",
-      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 58 },
-      "targets": [
-        { "expr": "pairtrade_bot_version_info{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} {{version}} {{git_sha}}", "refId": "A", "instant": true }
-      ],
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
-        "textMode": "name",
-        "colorMode": "none"
-      }
-    },
-    {
       "id": 8,
       "type": "stat",
       "title": "Snapshot age (seconds)",
-      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 58 },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 51 },
       "targets": [
         { "expr": "pairtrade_snapshot_age_seconds{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}}", "refId": "A" }
       ],
