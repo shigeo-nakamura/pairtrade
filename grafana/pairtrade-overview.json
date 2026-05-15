@@ -15,7 +15,7 @@
       "targets": [
         {
           "expr": "pairtrade_z",
-          "legendFormat": "{{variant}} {{pair}}",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
           "refId": "A"
         }
       ],
@@ -41,9 +41,9 @@
       "title": "beta (combined / short / long)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
       "targets": [
-        { "expr": "pairtrade_beta", "legendFormat": "{{variant}} beta", "refId": "A" },
-        { "expr": "pairtrade_beta_s", "legendFormat": "{{variant}} beta_s", "refId": "B" },
-        { "expr": "pairtrade_beta_l", "legendFormat": "{{variant}} beta_l", "refId": "C" }
+        { "expr": "pairtrade_beta", "legendFormat": "{{instance}} {{variant}} beta", "refId": "A" },
+        { "expr": "pairtrade_beta_s", "legendFormat": "{{instance}} {{variant}} beta_s", "refId": "B" },
+        { "expr": "pairtrade_beta_l", "legendFormat": "{{instance}} {{variant}} beta_l", "refId": "C" }
       ]
     },
     {
@@ -52,7 +52,7 @@
       "title": "|beta_s - beta_l| (threshold 0.30)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
       "targets": [
-        { "expr": "pairtrade_beta_divergence", "legendFormat": "{{variant}}", "refId": "A" }
+        { "expr": "pairtrade_beta_divergence", "legendFormat": "{{instance}} {{variant}}", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -74,12 +74,12 @@
       "title": "Eligibility / position / risk halts",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 17 },
       "targets": [
-        { "expr": "pairtrade_eligible",              "legendFormat": "{{variant}} elig",        "refId": "A" },
-        { "expr": "pairtrade_has_position",          "legendFormat": "{{variant}} has_pos",     "refId": "B" },
-        { "expr": "pairtrade_kill_switch_active",    "legendFormat": "{{variant}} kill_switch", "refId": "C" },
-        { "expr": "pairtrade_session_dd_halt_active","legendFormat": "{{variant}} session_dd",  "refId": "D" },
-        { "expr": "pairtrade_daily_dd_halt_active",  "legendFormat": "{{variant}} daily_dd",    "refId": "E" },
-        { "expr": "pairtrade_circuit_breaker_active","legendFormat": "{{variant}} cb",          "refId": "F" }
+        { "expr": "pairtrade_eligible",              "legendFormat": "{{instance}} {{variant}} elig",        "refId": "A" },
+        { "expr": "pairtrade_has_position",          "legendFormat": "{{instance}} {{variant}} has_pos",     "refId": "B" },
+        { "expr": "pairtrade_kill_switch_active",    "legendFormat": "{{instance}} {{variant}} kill_switch", "refId": "C" },
+        { "expr": "pairtrade_session_dd_halt_active","legendFormat": "{{instance}} {{variant}} session_dd",  "refId": "D" },
+        { "expr": "pairtrade_daily_dd_halt_active",  "legendFormat": "{{instance}} {{variant}} daily_dd",    "refId": "E" },
+        { "expr": "pairtrade_circuit_breaker_active","legendFormat": "{{instance}} {{variant}} cb",          "refId": "F" }
       ],
       "options": {
         "mergeValues": true,
@@ -101,7 +101,7 @@
       "title": "Time since last trade (seconds)",
       "gridPos": { "h": 7, "w": 12, "x": 0, "y": 25 },
       "targets": [
-        { "expr": "pairtrade_time_since_last_trade_seconds", "legendFormat": "{{variant}} {{pair}}", "refId": "A" }
+        { "expr": "pairtrade_time_since_last_trade_seconds", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
       ]
     },
     {
@@ -110,7 +110,7 @@
       "title": "Close reasons (rate last 24h)",
       "gridPos": { "h": 7, "w": 12, "x": 12, "y": 25 },
       "targets": [
-        { "expr": "sum by (reason, variant) (increase(pairtrade_close_reason_total[24h]))", "legendFormat": "{{variant}} {{reason}}", "refId": "A" }
+        { "expr": "sum by (reason, variant, instance) (increase(pairtrade_close_reason_total[24h]))", "legendFormat": "{{instance}} {{variant}} {{reason}}", "refId": "A" }
       ]
     },
     {
@@ -119,7 +119,7 @@
       "title": "Bot version",
       "gridPos": { "h": 5, "w": 12, "x": 0, "y": 32 },
       "targets": [
-        { "expr": "pairtrade_bot_version_info", "legendFormat": "{{variant}} {{version}} {{git_sha}}", "refId": "A", "instant": true }
+        { "expr": "pairtrade_bot_version_info", "legendFormat": "{{instance}} {{variant}} {{version}} {{git_sha}}", "refId": "A", "instant": true }
       ],
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
@@ -133,7 +133,7 @@
       "title": "Snapshot age (seconds)",
       "gridPos": { "h": 5, "w": 12, "x": 12, "y": 32 },
       "targets": [
-        { "expr": "pairtrade_snapshot_age_seconds", "legendFormat": "{{variant}}", "refId": "A" }
+        { "expr": "pairtrade_snapshot_age_seconds", "legendFormat": "{{instance}} {{variant}}", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
