@@ -1809,6 +1809,7 @@ impl PairTradeEngine {
                             legs,
                             direction,
                             placed_at: Instant::now(),
+                            placed_ts_ms: Utc::now().timestamp_millis(),
                             hedge_retry_count: 0,
                             post_only_hybrid: false,
                             exit_taker_takeover_at,
@@ -1997,6 +1998,7 @@ impl PairTradeEngine {
                                 legs,
                                 direction,
                                 placed_at: Instant::now(),
+                                placed_ts_ms: Utc::now().timestamp_millis(),
                                 hedge_retry_count: 0,
                                 post_only_hybrid: hybrid,
                                 // Entry path — exit_taker_takeover_at only

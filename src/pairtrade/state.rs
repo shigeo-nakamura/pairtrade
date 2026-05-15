@@ -59,6 +59,13 @@ pub(super) struct PendingOrders {
     pub(super) legs: Vec<PendingLeg>,
     pub(super) direction: PositionDirection,
     pub(super) placed_at: Instant,
+    /// Wall-clock placement time in Unix epoch milliseconds. Captured at
+    /// every PendingOrders construction (including reissue paths) so the
+    /// per-leg fill-latency histogram (#314 Group 4-C) can compare against
+    /// the venue-reported `FilledOrder.filled_ts_ms`. `placed_at` is a
+    /// monotonic `Instant` and not directly comparable to wall-clock fill
+    /// timestamps, hence this parallel field.
+    pub(super) placed_ts_ms: i64,
     pub(super) hedge_retry_count: u32,
     pub(super) post_only_hybrid: bool,
     /// Set only for post-only exits on fee-bearing venues (Extended).
@@ -84,6 +91,12 @@ pub(super) struct PendingStatus {
     /// `filled_values`. Lighter (fee-free) leaves entries unpopulated;
     /// Extended populates them.
     pub(super) filled_fees: HashMap<String, Decimal>,
+    /// Per-order-id maximum of `FilledOrder.filled_ts_ms` across that
+    /// order's partial fills (i.e. completion time, in Unix epoch ms).
+    /// Used by the fill-latency histogram (#314 Group 4-C). Extended
+    /// populates the source field; Lighter leaves it `None` so entries
+    /// stay absent and no latency is emitted there.
+    pub(super) filled_ts_ms_max: HashMap<String, i64>,
     pub(super) open_ids: HashSet<String>,
 }
 

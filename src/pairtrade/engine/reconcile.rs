@@ -94,6 +94,7 @@ impl PairTradeEngine {
                     "entry",
                     &pending.legs,
                     &status,
+                    pending.placed_ts_ms,
                 );
                 log::info!("[ORDER] {} entry orders filled", key);
             } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
@@ -472,6 +473,7 @@ impl PairTradeEngine {
                     "exit",
                     &pending.legs,
                     &status,
+                    pending.placed_ts_ms,
                 );
                 log::info!("[ORDER] {} exit orders filled", key);
                 if let Some((record, pnl_value, funding_value)) = pnl_record {
@@ -723,6 +725,7 @@ impl PairTradeEngine {
                             legs: new_legs,
                             direction: pending.direction,
                             placed_at: Instant::now(),
+                            placed_ts_ms: chrono::Utc::now().timestamp_millis(),
                             hedge_retry_count: next_retry,
                             post_only_hybrid: false,
                             // This branch reissues remaining exit legs (post-
@@ -771,6 +774,7 @@ impl PairTradeEngine {
         let mut fills: HashMap<String, Decimal> = HashMap::new();
         let mut filled_values: HashMap<String, Decimal> = HashMap::new();
         let mut filled_fees: HashMap<String, Decimal> = HashMap::new();
+        let mut filled_ts_ms_max: HashMap<String, i64> = HashMap::new();
         let mut open_ids: HashSet<String> = HashSet::new();
         let mut per_symbol_open: HashMap<String, HashSet<String>> = HashMap::new();
         let mut per_symbol_fill: HashMap<String, HashSet<String>> = HashMap::new();
@@ -818,6 +822,14 @@ impl PairTradeEngine {
                     if let Some(fee) = order.filled_fee {
                         *filled_fees.entry(order.order_id.clone()).or_default() += fee;
                     }
+                    if let Some(ts) = order.filled_ts_ms {
+                        let entry = filled_ts_ms_max
+                            .entry(order.order_id.clone())
+                            .or_insert(ts);
+                        if ts > *entry {
+                            *entry = ts;
+                        }
+                    }
                     log::debug!(
                         "[ORDER][FILLED] symbol={} order_id={} side={:?} size={} value={:?} fee={:?} trade_id={}",
                         symbol,
@@ -843,6 +855,7 @@ impl PairTradeEngine {
             fills,
             filled_values,
             filled_fees,
+            filled_ts_ms_max,
             open_ids,
         })
     }
@@ -863,32 +876,46 @@ impl PairTradeEngine {
             .unwrap_or(Decimal::ZERO)
     }
 
-    /// Per-leg slippage / fee bps observation (#314 Group 4-B). Reads the
-    /// volume-weighted fill price out of `status.filled_values` and
-    /// compares it to `leg.limit_price`. Only fires for legs that have
-    /// both a posted limit (post-only / limit) and a non-zero filled
-    /// size + value reported by the venue. Sign convention: positive =
-    /// cost (paid more / received less than posted limit).
+    /// Per-leg slippage / fee / fill-latency observation (#314 Group 4-B
+    /// + 4-C). Reads the volume-weighted fill price out of
+    /// `status.filled_values`, fee out of `status.filled_fees`, and
+    /// completion timestamp out of `status.filled_ts_ms_max`. Only fires
+    /// per metric when the necessary inputs are present:
+    /// - slippage: requires `leg.limit_price = Some` and a positive
+    ///   filled value (post-only / limit fills);
+    /// - fee: requires a venue-reported `filled_fee` for the leg;
+    /// - latency: requires a venue-reported `filled_ts_ms` for the leg
+    ///   (Extended populates, Lighter omits).
+    /// Sign convention on slippage: positive = cost (paid more /
+    /// received less than posted limit).
     fn observe_leg_execution_quality(
         variant: &str,
         pair: &str,
         leg_type: &str,
         legs: &[PendingLeg],
         status: &PendingStatus,
+        placed_ts_ms: i64,
     ) {
         for leg in legs {
             let fill_size = Self::leg_fill_from_map(leg, &status.fills);
             if fill_size <= Decimal::ZERO {
                 continue;
             }
-            let lookup_value = |map: &HashMap<String, Decimal>| {
+            let lookup_decimal = |map: &HashMap<String, Decimal>| {
                 map.get(&leg.order_id).cloned().or_else(|| {
                     leg.exchange_order_id
                         .as_ref()
                         .and_then(|id| map.get(id).cloned())
                 })
             };
-            if let Some(fill_value) = lookup_value(&status.filled_values) {
+            let lookup_ts = |map: &HashMap<String, i64>| -> Option<i64> {
+                map.get(&leg.order_id).copied().or_else(|| {
+                    leg.exchange_order_id
+                        .as_ref()
+                        .and_then(|id| map.get(id).copied())
+                })
+            };
+            if let Some(fill_value) = lookup_decimal(&status.filled_values) {
                 if fill_value > Decimal::ZERO {
                     if let Some(fill_value_f64) = fill_value.to_f64() {
                         if let Some(limit) = leg.limit_price {
@@ -909,7 +936,7 @@ impl PairTradeEngine {
                                 }
                             }
                         }
-                        if let Some(fee) = lookup_value(&status.filled_fees) {
+                        if let Some(fee) = lookup_decimal(&status.filled_fees) {
                             if let Some(fee_f64) = fee.to_f64() {
                                 let fee_bps = fee_f64 / fill_value_f64 * 10_000.0;
                                 super::super::prom::LEG_FEE_BPS
@@ -917,6 +944,16 @@ impl PairTradeEngine {
                                     .observe(fee_bps);
                             }
                         }
+                    }
+                }
+            }
+            if placed_ts_ms > 0 {
+                if let Some(fill_ts) = lookup_ts(&status.filled_ts_ms_max) {
+                    let latency_ms = (fill_ts - placed_ts_ms) as f64;
+                    if latency_ms >= 0.0 {
+                        super::super::prom::LEG_FILL_LATENCY_MS
+                            .with_label_values(&[variant, pair, leg_type])
+                            .observe(latency_ms);
                     }
                 }
             }
@@ -1012,6 +1049,7 @@ mod tests {
             legs,
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
+            placed_ts_ms: 0,
             hedge_retry_count: 0,
             post_only_hybrid: false,
             exit_taker_takeover_at: None,
