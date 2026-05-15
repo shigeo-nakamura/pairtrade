@@ -1253,6 +1253,9 @@ impl PairTradeEngine {
             if force_close_due {
                 if let Some(pos) = &position_state {
                     log::info!("[EXIT_CHECK] {} reason=force_close", key);
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                        state.pending_exit_reason = Some("force_close");
+                    }
                     action = TradeAction::Close {
                         direction: pos.direction,
                         z: 0.0,
@@ -1279,6 +1282,9 @@ impl PairTradeEngine {
                                 "[EXIT_CHECK] {} reason=maintenance_preempt remaining_hold_s={} window_h={}",
                                 key, remaining_hold, hours_to_check
                             );
+                            if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                                state.pending_exit_reason = Some("maintenance_preempt");
+                            }
                             action = TradeAction::Close {
                                 direction: pos.direction,
                                 z: 0.0,
@@ -1482,6 +1488,9 @@ impl PairTradeEngine {
                     // If pair falls out of eligibility, flatten
                     if let Some(pos) = &position_state {
                         log::info!("[EXIT_CHECK] {} reason=ineligible", key);
+                        if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                            state.pending_exit_reason = Some("ineligible");
+                        }
                         action = TradeAction::Close {
                             direction: pos.direction,
                             z: 0.0,
