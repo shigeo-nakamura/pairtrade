@@ -329,6 +329,15 @@ impl PairTradeEngine {
             if let Some(z) = strategy.mtf_z_min {
                 inst_default.mtf_z_min = z;
             }
+            if let Some(z) = strategy.entry_z_base {
+                inst_default.entry_z_base = z;
+            }
+            if let Some(z) = strategy.entry_z_min {
+                inst_default.entry_z_min = z;
+            }
+            if let Some(z) = strategy.entry_z_max {
+                inst_default.entry_z_max = z;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -344,6 +353,15 @@ impl PairTradeEngine {
                 }
                 if let Some(z) = strategy.mtf_z_min {
                     pp.mtf_z_min = z;
+                }
+                if let Some(z) = strategy.entry_z_base {
+                    pp.entry_z_base = z;
+                }
+                if let Some(z) = strategy.entry_z_min {
+                    pp.entry_z_min = z;
+                }
+                if let Some(z) = strategy.entry_z_max {
+                    pp.entry_z_max = z;
                 }
                 inst_pair_params.insert(k.clone(), pp);
             }
