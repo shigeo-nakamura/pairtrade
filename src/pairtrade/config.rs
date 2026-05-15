@@ -422,6 +422,9 @@ pub(super) struct StrategyYaml {
     pub(super) force_close_time_secs: Option<u64>,
     pub(super) mtf_windows: Option<Vec<usize>>,
     pub(super) mtf_z_min: Option<f64>,
+    pub(super) entry_z_score_base: Option<f64>,
+    pub(super) entry_z_score_min: Option<f64>,
+    pub(super) entry_z_score_max: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -697,6 +700,9 @@ pub struct StrategyConfig {
     pub force_close_time_secs: Option<u64>,
     pub mtf_windows: Option<Vec<usize>>,
     pub mtf_z_min: Option<f64>,
+    pub entry_z_base: Option<f64>,
+    pub entry_z_min: Option<f64>,
+    pub entry_z_max: Option<f64>,
 }
 
 impl PairTradeConfig {
@@ -1579,6 +1585,9 @@ pub(super) fn resolve_strategies(
                     force_close_time_secs: s.force_close_time_secs,
                     mtf_windows: s.mtf_windows.clone(),
                     mtf_z_min: s.mtf_z_min,
+                    entry_z_base: s.entry_z_score_base,
+                    entry_z_min: s.entry_z_score_min,
+                    entry_z_max: s.entry_z_score_max,
                 }
             })
             .collect(),
@@ -1592,6 +1601,9 @@ pub(super) fn resolve_strategies(
             force_close_time_secs: None,
             mtf_windows: None,
             mtf_z_min: None,
+            entry_z_base: None,
+            entry_z_min: None,
+            entry_z_max: None,
         }],
     }
 }
@@ -1823,6 +1835,53 @@ strategies:
         if let Some(v) = prev_c {
             std::env::set_var("EQUITY_REFERENCE_USD_C", v);
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn per_strategy_entry_z_override_resolves() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("pairtrade_per_strategy_entry_z.yaml");
+        let yaml = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+entry_z_score_base: 1.5
+entry_z_score_min: 1.0
+entry_z_score_max: 2.0
+strategies:
+  - id: a
+  - id: c
+    entry_z_score_base: 2.5
+    entry_z_score_min: 2.0
+    entry_z_score_max: 3.0
+"#;
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+
+        let cfg = PairTradeConfig::from_yaml_path(&path).expect("yaml load");
+        let by_id = |id: &str| {
+            cfg.strategies
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("missing strategy {id}"))
+                .clone()
+        };
+        let a = by_id("a");
+        assert!(a.entry_z_base.is_none(), "A inherits top-level (None)");
+        assert!(a.entry_z_min.is_none());
+        assert!(a.entry_z_max.is_none());
+        let c = by_id("c");
+        assert_eq!(c.entry_z_base, Some(2.5), "C overrides entry_z_base");
+        assert_eq!(c.entry_z_min, Some(2.0));
+        assert_eq!(c.entry_z_max, Some(3.0));
+
         let _ = std::fs::remove_file(&path);
     }
 }
