@@ -74,6 +74,16 @@ pub(super) struct PendingOrders {
 pub(super) struct PendingStatus {
     pub(super) open_remaining: usize,
     pub(super) fills: HashMap<String, Decimal>,
+    /// Per-order-id sum of `FilledOrder.filled_value` (i.e. size × price)
+    /// across all partial fills for that order. Used by the slippage /
+    /// fee-bps histograms (#314 Group 4-B) to derive a volume-weighted
+    /// average fill price without re-querying the venue. Absent entries
+    /// mean the venue did not report a value for that fill.
+    pub(super) filled_values: HashMap<String, Decimal>,
+    /// Per-order-id sum of `FilledOrder.filled_fee`. Same semantics as
+    /// `filled_values`. Lighter (fee-free) leaves entries unpopulated;
+    /// Extended populates them.
+    pub(super) filled_fees: HashMap<String, Decimal>,
     pub(super) open_ids: HashSet<String>,
 }
 
