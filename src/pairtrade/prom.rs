@@ -52,13 +52,13 @@ fn register_int_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVe
 // === Signal / cointegration ===
 
 pub static Z: Lazy<GaugeVec> =
-    Lazy::new(|| register_gauge("pairtrade_z", "Latest z-score per pair.", &["instance", "pair"]));
+    Lazy::new(|| register_gauge("pairtrade_z", "Latest z-score per pair.", &["variant", "pair"]));
 
 pub static BETA: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_beta",
         "Combined beta (Kalman) used for spread construction.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -66,7 +66,7 @@ pub static BETA_S: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_beta_s",
         "Short-window beta input to the combined beta.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -74,7 +74,7 @@ pub static BETA_L: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_beta_l",
         "Long-window beta input to the combined beta.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -82,7 +82,7 @@ pub static BETA_DIVERGENCE: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_beta_divergence",
         "Absolute gap |beta_s - beta_l|, gated by beta_divergence_max.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -90,7 +90,7 @@ pub static HALF_LIFE_HOURS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_half_life_hours",
         "Estimated mean-reversion half-life in hours.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -98,7 +98,7 @@ pub static ADF_PVALUE: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_adf_pvalue",
         "ADF cointegration test p-value (lower is more cointegrated).",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -106,7 +106,7 @@ pub static ELIGIBLE: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_eligible",
         "1 when the pair passes the primary cointegration eligibility filter.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -114,7 +114,7 @@ pub static ENTRY_Z_THRESHOLD_EFFECTIVE: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_entry_z_threshold_effective",
         "Per-variant entry-z threshold after beta_gap_entry_z_scale adjustment.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -124,7 +124,7 @@ pub static HAS_POSITION: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_has_position",
         "1 when the variant currently holds a pair position.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -132,7 +132,7 @@ pub static POSITION_AGE_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_position_age_seconds",
         "Seconds since the current position was opened. 0 when flat.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -140,7 +140,7 @@ pub static TIME_SINCE_LAST_TRADE_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_time_since_last_trade_seconds",
         "Seconds since the most recent exit. NaN-coerced to -1 before first exit.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -148,7 +148,7 @@ pub static LAST_ENTRY_Z: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_last_entry_z",
         "z-score at the most recent entry.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -156,7 +156,7 @@ pub static LAST_EXIT_Z: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_last_exit_z",
         "z-score observed at the most recent exit.",
-        &["instance", "pair"],
+        &["variant", "pair"],
     )
 });
 
@@ -164,7 +164,7 @@ pub static CLOSE_REASON_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter(
         "pairtrade_close_reason_total",
         "Cumulative count of position closes broken down by exit reason.",
-        &["instance", "pair", "reason"],
+        &["variant", "pair", "reason"],
     )
 });
 
@@ -174,7 +174,7 @@ pub static KILL_SWITCH_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_kill_switch_active",
         "1 when the process-wide KILL_SWITCH file is present.",
-        &["instance"],
+        &["variant"],
     )
 });
 
@@ -182,7 +182,7 @@ pub static SESSION_DD_HALT_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_session_dd_halt_active",
         "1 when the variant is in a sticky session-DD halt.",
-        &["instance"],
+        &["variant"],
     )
 });
 
@@ -190,7 +190,7 @@ pub static DAILY_DD_HALT_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_daily_dd_halt_active",
         "1 when the variant has tripped today's daily-DD threshold.",
-        &["instance"],
+        &["variant"],
     )
 });
 
@@ -198,7 +198,7 @@ pub static CIRCUIT_BREAKER_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_circuit_breaker_active",
         "1 while the consecutive-loss circuit breaker cooldown is in effect.",
-        &["instance"],
+        &["variant"],
     )
 });
 
@@ -208,7 +208,7 @@ pub static SNAPSHOT_AGE_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_snapshot_age_seconds",
         "Age of pairtrade_history_*.json on disk (file mtime delta).",
-        &["instance"],
+        &["variant"],
     )
 });
 
@@ -216,7 +216,7 @@ pub static PROCESS_START_TIMESTAMP_SECONDS: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_process_start_timestamp_seconds",
         "Unix timestamp of process boot.",
-        &["instance"],
+        &["variant"],
     )
 });
 
@@ -224,7 +224,7 @@ pub static BOT_VERSION_INFO: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_bot_version_info",
         "Always 1; carries version and git_sha labels.",
-        &["instance", "version", "git_sha", "dex_connector_sha"],
+        &["variant", "version", "git_sha", "dex_connector_sha"],
     )
 });
 
@@ -314,14 +314,16 @@ fn encode_metrics() -> Result<Vec<u8>> {
 }
 
 /// Stamp version / process-start gauges. Idempotent; safe to call from
-/// engine boot.
-pub fn record_process_info(instance: &str, process_started_at: i64) {
+/// engine boot. `variant` is the bot-internal A/B/C identifier
+/// (`StrategyInstance.id`); the Prometheus `instance` label is owned by
+/// the scrape config (Alloy sets it to the host id, e.g. `debot-tokyo`).
+pub fn record_process_info(variant: &str, process_started_at: i64) {
     PROCESS_START_TIMESTAMP_SECONDS
-        .with_label_values(&[instance])
+        .with_label_values(&[variant])
         .set(process_started_at);
     BOT_VERSION_INFO
         .with_label_values(&[
-            instance,
+            variant,
             env!("CARGO_PKG_VERSION"),
             option_env!("PAIRTRADE_GIT_SHA").unwrap_or("unknown"),
             option_env!("DEX_CONNECTOR_GIT_HASH").unwrap_or("unknown"),

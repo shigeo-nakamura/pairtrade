@@ -94,7 +94,7 @@ pub(in crate::pairtrade) fn apply_post_exit_state(
     state: &mut PairState,
     direction: PositionDirection,
     now_ts: i64,
-    instance: &str,
+    variant: &str,
     pair: &str,
 ) {
     state.position = None;
@@ -104,11 +104,11 @@ pub(in crate::pairtrade) fn apply_post_exit_state(
     // is consumed, so the Grafana panel can correlate close reason with the
     // z that triggered it. bot-strategy#409.
     if let Some((z, _)) = state.z_score() {
-        prom::LAST_EXIT_Z.with_label_values(&[instance, pair]).set(z);
+        prom::LAST_EXIT_Z.with_label_values(&[variant, pair]).set(z);
     }
     let reason = state.pending_exit_reason.take().unwrap_or("unknown");
     prom::CLOSE_REASON_TOTAL
-        .with_label_values(&[instance, pair, reason])
+        .with_label_values(&[variant, pair, reason])
         .inc();
     if reason == "stop_loss_z" {
         state.last_stop_loss_at = Some((direction, now_ts));

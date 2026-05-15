@@ -1,0 +1,154 @@
+{
+  "title": "Pairtrade overview",
+  "uid": "pairtrade-overview",
+  "tags": ["pairtrade", "bot"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "z-score (per pair / variant)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "pairtrade_z",
+          "legendFormat": "{{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "transparent", "value": null }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "beta (combined / short / long)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "targets": [
+        { "expr": "pairtrade_beta", "legendFormat": "{{variant}} beta", "refId": "A" },
+        { "expr": "pairtrade_beta_s", "legendFormat": "{{variant}} beta_s", "refId": "B" },
+        { "expr": "pairtrade_beta_l", "legendFormat": "{{variant}} beta_l", "refId": "C" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "|beta_s - beta_l| (threshold 0.30)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "targets": [
+        { "expr": "pairtrade_beta_divergence", "legendFormat": "{{variant}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 0.30 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "state-timeline",
+      "title": "Eligibility / position / risk halts",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 17 },
+      "targets": [
+        { "expr": "pairtrade_eligible",              "legendFormat": "{{variant}} elig",        "refId": "A" },
+        { "expr": "pairtrade_has_position",          "legendFormat": "{{variant}} has_pos",     "refId": "B" },
+        { "expr": "pairtrade_kill_switch_active",    "legendFormat": "{{variant}} kill_switch", "refId": "C" },
+        { "expr": "pairtrade_session_dd_halt_active","legendFormat": "{{variant}} session_dd",  "refId": "D" },
+        { "expr": "pairtrade_daily_dd_halt_active",  "legendFormat": "{{variant}} daily_dd",    "refId": "E" },
+        { "expr": "pairtrade_circuit_breaker_active","legendFormat": "{{variant}} cb",          "refId": "F" }
+      ],
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "rowHeight": 0.9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "color": "transparent" }, "1": { "color": "red" } } }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Time since last trade (seconds)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 25 },
+      "targets": [
+        { "expr": "pairtrade_time_since_last_trade_seconds", "legendFormat": "{{variant}} {{pair}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "barchart",
+      "title": "Close reasons (rate last 24h)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 25 },
+      "targets": [
+        { "expr": "sum by (reason, variant) (increase(pairtrade_close_reason_total[24h]))", "legendFormat": "{{variant}} {{reason}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Bot version",
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 32 },
+      "targets": [
+        { "expr": "pairtrade_bot_version_info", "legendFormat": "{{variant}} {{version}} {{git_sha}}", "refId": "A", "instant": true }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
+        "textMode": "name",
+        "colorMode": "none"
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Snapshot age (seconds)",
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        { "expr": "pairtrade_snapshot_age_seconds", "legendFormat": "{{variant}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "orange", "value": 120 },
+              { "color": "red",    "value": 600 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}
