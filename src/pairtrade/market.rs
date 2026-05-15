@@ -39,12 +39,23 @@ pub(super) struct SymbolSnapshot {
     pub(super) exchange_ts: Option<i64>,
 }
 
-/// Net per-hour funding the strategy will *receive* (positive) or *pay*
-/// (negative) on the planned pair position. Lighter settles funding every
-/// hour (verified bot-strategy#352 / #363: WS `market_stats.funding_rate`
-/// updates on every 1h boundary, magnitude matches the per-hour realized
-/// rate exposed by `/api/v1/fundings?resolution=1h`). The input is already
-/// per-hour, so no unit conversion is applied here.
+/// Per-hour funding signal used by the entry filter (`entry.rs`). Input
+/// is fraction-per-hour (bot-strategy#414 normalized both venues). Both
+/// exchanges settle hourly (verified bot-strategy#352 / #363); after
+/// #414, magnitude matches `/api/v1/funding-rates` and the CSV-settled
+/// `Rate` column.
+///
+/// **Sign caveat (bot-strategy#414, latent).** The expression below is
+/// the *inverse* of strategy-side received-carry: with perp-funding sign
+/// (`+rate ⇒ longs pay`), a planned LongSpread with `p1.funding_rate > 0`
+/// actually pays out, but this returns `+`. The entry-filter consumer
+/// (`funding_entry_z_scale`, `net_funding_min_per_hour`) currently runs
+/// with such loose gates that the sign doesn't bind any live decision;
+/// flipping it would change `[METRICS] net_funding_per_hour` log values
+/// and entry behavior, so it is deferred to a separate ticket. Carry
+/// reporting (`PnlLogRecord::funding_carry_usd`) was migrated to the
+/// strategy-side convention in #414 and no longer shares signs with this
+/// helper.
 pub(super) fn net_funding_for_direction(
     z: f64,
     p1: &SymbolSnapshot,
@@ -308,14 +319,15 @@ mod tests {
 
     #[test]
     fn net_funding_passes_per_hour_through_unchanged() {
-        // Lighter delivers funding_rate as a per-hour realized rate
-        // (bot-strategy#352 / #363). Verify both direction branches return
-        // the raw delta without any unit conversion.
-        let p1 = snap_with_funding(dec!(0.0012)); // BTC pays 0.12%/h
-        let p2 = snap_with_funding(dec!(-0.0003)); // ETH pays -0.03%/h
-        // z > 0: short p1, long p2 → receive p1's funding, pay p2's → p2 - p1
+        // Inputs are fraction-per-hour after the bot-strategy#414
+        // normalization in dex-connector; this verifies both direction
+        // branches return the raw delta with no further scaling. (Sign
+        // semantics — that the returned value is the inverse of
+        // strategy-side received-carry — are documented on
+        // `net_funding_for_direction` and tracked as a latent issue.)
+        let p1 = snap_with_funding(dec!(0.0012));
+        let p2 = snap_with_funding(dec!(-0.0003));
         let z_pos = net_funding_for_direction(1.0, &p1, &p2);
-        // z < 0: long p1, short p2 → pay p1's funding, receive p2's → p1 - p2
         let z_neg = net_funding_for_direction(-1.0, &p1, &p2);
         assert!((z_pos - (-0.0015)).abs() < 1e-12, "z_pos was {}", z_pos);
         assert!((z_neg - 0.0015).abs() < 1e-12, "z_neg was {}", z_neg);
