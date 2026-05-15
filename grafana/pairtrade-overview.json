@@ -260,12 +260,55 @@
     },
     {
       "id": 6,
-      "type": "barchart",
-      "title": "Close reasons (rate last 24h)",
+      "type": "table",
+      "title": "Close reasons (count last 24h)",
       "gridPos": { "h": 7, "w": 12, "x": 12, "y": 51 },
       "targets": [
-        { "expr": "sum by (reason, variant, instance) (increase(pairtrade_close_reason_total{variant!=\"\"}[24h]))", "legendFormat": "{{instance}} {{variant}} {{reason}}", "refId": "A" }
-      ]
+        {
+          "expr": "sum by (instance, variant, reason) (increase(pairtrade_close_reason_total{variant!=\"\"}[24h]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true },
+            "indexByName": { "instance": 0, "variant": 1, "reason": 2, "Value #A": 3 },
+            "renameByName": { "instance": "host", "Value #A": "count" }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              { "field": "host" },
+              { "field": "variant" },
+              { "field": "reason" }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "filterable": true },
+          "noValue": "0"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "count" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              { "id": "color", "value": { "mode": "continuous-GrYlRd" } },
+              { "id": "custom.align", "value": "center" },
+              { "id": "custom.width", "value": 80 }
+            ]
+          }
+        ]
+      }
     },
     {
       "id": 7,
