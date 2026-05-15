@@ -216,6 +216,45 @@ pub static CLOSE_FUNDING_BPS: Lazy<HistogramVec> = Lazy::new(|| {
     )
 });
 
+// === Per-leg execution quality (#314 Group 4-B / partial 4-C) ===
+//
+// Observed per leg at fill-resolve time. Volume-weighted average fill
+// price comes from `FilledOrder.filled_value / filled_size` aggregated
+// across partial fills. `leg` is "entry" or "exit".
+//
+// LEG_SLIPPAGE_BPS only fires when `PendingLeg.limit_price = Some` —
+// i.e. post-only / limit fills. Taker fallback legs (`use_market`) have
+// `limit_price = None`; capturing their slippage needs a decision-time
+// reference price in PendingLeg, deferred to a Group 4-B follow-up.
+//
+// Sign convention: positive = bot paid more / received less than the
+// posted limit (cost). For post-only fills this is typically 0 or
+// negative (price improvement).
+
+pub static LEG_SLIPPAGE_BPS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram(
+        "pairtrade_leg_slippage_bps",
+        "Per-leg slippage vs posted limit price, signed by side (positive = cost). \
+         Only emitted for post-only/limit fills (taker fallback excluded).",
+        &["variant", "pair", "leg"],
+        vec![
+            -50.0, -20.0, -10.0, -5.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0,
+        ],
+    )
+});
+
+pub static LEG_FEE_BPS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram(
+        "pairtrade_leg_fee_bps",
+        "Per-leg fee paid as bps of filled notional. Venues that bill no fee \
+         (Lighter) typically leave this unset and emit nothing.",
+        &["variant", "pair", "leg"],
+        vec![
+            0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 20.0,
+        ],
+    )
+});
+
 // === Risk / kill state ===
 
 pub static KILL_SWITCH_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {

@@ -88,6 +88,13 @@ impl PairTradeEngine {
                     });
                     state.pending_entry = None;
                 }
+                Self::observe_leg_execution_quality(
+                    &self.instances[inst_idx].id,
+                    key,
+                    "entry",
+                    &pending.legs,
+                    &status,
+                );
                 log::info!("[ORDER] {} entry orders filled", key);
             } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
                 let next_retry = pending.hedge_retry_count.saturating_add(1);
@@ -459,6 +466,13 @@ impl PairTradeEngine {
                     );
                     state.pending_exit = None;
                 }
+                Self::observe_leg_execution_quality(
+                    &inst_id,
+                    key,
+                    "exit",
+                    &pending.legs,
+                    &status,
+                );
                 log::info!("[ORDER] {} exit orders filled", key);
                 if let Some((record, pnl_value, funding_value)) = pnl_record {
                     self.write_pnl_record(inst_idx, record);
@@ -755,6 +769,8 @@ impl PairTradeEngine {
     async fn pending_status(&self, pending: &PendingOrders) -> Result<PendingStatus> {
         let mut open_remaining = 0;
         let mut fills: HashMap<String, Decimal> = HashMap::new();
+        let mut filled_values: HashMap<String, Decimal> = HashMap::new();
+        let mut filled_fees: HashMap<String, Decimal> = HashMap::new();
         let mut open_ids: HashSet<String> = HashSet::new();
         let mut per_symbol_open: HashMap<String, HashSet<String>> = HashMap::new();
         let mut per_symbol_fill: HashMap<String, HashSet<String>> = HashMap::new();
@@ -796,6 +812,12 @@ impl PairTradeEngine {
                 if fill_ids_filter.contains(&order.order_id) {
                     let sz = order.filled_size.unwrap_or(Decimal::ZERO);
                     *fills.entry(order.order_id.clone()).or_default() += sz;
+                    if let Some(value) = order.filled_value {
+                        *filled_values.entry(order.order_id.clone()).or_default() += value;
+                    }
+                    if let Some(fee) = order.filled_fee {
+                        *filled_fees.entry(order.order_id.clone()).or_default() += fee;
+                    }
                     log::debug!(
                         "[ORDER][FILLED] symbol={} order_id={} side={:?} size={} value={:?} fee={:?} trade_id={}",
                         symbol,
@@ -819,6 +841,8 @@ impl PairTradeEngine {
         Ok(PendingStatus {
             open_remaining,
             fills,
+            filled_values,
+            filled_fees,
             open_ids,
         })
     }
@@ -837,6 +861,66 @@ impl PairTradeEngine {
                     .and_then(|id| fills.get(id).cloned())
             })
             .unwrap_or(Decimal::ZERO)
+    }
+
+    /// Per-leg slippage / fee bps observation (#314 Group 4-B). Reads the
+    /// volume-weighted fill price out of `status.filled_values` and
+    /// compares it to `leg.limit_price`. Only fires for legs that have
+    /// both a posted limit (post-only / limit) and a non-zero filled
+    /// size + value reported by the venue. Sign convention: positive =
+    /// cost (paid more / received less than posted limit).
+    fn observe_leg_execution_quality(
+        variant: &str,
+        pair: &str,
+        leg_type: &str,
+        legs: &[PendingLeg],
+        status: &PendingStatus,
+    ) {
+        for leg in legs {
+            let fill_size = Self::leg_fill_from_map(leg, &status.fills);
+            if fill_size <= Decimal::ZERO {
+                continue;
+            }
+            let lookup_value = |map: &HashMap<String, Decimal>| {
+                map.get(&leg.order_id).cloned().or_else(|| {
+                    leg.exchange_order_id
+                        .as_ref()
+                        .and_then(|id| map.get(id).cloned())
+                })
+            };
+            if let Some(fill_value) = lookup_value(&status.filled_values) {
+                if fill_value > Decimal::ZERO {
+                    if let Some(fill_value_f64) = fill_value.to_f64() {
+                        if let Some(limit) = leg.limit_price {
+                            if let (Some(limit_f64), Some(size_f64)) =
+                                (limit.to_f64(), fill_size.to_f64())
+                            {
+                                if limit_f64 > 0.0 && size_f64 > 0.0 {
+                                    let avg_price = fill_value_f64 / size_f64;
+                                    let sign = match leg.side {
+                                        dex_connector::OrderSide::Long => 1.0,
+                                        dex_connector::OrderSide::Short => -1.0,
+                                    };
+                                    let slippage_bps =
+                                        sign * (avg_price - limit_f64) / limit_f64 * 10_000.0;
+                                    super::super::prom::LEG_SLIPPAGE_BPS
+                                        .with_label_values(&[variant, pair, leg_type])
+                                        .observe(slippage_bps);
+                                }
+                            }
+                        }
+                        if let Some(fee) = lookup_value(&status.filled_fees) {
+                            if let Some(fee_f64) = fee.to_f64() {
+                                let fee_bps = fee_f64 / fill_value_f64 * 10_000.0;
+                                super::super::prom::LEG_FEE_BPS
+                                    .with_label_values(&[variant, pair, leg_type])
+                                    .observe(fee_bps);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn update_pending_fills(pending: &mut PendingOrders, fills: &HashMap<String, Decimal>) {
