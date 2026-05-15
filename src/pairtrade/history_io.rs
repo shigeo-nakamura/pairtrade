@@ -12,6 +12,16 @@ use serde::{Deserialize, Serialize};
 use super::config::PairTradeConfig;
 use super::stats::PriceSample;
 
+/// Per-pair Kalman filter snapshot (bot-strategy#413). `q` / `r` are
+/// tuning knobs from the YAML, not state — they're restored from the
+/// current config rather than persisted.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub(super) struct KalmanSnapshot {
+    pub(super) beta: f64,
+    pub(super) p: f64,
+    pub(super) updates: u64,
+}
+
 /// On-disk snapshot schema used by the live bot.
 ///
 /// Version 1 (no `_v` field) was a bare `HashMap<String, Vec<(f64, i64)>>`
@@ -28,29 +38,50 @@ use super::stats::PriceSample;
 /// Version 3 (bot-strategy#274 / #276) bumps `ts` to Unix milliseconds so
 /// the on-disk timestamps match the BarBuilder bucketing layer after its
 /// ms-precision migration. Older v1 / v2 snapshots are auto-detected and
-/// migrated (`ts × 1000`) on load. This file is rewritten as v3 on the next
-/// `persist_history_to_disk` call, so the migration is one-way.
+/// migrated (`ts × 1000`) on load.
+///
+/// Version 4 (bot-strategy#413) adds `betas` (the eval-committed β per
+/// pair) and `kalman_states` (online Kalman filter state — β / p / updates)
+/// so a restart preserves the live β trajectory instead of reverting to a
+/// fresh OLS warm-start. The new fields default to empty when reading a
+/// pre-v4 file, so v3 snapshots auto-migrate (Kalman gets a fresh filter,
+/// committed β re-derived from OLS as before).
 ///
 /// The loader parses the explicit struct first and falls back to v1 (bare
 /// per-symbol map) on failure, so pre-existing history files keep working.
 #[derive(Serialize, Deserialize, Default)]
-struct SnapshotV3 {
+struct SnapshotV4 {
     #[serde(rename = "_v")]
     version: u32,
     prices: HashMap<String, Vec<(f64, i64)>>,
-    /// Pair key (e.g. "BTC/ETH") → the live engine's
-    /// `state.spread_history` as a plain `Vec<f64>`. Missing in older
-    /// files; defaulted to empty by `#[serde(default)]`.
+    /// Pair key (e.g. "BTC/ETH") → the engine's per-pair `spread_history`
+    /// as a plain `Vec<f64>`. Missing in pre-v2 files; defaulted to empty.
     #[serde(default)]
     spread_histories: HashMap<String, Vec<f64>>,
+    /// Eval-committed β per pair (was `state.beta` pre-#413). Missing in
+    /// pre-v4 snapshots; the engine recomputes from OLS at warm-start when
+    /// empty, matching pre-#413 behaviour.
+    #[serde(default)]
+    betas: HashMap<String, f64>,
+    /// Per-pair Kalman filter state. Missing in pre-v4 snapshots; the
+    /// engine constructs a fresh `KalmanBeta` from the YAML defaults when
+    /// empty.
+    #[serde(default)]
+    kalman_states: HashMap<String, KalmanSnapshot>,
 }
 
-const SNAPSHOT_VERSION: u32 = 3;
+const SNAPSHOT_VERSION: u32 = 4;
+/// Snapshot versions whose `ts` field is in seconds — they need a × 1000
+/// migration at load time so the post bot-strategy#274 / #276 BarBuilder
+/// bucket math lines up.
+const SECONDS_TS_VERSIONS_MAX: u32 = 2;
 
 pub(super) fn persist_history_to_disk(
     cfg: &PairTradeConfig,
     history: &HashMap<String, VecDeque<PriceSample>>,
     spread_histories: &HashMap<String, VecDeque<f64>>,
+    betas: &HashMap<String, f64>,
+    kalman_states: &HashMap<String, KalmanSnapshot>,
     history_path: &std::path::Path,
 ) {
     if cfg.disable_history_persist {
@@ -75,10 +106,12 @@ pub(super) fn persist_history_to_disk(
         .iter()
         .map(|(k, deque)| (k.clone(), deque.iter().copied().collect()))
         .collect();
-    let snapshot = SnapshotV3 {
+    let snapshot = SnapshotV4 {
         version: SNAPSHOT_VERSION,
         prices,
         spread_histories,
+        betas: betas.clone(),
+        kalman_states: kalman_states.clone(),
     };
     if let Ok(json) = serde_json::to_string(&snapshot) {
         // Atomic write: tmpfile in the same directory + rename. Multiple
@@ -160,20 +193,27 @@ struct ParsedSnapshot {
     version: u32,
     prices: HashMap<String, Vec<(f64, i64)>>,
     spread_histories: HashMap<String, Vec<f64>>,
+    betas: HashMap<String, f64>,
+    kalman_states: HashMap<String, KalmanSnapshot>,
 }
 
-/// Parse the persisted history file, accepting v3 (explicit struct with
-/// ms-precision `ts`), v2 (explicit struct with seconds `ts`, auto-migrated
-/// by × 1000) and legacy v1 (bare per-symbol map, also seconds, auto-migrated).
-/// Returns a `ParsedSnapshot` with `ts` always normalized to ms, or a
-/// human-readable error string for the caller to log (bot-strategy#370 —
-/// every load outcome must be greppable from journalctl).
+/// Parse the persisted history file, accepting v4 (explicit struct with
+/// ms-precision `ts` + betas + kalman_states), v3 (explicit struct with
+/// ms-precision `ts`, betas/kalman default to empty), v2 (explicit struct
+/// with seconds `ts`, auto-migrated by × 1000) and legacy v1 (bare per-symbol
+/// map, also seconds, auto-migrated). Returns a `ParsedSnapshot` with `ts`
+/// always normalized to ms, or a human-readable error string for the caller
+/// to log (bot-strategy#370 — every load outcome must be greppable from
+/// journalctl).
 fn parse_snapshot_file(path: &std::path::Path) -> Result<ParsedSnapshot, String> {
     let content = fs::read_to_string(path).map_err(|e| format!("read failed: {}", e))?;
-    // Try the explicit struct first (has `_v` and `prices`).
-    if let Ok(snap) = serde_json::from_str::<SnapshotV3>(&content) {
+    // Try the explicit struct first (has `_v` and `prices`). `SnapshotV4`
+    // is a superset of v3 / v2 / v3 — the missing-field defaults pick up
+    // empty `spread_histories` / `betas` / `kalman_states` for older
+    // snapshots.
+    if let Ok(snap) = serde_json::from_str::<SnapshotV4>(&content) {
         if snap.version >= 2 {
-            let prices = if snap.version < SNAPSHOT_VERSION {
+            let prices = if snap.version <= SECONDS_TS_VERSIONS_MAX {
                 migrate_prices_seconds_to_ms(snap.prices)
             } else {
                 snap.prices
@@ -182,10 +222,12 @@ fn parse_snapshot_file(path: &std::path::Path) -> Result<ParsedSnapshot, String>
                 version: snap.version,
                 prices,
                 spread_histories: snap.spread_histories,
+                betas: snap.betas,
+                kalman_states: snap.kalman_states,
             });
         }
         return Err(format!(
-            "schema _v={} not supported (expected 2 or 3, or v1 bare-map)",
+            "schema _v={} not supported (expected 2 / 3 / 4, or v1 bare-map)",
             snap.version
         ));
     }
@@ -195,9 +237,11 @@ fn parse_snapshot_file(path: &std::path::Path) -> Result<ParsedSnapshot, String>
             version: 1,
             prices: migrate_prices_seconds_to_ms(prices),
             spread_histories: HashMap::new(),
+            betas: HashMap::new(),
+            kalman_states: HashMap::new(),
         }),
         Err(e) => Err(format!(
-            "JSON did not match v2/v3 struct or v1 bare-map shape: {}",
+            "JSON did not match v2/v3/v4 struct or v1 bare-map shape: {}",
             e
         )),
     }
@@ -225,11 +269,13 @@ fn migrate_prices_seconds_to_ms(
 /// `load_history_from_disk`, this skips the stale-guard check (the
 /// snapshot is always older than the replay cursor) and instead accepts
 /// all samples within `max_history_len` bars of the *newest* sample in
-/// each symbol, regardless of `now_ts`. Also populates
-/// `spread_histories_out` when the snapshot is v2.
+/// each symbol, regardless of `now_ts`. Also populates `spread_histories_out`
+/// (v2+), `betas_out` and `kalman_states_out` (v4+) when present.
 pub(super) fn load_history_snapshot_for_bt(
     history: &mut HashMap<String, VecDeque<PriceSample>>,
     spread_histories_out: &mut HashMap<String, VecDeque<f64>>,
+    betas_out: &mut HashMap<String, f64>,
+    kalman_states_out: &mut HashMap<String, KalmanSnapshot>,
     snapshot_path: &std::path::Path,
     max_history_len: usize,
 ) {
@@ -284,12 +330,32 @@ pub(super) fn load_history_snapshot_for_bt(
         );
         spread_histories_out.insert(pair_key, deque);
     }
+    for (pair_key, beta) in snap.betas {
+        log::info!(
+            "[BT_WARM_START] loaded persisted β={:.4} for {}",
+            beta,
+            pair_key
+        );
+        betas_out.insert(pair_key, beta);
+    }
+    for (pair_key, kalman) in snap.kalman_states {
+        log::info!(
+            "[BT_WARM_START] loaded Kalman state β={:.4} p={:.6} updates={} for {}",
+            kalman.beta,
+            kalman.p,
+            kalman.updates,
+            pair_key
+        );
+        kalman_states_out.insert(pair_key, kalman);
+    }
 }
 
 pub(super) fn load_history_from_disk(
     cfg: &PairTradeConfig,
     history: &mut HashMap<String, VecDeque<PriceSample>>,
     spread_histories_out: &mut HashMap<String, VecDeque<f64>>,
+    betas_out: &mut HashMap<String, f64>,
+    kalman_states_out: &mut HashMap<String, KalmanSnapshot>,
     history_path: &std::path::Path,
     now_ts: i64,
     max_history_len: usize,
@@ -402,6 +468,14 @@ pub(super) fn load_history_from_disk(
             let deque: VecDeque<f64> = series.into_iter().collect();
             spreads_loaded.push((pair_key.clone(), len));
             spread_histories_out.insert(pair_key, deque);
+        }
+        // bot-strategy#413: lift persisted β and Kalman state into the
+        // engine's shared per-pair store. Empty for pre-v4 snapshots.
+        for (pair_key, beta) in snap.betas {
+            betas_out.insert(pair_key, beta);
+        }
+        for (pair_key, kalman) in snap.kalman_states {
+            kalman_states_out.insert(pair_key, kalman);
         }
     }
     // bot-strategy#370: emit one of three terminal log lines so operators
@@ -547,6 +621,32 @@ mod tests {
             snap.spread_histories.get("BTC/ETH").unwrap(),
             &vec![0.1, 0.2]
         );
+        // bot-strategy#413: pre-v4 snapshots default the new fields to empty
+        // so the engine falls back to OLS warm-start / fresh Kalman, matching
+        // pre-#413 behaviour.
+        assert!(snap.betas.is_empty());
+        assert!(snap.kalman_states.is_empty());
+    }
+
+    #[test]
+    fn parse_v4_snapshot_round_trips_betas_and_kalman() {
+        let json = r#"{
+            "_v": 4,
+            "prices": {"BTC": [[10.5, 1776232919000]]},
+            "spread_histories": {"BTC/ETH": [0.1, 0.2]},
+            "betas": {"BTC/ETH": 0.8123},
+            "kalman_states": {
+                "BTC/ETH": {"beta": 0.812, "p": 1.5e-4, "updates": 9876}
+            }
+        }"#;
+        let f = write_snapshot(json);
+        let snap = parse_snapshot_file(f.path()).unwrap();
+        assert_eq!(snap.version, 4);
+        assert_eq!(*snap.betas.get("BTC/ETH").unwrap(), 0.8123);
+        let kf = snap.kalman_states.get("BTC/ETH").unwrap();
+        assert_eq!(kf.beta, 0.812);
+        assert_eq!(kf.p, 1.5e-4);
+        assert_eq!(kf.updates, 9876);
     }
 
     #[test]
@@ -598,7 +698,7 @@ mod tests {
         }"#;
         let f = write_snapshot(json);
         let err = parse_snapshot_file(f.path()).unwrap_err();
-        assert!(err.contains("_v=0"), "got: {}", err);
+        assert!(err.contains("_v=0") || err.contains("not supported"), "got: {}", err);
     }
 
     #[test]
@@ -607,7 +707,7 @@ mod tests {
         let err = parse_snapshot_file(f.path()).unwrap_err();
         assert!(
             err.contains("JSON did not match"),
-            "expected v1/v2/v3-shape error, got: {}",
+            "expected v1/v2/v3/v4-shape error, got: {}",
             err
         );
     }

@@ -131,13 +131,17 @@ risk:
   max_notional_headroom: 1.0
 
 # Multi-strategy A/B/C variants for the single-process architecture
-# (shigeo-nakamura/bot-strategy#25). The single `debot-pair-btceth`
-# process spawns one StrategyInstance per entry, sharing the WS feed,
-# BarBuilder and spread_history above and only branching on the
-# per-strategy overrides below. Each instance loads its sub-account
+# (shigeo-nakamura/bot-strategy#25, completed in bot-strategy#413). The
+# single `debot-pair-btceth` process spawns one StrategyInstance per
+# entry. All instances now share the WS feed, BarBuilder, spread_history,
+# β / Kalman state and evaluate_pair cadence at engine level (#413's
+# `PairTradeEngine.per_pair_state`), so A/B/C produce byte-identical
+# β / std / z for the same tick. Variants only branch on the per-strategy
+# overrides below: entry_z / exit_z / stop_loss_z / force_close /
+# mtf_windows / equity_usd_reference. Each instance loads its sub-account
 # credentials via LIGHTER_*_{A,B,C} env vars set up by
-# /opt/debot/scripts/debot-pair-btceth.sh from the legacy per-bot
-# env files.
+# /opt/debot/scripts/debot-pair-btceth.sh from the legacy per-bot env
+# files.
 strategies:
   - id: a
     agent_name: debot-pair-btceth-a

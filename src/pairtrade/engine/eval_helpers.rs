@@ -3,7 +3,6 @@
 //! Thin wrappers / lookups that the entry / exit / reconcile paths use
 //! to translate between strategy state and order sizes:
 //!
-//! - `evaluate_pair` — delegate to `pair_eval::evaluate_pair`.
 //! - `exit_sizes_for_pair` — pick exit qtys from the exchange snapshot
 //!   when available, fall back to the bot-recorded entry sizes, and
 //!   ultimately to `hedged_sizes` if both are missing.
@@ -18,23 +17,21 @@
 //!   position; shells out to `sizing::hedged_sizes` against the
 //!   instance's `equity_reference_usd`.
 //!
-//! Pure relocation from the god-module split (#291); no semantic change.
+//! bot-strategy#413: the `evaluate_pair` delegate that used to live here
+//! moved into `engine/step.rs::step_pair_shared` as part of the shared
+//! per-pair pipeline. `pair_eval::evaluate_pair` is now called directly
+//! at the single canonical site.
 
 use anyhow::Result;
 use rust_decimal::Decimal;
 
 use super::super::config::PairSpec;
 use super::super::market::SymbolSnapshot;
-use super::super::pair_eval::{self, PairEvaluation};
 use super::super::sizing;
 use super::super::state::PendingLeg;
 use super::super::PairTradeEngine;
 
 impl PairTradeEngine {
-    pub(in crate::pairtrade) fn evaluate_pair(&self, pair: &PairSpec) -> Option<PairEvaluation> {
-        pair_eval::evaluate_pair(&self.cfg, &self.history, pair)
-    }
-
     pub(in crate::pairtrade) fn exit_sizes_for_pair(
         &self,
         inst_idx: usize,

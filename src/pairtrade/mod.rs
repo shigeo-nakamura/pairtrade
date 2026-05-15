@@ -9,9 +9,6 @@ use tokio::time::Duration;
 
 use crate::ports::replay_dex::ReplayConnector;
 
-#[cfg(test)]
-use dex_connector::PriceUpdate;
-
 mod backtest;
 mod bar;
 mod config;
@@ -49,7 +46,7 @@ pub fn start_metrics_exporter() {
     prom::maybe_start_exporter();
 }
 use config::PairParams;
-use state::{PairState, PositionDirection};
+use state::{PairSharedState, PairState, PositionDirection};
 #[cfg(test)]
 use config::PairSpec;
 #[cfg(test)]
@@ -92,6 +89,7 @@ const RISK_ACK_PATH: &str = "/opt/debot/RISK_ACK";
 /// bot-strategy#316.
 pub(in crate::pairtrade) fn apply_post_exit_state(
     state: &mut PairState,
+    shared: Option<&PairSharedState>,
     direction: PositionDirection,
     now_ts: i64,
     variant: &str,
@@ -103,7 +101,7 @@ pub(in crate::pairtrade) fn apply_post_exit_state(
     // Capture the z observed at exit before the post-take pending_exit_reason
     // is consumed, so the Grafana panel can correlate close reason with the
     // z that triggered it. bot-strategy#409.
-    if let Some((z, _)) = state.z_score() {
+    if let Some((z, _)) = shared.and_then(|s| s.z_score()) {
         prom::LAST_EXIT_Z.with_label_values(&[variant, pair]).set(z);
     }
     let reason = state.pending_exit_reason.take().unwrap_or("unknown");
@@ -206,6 +204,11 @@ pub struct PairTradeEngine {
     connector: Arc<dyn DexConnector + Send + Sync>,
     instances: Vec<StrategyInstance>,
     history: HashMap<String, VecDeque<PriceSample>>,
+    /// Per-pair quantities (β / spread / z / Kalman / eval result) shared
+    /// across every `StrategyInstance` on the same pair. Computed exactly
+    /// once per tick in `step_pair_shared`, so A/B/C variants observe
+    /// byte-identical β / std / z. See bot-strategy#413.
+    per_pair_state: HashMap<String, PairSharedState>,
     bar_builders: HashMap<String, BarBuilder>,
     last_metrics_log: Option<Instant>,
     last_ob_warn: HashMap<String, Instant>,
@@ -281,11 +284,23 @@ impl PairTradeEngine {
     ) -> Result<Self> {
         let mut history = HashMap::new();
         let mut bar_builders = HashMap::new();
+        let mut per_pair_state: HashMap<String, PairSharedState> = HashMap::new();
         for pair in &cfg.universe {
             history.insert(pair.base.clone(), VecDeque::new());
             history.insert(pair.quote.clone(), VecDeque::new());
             bar_builders.insert(pair.base.clone(), BarBuilder::new(cfg.trading_period_secs));
             bar_builders.insert(pair.quote.clone(), BarBuilder::new(cfg.trading_period_secs));
+            let pair_key = format!("{}/{}", pair.base, pair.quote);
+            let mut shared = PairSharedState::new(cfg.metrics_window);
+            if cfg.use_kalman_beta {
+                shared.kalman = Some(kalman::KalmanBeta::new(
+                    1.0,
+                    cfg.kalman_initial_p,
+                    cfg.kalman_q,
+                    cfg.kalman_r,
+                ));
+            }
+            per_pair_state.insert(pair_key, shared);
         }
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
@@ -372,15 +387,7 @@ impl PairTradeEngine {
                 let pp = inst_pair_params
                     .get(&pair_key)
                     .unwrap_or(&inst_default);
-                let mut ps = PairState::new(cfg.metrics_window, pp.entry_z_base);
-                if cfg.use_kalman_beta {
-                    ps.kalman = Some(kalman::KalmanBeta::new(
-                        1.0,
-                        cfg.kalman_initial_p,
-                        cfg.kalman_q,
-                        cfg.kalman_r,
-                    ));
-                }
+                let ps = PairState::new(pp.entry_z_base);
                 states.insert(pair_key, ps);
             }
 
@@ -464,6 +471,7 @@ impl PairTradeEngine {
             replay_connector,
             instances: built_instances,
             history,
+            per_pair_state,
             bar_builders,
             last_metrics_log: None,
             last_ob_warn: HashMap::new(),
@@ -622,11 +630,10 @@ impl PairTradeEngine {
         }
     }
 
-    fn compute_vol_median(&self, inst_idx: usize) -> f64 {
+    fn compute_vol_median(&self) -> f64 {
         let tail_len = self.entry_vol_window();
         let mut vols: Vec<f64> = self
-            .instances[inst_idx]
-            .states
+            .per_pair_state
             .values()
             .filter_map(|s| tail_std(&s.spread_history, tail_len))
             .collect();
@@ -653,11 +660,12 @@ impl PairTradeEngine {
             return;
         }
         let mut lines = Vec::new();
-        for (k, s) in &self.instances[inst_idx].states {
-            let z = s.z_score().map(|(z, _)| z).unwrap_or(0.0);
+        for (k, _) in &self.instances[inst_idx].states {
+            let Some(shared) = self.per_pair_state.get(k) else { continue };
+            let z = shared.z_score().map(|(z, _)| z).unwrap_or(0.0);
             lines.push(format!(
                 "{} elig={} z={:.2} beta={:.2} hl={:.2}h p={:.3}",
-                k, s.eligible, z, s.beta, s.half_life_hours, s.adf_p_value
+                k, shared.eligible, z, shared.beta, shared.half_life_hours, shared.adf_p_value
             ));
         }
         lines.sort();
@@ -678,27 +686,28 @@ impl PairTradeEngine {
         // --- per-pair gauges ---
         for (key, state) in &inst.states {
             let pp = inst.pair_params.get(key).unwrap_or(&inst.default_pair_params);
-            let z = state.z_score().map(|(z, _)| z).unwrap_or(0.0);
+            let shared = self.per_pair_state.get(key);
+            let z = shared.and_then(|s| s.z_score().map(|(z, _)| z)).unwrap_or(0.0);
             let labels = [instance, key.as_str()];
             prom::Z.with_label_values(&labels).set(z);
-            prom::BETA.with_label_values(&labels).set(state.beta);
-            prom::BETA_S.with_label_values(&labels).set(state.beta_short);
-            prom::BETA_L.with_label_values(&labels).set(state.beta_long);
+            prom::BETA.with_label_values(&labels).set(shared.map(|s| s.beta).unwrap_or(1.0));
+            prom::BETA_S.with_label_values(&labels).set(shared.map(|s| s.beta_short).unwrap_or(1.0));
+            prom::BETA_L.with_label_values(&labels).set(shared.map(|s| s.beta_long).unwrap_or(1.0));
             prom::BETA_DIVERGENCE
                 .with_label_values(&labels)
-                .set((state.beta_short - state.beta_long).abs());
+                .set(shared.map(|s| (s.beta_short - s.beta_long).abs()).unwrap_or(0.0));
             prom::HALF_LIFE_HOURS
                 .with_label_values(&labels)
-                .set(state.half_life_hours);
+                .set(shared.map(|s| s.half_life_hours).unwrap_or(0.0));
             prom::ADF_PVALUE
                 .with_label_values(&labels)
-                .set(state.adf_p_value);
+                .set(shared.map(|s| s.adf_p_value).unwrap_or(1.0));
             prom::ELIGIBLE
                 .with_label_values(&labels)
-                .set(if state.eligible { 1 } else { 0 });
+                .set(if shared.map(|s| s.eligible).unwrap_or(false) { 1 } else { 0 });
             let mut effective = state.z_entry;
             if pp.beta_gap_entry_z_scale > 0.0 {
-                effective *= 1.0 + pp.beta_gap_entry_z_scale * state.beta_gap;
+                effective *= 1.0 + pp.beta_gap_entry_z_scale * shared.map(|s| s.beta_gap).unwrap_or(0.0);
             }
             prom::ENTRY_Z_THRESHOLD_EFFECTIVE
                 .with_label_values(&labels)
@@ -755,8 +764,8 @@ impl PairTradeEngine {
         }
     }
 
-    fn state_score(&self, inst_idx: usize, key: &str) -> f64 {
-        self.instances[inst_idx].states
+    fn state_score(&self, _inst_idx: usize, key: &str) -> f64 {
+        self.per_pair_state
             .get(key)
             .map(|s| s.p_value_weighted_score)
             .unwrap_or(0.0)
@@ -1322,6 +1331,7 @@ impl PairTradeEngine {
         Self {
             cfg,
             connector: connector.clone(),
+            per_pair_state: HashMap::new(),
             instances: vec![StrategyInstance {
                 id: "default".to_string(),
                 connector,
@@ -2372,13 +2382,17 @@ mod pending_tests {
     // ------------------------------------------------------------------
 
     fn seed_state(engine: &mut PairTradeEngine, key: &str) {
-        // Inserts an empty PairState for `key` on instance 0 so the
-        // reconcile loop can find it. Mirrors the production state-build
-        // path in `new_inner` (one PairState per universe pair).
+        // Inserts an empty PairState for `key` on instance 0 + an empty
+        // PairSharedState on the engine so the reconcile loop can find both.
+        // Mirrors the production state-build path in `new_inner`.
         engine.instances[0].states.insert(
             key.to_string(),
-            state::PairState::new(8, 2.0),
+            state::PairState::new(2.0),
         );
+        engine
+            .per_pair_state
+            .entry(key.to_string())
+            .or_insert_with(|| state::PairSharedState::new(8));
     }
 
     /// `reconcile_pending_orders` keys off the per-pair `states` map. A

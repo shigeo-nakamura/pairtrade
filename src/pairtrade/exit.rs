@@ -4,13 +4,14 @@ use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 
 use super::config::{PairParams, PairTradeConfig};
-use super::state::{PairState, Position, PositionDirection};
+use super::state::{PairSharedState, PairState, Position, PositionDirection};
 use super::market::SymbolSnapshot;
 
 pub(super) fn exit_reason(
     cfg: &PairTradeConfig,
     pp: &PairParams,
     state: &PairState,
+    shared: &PairSharedState,
     z: f64,
     std: f64,
     p1: &SymbolSnapshot,
@@ -49,7 +50,7 @@ pub(super) fn exit_reason(
     if std > 1e-9 {
         if let Some(pnl) = pnl {
             if pnl > Decimal::ZERO {
-                let half_life_hours = state.half_life_hours;
+                let half_life_hours = shared.half_life_hours;
                 if half_life_hours.is_finite() && half_life_hours > 0.0 {
                     let elapsed_secs = now_ts.saturating_sub(pos.entered_ts).max(0) as f64;
                     let remaining_secs = (pp.force_close_secs as f64) - elapsed_secs;

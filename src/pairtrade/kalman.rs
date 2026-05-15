@@ -13,7 +13,7 @@ pub(super) struct KalmanBeta {
     pub(super) p: f64, // estimate variance
     q: f64,            // process noise
     r: f64,            // observation noise
-    updates: u64,
+    pub(super) updates: u64,
 }
 
 impl KalmanBeta {
@@ -24,6 +24,19 @@ impl KalmanBeta {
             q,
             r,
             updates: 0,
+        }
+    }
+
+    /// Reconstruct a KalmanBeta from a persisted snapshot (bot-strategy#413).
+    /// `q` / `r` come from the current YAML config — they're tuning knobs,
+    /// not state.
+    pub(super) fn from_snapshot(beta: f64, p: f64, updates: u64, q: f64, r: f64) -> Self {
+        Self {
+            beta: beta.clamp(0.1, 10.0),
+            p: p.max(0.0),
+            q,
+            r,
+            updates,
         }
     }
 

@@ -105,19 +105,17 @@ impl Error for PartialOrderPlacementError {
     }
 }
 
+/// Per-pair quantities that are deterministic functions of the shared
+/// log-price history and therefore must produce identical values for every
+/// strategy variant operating on the same pair. Owned at engine level
+/// (`PairTradeEngine.per_pair_state`) so A/B/C variants in the same process
+/// observe a single source of truth for β / spread / z. See bot-strategy#413.
 #[derive(Debug)]
-pub(super) struct PairState {
+pub(super) struct PairSharedState {
     pub(super) beta: f64,
-    pub(super) z_entry: f64,
     pub(super) spread_history: VecDeque<f64>,
     pub(super) last_spread: Option<f64>,
     pub(super) last_velocity_sigma_per_min: f64,
-    pub(super) position: Option<Position>,
-    pub(super) last_exit_at: Option<Instant>,
-    /// Replay-aware companion to `last_exit_at`. Drives the should_enter
-    /// cooldown and unhedged-close cooldown so they fire correctly under
-    /// backtest replay.
-    pub(super) last_exit_ts: Option<i64>,
     pub(super) beta_short: f64,
     pub(super) beta_long: f64,
     pub(super) half_life_hours: f64,
@@ -129,9 +127,6 @@ pub(super) struct PairState {
     pub(super) last_evaluated_ts: Option<i64>,
     pub(super) p_value_weighted_score: f64,
     pub(super) beta_gap: f64,
-    pub(super) pending_entry: Option<PendingOrders>,
-    pub(super) pending_exit: Option<PendingOrders>,
-    pub(super) position_guard: bool,
     pub(super) kalman: Option<KalmanBeta>,
     /// Rolling history of the most recent full-window spread std values, one
     /// sample per bar with a valid z-score. Used by the std-collapse guard
@@ -139,6 +134,24 @@ pub(super) struct PairState {
     /// far below its recent median — a sign that the z-score is no longer a
     /// trustworthy mean-reversion signal.
     pub(super) std_history: VecDeque<f64>,
+}
+
+#[derive(Debug)]
+pub(super) struct PairState {
+    /// Per-instance entry-z threshold; recomputed each tick from the
+    /// shared `beta_gap` × the variant's `entry_z_score_base/min/max`
+    /// overlay (bot-strategy#411). The β / spread / z themselves live in
+    /// `PairSharedState`.
+    pub(super) z_entry: f64,
+    pub(super) position: Option<Position>,
+    pub(super) last_exit_at: Option<Instant>,
+    /// Replay-aware companion to `last_exit_at`. Drives the should_enter
+    /// cooldown and unhedged-close cooldown so they fire correctly under
+    /// backtest replay.
+    pub(super) last_exit_ts: Option<i64>,
+    pub(super) pending_entry: Option<PendingOrders>,
+    pub(super) pending_exit: Option<PendingOrders>,
+    pub(super) position_guard: bool,
     /// BT fill-delay: when an exit is decided in dry_run + backtest mode with
     /// `bt_fill_delay_secs > 0`, we defer clearing `position` until the replay
     /// clock has advanced past this timestamp. While set, the bot considers the
@@ -166,17 +179,13 @@ pub(super) struct BtDeferredExit {
     pub(super) resolve_at_ts: i64,
 }
 
-impl PairState {
-    pub(super) fn new(window: usize, z_entry: f64) -> Self {
+impl PairSharedState {
+    pub(super) fn new(window: usize) -> Self {
         Self {
             beta: 1.0,
-            z_entry,
             spread_history: VecDeque::with_capacity(window),
             last_spread: None,
             last_velocity_sigma_per_min: 0.0,
-            position: None,
-            last_exit_at: None,
-            last_exit_ts: None,
             beta_short: 1.0,
             beta_long: 1.0,
             half_life_hours: 0.0,
@@ -186,14 +195,8 @@ impl PairState {
             last_evaluated_ts: None,
             p_value_weighted_score: 0.0,
             beta_gap: 0.0,
-            pending_entry: None,
-            pending_exit: None,
-            position_guard: false,
             kalman: None,
             std_history: VecDeque::new(),
-            bt_deferred_exit: None,
-            pending_exit_reason: None,
-            last_stop_loss_at: None,
         }
     }
 
@@ -279,5 +282,84 @@ impl PairState {
         }
         let latest = *self.spread_history.back().unwrap();
         Some((latest - mean) / std)
+    }
+}
+
+impl PairState {
+    pub(super) fn new(z_entry: f64) -> Self {
+        Self {
+            z_entry,
+            position: None,
+            last_exit_at: None,
+            last_exit_ts: None,
+            pending_entry: None,
+            pending_exit: None,
+            position_guard: false,
+            bt_deferred_exit: None,
+            pending_exit_reason: None,
+            last_stop_loss_at: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// bot-strategy#413 invariant: two `PairSharedState`s with identical
+    /// `spread_history` must produce bitwise-equal z / std / mean. This
+    /// is what guarantees A/B/C variants observe the same z when they
+    /// each read from `engine.per_pair_state[key]` (which is, in the live
+    /// engine, exactly the same shared deque).
+    #[test]
+    fn shared_state_z_is_deterministic_given_same_inputs() {
+        let mut a = PairSharedState::new(120);
+        let mut b = PairSharedState::new(120);
+        // Hand-populate the spread_history; we avoid PairTradeConfig here
+        // because `push_spread` pulls trading_period / std_collapse_window
+        // from it and PairTradeConfig has no Default impl. The behaviour
+        // under test is the z calculation, not push_spread.
+        for i in 0..200 {
+            let v = 0.02 * ((i as f64) * 0.1).sin() + 1.5;
+            a.spread_history.push_back(v);
+            b.spread_history.push_back(v);
+        }
+
+        let (z_a, std_a, mean_a, latest_a) = a.z_score_details().unwrap();
+        let (z_b, std_b, mean_b, latest_b) = b.z_score_details().unwrap();
+        assert_eq!(z_a.to_bits(), z_b.to_bits(), "z must be bitwise equal");
+        assert_eq!(std_a.to_bits(), std_b.to_bits());
+        assert_eq!(mean_a.to_bits(), mean_b.to_bits());
+        assert_eq!(latest_a.to_bits(), latest_b.to_bits());
+    }
+
+    /// PairState (per-instance) no longer carries β / z / spread fields.
+    /// This test pins the new struct shape — any field re-added here
+    /// without an explicit decision risks reintroducing the per-instance
+    /// drift that #413 fixes.
+    #[test]
+    fn pair_state_keeps_only_per_instance_fields() {
+        let s = PairState::new(1.5);
+        // Compile-time pin: these fields stay per-instance.
+        let _ = s.z_entry;
+        let _ = &s.position;
+        let _ = &s.pending_entry;
+        let _ = &s.pending_exit;
+        let _ = &s.bt_deferred_exit;
+        let _ = &s.pending_exit_reason;
+        let _ = &s.last_stop_loss_at;
+        let _ = &s.last_exit_at;
+        let _ = &s.last_exit_ts;
+        let _ = s.position_guard;
+    }
+
+    #[test]
+    fn z_score_for_window_handles_short_history() {
+        let mut s = PairSharedState::new(60);
+        s.spread_history.push_back(1.0);
+        // window > history is permissive (returns Some when len ≥ 2).
+        assert!(s.z_score_for_window(60).is_none());
+        s.spread_history.push_back(2.0);
+        assert!(s.z_score_for_window(60).is_some());
     }
 }

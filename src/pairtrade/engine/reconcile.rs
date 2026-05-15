@@ -62,6 +62,10 @@ impl PairTradeEngine {
             Self::update_pending_fills(&mut pending, &status.fills);
             let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
             if Self::all_filled(&pending, &status.fills) {
+                let z_at_entry = self
+                    .per_pair_state
+                    .get(key)
+                    .and_then(|s| s.z_score().map(|(z, _)| z));
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     let (mut ep_a, mut ep_b, mut es_a, mut es_b) = (None, None, None, None);
                     if let Some((base, quote)) = key.split_once('/') {
@@ -72,7 +76,6 @@ impl PairTradeEngine {
                         es_a = sum_a;
                         es_b = sum_b;
                     }
-                    let z_at_entry = state.z_score().map(|(z, _)| z);
                     state.position = Some(Position {
                         direction: pending.direction,
                         entered_at: Instant::now(),
@@ -155,7 +158,9 @@ impl PairTradeEngine {
                     let (z_entry, z_now) = {
                         let state_ref = self.instances[inst_idx].states.get(key);
                         let ze = state_ref.map(|s| s.z_entry).unwrap_or(0.0);
-                        let zn = state_ref
+                        let zn = self
+                            .per_pair_state
+                            .get(key)
                             .and_then(|s| s.z_score().map(|(z, _)| z))
                             .unwrap_or(0.0);
                         (ze, zn)
@@ -354,6 +359,11 @@ impl PairTradeEngine {
             let mut pnl_record: Option<(PnlLogRecord, f64, f64)> = None;
             if status.open_remaining == 0 && Self::all_filled(&pending, &status.fills) {
                 let inst_id = self.instances[inst_idx].id.clone();
+                let z_exit = self
+                    .per_pair_state
+                    .get(key)
+                    .and_then(|s| s.z_score().map(|(z, _)| z));
+                let beta_val = self.per_pair_state.get(key).map(|s| s.beta);
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     if let Some(pos) = state.position.as_ref() {
                         if let Some((base, quote)) = key.split_once('/') {
@@ -368,8 +378,6 @@ impl PairTradeEngine {
                                     );
                                     let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
                                     let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
-                                    let z_exit = state.z_score().map(|(z, _)| z);
-                                    let beta_val = Some(state.beta);
                                     let (carry_usd, ticks_observed) = match (
                                         pos.entry_size_a,
                                         pos.entry_price_a,
@@ -415,7 +423,14 @@ impl PairTradeEngine {
                             }
                         }
                     }
-                    apply_post_exit_state(state, pending.direction, now_ts, &inst_id, key);
+                    apply_post_exit_state(
+                        state,
+                        self.per_pair_state.get(key),
+                        pending.direction,
+                        now_ts,
+                        &inst_id,
+                        key,
+                    );
                     state.pending_exit = None;
                 }
                 log::info!("[ORDER] {} exit orders filled", key);
