@@ -13,21 +13,11 @@
       "title": "z-score (per pair / variant)",
       "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
       "targets": [
-        {
-          "expr": "pairtrade_z",
-          "legendFormat": "{{instance}} {{variant}} {{pair}}",
-          "refId": "A"
-        }
+        { "expr": "pairtrade_z", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "transparent", "value": null }
-            ]
-          }
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
         },
         "overrides": []
       },
@@ -69,17 +59,105 @@
       }
     },
     {
-      "id": 4,
-      "type": "state-timeline",
-      "title": "Eligibility / position / risk halts",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 17 },
+      "id": 9,
+      "type": "stat",
+      "title": "Variants currently in position",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 17 },
       "targets": [
-        { "expr": "pairtrade_eligible",              "legendFormat": "{{instance}} {{variant}} elig",        "refId": "A" },
-        { "expr": "pairtrade_has_position",          "legendFormat": "{{instance}} {{variant}} has_pos",     "refId": "B" },
-        { "expr": "pairtrade_kill_switch_active",    "legendFormat": "{{instance}} {{variant}} kill_switch", "refId": "C" },
-        { "expr": "pairtrade_session_dd_halt_active","legendFormat": "{{instance}} {{variant}} session_dd",  "refId": "D" },
-        { "expr": "pairtrade_daily_dd_halt_active",  "legendFormat": "{{instance}} {{variant}} daily_dd",    "refId": "E" },
-        { "expr": "pairtrade_circuit_breaker_active","legendFormat": "{{instance}} {{variant}} cb",          "refId": "F" }
+        { "expr": "sum by (instance) (pairtrade_has_position)", "legendFormat": "{{instance}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "gray",  "value": null },
+              { "color": "blue",  "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
+        "textMode": "value_and_name",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 10,
+      "type": "state-timeline",
+      "title": "Position state (per instance / variant)",
+      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 17 },
+      "targets": [
+        { "expr": "pairtrade_has_position", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
+      ],
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": {
+                "0": { "color": "transparent", "text": "FLAT" },
+                "1": { "color": "blue",        "text": "IN POSITION" }
+            } }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Position age (seconds, > 0 only while in position)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 25 },
+      "targets": [
+        { "expr": "pairtrade_position_age_seconds > 0", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "type": "state-timeline",
+      "title": "Eligibility (cointegration filter)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 25 },
+      "targets": [
+        { "expr": "pairtrade_eligible", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
+      ],
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": {
+                "0": { "color": "red",   "text": "NOT ELIGIBLE" },
+                "1": { "color": "green", "text": "ELIGIBLE" }
+            } }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "type": "state-timeline",
+      "title": "Risk halts (kill / session_dd / daily_dd / circuit_breaker)",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 32 },
+      "targets": [
+        { "expr": "pairtrade_kill_switch_active",     "legendFormat": "{{instance}} {{variant}} kill_switch", "refId": "A" },
+        { "expr": "pairtrade_session_dd_halt_active", "legendFormat": "{{instance}} {{variant}} session_dd",  "refId": "B" },
+        { "expr": "pairtrade_daily_dd_halt_active",   "legendFormat": "{{instance}} {{variant}} daily_dd",    "refId": "C" },
+        { "expr": "pairtrade_circuit_breaker_active", "legendFormat": "{{instance}} {{variant}} cb",          "refId": "D" }
       ],
       "options": {
         "mergeValues": true,
@@ -89,7 +167,10 @@
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "type": "value", "options": { "0": { "color": "transparent" }, "1": { "color": "red" } } }
+            { "type": "value", "options": {
+                "0": { "color": "transparent" },
+                "1": { "color": "red", "text": "HALTED" }
+            } }
           ]
         },
         "overrides": []
@@ -98,17 +179,21 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Time since last trade (seconds)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 25 },
+      "title": "Time since last trade (seconds, -1 before first trade)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 39 },
       "targets": [
         { "expr": "pairtrade_time_since_last_trade_seconds", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": []
+      }
     },
     {
       "id": 6,
       "type": "barchart",
       "title": "Close reasons (rate last 24h)",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 25 },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 39 },
       "targets": [
         { "expr": "sum by (reason, variant, instance) (increase(pairtrade_close_reason_total[24h]))", "legendFormat": "{{instance}} {{variant}} {{reason}}", "refId": "A" }
       ]
@@ -117,7 +202,7 @@
       "id": 7,
       "type": "stat",
       "title": "Bot version",
-      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 46 },
       "targets": [
         { "expr": "pairtrade_bot_version_info", "legendFormat": "{{instance}} {{variant}} {{version}} {{git_sha}}", "refId": "A", "instant": true }
       ],
@@ -131,7 +216,7 @@
       "id": 8,
       "type": "stat",
       "title": "Snapshot age (seconds)",
-      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 46 },
       "targets": [
         { "expr": "pairtrade_snapshot_age_seconds", "legendFormat": "{{instance}} {{variant}}", "refId": "A" }
       ],
