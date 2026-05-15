@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 
 use super::config::{PairParams, PairTradeConfig};
-use super::state::{PairState, PositionDirection};
+use super::state::{PairSharedState, PairState, PositionDirection};
 use super::stats::spread_slope_sigma;
 use super::util::tail_std;
 
@@ -62,12 +62,12 @@ const FUNDING_CARRY_ENTRY_DISCOUNT: f64 = 0.9;
 pub(super) fn entry_z_for_pair(
     cfg: &PairTradeConfig,
     pp: &PairParams,
-    state: &PairState,
+    shared: &PairSharedState,
     vol_median: f64,
 ) -> f64 {
     let entry_vol_len =
         ((pp.entry_vol_lookback_hours * 3600) / cfg.trading_period_secs).max(1) as usize;
-    let vol_pair = tail_std(&state.spread_history, entry_vol_len).unwrap_or(1.0);
+    let vol_pair = tail_std(&shared.spread_history, entry_vol_len).unwrap_or(1.0);
     let alpha = (vol_pair / vol_median).clamp(ENTRY_Z_SCALE_MIN, ENTRY_Z_SCALE_MAX);
     let z = pp.entry_z_base * alpha;
     z.clamp(pp.entry_z_min, pp.entry_z_max)
@@ -140,6 +140,7 @@ pub(super) fn should_enter(
     cfg: &PairTradeConfig,
     pp: &PairParams,
     state: &PairState,
+    shared: &PairSharedState,
     z: f64,
     std: f64,
     net_funding: f64,
@@ -160,7 +161,7 @@ pub(super) fn should_enter(
     // Block entry when spread is moving fast (likely trending, not mean-reverting).
     // Disabled when entry_velocity_block_sigma_per_min == 0.0.
     if pp.entry_velocity_block_sigma_per_min > 0.0
-        && state.last_velocity_sigma_per_min.abs() >= pp.entry_velocity_block_sigma_per_min
+        && shared.last_velocity_sigma_per_min.abs() >= pp.entry_velocity_block_sigma_per_min
     {
         return false;
     }
@@ -173,11 +174,11 @@ pub(super) fn should_enter(
     // the #41 A/B/C test window.
     if std_collapsed(
         std,
-        &state.std_history,
+        &shared.std_history,
         pp.std_collapse_window_bars,
         pp.std_collapse_min_ratio,
     ) {
-        let median = median_of(&state.std_history).unwrap_or(0.0);
+        let median = median_of(&shared.std_history).unwrap_or(0.0);
         let ratio = if median > 1e-9 { std / median } else { 0.0 };
         if pp.std_collapse_observe_only {
             log::warn!(
@@ -224,7 +225,7 @@ pub(super) fn should_enter(
     // entry_z *= 1.0 + scale * beta_gap
     // Disabled when beta_gap_entry_z_scale == 0.0.
     if pp.beta_gap_entry_z_scale > 0.0 {
-        entry_threshold *= 1.0 + pp.beta_gap_entry_z_scale * state.beta_gap;
+        entry_threshold *= 1.0 + pp.beta_gap_entry_z_scale * shared.beta_gap;
     }
 
     // --- Asymmetric entry threshold (bot-strategy#358) ---
@@ -235,17 +236,17 @@ pub(super) fn should_enter(
         return false;
     }
     // Spread trend filter: block entry if spread is trending
-    if let Some(slope_sigma) = spread_slope_sigma(&state.spread_history, cfg.metrics_window) {
+    if let Some(slope_sigma) = spread_slope_sigma(&shared.spread_history, cfg.metrics_window) {
         if slope_sigma > pp.spread_trend_max_slope_sigma {
             return false;
         }
     }
     // Beta stability filter: block entry if beta_s and beta_l diverge
-    if state.beta_gap > pp.beta_divergence_max {
+    if shared.beta_gap > pp.beta_divergence_max {
         return false;
     }
     // Beta minimum filter: block entry if beta is too low (hedge leg too small)
-    if pp.beta_min > 0.0 && state.beta < pp.beta_min {
+    if pp.beta_min > 0.0 && shared.beta < pp.beta_min {
         return false;
     }
     // Account for estimated cost (fees + slippage) in sigma units
@@ -262,7 +263,7 @@ pub(super) fn should_enter(
     if !pp.mtf_windows.is_empty() && pp.mtf_z_min > 0.0 {
         let primary_sign = z.signum();
         for &w in &pp.mtf_windows {
-            if let Some(z_w) = state.z_score_for_window(w) {
+            if let Some(z_w) = shared.z_score_for_window(w) {
                 if z_w.signum() != primary_sign || z_w.abs() < pp.mtf_z_min {
                     return false;
                 }
@@ -334,7 +335,7 @@ mod tests {
     // ---- bot-strategy#316: post-stop_loss_z cool-down ----
 
     fn cooldown_state(stop: Option<(PositionDirection, i64)>) -> PairState {
-        let mut s = PairState::new(240, 2.0);
+        let mut s = PairState::new(2.0);
         s.last_stop_loss_at = stop;
         s
     }

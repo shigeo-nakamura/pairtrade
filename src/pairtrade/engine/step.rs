@@ -38,6 +38,7 @@ use super::super::entry::{entry_z_for_pair, should_enter};
 use super::super::exit::{compute_pnl, exit_reason};
 use super::super::funding_history;
 use super::super::history_io;
+use super::super::pair_eval;
 use super::super::market::{
     liquidity_score, net_funding_for_direction, tick_sanity_check, SymbolSnapshot,
     MAX_TICK_PRICE_ENVELOPE_BPS, MAX_TICK_SPREAD_BPS,
@@ -111,18 +112,44 @@ impl PairTradeEngine {
             if let Some(ref path) = self.cfg.bt_warm_start_snapshot {
                 let max_len = self.max_history_len();
                 let mut loaded_spreads: HashMap<String, VecDeque<f64>> = HashMap::new();
+                let mut loaded_betas: HashMap<String, f64> = HashMap::new();
+                let mut loaded_kalman: HashMap<String, history_io::KalmanSnapshot> =
+                    HashMap::new();
                 history_io::load_history_snapshot_for_bt(
                     &mut self.history,
                     &mut loaded_spreads,
+                    &mut loaded_betas,
+                    &mut loaded_kalman,
                     std::path::Path::new(path),
                     max_len,
                 );
-                for inst in &mut self.instances {
-                    for (pair_key, spreads) in &loaded_spreads {
-                        if let Some(state) = inst.states.get_mut(pair_key) {
-                            state.last_spread = spreads.back().copied();
-                            state.spread_history = spreads.clone();
-                        }
+                // bot-strategy#413: shared per-pair store. Seed
+                // spread_history / β / Kalman directly; pre-#413 we
+                // fanned out across instances.
+                let kalman_q = self.cfg.kalman_q;
+                let kalman_r = self.cfg.kalman_r;
+                for (pair_key, spreads) in &loaded_spreads {
+                    if let Some(shared) = self.per_pair_state.get_mut(pair_key) {
+                        shared.last_spread = spreads.back().copied();
+                        shared.spread_history = spreads.clone();
+                    }
+                }
+                for (pair_key, beta) in &loaded_betas {
+                    if let Some(shared) = self.per_pair_state.get_mut(pair_key) {
+                        shared.beta = *beta;
+                    }
+                }
+                for (pair_key, kalman) in &loaded_kalman {
+                    if let Some(shared) = self.per_pair_state.get_mut(pair_key) {
+                        shared.kalman = Some(
+                            super::super::kalman::KalmanBeta::from_snapshot(
+                                kalman.beta,
+                                kalman.p,
+                                kalman.updates,
+                                kalman_q,
+                                kalman_r,
+                            ),
+                        );
                     }
                 }
             }
@@ -650,9 +677,268 @@ impl PairTradeEngine {
         if !self.cfg.backtest_mode {
             self.check_bar_rate_canary();
         }
+
+        // bot-strategy#413: run the spread / Kalman / eval pipeline once per
+        // pair before the per-instance loop. All variants on a pair share
+        // `self.per_pair_state[pair]`, so A/B/C observe byte-identical
+        // β / std / z. The eval gate is OR'd across instances so eval
+        // cadence matches the most-reactive variant's signal.
+        let universe = self.cfg.universe.clone();
+        let now_ts_shared = self.current_now_ts();
+        for pair in &universe {
+            let key = format!("{}/{}", pair.base, pair.quote);
+            if !(updated.contains(&pair.base) && updated.contains(&pair.quote)) {
+                continue;
+            }
+            self.step_pair_shared(pair, &key, now_ts_shared);
+        }
+
         self.persist_history_to_disk();
 
         Ok(Some((price_map, updated)))
+    }
+
+    /// Per-pair shared phase (bot-strategy#413). Runs the Kalman update,
+    /// pushes the new spread, computes the OR'd re-eval gate across all
+    /// `StrategyInstance`s on this pair, and commits the eval result into
+    /// `self.per_pair_state[key]` so every variant reads the same
+    /// β / spread_history / std / z. Emits the canonical [ZCHECK] +
+    /// [KALMAN] diagnostic logs once per pair per tick (was 3× per tick
+    /// pre-#413).
+    fn step_pair_shared(&mut self, pair: &PairSpec, key: &str, now_ts: i64) {
+        let Some(log_a) = self.latest_log_price(&pair.base) else { return };
+        let Some(log_b) = self.latest_log_price(&pair.quote) else { return };
+        let hist_a_prev = self
+            .history
+            .get(&pair.base)
+            .and_then(|h| h.iter().rev().nth(1).map(|s| s.log_price));
+        let hist_b_prev = self
+            .history
+            .get(&pair.quote)
+            .and_then(|h| h.iter().rev().nth(1).map(|s| s.log_price));
+
+        // Kalman update + spread push must run before we read z_snapshot
+        // back out, because push_spread also recomputes
+        // last_velocity_sigma_per_min and std_history.
+        let metrics_window = self.cfg.metrics_window;
+        {
+            let Some(shared) = self.per_pair_state.get_mut(key) else { return };
+            if let Some(ref mut kf) = shared.kalman {
+                if shared.last_spread.is_some() {
+                    if let (Some(a_prev), Some(b_prev)) = (hist_a_prev, hist_b_prev) {
+                        let dx = log_b - b_prev;
+                        let dy = log_a - a_prev;
+                        kf.update(dx, dy);
+                    }
+                }
+            }
+            let spread = log_a - shared.beta * log_b;
+            shared.push_spread(spread, metrics_window, &self.cfg);
+        }
+
+        // Snapshot derived state post-push.
+        let (z_snapshot, velocity, prev_eligible, last_eval_ts) = {
+            let Some(shared) = self.per_pair_state.get(key) else { return };
+            (
+                shared.z_score_details(),
+                shared.last_velocity_sigma_per_min,
+                shared.eligible,
+                shared.last_evaluated_ts,
+            )
+        };
+        let current_std = z_snapshot.map(|(_, std, _, _)| std).unwrap_or(0.0);
+        let base_std = self
+            .per_pair_state
+            .get(key)
+            .and_then(|s| tail_std(&s.spread_history, metrics_window));
+        let z_abs = z_snapshot.map(|(z, _, _, _)| z.abs()).unwrap_or(0.0);
+
+        // OR'd re-eval gate across every StrategyInstance on this pair.
+        // Eval cadence is a pair-level concern post-#413; the variant
+        // that would have triggered eval drives the cadence for all.
+        let bt_eval_force = self
+            .cfg
+            .bt_eval_timestamps
+            .as_ref()
+            .map(|set| set.contains(&now_ts));
+        let needs_eval_interval = last_eval_ts
+            .map(|t| now_ts.saturating_sub(t) >= PAIR_SELECTION_INTERVAL_SECS as i64)
+            .unwrap_or(true);
+        let mut needs_eval_jump_any = false;
+        let mut needs_eval_velocity_any = false;
+        let mut vol_spike_any = false;
+        let cfg_entry_z_base = self.cfg.default_pair_params.entry_z_base;
+        for inst_idx in 0..self.instances.len() {
+            let pp = self.pair_params_for(inst_idx, key);
+            let z_entry = self.instances[inst_idx]
+                .states
+                .get(key)
+                .map(|s| s.z_entry)
+                .unwrap_or(cfg_entry_z_base);
+            if z_abs >= z_entry * pp.reeval_jump_z_mult {
+                needs_eval_jump_any = true;
+            }
+            if velocity.abs()
+                >= pp.spread_velocity_max_sigma_per_min * pp.reeval_jump_z_mult
+            {
+                needs_eval_velocity_any = true;
+            }
+            if let Some(bs) = base_std {
+                if bs > 1e-9 && current_std / bs >= pp.vol_spike_mult {
+                    vol_spike_any = true;
+                }
+            }
+        }
+        let should_eval = match bt_eval_force {
+            Some(force) => force,
+            None => {
+                needs_eval_interval
+                    || needs_eval_jump_any
+                    || needs_eval_velocity_any
+                    || vol_spike_any
+            }
+        };
+
+        let eval = if should_eval {
+            let res = pair_eval::evaluate_pair(&self.cfg, &self.history, pair);
+            if let Some(ref e) = res {
+                log::info!(
+                    "[EVAL] {} beta_s={:.3} beta_l={:.3} beta={:.3} hl={:.2}h p={:.3} eligible={} score={:.3}",
+                    key,
+                    e.beta_short,
+                    e.beta_long,
+                    e.beta_eff,
+                    e.half_life_hours,
+                    e.adf_p_value,
+                    e.eligible,
+                    e.score
+                );
+            } else {
+                let (avail_a, avail_b) = (
+                    self.history.get(&pair.base).map(|h| h.len()).unwrap_or(0),
+                    self.history.get(&pair.quote).map(|h| h.len()).unwrap_or(0),
+                );
+                let pp = &self.cfg.default_pair_params;
+                log::debug!(
+                    "[EVAL] {} insufficient history ({}:{}, need long/short (strict) {} / {}, mode={:?})",
+                    key,
+                    pair.base,
+                    avail_a,
+                    pp.lookback_hours_long.max(pp.lookback_hours_short) * 3600
+                        / self.cfg.trading_period_secs,
+                    (pp.lookback_hours_short * 3600) / self.cfg.trading_period_secs,
+                    self.cfg.warm_start_mode
+                );
+                log::debug!(
+                    "[EVAL] {} insufficient history ({}:{}, need long/short (strict) {} / {}, mode={:?})",
+                    key,
+                    pair.quote,
+                    avail_b,
+                    pp.lookback_hours_long.max(pp.lookback_hours_short) * 3600
+                        / self.cfg.trading_period_secs,
+                    (pp.lookback_hours_short * 3600) / self.cfg.trading_period_secs,
+                    self.cfg.warm_start_mode
+                );
+            }
+            res
+        } else {
+            None
+        };
+
+        let use_kalman_beta = self.cfg.use_kalman_beta;
+        let kalman_min_updates = self.cfg.kalman_min_updates;
+        if let Some(eval) = eval {
+            if let Some(shared) = self.per_pair_state.get_mut(key) {
+                let kf_beta_warm = if use_kalman_beta {
+                    shared
+                        .kalman
+                        .as_ref()
+                        .filter(|kf| kf.is_warm(kalman_min_updates))
+                        .map(|kf| kf.beta)
+                } else {
+                    None
+                };
+                shared.beta = kf_beta_warm.unwrap_or(eval.beta_eff);
+                shared.beta_short = eval.beta_short;
+                shared.beta_long = eval.beta_long;
+                shared.half_life_hours = eval.half_life_hours;
+                shared.adf_p_value = eval.adf_p_value;
+                shared.eligible = eval.eligible;
+                shared.p_value_weighted_score = eval.score;
+                shared.beta_gap = eval.beta_gap;
+                shared.last_evaluated = Some(Instant::now());
+                shared.last_evaluated_ts = Some(now_ts);
+                if prev_eligible != shared.eligible {
+                    log::info!(
+                        "[ELIGIBILITY] {} -> {} (p={:.3} hl={:.2}h beta_gap={:.3})",
+                        key,
+                        shared.eligible,
+                        shared.adf_p_value,
+                        shared.half_life_hours,
+                        (shared.beta_short - shared.beta_long).abs()
+                    );
+                }
+            }
+        }
+
+        // Canonical [ZCHECK] + [KALMAN] diagnostics (one emit per pair,
+        // pre-#413 was once per StrategyInstance — 3× spam on A/B/C).
+        let base_first_ts = self
+            .history
+            .get(&pair.base)
+            .and_then(|h| h.front())
+            .map(|s| s.ts);
+        let quote_first_ts = self
+            .history
+            .get(&pair.quote)
+            .and_then(|h| h.front())
+            .map(|s| s.ts);
+        let base_bar = self.history.get(&pair.base).and_then(|h| h.back()).cloned();
+        let quote_bar = self
+            .history
+            .get(&pair.quote)
+            .and_then(|h| h.back())
+            .cloned();
+        if let (Some(ba), Some(bq), Some(shared)) =
+            (base_bar, quote_bar, self.per_pair_state.get(key))
+        {
+            if let Some((z, std, mean, latest)) = shared.z_score_details() {
+                log::info!(
+                    "[ZCHECK] {} bucket_ts={} bar_first_a={} bar_first_b={} bar_last_b={} \
+                     close_a={:.6} close_b={:.6} \
+                     beta_eff={:.4} beta_s={:.4} beta_l={:.4} mean={:.6} std={:.6} \
+                     spread={:.6} z={:.4} hist={}",
+                    key,
+                    ba.ts,
+                    base_first_ts.unwrap_or(0),
+                    quote_first_ts.unwrap_or(0),
+                    bq.ts,
+                    ba.log_price,
+                    bq.log_price,
+                    shared.beta,
+                    shared.beta_short,
+                    shared.beta_long,
+                    mean,
+                    std,
+                    latest,
+                    z,
+                    shared.spread_history.len(),
+                );
+            }
+            if use_kalman_beta {
+                if let Some(ref kf) = shared.kalman {
+                    log::info!(
+                        "[KALMAN] {} kalman_beta={:.4} ols_beta={:.4} diff={:.4} p={:.6} warm={}",
+                        key,
+                        kf.beta,
+                        shared.beta,
+                        kf.beta - shared.beta,
+                        kf.p,
+                        kf.is_warm(kalman_min_updates),
+                    );
+                }
+            }
+        }
     }
 
     /// Feed a single WebSocket price tick into the BarBuilder for `symbol`,
@@ -799,7 +1085,7 @@ impl PairTradeEngine {
         self.evaluate_session_dd(inst_idx).await;
         self.sync_positions_from_exchange(inst_idx, price_map).await?;
 
-        let vol_median = self.compute_vol_median(inst_idx);
+        let vol_median = self.compute_vol_median();
 
         // Regime filter: compute once per step cycle (not per pair)
         let regime_state = if self.cfg.regime_vol_max > 0.0 || self.cfg.regime_trend_max > 0.0 {
@@ -899,7 +1185,14 @@ impl PairTradeEngine {
                                 .as_ref()
                                 .map(|p| p.direction)
                                 .unwrap_or(PositionDirection::LongSpread);
-                            apply_post_exit_state(state, dir, now_ts, &inst_id, key.as_str());
+                            apply_post_exit_state(
+                                state,
+                                self.per_pair_state.get(&key),
+                                dir,
+                                now_ts,
+                                &inst_id,
+                                key.as_str(),
+                            );
                             state.bt_deferred_exit = None;
                         }
                     }
@@ -910,122 +1203,39 @@ impl PairTradeEngine {
             self.reconcile_pending_orders(inst_idx, &key, price_map).await?;
 
             let mut action = TradeAction::None;
-            let log_a = self
-                .latest_log_price(&pair.base)
-                .ok_or_else(|| anyhow!("no bar for {}", pair.base))?;
-            let log_b = self
-                .latest_log_price(&pair.quote)
-                .ok_or_else(|| anyhow!("no bar for {}", pair.quote))?;
 
+            // Read pair-level shared state (bot-strategy#413). β / spread /
+            // z were already computed once in step_pair_shared, so every
+            // variant on this pair observes the same values.
+            let Some(shared_snap) = self.per_pair_state.get(&key).map(|s| {
+                (
+                    s.z_score_details(),
+                    s.last_evaluated_ts,
+                    s.spread_history.len(),
+                    s.last_velocity_sigma_per_min,
+                    s.beta,
+                    s.beta_short,
+                    s.beta_long,
+                    s.eligible,
+                )
+            }) else {
+                continue;
+            };
             let (
-                prev_eligible,
                 z_snapshot,
                 last_eval_ts,
-                z_entry_copy,
                 spread_len,
-                position_state,
-                velocity,
+                _velocity,
                 beta_eff,
                 beta_short,
                 beta_long,
-            ) = {
-                let state = self
-                    .instances[inst_idx]
-                    .states
-                    .get_mut(&key)
-                    .ok_or_else(|| anyhow!("missing state for {}", key))?;
-                let prev_eligible = state.eligible;
-                // Kalman filter update: feed log-return diffs (dx, dy) per bar
-                if let Some(ref mut kf) = state.kalman {
-                    if state.last_spread.is_some() {
-                        if let (Some(hist_b), Some(hist_a)) = (
-                            self.history.get(&pair.quote),
-                            self.history.get(&pair.base),
-                        ) {
-                            if hist_b.len() >= 2 && hist_a.len() >= 2 {
-                                let dx = log_b - hist_b[hist_b.len() - 2].log_price;
-                                let dy = log_a - hist_a[hist_a.len() - 2].log_price;
-                                kf.update(dx, dy);
-                            }
-                        }
-                    }
-                }
-                let spread = log_a - state.beta * log_b;
-                state.push_spread(spread, self.cfg.metrics_window, &self.cfg);
-                (
-                    prev_eligible,
-                    state.z_score_details(),
-                    state.last_evaluated_ts,
-                    state.z_entry,
-                    state.spread_history.len(),
-                    state.position.clone(),
-                    state.last_velocity_sigma_per_min,
-                    state.beta,
-                    state.beta_short,
-                    state.beta_long,
-                )
-            };
-
-            // [ZCHECK] Per-step alignment audit log. Designed for side-by-side
-            // comparison across A/B/C bots running the same pair: if buckets are
-            // properly aligned, identical bucket_ts rows should show identical
-            // close/beta/mean/std/z values across processes. See pairtrade#4.
-            // bar_first_a / bar_first_b expose the rolling deque's front bucket_ts
-            // for both symbols so cross-host divergence (bot-strategy#274) can be
-            // attributed to bar-window misalignment vs. β-trajectory drift.
-            let base_first_ts = self
-                .history
-                .get(&pair.base)
-                .and_then(|h| h.front())
-                .map(|s| s.ts);
-            let quote_first_ts = self
-                .history
-                .get(&pair.quote)
-                .and_then(|h| h.front())
-                .map(|s| s.ts);
-            let base_bar = self.history.get(&pair.base).and_then(|h| h.back()).cloned();
-            let quote_bar = self.history.get(&pair.quote).and_then(|h| h.back()).cloned();
-            if let (Some(ba), Some(bq)) = (base_bar, quote_bar) {
-                if let Some((z, std, mean, latest)) = z_snapshot {
-                    log::info!(
-                        "[ZCHECK] {} bucket_ts={} bar_first_a={} bar_first_b={} bar_last_b={} \
-                         close_a={:.6} close_b={:.6} \
-                         beta_eff={:.4} beta_s={:.4} beta_l={:.4} mean={:.6} std={:.6} \
-                         spread={:.6} z={:.4} hist={}",
-                        key,
-                        ba.ts,
-                        base_first_ts.unwrap_or(0),
-                        quote_first_ts.unwrap_or(0),
-                        bq.ts,
-                        ba.log_price,
-                        bq.log_price,
-                        beta_eff,
-                        beta_short,
-                        beta_long,
-                        mean,
-                        std,
-                        latest,
-                        z,
-                        spread_len,
-                    );
-                }
-            }
-
-            // Kalman beta diagnostic log (only when enabled, so golden test is not affected)
-            if self.cfg.use_kalman_beta {
-                let state = &self.instances[inst_idx].states[&key];
-                if let Some(ref kf) = state.kalman {
-                    log::info!(
-                        "[KALMAN] {} kalman_beta={:.4} ols_beta={:.4} diff={:.4} p={:.6} warm={}",
-                        key,
-                        kf.beta,
-                        beta_eff,
-                        kf.beta - beta_eff,
-                        kf.p,
-                        kf.is_warm(self.cfg.kalman_min_updates),
-                    );
-                }
-            }
+                eligible_shared,
+            ) = shared_snap;
+            let position_state = self
+                .instances[inst_idx]
+                .states
+                .get(&key)
+                .and_then(|s| s.position.clone());
 
             let pp = self.pair_params_for(inst_idx, &key).clone();
             let pp = &pp;
@@ -1095,108 +1305,6 @@ impl PairTradeEngine {
                 }
             }
 
-            let needs_eval_interval = last_eval_ts
-                .map(|t| now_ts.saturating_sub(t) >= PAIR_SELECTION_INTERVAL_SECS as i64)
-                .unwrap_or(true);
-            let needs_eval_jump = z_snapshot
-                .map(|(z, _, _, _)| z.abs() >= z_entry_copy * pp.reeval_jump_z_mult)
-                .unwrap_or(false);
-            let needs_eval_velocity =
-                velocity.abs() >= pp.spread_velocity_max_sigma_per_min * pp.reeval_jump_z_mult;
-            let vol_spike = z_snapshot
-                .and_then(|(_, std, _, _)| {
-                    tail_std(&self.instances[inst_idx].states[&key].spread_history, self.cfg.metrics_window).map(
-                        |base_std| {
-                            if base_std <= 1e-9 {
-                                0.0
-                            } else {
-                                std / base_std
-                            }
-                        },
-                    )
-                })
-                .map(|ratio| ratio >= pp.vol_spike_mult)
-                .unwrap_or(false);
-
-            // TODO(#25 follow-up): evaluate_pair reads from engine.history
-            // (shared) but is called per-instance and gated by
-            // state.last_evaluated_ts (per-instance). In live mode the
-            // per-instance now_ts values differ by a few seconds, so an
-            // eval interval boundary can fall between instances — one
-            // triggers eval while the others skip. This causes ~0.3% beta
-            // drift between instances, which propagates into spread_history
-            // / mean / std / z. The drift is negligible for A/B test
-            // validity (variant params dominate by 50x) and self-corrects
-            // within the 240-bar window, but to guarantee byte-identical z
-            // long-term, move evaluate_pair + spread_history + beta to the
-            // shared phase (step_shared) so all instances consume the same
-            // evaluation result per tick.
-            // BT replay override: when `BT_EVAL_TIMESTAMPS_FILE` is loaded
-            // (bot-strategy#27 comment 2026-04-16), fire eval ONLY at the
-            // exact wall-clock seconds where the live bot ran evaluate_pair.
-            // This reproduces live's state.beta trajectory, which in turn
-            // makes every past spread_history entry match live even when
-            // the interval / z-jump / velocity gates would desync on the
-            // compounded drift.
-            let bt_eval_force = self
-                .cfg
-                .bt_eval_timestamps
-                .as_ref()
-                .map(|set| set.contains(&now_ts));
-            let should_eval = match bt_eval_force {
-                Some(force) => force,
-                None => needs_eval_interval || needs_eval_jump || needs_eval_velocity || vol_spike,
-            };
-            let eval = if should_eval
-            {
-                let res = self.evaluate_pair(pair);
-                if let Some(ref e) = res {
-                    log::info!(
-                        "[EVAL] {} beta_s={:.3} beta_l={:.3} beta={:.3} hl={:.2}h p={:.3} eligible={} score={:.3}",
-                        key,
-                        e.beta_short,
-                        e.beta_long,
-                        e.beta_eff,
-                        e.half_life_hours,
-                        e.adf_p_value,
-                        e.eligible,
-                        e.score
-                    );
-                } else {
-                    let (avail_a, avail_b) = (
-                        self.history.get(&pair.base).map(|h| h.len()).unwrap_or(0),
-                        self.history.get(&pair.quote).map(|h| h.len()).unwrap_or(0),
-                    );
-                    log::debug!(
-                        "[EVAL] {} insufficient history ({}:{}, need long/short (strict) {} / {}, mode={:?})",
-                        key,
-                        pair.base,
-                        avail_a,
-                        pp.lookback_hours_long
-                            .max(pp.lookback_hours_short)
-                            * 3600
-                            / self.cfg.trading_period_secs,
-                        (pp.lookback_hours_short * 3600) / self.cfg.trading_period_secs,
-                        self.cfg.warm_start_mode
-                    );
-                    log::debug!(
-                        "[EVAL] {} insufficient history ({}:{}, need long/short (strict) {} / {}, mode={:?})",
-                        key,
-                        pair.quote,
-                        avail_b,
-                        pp.lookback_hours_long
-                            .max(pp.lookback_hours_short)
-                            * 3600
-                            / self.cfg.trading_period_secs,
-                        (pp.lookback_hours_short * 3600) / self.cfg.trading_period_secs,
-                        self.cfg.warm_start_mode
-                    );
-                }
-                res
-            } else {
-                None
-            };
-
             let mut log_positions_not_ready = false;
             let circuit_breaker_until_ts_snapshot = self.instances[inst_idx].circuit_breaker_until_ts;
             let kill_switch_active_snapshot = self.kill_switch_active;
@@ -1204,130 +1312,145 @@ impl PairTradeEngine {
             let session_halted_snapshot = self.instances[inst_idx].session_halted;
             let consecutive_losses_snapshot = self.instances[inst_idx].consecutive_losses;
             let equity_reference_snapshot = self.instances[inst_idx].equity_reference_usd;
-            {
-                let state = self
-                    .instances[inst_idx]
-                    .states
-                    .get_mut(&key)
-                    .ok_or_else(|| anyhow!("missing state for {}", key))?;
-                if let Some(ref eval) = eval {
-                    if self.cfg.use_kalman_beta {
-                        if let Some(ref kf) = state.kalman {
-                            if kf.is_warm(self.cfg.kalman_min_updates) {
-                                state.beta = kf.beta;
-                            } else {
-                                state.beta = eval.beta_eff;
-                            }
-                        } else {
-                            state.beta = eval.beta_eff;
-                        }
-                    } else {
-                        state.beta = eval.beta_eff;
-                    }
-                    state.beta_short = eval.beta_short;
-                    state.beta_long = eval.beta_long;
-                    state.half_life_hours = eval.half_life_hours;
-                    state.adf_p_value = eval.adf_p_value;
-                    state.eligible = eval.eligible;
-                    state.p_value_weighted_score = eval.score;
-                    state.beta_gap = eval.beta_gap;
-                    state.last_evaluated = Some(Instant::now());
-                    state.last_evaluated_ts = Some(now_ts);
-                }
-                if prev_eligible != state.eligible {
-                    log::info!(
-                        "[ELIGIBILITY] {} -> {} (p={:.3} hl={:.2}h beta_gap={:.3})",
-                        key,
-                        state.eligible,
-                        state.adf_p_value,
-                        state.half_life_hours,
-                        (state.beta_short - state.beta_long).abs()
-                    );
-                }
 
-                let z_entry = entry_z_for_pair(&self.cfg, pp, state, vol_median);
+            // Refresh the per-instance entry_z threshold from the shared
+            // β_gap and the variant's entry_z_score_base/min/max overlay
+            // (bot-strategy#411 fix). Variant differences land here —
+            // β / spread / z themselves are shared.
+            let z_entry = self
+                .per_pair_state
+                .get(&key)
+                .map(|shared| entry_z_for_pair(&self.cfg, pp, shared, vol_median))
+                .unwrap_or(pp.entry_z_base);
+            if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
                 state.z_entry = z_entry;
+            }
 
-                let min_points = (self.cfg.metrics_window / 2).max(10);
-                if matches!(action, TradeAction::None) {
-                    if state.eligible && spread_len >= min_points {
-                        if let Some((z, std, mean, latest_spread)) = z_snapshot {
-                            let net_funding = net_funding_for_direction(z, p1, p2);
-                            if let Some(pos) = &state.position {
-                                let equity_base = equity_reference_snapshot;
-                                if let Some(reason) =
-                                    exit_reason(&self.cfg, pp, state, z, std, p1, p2, equity_base, now_ts)
-                                {
-                                    log::info!(
+            let min_points = (self.cfg.metrics_window / 2).max(10);
+            if matches!(action, TradeAction::None) {
+                if eligible_shared && spread_len >= min_points {
+                    if let Some((z, std, mean, latest_spread)) = z_snapshot {
+                        let net_funding = net_funding_for_direction(z, p1, p2);
+                        let position_open = self.instances[inst_idx]
+                            .states
+                            .get(&key)
+                            .map(|s| s.position.is_some())
+                            .unwrap_or(false);
+                        if position_open {
+                            let equity_base = equity_reference_snapshot;
+                            let reason_opt = {
+                                let state = self.instances[inst_idx]
+                                    .states
+                                    .get(&key)
+                                    .ok_or_else(|| anyhow!("missing state for {}", key))?;
+                                let shared = self.per_pair_state.get(&key).ok_or_else(|| {
+                                    anyhow!("missing shared state for {}", key)
+                                })?;
+                                exit_reason(
+                                    &self.cfg, pp, state, shared, z, std, p1, p2, equity_base, now_ts,
+                                )
+                            };
+                            if let Some(reason) = reason_opt {
+                                let velocity_for_log = self
+                                    .per_pair_state
+                                    .get(&key)
+                                    .map(|s| s.last_velocity_sigma_per_min)
+                                    .unwrap_or(0.0);
+                                log::info!(
                                     "[EXIT_CHECK] {} reason={} z={:.2} exit_z={:.2} stop_z={:.2} vel={:.3} max_vel={:.3}",
                                     key,
                                     reason,
                                     z,
                                     pp.exit_z,
                                     pp.stop_loss_z,
-                                    state.last_velocity_sigma_per_min,
+                                    velocity_for_log,
                                     pp.spread_velocity_max_sigma_per_min
                                 );
+                                let direction = self.instances[inst_idx]
+                                    .states
+                                    .get(&key)
+                                    .and_then(|s| s.position.as_ref().map(|p| p.direction))
+                                    .unwrap_or(PositionDirection::LongSpread);
+                                if let Some(state) = self.instances[inst_idx].states.get_mut(&key)
+                                {
                                     // Stash the reason so the exit-fill site
                                     // can tag last_stop_loss_at without
                                     // plumbing the reason through TradeAction
                                     // + PendingOrders. bot-strategy#316.
                                     state.pending_exit_reason = Some(reason);
-                                    action = TradeAction::Close {
-                                        direction: pos.direction,
-                                        z,
-                                        beta: state.beta,
-                                        force: false,
-                                    };
                                 }
-                            } else if !self.positions_ready {
-                                log_positions_not_ready = true;
-                            } else if kill_switch_active_snapshot {
-                                // entry blocked by KILL_SWITCH sentinel file;
-                                // engagement/release is logged in step_shared
-                            } else if session_halted_snapshot {
-                                // entry blocked by Phase 3-1 session-DD halt.
-                                // The trip + flatten was logged in
-                                // evaluate_session_dd; clearing requires a
-                                // manual ack at /opt/debot/RISK_ACK.
-                            } else if daily_loss_blocks_snapshot {
-                                // entry blocked by daily DD threshold; the
-                                // exact PnL / bps is surfaced in status.json
-                                // and re-logged on session rollover via
-                                // [DAILY_DD]. Existing positions still exit
-                                // through the usual exit_reason paths.
-                            } else if circuit_breaker_until_ts_snapshot
-                                .map_or(false, |until| now_ts < until)
-                            {
-                                // entry blocked by circuit breaker; logged via ZCHECK
-                            } else if last_eval_ts.is_none() {
-                                // Block entry until first evaluate_pair() completes,
-                                // because beta is still at its initial value (1.0).
-                            } else if !regime_ok {
-                                // entry blocked by regime filter
-                            } else {
-                                let direction = if z > 0.0 {
-                                    PositionDirection::ShortSpread
-                                } else {
-                                    PositionDirection::LongSpread
+                                action = TradeAction::Close {
+                                    direction,
+                                    z,
+                                    beta: beta_eff,
+                                    force: false,
                                 };
-                                if should_enter(
-                                    &self.cfg, pp, state, z, std, net_funding, now_ts, direction,
-                                ) {
-                                    action = TradeAction::Open {
-                                        direction,
-                                        z,
-                                        beta: state.beta,
-                                    };
-                                }
                             }
-                            let slope_sig =
-                                spread_slope_sigma(&state.spread_history, self.cfg.metrics_window);
-                            log::debug!(
+                        } else if !self.positions_ready {
+                            log_positions_not_ready = true;
+                        } else if kill_switch_active_snapshot {
+                            // entry blocked by KILL_SWITCH sentinel file;
+                            // engagement/release is logged in step_shared
+                        } else if session_halted_snapshot {
+                            // entry blocked by Phase 3-1 session-DD halt.
+                            // The trip + flatten was logged in
+                            // evaluate_session_dd; clearing requires a
+                            // manual ack at /opt/debot/RISK_ACK.
+                        } else if daily_loss_blocks_snapshot {
+                            // entry blocked by daily DD threshold; the
+                            // exact PnL / bps is surfaced in status.json
+                            // and re-logged on session rollover via
+                            // [DAILY_DD]. Existing positions still exit
+                            // through the usual exit_reason paths.
+                        } else if circuit_breaker_until_ts_snapshot
+                            .map_or(false, |until| now_ts < until)
+                        {
+                            // entry blocked by circuit breaker; logged via ZCHECK
+                        } else if last_eval_ts.is_none() {
+                            // Block entry until first evaluate_pair() completes,
+                            // because beta is still at its initial value (1.0).
+                        } else if !regime_ok {
+                            // entry blocked by regime filter
+                        } else {
+                            let direction = if z > 0.0 {
+                                PositionDirection::ShortSpread
+                            } else {
+                                PositionDirection::LongSpread
+                            };
+                            let entered = {
+                                let state = self.instances[inst_idx]
+                                    .states
+                                    .get(&key)
+                                    .ok_or_else(|| anyhow!("missing state for {}", key))?;
+                                let shared = self.per_pair_state.get(&key).ok_or_else(|| {
+                                    anyhow!("missing shared state for {}", key)
+                                })?;
+                                should_enter(
+                                    &self.cfg, pp, state, shared, z, std, net_funding, now_ts,
+                                    direction,
+                                )
+                            };
+                            if entered {
+                                action = TradeAction::Open {
+                                    direction,
+                                    z,
+                                    beta: beta_eff,
+                                };
+                            }
+                        }
+                        let slope_sig = self.per_pair_state.get(&key).and_then(|s| {
+                            spread_slope_sigma(&s.spread_history, self.cfg.metrics_window)
+                        });
+                        let beta_gap_for_log = self
+                            .per_pair_state
+                            .get(&key)
+                            .map(|s| s.beta_gap)
+                            .unwrap_or(0.0);
+                        log::debug!(
                             "[ZCHECK] {} z={:.2} entry={:.2} std={:.4} mean={:.4} spread={:.4} hist={} beta_s={:.3} beta_l={:.3} funding={:.5} eligible={} beta_gap={:.3} slope_sigma={:.3} consec_loss={}",
                             key,
                             z,
-                            state.z_entry,
+                            z_entry,
                             std,
                             mean,
                             latest_spread,
@@ -1335,30 +1458,29 @@ impl PairTradeEngine {
                             beta_short,
                             beta_long,
                             net_funding,
-                            state.eligible,
-                            state.beta_gap,
+                            eligible_shared,
+                            beta_gap_for_log,
                             slope_sig.unwrap_or(0.0),
                             consecutive_losses_snapshot
                         );
-                        }
-                    } else if state.eligible && spread_len < min_points {
-                        log::debug!(
-                            "[ZCHECK] {} skipped (spread history too short: {} < {})",
-                            key,
-                            spread_len,
-                            min_points
-                        );
-                    } else if position_state.is_some() && !state.eligible {
-                        // If pair falls out of eligibility, flatten
-                        if let Some(pos) = &state.position {
-                            log::info!("[EXIT_CHECK] {} reason=ineligible", key);
-                            action = TradeAction::Close {
-                                direction: pos.direction,
-                                z: 0.0,
-                                beta: state.beta,
-                                force: false,
-                            };
-                        }
+                    }
+                } else if eligible_shared && spread_len < min_points {
+                    log::debug!(
+                        "[ZCHECK] {} skipped (spread history too short: {} < {})",
+                        key,
+                        spread_len,
+                        min_points
+                    );
+                } else if position_state.is_some() && !eligible_shared {
+                    // If pair falls out of eligibility, flatten
+                    if let Some(pos) = &position_state {
+                        log::info!("[EXIT_CHECK] {} reason=ineligible", key);
+                        action = TradeAction::Close {
+                            direction: pos.direction,
+                            z: 0.0,
+                            beta: beta_eff,
+                            force: false,
+                        };
                     }
                 }
             }
@@ -1513,7 +1635,8 @@ impl PairTradeEngine {
                                 entry_a, entry_b,
                                 price_a.to_f64(), price_b.to_f64(),
                                 Some(beta), Some(z),
-                                self.instances[inst_idx].states.get(&plan.key)
+                                self.per_pair_state
+                                    .get(&plan.key)
                                     .and_then(|s| s.last_spread.map(|_| z)),
                                 hold_secs,
                             );
@@ -1627,6 +1750,7 @@ impl PairTradeEngine {
                         );
                     }
                     let inst_id = self.instances[inst_idx].id.clone();
+                    let shared_for_exit = self.per_pair_state.get(&plan.key);
                     if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         if self.cfg.backtest_mode && self.cfg.bt_fill_delay_secs > 0 {
                             // Defer position clearing to simulate exchange
@@ -1639,6 +1763,7 @@ impl PairTradeEngine {
                         } else {
                             apply_post_exit_state(
                                 state,
+                                shared_for_exit,
                                 direction,
                                 now_ts,
                                 &inst_id,

@@ -1,15 +1,18 @@
 //! Persistence helpers for `PairTradeEngine`.
 //!
 //! Bridges `PairTradeEngine` with the on-disk history and risk-state files
-//! (`history_io.rs` / `risk_io.rs`) plus the in-memory warm-start that
-//! seeds `state.beta` and `state.spread_history` from the loaded log-price
-//! history. Pure relocation from the god-module split (#291); no semantic
-//! change.
+//! (`history_io.rs` / `risk_io.rs`) plus the in-memory warm-start that seeds
+//! `per_pair_state[*].beta` and `per_pair_state[*].spread_history` from the
+//! loaded log-price history. Post-bot-strategy#413 the snapshot is owned at
+//! engine level (single source of truth per pair), and the loader also
+//! restores the committed β and Kalman filter state so a restart preserves
+//! the live β trajectory instead of reverting to a fresh OLS warm-start.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use super::super::history_io;
+use super::super::history_io::{self, KalmanSnapshot};
+use super::super::kalman::KalmanBeta;
 use super::super::risk_io;
 use super::super::stats::{regression_beta, tail_samples};
 use super::super::PairTradeEngine;
@@ -17,27 +20,42 @@ use super::super::RISK_ACK_PATH;
 
 impl PairTradeEngine {
     pub(in crate::pairtrade) fn persist_history_to_disk(&self) {
-        // Persist the engine's shared log-price history plus the first
-        // instance's per-pair `spread_history`. We pick instance 0 as
-        // the representative: A/B/C instances drift ≤0.3% per the
-        // existing TODO near evaluate_pair, which on reload converges
-        // back to whatever was persisted. Persisting per-instance would
-        // require an instance ID in the schema — over-engineered for
-        // the single-bot-per-process setup this field currently supports.
+        // bot-strategy#413: spread_history, β and Kalman state are now
+        // owned at engine level (single source of truth), so we read
+        // straight from `self.per_pair_state` instead of cherry-picking
+        // instance[0]. A/B/C now share these by construction.
         let spread_histories: HashMap<String, VecDeque<f64>> = self
-            .instances
-            .first()
-            .map(|inst| {
-                inst.states
-                    .iter()
-                    .map(|(k, s)| (k.clone(), s.spread_history.clone()))
-                    .collect()
+            .per_pair_state
+            .iter()
+            .map(|(k, s)| (k.clone(), s.spread_history.clone()))
+            .collect();
+        let betas: HashMap<String, f64> = self
+            .per_pair_state
+            .iter()
+            .map(|(k, s)| (k.clone(), s.beta))
+            .collect();
+        let kalman_states: HashMap<String, KalmanSnapshot> = self
+            .per_pair_state
+            .iter()
+            .filter_map(|(k, s)| {
+                s.kalman.as_ref().map(|kf| {
+                    (
+                        k.clone(),
+                        KalmanSnapshot {
+                            beta: kf.beta,
+                            p: kf.p,
+                            updates: kf.updates,
+                        },
+                    )
+                })
             })
-            .unwrap_or_default();
+            .collect();
         history_io::persist_history_to_disk(
             &self.cfg,
             &self.history,
             &spread_histories,
+            &betas,
+            &kalman_states,
             &self.history_path,
         );
     }
@@ -46,34 +64,67 @@ impl PairTradeEngine {
         let now = self.current_now_ts();
         let max_len = self.max_history_len();
         let mut loaded_spreads: HashMap<String, VecDeque<f64>> = HashMap::new();
+        let mut loaded_betas: HashMap<String, f64> = HashMap::new();
+        let mut loaded_kalman: HashMap<String, KalmanSnapshot> = HashMap::new();
         history_io::load_history_from_disk(
             &self.cfg,
             &mut self.history,
             &mut loaded_spreads,
+            &mut loaded_betas,
+            &mut loaded_kalman,
             &self.history_path,
             now,
             max_len,
             &mut self.last_warm_start_key,
         );
-        if loaded_spreads.is_empty() {
+        if loaded_spreads.is_empty() && loaded_betas.is_empty() && loaded_kalman.is_empty() {
             return;
         }
-        // Apply the persisted spread_history only when the instance's own
-        // spread_history is still empty — i.e. on the initial post-restart
-        // load, before any ticks have pushed a live spread. Subsequent
-        // per-tick loads must NOT clobber the instance's accumulating
-        // series, otherwise every step would silently revert the
-        // previous step's push (in single-bot mode) or import another
-        // bot's beta trajectory (in multi-bot mode, which is not the
-        // intended sharing axis — peer bots coordinate on log_prices,
-        // not on state.beta-dependent derived series).
-        for inst in &mut self.instances {
-            for (pair_key, spreads) in &loaded_spreads {
-                if let Some(state) = inst.states.get_mut(pair_key) {
-                    if state.spread_history.is_empty() {
-                        state.last_spread = spreads.back().copied();
-                        state.spread_history = spreads.clone();
-                    }
+        // Apply the persisted state only when the engine's own series is
+        // still empty — i.e. on the initial post-restart load, before any
+        // ticks have pushed a live spread. Subsequent per-tick loads must
+        // NOT clobber the engine's accumulating series, otherwise every
+        // step would silently revert the previous step's push.
+        let kalman_q = self.cfg.kalman_q;
+        let kalman_r = self.cfg.kalman_r;
+        for (pair_key, spreads) in &loaded_spreads {
+            if let Some(shared) = self.per_pair_state.get_mut(pair_key) {
+                if shared.spread_history.is_empty() {
+                    shared.last_spread = spreads.back().copied();
+                    shared.spread_history = spreads.clone();
+                }
+            }
+        }
+        for (pair_key, beta) in &loaded_betas {
+            if let Some(shared) = self.per_pair_state.get_mut(pair_key) {
+                // Only seed on a fresh boot: β=1.0 is the engine's
+                // default-init value (`PairSharedState::new`), so a value
+                // other than 1.0 means a later eval already overwrote it
+                // and we must not roll it back.
+                if (shared.beta - 1.0).abs() < f64::EPSILON {
+                    shared.beta = *beta;
+                }
+            }
+        }
+        for (pair_key, kalman) in &loaded_kalman {
+            if let Some(shared) = self.per_pair_state.get_mut(pair_key) {
+                // Skip if a live Kalman filter is already collecting
+                // updates (engine has been running for a while); only
+                // restore when the field is at its post-construction
+                // state.
+                let already_warm = shared
+                    .kalman
+                    .as_ref()
+                    .map(|kf| kf.updates > 0)
+                    .unwrap_or(false);
+                if !already_warm {
+                    shared.kalman = Some(KalmanBeta::from_snapshot(
+                        kalman.beta,
+                        kalman.p,
+                        kalman.updates,
+                        kalman_q,
+                        kalman_r,
+                    ));
                 }
             }
         }
@@ -233,60 +284,62 @@ impl PairTradeEngine {
     }
 
     /// Rebuild each pair's beta and spread_history from the shared on-disk
-    /// price history so A/B/C bots have identical regression windows the
-    /// instant they start, instead of waiting metrics_window live bars to
+    /// price history so the bot has a populated regression window the
+    /// instant it starts, instead of waiting metrics_window live bars to
     /// converge (pairtrade#4). Computes beta directly from whatever bars
     /// are available — does not go through evaluate_pair() because that
     /// path enforces full lookback_hours_long under Strict warm-start and
     /// would skip the seed when the loaded history is shorter than the
     /// configured long window.
+    ///
+    /// Post-bot-strategy#413: operates on engine-level `per_pair_state`
+    /// rather than per-instance, so there's a single β / spread_history
+    /// per pair shared across A/B/C.
     pub(in crate::pairtrade) fn warm_start_states_from_history(&mut self) {
         if self.cfg.disable_history_persist {
             return;
         }
-        for inst_idx in 0..self.instances.len() {
-            for pair in self.cfg.universe.clone() {
-                let key = format!("{}/{}", pair.base, pair.quote);
-                let (Some(hist_a), Some(hist_b)) =
-                    (self.history.get(&pair.base), self.history.get(&pair.quote))
-                else { continue };
-                let take = self.cfg.metrics_window.min(hist_a.len()).min(hist_b.len());
-                if take < 2 { continue }
-                let tail_a = tail_samples(hist_a, take);
-                let tail_b = tail_samples(hist_b, take);
-                let beta = regression_beta(&tail_b, &tail_a);
-                let Some(state) = self.instances[inst_idx].states.get_mut(&key) else { continue };
-                state.beta = beta;
-                state.beta_short = beta;
-                state.beta_long = beta;
-                // If `load_history_from_disk` / `load_history_snapshot_for_bt`
-                // has already restored the real persisted `spread_history`
-                // (v2 snapshot), keep it as-is. Synthesizing a
-                // single-OLS-beta series here would overwrite a 240-bar
-                // real series with one whose variance is artificially
-                // compressed — the mechanism behind the 2026-04-15 06:02
-                // UTC "std collapse" restart incident (bot-strategy#62).
-                // Only synthesize when the instance has no live spreads
-                // (fresh start with no persisted snapshot, or a v1
-                // snapshot from a pre-fix bot).
-                if state.spread_history.is_empty() {
-                    let spreads: VecDeque<f64> = tail_a
-                        .iter()
-                        .zip(tail_b.iter())
-                        .map(|(sa, sb)| sa.log_price - beta * sb.log_price)
-                        .collect();
-                    state.last_spread = spreads.back().copied();
-                    state.spread_history = spreads;
-                    log::info!(
-                        "[WARM_START] {} synthesized spread_history len={} beta={:.4} (no persisted v2 series)",
-                        key, state.spread_history.len(), state.beta
-                    );
-                } else {
-                    log::info!(
-                        "[WARM_START] {} kept persisted spread_history len={} beta={:.4} (no synthesis)",
-                        key, state.spread_history.len(), state.beta
-                    );
-                }
+        for pair in self.cfg.universe.clone() {
+            let key = format!("{}/{}", pair.base, pair.quote);
+            let (Some(hist_a), Some(hist_b)) =
+                (self.history.get(&pair.base), self.history.get(&pair.quote))
+            else { continue };
+            let take = self.cfg.metrics_window.min(hist_a.len()).min(hist_b.len());
+            if take < 2 { continue }
+            let tail_a = tail_samples(hist_a, take);
+            let tail_b = tail_samples(hist_b, take);
+            let beta = regression_beta(&tail_b, &tail_a);
+            let Some(shared) = self.per_pair_state.get_mut(&key) else { continue };
+            shared.beta = beta;
+            shared.beta_short = beta;
+            shared.beta_long = beta;
+            // If `load_history_from_disk` / `load_history_snapshot_for_bt`
+            // has already restored the real persisted `spread_history`
+            // (v2+ snapshot), keep it as-is. Synthesizing a
+            // single-OLS-beta series here would overwrite a 240-bar
+            // real series with one whose variance is artificially
+            // compressed — the mechanism behind the 2026-04-15 06:02
+            // UTC "std collapse" restart incident (bot-strategy#62).
+            // Only synthesize when the engine has no live spreads
+            // (fresh start with no persisted snapshot, or a v1
+            // snapshot from a pre-fix bot).
+            if shared.spread_history.is_empty() {
+                let spreads: VecDeque<f64> = tail_a
+                    .iter()
+                    .zip(tail_b.iter())
+                    .map(|(sa, sb)| sa.log_price - beta * sb.log_price)
+                    .collect();
+                shared.last_spread = spreads.back().copied();
+                shared.spread_history = spreads;
+                log::info!(
+                    "[WARM_START] {} synthesized spread_history len={} beta={:.4} (no persisted v2 series)",
+                    key, shared.spread_history.len(), shared.beta
+                );
+            } else {
+                log::info!(
+                    "[WARM_START] {} kept persisted spread_history len={} beta={:.4} (no synthesis)",
+                    key, shared.spread_history.len(), shared.beta
+                );
             }
         }
     }
