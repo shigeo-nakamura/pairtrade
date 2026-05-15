@@ -1127,6 +1127,11 @@ impl PairTradeEngine {
         while let Some(res) = join_set.join_next().await {
             results.push(res.expect("fetch task panicked"));
         }
+        // Sort by symbol so any [TICKER] / [ORDERBOOK] warning emit order
+        // is deterministic across runs — JoinSet completion order is
+        // tokio-scheduler dependent and previously caused intermittent
+        // golden_baseline drift.
+        results.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut map = HashMap::new();
         for (symbol, ticker_res, ob_res) in results {
