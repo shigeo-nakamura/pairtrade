@@ -304,6 +304,107 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 16,
+      "type": "heatmap",
+      "title": "Close gross PnL distribution (bps of entry notional)",
+      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional. Source for the #306 BT/live gap analysis: compare this distribution against BT output. (#314 Group 4-A, pairtrade#35)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "targets": [
+        {
+          "expr": "sum by (le) (increase(pairtrade_close_gross_pnl_bps_bucket{variant!=\"\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "yAxis": { "unit": "short" },
+        "cellGap": 1,
+        "color": { "mode": "scheme", "scheme": "Spectral", "steps": 64, "reverse": false }
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Per-leg slippage p50/p90 (bps, by order_type)",
+      "description": "Median + 90th-percentile slippage vs decision-time reference price, signed positive = cost. post_only fills typically hover near 0; taker fills are the adverse tail #306 cares about. (#314 Group 4-B/B-2, pairtrade#38/#42)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{order_type}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{order_type}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Per-leg fee p50/p90 (bps of filled notional)",
+      "description": "Venue-reported fee per leg. Lighter is fee-free and leaves the source unset (no series); Extended populates it. (#314 Group 4-B, pairtrade#38)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 64 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{leg}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{leg}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Per-leg fill latency p50/p90 (ms)",
+      "description": "Wall-clock latency from PendingOrders placement to leg fill completion. Extended populates FilledOrder.filled_ts_ms; Lighter leaves it None and emits no series. (#314 Group 4-C, pairtrade#40)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 64 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{leg}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{leg}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+        },
+        "overrides": []
+      }
     }
   ]
 }
