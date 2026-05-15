@@ -53,10 +53,14 @@ pub(super) struct PnlLogRecord {
     /// Net funding paid (negative) or received (positive) over the cycle.
     /// Computed by walking the rolling WS funding-rate history per leg
     /// during `[entry_ts, exit_ts)`; per-leg notionals captured at entry.
-    /// Sign convention follows `market::net_funding_for_direction` (the
-    /// bot's existing per-tick log line) so they reconcile. Field is added
-    /// at exit time only — `None` on records that pre-date the cycle's
-    /// entry or on `startup_force_close`. bot-strategy#364.
+    /// Sign convention matches the exchange `Payment` column (CSV
+    /// funding-history export): positive ⇒ strategy received. Note this
+    /// is the opposite sign of `market::net_funding_for_direction`, which
+    /// is left as-is for the (latent) entry-threshold filter only — the
+    /// two log lines no longer share a convention as of
+    /// bot-strategy#414. Field is added at exit time only — `None` on
+    /// records that pre-date the cycle's entry or on
+    /// `startup_force_close`. bot-strategy#364 / #414.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) funding_carry_usd: Option<f64>,
     /// Number of hourly funding ticks observed across both legs during the

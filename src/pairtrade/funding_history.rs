@@ -1,19 +1,23 @@
 //! Per-symbol rolling history of realized funding rates from the WS feed.
 //!
-//! Lighter settles funding hourly (verified bot-strategy#352 / #363:
-//! `market_stats.funding_rate` updates every 1h on `:00:05` boundaries). We
-//! observe the WS rate on every step and append a tick whenever the rate
-//! changes. At exit time, the cycle's `[open_ts, close_ts)` window is walked
-//! over the buffer and per-leg payments are summed to produce
-//! `funding_carry_usd` for `PnlLogRecord` (bot-strategy#364).
+//! Both venues settle funding hourly. The dex-connector normalizes incoming
+//! WS rates to **fraction per hour** (bot-strategy#414): for Lighter the
+//! wire arrives as percent-per-hour and is divided by 100 at parse time;
+//! Extended already pushes fraction-scale values. Sign convention on the
+//! cached rate is "perp funding rate": `+rate` means longs pay shorts.
+//! We observe the rate on every step and append a tick whenever it
+//! changes. At exit time, the cycle's `[open_ts, close_ts)` window is
+//! walked over the buffer and per-leg payments are summed to produce
+//! `funding_carry_usd` for `PnlLogRecord` (bot-strategy#364 / #414).
 //!
-//! Sign convention mirrors `market::net_funding_for_direction`:
-//! `funding_carry_usd > 0` means the strategy "received net carry" in the
-//! sense that entry.rs treats as positive carry (i.e., long-leg rate −
-//! short-leg rate weighted by per-leg notional is positive). If a later
-//! investigation shows Lighter's WS rate uses the opposite sign convention
-//! to the bot's mental model, both this field and the existing
-//! `net_funding_per_hour` log line move together — they stay consistent.
+//! Sign convention on the *output*: `funding_carry_usd > 0` means the
+//! strategy **received** carry over the window (matches the CSV/exchange
+//! `Payment` column sign). Since a long position with a positive rate
+//! pays out, per-leg P&L is `-rate × notional` for long legs and
+//! `+rate × notional` for short legs (bot-strategy#414). This is the
+//! opposite sign of `market::net_funding_for_direction`, which is used
+//! only for the entry-threshold filter and is documented separately as a
+//! latent bug; the two no longer share a sign convention.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -91,12 +95,15 @@ impl FundingHistory {
 /// Aggregate funding carry over the cycle window. Returns
 /// `(carry_usd, ticks_observed)` where:
 ///
-/// - `carry_usd` follows `net_funding_for_direction` sign convention:
-///   `+ long_leg_rate × notional_long − short_leg_rate × notional_short`
-///   summed across funding ticks during `[open_ts, close_ts)`. Per-leg
-///   notional captured at entry (size × price) — small drift from
-///   intra-hold price changes is on the order of the per-tick fee already
-///   being approximated to integer hours, well within reporting tolerance.
+/// - `carry_usd` is the strategy's realized funding P&L over the window,
+///   in USD. Sign convention matches the exchange `Payment` column:
+///   positive = strategy received, negative = strategy paid. Per-leg P&L
+///   for the perp-funding sign convention (`+rate ⇒ longs pay shorts`)
+///   is `-rate × notional` on the long leg and `+rate × notional` on the
+///   short leg; summed across all funding ticks in `[open_ts, close_ts)`.
+///   Per-leg notional is captured at entry (size × price); drift from
+///   intra-hold price moves is within the per-tick integer-hour
+///   approximation already in play (bot-strategy#414).
 /// - `ticks_observed` is the count of ticks summed over both legs
 ///   (`ticks_in_range(base) + ticks_in_range(quote)`). Caller can divide
 ///   by 2 to get hours-equivalent.
@@ -134,7 +141,9 @@ pub(super) fn compute_carry_usd(
         .iter()
         .map(|t| t.rate.to_f64().unwrap_or(0.0))
         .sum();
-    let carry = long_sum * long_leg_notional - short_sum * short_leg_notional;
+    // Long leg loses `rate × notional` when rate > 0 (longs pay shorts);
+    // short leg gains the same. Carry is the net strategy-side P&L.
+    let carry = short_sum * short_leg_notional - long_sum * long_leg_notional;
     let ticks = (long_leg_ticks.len() + short_leg_ticks.len()) as u32;
     (carry, ticks)
 }
@@ -190,8 +199,9 @@ mod tests {
 
     #[test]
     fn carry_short_spread_matches_per_leg_formula() {
-        // ShortSpread = short BTC, long ETH. Bot convention:
-        //   carry = +rate_quote * N_eth - rate_base * N_btc
+        // ShortSpread = short BTC, long ETH. Strategy-side P&L:
+        //   carry = -rate_eth * N_eth + rate_btc * N_btc
+        // (long leg pays rate; short leg receives rate; total = -long + short)
         let mut h = FundingHistory::new();
         // Two BTC ticks (short leg) at +0.001 and +0.0005
         h.observe("BTC", 1000, dec!(0.001));
@@ -212,18 +222,19 @@ mod tests {
             dec!(0.5),     // ETH size
             dec!(2400),    // ETH price → N_eth = $1200
             // For ShortSpread: long_leg=ETH (N=1200), short_leg=BTC (N=800)
-            // carry = (0.0002 + (-0.0001)) * 1200 - (0.001 + 0.0005) * 800
-            //       = 0.0001 * 1200 - 0.0015 * 800
-            //       = 0.12 - 1.2 = -1.08
+            // carry = short_sum * N_btc - long_sum * N_eth
+            //       = (0.001 + 0.0005) * 800 - (0.0002 + (-0.0001)) * 1200
+            //       = 0.0015 * 800 - 0.0001 * 1200
+            //       = 1.2 - 0.12 = 1.08
         );
         assert_eq!(n, 4);
-        assert!((carry - (-1.08)).abs() < 1e-9, "carry was {}", carry);
+        assert!((carry - 1.08).abs() < 1e-9, "carry was {}", carry);
     }
 
     #[test]
     fn carry_long_spread_flips_leg_assignment() {
         // LongSpread = long BTC, short ETH.
-        //   carry = +rate_base * N_btc - rate_quote * N_eth
+        //   carry = +rate_eth * N_eth - rate_btc * N_btc
         let mut h = FundingHistory::new();
         h.observe("BTC", 1000, dec!(0.001));
         h.observe("ETH", 1000, dec!(0.0002));
@@ -238,10 +249,67 @@ mod tests {
             dec!(80000),  // N_btc = 800
             dec!(0.5),
             dec!(2400),   // N_eth = 1200
-            // carry = 0.001 * 800 - 0.0002 * 1200 = 0.8 - 0.24 = 0.56
+            // carry = short_sum * N_eth - long_sum * N_btc
+            //       = 0.0002 * 1200 - 0.001 * 800
+            //       = 0.24 - 0.8 = -0.56
         );
         assert_eq!(n, 2);
-        assert!((carry - 0.56).abs() < 1e-9, "carry was {}", carry);
+        assert!((carry - (-0.56)).abs() < 1e-9, "carry was {}", carry);
+    }
+
+    #[test]
+    fn carry_matches_lighter_csv_for_2026_05_15_pair_a() {
+        // bot-strategy#414 regression. Reproduces Frankfurt Pair-A's
+        // 2026-05-15 13:17→15:23 LongSpread cycle (long BTC, short ETH).
+        //
+        // WS pushes (now in fraction/h after dex-connector normalizes):
+        //   BTC:  0 / +7e-6 / -1e-6 at 13:19, 14:00:05, 15:00:05
+        //   ETH:  +3e-6 / -1e-6 / +1e-6 at the same times
+        //
+        // Cycle window covers [open_ts=13:17:05, close_ts=15:23:10), so
+        // the 13:19 initial tick is included. The settlements that
+        // actually pay out are the boundary updates (14:00, 15:00); the
+        // 13:19 tick is the rate that was paid at the *previous* (13:00)
+        // boundary, which the strategy did not hold. Removing it is a
+        // separate hygiene fix; this regression locks the magnitude/sign
+        // we expect with current behavior so a future tightening can't
+        // flip it back to the buggy +1.2 USDC.
+        //
+        // Realized from Lighter CSV: -0.01179 USDC.
+        let mut h = FundingHistory::new();
+        let open_ts = 1_000;
+        let close_ts = 8_000;
+        // Mimic the actual sample ordering relative to open_ts.
+        h.observe("BTC", open_ts + 120, dec!(0.0));
+        h.observe("ETH", open_ts + 120, dec!(0.000003));
+        h.observe("BTC", open_ts + 2_580, dec!(0.000007));
+        h.observe("ETH", open_ts + 2_580, dec!(-0.000001));
+        h.observe("BTC", open_ts + 6_180, dec!(-0.000001));
+        h.observe("ETH", open_ts + 6_180, dec!(0.000001));
+
+        let (carry, n) = compute_carry_usd(
+            &h,
+            "BTC",
+            "ETH",
+            open_ts,
+            close_ts,
+            PositionDirection::LongSpread,
+            dec!(0.02498),
+            dec!(80060.7),    // N_btc = 1999.92
+            dec!(0.9161),
+            dec!(2245.64),    // N_eth = 2057.13
+        );
+        assert_eq!(n, 6);
+        // Expected: carry = short_sum*N_eth - long_sum*N_btc
+        //   short_sum(ETH) = 3e-6 + (-1e-6) + 1e-6 = 3e-6
+        //   long_sum(BTC)  = 0 + 7e-6 + (-1e-6)  = 6e-6
+        //   carry = 3e-6 * 2057.13 - 6e-6 * 1999.92
+        //         = 0.006171 - 0.011999 ≈ -0.005828
+        assert!(
+            (carry - (-0.005828)).abs() < 1e-5,
+            "carry was {} (expected ≈ -0.0058 to be the right order of magnitude / sign for the 2026-05-15 cycle vs the CSV-realized -0.01179)",
+            carry
+        );
     }
 
     #[test]
