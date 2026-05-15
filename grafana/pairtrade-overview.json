@@ -26,10 +26,41 @@
       }
     },
     {
+      "id": 14,
+      "type": "timeseries",
+      "title": "z-score divergence: Frankfurt - Tokyo (per variant)",
+      "description": "Frankfurt z minus Tokyo z, matched on pair+variant. Should sit near 0; non-zero pulses point at one host's WS lagging.",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 9 },
+      "targets": [
+        {
+          "expr": "pairtrade_z{instance=\"debot-frankfurt\"} - on(pair, variant) pairtrade_z{instance=\"debot-tokyo\"}",
+          "legendFormat": "{{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": false },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "red",    "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
       "id": 2,
       "type": "timeseries",
       "title": "beta (combined / short / long)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "targets": [
         { "expr": "pairtrade_beta", "legendFormat": "{{instance}} {{variant}} beta", "refId": "A" },
         { "expr": "pairtrade_beta_s", "legendFormat": "{{instance}} {{variant}} beta_s", "refId": "B" },
@@ -40,7 +71,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "|beta_s - beta_l| (threshold 0.30)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
       "targets": [
         { "expr": "pairtrade_beta_divergence", "legendFormat": "{{instance}} {{variant}}", "refId": "A" }
       ],
@@ -62,7 +93,7 @@
       "id": 9,
       "type": "stat",
       "title": "Variants currently in position",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 17 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 23 },
       "targets": [
         { "expr": "sum by (instance) (pairtrade_has_position)", "legendFormat": "{{instance}}", "refId": "A" }
       ],
@@ -89,7 +120,7 @@
       "id": 10,
       "type": "state-timeline",
       "title": "Position state (per instance / variant)",
-      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 17 },
+      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 23 },
       "targets": [
         { "expr": "pairtrade_has_position", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
       ],
@@ -114,7 +145,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Position age (seconds, > 0 only while in position)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 25 },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 31 },
       "targets": [
         { "expr": "pairtrade_position_age_seconds > 0", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
       ],
@@ -127,7 +158,7 @@
       "id": 12,
       "type": "state-timeline",
       "title": "Eligibility (cointegration filter)",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 25 },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 31 },
       "targets": [
         { "expr": "pairtrade_eligible", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
       ],
@@ -152,7 +183,7 @@
       "id": 13,
       "type": "state-timeline",
       "title": "Risk halts (kill / session_dd / daily_dd / circuit_breaker)",
-      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 32 },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 38 },
       "targets": [
         { "expr": "pairtrade_kill_switch_active",     "legendFormat": "{{instance}} {{variant}} kill_switch", "refId": "A" },
         { "expr": "pairtrade_session_dd_halt_active", "legendFormat": "{{instance}} {{variant}} session_dd",  "refId": "B" },
@@ -180,7 +211,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "Time since last trade (seconds, -1 before first trade)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 39 },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 45 },
       "targets": [
         { "expr": "pairtrade_time_since_last_trade_seconds", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
       ],
@@ -193,7 +224,7 @@
       "id": 6,
       "type": "barchart",
       "title": "Close reasons (rate last 24h)",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 39 },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 45 },
       "targets": [
         { "expr": "sum by (reason, variant, instance) (increase(pairtrade_close_reason_total[24h]))", "legendFormat": "{{instance}} {{variant}} {{reason}}", "refId": "A" }
       ]
@@ -202,7 +233,7 @@
       "id": 7,
       "type": "stat",
       "title": "Bot version",
-      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 46 },
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 52 },
       "targets": [
         { "expr": "pairtrade_bot_version_info", "legendFormat": "{{instance}} {{variant}} {{version}} {{git_sha}}", "refId": "A", "instant": true }
       ],
@@ -216,7 +247,7 @@
       "id": 8,
       "type": "stat",
       "title": "Snapshot age (seconds)",
-      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 46 },
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 52 },
       "targets": [
         { "expr": "pairtrade_snapshot_age_seconds", "legendFormat": "{{instance}} {{variant}}", "refId": "A" }
       ],
