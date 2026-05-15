@@ -418,6 +418,32 @@ impl PairTradeEngine {
                                     if ticks_observed > 0 {
                                         record = record.with_funding(carry_usd, ticks_observed);
                                     }
+                                    // #314 Group 4: emit gross/funding bps to
+                                    // Prometheus. Same Some(...,...,...,...)
+                                    // gate as the funding compute above so the
+                                    // bps denominator stays consistent.
+                                    if let (Some(sa), Some(pa), Some(sb), Some(pb)) = (
+                                        pos.entry_size_a,
+                                        pos.entry_price_a,
+                                        pos.entry_size_b,
+                                        pos.entry_price_b,
+                                    ) {
+                                        let leg_a = (sa * pa).abs().to_f64();
+                                        let leg_b = (sb * pb).abs().to_f64();
+                                        if let (Some(a), Some(b)) = (leg_a, leg_b) {
+                                            let notional = a + b;
+                                            if notional > 0.0 {
+                                                super::super::prom::CLOSE_GROSS_PNL_BPS
+                                                    .with_label_values(&[&inst_id, key])
+                                                    .observe(pnl / notional * 10_000.0);
+                                                if ticks_observed > 0 {
+                                                    super::super::prom::CLOSE_FUNDING_BPS
+                                                        .with_label_values(&[&inst_id, key])
+                                                        .observe(carry_usd / notional * 10_000.0);
+                                                }
+                                            }
+                                        }
+                                    }
                                     pnl_record = Some((record, pnl, carry_usd));
                                 }
                             }
