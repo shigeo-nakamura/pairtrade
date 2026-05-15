@@ -882,6 +882,7 @@ impl PairTradeEngine {
             // (bot-strategy#69). Must run before reconcile so the position
             // is cleared before entry evaluation on the same tick.
             if self.cfg.bt_fill_delay_secs > 0 {
+                let inst_id = self.instances[inst_idx].id.clone();
                 if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
                     if let Some(ref deferred) = state.bt_deferred_exit {
                         if now_ts >= deferred.resolve_at_ts {
@@ -898,7 +899,7 @@ impl PairTradeEngine {
                                 .as_ref()
                                 .map(|p| p.direction)
                                 .unwrap_or(PositionDirection::LongSpread);
-                            apply_post_exit_state(state, dir, now_ts);
+                            apply_post_exit_state(state, dir, now_ts, &inst_id, key.as_str());
                             state.bt_deferred_exit = None;
                         }
                     }
@@ -1625,6 +1626,7 @@ impl PairTradeEngine {
                             now_ts
                         );
                     }
+                    let inst_id = self.instances[inst_idx].id.clone();
                     if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         if self.cfg.backtest_mode && self.cfg.bt_fill_delay_secs > 0 {
                             // Defer position clearing to simulate exchange
@@ -1635,7 +1637,13 @@ impl PairTradeEngine {
                                 resolve_at_ts: now_ts + self.cfg.bt_fill_delay_secs,
                             });
                         } else {
-                            apply_post_exit_state(state, direction, now_ts);
+                            apply_post_exit_state(
+                                state,
+                                direction,
+                                now_ts,
+                                &inst_id,
+                                plan.key.as_str(),
+                            );
                         }
                     }
                 } else if self.cfg.observe_only {
@@ -1786,6 +1794,7 @@ impl PairTradeEngine {
                             plan.net_funding_per_hour,
                             now_ts
                         );
+                    let inst_id = self.instances[inst_idx].id.clone();
                     if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         state.position = Some(Position {
                             direction,
@@ -1797,6 +1806,9 @@ impl PairTradeEngine {
                             entry_size_b: Some(qtys.1),
                             entry_z: Some(z),
                         });
+                        super::super::prom::LAST_ENTRY_Z
+                            .with_label_values(&[&inst_id, plan.key.as_str()])
+                            .set(z);
                     }
                 } else if self.cfg.observe_only {
                     log::info!(

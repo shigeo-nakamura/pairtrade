@@ -27,6 +27,7 @@ mod market;
 mod order_pricing;
 mod pair_eval;
 mod pnl_log;
+pub(crate) mod prom;
 mod regime;
 mod risk_io;
 mod s3_mirror;
@@ -40,6 +41,13 @@ use market::SymbolSnapshot;
 use pnl_log::{PnlLogRecord, PnlLogger};
 use stats::PriceSample;
 pub use config::{PairTradeConfig, WarmStartMode};
+
+/// Spawn the Prometheus exporter when `PROM_LISTEN` is set in the env.
+/// Safe to call at most once at process boot from `main`. See
+/// `pairtrade::prom`.
+pub fn start_metrics_exporter() {
+    prom::maybe_start_exporter();
+}
 use config::PairParams;
 use state::{PairState, PositionDirection};
 #[cfg(test)]
@@ -82,18 +90,33 @@ const RISK_ACK_PATH: &str = "/opt/debot/RISK_ACK";
 /// same-direction re-entry. The tag is dropped after consumption so a
 /// later non-stop exit (force_close / exit_z) does not refresh it.
 /// bot-strategy#316.
-pub(in crate::pairtrade) fn apply_post_exit_state(state: &mut PairState, direction: PositionDirection, now_ts: i64) {
+pub(in crate::pairtrade) fn apply_post_exit_state(
+    state: &mut PairState,
+    direction: PositionDirection,
+    now_ts: i64,
+    instance: &str,
+    pair: &str,
+) {
     state.position = None;
     state.last_exit_at = Some(Instant::now());
     state.last_exit_ts = Some(now_ts);
-    if let Some(reason) = state.pending_exit_reason.take() {
-        if reason == "stop_loss_z" {
-            state.last_stop_loss_at = Some((direction, now_ts));
-            log::info!(
-                "[STOP_COOLDOWN] armed direction={:?} now_ts={}",
-                direction, now_ts
-            );
-        }
+    // Capture the z observed at exit before the post-take pending_exit_reason
+    // is consumed, so the Grafana panel can correlate close reason with the
+    // z that triggered it. bot-strategy#409.
+    if let Some((z, _)) = state.z_score() {
+        prom::LAST_EXIT_Z.with_label_values(&[instance, pair]).set(z);
+    }
+    let reason = state.pending_exit_reason.take().unwrap_or("unknown");
+    prom::CLOSE_REASON_TOTAL
+        .with_label_values(&[instance, pair, reason])
+        .inc();
+    if reason == "stop_loss_z" {
+        state.last_stop_loss_at = Some((direction, now_ts));
+        log::info!(
+            "[STOP_COOLDOWN] armed direction={:?} now_ts={}",
+            direction,
+            now_ts
+        );
     }
 }
 
@@ -409,6 +432,14 @@ impl PairTradeEngine {
             });
         }
 
+        // Stamp Prometheus process-info gauges once per variant so the
+        // `pairtrade_bot_version_info` series shows up on /metrics even
+        // before the first tick. bot-strategy#409.
+        let process_started = status::process_started_at();
+        for inst in &built_instances {
+            prom::record_process_info(inst.id.as_str(), process_started);
+        }
+
         Ok(Self {
             cfg,
             connector,
@@ -589,6 +620,12 @@ impl PairTradeEngine {
     }
 
     fn maybe_log_metrics(&mut self, inst_idx: usize) {
+        // Refresh Prometheus gauges every tick. Cheap (a handful of
+        // atomic stores per pair) and gives Grafana the same resolution as
+        // the underlying state instead of the 300 s log cadence. See
+        // bot-strategy#409.
+        self.update_prom_metrics(inst_idx);
+
         const LOG_INTERVAL: u64 = 300;
         if self
             .last_metrics_log
@@ -610,6 +647,94 @@ impl PairTradeEngine {
             log::info!("[METRICS] {}", lines.join(" | "));
         }
         self.last_metrics_log = Some(Instant::now());
+    }
+
+    /// Push per-instance signal / position / risk state into the
+    /// Prometheus registry. Bot-strategy#409 — meant for at-a-glance
+    /// "how close are we to entry?" and "is anything blocking entry?"
+    /// reading, not a byte-exact predicate.
+    fn update_prom_metrics(&self, inst_idx: usize) {
+        let inst = &self.instances[inst_idx];
+        let instance = inst.id.as_str();
+        let now_ts = chrono::Utc::now().timestamp();
+        // --- per-pair gauges ---
+        for (key, state) in &inst.states {
+            let pp = inst.pair_params.get(key).unwrap_or(&inst.default_pair_params);
+            let z = state.z_score().map(|(z, _)| z).unwrap_or(0.0);
+            let labels = [instance, key.as_str()];
+            prom::Z.with_label_values(&labels).set(z);
+            prom::BETA.with_label_values(&labels).set(state.beta);
+            prom::BETA_S.with_label_values(&labels).set(state.beta_short);
+            prom::BETA_L.with_label_values(&labels).set(state.beta_long);
+            prom::BETA_DIVERGENCE
+                .with_label_values(&labels)
+                .set((state.beta_short - state.beta_long).abs());
+            prom::HALF_LIFE_HOURS
+                .with_label_values(&labels)
+                .set(state.half_life_hours);
+            prom::ADF_PVALUE
+                .with_label_values(&labels)
+                .set(state.adf_p_value);
+            prom::ELIGIBLE
+                .with_label_values(&labels)
+                .set(if state.eligible { 1 } else { 0 });
+            let mut effective = state.z_entry;
+            if pp.beta_gap_entry_z_scale > 0.0 {
+                effective *= 1.0 + pp.beta_gap_entry_z_scale * state.beta_gap;
+            }
+            prom::ENTRY_Z_THRESHOLD_EFFECTIVE
+                .with_label_values(&labels)
+                .set(effective);
+            if let Some(pos) = state.position.as_ref() {
+                prom::HAS_POSITION.with_label_values(&labels).set(1);
+                prom::POSITION_AGE_SECONDS
+                    .with_label_values(&labels)
+                    .set((now_ts - pos.entered_ts).max(0) as f64);
+                if let Some(ez) = pos.entry_z {
+                    prom::LAST_ENTRY_Z.with_label_values(&labels).set(ez);
+                }
+            } else {
+                prom::HAS_POSITION.with_label_values(&labels).set(0);
+                prom::POSITION_AGE_SECONDS.with_label_values(&labels).set(0.0);
+            }
+            let since_exit = match state.last_exit_ts {
+                Some(ts) => (now_ts - ts).max(0) as f64,
+                None => -1.0,
+            };
+            prom::TIME_SINCE_LAST_TRADE_SECONDS
+                .with_label_values(&labels)
+                .set(since_exit);
+        }
+        // --- per-instance scalars ---
+        prom::KILL_SWITCH_ACTIVE
+            .with_label_values(&[instance])
+            .set(if self.kill_switch_active { 1 } else { 0 });
+        prom::SESSION_DD_HALT_ACTIVE
+            .with_label_values(&[instance])
+            .set(if inst.session_halted { 1 } else { 0 });
+        prom::DAILY_DD_HALT_ACTIVE
+            .with_label_values(&[instance])
+            .set(if inst.daily_loss_halted { 1 } else { 0 });
+        let cb_active = match inst.circuit_breaker_until_ts {
+            Some(until) => until > now_ts,
+            None => false,
+        };
+        prom::CIRCUIT_BREAKER_ACTIVE
+            .with_label_values(&[instance])
+            .set(if cb_active { 1 } else { 0 });
+        // Snapshot age — mtime of the on-disk history file. Bounded I/O
+        // (single stat per tick per instance) is acceptable here; the
+        // alternative is plumbing the writer's last-write timestamp
+        // out through several layers.
+        if let Ok(meta) = std::fs::metadata(&self.history_path) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(elapsed) = modified.elapsed() {
+                    prom::SNAPSHOT_AGE_SECONDS
+                        .with_label_values(&[instance])
+                        .set(elapsed.as_secs_f64());
+                }
+            }
+        }
     }
 
     fn state_score(&self, inst_idx: usize, key: &str) -> f64 {

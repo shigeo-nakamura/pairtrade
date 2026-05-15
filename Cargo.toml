@@ -30,6 +30,11 @@ libc = "0.2"
 aws-config = "1"
 aws-sdk-s3 = "1"
 
+# In-process Prometheus exporter (bot-strategy#314 / #409). Always
+# initialised; the HTTP server is bound only when `PROM_LISTEN` is set in
+# the env, otherwise the gauges are updated as dead code.
+prometheus = { version = "0.13", default-features = false }
+
 debot-utils = "1.0.*"
 
 dex-connector = { path = "../dex-connector", default-features = false }

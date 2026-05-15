@@ -353,6 +353,7 @@ impl PairTradeEngine {
             // `realized_pnl_today` below. 0.0 when no ticks were observed.
             let mut pnl_record: Option<(PnlLogRecord, f64, f64)> = None;
             if status.open_remaining == 0 && Self::all_filled(&pending, &status.fills) {
+                let inst_id = self.instances[inst_idx].id.clone();
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     if let Some(pos) = state.position.as_ref() {
                         if let Some((base, quote)) = key.split_once('/') {
@@ -414,7 +415,7 @@ impl PairTradeEngine {
                             }
                         }
                     }
-                    apply_post_exit_state(state, pending.direction, now_ts);
+                    apply_post_exit_state(state, pending.direction, now_ts, &inst_id, key);
                     state.pending_exit = None;
                 }
                 log::info!("[ORDER] {} exit orders filled", key);

@@ -28,7 +28,7 @@ use std::env;
 /// reports the same value. See bot-strategy#343.
 static PROCESS_STARTED_AT: OnceLock<i64> = OnceLock::new();
 
-fn process_started_at() -> i64 {
+pub(in crate::pairtrade) fn process_started_at() -> i64 {
     *PROCESS_STARTED_AT.get_or_init(|| Utc::now().timestamp())
 }
 

@@ -45,6 +45,10 @@ async fn run_single() -> std::io::Result<()> {
     let dex_connector_git = option_env!("DEX_CONNECTOR_GIT_HASH").unwrap_or("unknown");
     log::info!("dex-connector git: {}", dex_connector_git);
     log::info!("Starting pair-trade loop...");
+    // Prometheus exporter is opt-in via `PROM_LISTEN`; safe to call
+    // before engine boot so a slow startup still exposes the
+    // process_start / version_info gauges via `/metrics`.
+    debot::pairtrade::start_metrics_exporter();
     let cfg = PairTradeConfig::from_env_or_yaml().expect("invalid pair trade config");
     let mut engine = init_engine_with_retry(cfg)
         .await

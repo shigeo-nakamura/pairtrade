@@ -1,0 +1,330 @@
+//! In-process Prometheus exporter (bot-strategy#314 / #409).
+//!
+//! The exporter is always defined — callers update gauges and counters
+//! unconditionally on the hot path. The HTTP `/metrics` server is bound
+//! only when `PROM_LISTEN` is present in the environment (e.g.
+//! `PROM_LISTEN=127.0.0.1:9464`), otherwise the metrics are recorded but
+//! never scraped. This keeps the production rollout opt-in per host.
+
+use anyhow::Result;
+use once_cell::sync::Lazy;
+use prometheus::{
+    Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+};
+use std::env;
+use std::net::SocketAddr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+const ENV_LISTEN: &str = "PROM_LISTEN";
+
+/// Process-wide registry. All metrics are registered here at first
+/// access.
+pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
+
+fn register_gauge(name: &str, help: &str, labels: &[&str]) -> GaugeVec {
+    let g = GaugeVec::new(Opts::new(name, help), labels)
+        .expect("prometheus GaugeVec construction never fails for static names");
+    REGISTRY
+        .register(Box::new(g.clone()))
+        .expect("prometheus registry rejected duplicate metric");
+    g
+}
+
+fn register_int_gauge(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
+    let g = IntGaugeVec::new(Opts::new(name, help), labels)
+        .expect("prometheus IntGaugeVec construction never fails for static names");
+    REGISTRY
+        .register(Box::new(g.clone()))
+        .expect("prometheus registry rejected duplicate metric");
+    g
+}
+
+fn register_int_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    let c = IntCounterVec::new(Opts::new(name, help), labels)
+        .expect("prometheus IntCounterVec construction never fails for static names");
+    REGISTRY
+        .register(Box::new(c.clone()))
+        .expect("prometheus registry rejected duplicate metric");
+    c
+}
+
+// === Signal / cointegration ===
+
+pub static Z: Lazy<GaugeVec> =
+    Lazy::new(|| register_gauge("pairtrade_z", "Latest z-score per pair.", &["instance", "pair"]));
+
+pub static BETA: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_beta",
+        "Combined beta (Kalman) used for spread construction.",
+        &["instance", "pair"],
+    )
+});
+
+pub static BETA_S: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_beta_s",
+        "Short-window beta input to the combined beta.",
+        &["instance", "pair"],
+    )
+});
+
+pub static BETA_L: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_beta_l",
+        "Long-window beta input to the combined beta.",
+        &["instance", "pair"],
+    )
+});
+
+pub static BETA_DIVERGENCE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_beta_divergence",
+        "Absolute gap |beta_s - beta_l|, gated by beta_divergence_max.",
+        &["instance", "pair"],
+    )
+});
+
+pub static HALF_LIFE_HOURS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_half_life_hours",
+        "Estimated mean-reversion half-life in hours.",
+        &["instance", "pair"],
+    )
+});
+
+pub static ADF_PVALUE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_adf_pvalue",
+        "ADF cointegration test p-value (lower is more cointegrated).",
+        &["instance", "pair"],
+    )
+});
+
+pub static ELIGIBLE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_eligible",
+        "1 when the pair passes the primary cointegration eligibility filter.",
+        &["instance", "pair"],
+    )
+});
+
+pub static ENTRY_Z_THRESHOLD_EFFECTIVE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_entry_z_threshold_effective",
+        "Per-variant entry-z threshold after beta_gap_entry_z_scale adjustment.",
+        &["instance", "pair"],
+    )
+});
+
+// === Position / activity ===
+
+pub static HAS_POSITION: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_has_position",
+        "1 when the variant currently holds a pair position.",
+        &["instance", "pair"],
+    )
+});
+
+pub static POSITION_AGE_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_position_age_seconds",
+        "Seconds since the current position was opened. 0 when flat.",
+        &["instance", "pair"],
+    )
+});
+
+pub static TIME_SINCE_LAST_TRADE_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_time_since_last_trade_seconds",
+        "Seconds since the most recent exit. NaN-coerced to -1 before first exit.",
+        &["instance", "pair"],
+    )
+});
+
+pub static LAST_ENTRY_Z: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_last_entry_z",
+        "z-score at the most recent entry.",
+        &["instance", "pair"],
+    )
+});
+
+pub static LAST_EXIT_Z: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_last_exit_z",
+        "z-score observed at the most recent exit.",
+        &["instance", "pair"],
+    )
+});
+
+pub static CLOSE_REASON_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_close_reason_total",
+        "Cumulative count of position closes broken down by exit reason.",
+        &["instance", "pair", "reason"],
+    )
+});
+
+// === Risk / kill state ===
+
+pub static KILL_SWITCH_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_kill_switch_active",
+        "1 when the process-wide KILL_SWITCH file is present.",
+        &["instance"],
+    )
+});
+
+pub static SESSION_DD_HALT_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_session_dd_halt_active",
+        "1 when the variant is in a sticky session-DD halt.",
+        &["instance"],
+    )
+});
+
+pub static DAILY_DD_HALT_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_daily_dd_halt_active",
+        "1 when the variant has tripped today's daily-DD threshold.",
+        &["instance"],
+    )
+});
+
+pub static CIRCUIT_BREAKER_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_circuit_breaker_active",
+        "1 while the consecutive-loss circuit breaker cooldown is in effect.",
+        &["instance"],
+    )
+});
+
+// === System health ===
+
+pub static SNAPSHOT_AGE_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_snapshot_age_seconds",
+        "Age of pairtrade_history_*.json on disk (file mtime delta).",
+        &["instance"],
+    )
+});
+
+pub static PROCESS_START_TIMESTAMP_SECONDS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_process_start_timestamp_seconds",
+        "Unix timestamp of process boot.",
+        &["instance"],
+    )
+});
+
+pub static BOT_VERSION_INFO: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_bot_version_info",
+        "Always 1; carries version and git_sha labels.",
+        &["instance", "version", "git_sha", "dex_connector_sha"],
+    )
+});
+
+/// Spawn the metrics HTTP server if `PROM_LISTEN` is set in the
+/// environment. The address must parse as `host:port`. Failures during
+/// bind are logged at WARN and do not abort the bot — the gauges keep
+/// updating in-process and a later /metrics scrape can be re-enabled by
+/// restart with a valid address.
+pub fn maybe_start_exporter() {
+    let addr_str = match env::var(ENV_LISTEN) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            log::info!(
+                "[PROM] {} not set; metrics recorded but /metrics endpoint disabled",
+                ENV_LISTEN
+            );
+            return;
+        }
+    };
+    let addr: SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            log::warn!(
+                "[PROM] failed to parse {}={}: {}; exporter disabled",
+                ENV_LISTEN,
+                addr_str,
+                e
+            );
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        if let Err(e) = serve(addr).await {
+            log::warn!("[PROM] exporter exited: {:?}", e);
+        }
+    });
+}
+
+async fn serve(addr: SocketAddr) -> Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    log::info!("[PROM] exporter listening on http://{}/metrics", addr);
+    loop {
+        let (mut sock, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                log::warn!("[PROM] accept error: {}", e);
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            // Drain the request line + headers (we ignore them; localhost
+            // scraping doesn't need routing precision). Use a small read
+            // budget so a malicious peer can't keep the task alive.
+            let mut buf = [0u8; 1024];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                sock.read(&mut buf),
+            )
+            .await;
+            let body = match encode_metrics() {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("[PROM] encode error for {}: {}", peer, e);
+                    return;
+                }
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                TextEncoder::new().format_type(),
+                body.len()
+            );
+            if let Err(e) = sock.write_all(resp.as_bytes()).await {
+                log::debug!("[PROM] write header to {} failed: {}", peer, e);
+                return;
+            }
+            let _ = sock.write_all(&body).await;
+        });
+    }
+}
+
+fn encode_metrics() -> Result<Vec<u8>> {
+    let encoder = TextEncoder::new();
+    let mf = REGISTRY.gather();
+    let mut buf = Vec::with_capacity(8 * 1024);
+    encoder.encode(&mf, &mut buf)?;
+    Ok(buf)
+}
+
+/// Stamp version / process-start gauges. Idempotent; safe to call from
+/// engine boot.
+pub fn record_process_info(instance: &str, process_started_at: i64) {
+    PROCESS_START_TIMESTAMP_SECONDS
+        .with_label_values(&[instance])
+        .set(process_started_at);
+    BOT_VERSION_INFO
+        .with_label_values(&[
+            instance,
+            env!("CARGO_PKG_VERSION"),
+            option_env!("PAIRTRADE_GIT_SHA").unwrap_or("unknown"),
+            option_env!("DEX_CONNECTOR_GIT_HASH").unwrap_or("unknown"),
+        ])
+        .set(1);
+}
