@@ -577,7 +577,14 @@ impl PairTradeEngine {
             self.warm_start_states_from_history();
         }
         let mut updated = HashSet::new();
-        for (symbol, snapshot) in price_map.iter() {
+        // Sort symbols before processing so [TICK_FILTER] / [BAR_FORCE_CLOSE]
+        // log ordering and bar push ordering are deterministic across
+        // builds — HashMap iteration order is intentionally randomized,
+        // which previously caused intermittent golden_baseline mismatches.
+        let mut sorted_symbols: Vec<&String> = price_map.keys().collect();
+        sorted_symbols.sort();
+        for symbol in sorted_symbols {
+            let snapshot = price_map.get(symbol).expect("just enumerated from price_map");
             // bot-strategy#346: drop corrupt orderbook frames before they
             // poison the bar builder / regression history. The data dump
             // above already recorded the raw frame for diagnostics.
