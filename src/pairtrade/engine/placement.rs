@@ -217,6 +217,7 @@ impl PairTradeEngine {
             legs: new_legs,
             direction: pending.direction,
             placed_at: Instant::now(),
+            placed_ts_ms: chrono::Utc::now().timestamp_millis(),
             hedge_retry_count: retry_count,
             post_only_hybrid: false,
             // The reissue is itself the taker-takeover step (either market or
@@ -290,6 +291,7 @@ impl PairTradeEngine {
             legs: new_legs,
             direction: pending.direction,
             placed_at: Instant::now(),
+            placed_ts_ms: chrono::Utc::now().timestamp_millis(),
             hedge_retry_count: 0,
             post_only_hybrid: false,
             // Entry path — no exit takeover deadline.
@@ -966,6 +968,7 @@ impl PairTradeEngine {
                     legs: partial.legs().to_vec(),
                     direction,
                     placed_at: Instant::now(),
+                    placed_ts_ms: chrono::Utc::now().timestamp_millis(),
                     hedge_retry_count: 0,
                     post_only_hybrid: false,
                     // Partial-failure recovery — let the next reconcile tick

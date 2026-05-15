@@ -255,6 +255,20 @@ pub static LEG_FEE_BPS: Lazy<HistogramVec> = Lazy::new(|| {
     )
 });
 
+pub static LEG_FILL_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram(
+        "pairtrade_leg_fill_latency_ms",
+        "Wall-clock latency from PendingOrders placement to leg fill completion, in ms. \
+         Requires venue-reported FilledOrder.filled_ts_ms; venues that omit it \
+         (Lighter) emit nothing. (#314 Group 4-C)",
+        &["variant", "pair", "leg"],
+        vec![
+            10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+            60_000.0, 120_000.0, 300_000.0,
+        ],
+    )
+});
+
 // === Risk / kill state ===
 
 pub static KILL_SWITCH_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
