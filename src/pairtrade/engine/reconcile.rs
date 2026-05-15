@@ -614,6 +614,12 @@ impl PairTradeEngine {
                             continue;
                         }
                         let limit = None;
+                        // Reference for the taker retry — feeds the
+                        // taker-side slippage histogram (#314 Group
+                        // 4-B-2). The downsized retry below uses the
+                        // same captured value.
+                        let ref_price_retry =
+                            self.order_reference_price(&leg.symbol, leg.side, price_map);
                         match self
                             .connector
                             .create_order(&leg.symbol, quantized, leg.side, limit, None, true, None)
@@ -628,6 +634,7 @@ impl PairTradeEngine {
                                     filled: Decimal::ZERO,
                                     side: leg.side,
                                     limit_price: None,
+                                    reference_price: ref_price_retry,
                                 });
                                 log::warn!(
                                     "[ORDER] Retrying exit leg {} size={} mode=MARKET",
@@ -686,6 +693,7 @@ impl PairTradeEngine {
                                                     filled: Decimal::ZERO,
                                                     side: leg.side,
                                                     limit_price: None,
+                                                    reference_price: ref_price_retry,
                                                 });
                                                 log::warn!(
                                                     "[ORDER] Retrying exit leg {} size={} mode=MARKET (sized down from {})",
@@ -881,13 +889,20 @@ impl PairTradeEngine {
     /// `status.filled_values`, fee out of `status.filled_fees`, and
     /// completion timestamp out of `status.filled_ts_ms_max`. Only fires
     /// per metric when the necessary inputs are present:
-    /// - slippage: requires `leg.limit_price = Some` and a positive
-    ///   filled value (post-only / limit fills);
+    /// - slippage: requires a non-zero `leg.reference_price` and a
+    ///   positive filled value. Reference price is the decision-time
+    ///   best quote on the trading side, captured at order placement
+    ///   for both limit/post-only and taker orders so taker fallbacks
+    ///   (`limit_price = None`) still produce a slippage signal
+    ///   (#314 Group 4-B-2). Falls back to `limit_price` for legs that
+    ///   pre-date the field.
     /// - fee: requires a venue-reported `filled_fee` for the leg;
     /// - latency: requires a venue-reported `filled_ts_ms` for the leg
     ///   (Extended populates, Lighter omits).
     /// Sign convention on slippage: positive = cost (paid more /
-    /// received less than posted limit).
+    /// received less than the reference). The `order_type` label
+    /// ("post_only" or "taker") lets the two distributions be
+    /// inspected separately.
     fn observe_leg_execution_quality(
         variant: &str,
         pair: &str,
@@ -918,20 +933,35 @@ impl PairTradeEngine {
             if let Some(fill_value) = lookup_decimal(&status.filled_values) {
                 if fill_value > Decimal::ZERO {
                     if let Some(fill_value_f64) = fill_value.to_f64() {
-                        if let Some(limit) = leg.limit_price {
-                            if let (Some(limit_f64), Some(size_f64)) =
-                                (limit.to_f64(), fill_size.to_f64())
+                        // Prefer the decision-time reference; fall back
+                        // to limit_price for legs that pre-date the
+                        // reference_price field. order_type tags whether
+                        // this was a post-only/limit fill (post-only)
+                        // or a market/taker fill (taker), so the two
+                        // distributions can be split in Grafana — taker
+                        // fallbacks are the adverse-slippage tail that
+                        // #306 cares about.
+                        let (ref_price_opt, order_type) = match leg.reference_price {
+                            Some(rp) => (
+                                Some(rp),
+                                if leg.limit_price.is_some() { "post_only" } else { "taker" },
+                            ),
+                            None => (leg.limit_price, "post_only"),
+                        };
+                        if let Some(ref_price) = ref_price_opt {
+                            if let (Some(ref_f64), Some(size_f64)) =
+                                (ref_price.to_f64(), fill_size.to_f64())
                             {
-                                if limit_f64 > 0.0 && size_f64 > 0.0 {
+                                if ref_f64 > 0.0 && size_f64 > 0.0 {
                                     let avg_price = fill_value_f64 / size_f64;
                                     let sign = match leg.side {
                                         dex_connector::OrderSide::Long => 1.0,
                                         dex_connector::OrderSide::Short => -1.0,
                                     };
                                     let slippage_bps =
-                                        sign * (avg_price - limit_f64) / limit_f64 * 10_000.0;
+                                        sign * (avg_price - ref_f64) / ref_f64 * 10_000.0;
                                     super::super::prom::LEG_SLIPPAGE_BPS
-                                        .with_label_values(&[variant, pair, leg_type])
+                                        .with_label_values(&[variant, pair, leg_type, order_type])
                                         .observe(slippage_bps);
                                 }
                             }
@@ -1024,6 +1054,7 @@ mod tests {
             filled: dec(filled),
             side: OrderSide::Long,
             limit_price: None,
+            reference_price: None,
         }
     }
 
@@ -1041,6 +1072,7 @@ mod tests {
             filled: Decimal::ZERO,
             side: OrderSide::Long,
             limit_price: None,
+            reference_price: None,
         }
     }
 

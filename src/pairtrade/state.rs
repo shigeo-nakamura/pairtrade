@@ -52,6 +52,15 @@ pub(super) struct PendingLeg {
     /// ([ORDER_FALLBACK_DETAIL], bot-strategy#165) to compare the posted
     /// price against the book at timeout.
     pub(super) limit_price: Option<Decimal>,
+    /// Decision-time reference price captured at order placement (best
+    /// quote on the trading side or recent mid). Distinct from
+    /// `limit_price`: limit is the price actually posted to the venue
+    /// (only set for limit/post-only orders), reference is the price
+    /// the decision was made against (set for both limit and market
+    /// orders). Used by the per-leg slippage histogram (#314 Group
+    /// 4-B-2) so taker fallbacks — where `limit_price = None` — still
+    /// produce a measurable adverse-slippage signal.
+    pub(super) reference_price: Option<Decimal>,
 }
 
 #[derive(Debug)]

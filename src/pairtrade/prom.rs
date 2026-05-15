@@ -234,9 +234,11 @@ pub static CLOSE_FUNDING_BPS: Lazy<HistogramVec> = Lazy::new(|| {
 pub static LEG_SLIPPAGE_BPS: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram(
         "pairtrade_leg_slippage_bps",
-        "Per-leg slippage vs posted limit price, signed by side (positive = cost). \
-         Only emitted for post-only/limit fills (taker fallback excluded).",
-        &["variant", "pair", "leg"],
+        "Per-leg slippage vs decision-time reference price, signed by side \
+         (positive = cost). `order_type` is \"post_only\" for limit/post-only \
+         fills and \"taker\" for market/taker fills; the taker bucket is the \
+         adverse-slippage tail the BT/live gap analysis (#306) cares about.",
+        &["variant", "pair", "leg", "order_type"],
         vec![
             -50.0, -20.0, -10.0, -5.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0,
         ],

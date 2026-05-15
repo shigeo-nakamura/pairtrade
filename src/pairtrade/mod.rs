@@ -1656,6 +1656,7 @@ mod tests {
             filled: target,
             side: dex_connector::OrderSide::Long,
             limit_price: None,
+            reference_price: None,
         }
     }
 
@@ -1953,6 +1954,7 @@ mod pending_tests {
                 filled: Decimal::ZERO,
                 side: OrderSide::Long,
                 limit_price: None,
+                reference_price: None,
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
@@ -2013,6 +2015,7 @@ mod pending_tests {
                 filled: Decimal::ZERO,
                 side: OrderSide::Long,
                 limit_price: None,
+                reference_price: None,
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
@@ -2474,6 +2477,7 @@ mod pending_tests {
             filled: Decimal::ZERO,
             side: OrderSide::Long,
             limit_price: None,
+            reference_price: None,
         }];
         let partial_err: anyhow::Error = state::PartialOrderPlacementError::new(
             placed_legs.clone(),
@@ -2518,6 +2522,7 @@ mod pending_tests {
             filled: Decimal::ZERO,
             side: OrderSide::Short,
             limit_price: None,
+            reference_price: None,
         }];
         let partial_err: anyhow::Error = state::PartialOrderPlacementError::new(
             placed_legs,
