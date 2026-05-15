@@ -103,6 +103,11 @@ impl PairTradeEngine {
             } else {
                 self.limit_price_for(&leg.symbol, leg.side, price_map)
             };
+            // Decision-time reference price for the reissue. Captured
+            // for both market and limit reissues so the slippage
+            // histogram (#314 Group 4-B-2) can tag the order_type
+            // correctly and produce taker-side measurements.
+            let ref_price_reissue = self.order_reference_price(&leg.symbol, leg.side, price_map);
             if !use_market && limit.is_none() {
                 log::warn!(
                     "[ORDER] Cannot reissue {} leg {}: missing reference price",
@@ -153,6 +158,10 @@ impl PairTradeEngine {
                         quantized_size
                     );
                     if filled > Decimal::ZERO {
+                        // Preserved record of the already-filled portion
+                        // of the original leg. No new fill expected on
+                        // this entry, so both decision-time fields stay
+                        // None.
                         new_legs.push(PendingLeg {
                             symbol: leg.symbol.clone(),
                             order_id: leg.order_id.clone(),
@@ -161,6 +170,7 @@ impl PairTradeEngine {
                             filled,
                             side: leg.side,
                             limit_price: None,
+                            reference_price: None,
                         });
                     }
                     new_legs.push(PendingLeg {
@@ -170,7 +180,8 @@ impl PairTradeEngine {
                         target: quantized_size,
                         filled: Decimal::ZERO,
                         side: leg.side,
-                        limit_price: None,
+                        limit_price: limit,
+                        reference_price: ref_price_reissue,
                     });
                 }
                 Err(e) => {
@@ -244,6 +255,12 @@ impl PairTradeEngine {
                 );
                 continue;
             }
+            // Decision-time reference for the taker reissue. Powers the
+            // taker-side slippage histogram (#314 Group 4-B-2) — this is
+            // the principal post-only-fallback path the BT/live gap
+            // analysis cares about.
+            let ref_price_taker =
+                self.order_reference_price(&leg.symbol, leg.side, price_map);
             match self
                 .connector
                 .create_order(
@@ -272,6 +289,7 @@ impl PairTradeEngine {
                         filled: Decimal::ZERO,
                         side: leg.side,
                         limit_price: None,
+                        reference_price: ref_price_taker,
                     });
                 }
                 Err(e) => {
@@ -560,6 +578,7 @@ impl PairTradeEngine {
             filled: Decimal::ZERO,
             side: side_a,
             limit_price: limit_a,
+            reference_price: ref_price_a,
         });
 
         let res_b = match self
@@ -602,6 +621,7 @@ impl PairTradeEngine {
             filled: Decimal::ZERO,
             side: side_b,
             limit_price: limit_b,
+            reference_price: ref_price_b,
         });
         Ok(legs)
     }
@@ -812,7 +832,14 @@ impl PairTradeEngine {
                         target: qty_a,
                         filled: Decimal::ZERO,
                         side: side_a,
-                        limit_price: None,
+                        // limit_price was previously hardcoded to None
+                        // for exit legs even on the post-only path,
+                        // which silently disabled exit-side slippage
+                        // observation in Group 4-B. Carry through the
+                        // actual posted limit so the order_type tag
+                        // resolves correctly (#314 Group 4-B-2).
+                        limit_price: limit_a,
+                        reference_price: ref_price_a,
                     });
                     res_a = Some(res);
                 }
@@ -913,7 +940,11 @@ impl PairTradeEngine {
                     target: qty_b,
                     filled: Decimal::ZERO,
                     side: side_b,
-                    limit_price: None,
+                    // Same fix as the leg-A site above — exit legs
+                    // need limit_price carried through for post-only
+                    // slippage tagging (#314 Group 4-B-2).
+                    limit_price: limit_b,
+                    reference_price: ref_price_b,
                 });
             }
         }
