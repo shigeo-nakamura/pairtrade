@@ -19,7 +19,14 @@
         "defaults": {
           "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "debot-frankfurt-canary.*" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF66FF" } }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" }
