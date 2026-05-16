@@ -405,6 +405,108 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Canary regression detection (bot-strategy#412)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 71 },
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Canary restart events (24h count via process_start change)",
+      "description": "bot-strategy#412 signal #1. `changes(pairtrade_process_start_timestamp_seconds[24h])` = number of restarts in the last 24h. Canary auto-restarts on each CI deploy (#376), so the typical level is 1-3/day. Spikes above 5/day indicate either CI churn or a `Restart=on-failure` loop (the latter is the binary-regression signal). Unexpected-exit details (SIGKILL, timeout) are surfaced separately by the error-watch workflow (#168) as auto-issues.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 72 },
+      "targets": [
+        { "expr": "changes(pairtrade_process_start_timestamp_seconds{instance=\"debot-frankfurt-canary\"}[24h])", "legendFormat": "canary", "refId": "A" },
+        { "expr": "changes(pairtrade_process_start_timestamp_seconds{instance=\"debot-frankfurt\"}[24h])", "legendFormat": "main A/B/C (ref)", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Canary / main-A trade rate ratio (24h)",
+      "description": "bot-strategy#412 signal #5 supplement. Ratio of canary trade count to main A trade count (`pairtrade_close_gross_pnl_bps_count`). Target >= 2.0 per #376 (canary entry_z=1.0 vs main A 1.5 → ~2-3x). Below 1.5 means canary stopped trading at its expected aggressive pace, e.g. a binary that silently breaks entry logic.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 72 },
+      "targets": [
+        { "expr": "sum(rate(pairtrade_close_gross_pnl_bps_count{instance=\"debot-frankfurt-canary\"}[24h])) / on() group_right sum(rate(pairtrade_close_gross_pnl_bps_count{instance=\"debot-frankfurt\",variant=\"a\"}[24h]))", "legendFormat": "canary / main-A", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 1.5 },
+              { "color": "green", "value": 2.0 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Canary per-leg slippage p50/p95 — entry (bps)",
+      "description": "bot-strategy#412 signal #4. Canary-only view of `pairtrade_leg_slippage_bps` for the entry leg, split by order_type (post_only vs taker). Positive bps = cost (paid more than reference). Panel 17 above mixes canary into the global `variant!=\"\"` aggregate; this panel isolates the canary path so binary regression in fill quality is visible. Baseline + threshold tuning is bot-strategy#412 Stage B/C (~2026-05-21 → 2026-05-28).",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 78 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[$__rate_interval])))", "legendFormat": "p50 {{order_type}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[$__rate_interval])))", "legendFormat": "p95 {{order_type}}", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Canary per-leg slippage p50/p95 — exit (bps)",
+      "description": "bot-strategy#412 signal #4, exit-leg companion to panel 23. Exit-side slippage is the leg-sync tail that pairtrade#23 / bot-strategy#258 cared about — for canary the regression signal is the same shape as entry but on the exit path.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 78 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[$__rate_interval])))", "legendFormat": "p50 {{order_type}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[$__rate_interval])))", "legendFormat": "p95 {{order_type}}", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 25,
+      "type": "heatmap",
+      "title": "Canary close gross PnL distribution (bps of entry notional)",
+      "description": "bot-strategy#412 signal #5. Canary-only view of `pairtrade_close_gross_pnl_bps` per close (gross of fees+funding), filtered to instance=debot-frankfurt-canary. A binary that breaks position sizing / exit logic shifts the mode away from zero or fattens the loss tail. Compare against panel 16 (mixed-instance view) and against main A only via `variant=\"a\",instance=\"debot-frankfurt\"`.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 85 },
+      "targets": [
+        { "expr": "sum by (le) (increase(pairtrade_close_gross_pnl_bps_bucket{instance=\"debot-frankfurt-canary\"}[$__rate_interval]))", "format": "heatmap", "legendFormat": "{{le}}", "refId": "A" }
+      ],
+      "options": { "legend": { "show": true }, "yAxis": { "unit": "short" } }
     }
   ]
 }
