@@ -307,22 +307,32 @@
     },
     {
       "id": 16,
-      "type": "heatmap",
-      "title": "Close gross PnL distribution (bps of entry notional)",
-      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional. Source for the #306 BT/live gap analysis: compare this distribution against BT output. (#314 Group 4-A, pairtrade#35)",
+      "type": "timeseries",
+      "title": "Close gross PnL — per close (bps of entry notional)",
+      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point ≈ 1 close). pairtrade closes ~1-2/day per variant; the prior heatmap form (pairtrade#35) was too sparse to show signal. Replaced per bot-strategy#420. Source for #306 BT/live gap analysis. (#314 Group 4-A)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
       "targets": [
         {
-          "expr": "sum by (le) (increase(pairtrade_close_gross_pnl_bps_bucket{variant!=\"\"}[$__rate_interval]))",
-          "format": "heatmap",
-          "legendFormat": "{{le}}",
+          "expr": "sum by (variant, pair) (increase(pairtrade_close_gross_pnl_bps_sum{variant!=\"\"}[$__rate_interval])) / sum by (variant, pair) (increase(pairtrade_close_gross_pnl_bps_count{variant!=\"\"}[$__rate_interval]))",
+          "legendFormat": "{{variant}}",
           "refId": "A"
         }
       ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "spanNulls": false,
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      },
       "options": {
-        "yAxis": { "unit": "short" },
-        "cellGap": 1,
-        "color": { "mode": "scheme", "scheme": "Spectral", "steps": 64, "reverse": false }
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
       }
     },
     {
