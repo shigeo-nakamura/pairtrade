@@ -429,7 +429,13 @@ impl PairTradeEngine {
                                     // #314 Group 4: emit gross/funding bps to
                                     // Prometheus. Same Some(...,...,...,...)
                                     // gate as the funding compute above so the
-                                    // bps denominator stays consistent.
+                                    // bps denominator stays consistent. `reason`
+                                    // is the same Option<&'static str> that
+                                    // apply_post_exit_state consumes immediately
+                                    // after this — read without .take() so the
+                                    // close-reason counter still receives it
+                                    // (bot-strategy#421).
+                                    let reason = state.pending_exit_reason.unwrap_or("unknown");
                                     if let (Some(sa), Some(pa), Some(sb), Some(pb)) = (
                                         pos.entry_size_a,
                                         pos.entry_price_a,
@@ -442,7 +448,7 @@ impl PairTradeEngine {
                                             let notional = a + b;
                                             if notional > 0.0 {
                                                 super::super::prom::CLOSE_GROSS_PNL_BPS
-                                                    .with_label_values(&[&inst_id, key])
+                                                    .with_label_values(&[&inst_id, key, reason])
                                                     .observe(pnl / notional * 10_000.0);
                                                 if ticks_observed > 0 {
                                                     super::super::prom::CLOSE_FUNDING_BPS

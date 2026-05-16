@@ -227,8 +227,10 @@ pub fn init_close_reason_series(variant: &str, pair: &str) {
 pub static CLOSE_GROSS_PNL_BPS: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram(
         "pairtrade_close_gross_pnl_bps",
-        "Gross PnL per close, in bps of (|size_a*price_a| + |size_b*price_b|) at entry.",
-        &["variant", "pair"],
+        "Gross PnL per close, in bps of (|size_a*price_a| + |size_b*price_b|) at entry. \
+         `reason` mirrors `pairtrade_close_reason_total` and lets the scatter panel \
+         color points by exit cause (bot-strategy#421).",
+        &["variant", "pair", "reason"],
         vec![
             -200.0, -100.0, -50.0, -25.0, -15.0, -10.0, -5.0, -2.0, 0.0, 2.0, 5.0, 10.0, 15.0,
             25.0, 50.0, 100.0, 200.0,
