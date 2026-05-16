@@ -183,6 +183,37 @@ pub static CLOSE_REASON_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// Every close-reason string that `apply_post_exit_state` may receive.
+/// Kept in sync with the literals in `engine/exit.rs`, `engine/step.rs`
+/// and the `"unknown"` fallback in `mod.rs`. The unit test below asserts
+/// each new variant lands here so `increase(pairtrade_close_reason_total)`
+/// stays correct on low-volume reasons.
+pub const KNOWN_CLOSE_REASONS: &[&str] = &[
+    "stop_loss_z",
+    "force_close",
+    "exit_z",
+    "max_loss_r",
+    "risk_budget",
+    "expected_value",
+    "maintenance_preempt",
+    "ineligible",
+    "unknown",
+];
+
+/// Materialize every `(variant, pair, reason)` series for
+/// `pairtrade_close_reason_total` at value 0. Without this, `IntCounterVec`
+/// only emits a series from the moment `.inc()` is first called, so the
+/// first scrape after the first close already sees value=1 with no prior
+/// baseline — and `increase([range])` returns 0 for any reason that only
+/// fires once in the window. bot-strategy#416.
+pub fn init_close_reason_series(variant: &str, pair: &str) {
+    for reason in KNOWN_CLOSE_REASONS {
+        CLOSE_REASON_TOTAL
+            .with_label_values(&[variant, pair, reason])
+            .inc_by(0);
+    }
+}
+
 // === Execution quality (#314 Group 4) ===
 //
 // Observed at the exit_fill site (engine/reconcile.rs). `gross_pnl_bps` is
@@ -432,4 +463,41 @@ pub fn record_process_info(variant: &str, process_started_at: i64) {
             option_env!("DEX_CONNECTOR_GIT_HASH").unwrap_or("unknown"),
         ])
         .set(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_close_reason_series_registers_every_known_reason_at_zero() {
+        let variant = "test-init-zero";
+        let pair = "BTC/ETH";
+        init_close_reason_series(variant, pair);
+        for reason in KNOWN_CLOSE_REASONS {
+            let value = CLOSE_REASON_TOTAL
+                .with_label_values(&[variant, pair, reason])
+                .get();
+            assert_eq!(value, 0, "reason {} should be pre-registered at 0", reason);
+        }
+    }
+
+    #[test]
+    fn init_close_reason_series_is_idempotent_and_does_not_clobber_increments() {
+        let variant = "test-init-idempotent";
+        let pair = "BTC/ETH";
+        init_close_reason_series(variant, pair);
+        CLOSE_REASON_TOTAL
+            .with_label_values(&[variant, pair, "exit_z"])
+            .inc();
+        // Second call simulates a hypothetical re-init path; must not zero
+        // out the live counter.
+        init_close_reason_series(variant, pair);
+        assert_eq!(
+            CLOSE_REASON_TOTAL
+                .with_label_values(&[variant, pair, "exit_z"])
+                .get(),
+            1
+        );
+    }
 }
