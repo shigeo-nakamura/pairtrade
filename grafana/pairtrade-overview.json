@@ -313,8 +313,8 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
       "targets": [
         {
-          "expr": "sum by (variant, pair) (increase(pairtrade_close_gross_pnl_bps_sum{variant!=\"\"}[$__rate_interval])) / sum by (variant, pair) (increase(pairtrade_close_gross_pnl_bps_count{variant!=\"\"}[$__rate_interval]))",
-          "legendFormat": "{{variant}}",
+          "expr": "increase(pairtrade_close_gross_pnl_bps_sum{variant!=\"\"}[$__rate_interval]) / increase(pairtrade_close_gross_pnl_bps_count{variant!=\"\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} {{variant}}",
           "refId": "A"
         }
       ],
@@ -509,14 +509,33 @@
     },
     {
       "id": 25,
-      "type": "heatmap",
-      "title": "Canary close gross PnL distribution (bps of entry notional)",
-      "description": "bot-strategy#412 signal #5. Canary-only view of `pairtrade_close_gross_pnl_bps` per close (gross of fees+funding), filtered to instance=debot-frankfurt-canary. A binary that breaks position sizing / exit logic shifts the mode away from zero or fattens the loss tail. Compare against panel 16 (mixed-instance view) and against main A only via `variant=\"a\",instance=\"debot-frankfurt\"`.",
+      "type": "timeseries",
+      "title": "Canary close gross PnL — per close (bps of entry notional)",
+      "description": "bot-strategy#412 signal #5. Canary-only per-close gross PnL (fees+funding excluded), filtered to instance=debot-frankfurt-canary. Plotted as scatter (1 point ≈ 1 close); the prior heatmap form was too sparse for canary's trade cadence. A binary that breaks position sizing / exit logic shifts the mode away from zero or fattens the loss tail. Replaced per bot-strategy#420.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 85 },
       "targets": [
-        { "expr": "sum by (le) (increase(pairtrade_close_gross_pnl_bps_bucket{instance=\"debot-frankfurt-canary\"}[$__rate_interval]))", "format": "heatmap", "legendFormat": "{{le}}", "refId": "A" }
+        {
+          "expr": "increase(pairtrade_close_gross_pnl_bps_sum{instance=\"debot-frankfurt-canary\"}[$__rate_interval]) / increase(pairtrade_close_gross_pnl_bps_count{instance=\"debot-frankfurt-canary\"}[$__rate_interval])",
+          "legendFormat": "{{variant}}",
+          "refId": "A"
+        }
       ],
-      "options": { "legend": { "show": true }, "yAxis": { "unit": "short" } }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "spanNulls": false,
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
     }
   ]
 }
