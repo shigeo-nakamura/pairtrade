@@ -1,66 +1,66 @@
 {
   "title": "Pairtrade overview",
   "uid": "pairtrade-overview",
-  "tags": ["pairtrade", "bot"],
+  "tags": [
+    "pairtrade",
+    "bot"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "refresh": "30s",
-  "time": { "from": "now-6h", "to": "now" },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
   "panels": [
     {
       "id": 1,
       "type": "timeseries",
       "title": "z-score (per pair / variant)",
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
-      "targets": [
-        { "expr": "pairtrade_z{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byRegexp", "options": "debot-frankfurt-canary.*" },
-            "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF66FF" } }
-            ]
-          }
-        ]
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
       },
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" }
-      }
-    },
-    {
-      "id": 14,
-      "type": "timeseries",
-      "title": "z-score divergence: Frankfurt - Tokyo (per variant)",
-      "description": "Frankfurt z minus Tokyo z, matched on pair+variant. Should sit near 0; non-zero pulses point at one host's WS lagging.",
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 9 },
       "targets": [
         {
-          "expr": "pairtrade_z{instance=\"debot-frankfurt\",variant!=\"\"} - on(pair, variant) pairtrade_z{instance=\"debot-tokyo\",variant!=\"\"}",
-          "legendFormat": "{{variant}} {{pair}}",
+          "expr": "pairtrade_z{variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": false },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green",  "value": null },
-              { "color": "orange", "value": 0.25 },
-              { "color": "red",    "value": 0.5 }
-            ]
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "debot-frankfurt-canary.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#FF66FF"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
       }
     },
     {
@@ -68,7 +68,12 @@
       "type": "timeseries",
       "title": "z-score divergence: Frankfurt A/B/C - canary (per variant)",
       "description": "Frankfurt main z minus Frankfurt canary z, broadcast on pair (group_left) so canary's single series compares against each of A/B/C. Structural drift is expected per bot-strategy#410 (separate process, independent WS bar close); the panel is a direction indicator for binary-regression detection rather than a 'should be 0' alert. Requires canary added to Alloy scrape with instance=\"debot-frankfurt-canary\".",
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 15 },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
       "targets": [
         {
           "expr": "pairtrade_z{instance=\"debot-frankfurt\",variant!=\"\"} - on(pair) group_left pairtrade_z{instance=\"debot-frankfurt-canary\",variant!=\"\"}",
@@ -78,51 +83,103 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": false },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": false
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green",  "value": null },
-              { "color": "orange", "value": 0.5 },
-              { "color": "red",    "value": 1.0 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 1.0
+              }
             ]
           }
         },
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
       }
     },
     {
       "id": 2,
       "type": "timeseries",
       "title": "beta (combined / short / long)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 21 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
       "targets": [
-        { "expr": "pairtrade_beta{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} beta", "refId": "A" },
-        { "expr": "pairtrade_beta_s{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} beta_s", "refId": "B" },
-        { "expr": "pairtrade_beta_l{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} beta_l", "refId": "C" }
+        {
+          "expr": "pairtrade_beta{variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} beta",
+          "refId": "A"
+        },
+        {
+          "expr": "pairtrade_beta_s{variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} beta_s",
+          "refId": "B"
+        },
+        {
+          "expr": "pairtrade_beta_l{variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} beta_l",
+          "refId": "C"
+        }
       ]
     },
     {
       "id": 3,
       "type": "timeseries",
       "title": "|beta_s - beta_l| (threshold 0.30)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 21 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
       "targets": [
-        { "expr": "pairtrade_beta_divergence{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}}", "refId": "A" }
+        {
+          "expr": "pairtrade_beta_divergence{variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}}",
+          "refId": "A"
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red",   "value": 0.30 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.3
+              }
             ]
           },
-          "custom": { "thresholdsStyle": { "mode": "line" } }
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          }
         },
         "overrides": []
       }
@@ -131,25 +188,47 @@
       "id": 9,
       "type": "stat",
       "title": "Variants currently in position",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 29 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 23
+      },
       "targets": [
-        { "expr": "sum by (instance) (pairtrade_has_position{variant!=\"\"})", "legendFormat": "{{instance}}", "refId": "A" }
+        {
+          "expr": "sum by (instance) (pairtrade_has_position{variant!=\"\"})",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "gray",  "value": null },
-              { "color": "blue",  "value": 1 }
+              {
+                "color": "gray",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 1
+              }
             ]
           },
-          "color": { "mode": "thresholds" }
+          "color": {
+            "mode": "thresholds"
+          }
         },
         "overrides": []
       },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
         "textMode": "value_and_name",
         "colorMode": "value"
       }
@@ -158,9 +237,18 @@
       "id": 10,
       "type": "state-timeline",
       "title": "Position state (per instance / variant)",
-      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 29 },
+      "gridPos": {
+        "h": 8,
+        "w": 18,
+        "x": 6,
+        "y": 23
+      },
       "targets": [
-        { "expr": "pairtrade_has_position{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
+        {
+          "expr": "pairtrade_has_position{variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "refId": "A"
+        }
       ],
       "options": {
         "mergeValues": true,
@@ -170,10 +258,19 @@
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "type": "value", "options": {
-                "0": { "color": "transparent", "text": "FLAT" },
-                "1": { "color": "blue",        "text": "IN POSITION" }
-            } }
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "color": "transparent",
+                  "text": "FLAT"
+                },
+                "1": {
+                  "color": "blue",
+                  "text": "IN POSITION"
+                }
+              }
+            }
           ]
         },
         "overrides": []
@@ -183,12 +280,23 @@
       "id": 11,
       "type": "timeseries",
       "title": "Position age (seconds, > 0 only while in position)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 37 },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 31
+      },
       "targets": [
-        { "expr": "pairtrade_position_age_seconds{variant!=\"\"} > 0", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
+        {
+          "expr": "pairtrade_position_age_seconds{variant!=\"\"} > 0",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "refId": "A"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "s" },
+        "defaults": {
+          "unit": "s"
+        },
         "overrides": []
       }
     },
@@ -196,9 +304,18 @@
       "id": 12,
       "type": "state-timeline",
       "title": "Eligibility (cointegration filter)",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 37 },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 31
+      },
       "targets": [
-        { "expr": "pairtrade_eligible{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
+        {
+          "expr": "pairtrade_eligible{variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "refId": "A"
+        }
       ],
       "options": {
         "mergeValues": true,
@@ -208,10 +325,19 @@
       "fieldConfig": {
         "defaults": {
           "mappings": [
-            { "type": "value", "options": {
-                "0": { "color": "red",   "text": "NOT ELIGIBLE" },
-                "1": { "color": "green", "text": "ELIGIBLE" }
-            } }
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "color": "red",
+                  "text": "NOT ELIGIBLE"
+                },
+                "1": {
+                  "color": "green",
+                  "text": "ELIGIBLE"
+                }
+              }
+            }
           ]
         },
         "overrides": []
@@ -221,12 +347,23 @@
       "id": 5,
       "type": "timeseries",
       "title": "Time since last trade (seconds, -1 before first trade)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 44 },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
       "targets": [
-        { "expr": "pairtrade_time_since_last_trade_seconds{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}} {{pair}}", "refId": "A" }
+        {
+          "expr": "pairtrade_time_since_last_trade_seconds{variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "refId": "A"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "s" },
+        "defaults": {
+          "unit": "s"
+        },
         "overrides": []
       }
     },
@@ -234,7 +371,12 @@
       "id": 6,
       "type": "table",
       "title": "Close reasons (count last 24h)",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 44 },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
       "targets": [
         {
           "expr": "sum by (instance, variant, reason) (increase(pairtrade_close_reason_total{variant!=\"\"}[24h]))",
@@ -247,9 +389,21 @@
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Time": true, "__name__": true, "job": true },
-            "indexByName": { "instance": 0, "variant": 1, "reason": 2, "Value #A": 3 },
-            "renameByName": { "instance": "host", "Value #A": "count" }
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true
+            },
+            "indexByName": {
+              "instance": 0,
+              "variant": 1,
+              "reason": 2,
+              "Value #A": 3
+            },
+            "renameByName": {
+              "instance": "host",
+              "Value #A": "count"
+            }
           }
         },
         {
@@ -257,26 +411,55 @@
           "options": {
             "fields": {},
             "sort": [
-              { "field": "host" },
-              { "field": "variant" },
-              { "field": "reason" }
+              {
+                "field": "host"
+              },
+              {
+                "field": "variant"
+              },
+              {
+                "field": "reason"
+              }
             ]
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "custom": { "align": "auto", "filterable": true },
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
           "noValue": "0"
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "count" },
+            "matcher": {
+              "id": "byName",
+              "options": "count"
+            },
             "properties": [
-              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
-              { "id": "color", "value": { "mode": "continuous-GrYlRd" } },
-              { "id": "custom.align", "value": "center" },
-              { "id": "custom.width", "value": 80 }
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "continuous-GrYlRd"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
             ]
           }
         ]
@@ -286,9 +469,18 @@
       "id": 8,
       "type": "stat",
       "title": "Snapshot age (seconds)",
-      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 51 },
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 45
+      },
       "targets": [
-        { "expr": "pairtrade_snapshot_age_seconds{variant!=\"\"}", "legendFormat": "{{instance}} {{variant}}", "refId": "A" }
+        {
+          "expr": "pairtrade_snapshot_age_seconds{variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}}",
+          "refId": "A"
+        }
       ],
       "fieldConfig": {
         "defaults": {
@@ -296,9 +488,18 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green",  "value": null },
-              { "color": "orange", "value": 120 },
-              { "color": "red",    "value": 600 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 120
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
             ]
           }
         },
@@ -308,9 +509,14 @@
     {
       "id": 16,
       "type": "timeseries",
-      "title": "Close gross PnL — per close (bps of entry notional)",
-      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point ≈ 1 close). pairtrade closes ~1-2/day per variant; the prior heatmap form (pairtrade#35) was too sparse to show signal. Replaced per bot-strategy#420. Source for #306 BT/live gap analysis. (#314 Group 4-A)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "title": "Close gross PnL \u2014 per close (bps of entry notional)",
+      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point \u2248 1 close). pairtrade closes ~1-2/day per variant; the prior heatmap form (pairtrade#35) was too sparse to show signal. Replaced per bot-strategy#420. Source for #306 BT/live gap analysis. (#314 Group 4-A)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
       "targets": [
         {
           "expr": "increase(pairtrade_close_gross_pnl_bps_sum{variant!=\"\"}[$__rate_interval]) / increase(pairtrade_close_gross_pnl_bps_count{variant!=\"\"}[$__rate_interval])",
@@ -329,20 +535,151 @@
           }
         },
         "overrides": [
-          { "matcher": { "id": "byRegexp", "options": ".* exit_z$" },              "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green"      } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* expected_value$" },      "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue"       } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* stop_loss_z$" },         "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red"        } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* max_loss_r$" },          "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange"     } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* risk_budget$" },         "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "magenta"    } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* force_close$" },         "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "dark-red"   } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* maintenance_preempt$" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#5DADE2"    } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* ineligible$" },          "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#888888"    } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* unknown$" },             "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#CCCCCC"    } }] }
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* exit_z$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* expected_value$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* stop_loss_z$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* max_loss_r$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* risk_budget$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "magenta"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* force_close$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "dark-red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* maintenance_preempt$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#5DADE2"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* ineligible$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#888888"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* unknown$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#CCCCCC"
+                }
+              }
+            ]
+          }
         ]
       },
       "options": {
-        "tooltip": { "mode": "multi" },
-        "legend": { "displayMode": "list", "placement": "bottom" }
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
       }
     },
     {
@@ -350,7 +687,12 @@
       "type": "timeseries",
       "title": "Per-leg slippage p50/p90 (bps, by order_type)",
       "description": "Median + 90th-percentile slippage vs decision-time reference price, signed positive = cost. post_only fills typically hover near 0; taker fills are the adverse tail #306 cares about. (#314 Group 4-B/B-2, pairtrade#38/#42)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 50
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{variant!=\"\"}[$__rate_interval])))",
@@ -366,12 +708,19 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
         },
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
       }
     },
     {
@@ -379,7 +728,12 @@
       "type": "timeseries",
       "title": "Per-leg fee p50/p90 (bps of filled notional)",
       "description": "Venue-reported fee per leg. Lighter is fee-free and leaves the source unset (no series); Extended populates it. (#314 Group 4-B, pairtrade#38)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 64 },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 58
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{variant!=\"\"}[$__rate_interval])))",
@@ -395,7 +749,11 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
         },
         "overrides": []
       }
@@ -405,7 +763,12 @@
       "type": "timeseries",
       "title": "Per-leg fill latency p50/p90 (ms)",
       "description": "Wall-clock latency from PendingOrders placement to leg fill completion. Extended populates FilledOrder.filled_ts_ms; Lighter leaves it None and emits no series. (#314 Group 4-C, pairtrade#40)",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 64 },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 58
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{variant!=\"\"}[$__rate_interval])))",
@@ -421,7 +784,11 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
         },
         "overrides": []
       }
@@ -431,7 +798,12 @@
       "type": "row",
       "title": "Canary regression detection (bot-strategy#412)",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 71 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 65
+      },
       "panels": []
     },
     {
@@ -439,90 +811,188 @@
       "type": "timeseries",
       "title": "Canary restart events (24h count via process_start change)",
       "description": "bot-strategy#412 signal #1. `changes(pairtrade_process_start_timestamp_seconds[24h])` = number of restarts in the last 24h. Canary auto-restarts on each CI deploy (#376), so the typical level is 1-3/day. Spikes above 5/day indicate either CI churn or a `Restart=on-failure` loop (the latter is the binary-regression signal). Unexpected-exit details (SIGKILL, timeout) are surfaced separately by the error-watch workflow (#168) as auto-issues.",
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 72 },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 66
+      },
       "targets": [
-        { "expr": "changes(pairtrade_process_start_timestamp_seconds{instance=\"debot-frankfurt-canary\"}[24h])", "legendFormat": "canary", "refId": "A" },
-        { "expr": "changes(pairtrade_process_start_timestamp_seconds{instance=\"debot-frankfurt\"}[24h])", "legendFormat": "main A/B/C (ref)", "refId": "B" }
+        {
+          "expr": "changes(pairtrade_process_start_timestamp_seconds{instance=\"debot-frankfurt-canary\"}[24h])",
+          "legendFormat": "canary",
+          "refId": "A"
+        },
+        {
+          "expr": "changes(pairtrade_process_start_timestamp_seconds{instance=\"debot-frankfurt\"}[24h])",
+          "legendFormat": "main A/B/C (ref)",
+          "refId": "B"
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
         },
         "overrides": []
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 22,
       "type": "timeseries",
       "title": "Canary / main-A trade rate ratio (24h)",
-      "description": "bot-strategy#412 signal #5 supplement. Ratio of canary trade count to main A trade count (`pairtrade_close_gross_pnl_bps_count`). Target >= 2.0 per #376 (canary entry_z=1.0 vs main A 1.5 → ~2-3x). Below 1.5 means canary stopped trading at its expected aggressive pace, e.g. a binary that silently breaks entry logic.",
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 72 },
+      "description": "bot-strategy#412 signal #5 supplement. Ratio of canary trade count to main A trade count (`pairtrade_close_gross_pnl_bps_count`). Target >= 2.0 per #376 (canary entry_z=1.0 vs main A 1.5 \u2192 ~2-3x). Below 1.5 means canary stopped trading at its expected aggressive pace, e.g. a binary that silently breaks entry logic.",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 66
+      },
       "targets": [
-        { "expr": "sum(rate(pairtrade_close_gross_pnl_bps_count{instance=\"debot-frankfurt-canary\"}[24h])) / on() group_right sum(rate(pairtrade_close_gross_pnl_bps_count{instance=\"debot-frankfurt\",variant=\"a\"}[24h]))", "legendFormat": "canary / main-A", "refId": "A" }
+        {
+          "expr": "sum(rate(pairtrade_close_gross_pnl_bps_count{instance=\"debot-frankfurt-canary\"}[24h])) / on() group_right sum(rate(pairtrade_close_gross_pnl_bps_count{instance=\"debot-frankfurt\",variant=\"a\"}[24h]))",
+          "legendFormat": "canary / main-A",
+          "refId": "A"
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "orange", "value": 1.5 },
-              { "color": "green", "value": 2.0 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1.5
+              },
+              {
+                "color": "green",
+                "value": 2.0
+              }
             ]
           }
         },
         "overrides": []
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 23,
       "type": "timeseries",
-      "title": "Canary per-leg slippage p50/p95 — entry (bps)",
-      "description": "bot-strategy#412 signal #4. Canary-only view of `pairtrade_leg_slippage_bps` for the entry leg, split by order_type (post_only vs taker). Positive bps = cost (paid more than reference). Panel 17 above mixes canary into the global `variant!=\"\"` aggregate; this panel isolates the canary path so binary regression in fill quality is visible. Baseline + threshold tuning is bot-strategy#412 Stage B/C (~2026-05-21 → 2026-05-28).",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 78 },
+      "title": "Canary per-leg slippage p50/p95 \u2014 entry (bps)",
+      "description": "bot-strategy#412 signal #4. Canary-only view of `pairtrade_leg_slippage_bps` for the entry leg, split by order_type (post_only vs taker). Positive bps = cost (paid more than reference). Panel 17 above mixes canary into the global `variant!=\"\"` aggregate; this panel isolates the canary path so binary regression in fill quality is visible. Baseline + threshold tuning is bot-strategy#412 Stage B/C (~2026-05-21 \u2192 2026-05-28).",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
       "targets": [
-        { "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[$__rate_interval])))", "legendFormat": "p50 {{order_type}}", "refId": "A" },
-        { "expr": "histogram_quantile(0.95, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[$__rate_interval])))", "legendFormat": "p95 {{order_type}}", "refId": "B" }
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{order_type}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{order_type}}",
+          "refId": "B"
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
         },
         "overrides": []
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 24,
       "type": "timeseries",
-      "title": "Canary per-leg slippage p50/p95 — exit (bps)",
-      "description": "bot-strategy#412 signal #4, exit-leg companion to panel 23. Exit-side slippage is the leg-sync tail that pairtrade#23 / bot-strategy#258 cared about — for canary the regression signal is the same shape as entry but on the exit path.",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 78 },
+      "title": "Canary per-leg slippage p50/p95 \u2014 exit (bps)",
+      "description": "bot-strategy#412 signal #4, exit-leg companion to panel 23. Exit-side slippage is the leg-sync tail that pairtrade#23 / bot-strategy#258 cared about \u2014 for canary the regression signal is the same shape as entry but on the exit path.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
       "targets": [
-        { "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[$__rate_interval])))", "legendFormat": "p50 {{order_type}}", "refId": "A" },
-        { "expr": "histogram_quantile(0.95, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[$__rate_interval])))", "legendFormat": "p95 {{order_type}}", "refId": "B" }
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{order_type}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{order_type}}",
+          "refId": "B"
+        }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "spanNulls": true }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
         },
         "overrides": []
       },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 25,
       "type": "timeseries",
-      "title": "Canary close gross PnL — per close (bps of entry notional)",
-      "description": "bot-strategy#412 signal #5. Canary-only per-close gross PnL (fees+funding excluded), filtered to instance=debot-frankfurt-canary. Plotted as scatter (1 point ≈ 1 close); the prior heatmap form was too sparse for canary's trade cadence. A binary that breaks position sizing / exit logic shifts the mode away from zero or fattens the loss tail. Replaced per bot-strategy#420.",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 85 },
+      "title": "Canary close gross PnL \u2014 per close (bps of entry notional)",
+      "description": "bot-strategy#412 signal #5. Canary-only per-close gross PnL (fees+funding excluded), filtered to instance=debot-frankfurt-canary. Plotted as scatter (1 point \u2248 1 close); the prior heatmap form was too sparse for canary's trade cadence. A binary that breaks position sizing / exit logic shifts the mode away from zero or fattens the loss tail. Replaced per bot-strategy#420.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 79
+      },
       "targets": [
         {
           "expr": "increase(pairtrade_close_gross_pnl_bps_sum{instance=\"debot-frankfurt-canary\"}[$__rate_interval]) / increase(pairtrade_close_gross_pnl_bps_count{instance=\"debot-frankfurt-canary\"}[$__rate_interval])",
@@ -541,20 +1011,151 @@
           }
         },
         "overrides": [
-          { "matcher": { "id": "byRegexp", "options": ".* exit_z$" },              "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green"      } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* expected_value$" },      "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue"       } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* stop_loss_z$" },         "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red"        } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* max_loss_r$" },          "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange"     } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* risk_budget$" },         "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "magenta"    } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* force_close$" },         "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "dark-red"   } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* maintenance_preempt$" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#5DADE2"    } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* ineligible$" },          "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#888888"    } }] },
-          { "matcher": { "id": "byRegexp", "options": ".* unknown$" },             "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#CCCCCC"    } }] }
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* exit_z$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* expected_value$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* stop_loss_z$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* max_loss_r$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* risk_budget$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "magenta"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* force_close$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "dark-red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* maintenance_preempt$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#5DADE2"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* ineligible$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#888888"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* unknown$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#CCCCCC"
+                }
+              }
+            ]
+          }
         ]
       },
       "options": {
-        "tooltip": { "mode": "multi" },
-        "legend": { "displayMode": "list", "placement": "bottom" }
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
       }
     }
   ]
