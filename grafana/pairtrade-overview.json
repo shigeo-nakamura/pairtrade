@@ -25,7 +25,7 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_z{variant!=\"\"}",
+          "expr": "pairtrade_z{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}} {{pair}}",
           "refId": "A"
         }
@@ -127,17 +127,17 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_beta{variant!=\"\"}",
+          "expr": "pairtrade_beta{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}} beta",
           "refId": "A"
         },
         {
-          "expr": "pairtrade_beta_s{variant!=\"\"}",
+          "expr": "pairtrade_beta_s{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}} beta_s",
           "refId": "B"
         },
         {
-          "expr": "pairtrade_beta_l{variant!=\"\"}",
+          "expr": "pairtrade_beta_l{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}} beta_l",
           "refId": "C"
         }
@@ -155,7 +155,7 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_beta_divergence{variant!=\"\"}",
+          "expr": "pairtrade_beta_divergence{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}}",
           "refId": "A"
         }
@@ -196,7 +196,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (instance) (pairtrade_has_position{variant!=\"\"})",
+          "expr": "sum by (instance) (pairtrade_has_position{instance!~\"debot-tokyo.*\",variant!=\"\"})",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
@@ -245,7 +245,7 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_has_position{variant!=\"\"}",
+          "expr": "pairtrade_has_position{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}} {{pair}}",
           "refId": "A"
         }
@@ -288,7 +288,7 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_position_age_seconds{variant!=\"\"} > 0",
+          "expr": "pairtrade_position_age_seconds{instance!~\"debot-tokyo.*\",variant!=\"\"} > 0",
           "legendFormat": "{{instance}} {{variant}} {{pair}}",
           "refId": "A"
         }
@@ -312,7 +312,7 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_eligible{variant!=\"\"}",
+          "expr": "pairtrade_eligible{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}} {{pair}}",
           "refId": "A"
         }
@@ -355,7 +355,7 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_time_since_last_trade_seconds{variant!=\"\"}",
+          "expr": "pairtrade_time_since_last_trade_seconds{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}} {{pair}}",
           "refId": "A"
         }
@@ -379,7 +379,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (instance, variant, reason) (increase(pairtrade_close_reason_total{variant!=\"\"}[24h]))",
+          "expr": "sum by (instance, variant, reason) (increase(pairtrade_close_reason_total{instance!~\"debot-tokyo.*\",variant!=\"\"}[24h]))",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -477,7 +477,7 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_snapshot_age_seconds{variant!=\"\"}",
+          "expr": "pairtrade_snapshot_age_seconds{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}}",
           "refId": "A"
         }
@@ -519,7 +519,7 @@
       },
       "targets": [
         {
-          "expr": "increase(pairtrade_close_gross_pnl_bps_sum{variant!=\"\"}[$__rate_interval]) / increase(pairtrade_close_gross_pnl_bps_count{variant!=\"\"}[$__rate_interval])",
+          "expr": "increase(pairtrade_close_gross_pnl_bps_sum{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval]) / increase(pairtrade_close_gross_pnl_bps_count{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])",
           "legendFormat": "{{instance}} {{variant}} {{reason}}",
           "refId": "A"
         }
@@ -695,12 +695,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{variant!=\"\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
           "legendFormat": "p50 {{order_type}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.9, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{variant!=\"\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
           "legendFormat": "p90 {{order_type}}",
           "refId": "B"
         }
@@ -736,12 +736,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{variant!=\"\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
           "legendFormat": "p50 {{leg}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{variant!=\"\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
           "legendFormat": "p90 {{leg}}",
           "refId": "B"
         }
@@ -771,12 +771,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{variant!=\"\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
           "legendFormat": "p50 {{leg}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{variant!=\"\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
           "legendFormat": "p90 {{leg}}",
           "refId": "B"
         }
