@@ -25,8 +25,8 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_z{instance!~\"debot-tokyo.*\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "expr": "label_replace(label_replace(pairtrade_z{instance!~\"debot-tokyo.*\",variant!=\"\"}, \"host\", \"canary\", \"instance\", \"debot-frankfurt-canary\"), \"host\", \"main\", \"instance\", \"debot-frankfurt\")",
+          "legendFormat": "{{host}} {{variant}}",
           "refId": "A"
         }
       ],
@@ -35,14 +35,15 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 2,
-            "spanNulls": true
+            "spanNulls": true,
+            "axisWidth": 120
           }
         },
         "overrides": [
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "debot-frankfurt-canary.*"
+              "options": "canary.*"
             },
             "properties": [
               {
@@ -245,8 +246,8 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_has_position{instance!~\"debot-tokyo.*\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "expr": "label_replace(label_replace(pairtrade_has_position{instance!~\"debot-tokyo.*\",variant!=\"\"}, \"host\", \"canary\", \"instance\", \"debot-frankfurt-canary\"), \"host\", \"main\", \"instance\", \"debot-frankfurt\")",
+          "legendFormat": "{{host}} {{variant}}",
           "refId": "A"
         }
       ],
