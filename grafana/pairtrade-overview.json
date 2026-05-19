@@ -53,7 +53,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "min": -2,
+          "min": -4,
           "max": 4,
           "custom": {
             "drawStyle": "line",
@@ -81,7 +81,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^main a"
+              "options": "^main a.*"
             },
             "properties": [
               {
@@ -96,7 +96,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^main b"
+              "options": "^main b.*"
             },
             "properties": [
               {
@@ -111,7 +111,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^main c"
+              "options": "^main c.*"
             },
             "properties": [
               {
