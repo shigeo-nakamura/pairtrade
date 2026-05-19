@@ -1207,6 +1207,722 @@
           "placement": "bottom"
         }
       }
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Tokyo Extended pairtrade (debot-pair-btceth-extended)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 86
+      },
+      "panels": []
+    },
+    {
+      "id": 101,
+      "type": "timeseries",
+      "title": "[Tokyo Extended] z-score + position state (per pair / variant)",
+      "description": "Combined view: z-score line plus position-state bar at Y=3.0 (`pairtrade_has_position == 1` rendered as a thick step line). Tokyo Extended is single-variant so there is one z line and one position bar.",
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 87
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_z{instance=\"debot-tokyo\",variant!=\"\"}",
+          "legendFormat": "tokyo {{variant}}",
+          "refId": "A"
+        },
+        {
+          "expr": "(pairtrade_has_position{instance=\"debot-tokyo\",variant!=\"\"} == 1) * 3.0",
+          "legendFormat": "tokyo {{variant}} pos",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": -4,
+          "max": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true,
+            "axisWidth": 120
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*pos$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 10
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "stepAfter"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 30
+              },
+              {
+                "id": "custom.spanNulls",
+                "value": false
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 102,
+      "type": "timeseries",
+      "title": "[Tokyo Extended] beta (combined / short / long)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 105
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_beta{instance=\"debot-tokyo\",variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} beta",
+          "refId": "A"
+        },
+        {
+          "expr": "pairtrade_beta_s{instance=\"debot-tokyo\",variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} beta_s",
+          "refId": "B"
+        },
+        {
+          "expr": "pairtrade_beta_l{instance=\"debot-tokyo\",variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} beta_l",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 103,
+      "type": "timeseries",
+      "title": "[Tokyo Extended] |beta_s - beta_l| (threshold 0.30)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 105
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_beta_divergence{instance=\"debot-tokyo\",variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.3
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 104,
+      "type": "stat",
+      "title": "[Tokyo Extended] Variants currently in position",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 113
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (pairtrade_has_position{instance=\"debot-tokyo\",variant!=\"\"})",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "gray",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 105,
+      "type": "timeseries",
+      "title": "[Tokyo Extended] Position age (seconds, > 0 only while in position)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 117
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_position_age_seconds{instance=\"debot-tokyo\",variant!=\"\"} > 0",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 106,
+      "type": "state-timeline",
+      "title": "[Tokyo Extended] Eligibility (cointegration filter)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 117
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_eligible{instance=\"debot-tokyo\",variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "color": "red",
+                  "text": "NOT ELIGIBLE"
+                },
+                "1": {
+                  "color": "green",
+                  "text": "ELIGIBLE"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 107,
+      "type": "timeseries",
+      "title": "[Tokyo Extended] Time since last trade (seconds, -1 before first trade)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 124
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_time_since_last_trade_seconds{instance=\"debot-tokyo\",variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 108,
+      "type": "table",
+      "title": "[Tokyo Extended] Close reasons (count last 24h)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 124
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance, variant, reason) (increase(pairtrade_close_reason_total{instance=\"debot-tokyo\",variant!=\"\"}[24h]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true
+            },
+            "indexByName": {
+              "instance": 0,
+              "variant": 1,
+              "reason": 2,
+              "Value #A": 3
+            },
+            "renameByName": {
+              "instance": "host",
+              "Value #A": "count"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "host"
+              },
+              {
+                "field": "variant"
+              },
+              {
+                "field": "reason"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
+          "noValue": "0"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "count"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "continuous-GrYlRd"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 109,
+      "type": "stat",
+      "title": "[Tokyo Extended] Snapshot age (seconds)",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 131
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_snapshot_age_seconds{instance=\"debot-tokyo\",variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 120
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 110,
+      "type": "timeseries",
+      "title": "[Tokyo Extended] Close gross PnL \u2014 per close (bps of entry notional)",
+      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point \u2248 1 close). pairtrade closes ~1-2/day per variant; the prior heatmap form (pairtrade#35) was too sparse to show signal. Replaced per bot-strategy#420. Source for #306 BT/live gap analysis. (#314 Group 4-A)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 136
+      },
+      "targets": [
+        {
+          "expr": "increase(pairtrade_close_gross_pnl_bps_sum{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval]) / increase(pairtrade_close_gross_pnl_bps_count{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} {{variant}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "spanNulls": false,
+            "lineWidth": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* exit_z$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* expected_value$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* stop_loss_z$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* max_loss_r$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* risk_budget$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "magenta"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* force_close$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "dark-red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* maintenance_preempt$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#5DADE2"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* ineligible$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#888888"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* unknown$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#CCCCCC"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 111,
+      "type": "timeseries",
+      "title": "[Tokyo Extended] Per-leg slippage p50/p90 (bps, by order_type)",
+      "description": "Median + 90th-percentile slippage vs decision-time reference price, signed positive = cost. post_only fills typically hover near 0; taker fills are the adverse tail #306 cares about. (#314 Group 4-B/B-2, pairtrade#38/#42)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 136
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{order_type}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{order_type}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 112,
+      "type": "timeseries",
+      "title": "[Tokyo Extended] Per-leg fee p50/p90 (bps of filled notional)",
+      "description": "Venue-reported fee per leg. Lighter is fee-free and leaves the source unset (no series); Extended populates it. (#314 Group 4-B, pairtrade#38)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 144
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{leg}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{leg}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 113,
+      "type": "timeseries",
+      "title": "[Tokyo Extended] Per-leg fill latency p50/p90 (ms)",
+      "description": "Wall-clock latency from PendingOrders placement to leg fill completion. Extended populates FilledOrder.filled_ts_ms; Lighter leaves it None and emits no series. (#314 Group 4-C, pairtrade#40)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 144
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{leg}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{leg}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
     }
   ]
 }
