@@ -209,41 +209,13 @@
       }
     },
     {
-      "id": 2,
-      "type": "timeseries",
-      "title": "beta (combined / short / long)",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 18
-      },
-      "targets": [
-        {
-          "expr": "pairtrade_beta{instance!~\"debot-tokyo.*\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} beta",
-          "refId": "A"
-        },
-        {
-          "expr": "pairtrade_beta_s{instance!~\"debot-tokyo.*\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} beta_s",
-          "refId": "B"
-        },
-        {
-          "expr": "pairtrade_beta_l{instance!~\"debot-tokyo.*\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} beta_l",
-          "refId": "C"
-        }
-      ]
-    },
-    {
       "id": 3,
       "type": "timeseries",
       "title": "|beta_s - beta_l| (threshold 0.30)",
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 24,
+        "x": 0,
         "y": 18
       },
       "targets": [
@@ -774,76 +746,6 @@
       }
     },
     {
-      "id": 18,
-      "type": "timeseries",
-      "title": "Per-leg fee p50/p90 (bps of filled notional)",
-      "description": "Venue-reported fee per leg. Lighter is fee-free and leaves the source unset (no series); Extended populates it. (#314 Group 4-B, pairtrade#38)",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 0,
-        "y": 57
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{leg}}",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{leg}}",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "id": 19,
-      "type": "timeseries",
-      "title": "Per-leg fill latency p50/p90 (ms)",
-      "description": "Wall-clock latency from PendingOrders placement to leg fill completion. Extended populates FilledOrder.filled_ts_ms; Lighter leaves it None and emits no series. (#314 Group 4-C, pairtrade#40)",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 57
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{leg}}",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{instance!~\"debot-tokyo.*\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{leg}}",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ms",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
       "id": 20,
       "type": "row",
       "title": "Canary regression detection (bot-strategy#412)",
@@ -852,7 +754,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 64
+        "y": 57
       },
       "panels": []
     },
@@ -865,7 +767,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 65
+        "y": 58
       },
       "targets": [
         {
@@ -906,7 +808,7 @@
         "h": 6,
         "w": 12,
         "x": 12,
-        "y": 65
+        "y": 58
       },
       "targets": [
         {
@@ -959,7 +861,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 71
+        "y": 64
       },
       "targets": [
         {
@@ -1000,7 +902,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 71
+        "y": 64
       },
       "targets": [
         {
@@ -1041,7 +943,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 71
       },
       "targets": [
         {
@@ -1217,7 +1119,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 86
+        "y": 79
       },
       "panels": []
     },
@@ -1230,7 +1132,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 87
+        "y": 80
       },
       "targets": [
         {
@@ -1290,42 +1192,14 @@
       }
     },
     {
-      "id": 102,
-      "type": "timeseries",
-      "title": "[Tokyo Extended] beta (combined / short / long)",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 105
-      },
-      "targets": [
-        {
-          "expr": "pairtrade_beta{instance=\"debot-tokyo\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} beta",
-          "refId": "A"
-        },
-        {
-          "expr": "pairtrade_beta_s{instance=\"debot-tokyo\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} beta_s",
-          "refId": "B"
-        },
-        {
-          "expr": "pairtrade_beta_l{instance=\"debot-tokyo\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} beta_l",
-          "refId": "C"
-        }
-      ]
-    },
-    {
       "id": 103,
       "type": "timeseries",
       "title": "[Tokyo Extended] |beta_s - beta_l| (threshold 0.30)",
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 105
+        "w": 24,
+        "x": 0,
+        "y": 98
       },
       "targets": [
         {
@@ -1366,7 +1240,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 113
+        "y": 106
       },
       "targets": [
         {
@@ -1415,7 +1289,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 117
+        "y": 110
       },
       "targets": [
         {
@@ -1439,7 +1313,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 117
+        "y": 110
       },
       "targets": [
         {
@@ -1482,7 +1356,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 124
+        "y": 117
       },
       "targets": [
         {
@@ -1506,7 +1380,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 124
+        "y": 117
       },
       "targets": [
         {
@@ -1604,7 +1478,7 @@
         "h": 5,
         "w": 24,
         "x": 0,
-        "y": 131
+        "y": 124
       },
       "targets": [
         {
@@ -1646,7 +1520,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 136
+        "y": 129
       },
       "targets": [
         {
@@ -1822,7 +1696,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 136
+        "y": 129
       },
       "targets": [
         {
@@ -1863,7 +1737,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 144
+        "y": 137
       },
       "targets": [
         {
@@ -1898,7 +1772,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 144
+        "y": 137
       },
       "targets": [
         {
