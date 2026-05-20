@@ -68,6 +68,16 @@ impl KalmanBeta {
     pub(super) fn is_warm(&self, min_updates: u64) -> bool {
         self.updates >= min_updates
     }
+
+    /// Posterior 1-σ uncertainty of the current β estimate.
+    /// The filter's `p` is the posterior **variance**; this returns
+    /// `sqrt(p)`, the standard deviation that downstream code can
+    /// compare against a threshold (bot-strategy#462). Clamped to
+    /// non-negative defensively — `p` should never be negative but
+    /// numerical rounding occasionally produces tiny negative values.
+    pub(super) fn posterior_std(&self) -> f64 {
+        self.p.max(0.0).sqrt()
+    }
 }
 
 #[cfg(test)]

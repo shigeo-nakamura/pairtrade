@@ -1895,6 +1895,49 @@
           "sort": "desc"
         }
       }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Kalman beta uncertainty (sqrt(P)) \u2014 calibration view",
+      "description": "`pairtrade_beta_uncertainty` = sqrt of the Kalman filter's posterior variance. This is the rigorous 1-sigma uncertainty of the current beta estimate; it dominates the beta_s/beta_l divergence proxy used today. Phase 1 of bot-strategy#462: gauge only \u2014 we observe the distribution for 1-2 weeks across calm and unstable periods, then set `beta_uncertainty_max` from the calibration data and flip the gate. Frankfurt + Tokyo Lighter shown; Tokyo Extended excluded (single-bot, different cadence).",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 158
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_beta_uncertainty{instance!~\"debot-tokyo-extended.*\",variant!=\"\"}",
+          "legendFormat": "{{instance}} {{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     }
   ]
 }

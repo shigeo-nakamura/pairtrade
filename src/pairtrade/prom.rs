@@ -109,6 +109,18 @@ pub static BETA_GAP_RELATIVE: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static BETA_UNCERTAINTY: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_beta_uncertainty",
+        "Kalman posterior 1-sigma uncertainty of the current beta estimate \
+         (sqrt of the filter's `p`). Rigorous alternative to the \
+         beta_s/beta_l divergence proxy. Phase 1: gauge only, not yet \
+         used as an entry gate — pending calibration period. \
+         (bot-strategy#462)",
+        &["variant", "pair"],
+    )
+});
+
 pub static HALF_LIFE_HOURS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_half_life_hours",
