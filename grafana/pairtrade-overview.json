@@ -211,7 +211,7 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "|beta_s - beta_l| (threshold 0.30)",
+      "title": "Relative beta_gap = |beta_s - beta_l| / beta_eff (gate 0.30)",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -220,7 +220,7 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_beta_divergence{instance!~\"debot-tokyo.*\",variant!=\"\"}",
+          "expr": "pairtrade_beta_gap_relative{instance!~\"debot-tokyo.*\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}}",
           "refId": "A"
         }
@@ -247,7 +247,8 @@
           }
         },
         "overrides": []
-      }
+      },
+      "description": "Relative beta divergence = |beta_s - beta_l| / beta_eff. This is the value the entry filter compares against `beta_divergence_max` (default 0.30) \u2014 exceeding the red line hard-blocks entries, and `beta_gap_entry_z_scale` linearly raises the entry-z threshold even below it. Replaces the prior `pairtrade_beta_divergence` plot which showed the absolute gap on the same threshold line and was not comparable to the gate."
     },
     {
       "id": 9,
@@ -1194,7 +1195,7 @@
     {
       "id": 103,
       "type": "timeseries",
-      "title": "[Tokyo Extended] |beta_s - beta_l| (threshold 0.30)",
+      "title": "[Tokyo Extended] Relative beta_gap = |beta_s - beta_l| / beta_eff (gate 0.30)",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -1203,7 +1204,7 @@
       },
       "targets": [
         {
-          "expr": "pairtrade_beta_divergence{instance=\"debot-tokyo\",variant!=\"\"}",
+          "expr": "pairtrade_beta_gap_relative{instance=\"debot-tokyo\",variant!=\"\"}",
           "legendFormat": "{{instance}} {{variant}}",
           "refId": "A"
         }
@@ -1230,7 +1231,8 @@
           }
         },
         "overrides": []
-      }
+      },
+      "description": "Relative beta divergence = |beta_s - beta_l| / beta_eff. This is the value the entry filter compares against `beta_divergence_max` (default 0.30) \u2014 exceeding the red line hard-blocks entries, and `beta_gap_entry_z_scale` linearly raises the entry-z threshold even below it. Replaces the prior `pairtrade_beta_divergence` plot which showed the absolute gap on the same threshold line and was not comparable to the gate."
     },
     {
       "id": 104,

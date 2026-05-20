@@ -96,7 +96,15 @@ pub static BETA_L: Lazy<GaugeVec> = Lazy::new(|| {
 pub static BETA_DIVERGENCE: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_beta_divergence",
-        "Absolute gap |beta_s - beta_l|, gated by beta_divergence_max.",
+        "Absolute gap |beta_s - beta_l|. Reference only — the actual entry gate uses pairtrade_beta_gap_relative.",
+        &["variant", "pair"],
+    )
+});
+
+pub static BETA_GAP_RELATIVE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_beta_gap_relative",
+        "Relative beta divergence |beta_s - beta_l| / beta_eff, the value gated by beta_divergence_max and used by beta_gap_entry_z_scale.",
         &["variant", "pair"],
     )
 });

@@ -697,6 +697,9 @@ impl PairTradeEngine {
             prom::BETA_DIVERGENCE
                 .with_label_values(&labels)
                 .set(shared.map(|s| (s.beta_short - s.beta_long).abs()).unwrap_or(0.0));
+            prom::BETA_GAP_RELATIVE
+                .with_label_values(&labels)
+                .set(shared.map(|s| s.beta_gap).unwrap_or(0.0));
             prom::HALF_LIFE_HOURS
                 .with_label_values(&labels)
                 .set(shared.map(|s| s.half_life_hours).unwrap_or(0.0));
