@@ -702,6 +702,9 @@ impl PairTradeEngine {
             prom::BETA_GAP_RELATIVE
                 .with_label_values(&labels)
                 .set(shared.map(|s| s.beta_gap).unwrap_or(0.0));
+            prom::BETA_UNCERTAINTY
+                .with_label_values(&labels)
+                .set(shared.and_then(|s| s.kalman.as_ref().map(|k| k.posterior_std())).unwrap_or(0.0));
             prom::HALF_LIFE_HOURS
                 .with_label_values(&labels)
                 .set(shared.map(|s| s.half_life_hours).unwrap_or(0.0));
