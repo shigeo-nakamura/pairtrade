@@ -75,28 +75,83 @@ def s3_get_jsonl(client, key: str) -> list[dict]:
         return []
 
 
-def filter_window(samples: list[dict], cutoff_ts: float) -> list[dict]:
-    return [s for s in samples if s.get("ts", 0) >= cutoff_ts]
+# Heuristic threshold for treating an equity-history step as a discrete
+# trade-close event vs continuous drift (funding + unrealised PnL on an
+# open position). 5 bps of starting equity matches canary's observed
+# trade cadence (≈0.46 trades/h × 168h ≈ 77, heuristic count 81 at
+# 5 bps for canary on the 5/13-5/20 window). Main A over-counts at this
+# threshold because $1000 notional × intraday volatility produces 5-bps
+# equity steps from unrealised PnL during holds, but the metric stays
+# consistent week-over-week so it still serves regression detection.
+# Refined under bot-strategy#376 Phase 5 Stage B baseline review.
+TRADE_EVENT_BPS_OF_EQUITY = 5.0
 
 
-def build_snapshot(client, prefix: str, agent: str, cutoff_ts: float) -> WindowSnapshot:
+def filter_window(samples: list[dict], cutoff_ts_ms: float) -> list[dict]:
+    """Filter equity-history samples to those at or after the cutoff.
+
+    `equity_history.jsonl` writes `ts` in milliseconds; callers pass the
+    cutoff in milliseconds too. The earlier seconds-vs-milliseconds
+    mismatch silently let every sample through (lifetime accumulation
+    instead of a real window) — see bot-strategy#376 Phase 5 Stage B
+    fix.
+    """
+    return [s for s in samples if s.get("ts", 0) >= cutoff_ts_ms]
+
+
+def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float) -> WindowSnapshot:
+    """Build a 7-day window summary from S3-mirrored bot state.
+
+    Source of truth is `equity_history.jsonl`, which persists across
+    process restarts. The earlier draft read `status.json.trade_stats.*`
+    directly, but `trade_stats` is per-process and resets when systemd
+    restarts the bot (canary auto-restarts on every CI deploy per
+    bot-strategy#376 design), making the report show `trades=0` whenever
+    the workflow happens to run shortly after a deploy. Equity history
+    is the only S3-side feed that survives restarts today; bringing the
+    debot_pnl/ jsonl mirror up to S3 is a follow-up.
+    """
     status = s3_get_json(client, f"{prefix}/{agent}.json") or {}
     history = s3_get_jsonl(client, f"{prefix}/{agent}.equity_history.jsonl")
-    history_in_window = filter_window(history, cutoff_ts)
+    history_in_window = filter_window(history, cutoff_ts_ms)
 
-    trade_stats = status.get("trade_stats", {}) or {}
-    trade_count = int(trade_stats.get("trades", 0))
-    win_count = int(trade_stats.get("wins", 0))
-    cumulative_pnl = float(trade_stats.get("pnl", 0.0))
     funding_carry = float(status.get("funding_carry_today", 0.0) or 0.0)
 
-    equity_start = history_in_window[0]["equity"] if history_in_window else float(status.get("pnl_total", 0.0))
-    equity_end = float(status.get("pnl_total", equity_start))
+    if not history_in_window:
+        equity_end = float(status.get("pnl_total", 0.0))
+        return WindowSnapshot(
+            agent=agent,
+            trade_count=0,
+            win_count=0,
+            cumulative_pnl=0.0,
+            median_per_trade_pnl=0.0,
+            funding_carry=funding_carry,
+            equity_start=equity_end,
+            equity_end=equity_end,
+        )
 
-    # Stage A placeholder: median_per_trade_pnl approximated from
-    # cumulative / count. Stage B/C will load per-cycle pnl from the
-    # debot_pnl/ S3 prefix once the schema is wired in.
-    median_per_trade_pnl = cumulative_pnl / trade_count if trade_count else 0.0
+    equity_start = float(history_in_window[0]["equity"])
+    equity_end = float(history_in_window[-1]["equity"])
+    cumulative_pnl = equity_end - equity_start
+
+    # Trade count heuristic: count equity-history transitions where
+    # |Δ equity| ≥ TRADE_EVENT_BPS_OF_EQUITY bps of starting equity.
+    # This is a coarse proxy — Stage B/C follow-up will replace it with
+    # an authoritative debot_pnl/ jsonl read once that prefix is
+    # mirrored to S3. Until then the heuristic gives a directionally
+    # correct trade-rate ratio (the metric the verdict cares about).
+    threshold = abs(equity_start) * TRADE_EVENT_BPS_OF_EQUITY / 10_000.0
+    trade_count = 0
+    win_count = 0
+    deltas: list[float] = []
+    for i in range(1, len(history_in_window)):
+        delta = history_in_window[i]["equity"] - history_in_window[i - 1]["equity"]
+        if abs(delta) >= threshold:
+            trade_count += 1
+            if delta > 0:
+                win_count += 1
+            deltas.append(delta)
+    median_per_trade_pnl = statistics.median(deltas) if deltas else 0.0
 
     return WindowSnapshot(
         agent=agent,
@@ -118,9 +173,20 @@ def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot) -> tuple[str, 
     """
     rate_ratio = (canary.trade_count / main.trade_count) if main.trade_count else 0.0
     notes = []
-    notes.append(f"trade_rate_ratio={rate_ratio:.2f} (target ≥ 2.0 with entry_z=1.0)")
-    notes.append(f"main_cumulative={main.cumulative_pnl:.4f} canary_cumulative={canary.cumulative_pnl:.4f}")
-    notes.append("Stage A: thresholds are placeholders, verdict always PASS until Stage C")
+    notes.append(
+        f"activity_event_ratio={rate_ratio:.2f} "
+        f"(heuristic at ≥{TRADE_EVENT_BPS_OF_EQUITY:.0f} bps Δ; main A over-counts from "
+        f"unrealised-PnL mid-hold so the absolute target ≥ 2.0 from #376 needs "
+        f"recalibration in Stage C)"
+    )
+    notes.append(
+        f"main_cumulative={main.cumulative_pnl:+.4f} "
+        f"canary_cumulative={canary.cumulative_pnl:+.4f} "
+        f"(equity_history Δ over window, restart-resilient)"
+    )
+    notes.append(
+        "Stage A: thresholds are placeholders, verdict always PASS until Stage C"
+    )
     return "PASS", " | ".join(notes)
 
 
@@ -136,7 +202,7 @@ def render_markdown(canary: WindowSnapshot, main: WindowSnapshot,
         "",
         "| Metric | Main (Pair-A Frankfurt) | Canary (Frankfurt) | Δ / Ratio |",
         "|---|---|---|---|",
-        f"| Trades | {main.trade_count} | {canary.trade_count} | ratio {rate_ratio:.2f} |",
+        f"| Activity events (equity-step heuristic, ≥{TRADE_EVENT_BPS_OF_EQUITY:.0f} bps Δ) | {main.trade_count} | {canary.trade_count} | ratio {rate_ratio:.2f} |",
         f"| Wins | {main.win_count} | {canary.win_count} | — |",
         f"| Win rate | {main.win_rate*100:.1f}% | {canary.win_rate*100:.1f}% | Δ {(canary.win_rate-main.win_rate)*100:+.1f} pp |",
         f"| Cumulative PnL | ${main.cumulative_pnl:.4f} | ${canary.cumulative_pnl:.4f} | Δ ${canary.cumulative_pnl-main.cumulative_pnl:+.4f} |",
@@ -158,11 +224,11 @@ def main() -> int:
     parser.add_argument("--days", type=int, default=7, help="window length in days")
     args = parser.parse_args()
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=args.days)).timestamp()
+    cutoff_ms = (datetime.now(timezone.utc) - timedelta(days=args.days)).timestamp() * 1000
     client = boto3.client("s3", region_name="eu-central-1")
 
-    main_snap = build_snapshot(client, MAIN_PREFIX, MAIN_AGENT, cutoff)
-    canary_snap = build_snapshot(client, CANARY_PREFIX, CANARY_AGENT, cutoff)
+    main_snap = build_snapshot(client, MAIN_PREFIX, MAIN_AGENT, cutoff_ms)
+    canary_snap = build_snapshot(client, CANARY_PREFIX, CANARY_AGENT, cutoff_ms)
 
     verdict, notes = compute_verdict(canary_snap, main_snap)
     print(render_markdown(canary_snap, main_snap, args.days, verdict, notes))
