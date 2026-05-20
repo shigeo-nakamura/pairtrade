@@ -1167,13 +1167,14 @@ impl PairTradeEngine {
                 (Some(a), Some(b)) => (a, b),
                 _ => continue,
             };
-            if !(updated.contains(&pair.base) && updated.contains(&pair.quote)) {
-                continue;
-            }
-
             // Resolve BT deferred exits whose fill delay has elapsed
             // (bot-strategy#69). Must run before reconcile so the position
             // is cleared before entry evaluation on the same tick.
+            //
+            // bot-strategy#306 B-3a: moved out of the bar-tick gate below so
+            // BT fill-delay timing tracks `interval_secs` (~5s) rather than
+            // `trading_period_secs` (~60s). No-op in live where
+            // `bt_fill_delay_secs == 0`.
             if self.cfg.bt_fill_delay_secs > 0 {
                 let inst_id = self.instances[inst_idx].id.clone();
                 if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
@@ -1206,8 +1207,19 @@ impl PairTradeEngine {
                 }
             }
 
-            // First, reconcile any pending entry/exit orders for this pair
+            // Reconcile every tick (interval_secs ~5s) instead of only on
+            // bar completion (trading_period_secs ~60s). bot-strategy#306
+            // B-3a: WS pushes fills into the dex-connector cache within ~1s,
+            // but pairtrade used to sleep up to 60s before acting on them,
+            // dominating exit leg-sync. Both `get_open_orders` and
+            // `get_filled_orders` already read from in-memory caches for
+            // Lighter and Extended, so the higher cadence does not introduce
+            // REST traffic.
             self.reconcile_pending_orders(inst_idx, &key, price_map).await?;
+
+            if !(updated.contains(&pair.base) && updated.contains(&pair.quote)) {
+                continue;
+            }
 
             let mut action = TradeAction::None;
 
