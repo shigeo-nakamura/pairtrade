@@ -75,9 +75,7 @@ impl PairTradeEngine {
         let mut next_log = start + LOG_INTERVAL;
         loop {
             match self.connector.get_positions().await {
-                Err(DexError::Transient(ref msg))
-                    if msg.contains("not ready from websocket") =>
-                {
+                Err(DexError::Transient(ref msg)) if msg.contains("not ready from websocket") => {
                     let now = Instant::now();
                     if now.duration_since(start) >= timeout {
                         return Err(());
@@ -147,10 +145,7 @@ impl PairTradeEngine {
                         // attempt — subsequent retries see partial / shrinking
                         // residue of the same position set and would double-count.
                         if let Err(err) = pnl_log::log_startup_force_close(&self.cfg, &positions) {
-                            log::warn!(
-                                "[Startup] log_startup_force_close failed: {:?}",
-                                err
-                            );
+                            log::warn!("[Startup] log_startup_force_close failed: {:?}", err);
                         }
                     }
                     if let Err(err) = self.connector.close_all_positions(None).await {
@@ -285,7 +280,11 @@ impl PairTradeEngine {
                 let err_msg = err.to_string();
                 if err_msg.contains("positions not ready from websocket") {
                     let stale_clear_secs = self.cfg.order_timeout_secs.max(1).saturating_mul(6);
-                    self.clear_stale_pending(inst_idx, Duration::from_secs(stale_clear_secs), "ws_not_ready");
+                    self.clear_stale_pending(
+                        inst_idx,
+                        Duration::from_secs(stale_clear_secs),
+                        "ws_not_ready",
+                    );
                     // Startup transient: the Lighter WS hasn't pushed the
                     // initial position snapshot yet. Resolves within seconds
                     // of the first WS push. Log at INFO so it does not
@@ -463,7 +462,10 @@ impl PairTradeEngine {
         }
 
         const UNHEDGED_CLOSE_COOLDOWN_SECS: u64 = 30;
-        let last_exit = self.instances[inst_idx].states.get(key).and_then(|state| state.last_exit_at);
+        let last_exit = self.instances[inst_idx]
+            .states
+            .get(key)
+            .and_then(|state| state.last_exit_at);
         if let Some(last_exit) = last_exit {
             if last_exit.elapsed() < Duration::from_secs(UNHEDGED_CLOSE_COOLDOWN_SECS) {
                 return;

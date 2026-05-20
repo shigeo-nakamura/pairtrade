@@ -170,9 +170,7 @@ mod tests {
     // bot-strategy#258: Extended reduce-only error classification
     #[test]
     fn reduce_only_position_missing_matches_code_1137_message() {
-        let err = DexError::ServerResponse(
-            "Position is missing for reduce-only order".to_string(),
-        );
+        let err = DexError::ServerResponse("Position is missing for reduce-only order".to_string());
         assert!(is_reduce_only_position_missing_error(&err));
         assert!(!is_reduce_only_size_mismatch_error(&err));
         assert!(is_reduce_only_rejection(&err));
@@ -180,9 +178,8 @@ mod tests {
 
     #[test]
     fn reduce_only_size_mismatch_matches_code_1136_message() {
-        let err = DexError::ServerResponse(
-            "Reduce-only order size exceeds position size".to_string(),
-        );
+        let err =
+            DexError::ServerResponse("Reduce-only order size exceeds position size".to_string());
         assert!(!is_reduce_only_position_missing_error(&err));
         assert!(is_reduce_only_size_mismatch_error(&err));
         assert!(is_reduce_only_rejection(&err));

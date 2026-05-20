@@ -67,7 +67,11 @@ pub(super) fn compute_regime(
             var_p += dp * dp;
         }
         let std_p = (var_p / n).max(0.0).sqrt();
-        let slope = if var_i.abs() < 1e-15 { 0.0 } else { cov / var_i };
+        let slope = if var_i.abs() < 1e-15 {
+            0.0
+        } else {
+            cov / var_i
+        };
         if std_p < 1e-9 {
             0.0
         } else {

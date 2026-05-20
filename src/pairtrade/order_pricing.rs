@@ -18,8 +18,7 @@ pub(super) fn apply_slippage(
     if slippage_bps == 0 {
         return Some(p);
     }
-    let factor =
-        Decimal::from_f64((slippage_bps.abs() as f64) / 10_000.0).unwrap_or(Decimal::ZERO);
+    let factor = Decimal::from_f64((slippage_bps.abs() as f64) / 10_000.0).unwrap_or(Decimal::ZERO);
     let passive = slippage_bps < 0;
     match side {
         dex_connector::OrderSide::Long => {
@@ -244,8 +243,14 @@ mod tests {
         // Extended ETH: min_order=0.01, size_decimals=3 → step 0.001.
         // 0.011 ETH must stay at 0.011 (above min_order, on 0.001 grid).
         let prices = prices_for("ETH", snapshot_with(Some("0.01"), Some(3)));
-        assert_eq!(quantize_order_size("ETH", dec("0.011"), &prices), dec("0.011"));
-        assert_eq!(quantize_order_size_exit("ETH", dec("0.011"), &prices), dec("0.011"));
+        assert_eq!(
+            quantize_order_size("ETH", dec("0.011"), &prices),
+            dec("0.011")
+        );
+        assert_eq!(
+            quantize_order_size_exit("ETH", dec("0.011"), &prices),
+            dec("0.011")
+        );
     }
 
     #[test]
@@ -253,8 +258,14 @@ mod tests {
         // Lighter ETH: min_order=0.005, size_decimals=4 → step 0.0001.
         // 0.012 must stay at 0.012, not floor to 0.010 / ceil to 0.015.
         let prices = prices_for("ETH", snapshot_with(Some("0.005"), Some(4)));
-        assert_eq!(quantize_order_size("ETH", dec("0.012"), &prices), dec("0.012"));
-        assert_eq!(quantize_order_size_exit("ETH", dec("0.012"), &prices), dec("0.012"));
+        assert_eq!(
+            quantize_order_size("ETH", dec("0.012"), &prices),
+            dec("0.012")
+        );
+        assert_eq!(
+            quantize_order_size_exit("ETH", dec("0.012"), &prices),
+            dec("0.012")
+        );
     }
 
     #[test]
@@ -278,7 +289,10 @@ mod tests {
     fn quantize_size_below_min_order_bumps_to_min_order() {
         // 0.003 ETH < min_order 0.005 → bump up to 0.005 even on 0.0001 grid.
         let prices = prices_for("ETH", snapshot_with(Some("0.005"), Some(4)));
-        assert_eq!(quantize_order_size("ETH", dec("0.003"), &prices), dec("0.005"));
+        assert_eq!(
+            quantize_order_size("ETH", dec("0.003"), &prices),
+            dec("0.005")
+        );
         assert_eq!(
             quantize_order_size_exit("ETH", dec("0.003"), &prices),
             dec("0.005")
@@ -293,7 +307,10 @@ mod tests {
         // behavior: step = min_order.
         let prices = prices_for("ETH", snapshot_with(Some("0.005"), None));
         // 0.012 → trunc(0.012/0.005)=2 → 0.010
-        assert_eq!(quantize_order_size("ETH", dec("0.012"), &prices), dec("0.010"));
+        assert_eq!(
+            quantize_order_size("ETH", dec("0.012"), &prices),
+            dec("0.010")
+        );
         // ceiling: ceil(0.012/0.005)=3 → 0.015
         assert_eq!(
             quantize_order_size_exit("ETH", dec("0.012"), &prices),

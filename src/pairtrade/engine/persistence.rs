@@ -162,7 +162,9 @@ impl PairTradeEngine {
         let loaded = snapshot.instances;
         let now_ts = self.current_now_ts();
         for inst in &mut self.instances {
-            let Some(state) = loaded.get(&inst.id) else { continue };
+            let Some(state) = loaded.get(&inst.id) else {
+                continue;
+            };
             inst.consecutive_losses = state.consecutive_losses;
             inst.session_start_equity = state.session_start_equity;
             inst.session_start_ts = state.session_start_ts;
@@ -183,7 +185,9 @@ impl PairTradeEngine {
                     let elapsed = now_ts.saturating_sub(mark.ts).max(0);
                     log::info!(
                         "[STOP_COOLDOWN] {} restored: direction={:?} elapsed={}s",
-                        pair_key, mark.direction, elapsed
+                        pair_key,
+                        mark.direction,
+                        elapsed
                     );
                 } else {
                     log::debug!(
@@ -244,13 +248,9 @@ impl PairTradeEngine {
                     .states
                     .iter()
                     .filter_map(|(key, st)| {
-                        st.last_stop_loss_at
-                            .map(|(direction, ts)| {
-                                (
-                                    key.clone(),
-                                    risk_io::StopLossMark { direction, ts },
-                                )
-                            })
+                        st.last_stop_loss_at.map(|(direction, ts)| {
+                            (key.clone(), risk_io::StopLossMark { direction, ts })
+                        })
                     })
                     .collect();
                 (
@@ -303,13 +303,19 @@ impl PairTradeEngine {
             let key = format!("{}/{}", pair.base, pair.quote);
             let (Some(hist_a), Some(hist_b)) =
                 (self.history.get(&pair.base), self.history.get(&pair.quote))
-            else { continue };
+            else {
+                continue;
+            };
             let take = self.cfg.metrics_window.min(hist_a.len()).min(hist_b.len());
-            if take < 2 { continue }
+            if take < 2 {
+                continue;
+            }
             let tail_a = tail_samples(hist_a, take);
             let tail_b = tail_samples(hist_b, take);
             let beta = regression_beta(&tail_b, &tail_a);
-            let Some(shared) = self.per_pair_state.get_mut(&key) else { continue };
+            let Some(shared) = self.per_pair_state.get_mut(&key) else {
+                continue;
+            };
             shared.beta = beta;
             shared.beta_short = beta;
             shared.beta_long = beta;

@@ -42,8 +42,7 @@ pub(super) fn evaluate_pair(
     let hist_a = history.get(&pair.base)?;
     let hist_b = history.get(&pair.quote)?;
     let available = hist_a.len().min(hist_b.len());
-    let desired_long =
-        ((pp.lookback_hours_long * 3600) / cfg.trading_period_secs).max(1) as usize;
+    let desired_long = ((pp.lookback_hours_long * 3600) / cfg.trading_period_secs).max(1) as usize;
     let desired_short =
         ((pp.lookback_hours_short * 3600) / cfg.trading_period_secs).max(1) as usize;
     let (long_len, short_len) = match cfg.warm_start_mode {

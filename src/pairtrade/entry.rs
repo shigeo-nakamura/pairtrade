@@ -131,7 +131,9 @@ pub(super) fn post_stop_cooldown_allows(
     }
     log::info!(
         "[STOP_COOLDOWN] {:?} blocked, elapsed={}s of {}s",
-        proposed_direction, elapsed, pp.stop_loss_cooldown_secs,
+        proposed_direction,
+        elapsed,
+        pp.stop_loss_cooldown_secs,
     );
     false
 }
@@ -352,7 +354,10 @@ mod tests {
         let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
         // Re-attempt at t=1300 (5 min after the stop, well inside 1800s).
         assert!(!post_stop_cooldown_allows(
-            &pp, &s, 1300, PositionDirection::LongSpread
+            &pp,
+            &s,
+            1300,
+            PositionDirection::LongSpread
         ));
     }
 
@@ -362,7 +367,10 @@ mod tests {
         let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
         // ShortSpread reversal is on a different signal — must not be blocked.
         assert!(post_stop_cooldown_allows(
-            &pp, &s, 1300, PositionDirection::ShortSpread
+            &pp,
+            &s,
+            1300,
+            PositionDirection::ShortSpread
         ));
     }
 
@@ -372,7 +380,10 @@ mod tests {
         let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
         // 1s past the 1800s window.
         assert!(post_stop_cooldown_allows(
-            &pp, &s, 1000 + 1801, PositionDirection::LongSpread
+            &pp,
+            &s,
+            1000 + 1801,
+            PositionDirection::LongSpread
         ));
     }
 
@@ -382,7 +393,10 @@ mod tests {
         let pp = cooldown_params(1800);
         let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
         assert!(post_stop_cooldown_allows(
-            &pp, &s, 1000 + 1800, PositionDirection::LongSpread
+            &pp,
+            &s,
+            1000 + 1800,
+            PositionDirection::LongSpread
         ));
     }
 
@@ -391,7 +405,10 @@ mod tests {
         let pp = cooldown_params(0); // legacy / disabled
         let s = cooldown_state(Some((PositionDirection::LongSpread, 1000)));
         assert!(post_stop_cooldown_allows(
-            &pp, &s, 1300, PositionDirection::LongSpread
+            &pp,
+            &s,
+            1300,
+            PositionDirection::LongSpread
         ));
     }
 
@@ -400,7 +417,10 @@ mod tests {
         let pp = cooldown_params(1800);
         let s = cooldown_state(None);
         assert!(post_stop_cooldown_allows(
-            &pp, &s, 1_000_000, PositionDirection::LongSpread
+            &pp,
+            &s,
+            1_000_000,
+            PositionDirection::LongSpread
         ));
     }
 
@@ -462,7 +482,11 @@ mod tests {
         // produces a threshold no realistic |z| can clear → shorts disabled.
         let pp = short_mult_params(9999.0);
         let threshold = apply_short_multiplier(1.5, &pp, PositionDirection::ShortSpread);
-        assert!(threshold > 1000.0, "expected huge threshold, got {}", threshold);
+        assert!(
+            threshold > 1000.0,
+            "expected huge threshold, got {}",
+            threshold
+        );
     }
 
     #[test]

@@ -161,7 +161,10 @@ fn archive_snapshot_hourly(cfg: &PairTradeConfig, history_path: &Path) {
     }
     log::info!(
         "[HISTORY_ARCHIVE] saved {}",
-        archive_path.file_name().unwrap_or_default().to_string_lossy()
+        archive_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
     );
     cleanup_old_archives(archive_dir, cfg.history_archive_retention_days);
 }
@@ -175,7 +178,9 @@ fn cleanup_old_archives(dir: &Path, retention_days: u32) {
     };
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         if modified < cutoff {
             let _ = fs::remove_file(entry.path());
             log::info!(
@@ -490,18 +495,9 @@ pub(super) fn load_history_from_disk(
     if !stale_summary.is_empty() && loaded_summary.is_empty() {
         // Every symbol failed the stale-guard — the canonical failure
         // mode behind the 2026-05-12 03:51 UTC silent-reject incident.
-        let key = format!(
-            "rejected_all:v{}:n{}",
-            snap.version,
-            stale_summary.len(),
-        );
+        let key = format!("rejected_all:v{}:n{}", snap.version, stale_summary.len(),);
         if last_logged_key.as_deref() != Some(key.as_str()) {
-            let oldest_min = stale_summary
-                .iter()
-                .map(|(_, a)| *a)
-                .max()
-                .unwrap_or(0)
-                / 60_000;
+            let oldest_min = stale_summary.iter().map(|(_, a)| *a).max().unwrap_or(0) / 60_000;
             let threshold_min = stale_threshold_ms / 60_000;
             log::warn!(
                 "[WARM_START] snapshot at {} rejected as stale: v{}, {} symbol(s) all older than {}min (oldest {}min) — cold start. \
@@ -698,7 +694,11 @@ mod tests {
         }"#;
         let f = write_snapshot(json);
         let err = parse_snapshot_file(f.path()).unwrap_err();
-        assert!(err.contains("_v=0") || err.contains("not supported"), "got: {}", err);
+        assert!(
+            err.contains("_v=0") || err.contains("not supported"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]

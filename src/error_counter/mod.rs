@@ -198,10 +198,7 @@ impl Counters {
     fn bucket(&self, instance: Option<&str>) -> Arc<Bucket> {
         let key = instance.map(|s| s.to_string());
         let mut map = self.buckets.lock().unwrap();
-        Arc::clone(
-            map.entry(key)
-                .or_insert_with(|| Arc::new(Bucket::new())),
-        )
+        Arc::clone(map.entry(key).or_insert_with(|| Arc::new(Bucket::new())))
     }
 }
 
@@ -348,7 +345,13 @@ impl ErrorCountingLogger {
 
 /// Commit a single record into the bucket identified by `instance`.
 /// Used both by the live log path and by the deferred-pending flush.
-fn commit_to_bucket(counters: &Counters, instance: Option<&str>, ts: i64, level: Level, msg: String) {
+fn commit_to_bucket(
+    counters: &Counters,
+    instance: Option<&str>,
+    ts: i64,
+    level: Level,
+    msg: String,
+) {
     let bucket = counters.bucket(instance);
     bucket.recent.lock().unwrap().push_back((ts, level));
     match level {
@@ -474,13 +477,7 @@ mod tests {
     /// matching, and instance attribution directly. Mirrors the real
     /// `log()` body. `instance = None` matches the shared / unattributed
     /// path the connector layer takes today.
-    fn fake_log_for(
-        counters: &Counters,
-        instance: Option<&str>,
-        ts: i64,
-        level: Level,
-        msg: &str,
-    ) {
+    fn fake_log_for(counters: &Counters, instance: Option<&str>, ts: i64, level: Level, msg: &str) {
         if msg.contains(WS_RESET_PHRASE) {
             let cutoff = ts - WS_RESET_24H_WINDOW_SECS;
             let mut q = counters.ws_resets_24h.lock().unwrap();
@@ -495,7 +492,11 @@ mod tests {
         }
         if is_ws_recovery_event(msg) {
             let cutoff = ts - WS_DEFER_WINDOW_SECS;
-            counters.pending_ws.lock().unwrap().retain(|e| e.ts < cutoff);
+            counters
+                .pending_ws
+                .lock()
+                .unwrap()
+                .retain(|e| e.ts < cutoff);
         }
         if is_step_overrun_recovery_event(msg) {
             let cutoff = ts - STEP_OVERRUN_DEFER_WINDOW_SECS;
@@ -603,12 +604,37 @@ mod tests {
         let c = make_counters();
         let t0 = 1_000_000;
         // Simulate the #260 sequence verbatim (~27s window).
-        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer (os error 104)");
-        fake_log(&c, t0, Level::Error, "WebSocket IO error detail: kind=ConnectionReset, error=Connection reset by peer");
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer (os error 104)",
+        );
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket IO error detail: kind=ConnectionReset, error=Connection reset by peer",
+        );
         fake_log(&c, t0 + 18, Level::Warn, "[XVENUE] tick error: read_mid Lighter\n\nCaused by:\n    get_order_book(ETH, 1): Other(\"order book snapshot unavailable (no recent update)\")");
-        fake_log(&c, t0 + 23, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
-        fake_log(&c, t0 + 27, Level::Info, "WebSocket connected successfully: ...");
-        fake_log(&c, t0 + 27, Level::Info, "WebSocket subscriptions sent successfully");
+        fake_log(
+            &c,
+            t0 + 23,
+            Level::Warn,
+            "[XVENUE] tick error: read_mid Lighter",
+        );
+        fake_log(
+            &c,
+            t0 + 27,
+            Level::Info,
+            "WebSocket connected successfully: ...",
+        );
+        fake_log(
+            &c,
+            t0 + 27,
+            Level::Info,
+            "WebSocket subscriptions sent successfully",
+        );
         // After recovery, the pending queue should be empty.
         assert!(
             c.pending_ws.lock().unwrap().is_empty(),
@@ -625,8 +651,18 @@ mod tests {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 2_000_000;
-        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer (os error 104)");
-        fake_log(&c, t0 + 5, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer (os error 104)",
+        );
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Warn,
+            "[XVENUE] tick error: read_mid Lighter",
+        );
         // Sample BEFORE either deadline — neither WS-typed event has aged
         // out of its individual recovery window. Counter still zero.
         let (e0, w0) = snap_counts(&c, t0 + 30);
@@ -643,14 +679,24 @@ mod tests {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 3_000_000;
-        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer");
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer",
+        );
         // No recovery within window — flush via a snapshot past the deadline
         // promotes the entry to `recent`.
         let (e0, _) = snap_counts(&c, t0 + WS_DEFER_WINDOW_SECS + 1);
         assert_eq!(e0, 1, "post-deadline ERROR commits");
         // A late recovery marker must NOT retroactively decrement the
         // already-committed counter — the `recent` queue is durable.
-        fake_log(&c, t0 + 120, Level::Info, "WebSocket connected successfully: ...");
+        fake_log(
+            &c,
+            t0 + 120,
+            Level::Info,
+            "WebSocket connected successfully: ...",
+        );
         let (e1, _) = snap_counts(&c, t0 + 130);
         assert_eq!(e1, 1, "late recovery cannot uncommit");
     }
@@ -671,8 +717,18 @@ mod tests {
         let c = make_counters();
         set_counting_suppressed(true);
         let t0 = 5_000_000;
-        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset by peer");
-        fake_log(&c, t0 + 5, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer",
+        );
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Warn,
+            "[XVENUE] tick error: read_mid Lighter",
+        );
         // Maintenance mode short-circuits before either path runs.
         assert!(
             c.pending_ws.lock().unwrap().is_empty(),
@@ -691,8 +747,18 @@ mod tests {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 6_000_000;
-        fake_log(&c, t0, Level::Error, "WebSocket error: IO error: Connection reset");
-        fake_log(&c, t0 + 5, Level::Warn, "orderbook BTC/ETH unavailable: waiting for websocket data");
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset",
+        );
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Warn,
+            "orderbook BTC/ETH unavailable: waiting for websocket data",
+        );
         fake_log(&c, t0 + 10, Level::Info, "WebSocket connected successfully");
         let (e, w) = snap_counts(&c, t0 + 15);
         assert_eq!((e, w), (0, 0), "pairtrade orderbook WARN suppressed too");
@@ -761,7 +827,11 @@ mod tests {
             "WebSocket connected successfully (stream=account ...)",
         );
         let (e, w) = snap_counts(&c, t0 + 5);
-        assert_eq!((e, w), (0, 0), "account stream WARN must suppress on recovery");
+        assert_eq!(
+            (e, w),
+            (0, 0),
+            "account stream WARN must suppress on recovery"
+        );
     }
 
     #[test]
@@ -800,13 +870,22 @@ mod tests {
             Level::Warn,
             "[STEP_OVERRUN] step() took 12.18s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
         );
-        fake_log(&c, t0 + 48, Level::Info, "[ORDER] BTC/ETH entry orders filled");
+        fake_log(
+            &c,
+            t0 + 48,
+            Level::Info,
+            "[ORDER] BTC/ETH entry orders filled",
+        );
         assert!(
             c.pending_step_overrun.lock().unwrap().is_empty(),
             "entry completion must drain pending STEP_OVERRUN"
         );
         let (e, w) = snap_counts(&c, t0 + 60);
-        assert_eq!((e, w), (0, 0), "STEP_OVERRUN with completion must not commit");
+        assert_eq!(
+            (e, w),
+            (0, 0),
+            "STEP_OVERRUN with completion must not commit"
+        );
     }
 
     #[test]
@@ -820,9 +899,17 @@ mod tests {
             Level::Warn,
             "[STEP_OVERRUN] step() took 8.02s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
         );
-        fake_log(&c, t0 + 30, Level::Info, "[ORDER] BTC/ETH exit orders filled");
+        fake_log(
+            &c,
+            t0 + 30,
+            Level::Info,
+            "[ORDER] BTC/ETH exit orders filled",
+        );
         let (_, w) = snap_counts(&c, t0 + 60);
-        assert_eq!(w, 0, "STEP_OVERRUN paired with exit completion must not commit");
+        assert_eq!(
+            w, 0,
+            "STEP_OVERRUN paired with exit completion must not commit"
+        );
     }
 
     #[test]
@@ -888,7 +975,12 @@ mod tests {
             Level::Warn,
             "[STEP_OVERRUN] step() took 12.18s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
         );
-        fake_log(&c, t0 + 5, Level::Error, "WebSocket error: IO error: Connection reset by peer");
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer",
+        );
         // WS recovery only — STEP_OVERRUN entry must remain pending.
         fake_log(&c, t0 + 15, Level::Info, "WebSocket connected successfully");
         assert!(
@@ -901,7 +993,12 @@ mod tests {
             "STEP_OVERRUN must NOT be drained by WS recovery"
         );
         // Now the entry completion drains STEP_OVERRUN.
-        fake_log(&c, t0 + 50, Level::Info, "[ORDER] BTC/ETH entry orders filled");
+        fake_log(
+            &c,
+            t0 + 50,
+            Level::Info,
+            "[ORDER] BTC/ETH entry orders filled",
+        );
         assert!(c.pending_step_overrun.lock().unwrap().is_empty());
         let (e, w) = snap_counts(&c, t0 + 60);
         assert_eq!((e, w), (0, 0));
@@ -954,7 +1051,12 @@ mod tests {
             "account stream error: Connection reset without closing handshake",
         );
         // A non-matching warn must not contribute.
-        fake_log(&c, t0 + 3, Level::Warn, "[XVENUE] tick error: read_mid Lighter");
+        fake_log(
+            &c,
+            t0 + 3,
+            Level::Warn,
+            "[XVENUE] tick error: read_mid Lighter",
+        );
         assert_eq!(ws_reset_count(&c, t0 + 5), 3);
     }
 
@@ -963,8 +1065,18 @@ mod tests {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 13_000_000;
-        fake_log(&c, t0, Level::Warn, "Connection reset without closing handshake (1)");
-        fake_log(&c, t0 + 100, Level::Warn, "Connection reset without closing handshake (2)");
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "Connection reset without closing handshake (1)",
+        );
+        fake_log(
+            &c,
+            t0 + 100,
+            Level::Warn,
+            "Connection reset without closing handshake (2)",
+        );
         // Probe just before the 24h boundary ages out the first entry —
         // both still in window.
         let now = t0 + WS_RESET_24H_WINDOW_SECS - 10;
@@ -983,7 +1095,12 @@ mod tests {
         let c = make_counters();
         set_counting_suppressed(true);
         let t0 = 14_000_000;
-        fake_log(&c, t0, Level::Warn, "Connection reset without closing handshake");
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "Connection reset without closing handshake",
+        );
         // The committed `recent` queue stays empty (suppression worked
         // for the rolling window), but ws_resets_24h has the entry.
         let (e, w) = snap_counts(&c, t0 + 5);
@@ -1000,9 +1117,19 @@ mod tests {
         // Closely-related but not exact phrases must not contribute. The
         // dashboard's old journalctl probe matched the exact substring;
         // the bot self-reported counter must match the same set.
-        fake_log(&c, t0, Level::Warn, "Connection reset by peer (os error 104)");
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "Connection reset by peer (os error 104)",
+        );
         fake_log(&c, t0 + 1, Level::Warn, "WebSocket reset");
-        fake_log(&c, t0 + 2, Level::Warn, "Connection reset without graceful close");
+        fake_log(
+            &c,
+            t0 + 2,
+            Level::Warn,
+            "Connection reset without graceful close",
+        );
         assert_eq!(ws_reset_count(&c, t0 + 5), 0);
     }
 
@@ -1116,7 +1243,10 @@ mod tests {
         let t0 = 20_000_000;
         fake_log_for(&c, None, t0, Level::Warn, "shared warn");
         let (_, w) = snap_counts_for(&c, Some("never-existed"), t0 + 5);
-        assert_eq!(w, 1, "shared events visible regardless of which variant queries");
+        assert_eq!(
+            w, 1,
+            "shared events visible regardless of which variant queries"
+        );
     }
 
     #[test]

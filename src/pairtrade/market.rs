@@ -56,11 +56,7 @@ pub(super) struct SymbolSnapshot {
 /// reporting (`PnlLogRecord::funding_carry_usd`) was migrated to the
 /// strategy-side convention in #414 and no longer shares signs with this
 /// helper.
-pub(super) fn net_funding_for_direction(
-    z: f64,
-    p1: &SymbolSnapshot,
-    p2: &SymbolSnapshot,
-) -> f64 {
+pub(super) fn net_funding_for_direction(z: f64, p1: &SymbolSnapshot, p2: &SymbolSnapshot) -> f64 {
     if z > 0.0 {
         // plan to short base (p1) and long quote (p2)
         (p2.funding_rate - p1.funding_rate).to_f64().unwrap_or(0.0)

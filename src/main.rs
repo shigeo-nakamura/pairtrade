@@ -67,9 +67,7 @@ async fn run_single() -> std::io::Result<()> {
 // the cooldown active. Now we retry the whole engine init with backoff
 // inside the process for transient signatures; permanent errors (bad
 // config, missing keys, unexpected shapes) still propagate straight out.
-async fn init_engine_with_retry(
-    cfg: PairTradeConfig,
-) -> Result<PairTradeEngine, anyhow::Error> {
+async fn init_engine_with_retry(cfg: PairTradeConfig) -> Result<PairTradeEngine, anyhow::Error> {
     const MAX_ATTEMPTS: u32 = 20;
     let mut attempt: u32 = 0;
     let mut backoff = std::time::Duration::from_secs(3);

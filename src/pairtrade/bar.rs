@@ -131,10 +131,7 @@ impl BarBuilder {
     /// This is a defensive backstop for the case where both WS and polling
     /// stop delivering ticks — without it, BarBuilder would wait
     /// indefinitely for the next crossing tick. bot-strategy#341.
-    pub(super) fn force_close_if_stale(
-        &mut self,
-        now_ms: i64,
-    ) -> Option<(Decimal, i64)> {
+    pub(super) fn force_close_if_stale(&mut self, now_ms: i64) -> Option<(Decimal, i64)> {
         let start = self.start_ts?;
         if self.window_ms <= 0 {
             return None;
