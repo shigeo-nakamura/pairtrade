@@ -1515,7 +1515,7 @@
       "id": 110,
       "type": "timeseries",
       "title": "[Tokyo Extended] Close gross PnL \u2014 per close (bps of entry notional)",
-      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point \u2248 1 close). pairtrade closes ~1-2/day per variant; the prior heatmap form (pairtrade#35) was too sparse to show signal. Replaced per bot-strategy#420. Source for #306 BT/live gap analysis. (#314 Group 4-A)",
+      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point \u2248 1 close). pairtrade closes ~1-2/day per variant; the prior heatmap form (pairtrade#35) was too sparse to show signal. Replaced per bot-strategy#420. Source for #306 BT/live gap analysis. (#314 Group 4-A) Tokyo Extended uses [$__range] (vs Frankfurt [$__rate_interval]) so the mean survives the panel window at single-bot, sub-1-trade/h cadence.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1524,7 +1524,7 @@
       },
       "targets": [
         {
-          "expr": "increase(pairtrade_close_gross_pnl_bps_sum{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval]) / increase(pairtrade_close_gross_pnl_bps_count{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])",
+          "expr": "increase(pairtrade_close_gross_pnl_bps_sum{instance=\"debot-tokyo\",variant!=\"\"}[$__range]) / increase(pairtrade_close_gross_pnl_bps_count{instance=\"debot-tokyo\",variant!=\"\"}[$__range])",
           "legendFormat": "{{instance}} {{variant}} {{reason}}",
           "refId": "A"
         }
@@ -1690,8 +1690,8 @@
     {
       "id": 111,
       "type": "timeseries",
-      "title": "[Tokyo Extended] Per-leg slippage p50/p90 (bps, by order_type)",
-      "description": "Median + 90th-percentile slippage vs decision-time reference price, signed positive = cost. post_only fills typically hover near 0; taker fills are the adverse tail #306 cares about. (#314 Group 4-B/B-2, pairtrade#38/#42)",
+      "title": "[Tokyo Extended] Slippage fill samples (count by order_type)",
+      "description": "Cumulative fill-event count over the panel window, broken down by order_type (post_only vs taker). Replaces the Frankfurt-style p50/p90 view because Extended single-bot cadence (~1 trade/day) gives too few samples to compute meaningful quantiles per scrape interval. Revisit p50/p90 once trade density rises. (#314)",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1700,23 +1700,23 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{order_type}}",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.9, sum by (le, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{order_type}}",
-          "refId": "B"
+          "refId": "A",
+          "expr": "sum by (order_type) (increase(pairtrade_leg_slippage_bps_count{instance=\"debot-tokyo\",variant!=\"\"}[$__range]))",
+          "legendFormat": "{{order_type}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "spanNulls": true
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 60,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -1731,8 +1731,8 @@
     {
       "id": 112,
       "type": "timeseries",
-      "title": "[Tokyo Extended] Per-leg fee p50/p90 (bps of filled notional)",
-      "description": "Venue-reported fee per leg. Lighter is fee-free and leaves the source unset (no series); Extended populates it. (#314 Group 4-B, pairtrade#38)",
+      "title": "[Tokyo Extended] Fee samples (count by leg)",
+      "description": "Cumulative fee-event count over the panel window, broken down by leg (entry vs exit). Confirms fee samples are reaching the histogram. p50/p90 replaced because single-bot cadence floors rate() to zero outside the scrape window. (#314)",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -1741,23 +1741,23 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{leg}}",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fee_bps_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{leg}}",
-          "refId": "B"
+          "refId": "A",
+          "expr": "sum by (leg) (increase(pairtrade_leg_fee_bps_count{instance=\"debot-tokyo\",variant!=\"\"}[$__range]))",
+          "legendFormat": "{{leg}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "spanNulls": true
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 60,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -1766,8 +1766,8 @@
     {
       "id": 113,
       "type": "timeseries",
-      "title": "[Tokyo Extended] Per-leg fill latency p50/p90 (ms)",
-      "description": "Wall-clock latency from PendingOrders placement to leg fill completion. Extended populates FilledOrder.filled_ts_ms; Lighter leaves it None and emits no series. (#314 Group 4-C, pairtrade#40)",
+      "title": "[Tokyo Extended] Fill latency samples (count by leg)",
+      "description": "Cumulative fill-latency sample count over the panel window, by leg. p50/p90 replaced for the same reason as the slippage/fee panels \u2014 quantiles need denser samples than Extended currently produces. (#314)",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -1776,23 +1776,23 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{leg}}",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.9, sum by (le, leg) (rate(pairtrade_leg_fill_latency_ms_bucket{instance=\"debot-tokyo\",variant!=\"\"}[$__rate_interval])))",
-          "legendFormat": "p90 {{leg}}",
-          "refId": "B"
+          "refId": "A",
+          "expr": "sum by (leg) (increase(pairtrade_leg_fill_latency_ms_count{instance=\"debot-tokyo\",variant!=\"\"}[$__range]))",
+          "legendFormat": "{{leg}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ms",
+          "unit": "short",
           "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "spanNulls": true
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "spanNulls": true,
+            "fillOpacity": 60,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
