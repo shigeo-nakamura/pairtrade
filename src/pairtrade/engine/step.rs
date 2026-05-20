@@ -1061,16 +1061,16 @@ impl PairTradeEngine {
         price_map: &HashMap<String, SymbolSnapshot>,
     ) -> Result<StepSetup> {
         // Skip new entries if maintenance is upcoming within 1 hour
-        let maintenance_block_entries = self.connector.is_upcoming_maintenance(1).await;
-        if maintenance_block_entries {
-            log::info!("Upcoming maintenance detected; blocking new entries this cycle");
+        let maintenance_status = self.connector.maintenance_status(1).await;
+        let maintenance_block_entries = maintenance_status.is_some();
+        if let Some(status) = maintenance_status.as_deref() {
+            log::info!(
+                "Maintenance/degraded exchange detected ({}); blocking new entries this cycle",
+                status
+            );
         }
         if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
-            reporter.set_maintenance(if maintenance_block_entries {
-                Some("blocking_entries".to_string())
-            } else {
-                None
-            });
+            reporter.set_maintenance(maintenance_status.clone());
         }
         // Also stop inflating warn/error counters for the duration of the
         // detected maintenance window (bot-strategy#199). The WS reconnect
