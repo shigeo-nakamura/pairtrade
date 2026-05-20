@@ -1072,6 +1072,9 @@ impl PairTradeEngine {
         if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
             reporter.set_maintenance(maintenance_status.clone());
         }
+        crate::pairtrade::prom::MAINTENANCE_ACTIVE
+            .with_label_values(&[self.instances[inst_idx].id.as_str()])
+            .set(if maintenance_block_entries { 1 } else { 0 });
         // Also stop inflating warn/error counters for the duration of the
         // detected maintenance window (bot-strategy#199). The WS reconnect
         // bursts / 503s / stale-price WARNs that follow are expected fallout

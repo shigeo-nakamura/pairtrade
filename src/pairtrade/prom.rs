@@ -141,6 +141,17 @@ pub static ENTRY_Z_THRESHOLD_EFFECTIVE: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static MAINTENANCE_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_maintenance_active",
+        "1 when the per-tick gate sees maintenance_status() != None on the \
+         connector (RSS-announced or observed-degraded). Shared across A/B/C \
+         since the Lighter connector is process-global; the per-variant label \
+         records which variant last wrote the value this tick. (#427)",
+        &["variant"],
+    )
+});
+
 // === Position / activity ===
 
 pub static HAS_POSITION: Lazy<IntGaugeVec> = Lazy::new(|| {

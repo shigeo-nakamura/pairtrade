@@ -1799,6 +1799,55 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 30,
+      "type": "state-timeline",
+      "title": "Maintenance / degraded windows (#427)",
+      "description": "1 when the per-tick gate observes maintenance_status() != None on the venue connector. Captures both RSS-announced Lighter maintenance (`upcoming_or_active`) and observed-degraded mode from the OutageDetector (`degraded_observed`, latched on 6 REST/WS/read_mid failures in 60s, cleared on 3 consecutive successes). xvenue-arb additionally folds in Extended's announced maintenance. Visualises the exact windows during which entries are blocked and error-watch is suppressed.",
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 144
+      },
+      "targets": [
+        {
+          "expr": "max by (instance) (pairtrade_maintenance_active{variant!=\"\"})",
+          "legendFormat": "{{instance}} (pairtrade)",
+          "refId": "A"
+        },
+        {
+          "expr": "xvenue_arb_maintenance_active{agent!=\"\"}",
+          "legendFormat": "{{agent}} (xvenue-arb)",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "color": "green",
+                  "text": "OK"
+                },
+                "1": {
+                  "color": "red",
+                  "text": "MAINTENANCE"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
     }
   ]
 }
