@@ -61,17 +61,10 @@ pub(super) async fn create_connector(
     // suffixed path.
     let mut instance_connectors: Vec<Arc<dyn DexConnector + Send + Sync>> = Vec::new();
     if cfg.strategies.len() <= 1 {
-        let conn = DexConnectorBox::create(
-            &cfg.dex_name,
-            cfg.dry_run,
-            &tokens,
-            None,
-        )
-        .await
-        .context("failed to initialize connector")?;
-        conn.start()
+        let conn = DexConnectorBox::create(&cfg.dex_name, cfg.dry_run, &tokens, None)
             .await
-            .context("failed to start connector")?;
+            .context("failed to initialize connector")?;
+        conn.start().await.context("failed to start connector")?;
         instance_connectors.push(Arc::new(conn));
     } else {
         // Lighter enforces a short-window rate limit across both /account

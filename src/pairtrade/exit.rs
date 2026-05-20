@@ -4,8 +4,8 @@ use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 
 use super::config::{PairParams, PairTradeConfig};
-use super::state::{PairSharedState, PairState, Position, PositionDirection};
 use super::market::SymbolSnapshot;
+use super::state::{PairSharedState, PairState, Position, PositionDirection};
 
 pub(super) fn exit_reason(
     cfg: &PairTradeConfig,

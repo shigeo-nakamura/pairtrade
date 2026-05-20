@@ -217,15 +217,15 @@ mod tests {
             500,
             5000,
             PositionDirection::ShortSpread,
-            dec!(0.01),    // BTC size
-            dec!(80000),   // BTC price → N_btc = $800
-            dec!(0.5),     // ETH size
-            dec!(2400),    // ETH price → N_eth = $1200
-            // For ShortSpread: long_leg=ETH (N=1200), short_leg=BTC (N=800)
-            // carry = short_sum * N_btc - long_sum * N_eth
-            //       = (0.001 + 0.0005) * 800 - (0.0002 + (-0.0001)) * 1200
-            //       = 0.0015 * 800 - 0.0001 * 1200
-            //       = 1.2 - 0.12 = 1.08
+            dec!(0.01),  // BTC size
+            dec!(80000), // BTC price → N_btc = $800
+            dec!(0.5),   // ETH size
+            dec!(2400),  // ETH price → N_eth = $1200
+                         // For ShortSpread: long_leg=ETH (N=1200), short_leg=BTC (N=800)
+                         // carry = short_sum * N_btc - long_sum * N_eth
+                         //       = (0.001 + 0.0005) * 800 - (0.0002 + (-0.0001)) * 1200
+                         //       = 0.0015 * 800 - 0.0001 * 1200
+                         //       = 1.2 - 0.12 = 1.08
         );
         assert_eq!(n, 4);
         assert!((carry - 1.08).abs() < 1e-9, "carry was {}", carry);
@@ -246,12 +246,12 @@ mod tests {
             2000,
             PositionDirection::LongSpread,
             dec!(0.01),
-            dec!(80000),  // N_btc = 800
+            dec!(80000), // N_btc = 800
             dec!(0.5),
-            dec!(2400),   // N_eth = 1200
-            // carry = short_sum * N_eth - long_sum * N_btc
-            //       = 0.0002 * 1200 - 0.001 * 800
-            //       = 0.24 - 0.8 = -0.56
+            dec!(2400), // N_eth = 1200
+                        // carry = short_sum * N_eth - long_sum * N_btc
+                        //       = 0.0002 * 1200 - 0.001 * 800
+                        //       = 0.24 - 0.8 = -0.56
         );
         assert_eq!(n, 2);
         assert!((carry - (-0.56)).abs() < 1e-9, "carry was {}", carry);
@@ -295,9 +295,9 @@ mod tests {
             close_ts,
             PositionDirection::LongSpread,
             dec!(0.02498),
-            dec!(80060.7),    // N_btc = 1999.92
+            dec!(80060.7), // N_btc = 1999.92
             dec!(0.9161),
-            dec!(2245.64),    // N_eth = 2057.13
+            dec!(2245.64), // N_eth = 2057.13
         );
         assert_eq!(n, 6);
         // Expected: carry = short_sum*N_eth - long_sum*N_btc

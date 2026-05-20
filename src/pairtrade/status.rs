@@ -2,8 +2,8 @@
 //! from the monolithic pairtrade module. The reporter writes a JSON status
 //! file consumed by the dashboard, plus an equity history JSONL.
 
-use std::collections::HashMap;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -601,18 +601,12 @@ impl StatusReporter {
         // Failures are warned but do not block the in-memory path so
         // the dashboard still gets the live event.
         if let Err(err) = self.append_risk_history_line(&event) {
-            log::warn!(
-                "[STATUS] failed to persist risk_history event: {:?}",
-                err
-            );
+            log::warn!("[STATUS] failed to persist risk_history event: {:?}", err);
         }
         self.risk_history.push_back(event);
     }
 
-    fn append_risk_history_line(
-        &self,
-        event: &RiskHistoryEvent,
-    ) -> std::io::Result<()> {
+    fn append_risk_history_line(&self, event: &RiskHistoryEvent) -> std::io::Result<()> {
         if let Some(parent) = self.risk_history_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -746,8 +740,7 @@ impl StatusReporter {
             // WS resets, account refresh failures, …). Variants that
             // never logged anything stay clean even when a sibling
             // is tripping risk halts.
-            error_summary: error_counter::global()
-                .map(|h| h.snapshot_for(self.id.as_deref())),
+            error_summary: error_counter::global().map(|h| h.snapshot_for(self.id.as_deref())),
             ws_reset_24h_count: error_counter::global()
                 .map(|h| h.ws_reset_24h_count())
                 .unwrap_or(0),

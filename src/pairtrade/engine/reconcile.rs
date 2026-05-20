@@ -39,7 +39,6 @@ use super::super::state::{PendingLeg, PendingOrders, PendingStatus, Position};
 use super::super::PairTradeEngine;
 
 impl PairTradeEngine {
-
     pub(in crate::pairtrade) async fn reconcile_pending_orders(
         &mut self,
         inst_idx: usize,
@@ -49,8 +48,7 @@ impl PairTradeEngine {
         let timeout = Duration::from_secs(self.cfg.order_timeout_secs.max(1));
         let now_ts = self.current_now_ts();
         let (pending_entry, pending_exit) = {
-            let state = self
-                .instances[inst_idx]
+            let state = self.instances[inst_idx]
                 .states
                 .get_mut(key)
                 .ok_or_else(|| anyhow!("missing state for {}", key))?;
@@ -197,12 +195,9 @@ impl PairTradeEngine {
                                 leg.limit_price
                                     .map(|d| d.to_string())
                                     .unwrap_or_else(|| "none".into()),
-                                bid.map(|d| d.to_string())
-                                    .unwrap_or_else(|| "?".into()),
-                                ask.map(|d| d.to_string())
-                                    .unwrap_or_else(|| "?".into()),
-                                tick.map(|d| d.to_string())
-                                    .unwrap_or_else(|| "?".into()),
+                                bid.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                                ask.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                                tick.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
                             )
                         })
                         .collect();
@@ -381,9 +376,8 @@ impl PairTradeEngine {
                                 if let Some(pnl) =
                                     compute_pnl(pos, p1.price, p2.price).and_then(|p| p.to_f64())
                                 {
-                                    let hold_secs = Some(
-                                        now_ts.saturating_sub(pos.entered_ts).max(0) as f64,
-                                    );
+                                    let hold_secs =
+                                        Some(now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
                                     let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
                                     let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
                                     let (carry_usd, ticks_observed) = match (
@@ -415,9 +409,12 @@ impl PairTradeEngine {
                                         pnl,
                                         now_ts,
                                         "exit_fill",
-                                    ).with_trade_details(
-                                        entry_a, entry_b,
-                                        p1.price.to_f64(), p2.price.to_f64(),
+                                    )
+                                    .with_trade_details(
+                                        entry_a,
+                                        entry_b,
+                                        p1.price.to_f64(),
+                                        p2.price.to_f64(),
                                         beta_val,
                                         pos.entry_z,
                                         z_exit,
@@ -493,11 +490,11 @@ impl PairTradeEngine {
                     if pnl_value < 0.0 {
                         self.instances[inst_idx].consecutive_losses += 1;
                         risk_state_dirty = true;
-                        if let Some(cooldown) = self
-                            .cfg
-                            .circuit_breaker_cooldown_for(self.instances[inst_idx].consecutive_losses)
-                        {
-                            self.instances[inst_idx].circuit_breaker_until = Some(Instant::now() + cooldown);
+                        if let Some(cooldown) = self.cfg.circuit_breaker_cooldown_for(
+                            self.instances[inst_idx].consecutive_losses,
+                        ) {
+                            self.instances[inst_idx].circuit_breaker_until =
+                                Some(Instant::now() + cooldown);
                             self.instances[inst_idx].circuit_breaker_until_ts =
                                 Some(now_ts + cooldown.as_secs() as i64);
                             log::warn!(
@@ -837,9 +834,7 @@ impl PairTradeEngine {
                         *filled_fees.entry(order.order_id.clone()).or_default() += fee;
                     }
                     if let Some(ts) = order.filled_ts_ms {
-                        let entry = filled_ts_ms_max
-                            .entry(order.order_id.clone())
-                            .or_insert(ts);
+                        let entry = filled_ts_ms_max.entry(order.order_id.clone()).or_insert(ts);
                         if ts > *entry {
                             *entry = ts;
                         }
@@ -950,7 +945,11 @@ impl PairTradeEngine {
                         let (ref_price_opt, order_type) = match leg.reference_price {
                             Some(rp) => (
                                 Some(rp),
-                                if leg.limit_price.is_some() { "post_only" } else { "taker" },
+                                if leg.limit_price.is_some() {
+                                    "post_only"
+                                } else {
+                                    "taker"
+                                },
                             ),
                             None => (leg.limit_price, "post_only"),
                         };
@@ -1113,10 +1112,7 @@ mod tests {
         let mut fills = HashMap::new();
         fills.insert("ord-1".to_string(), dec("0.3"));
         fills.insert("exch-9".to_string(), dec("0.7"));
-        assert_eq!(
-            PairTradeEngine::leg_fill_from_map(&l, &fills),
-            dec("0.3")
-        );
+        assert_eq!(PairTradeEngine::leg_fill_from_map(&l, &fills), dec("0.3"));
     }
 
     #[test]
@@ -1126,10 +1122,7 @@ mod tests {
         let l = leg_with_exchange("BTC", "ord-1", "exch-9", "1.0");
         let mut fills = HashMap::new();
         fills.insert("exch-9".to_string(), dec("0.5"));
-        assert_eq!(
-            PairTradeEngine::leg_fill_from_map(&l, &fills),
-            dec("0.5")
-        );
+        assert_eq!(PairTradeEngine::leg_fill_from_map(&l, &fills), dec("0.5"));
     }
 
     #[test]

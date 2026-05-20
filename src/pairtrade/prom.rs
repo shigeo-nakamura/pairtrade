@@ -50,12 +50,7 @@ fn register_int_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVe
     c
 }
 
-fn register_histogram(
-    name: &str,
-    help: &str,
-    labels: &[&str],
-    buckets: Vec<f64>,
-) -> HistogramVec {
+fn register_histogram(name: &str, help: &str, labels: &[&str], buckets: Vec<f64>) -> HistogramVec {
     let h = HistogramVec::new(HistogramOpts::new(name, help).buckets(buckets), labels)
         .expect("prometheus HistogramVec construction never fails for static names");
     REGISTRY
@@ -66,8 +61,13 @@ fn register_histogram(
 
 // === Signal / cointegration ===
 
-pub static Z: Lazy<GaugeVec> =
-    Lazy::new(|| register_gauge("pairtrade_z", "Latest z-score per pair.", &["variant", "pair"]));
+pub static Z: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_z",
+        "Latest z-score per pair.",
+        &["variant", "pair"],
+    )
+});
 
 pub static BETA: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
@@ -292,9 +292,7 @@ pub static LEG_FEE_BPS: Lazy<HistogramVec> = Lazy::new(|| {
         "Per-leg fee paid as bps of filled notional. Venues that bill no fee \
          (Lighter) typically leave this unset and emit nothing.",
         &["variant", "pair", "leg"],
-        vec![
-            0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 20.0,
-        ],
+        vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 20.0],
     )
 });
 
@@ -423,11 +421,8 @@ async fn serve(addr: SocketAddr) -> Result<()> {
             // scraping doesn't need routing precision). Use a small read
             // budget so a malicious peer can't keep the task alive.
             let mut buf = [0u8; 1024];
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                sock.read(&mut buf),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), sock.read(&mut buf)).await;
             let body = match encode_metrics() {
                 Ok(b) => b,
                 Err(e) => {

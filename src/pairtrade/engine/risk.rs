@@ -98,7 +98,10 @@ impl PairTradeEngine {
     /// `None` when the threshold is disabled (no point surfacing data
     /// nobody acts on) or no equity samples have been taken yet. See
     /// bot-strategy#185 Phase 3-1.
-    pub(in crate::pairtrade) fn session_risk_snapshot(&self, inst_idx: usize) -> Option<status::SessionRiskSnapshot> {
+    pub(in crate::pairtrade) fn session_risk_snapshot(
+        &self,
+        inst_idx: usize,
+    ) -> Option<status::SessionRiskSnapshot> {
         let threshold_bps = self.cfg.risk.max_session_loss_bps;
         if threshold_bps == 0 {
             return None;
@@ -188,7 +191,8 @@ impl PairTradeEngine {
                     if !inst.equity_initialized {
                         log::info!(
                             "[SESSION_DD] {} equity initialized: cache={:.2}",
-                            inst.id, inst.equity_cache
+                            inst.id,
+                            inst.equity_cache
                         );
                         inst.equity_initialized = true;
                     }
@@ -198,7 +202,11 @@ impl PairTradeEngine {
                 }
             }
             Err(err) => {
-                log::warn!("equity refresh failed for {}: {:?}", self.instances[inst_idx].id, err);
+                log::warn!(
+                    "equity refresh failed for {}: {:?}",
+                    self.instances[inst_idx].id,
+                    err
+                );
                 self.instances[inst_idx].last_equity_fetch = Some(Instant::now());
             }
         }
@@ -232,8 +240,12 @@ impl PairTradeEngine {
         // Collect transitions during the &mut iter so we can call
         // record_risk_event_for_instance after the loop ends (the
         // recorder needs &mut self, conflicting with the iter borrow).
-        let mut transitions: Vec<(usize, &'static str, Option<String>, Option<serde_json::Value>)> =
-            Vec::new();
+        let mut transitions: Vec<(
+            usize,
+            &'static str,
+            Option<String>,
+            Option<serde_json::Value>,
+        )> = Vec::new();
         for (inst_idx, inst) in self.instances.iter_mut().enumerate() {
             let prior_day = if inst.session_start_ts > 0 {
                 Some(session_day(inst.session_start_ts, reset_hour))
@@ -252,9 +264,7 @@ impl PairTradeEngine {
                 inst.realized_pnl_today = 0.0;
                 inst.funding_carry_today = 0.0;
                 if inst.daily_loss_halted {
-                    log::warn!(
-                        "[DAILY_DD] {} halt cleared by session rollover", inst.id
-                    );
+                    log::warn!("[DAILY_DD] {} halt cleared by session rollover", inst.id);
                     transitions.push((
                         inst_idx,
                         "cleared",
@@ -272,7 +282,8 @@ impl PairTradeEngine {
                 } else {
                     log::info!(
                         "[DAILY_DD] {} session initialised: session_start_equity={:.2}",
-                        inst.id, equity_base
+                        inst.id,
+                        equity_base
                     );
                 }
             }
@@ -292,8 +303,7 @@ impl PairTradeEngine {
                     loss_bps >= effective_threshold_bps
                 };
             if currently_blocks && !inst.daily_loss_halted {
-                let loss_bps =
-                    (-inst.realized_pnl_today / inst.session_start_equity) * 10_000.0;
+                let loss_bps = (-inst.realized_pnl_today / inst.session_start_equity) * 10_000.0;
                 log::warn!(
                     "[DAILY_DD] {} halted: realized_pnl_today={:.4} loss_bps={:.1} threshold={}bps × leverage={:.1} = effective={:.1}bps (new entries blocked until UTC {:02}:00)",
                     inst.id, inst.realized_pnl_today, loss_bps, threshold_bps, leverage, effective_threshold_bps, reset_hour
@@ -322,13 +332,7 @@ impl PairTradeEngine {
             }
         }
         for (inst_idx, event_type, reason, detail) in transitions {
-            self.record_risk_event_for_instance(
-                inst_idx,
-                "daily_dd",
-                event_type,
-                reason,
-                detail,
-            );
+            self.record_risk_event_for_instance(inst_idx, "daily_dd", event_type, reason, detail);
         }
         if dirty {
             self.persist_risk_state();
@@ -470,7 +474,10 @@ impl PairTradeEngine {
         let mut cleared_indices: Vec<(usize, String)> = Vec::new();
         for (inst_idx, inst) in self.instances.iter_mut().enumerate() {
             if inst.session_halted {
-                let prior_reason = inst.session_halt_reason.clone().unwrap_or_else(|| "unknown".to_string());
+                let prior_reason = inst
+                    .session_halt_reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
                 log::warn!(
                     "[SESSION_DD] {} halt cleared by ack at {} (reason was: {}, ack payload: {:?})",
                     inst.id,
@@ -500,7 +507,11 @@ impl PairTradeEngine {
             );
         }
         if let Err(e) = std::fs::remove_file(path) {
-            log::warn!("[SESSION_DD] failed to remove {} after ack: {:?}", RISK_ACK_PATH, e);
+            log::warn!(
+                "[SESSION_DD] failed to remove {} after ack: {:?}",
+                RISK_ACK_PATH,
+                e
+            );
         } else {
             log::info!("[SESSION_DD] {} consumed", RISK_ACK_PATH);
         }
@@ -552,10 +563,8 @@ impl PairTradeEngine {
             }
         }
         if !replaced {
-            inst.equity_samples.push(risk_io::EquitySample {
-                ts: now_ts,
-                equity,
-            });
+            inst.equity_samples
+                .push(risk_io::EquitySample { ts: now_ts, equity });
         }
         let pre_len = inst.equity_samples.len();
         inst.equity_samples.retain(|s| s.ts >= cutoff);
@@ -563,7 +572,9 @@ impl PairTradeEngine {
         if pruned > 0 {
             log::debug!(
                 "[SESSION_DD] {} pruned {} expired equity samples (window {}s)",
-                inst.id, pruned, lookback
+                inst.id,
+                pruned,
+                lookback
             );
         }
         // Persistence is cheap (atomic rename of a small JSON file) but
@@ -644,10 +655,7 @@ impl PairTradeEngine {
             return false;
         }
         let now_ts = self.current_now_ts();
-        let reason = format!(
-            "session_dd_{}bps_lev{:.1}",
-            threshold_bps, leverage
-        );
+        let reason = format!("session_dd_{}bps_lev{:.1}", threshold_bps, leverage);
         log::error!(
             "[SESSION_DD] {} breach: equity={:.2} peak={:.2} dd_bps={:.1} threshold={}bps × leverage={:.1} = effective={:.1}bps; flattening positions and halting (ack via {})",
             inst.id, current, peak, dd_bps, threshold_bps, leverage, effective_threshold_bps, RISK_ACK_PATH
@@ -771,14 +779,21 @@ mod tests {
     fn session_day_midnight_reset_same_bucket_before_boundary() {
         let a = session_day(TS_2026_04_23_18_29, 0);
         let b = session_day(TS_2026_04_23_23_59, 0);
-        assert_eq!(a, b, "timestamps within the same UTC day should share bucket");
+        assert_eq!(
+            a, b,
+            "timestamps within the same UTC day should share bucket"
+        );
     }
 
     #[test]
     fn session_day_midnight_reset_boundary_crosses() {
         let before = session_day(TS_2026_04_23_23_59, 0);
         let after = session_day(TS_2026_04_24_00_00, 0);
-        assert_eq!(after - before, 1, "UTC midnight should advance bucket by exactly 1");
+        assert_eq!(
+            after - before,
+            1,
+            "UTC midnight should advance bucket by exactly 1"
+        );
     }
 
     #[test]
@@ -807,7 +822,11 @@ mod tests {
 
     #[test]
     fn rolling_peak_picks_max_across_samples_and_current() {
-        let s = vec![sample(100, 1_000.0), sample(200, 1_500.0), sample(300, 1_200.0)];
+        let s = vec![
+            sample(100, 1_000.0),
+            sample(200, 1_500.0),
+            sample(300, 1_200.0),
+        ];
         let (peak, dd) = PairTradeEngine::rolling_peak(&s, 900.0).unwrap();
         assert_eq!(peak, 1_500.0);
         // (1500 - 900)/1500 * 10000 = 4000 bps
@@ -944,9 +963,7 @@ mod tests {
 
     #[test]
     fn risk_state_path_falls_back_to_cwd_for_bare_filename() {
-        let p = risk_state_path_for(std::path::Path::new(
-            "pairtrade_history_BTC_ETH.json",
-        ));
+        let p = risk_state_path_for(std::path::Path::new("pairtrade_history_BTC_ETH.json"));
         assert_eq!(p, std::path::PathBuf::from("risk_state.json"));
     }
 

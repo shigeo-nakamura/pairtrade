@@ -34,10 +34,10 @@ mod stats;
 mod status;
 mod util;
 use bar::BarBuilder;
+pub use config::{PairTradeConfig, WarmStartMode};
 use market::SymbolSnapshot;
 use pnl_log::{PnlLogRecord, PnlLogger};
 use stats::PriceSample;
-pub use config::{PairTradeConfig, WarmStartMode};
 
 /// Spawn the Prometheus exporter when `PROM_LISTEN` is set in the env.
 /// Safe to call at most once at process boot from `main`. See
@@ -46,16 +46,16 @@ pub fn start_metrics_exporter() {
     prom::maybe_start_exporter();
 }
 use config::PairParams;
-use state::{PairSharedState, PairState, PositionDirection};
 #[cfg(test)]
 use config::PairSpec;
 #[cfg(test)]
 use defaults::*;
+use engine::risk::risk_state_path_for;
+use state::{PairSharedState, PairState, PositionDirection};
 #[cfg(test)]
 use state::{PendingLeg, PendingOrders};
 use status::{PairTradeStats, StatusReporter};
 use util::{enforce_post_only_passive, round_price_by_tick, tail_std};
-use engine::risk::risk_state_path_for;
 
 /// Max age of the per-instance equity cache before `refresh_equity_if_needed`
 /// fetches a fresh value from the exchange. Now a low-frequency dashboard tick:
@@ -384,9 +384,7 @@ impl PairTradeEngine {
             let mut states = HashMap::new();
             for pair in &cfg.universe {
                 let pair_key = format!("{}/{}", pair.base, pair.quote);
-                let pp = inst_pair_params
-                    .get(&pair_key)
-                    .unwrap_or(&inst_default);
+                let pp = inst_pair_params.get(&pair_key).unwrap_or(&inst_default);
                 let ps = PairState::new(pp.entry_z_base);
                 prom::init_close_reason_series(&strategy.id, &pair_key);
                 states.insert(pair_key, ps);
@@ -396,8 +394,7 @@ impl PairTradeEngine {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| connector.clone());
-            let pnl_logger =
-                PnlLogger::from_env_for_instance(&cfg, &strategy.id, multi_instance);
+            let pnl_logger = PnlLogger::from_env_for_instance(&cfg, &strategy.id, multi_instance);
             let mut status_reporter =
                 StatusReporter::from_env_for_instance(&cfg, &strategy.id, multi_instance);
             if let Some(reporter) = status_reporter.as_mut() {
@@ -420,8 +417,7 @@ impl PairTradeEngine {
             let last_equity_fetch = if i == 0 || instance_count <= 1 {
                 None
             } else {
-                let offset_secs =
-                    (EQUITY_REFRESH_CACHE_SECS * i as u64) / instance_count as u64;
+                let offset_secs = (EQUITY_REFRESH_CACHE_SECS * i as u64) / instance_count as u64;
                 let phase = EQUITY_REFRESH_CACHE_SECS.saturating_sub(offset_secs);
                 Some(Instant::now() - Duration::from_secs(phase))
             };
@@ -505,9 +501,10 @@ impl PairTradeEngine {
             return self.open_positions.is_empty();
         }
         self.open_positions.is_empty()
-            && self.instances.iter().all(|inst| {
-                inst.states.values().all(|s| s.position.is_none())
-            })
+            && self
+                .instances
+                .iter()
+                .all(|inst| inst.states.values().all(|s| s.position.is_none()))
     }
 
     /// Total open-position count surfaced in shutdown log lines. Mirrors
@@ -522,7 +519,12 @@ impl PairTradeEngine {
         let from_states: usize = self
             .instances
             .iter()
-            .map(|inst| inst.states.values().filter(|s| s.position.is_some()).count())
+            .map(|inst| {
+                inst.states
+                    .values()
+                    .filter(|s| s.position.is_some())
+                    .count()
+            })
             .sum();
         from_states.max(self.open_positions.len())
     }
@@ -534,7 +536,9 @@ impl PairTradeEngine {
     /// `exit_z` / `stop_loss_z` / `max_loss_r_mult`.
     fn pair_params_for(&self, inst_idx: usize, key: &str) -> &PairParams {
         let inst = &self.instances[inst_idx];
-        inst.pair_params.get(key).unwrap_or(&inst.default_pair_params)
+        inst.pair_params
+            .get(key)
+            .unwrap_or(&inst.default_pair_params)
     }
 
     fn write_pnl_record(&mut self, inst_idx: usize, record: PnlLogRecord) {
@@ -557,7 +561,9 @@ impl PairTradeEngine {
         if let Some(reporter) = &mut inst.status_reporter {
             let wr = if inst.total_trades > 0 {
                 inst.total_wins as f64 / inst.total_trades as f64 * 100.0
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             reporter.trade_stats = Some(PairTradeStats {
                 trades: inst.total_trades,
                 wins: inst.total_wins,
@@ -574,32 +580,12 @@ impl PairTradeEngine {
         }
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     fn latest_log_price(&self, symbol: &str) -> Option<f64> {
         self.history
             .get(symbol)
             .and_then(|h| h.back())
             .map(|p| p.log_price)
     }
-
-
-
-
 
     fn clear_stale_pending(&mut self, inst_idx: usize, max_age: Duration, reason: &str) {
         let now_ts = self.current_now_ts();
@@ -662,7 +648,9 @@ impl PairTradeEngine {
         }
         let mut lines = Vec::new();
         for (k, _) in &self.instances[inst_idx].states {
-            let Some(shared) = self.per_pair_state.get(k) else { continue };
+            let Some(shared) = self.per_pair_state.get(k) else {
+                continue;
+            };
             let z = shared.z_score().map(|(z, _)| z).unwrap_or(0.0);
             lines.push(format!(
                 "{} elig={} z={:.2} beta={:.2} hl={:.2}h p={:.3}",
@@ -686,17 +674,30 @@ impl PairTradeEngine {
         let now_ts = chrono::Utc::now().timestamp();
         // --- per-pair gauges ---
         for (key, state) in &inst.states {
-            let pp = inst.pair_params.get(key).unwrap_or(&inst.default_pair_params);
+            let pp = inst
+                .pair_params
+                .get(key)
+                .unwrap_or(&inst.default_pair_params);
             let shared = self.per_pair_state.get(key);
-            let z = shared.and_then(|s| s.z_score().map(|(z, _)| z)).unwrap_or(0.0);
+            let z = shared
+                .and_then(|s| s.z_score().map(|(z, _)| z))
+                .unwrap_or(0.0);
             let labels = [instance, key.as_str()];
             prom::Z.with_label_values(&labels).set(z);
-            prom::BETA.with_label_values(&labels).set(shared.map(|s| s.beta).unwrap_or(1.0));
-            prom::BETA_S.with_label_values(&labels).set(shared.map(|s| s.beta_short).unwrap_or(1.0));
-            prom::BETA_L.with_label_values(&labels).set(shared.map(|s| s.beta_long).unwrap_or(1.0));
-            prom::BETA_DIVERGENCE
+            prom::BETA
                 .with_label_values(&labels)
-                .set(shared.map(|s| (s.beta_short - s.beta_long).abs()).unwrap_or(0.0));
+                .set(shared.map(|s| s.beta).unwrap_or(1.0));
+            prom::BETA_S
+                .with_label_values(&labels)
+                .set(shared.map(|s| s.beta_short).unwrap_or(1.0));
+            prom::BETA_L
+                .with_label_values(&labels)
+                .set(shared.map(|s| s.beta_long).unwrap_or(1.0));
+            prom::BETA_DIVERGENCE.with_label_values(&labels).set(
+                shared
+                    .map(|s| (s.beta_short - s.beta_long).abs())
+                    .unwrap_or(0.0),
+            );
             prom::BETA_GAP_RELATIVE
                 .with_label_values(&labels)
                 .set(shared.map(|s| s.beta_gap).unwrap_or(0.0));
@@ -706,12 +707,17 @@ impl PairTradeEngine {
             prom::ADF_PVALUE
                 .with_label_values(&labels)
                 .set(shared.map(|s| s.adf_p_value).unwrap_or(1.0));
-            prom::ELIGIBLE
-                .with_label_values(&labels)
-                .set(if shared.map(|s| s.eligible).unwrap_or(false) { 1 } else { 0 });
+            prom::ELIGIBLE.with_label_values(&labels).set(
+                if shared.map(|s| s.eligible).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            );
             let mut effective = state.z_entry;
             if pp.beta_gap_entry_z_scale > 0.0 {
-                effective *= 1.0 + pp.beta_gap_entry_z_scale * shared.map(|s| s.beta_gap).unwrap_or(0.0);
+                effective *=
+                    1.0 + pp.beta_gap_entry_z_scale * shared.map(|s| s.beta_gap).unwrap_or(0.0);
             }
             prom::ENTRY_Z_THRESHOLD_EFFECTIVE
                 .with_label_values(&labels)
@@ -726,7 +732,9 @@ impl PairTradeEngine {
                 }
             } else {
                 prom::HAS_POSITION.with_label_values(&labels).set(0);
-                prom::POSITION_AGE_SECONDS.with_label_values(&labels).set(0.0);
+                prom::POSITION_AGE_SECONDS
+                    .with_label_values(&labels)
+                    .set(0.0);
             }
             let since_exit = match state.last_exit_ts {
                 Some(ts) => (now_ts - ts).max(0) as f64,
@@ -813,27 +821,6 @@ impl PairTradeEngine {
         snapshot.size < min_order
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     fn entry_vol_window(&self) -> usize {
         ((self.cfg.default_pair_params.entry_vol_lookback_hours * 3600)
             / self.cfg.trading_period_secs)
@@ -869,19 +856,6 @@ impl PairTradeEngine {
         }
         max_needed.max(self.cfg.metrics_window)
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     fn post_only_supported(&self) -> bool {
         let dex = self.cfg.dex_name.to_ascii_lowercase();
@@ -1099,12 +1073,6 @@ impl PairTradeEngine {
         rounded
     }
 
-
-
-
-
-
-
     async fn fetch_latest_prices(&mut self) -> Result<HashMap<String, SymbolSnapshot>> {
         let symbols: Vec<String> = self
             .cfg
@@ -1120,10 +1088,8 @@ impl PairTradeEngine {
         for sym in symbols.iter().cloned() {
             let conn = connector.clone();
             join_set.spawn(async move {
-                let (ticker_res, ob_res) = tokio::join!(
-                    conn.get_ticker(&sym, None),
-                    conn.get_order_book(&sym, 1),
-                );
+                let (ticker_res, ob_res) =
+                    tokio::join!(conn.get_ticker(&sym, None), conn.get_order_book(&sym, 1),);
                 (sym, ticker_res, ob_res)
             });
         }
@@ -1154,18 +1120,10 @@ impl PairTradeEngine {
                     }
                     if engine::error_class::is_ticker_rate_limited(&e, &msg) {
                         if self.should_log_ticker_warn(&symbol) {
-                            log::warn!(
-                                "ticker {} rate-limited (cooling down): {}",
-                                symbol,
-                                msg
-                            );
+                            log::warn!("ticker {} rate-limited (cooling down): {}", symbol, msg);
                             self.last_ticker_warn.insert(symbol.clone(), Instant::now());
                         } else {
-                            log::debug!(
-                                "ticker {} rate-limited (cooling down): {}",
-                                symbol,
-                                msg
-                            );
+                            log::debug!("ticker {} rate-limited (cooling down): {}", symbol, msg);
                         }
                         continue;
                     }
@@ -1395,19 +1353,12 @@ impl PairTradeEngine {
     }
 }
 
-
-
-
-
-
-
-
-
-
 #[cfg(test)]
 mod tests {
+    use super::util::{
+        enforce_post_only_passive, quantize_size_by_step, quantize_size_by_step_ceiling,
+    };
     use super::*;
-    use super::util::{enforce_post_only_passive, quantize_size_by_step, quantize_size_by_step_ceiling};
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
@@ -1458,7 +1409,8 @@ mod tests {
         let rounded = dec("2315.5");
         let touch = dec("2315.5");
         let tick = dec("0.1");
-        let limit = enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Short);
+        let limit =
+            enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Short);
         assert_eq!(limit, dec("2315.6"));
     }
 
@@ -1477,7 +1429,8 @@ mod tests {
         let rounded = dec("2315.6");
         let touch = dec("2315.5");
         let tick = dec("0.1");
-        let limit = enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Short);
+        let limit =
+            enforce_post_only_passive(rounded, touch, tick, dex_connector::OrderSide::Short);
         assert_eq!(limit, dec("2315.6"));
     }
 
@@ -1504,13 +1457,8 @@ mod tests {
 
     // bot-strategy#258: Extended reduce-only error classification
 
-
-
     // bot-strategy#281: classify Lighter REST 429 / DexError::RateLimited so
     // the step skips quietly instead of erroring out per cycle.
-
-
-
 
     #[test]
     fn quantize_size_by_step_uses_size_decimals() {
@@ -1543,14 +1491,7 @@ mod tests {
     // 2026-04-23 23:59:55 UTC — 1745452795 — still Thu of day 20203
     const TS_2026_04_23_23_59: i64 = 1_745_452_795;
 
-
-
-
     // bot-strategy#185 Phase 3-1: rolling-peak DD calculations.
-
-
-
-
 
     // bot-strategy#185 leverage-neutralization amendment:
     // `max_daily_loss_bps` and `max_session_loss_bps` are interpreted as
@@ -1558,15 +1499,6 @@ mod tests {
     // comparison time. Same YAML value should produce the same trip
     // behaviour at any leverage, so changing leverage doesn't silently
     // relax the gates.
-
-
-
-
-
-
-
-
-
 
     // bot-strategy#320: trade-stats fields round-trip through risk_state.json.
 
@@ -1590,8 +1522,6 @@ mod tests {
         assert_eq!(snapshot.version, 2);
     }
 
-
-
     // bot-strategy#259: defensive cap on exit qty when exchange position
     // size momentarily over-reports vs the bot-recorded entry size after
     // partial-fill retry recovery on Tokyo Extended LongSpread.
@@ -1600,7 +1530,11 @@ mod tests {
         let exch = Some(dec("0.092"));
         let recorded = Some(dec("0.046"));
         let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", exch, recorded);
-        assert_eq!(q, dec("0.046"), "must cap to recorded entry size when exchange is 2x");
+        assert_eq!(
+            q,
+            dec("0.046"),
+            "must cap to recorded entry size when exchange is 2x"
+        );
     }
 
     #[test]
@@ -1648,7 +1582,11 @@ mod tests {
         let exch = Some(dec("0.020"));
         let recorded = Some(dec("0.046"));
         let q = PairTradeEngine::cap_exit_qty("BTC/ETH", "ETH", exch, recorded);
-        assert_eq!(q, dec("0.020"), "exchange-side close already happened; trust the smaller residual");
+        assert_eq!(
+            q,
+            dec("0.020"),
+            "exchange-side close already happened; trust the smaller residual"
+        );
     }
 
     fn make_leg(symbol: &str, target: Decimal) -> PendingLeg {
@@ -1670,7 +1608,10 @@ mod tests {
     // entry_size_a/b and breaks the cap_exit_qty invariant.
     #[test]
     fn sum_entry_sizes_simple_one_leg_per_symbol() {
-        let legs = vec![make_leg("BTC", dec("0.0013")), make_leg("ETH", dec("0.046"))];
+        let legs = vec![
+            make_leg("BTC", dec("0.0013")),
+            make_leg("ETH", dec("0.046")),
+        ];
         let (a, b) = PairTradeEngine::sum_entry_sizes_by_symbol(&legs, "BTC", "ETH");
         assert_eq!(a, Some(dec("0.0013")));
         assert_eq!(b, Some(dec("0.046")));
@@ -2059,9 +2000,8 @@ mod pending_tests {
         let connector = Arc::new(DummyConnector::default());
         *connector.balance_equity.lock().unwrap() = Some(dec("1234.56"));
         let mut engine = PairTradeEngine::test_instance(connector.clone());
-        engine.instances[0].last_equity_fetch = Some(
-            Instant::now() - Duration::from_secs(EQUITY_REFRESH_CACHE_SECS + 1),
-        );
+        engine.instances[0].last_equity_fetch =
+            Some(Instant::now() - Duration::from_secs(EQUITY_REFRESH_CACHE_SECS + 1));
 
         engine.refresh_equity_if_needed(0).await.unwrap();
 
@@ -2114,9 +2054,10 @@ mod pending_tests {
         let now_ts = engine.current_now_ts();
         {
             let inst = &mut engine.instances[0];
-            inst.equity_samples = vec![
-                risk_io::EquitySample { ts: now_ts - 60, equity: 1003.45 },
-            ];
+            inst.equity_samples = vec![risk_io::EquitySample {
+                ts: now_ts - 60,
+                equity: 1003.45,
+            }];
             inst.equity_cache = 500.0;
             inst.equity_initialized = false;
             inst.session_halted = false;
@@ -2127,7 +2068,10 @@ mod pending_tests {
         // threshold of 5000 bps and trip the halt. The gate must
         // suppress the evaluation entirely.
         let halted = engine.evaluate_session_dd(0).await;
-        assert!(!halted, "session_dd must not trip while equity_initialized=false");
+        assert!(
+            !halted,
+            "session_dd must not trip while equity_initialized=false"
+        );
         assert!(!engine.instances[0].session_halted);
         assert!(engine.instances[0].session_halt_reason.is_none());
 
@@ -2153,14 +2097,19 @@ mod pending_tests {
             inst.equity_initialized = true;
         }
         let halted = engine.evaluate_session_dd(0).await;
-        assert!(!halted, "real equity ($1000.84 vs peak $1003.45) is well below threshold");
+        assert!(
+            !halted,
+            "real equity ($1000.84 vs peak $1003.45) is well below threshold"
+        );
         assert!(!engine.instances[0].session_halted);
 
         // The snapshot now exposes the real, non-phantom DD reading,
         // computed against the persisted peak. Check this before
         // `update_equity_sample` runs so the hourly-bucket replacement
         // in the sampler does not rewrite the persisted entry.
-        let snapshot = engine.session_risk_snapshot(0).expect("snapshot should exist post-init");
+        let snapshot = engine
+            .session_risk_snapshot(0)
+            .expect("snapshot should exist post-init");
         assert!((snapshot.current_equity - 1000.84).abs() < 1e-6);
         assert!((snapshot.peak_equity - 1003.45).abs() < 1e-6);
         assert!(snapshot.dd_bps < 100.0);
@@ -2169,8 +2118,7 @@ mod pending_tests {
         // the persisted entry if it falls in the same bucket).
         engine.update_equity_sample(0);
         assert!(
-            engine
-                .instances[0]
+            engine.instances[0]
                 .equity_samples
                 .iter()
                 .any(|s| (s.equity - 1000.84).abs() < 1e-6),
@@ -2283,7 +2231,10 @@ mod pending_tests {
                 session_start_equity: 1234.5,
                 session_start_ts: 4242,
                 realized_pnl_today: -12.0,
-                equity_samples: vec![risk_io::EquitySample { ts: 10, equity: 100.0 }],
+                equity_samples: vec![risk_io::EquitySample {
+                    ts: 10,
+                    equity: 100.0,
+                }],
                 session_halted: true,
                 session_halt_reason: Some("session_dd_500bps".to_string()),
                 session_halt_ts: Some(8888),
@@ -2399,10 +2350,9 @@ mod pending_tests {
         // Inserts an empty PairState for `key` on instance 0 + an empty
         // PairSharedState on the engine so the reconcile loop can find both.
         // Mirrors the production state-build path in `new_inner`.
-        engine.instances[0].states.insert(
-            key.to_string(),
-            state::PairState::new(2.0),
-        );
+        engine.instances[0]
+            .states
+            .insert(key.to_string(), state::PairState::new(2.0));
         engine
             .per_pair_state
             .entry(key.to_string())
@@ -2543,7 +2493,10 @@ mod pending_tests {
         );
 
         let state_ref = engine.instances[0].states.get("AAA/BBB").unwrap();
-        assert!(state_ref.pending_entry.is_none(), "exit must not touch pending_entry");
+        assert!(
+            state_ref.pending_entry.is_none(),
+            "exit must not touch pending_entry"
+        );
         let pending = state_ref
             .pending_exit
             .as_ref()
@@ -2716,7 +2669,11 @@ mod shutdown_grace_tests {
             }
             let max_fc = std::iter::once(cfg.default_pair_params.force_close_secs)
                 .chain(cfg.pair_params.values().map(|p| p.force_close_secs))
-                .chain(cfg.strategies.iter().filter_map(|s| s.force_close_time_secs))
+                .chain(
+                    cfg.strategies
+                        .iter()
+                        .filter_map(|s| s.force_close_time_secs),
+                )
                 .max()
                 .expect("at least default_pair_params.force_close_secs");
             let required = max_fc + BUFFER_SECS;

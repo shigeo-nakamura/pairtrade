@@ -599,7 +599,8 @@ fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig> {
         }
         Some(other) => {
             return Err(anyhow!(
-                "risk.max_daily_loss_action: unknown value '{}'", other
+                "risk.max_daily_loss_action: unknown value '{}'",
+                other
             ));
         }
     };
@@ -627,9 +628,7 @@ fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig> {
         .session_dd_sample_secs
         .unwrap_or(DEFAULT_SESSION_DD_SAMPLE_SECS);
     if sample_secs == 0 {
-        return Err(anyhow!(
-            "risk.session_dd_sample_secs must be > 0"
-        ));
+        return Err(anyhow!("risk.session_dd_sample_secs must be > 0"));
     }
     let lookback_secs = y
         .session_dd_lookback_secs
@@ -854,7 +853,7 @@ impl PairTradeConfig {
             bt_warm_start_snapshot: None, // env-only, not in YAML
             bt_eval_timestamps: None,     // env-only, not in YAML
             bt_restart_timestamps: None,  // env-only, not in YAML
-            bt_fill_delay_secs: 0,         // env-only, not in YAML
+            bt_fill_delay_secs: 0,        // env-only, not in YAML
             shutdown_grace_secs: yaml
                 .shutdown_grace_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
@@ -865,10 +864,14 @@ impl PairTradeConfig {
             kalman_q: yaml.kalman_q.unwrap_or(DEFAULT_KALMAN_Q),
             kalman_r: yaml.kalman_r.unwrap_or(DEFAULT_KALMAN_R),
             kalman_initial_p: yaml.kalman_initial_p.unwrap_or(DEFAULT_KALMAN_INITIAL_P),
-            kalman_min_updates: yaml.kalman_min_updates.unwrap_or(DEFAULT_KALMAN_MIN_UPDATES),
+            kalman_min_updates: yaml
+                .kalman_min_updates
+                .unwrap_or(DEFAULT_KALMAN_MIN_UPDATES),
             regime_vol_window: yaml.regime_vol_window.unwrap_or(DEFAULT_REGIME_VOL_WINDOW),
             regime_vol_max: yaml.regime_vol_max.unwrap_or(DEFAULT_REGIME_VOL_MAX),
-            regime_trend_window: yaml.regime_trend_window.unwrap_or(DEFAULT_REGIME_TREND_WINDOW),
+            regime_trend_window: yaml
+                .regime_trend_window
+                .unwrap_or(DEFAULT_REGIME_TREND_WINDOW),
             regime_trend_max: yaml.regime_trend_max.unwrap_or(DEFAULT_REGIME_TREND_MAX),
             regime_reference_symbol: yaml
                 .regime_reference_symbol
@@ -1031,14 +1034,18 @@ impl PairTradeConfig {
             observe_only,
             disable_history_persist,
             history_file,
-            history_archive_dir: env::var("HISTORY_ARCHIVE_DIR").ok().filter(|v| !v.trim().is_empty()),
+            history_archive_dir: env::var("HISTORY_ARCHIVE_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             history_archive_retention_days: env::var("HISTORY_ARCHIVE_RETENTION_DAYS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(360),
             backtest_mode,
             backtest_file,
-            bt_warm_start_snapshot: env::var("BT_WARM_START_SNAPSHOT").ok().filter(|v| !v.trim().is_empty()),
+            bt_warm_start_snapshot: env::var("BT_WARM_START_SNAPSHOT")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             bt_eval_timestamps: load_bt_eval_timestamps(),
             bt_restart_timestamps: load_bt_restart_timestamps(),
             bt_fill_delay_secs: env::var("BT_FILL_DELAY_SECS")
@@ -1114,27 +1121,66 @@ impl PairTradeConfig {
         env_override("INTERVAL_SECS", &mut self.interval_secs);
         env_override("TRADING_PERIOD_SECS", &mut self.trading_period_secs);
         env_override("METRICS_WINDOW_LENGTH", &mut self.metrics_window);
-        env_override("ENTRY_Z_SCORE_BASE", &mut self.default_pair_params.entry_z_base);
-        env_override("ENTRY_Z_SCORE_MIN", &mut self.default_pair_params.entry_z_min);
-        env_override("ENTRY_Z_SCORE_MAX", &mut self.default_pair_params.entry_z_max);
+        env_override(
+            "ENTRY_Z_SCORE_BASE",
+            &mut self.default_pair_params.entry_z_base,
+        );
+        env_override(
+            "ENTRY_Z_SCORE_MIN",
+            &mut self.default_pair_params.entry_z_min,
+        );
+        env_override(
+            "ENTRY_Z_SCORE_MAX",
+            &mut self.default_pair_params.entry_z_max,
+        );
         env_override("EXIT_Z_SCORE", &mut self.default_pair_params.exit_z);
-        env_override("STOP_LOSS_Z_SCORE", &mut self.default_pair_params.stop_loss_z);
-        env_override("FORCE_CLOSE_TIME_SECS", &mut self.default_pair_params.force_close_secs);
+        env_override(
+            "STOP_LOSS_Z_SCORE",
+            &mut self.default_pair_params.stop_loss_z,
+        );
+        env_override(
+            "FORCE_CLOSE_TIME_SECS",
+            &mut self.default_pair_params.force_close_secs,
+        );
         env_override("COOLDOWN_SECS", &mut self.default_pair_params.cooldown_secs);
         env_override(
             "STOP_LOSS_COOLDOWN_SECS",
             &mut self.default_pair_params.stop_loss_cooldown_secs,
         );
-        env_override("NET_FUNDING_MIN_PER_HOUR", &mut self.net_funding_min_per_hour);
-        env_override("SPREAD_VELOCITY_MAX_SIGMA_PER_MIN", &mut self.default_pair_params.spread_velocity_max_sigma_per_min);
+        env_override(
+            "NET_FUNDING_MIN_PER_HOUR",
+            &mut self.net_funding_min_per_hour,
+        );
+        env_override(
+            "SPREAD_VELOCITY_MAX_SIGMA_PER_MIN",
+            &mut self.default_pair_params.spread_velocity_max_sigma_per_min,
+        );
         env_override("RISK_PCT_PER_TRADE", &mut self.risk_pct_per_trade);
-        env_override("MAX_LOSS_R_MULT", &mut self.default_pair_params.max_loss_r_mult);
+        env_override(
+            "MAX_LOSS_R_MULT",
+            &mut self.default_pair_params.max_loss_r_mult,
+        );
         env_override("EQUITY_REFERENCE_USD", &mut self.equity_reference_usd);
-        env_override("PAIR_SELECTION_LOOKBACK_HOURS_SHORT", &mut self.default_pair_params.lookback_hours_short);
-        env_override("PAIR_SELECTION_LOOKBACK_HOURS_LONG", &mut self.default_pair_params.lookback_hours_long);
-        env_override("HALF_LIFE_MAX_HOURS", &mut self.default_pair_params.half_life_max_hours);
-        env_override("ADF_P_THRESHOLD", &mut self.default_pair_params.adf_p_threshold);
-        env_override("ENTRY_VOL_LOOKBACK_HOURS", &mut self.default_pair_params.entry_vol_lookback_hours);
+        env_override(
+            "PAIR_SELECTION_LOOKBACK_HOURS_SHORT",
+            &mut self.default_pair_params.lookback_hours_short,
+        );
+        env_override(
+            "PAIR_SELECTION_LOOKBACK_HOURS_LONG",
+            &mut self.default_pair_params.lookback_hours_long,
+        );
+        env_override(
+            "HALF_LIFE_MAX_HOURS",
+            &mut self.default_pair_params.half_life_max_hours,
+        );
+        env_override(
+            "ADF_P_THRESHOLD",
+            &mut self.default_pair_params.adf_p_threshold,
+        );
+        env_override(
+            "ENTRY_VOL_LOOKBACK_HOURS",
+            &mut self.default_pair_params.entry_vol_lookback_hours,
+        );
         if let Ok(value) = env::var("SLIPPAGE_BPS") {
             if let Ok(parsed) = value.parse::<i32>() {
                 self.slippage_bps = parsed;
@@ -1142,8 +1188,14 @@ impl PairTradeConfig {
         }
         env_override("FEE_BPS", &mut self.fee_bps);
         env_override("MAX_LEVERAGE", &mut self.max_leverage);
-        env_override("REEVAL_JUMP_Z_MULT", &mut self.default_pair_params.reeval_jump_z_mult);
-        env_override("VOL_SPIKE_MULT", &mut self.default_pair_params.vol_spike_mult);
+        env_override(
+            "REEVAL_JUMP_Z_MULT",
+            &mut self.default_pair_params.reeval_jump_z_mult,
+        );
+        env_override(
+            "VOL_SPIKE_MULT",
+            &mut self.default_pair_params.vol_spike_mult,
+        );
         env_override("MAX_ACTIVE_PAIRS", &mut self.max_active_pairs);
         env_override("WARM_START_MODE", &mut self.warm_start_mode);
         let mut warm_start_min_overridden = false;
@@ -1161,7 +1213,10 @@ impl PairTradeConfig {
             self.default_pair_params.warm_start_min_bars = self.metrics_window;
         }
         env_override("ORDER_TIMEOUT_SECS", &mut self.order_timeout_secs);
-        env_override("ENTRY_PARTIAL_FILL_MAX_RETRIES", &mut self.entry_partial_fill_max_retries);
+        env_override(
+            "ENTRY_PARTIAL_FILL_MAX_RETRIES",
+            &mut self.entry_partial_fill_max_retries,
+        );
         if let Ok(value) = env::var("STARTUP_FORCE_CLOSE_ATTEMPTS") {
             if let Ok(parsed) = value.parse::<u32>() {
                 if parsed > 0 {
@@ -1255,17 +1310,50 @@ impl PairTradeConfig {
         }
         env_override("BT_FILL_DELAY_SECS", &mut self.bt_fill_delay_secs);
 
-        env_override("SPREAD_TREND_MAX_SLOPE_SIGMA", &mut self.default_pair_params.spread_trend_max_slope_sigma);
-        env_override("BETA_DIVERGENCE_MAX", &mut self.default_pair_params.beta_divergence_max);
-        env_override("CIRCUIT_BREAKER_TIER1_LOSSES", &mut self.default_pair_params.circuit_breaker_tier1_losses);
-        env_override("CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS", &mut self.default_pair_params.circuit_breaker_tier1_cooldown_secs);
-        env_override("CIRCUIT_BREAKER_TIER2_LOSSES", &mut self.default_pair_params.circuit_breaker_tier2_losses);
-        env_override("CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS", &mut self.default_pair_params.circuit_breaker_tier2_cooldown_secs);
-        env_override("ENTRY_POST_ONLY_TIMEOUT_SECS", &mut self.default_pair_params.entry_post_only_timeout_secs);
-        env_override("EXIT_POST_ONLY_TIMEOUT_SECS", &mut self.default_pair_params.exit_post_only_timeout_secs);
-        env_override("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", &mut self.default_pair_params.entry_velocity_block_sigma_per_min);
-        env_override("FUNDING_ENTRY_Z_SCALE", &mut self.default_pair_params.funding_entry_z_scale);
-        env_override("BETA_GAP_ENTRY_Z_SCALE", &mut self.default_pair_params.beta_gap_entry_z_scale);
+        env_override(
+            "SPREAD_TREND_MAX_SLOPE_SIGMA",
+            &mut self.default_pair_params.spread_trend_max_slope_sigma,
+        );
+        env_override(
+            "BETA_DIVERGENCE_MAX",
+            &mut self.default_pair_params.beta_divergence_max,
+        );
+        env_override(
+            "CIRCUIT_BREAKER_TIER1_LOSSES",
+            &mut self.default_pair_params.circuit_breaker_tier1_losses,
+        );
+        env_override(
+            "CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS",
+            &mut self.default_pair_params.circuit_breaker_tier1_cooldown_secs,
+        );
+        env_override(
+            "CIRCUIT_BREAKER_TIER2_LOSSES",
+            &mut self.default_pair_params.circuit_breaker_tier2_losses,
+        );
+        env_override(
+            "CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS",
+            &mut self.default_pair_params.circuit_breaker_tier2_cooldown_secs,
+        );
+        env_override(
+            "ENTRY_POST_ONLY_TIMEOUT_SECS",
+            &mut self.default_pair_params.entry_post_only_timeout_secs,
+        );
+        env_override(
+            "EXIT_POST_ONLY_TIMEOUT_SECS",
+            &mut self.default_pair_params.exit_post_only_timeout_secs,
+        );
+        env_override(
+            "ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN",
+            &mut self.default_pair_params.entry_velocity_block_sigma_per_min,
+        );
+        env_override(
+            "FUNDING_ENTRY_Z_SCALE",
+            &mut self.default_pair_params.funding_entry_z_scale,
+        );
+        env_override(
+            "BETA_GAP_ENTRY_Z_SCALE",
+            &mut self.default_pair_params.beta_gap_entry_z_scale,
+        );
         env_override(
             "ENTRY_Z_SHORT_MULTIPLIER",
             &mut self.default_pair_params.entry_z_short_multiplier,
@@ -1487,12 +1575,18 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         warm_start_min_bars: env_parse::<usize>("WARM_START_MIN_BARS", 0),
         reeval_jump_z_mult: env_parse("REEVAL_JUMP_Z_MULT", DEFAULT_REEVAL_JUMP_Z_MULT),
         vol_spike_mult: env_parse("VOL_SPIKE_MULT", DEFAULT_VOL_SPIKE_MULT),
-        circuit_breaker_tier1_losses: env_parse("CIRCUIT_BREAKER_TIER1_LOSSES", DEFAULT_CB_TIER1_LOSSES),
+        circuit_breaker_tier1_losses: env_parse(
+            "CIRCUIT_BREAKER_TIER1_LOSSES",
+            DEFAULT_CB_TIER1_LOSSES,
+        ),
         circuit_breaker_tier1_cooldown_secs: env_parse(
             "CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS",
             DEFAULT_CB_TIER1_COOLDOWN_SECS,
         ),
-        circuit_breaker_tier2_losses: env_parse("CIRCUIT_BREAKER_TIER2_LOSSES", DEFAULT_CB_TIER2_LOSSES),
+        circuit_breaker_tier2_losses: env_parse(
+            "CIRCUIT_BREAKER_TIER2_LOSSES",
+            DEFAULT_CB_TIER2_LOSSES,
+        ),
         circuit_breaker_tier2_cooldown_secs: env_parse(
             "CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS",
             DEFAULT_CB_TIER2_COOLDOWN_SECS,
@@ -1518,10 +1612,7 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
             "STD_COLLAPSE_WINDOW_BARS",
             DEFAULT_STD_COLLAPSE_WINDOW_BARS,
         ),
-        std_collapse_min_ratio: env_parse(
-            "STD_COLLAPSE_MIN_RATIO",
-            DEFAULT_STD_COLLAPSE_MIN_RATIO,
-        ),
+        std_collapse_min_ratio: env_parse("STD_COLLAPSE_MIN_RATIO", DEFAULT_STD_COLLAPSE_MIN_RATIO),
         std_collapse_observe_only: env::var("STD_COLLAPSE_OBSERVE_ONLY")
             .ok()
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
@@ -1554,23 +1645,22 @@ pub(super) fn resolve_strategies(
             .iter()
             .enumerate()
             .map(|(idx, s)| {
-                let id = s
-                    .id
-                    .clone()
-                    .or_else(|| s.agent_name.clone())
-                    .unwrap_or_else(|| format!("strategy-{}", idx));
+                let id =
+                    s.id.clone()
+                        .or_else(|| s.agent_name.clone())
+                        .unwrap_or_else(|| format!("strategy-{}", idx));
                 // Per-strategy equity reference env override:
                 // `EQUITY_REFERENCE_USD_<ID>` (id uppercased) takes precedence
                 // over both the per-strategy yaml field and the top-level
                 // reference. Lets one shared yaml deploy with different
                 // per-instance reference equity per region.
-                let equity_reference_usd = env::var(format!(
-                    "EQUITY_REFERENCE_USD_{}",
-                    id.to_ascii_uppercase()
-                ))
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or_else(|| s.equity_usd_reference.unwrap_or(cfg.equity_reference_usd));
+                let equity_reference_usd =
+                    env::var(format!("EQUITY_REFERENCE_USD_{}", id.to_ascii_uppercase()))
+                        .ok()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or_else(|| {
+                            s.equity_usd_reference.unwrap_or(cfg.equity_reference_usd)
+                        });
                 StrategyConfig {
                     id,
                     agent_name: s.agent_name.clone().or_else(|| cfg.agent_name.clone()),
@@ -1674,9 +1764,7 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         exit_post_only_timeout_secs: yaml
             .exit_post_only_timeout_secs
             .unwrap_or(DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS),
-        entry_velocity_block_sigma_per_min: yaml
-            .entry_velocity_block_sigma_per_min
-            .unwrap_or(0.0),
+        entry_velocity_block_sigma_per_min: yaml.entry_velocity_block_sigma_per_min.unwrap_or(0.0),
         funding_entry_z_scale: yaml.funding_entry_z_scale.unwrap_or(0.0),
         beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
         entry_z_short_multiplier: yaml.entry_z_short_multiplier.unwrap_or(1.0),

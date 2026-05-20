@@ -38,7 +38,6 @@ use super::super::state::{
 use super::super::PairTradeEngine;
 
 impl PairTradeEngine {
-
     pub(in crate::pairtrade) async fn reissue_partial_legs(
         &mut self,
         pending: &PendingOrders,
@@ -259,8 +258,7 @@ impl PairTradeEngine {
             // taker-side slippage histogram (#314 Group 4-B-2) — this is
             // the principal post-only-fallback path the BT/live gap
             // analysis cares about.
-            let ref_price_taker =
-                self.order_reference_price(&leg.symbol, leg.side, price_map);
+            let ref_price_taker = self.order_reference_price(&leg.symbol, leg.side, price_map);
             match self
                 .connector
                 .create_order(
@@ -596,7 +594,8 @@ impl PairTradeEngine {
         {
             Ok(res) => res,
             Err(e) => {
-                self.recover_from_leg_b_failure(pair, &res_a, side_a, &e).await;
+                self.recover_from_leg_b_failure(pair, &res_a, side_a, &e)
+                    .await;
                 return Err(PartialOrderPlacementError::new(legs.clone(), e).into());
             }
         };
@@ -910,7 +909,8 @@ impl PairTradeEngine {
                         None
                     } else {
                         if let Some(ref res_a) = res_a {
-                            self.recover_from_leg_b_failure(pair, res_a, side_a, &e).await;
+                            self.recover_from_leg_b_failure(pair, res_a, side_a, &e)
+                                .await;
                         } else {
                             log::error!(
                                 "[ORDER] Failed to close leg B for {}/{}: {:?}",

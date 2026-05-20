@@ -43,8 +43,7 @@ impl PairTradeEngine {
     ) -> Result<(Decimal, Decimal)> {
         let base_snapshot = self.open_positions.get(&pair.base);
         let quote_snapshot = self.open_positions.get(&pair.quote);
-        let recorded = self
-            .instances[inst_idx]
+        let recorded = self.instances[inst_idx]
             .states
             .get(key)
             .and_then(|s| s.position.as_ref());
@@ -52,18 +51,10 @@ impl PairTradeEngine {
         let recorded_b = recorded.and_then(|p| p.entry_size_b);
 
         if base_snapshot.is_some() || quote_snapshot.is_some() {
-            let qty_a = Self::cap_exit_qty(
-                key,
-                &pair.base,
-                base_snapshot.map(|p| p.size),
-                recorded_a,
-            );
-            let qty_b = Self::cap_exit_qty(
-                key,
-                &pair.quote,
-                quote_snapshot.map(|p| p.size),
-                recorded_b,
-            );
+            let qty_a =
+                Self::cap_exit_qty(key, &pair.base, base_snapshot.map(|p| p.size), recorded_a);
+            let qty_b =
+                Self::cap_exit_qty(key, &pair.quote, quote_snapshot.map(|p| p.size), recorded_b);
             return Ok((qty_a, qty_b));
         }
 

@@ -361,11 +361,7 @@ impl PnlLogRecord {
         }
     }
 
-    pub(super) fn with_funding(
-        mut self,
-        carry_usd: f64,
-        ticks_observed: u32,
-    ) -> Self {
+    pub(super) fn with_funding(mut self, carry_usd: f64, ticks_observed: u32) -> Self {
         self.funding_carry_usd = Some(carry_usd);
         self.funding_ticks_observed = Some(ticks_observed);
         self

@@ -179,7 +179,9 @@ pub(super) fn persist_risk_state(
         log::warn!("[RISK_STATE] serialize failed");
         return;
     };
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty())
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -264,13 +266,19 @@ mod tests {
         s.circuit_breaker_until_ts = Some(1_234_567_890);
         s.last_stop_loss_per_pair.insert(
             "BTC/ETH".to_string(),
-            StopLossMark { direction: PositionDirection::LongSpread, ts: 1_234_567_000 },
+            StopLossMark {
+                direction: PositionDirection::LongSpread,
+                ts: 1_234_567_000,
+            },
         );
         s.session_start_equity = 500.0;
         s.session_start_ts = 1_700_000_000;
         s.realized_pnl_today = -4.20;
         s.funding_carry_today = -0.85;
-        s.equity_samples.push(EquitySample { ts: 1_700_000_000, equity: 500.0 });
+        s.equity_samples.push(EquitySample {
+            ts: 1_700_000_000,
+            equity: 500.0,
+        });
         s.session_halted = true;
         s.session_halt_reason = Some("session_dd_500bps".to_string());
         s.session_halt_ts = Some(1_700_000_500);
@@ -329,11 +337,26 @@ mod tests {
         // are no-ops; in those cases the operator runs reset-round-state.sh
         // explicitly.
         for (configured, persisted, expected_fire, label) in [
-            (None,       None,      false, "(None, None)"),
-            (Some("a"),  None,      false, "(Some(a), None) — initial opt-in"),
-            (None,       Some("a"), false, "(None, Some(a)) — operator removed round_id"),
-            (Some("a"),  Some("a"), false, "(Some(a), Some(a)) — same round"),
-            (Some("a"),  Some("b"), true,  "(Some(a), Some(b)) — transition"),
+            (None, None, false, "(None, None)"),
+            (Some("a"), None, false, "(Some(a), None) — initial opt-in"),
+            (
+                None,
+                Some("a"),
+                false,
+                "(None, Some(a)) — operator removed round_id",
+            ),
+            (
+                Some("a"),
+                Some("a"),
+                false,
+                "(Some(a), Some(a)) — same round",
+            ),
+            (
+                Some("a"),
+                Some("b"),
+                true,
+                "(Some(a), Some(b)) — transition",
+            ),
         ] {
             let mut snap = make_snapshot(persisted);
             let fired = snap.apply_round_transition(configured);
@@ -342,10 +365,19 @@ mod tests {
             let inst = snap.instances.get("a").expect("instance present");
             if expected_fire {
                 assert_eq!(inst.total_trades, 0, "case {label}: round fields not reset");
-                assert_eq!(inst.consecutive_losses, 0, "case {label}: counter not reset");
+                assert_eq!(
+                    inst.consecutive_losses, 0,
+                    "case {label}: counter not reset"
+                );
             } else {
-                assert_eq!(inst.total_trades, 42, "case {label}: round fields wrongly reset");
-                assert_eq!(inst.consecutive_losses, 3, "case {label}: counter wrongly reset");
+                assert_eq!(
+                    inst.total_trades, 42,
+                    "case {label}: round fields wrongly reset"
+                );
+                assert_eq!(
+                    inst.consecutive_losses, 3,
+                    "case {label}: counter wrongly reset"
+                );
             }
             // round_id itself is not touched by the reset — only instance
             // fields are. Caller (engine/persistence.rs) rewrites round_id
@@ -370,8 +402,14 @@ mod tests {
             assert_eq!(inst.total_trades, 0, "instance {id}: not reset");
             assert_eq!(inst.total_wins, 0, "instance {id}: not reset");
             assert_eq!(inst.consecutive_losses, 0, "instance {id}: not reset");
-            assert!(inst.last_stop_loss_per_pair.is_empty(), "instance {id}: stop-loss anchors not cleared");
-            assert!(inst.equity_samples.is_empty(), "instance {id}: equity samples not cleared");
+            assert!(
+                inst.last_stop_loss_per_pair.is_empty(),
+                "instance {id}: stop-loss anchors not cleared"
+            );
+            assert!(
+                inst.equity_samples.is_empty(),
+                "instance {id}: equity samples not cleared"
+            );
         }
     }
 
@@ -390,8 +428,8 @@ mod tests {
                 }
             }
         }"#;
-        let snap: RiskStateSnapshot = serde_json::from_str(json)
-            .expect("legacy snapshot parses with new field defaulted");
+        let snap: RiskStateSnapshot =
+            serde_json::from_str(json).expect("legacy snapshot parses with new field defaulted");
         let inst = snap.instances.get("a").expect("instance present");
         assert_eq!(inst.funding_carry_today, 0.0);
         assert!((inst.realized_pnl_today - (-1.5)).abs() < 1e-9);
