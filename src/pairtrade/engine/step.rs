@@ -26,30 +26,30 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use dex_connector::PriceUpdate;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use tokio::time::{sleep, Duration};
-use dex_connector::PriceUpdate;
 
+use super::super::apply_post_exit_state;
 use super::super::config::PairSpec;
 use super::super::defaults::PAIR_SELECTION_INTERVAL_SECS;
 use super::super::entry::{entry_z_for_pair, should_enter};
 use super::super::exit::{compute_pnl, exit_reason};
 use super::super::funding_history;
 use super::super::history_io;
-use super::super::pair_eval;
 use super::super::market::{
     liquidity_score, net_funding_for_direction, tick_sanity_check, SymbolSnapshot,
     MAX_TICK_PRICE_ENVELOPE_BPS, MAX_TICK_SPREAD_BPS,
 };
+use super::super::pair_eval;
 use super::super::pnl_log::PnlLogRecord;
 use super::super::regime;
 use super::super::state::{BtDeferredExit, PendingOrders, Position, PositionDirection};
 use super::super::stats::{spread_slope_sigma, PriceSample};
 use super::super::status::{ShutdownPosition, ShutdownStatus};
 use super::super::util::tail_std;
-use super::super::apply_post_exit_state;
 use super::super::PairTradeEngine;
 
 struct PlannedAction {
@@ -93,7 +93,6 @@ struct StepSetup {
 }
 
 impl PairTradeEngine {
-
     pub async fn run(&mut self) -> Result<()> {
         log::info!("[CONFIG] DEX_NAME is: {}", self.cfg.dex_name);
         log::info!(
@@ -113,8 +112,7 @@ impl PairTradeEngine {
                 let max_len = self.max_history_len();
                 let mut loaded_spreads: HashMap<String, VecDeque<f64>> = HashMap::new();
                 let mut loaded_betas: HashMap<String, f64> = HashMap::new();
-                let mut loaded_kalman: HashMap<String, history_io::KalmanSnapshot> =
-                    HashMap::new();
+                let mut loaded_kalman: HashMap<String, history_io::KalmanSnapshot> = HashMap::new();
                 history_io::load_history_snapshot_for_bt(
                     &mut self.history,
                     &mut loaded_spreads,
@@ -141,15 +139,13 @@ impl PairTradeEngine {
                 }
                 for (pair_key, kalman) in &loaded_kalman {
                     if let Some(shared) = self.per_pair_state.get_mut(pair_key) {
-                        shared.kalman = Some(
-                            super::super::kalman::KalmanBeta::from_snapshot(
-                                kalman.beta,
-                                kalman.p,
-                                kalman.updates,
-                                kalman_q,
-                                kalman_r,
-                            ),
-                        );
+                        shared.kalman = Some(super::super::kalman::KalmanBeta::from_snapshot(
+                            kalman.beta,
+                            kalman.p,
+                            kalman.updates,
+                            kalman_q,
+                            kalman_r,
+                        ));
                     }
                 }
             }
@@ -205,25 +201,24 @@ impl PairTradeEngine {
             } else {
                 self.connector.clone()
             };
-            let mut ws_price_rx: Option<
-                tokio::sync::broadcast::Receiver<PriceUpdate>,
-            > = match primary_connector.subscribe_price_updates() {
-                Ok(rx) => {
-                    log::info!(
-                        "[WS_BARS] subscribed to connector price-update broadcast; \
+            let mut ws_price_rx: Option<tokio::sync::broadcast::Receiver<PriceUpdate>> =
+                match primary_connector.subscribe_price_updates() {
+                    Ok(rx) => {
+                        log::info!(
+                            "[WS_BARS] subscribed to connector price-update broadcast; \
                          bar closes will be refined by WS ticks (polling still emits)"
-                    );
-                    Some(rx)
-                }
-                Err(e) => {
-                    log::info!(
-                        "[WS_BARS] connector does not publish price updates ({}); \
+                        );
+                        Some(rx)
+                    }
+                    Err(e) => {
+                        log::info!(
+                            "[WS_BARS] connector does not publish price updates ({}); \
                          polling arm is the sole bar driver",
-                        e
-                    );
-                    None
-                }
-            };
+                            e
+                        );
+                        None
+                    }
+                };
             // Wall-clock aligned ticker: fires at floor(now/interval)*interval + interval boundaries
             // so every bot process observing the same stream ticks at identical wall-clock seconds.
             // This is required on top of the BarBuilder bucket alignment (pairtrade#4): without
@@ -243,14 +238,12 @@ impl PairTradeEngine {
                 tokio::time::Instant::now() + Duration::from_millis(wait_ms)
             }
             let mut next_tick = next_wall_clock_boundary(interval_secs);
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            )
-            .expect("failed to register SIGTERM handler");
-            let mut sigint = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::interrupt(),
-            )
-            .expect("failed to register SIGINT handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("failed to register SIGINT handler");
 
             let grace = Duration::from_secs(self.cfg.shutdown_grace_secs);
             let mut shutdown_deadline: Option<Instant> = None;
@@ -469,7 +462,9 @@ impl PairTradeEngine {
                 // `[STATUS] failed` warn that would follow) attributes
                 // correctly. See bot-strategy#367.
                 let _attr = crate::error_counter::CurrentInstanceGuard::enter(&inst.id);
-                if let Err(err) = reporter.write_snapshot(&self.open_positions, self.positions_ready) {
+                if let Err(err) =
+                    reporter.write_snapshot(&self.open_positions, self.positions_ready)
+                {
                     log::warn!("[STATUS] failed to write status: {:?}", err);
                 }
             }
@@ -497,7 +492,8 @@ impl PairTradeEngine {
             // across A/B/C. See bot-strategy#367.
             let _attr =
                 crate::error_counter::CurrentInstanceGuard::enter(&self.instances[inst_idx].id);
-            self.step_for_instance(inst_idx, &price_map, &updated).await?;
+            self.step_for_instance(inst_idx, &price_map, &updated)
+                .await?;
         }
         Ok(())
     }
@@ -584,7 +580,9 @@ impl PairTradeEngine {
         let mut sorted_symbols: Vec<&String> = price_map.keys().collect();
         sorted_symbols.sort();
         for symbol in sorted_symbols {
-            let snapshot = price_map.get(symbol).expect("just enumerated from price_map");
+            let snapshot = price_map
+                .get(symbol)
+                .expect("just enumerated from price_map");
             // bot-strategy#346: drop corrupt orderbook frames before they
             // poison the bar builder / regression history. The data dump
             // above already recorded the raw frame for diagnostics.
@@ -597,11 +595,9 @@ impl PairTradeEngine {
             // burying genuinely-actionable WARNs. error-watch's TICK_FILTER
             // skip pattern (bot-strategy#356) becomes redundant after this
             // but is left in place as a safety net.
-            if let Err(reason) = tick_sanity_check(
-                snapshot,
-                MAX_TICK_SPREAD_BPS,
-                MAX_TICK_PRICE_ENVELOPE_BPS,
-            ) {
+            if let Err(reason) =
+                tick_sanity_check(snapshot, MAX_TICK_SPREAD_BPS, MAX_TICK_PRICE_ENVELOPE_BPS)
+            {
                 log::info!(
                     "[TICK_FILTER] rejected {} reason={} price={} bid={:?} ask={:?} bid_size={} ask_size={}",
                     symbol,
@@ -713,8 +709,12 @@ impl PairTradeEngine {
     /// [KALMAN] diagnostic logs once per pair per tick (was 3× per tick
     /// pre-#413).
     fn step_pair_shared(&mut self, pair: &PairSpec, key: &str, now_ts: i64) {
-        let Some(log_a) = self.latest_log_price(&pair.base) else { return };
-        let Some(log_b) = self.latest_log_price(&pair.quote) else { return };
+        let Some(log_a) = self.latest_log_price(&pair.base) else {
+            return;
+        };
+        let Some(log_b) = self.latest_log_price(&pair.quote) else {
+            return;
+        };
         let hist_a_prev = self
             .history
             .get(&pair.base)
@@ -729,7 +729,9 @@ impl PairTradeEngine {
         // last_velocity_sigma_per_min and std_history.
         let metrics_window = self.cfg.metrics_window;
         {
-            let Some(shared) = self.per_pair_state.get_mut(key) else { return };
+            let Some(shared) = self.per_pair_state.get_mut(key) else {
+                return;
+            };
             if let Some(ref mut kf) = shared.kalman {
                 if shared.last_spread.is_some() {
                     if let (Some(a_prev), Some(b_prev)) = (hist_a_prev, hist_b_prev) {
@@ -745,7 +747,9 @@ impl PairTradeEngine {
 
         // Snapshot derived state post-push.
         let (z_snapshot, velocity, prev_eligible, last_eval_ts) = {
-            let Some(shared) = self.per_pair_state.get(key) else { return };
+            let Some(shared) = self.per_pair_state.get(key) else {
+                return;
+            };
             (
                 shared.z_score_details(),
                 shared.last_velocity_sigma_per_min,
@@ -785,9 +789,7 @@ impl PairTradeEngine {
             if z_abs >= z_entry * pp.reeval_jump_z_mult {
                 needs_eval_jump_any = true;
             }
-            if velocity.abs()
-                >= pp.spread_velocity_max_sigma_per_min * pp.reeval_jump_z_mult
-            {
+            if velocity.abs() >= pp.spread_velocity_max_sigma_per_min * pp.reeval_jump_z_mult {
                 needs_eval_velocity_any = true;
             }
             if let Some(bs) = base_std {
@@ -1004,14 +1006,11 @@ impl PairTradeEngine {
             }
             let count = log.len();
             let oldest = log.front().copied();
-            let observed_for = oldest
-                .map(|t| now.duration_since(t))
-                .unwrap_or_default();
+            let observed_for = oldest.map(|t| now.duration_since(t)).unwrap_or_default();
             if observed_for < min_observation {
                 continue;
             }
-            let rate_per_min =
-                count as f64 / (observed_for.as_secs_f64() / 60.0).max(1e-9);
+            let rate_per_min = count as f64 / (observed_for.as_secs_f64() / 60.0).max(1e-9);
             if rate_per_min >= threshold_per_min {
                 continue;
             }
@@ -1090,7 +1089,8 @@ impl PairTradeEngine {
         // entry gate below picks up the halt.
         self.update_equity_sample(inst_idx);
         self.evaluate_session_dd(inst_idx).await;
-        self.sync_positions_from_exchange(inst_idx, price_map).await?;
+        self.sync_positions_from_exchange(inst_idx, price_map)
+            .await?;
 
         let vol_median = self.compute_vol_median();
 
@@ -1099,7 +1099,11 @@ impl PairTradeEngine {
             self.history
                 .get(&self.cfg.regime_reference_symbol)
                 .and_then(|h| {
-                    regime::compute_regime(h, self.cfg.regime_vol_window, self.cfg.regime_trend_window)
+                    regime::compute_regime(
+                        h,
+                        self.cfg.regime_vol_window,
+                        self.cfg.regime_trend_window,
+                    )
                 })
         } else {
             None
@@ -1123,8 +1127,7 @@ impl PairTradeEngine {
         }
 
         let positions_clear = self.open_positions.is_empty();
-        let has_pending_orders = self
-            .instances[inst_idx]
+        let has_pending_orders = self.instances[inst_idx]
             .states
             .values()
             .any(|state| state.pending_entry.is_some() || state.pending_exit.is_some());
@@ -1182,7 +1185,9 @@ impl PairTradeEngine {
                         if now_ts >= deferred.resolve_at_ts {
                             log::debug!(
                                 "[BT_FILL_DELAY] {} resolved (delay={}s, now_ts={})",
-                                key, self.cfg.bt_fill_delay_secs, now_ts
+                                key,
+                                self.cfg.bt_fill_delay_secs,
+                                now_ts
                             );
                             // The deferred exit is the resolution of an
                             // earlier exit decision; pending_exit_reason
@@ -1215,7 +1220,8 @@ impl PairTradeEngine {
             // `get_filled_orders` already read from in-memory caches for
             // Lighter and Extended, so the higher cadence does not introduce
             // REST traffic.
-            self.reconcile_pending_orders(inst_idx, &key, price_map).await?;
+            self.reconcile_pending_orders(inst_idx, &key, price_map)
+                .await?;
 
             if !(updated.contains(&pair.base) && updated.contains(&pair.quote)) {
                 continue;
@@ -1250,8 +1256,7 @@ impl PairTradeEngine {
                 beta_long,
                 eligible_shared,
             ) = shared_snap;
-            let position_state = self
-                .instances[inst_idx]
+            let position_state = self.instances[inst_idx]
                 .states
                 .get(&key)
                 .and_then(|s| s.position.clone());
@@ -1308,9 +1313,13 @@ impl PairTradeEngine {
                 }
             }
 
-            if self.instances[inst_idx].states[&key].pending_entry.is_some()
+            if self.instances[inst_idx].states[&key]
+                .pending_entry
+                .is_some()
                 || self.instances[inst_idx].states[&key].pending_exit.is_some()
-                || self.instances[inst_idx].states[&key].bt_deferred_exit.is_some()
+                || self.instances[inst_idx].states[&key]
+                    .bt_deferred_exit
+                    .is_some()
             {
                 if !matches!(action, TradeAction::None) {
                     log::debug!("[ORDER] {} has pending orders; skipping new actions", key);
@@ -1331,7 +1340,8 @@ impl PairTradeEngine {
             }
 
             let mut log_positions_not_ready = false;
-            let circuit_breaker_until_ts_snapshot = self.instances[inst_idx].circuit_breaker_until_ts;
+            let circuit_breaker_until_ts_snapshot =
+                self.instances[inst_idx].circuit_breaker_until_ts;
             let kill_switch_active_snapshot = self.kill_switch_active;
             let daily_loss_blocks_snapshot = self.daily_loss_blocks(&self.instances[inst_idx]);
             let session_halted_snapshot = self.instances[inst_idx].session_halted;
@@ -1368,11 +1378,21 @@ impl PairTradeEngine {
                                     .states
                                     .get(&key)
                                     .ok_or_else(|| anyhow!("missing state for {}", key))?;
-                                let shared = self.per_pair_state.get(&key).ok_or_else(|| {
-                                    anyhow!("missing shared state for {}", key)
-                                })?;
+                                let shared = self
+                                    .per_pair_state
+                                    .get(&key)
+                                    .ok_or_else(|| anyhow!("missing shared state for {}", key))?;
                                 exit_reason(
-                                    &self.cfg, pp, state, shared, z, std, p1, p2, equity_base, now_ts,
+                                    &self.cfg,
+                                    pp,
+                                    state,
+                                    shared,
+                                    z,
+                                    std,
+                                    p1,
+                                    p2,
+                                    equity_base,
+                                    now_ts,
                                 )
                             };
                             if let Some(reason) = reason_opt {
@@ -1396,8 +1416,7 @@ impl PairTradeEngine {
                                     .get(&key)
                                     .and_then(|s| s.position.as_ref().map(|p| p.direction))
                                     .unwrap_or(PositionDirection::LongSpread);
-                                if let Some(state) = self.instances[inst_idx].states.get_mut(&key)
-                                {
+                                if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
                                     // Stash the reason so the exit-fill site
                                     // can tag last_stop_loss_at without
                                     // plumbing the reason through TradeAction
@@ -1447,11 +1466,19 @@ impl PairTradeEngine {
                                     .states
                                     .get(&key)
                                     .ok_or_else(|| anyhow!("missing state for {}", key))?;
-                                let shared = self.per_pair_state.get(&key).ok_or_else(|| {
-                                    anyhow!("missing shared state for {}", key)
-                                })?;
+                                let shared = self
+                                    .per_pair_state
+                                    .get(&key)
+                                    .ok_or_else(|| anyhow!("missing shared state for {}", key))?;
                                 should_enter(
-                                    &self.cfg, pp, state, shared, z, std, net_funding, now_ts,
+                                    &self.cfg,
+                                    pp,
+                                    state,
+                                    shared,
+                                    z,
+                                    std,
+                                    net_funding,
+                                    now_ts,
                                     direction,
                                 )
                             };
@@ -1609,18 +1636,19 @@ impl PairTradeEngine {
                         .get(&plan.pair.quote)
                         .map(|s| s.price)
                         .unwrap_or_default();
-                    let pnl = self
-                        .instances[inst_idx]
+                    let pnl = self.instances[inst_idx]
                         .states
                         .get(&plan.key)
                         .and_then(|s| s.position.as_ref())
                         .and_then(|pos| compute_pnl(pos, price_a, price_b));
                     if let Some(pnl) = pnl {
                         if let Some(pnl_value) = pnl.to_f64() {
-                            let pos_ref = self.instances[inst_idx].states.get(&plan.key)
+                            let pos_ref = self.instances[inst_idx]
+                                .states
+                                .get(&plan.key)
                                 .and_then(|s| s.position.as_ref());
-                            let hold_secs = pos_ref
-                                .map(|p| now_ts.saturating_sub(p.entered_ts).max(0) as f64);
+                            let hold_secs =
+                                pos_ref.map(|p| now_ts.saturating_sub(p.entered_ts).max(0) as f64);
                             let entry_a = pos_ref
                                 .and_then(|p| p.entry_price_a)
                                 .and_then(|v| v.to_f64());
@@ -1659,10 +1687,14 @@ impl PairTradeEngine {
                                 pnl_value,
                                 now_ts,
                                 "exit_dry_run",
-                            ).with_trade_details(
-                                entry_a, entry_b,
-                                price_a.to_f64(), price_b.to_f64(),
-                                Some(beta), Some(z),
+                            )
+                            .with_trade_details(
+                                entry_a,
+                                entry_b,
+                                price_a.to_f64(),
+                                price_b.to_f64(),
+                                Some(beta),
+                                Some(z),
                                 self.per_pair_state
                                     .get(&plan.key)
                                     .and_then(|s| s.last_spread.map(|_| z)),
@@ -1686,11 +1718,11 @@ impl PairTradeEngine {
                             if pnl_value < 0.0 {
                                 self.instances[inst_idx].consecutive_losses += 1;
                                 risk_state_dirty = true;
-                                if let Some(cooldown) = self
-                                    .cfg
-                                    .circuit_breaker_cooldown_for(self.instances[inst_idx].consecutive_losses)
-                                {
-                                    self.instances[inst_idx].circuit_breaker_until = Some(Instant::now() + cooldown);
+                                if let Some(cooldown) = self.cfg.circuit_breaker_cooldown_for(
+                                    self.instances[inst_idx].consecutive_losses,
+                                ) {
+                                    self.instances[inst_idx].circuit_breaker_until =
+                                        Some(Instant::now() + cooldown);
                                     self.instances[inst_idx].circuit_breaker_until_ts =
                                         Some(now_ts + cooldown.as_secs() as i64);
                                     log::warn!(
@@ -1812,7 +1844,9 @@ impl PairTradeEngine {
                     {
                         Ok(out) => out,
                         Err(err) => {
-                            self.register_partial_leg_failure(inst_idx, &plan.key, direction, &err, true);
+                            self.register_partial_leg_failure(
+                                inst_idx, &plan.key, direction, &err, true,
+                            );
                             return Err(err);
                         }
                     };
@@ -1991,7 +2025,9 @@ impl PairTradeEngine {
                     {
                         Ok(legs) => legs,
                         Err(err) => {
-                            self.register_partial_leg_failure(inst_idx, &plan.key, direction, &err, false);
+                            self.register_partial_leg_failure(
+                                inst_idx, &plan.key, direction, &err, false,
+                            );
                             return Err(err);
                         }
                     };
@@ -2003,8 +2039,8 @@ impl PairTradeEngine {
                     if !legs.is_empty() {
                         let entry_pp = self.pair_params_for(inst_idx, &plan.key).clone();
                         let entry_pp = &entry_pp;
-                        let hybrid = entry_pp.entry_post_only_timeout_secs > 0
-                            && self.post_only_supported();
+                        let hybrid =
+                            entry_pp.entry_post_only_timeout_secs > 0 && self.post_only_supported();
                         if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                             state.pending_entry = Some(PendingOrders {
                                 legs,
