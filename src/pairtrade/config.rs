@@ -56,6 +56,18 @@ pub struct PairParams {
     pub entry_velocity_block_sigma_per_min: f64,
     pub funding_entry_z_scale: f64,
     pub beta_gap_entry_z_scale: f64,
+    /// Linear notional shrink as `shared.beta_gap` grows: notional is
+    /// multiplied by `clamp(1 - beta_gap_notional_scale * beta_gap,
+    /// beta_gap_notional_floor, 1.0)`. Captures z-fire opportunities
+    /// that the threshold-side `beta_gap_entry_z_scale` would discard
+    /// entirely, at the cost of a smaller per-trade exposure when the
+    /// hedge is uncertain. 0.0 = disabled. (bot-strategy#461)
+    pub beta_gap_notional_scale: f64,
+    /// Lower bound for `beta_gap_notional_scale`'s shrink. Default 0.5
+    /// — never go below 50% of base size — so minimum-order / dust
+    /// constraints stay satisfied. 0.0 still works as long as no min-
+    /// notional issues; 1.0 disables (no shrink ever).
+    pub beta_gap_notional_floor: f64,
     /// Multiplicative scale applied to `entry_threshold` when the proposed
     /// direction is `ShortSpread`. 1.0 keeps the current direction-symmetric
     /// behavior; values > 1.0 require a deeper |z| for short entries (gates
@@ -313,6 +325,8 @@ pub(super) struct PairTradeYaml {
     pub(super) entry_velocity_block_sigma_per_min: Option<f64>,
     pub(super) funding_entry_z_scale: Option<f64>,
     pub(super) beta_gap_entry_z_scale: Option<f64>,
+    pub(super) beta_gap_notional_scale: Option<f64>,
+    pub(super) beta_gap_notional_floor: Option<f64>,
     pub(super) entry_z_short_multiplier: Option<f64>,
     pub(super) mtf_windows: Option<Vec<usize>>,
     pub(super) mtf_z_min: Option<f64>,
@@ -1355,6 +1369,14 @@ impl PairTradeConfig {
             &mut self.default_pair_params.beta_gap_entry_z_scale,
         );
         env_override(
+            "BETA_GAP_NOTIONAL_SCALE",
+            &mut self.default_pair_params.beta_gap_notional_scale,
+        );
+        env_override(
+            "BETA_GAP_NOTIONAL_FLOOR",
+            &mut self.default_pair_params.beta_gap_notional_floor,
+        );
+        env_override(
             "ENTRY_Z_SHORT_MULTIPLIER",
             &mut self.default_pair_params.entry_z_short_multiplier,
         );
@@ -1602,6 +1624,8 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         entry_velocity_block_sigma_per_min: env_parse("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", 0.0),
         funding_entry_z_scale: env_parse("FUNDING_ENTRY_Z_SCALE", 0.0),
         beta_gap_entry_z_scale: env_parse("BETA_GAP_ENTRY_Z_SCALE", 0.0),
+        beta_gap_notional_scale: env_parse("BETA_GAP_NOTIONAL_SCALE", 0.0),
+        beta_gap_notional_floor: env_parse("BETA_GAP_NOTIONAL_FLOOR", 0.5),
         entry_z_short_multiplier: env_parse("ENTRY_Z_SHORT_MULTIPLIER", 1.0),
         mtf_windows: env::var("MTF_WINDOWS")
             .ok()
@@ -1767,6 +1791,8 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         entry_velocity_block_sigma_per_min: yaml.entry_velocity_block_sigma_per_min.unwrap_or(0.0),
         funding_entry_z_scale: yaml.funding_entry_z_scale.unwrap_or(0.0),
         beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
+        beta_gap_notional_scale: yaml.beta_gap_notional_scale.unwrap_or(0.0),
+        beta_gap_notional_floor: yaml.beta_gap_notional_floor.unwrap_or(0.5),
         entry_z_short_multiplier: yaml.entry_z_short_multiplier.unwrap_or(1.0),
         mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),
         mtf_z_min: yaml.mtf_z_min.unwrap_or(DEFAULT_MTF_Z_MIN),

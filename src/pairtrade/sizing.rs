@@ -31,19 +31,37 @@ pub(super) fn cap_leg_notional(leg_notional: f64, beta: f64, cap: f64) -> Option
     }
 }
 
+/// Resolve the multiplicative size factor for the beta-gap notional shrink
+/// (bot-strategy#461). Returns 1.0 (no shrink) when the feature is disabled
+/// via `scale_param == 0.0`. Otherwise computes
+/// `clamp(1 - scale_param * beta_gap, floor, 1.0)`.
+pub(super) fn beta_gap_notional_scale(beta_gap: f64, scale_param: f64, floor_param: f64) -> f64 {
+    if scale_param <= 0.0 {
+        return 1.0;
+    }
+    let raw = 1.0 - scale_param * beta_gap.max(0.0);
+    let floor = floor_param.clamp(0.0, 1.0);
+    raw.clamp(floor, 1.0)
+}
+
 pub(super) fn hedged_sizes(
     cfg: &PairTradeConfig,
     equity: f64,
     beta: f64,
     p1: &SymbolSnapshot,
     p2: &SymbolSnapshot,
+    notional_scale: f64,
 ) -> Result<(Decimal, Decimal)> {
     // `equity` is the per-instance fixed `equity_reference_usd` so each
     // variant sizes against its own declared capital. Live equity is no
     // longer mixed in here — see StrategyInstance.equity_reference_usd
     // and bot-strategy#222.
     let total_risk = equity * cfg.risk_pct_per_trade * cfg.max_leverage;
-    let mut leg_notional = (total_risk / 2.0).max(10.0);
+    let base_leg = (total_risk / 2.0).max(10.0);
+    // bot-strategy#461: shrink notional under beta-uncertainty before the
+    // notional cap (caller supplies the resolved scale, default 1.0).
+    let scale = notional_scale.clamp(0.0, 1.0);
+    let mut leg_notional = (base_leg * scale).max(10.0);
     let notional_cap = equity * cfg.max_leverage * cfg.risk.max_notional_headroom;
     if let Some(capped) = cap_leg_notional(leg_notional, beta, notional_cap) {
         log::warn!(
@@ -136,5 +154,35 @@ mod tests {
     fn cap_at_exact_threshold_no_clamp() {
         // leg_notional == allowed → no clamp (use > comparison, not ≥).
         assert_eq!(cap_leg_notional(50_000.0, 1.0, 50_000.0), None);
+    }
+
+    #[test]
+    fn beta_gap_notional_scale_disabled_returns_one() {
+        // scale_param == 0 → feature disabled, regardless of beta_gap.
+        assert_eq!(beta_gap_notional_scale(0.0, 0.0, 0.5), 1.0);
+        assert_eq!(beta_gap_notional_scale(0.3, 0.0, 0.5), 1.0);
+        assert_eq!(beta_gap_notional_scale(0.3, -0.5, 0.5), 1.0);
+    }
+
+    #[test]
+    fn beta_gap_notional_scale_linear_in_gap() {
+        // scale=1.0, gap=0.20 → 1 - 0.20 = 0.80
+        assert!((beta_gap_notional_scale(0.20, 1.0, 0.0) - 0.80).abs() < 1e-9);
+        // scale=2.0, gap=0.20 → 1 - 0.40 = 0.60
+        assert!((beta_gap_notional_scale(0.20, 2.0, 0.0) - 0.60).abs() < 1e-9);
+    }
+
+    #[test]
+    fn beta_gap_notional_scale_clamps_at_floor() {
+        // scale=10, gap=0.30 → would give 1 - 3.0 = -2.0; clamp to floor=0.5.
+        assert_eq!(beta_gap_notional_scale(0.30, 10.0, 0.5), 0.5);
+        // scale=1, gap=0.20, floor=0.9 → would give 0.80, clamp up to 0.9.
+        assert_eq!(beta_gap_notional_scale(0.20, 1.0, 0.9), 0.9);
+    }
+
+    #[test]
+    fn beta_gap_notional_scale_negative_gap_is_zero() {
+        // Defensive: beta_gap should never be negative, but clamp to 0.
+        assert_eq!(beta_gap_notional_scale(-0.5, 1.0, 0.5), 1.0);
     }
 }
