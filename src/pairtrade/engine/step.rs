@@ -2014,8 +2014,33 @@ impl PairTradeEngine {
                 // 30-min cache used for dashboard / R-budget. See
                 // bot-strategy#156.
                 self.fetch_equity_rest(inst_idx).await;
+                // bot-strategy#461: shrink notional under beta-uncertainty.
+                // Lookup pair-specific params (with default fallback) so the
+                // YAML `pairs.<pair>.beta_gap_notional_scale` override works
+                // identically to the other Phase 2 filters.
+                let pair_key = format!("{}/{}", plan.pair.base, plan.pair.quote);
+                let beta_gap = self
+                    .per_pair_state
+                    .get(&pair_key)
+                    .map(|s| s.beta_gap)
+                    .unwrap_or(0.0);
+                let (notional_scale_param, notional_floor_param) = {
+                    let pp = self.pair_params_for(inst_idx, &pair_key);
+                    (pp.beta_gap_notional_scale, pp.beta_gap_notional_floor)
+                };
+                let notional_scale = crate::pairtrade::sizing::beta_gap_notional_scale(
+                    beta_gap,
+                    notional_scale_param,
+                    notional_floor_param,
+                );
+                crate::pairtrade::prom::ENTRY_NOTIONAL_SCALE
+                    .with_label_values(&[
+                        self.instances[inst_idx].id.as_str(),
+                        pair_key.as_str(),
+                    ])
+                    .set(notional_scale);
                 let qtys = self
-                    .hedged_sizes(inst_idx, &plan.pair, beta, &plan.p1, &plan.p2)
+                    .hedged_sizes(inst_idx, &plan.pair, beta, &plan.p1, &plan.p2, notional_scale)
                     .context("hedged_sizes")?;
                 let price_a = price_map
                     .get(&plan.pair.base)
