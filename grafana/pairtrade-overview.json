@@ -1848,6 +1848,53 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Entry rejects breakdown (24h, by gate) \u2014 Frankfurt + Tokyo Lighter",
+      "description": "Stacked area of `increase(pairtrade_entry_reject_total[24h])` summed over the Frankfurt + Tokyo Lighter pairtrade fleet, broken down by the gate that fired. Use this to see which filter is responsible for blocked entries \u2014 especially when the live trade rate looks low. Common reasons in production: `z_below_threshold` (most cycles' z is just under the dynamic threshold; influenced by `beta_gap_entry_z_scale`), `beta_divergence` (hard gate at `beta_divergence_max=0.30`), `beta_min` (hedge leg too small), `mtf` (multi-timeframe z-confluence). Added for bot-strategy#355 Round-4 follow-up.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 150
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(pairtrade_entry_reject_total{instance!~\"debot-tokyo-extended.*\",variant!=\"\"}[24h]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
   ]
 }

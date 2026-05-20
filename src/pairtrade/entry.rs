@@ -138,6 +138,9 @@ pub(super) fn post_stop_cooldown_allows(
     false
 }
 
+/// Result of `should_enter`. `Ok(())` means take the entry. `Err(reason)` is
+/// the static identifier of the gate that fired — kept in sync with
+/// `prom::KNOWN_ENTRY_REJECT_REASONS`.
 pub(super) fn should_enter(
     cfg: &PairTradeConfig,
     pp: &PairParams,
@@ -148,15 +151,15 @@ pub(super) fn should_enter(
     net_funding: f64,
     now_ts: i64,
     proposed_direction: PositionDirection,
-) -> bool {
+) -> Result<(), &'static str> {
     if let Some(last_exit_ts) = state.last_exit_ts {
         if now_ts.saturating_sub(last_exit_ts) < pp.cooldown_secs as i64 {
-            return false;
+            return Err("cooldown");
         }
     }
 
     if !post_stop_cooldown_allows(pp, state, now_ts, proposed_direction) {
-        return false;
+        return Err("post_stop_cooldown");
     }
 
     // --- Phase 2 filter: spread momentum block ---
@@ -165,7 +168,7 @@ pub(super) fn should_enter(
     if pp.entry_velocity_block_sigma_per_min > 0.0
         && shared.last_velocity_sigma_per_min.abs() >= pp.entry_velocity_block_sigma_per_min
     {
-        return false;
+        return Err("velocity");
     }
 
     // --- Std collapse guard (bot-strategy#62) ---
@@ -200,7 +203,7 @@ pub(super) fn should_enter(
                 ratio,
                 pp.std_collapse_min_ratio,
             );
-            return false;
+            return Err("std_collapse");
         }
     }
 
@@ -212,20 +215,12 @@ pub(super) fn should_enter(
     };
 
     // --- Phase 2 filter: funding rate continuous scaling ---
-    // Scale entry_z based on funding magnitude (beyond the simple discount
-    // above). funding_entry_z_scale > 0: entry_z *= 1.0 - scale * net_funding
-    //   positive funding → lower threshold (easier entry)
-    //   negative funding → higher threshold (harder entry)
-    // Disabled when funding_entry_z_scale == 0.0.
     if pp.funding_entry_z_scale > 0.0 {
         let adjustment = 1.0 - pp.funding_entry_z_scale * net_funding;
         entry_threshold *= adjustment.clamp(ENTRY_Z_SCALE_MIN, ENTRY_Z_SCALE_MAX);
     }
 
     // --- Phase 2 filter: beta gap dynamic adjustment ---
-    // Raise entry threshold when beta_s and beta_l diverge (hedge unreliable).
-    // entry_z *= 1.0 + scale * beta_gap
-    // Disabled when beta_gap_entry_z_scale == 0.0.
     if pp.beta_gap_entry_z_scale > 0.0 {
         entry_threshold *= 1.0 + pp.beta_gap_entry_z_scale * shared.beta_gap;
     }
@@ -235,28 +230,28 @@ pub(super) fn should_enter(
 
     // Avoid entering when the current z already triggers stop-loss exit.
     if z.abs() >= pp.stop_loss_z {
-        return false;
+        return Err("stop_loss_z");
     }
     // Spread trend filter: block entry if spread is trending
     if let Some(slope_sigma) = spread_slope_sigma(&shared.spread_history, cfg.metrics_window) {
         if slope_sigma > pp.spread_trend_max_slope_sigma {
-            return false;
+            return Err("spread_trend");
         }
     }
     // Beta stability filter: block entry if beta_s and beta_l diverge
     if shared.beta_gap > pp.beta_divergence_max {
-        return false;
+        return Err("beta_divergence");
     }
     // Beta minimum filter: block entry if beta is too low (hedge leg too small)
     if pp.beta_min > 0.0 && shared.beta < pp.beta_min {
-        return false;
+        return Err("beta_min");
     }
     // Account for estimated cost (fees + slippage) in sigma units
     let total_cost_bps = cfg.fee_bps * 2.0 + cfg.slippage_cost_bps() * 2.0; // two legs
     let cost_ratio = total_cost_bps / 10_000.0;
     let cost_in_sigma = if std <= 1e-9 { 0.0 } else { cost_ratio / std };
     if z.abs() < entry_threshold {
-        return false;
+        return Err("z_below_threshold");
     }
 
     // Multi-timeframe z-score confluence filter.
@@ -267,14 +262,20 @@ pub(super) fn should_enter(
         for &w in &pp.mtf_windows {
             if let Some(z_w) = shared.z_score_for_window(w) {
                 if z_w.signum() != primary_sign || z_w.abs() < pp.mtf_z_min {
-                    return false;
+                    return Err("mtf");
                 }
             }
             // Insufficient data for this window → skip (permissive)
         }
     }
 
-    z.abs() >= entry_threshold + cost_in_sigma && net_funding >= cfg.net_funding_min_per_hour
+    if z.abs() < entry_threshold + cost_in_sigma {
+        return Err("z_below_threshold");
+    }
+    if net_funding < cfg.net_funding_min_per_hour {
+        return Err("net_funding_min");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

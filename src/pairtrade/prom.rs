@@ -233,6 +233,54 @@ pub fn init_close_reason_series(variant: &str, pair: &str) {
     }
 }
 
+pub static ENTRY_REJECT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_entry_reject_total",
+        "Cumulative count of entry attempts blocked, broken down by the \
+         gate that fired. Counts pre-`should_enter` gates (KILL_SWITCH, \
+         session_halted, daily_loss, circuit_breaker, waiting_first_eval, \
+         regime) and the in-`should_enter` filters \
+         (cooldown, post_stop_cooldown, velocity, std_collapse, \
+         stop_loss_z, spread_trend, beta_divergence, beta_min, \
+         z_below_threshold, mtf, net_funding_min). Round-4 follow-up \
+         (bot-strategy#355).",
+        &["variant", "pair", "reason"],
+    )
+});
+
+/// Every entry-reject reason string `pairtrade_entry_reject_total` may receive.
+/// Kept in sync with the literals in `engine/step.rs` (pre-`should_enter`) and
+/// `entry.rs::should_enter` (in-filter). The unit test below asserts that.
+pub const KNOWN_ENTRY_REJECT_REASONS: &[&str] = &[
+    // pre-should_enter (step.rs)
+    "kill_switch",
+    "session_halted",
+    "daily_loss",
+    "circuit_breaker",
+    "waiting_first_eval",
+    "regime",
+    // in-should_enter (entry.rs)
+    "cooldown",
+    "post_stop_cooldown",
+    "velocity",
+    "std_collapse",
+    "stop_loss_z",
+    "spread_trend",
+    "beta_divergence",
+    "beta_min",
+    "z_below_threshold",
+    "mtf",
+    "net_funding_min",
+];
+
+pub fn init_entry_reject_series(variant: &str, pair: &str) {
+    for reason in KNOWN_ENTRY_REJECT_REASONS {
+        ENTRY_REJECT_TOTAL
+            .with_label_values(&[variant, pair, reason])
+            .inc_by(0);
+    }
+}
+
 // === Execution quality (#314 Group 4) ===
 //
 // Observed at the exit_fill site (engine/reconcile.rs). `gross_pnl_bps` is
