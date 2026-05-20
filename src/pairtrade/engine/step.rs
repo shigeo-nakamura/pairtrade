@@ -93,6 +93,39 @@ struct StepSetup {
 }
 
 impl PairTradeEngine {
+    /// Dump the `pairtrade_entry_reject_total` counter as a single
+    /// `[ENTRY_REJECT_SUMMARY]` log block. Used at BT end-of-data so the
+    /// breakdown is recoverable from the BT log without a /metrics
+    /// scrape. Live runs read the counter via Prometheus instead.
+    fn log_entry_reject_summary(&self) {
+        use crate::pairtrade::prom::{ENTRY_REJECT_TOTAL, KNOWN_ENTRY_REJECT_REASONS};
+        for inst in &self.instances {
+            for pair in &self.cfg.universe {
+                let pair_key = format!("{}/{}", pair.base, pair.quote);
+                let mut parts: Vec<String> = Vec::new();
+                let mut total: u64 = 0;
+                for reason in KNOWN_ENTRY_REJECT_REASONS {
+                    let v = ENTRY_REJECT_TOTAL
+                        .with_label_values(&[inst.id.as_str(), pair_key.as_str(), reason])
+                        .get();
+                    if v > 0 {
+                        parts.push(format!("{}={}", reason, v));
+                        total += v;
+                    }
+                }
+                if total > 0 {
+                    log::info!(
+                        "[ENTRY_REJECT_SUMMARY] variant={} pair={} total={} {}",
+                        inst.id,
+                        pair_key,
+                        total,
+                        parts.join(" ")
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         log::info!("[CONFIG] DEX_NAME is: {}", self.cfg.dex_name);
         log::info!(
@@ -170,6 +203,7 @@ impl PairTradeEngine {
                 };
                 if !has_more {
                     log::info!("[BACKTEST] End of data file reached. Backtest finished.");
+                    self.log_entry_reject_summary();
                     break;
                 }
             }
@@ -1435,62 +1469,83 @@ impl PairTradeEngine {
                             }
                         } else if !self.positions_ready {
                             log_positions_not_ready = true;
-                        } else if kill_switch_active_snapshot {
-                            // entry blocked by KILL_SWITCH sentinel file;
-                            // engagement/release is logged in step_shared
-                        } else if session_halted_snapshot {
-                            // entry blocked by Phase 3-1 session-DD halt.
-                            // The trip + flatten was logged in
-                            // evaluate_session_dd; clearing requires a
-                            // manual ack at /opt/debot/RISK_ACK.
-                        } else if daily_loss_blocks_snapshot {
-                            // entry blocked by daily DD threshold; the
-                            // exact PnL / bps is surfaced in status.json
-                            // and re-logged on session rollover via
-                            // [DAILY_DD]. Existing positions still exit
-                            // through the usual exit_reason paths.
-                        } else if circuit_breaker_until_ts_snapshot
-                            .map_or(false, |until| now_ts < until)
-                        {
-                            // entry blocked by circuit breaker; logged via ZCHECK
-                        } else if last_eval_ts.is_none() {
-                            // Block entry until first evaluate_pair() completes,
-                            // because beta is still at its initial value (1.0).
-                        } else if !regime_ok {
-                            // entry blocked by regime filter
                         } else {
-                            let direction = if z > 0.0 {
-                                PositionDirection::ShortSpread
+                            // Pre-`should_enter` block chain. The reject
+                            // counter increments only here (each tick that
+                            // reaches the eligible/z_snapshot branch counts
+                            // as one entry attempt) so the dashboard's
+                            // breakdown stays comparable to in-filter
+                            // rejects. bot-strategy#355 follow-up.
+                            let pre_reject_reason: Option<&'static str> = if kill_switch_active_snapshot {
+                                Some("kill_switch")
+                            } else if session_halted_snapshot {
+                                Some("session_halted")
+                            } else if daily_loss_blocks_snapshot {
+                                Some("daily_loss")
+                            } else if circuit_breaker_until_ts_snapshot
+                                .map_or(false, |until| now_ts < until)
+                            {
+                                Some("circuit_breaker")
+                            } else if last_eval_ts.is_none() {
+                                Some("waiting_first_eval")
+                            } else if !regime_ok {
+                                Some("regime")
                             } else {
-                                PositionDirection::LongSpread
+                                None
                             };
-                            let entered = {
-                                let state = self.instances[inst_idx]
-                                    .states
-                                    .get(&key)
-                                    .ok_or_else(|| anyhow!("missing state for {}", key))?;
-                                let shared = self
-                                    .per_pair_state
-                                    .get(&key)
-                                    .ok_or_else(|| anyhow!("missing shared state for {}", key))?;
-                                should_enter(
-                                    &self.cfg,
-                                    pp,
-                                    state,
-                                    shared,
-                                    z,
-                                    std,
-                                    net_funding,
-                                    now_ts,
-                                    direction,
-                                )
-                            };
-                            if entered {
-                                action = TradeAction::Open {
-                                    direction,
-                                    z,
-                                    beta: beta_eff,
+                            if let Some(reason) = pre_reject_reason {
+                                crate::pairtrade::prom::ENTRY_REJECT_TOTAL
+                                    .with_label_values(&[
+                                        self.instances[inst_idx].id.as_str(),
+                                        key.as_str(),
+                                        reason,
+                                    ])
+                                    .inc();
+                            } else {
+                                let direction = if z > 0.0 {
+                                    PositionDirection::ShortSpread
+                                } else {
+                                    PositionDirection::LongSpread
                                 };
+                                let decision = {
+                                    let state = self.instances[inst_idx]
+                                        .states
+                                        .get(&key)
+                                        .ok_or_else(|| anyhow!("missing state for {}", key))?;
+                                    let shared = self
+                                        .per_pair_state
+                                        .get(&key)
+                                        .ok_or_else(|| anyhow!("missing shared state for {}", key))?;
+                                    should_enter(
+                                        &self.cfg,
+                                        pp,
+                                        state,
+                                        shared,
+                                        z,
+                                        std,
+                                        net_funding,
+                                        now_ts,
+                                        direction,
+                                    )
+                                };
+                                match decision {
+                                    Ok(()) => {
+                                        action = TradeAction::Open {
+                                            direction,
+                                            z,
+                                            beta: beta_eff,
+                                        };
+                                    }
+                                    Err(reason) => {
+                                        crate::pairtrade::prom::ENTRY_REJECT_TOTAL
+                                            .with_label_values(&[
+                                                self.instances[inst_idx].id.as_str(),
+                                                key.as_str(),
+                                                reason,
+                                            ])
+                                            .inc();
+                                    }
+                                }
                             }
                         }
                         let slope_sig = self.per_pair_state.get(&key).and_then(|s| {

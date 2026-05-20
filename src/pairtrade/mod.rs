@@ -387,6 +387,7 @@ impl PairTradeEngine {
                 let pp = inst_pair_params.get(&pair_key).unwrap_or(&inst_default);
                 let ps = PairState::new(pp.entry_z_base);
                 prom::init_close_reason_series(&strategy.id, &pair_key);
+                prom::init_entry_reject_series(&strategy.id, &pair_key);
                 states.insert(pair_key, ps);
             }
 
