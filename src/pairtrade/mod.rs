@@ -353,6 +353,15 @@ impl PairTradeEngine {
             if let Some(z) = strategy.entry_z_max {
                 inst_default.entry_z_max = z;
             }
+            if let Some(v) = strategy.beta_gap_entry_z_scale {
+                inst_default.beta_gap_entry_z_scale = v;
+            }
+            if let Some(v) = strategy.beta_gap_notional_scale {
+                inst_default.beta_gap_notional_scale = v;
+            }
+            if let Some(v) = strategy.beta_gap_notional_floor {
+                inst_default.beta_gap_notional_floor = v;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -377,6 +386,15 @@ impl PairTradeEngine {
                 }
                 if let Some(z) = strategy.entry_z_max {
                     pp.entry_z_max = z;
+                }
+                if let Some(v) = strategy.beta_gap_entry_z_scale {
+                    pp.beta_gap_entry_z_scale = v;
+                }
+                if let Some(v) = strategy.beta_gap_notional_scale {
+                    pp.beta_gap_notional_scale = v;
+                }
+                if let Some(v) = strategy.beta_gap_notional_floor {
+                    pp.beta_gap_notional_floor = v;
                 }
                 inst_pair_params.insert(k.clone(), pp);
             }

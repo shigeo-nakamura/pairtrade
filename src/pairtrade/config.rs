@@ -439,6 +439,14 @@ pub(super) struct StrategyYaml {
     pub(super) entry_z_score_base: Option<f64>,
     pub(super) entry_z_score_min: Option<f64>,
     pub(super) entry_z_score_max: Option<f64>,
+    /// Per-strategy override of the global `beta_gap_entry_z_scale`.
+    /// Round 5 (bot-strategy#461): variant C disables threshold-side
+    /// scaling by setting this to 0.0; A/B inherit the global default.
+    pub(super) beta_gap_entry_z_scale: Option<f64>,
+    /// Per-strategy override of `beta_gap_notional_scale` (bot-strategy#461).
+    pub(super) beta_gap_notional_scale: Option<f64>,
+    /// Per-strategy override of `beta_gap_notional_floor` (bot-strategy#461).
+    pub(super) beta_gap_notional_floor: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -716,6 +724,12 @@ pub struct StrategyConfig {
     pub entry_z_base: Option<f64>,
     pub entry_z_min: Option<f64>,
     pub entry_z_max: Option<f64>,
+    /// Per-strategy override of the global Phase 2 β-handling parameters
+    /// (bot-strategy#461). `None` = inherit; `Some` overrides at instance
+    /// build time in `pairtrade::mod`.
+    pub beta_gap_entry_z_scale: Option<f64>,
+    pub beta_gap_notional_scale: Option<f64>,
+    pub beta_gap_notional_floor: Option<f64>,
 }
 
 impl PairTradeConfig {
@@ -1702,6 +1716,9 @@ pub(super) fn resolve_strategies(
                     entry_z_base: s.entry_z_score_base,
                     entry_z_min: s.entry_z_score_min,
                     entry_z_max: s.entry_z_score_max,
+                    beta_gap_entry_z_scale: s.beta_gap_entry_z_scale,
+                    beta_gap_notional_scale: s.beta_gap_notional_scale,
+                    beta_gap_notional_floor: s.beta_gap_notional_floor,
                 }
             })
             .collect(),
@@ -1718,6 +1735,9 @@ pub(super) fn resolve_strategies(
             entry_z_base: None,
             entry_z_min: None,
             entry_z_max: None,
+            beta_gap_entry_z_scale: None,
+            beta_gap_notional_scale: None,
+            beta_gap_notional_floor: None,
         }],
     }
 }
