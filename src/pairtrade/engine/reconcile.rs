@@ -90,6 +90,7 @@ impl PairTradeEngine {
                         entry_beta: beta_at_entry,
                         last_rehedge_ts: None,
                         rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
                     });
                     state.pending_entry = None;
                 }

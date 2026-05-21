@@ -1622,25 +1622,40 @@ impl PairTradeEngine {
                             // live data before Phase 2 enables the actual
                             // re-balance. Disabled by default
                             // (`rehedge_drift_threshold_pct=0`).
+                            let current_beta = self
+                                .per_pair_state
+                                .get(&key)
+                                .map(|s| s.beta)
+                                .unwrap_or(0.0);
                             let rehedge_decision = {
                                 let state = self.instances[inst_idx]
                                     .states
                                     .get(&key)
                                     .ok_or_else(|| anyhow!("missing state for {}", key))?;
-                                let current_beta = self
-                                    .per_pair_state
-                                    .get(&key)
-                                    .map(|s| s.beta)
-                                    .unwrap_or(0.0);
                                 // #465: pass current z for the optional
                                 // no-revert gate. z is already in scope
                                 // from the `z_snapshot` destructure above.
                                 state.position.as_ref().and_then(|pos| {
                                     super::super::rehedge::should_rehedge(
-                                        pp, pos, current_beta, Some(z), now_ts,
+                                        pp,
+                                        pos,
+                                        current_beta,
+                                        Some(z),
+                                        pp.force_close_secs,
+                                        now_ts,
                                     )
                                 })
                             };
+                            // bot-strategy#465 Option B: refresh
+                            // `prev_beta_for_velocity` AFTER evaluating
+                            // so the NEXT tick's velocity gate has a
+                            // real per-tick interval. Independent of
+                            // whether the gate fires this tick.
+                            if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                                if let Some(pos) = state.position.as_mut() {
+                                    pos.prev_beta_for_velocity = Some((current_beta, now_ts));
+                                }
+                            }
                             if let Some(dec) = rehedge_decision {
                                 log::info!(
                                     "[REHEDGE_NEEDED] variant={} pair={} entry_beta={:.4} current_beta={:.4} drift_pct={:.4} swing_usd={:.2}",
@@ -2352,6 +2367,7 @@ impl PairTradeEngine {
                             entry_beta: Some(beta),
                             last_rehedge_ts: None,
                             rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
                         });
                         super::super::prom::LAST_ENTRY_Z
                             .with_label_values(&[&inst_id, plan.key.as_str()])

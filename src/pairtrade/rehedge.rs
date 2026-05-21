@@ -46,6 +46,7 @@ pub(super) fn should_rehedge(
     position: &Position,
     current_beta: f64,
     current_z: Option<f64>,
+    force_close_secs: u64,
     now_ts: i64,
 ) -> Option<RehedgeDecision> {
     let threshold = pp.rehedge_drift_threshold_pct;
@@ -74,6 +75,27 @@ pub(super) fn should_rehedge(
             let z_now_abs = z_now.abs();
             if z_now_abs < z_entry_abs * pp.rehedge_z_no_revert_factor {
                 return None;
+            }
+        }
+    }
+    // bot-strategy#465 Option B — β-velocity gate. Compute the
+    // instantaneous drift rate from `prev_beta_for_velocity` and
+    // project to remaining hold time. Skip when projected total
+    // drift is below the configured minimum (slow drifts tend to
+    // self-correct before they hurt).
+    if pp.rehedge_velocity_projected_drift_min > 0.0 {
+        if let Some((prev_beta, prev_ts)) = position.prev_beta_for_velocity {
+            let dt = (now_ts - prev_ts) as f64;
+            if dt > 0.0 {
+                let beta_velocity = (current_beta - prev_beta) / dt;
+                let elapsed = (now_ts - position.entered_ts).max(0) as i64;
+                let remaining =
+                    (force_close_secs as i64).saturating_sub(elapsed).max(0) as f64;
+                let projected_total_drift =
+                    drift + (beta_velocity.abs() * remaining) / entry_beta.abs();
+                if projected_total_drift < pp.rehedge_velocity_projected_drift_min {
+                    return None;
+                }
             }
         }
     }
@@ -201,20 +223,21 @@ mod tests {
             entry_beta,
             last_rehedge_ts,
             rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
         }
     }
 
     #[test]
     fn disabled_when_threshold_is_zero() {
         let p = pp(0.0, 1800, 50.0);
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.5, None, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.5, None, 7200u64, 2_000_000);
         assert_eq!(r, None);
     }
 
     #[test]
     fn skipped_when_entry_beta_unknown() {
         let p = pp(0.15, 1800, 50.0);
-        let r = should_rehedge(&p, &pos(None, None), 1.5, None, 2_000_000);
+        let r = should_rehedge(&p, &pos(None, None), 1.5, None, 7200u64, 2_000_000);
         assert_eq!(r, None);
     }
 
@@ -222,7 +245,7 @@ mod tests {
     fn skipped_when_drift_under_threshold() {
         let p = pp(0.20, 1800, 50.0);
         // drift = |1.10 - 1.00| / 1.00 = 0.10 < 0.20
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.10, None, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.10, None, 7200u64, 2_000_000);
         assert_eq!(r, None);
     }
 
@@ -231,7 +254,7 @@ mod tests {
         let p = pp(0.15, 1800, 5.0);
         // drift = |0.70 - 1.00| / 1.00 = 0.30 >= 0.15
         // notional swing = 0.30 * 0.025 * 2000 = $15.00 >= $5
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.70, None, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.70, None, 7200u64, 2_000_000);
         let d = r.expect("should fire");
         assert!((d.drift_pct - 0.30).abs() < 1e-9);
         assert!((d.notional_swing_usd - 15.0).abs() < 1e-9);
@@ -241,7 +264,7 @@ mod tests {
     fn skipped_when_inside_cooldown() {
         let p = pp(0.15, 1800, 5.0);
         // last rehedge 900 s ago < 1800 s cool-down
-        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 900)), 0.70, None, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 900)), 0.70, None, 7200u64, 2_000_000);
         assert_eq!(r, None);
     }
 
@@ -249,7 +272,7 @@ mod tests {
     fn fires_after_cooldown_elapses() {
         let p = pp(0.15, 1800, 5.0);
         // 1801 s ago > 1800 s
-        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 1801)), 0.70, None, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 1801)), 0.70, None, 7200u64, 2_000_000);
         assert!(r.is_some());
     }
 
@@ -257,7 +280,7 @@ mod tests {
     fn skipped_when_swing_below_min_notional() {
         let p = pp(0.15, 1800, 100.0);
         // notional swing = 0.30 * 0.025 * 2000 = $15.00 < $100 floor
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.70, None, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.70, None, 7200u64, 2_000_000);
         assert_eq!(r, None);
     }
 
@@ -265,10 +288,10 @@ mod tests {
     fn handles_negative_drift_direction() {
         let p = pp(0.20, 1800, 5.0);
         // β grew 60% (drift = +0.60), still triggers
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.60, None, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.60, None, 7200u64, 2_000_000);
         assert!(r.is_some());
         // β shrunk 60% (drift = +0.60 still — absolute value),
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.40, None, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.40, None, 7200u64, 2_000_000);
         assert!(r.is_some());
     }
 

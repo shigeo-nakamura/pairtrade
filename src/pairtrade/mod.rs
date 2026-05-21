@@ -381,6 +381,9 @@ impl PairTradeEngine {
             if let Some(v) = strategy.rehedge_z_no_revert_factor {
                 inst_default.rehedge_z_no_revert_factor = v;
             }
+            if let Some(v) = strategy.rehedge_velocity_projected_drift_min {
+                inst_default.rehedge_velocity_projected_drift_min = v;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -432,6 +435,9 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.rehedge_z_no_revert_factor {
                     pp.rehedge_z_no_revert_factor = v;
+                }
+                if let Some(v) = strategy.rehedge_velocity_projected_drift_min {
+                    pp.rehedge_velocity_projected_drift_min = v;
                 }
                 inst_pair_params.insert(k.clone(), pp);
             }
