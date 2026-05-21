@@ -64,6 +64,10 @@ impl PairTradeEngine {
                     .per_pair_state
                     .get(key)
                     .and_then(|s| s.z_score().map(|(z, _)| z));
+                // bot-strategy#463: snapshot β at fill time so the
+                // re-hedge guard measures drift against the actually-
+                // hedged ratio, not against a later re-estimation.
+                let beta_at_entry = self.per_pair_state.get(key).map(|s| s.beta);
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     let (mut ep_a, mut ep_b, mut es_a, mut es_b) = (None, None, None, None);
                     if let Some((base, quote)) = key.split_once('/') {
@@ -83,6 +87,8 @@ impl PairTradeEngine {
                         entry_size_a: es_a,
                         entry_size_b: es_b,
                         entry_z: z_at_entry,
+                        entry_beta: beta_at_entry,
+                        last_rehedge_ts: None,
                     });
                     state.pending_entry = None;
                 }

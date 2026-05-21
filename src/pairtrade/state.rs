@@ -36,6 +36,18 @@ pub(super) struct Position {
     pub(super) entry_size_a: Option<Decimal>,
     pub(super) entry_size_b: Option<Decimal>,
     pub(super) entry_z: Option<f64>,
+    /// Effective β used for hedge sizing at entry. Snapshotted once at
+    /// position open and never updated, so the mid-hold re-hedge guard
+    /// (bot-strategy#463) can measure drift against the originally-
+    /// committed hedge ratio rather than a moving target. `None` for
+    /// positions opened before #463 landed.
+    pub(super) entry_beta: Option<f64>,
+    /// Replay-aware timestamp of the most recent re-hedge fire for this
+    /// position. Drives the cool-down guard so a single β oscillation
+    /// does not produce a stream of re-hedges. `None` until the first
+    /// re-hedge. Phase 1 records the would-have-rehedged time; Phase 2
+    /// will set this on actual fill. bot-strategy#463.
+    pub(super) last_rehedge_ts: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

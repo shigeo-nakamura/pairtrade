@@ -153,6 +153,19 @@ pub static ENTRY_Z_THRESHOLD_EFFECTIVE: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static REHEDGE_NEEDED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_rehedge_needed_total",
+        "Cumulative count of ticks where #463's `should_rehedge` returned \
+         a decision — i.e. the open position's β drifted beyond \
+         `rehedge_drift_threshold_pct` and the cool-down + min-notional \
+         floors allowed firing. Phase 1: no order is actually placed — \
+         this counter is the observability hook for tuning. Phase 2 will \
+         add a sibling `_executed_total` counter at fill time.",
+        &["variant", "pair"],
+    )
+});
+
 pub static ENTRY_NOTIONAL_SCALE: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_entry_notional_scale",

@@ -383,6 +383,11 @@ impl PairTradeEngine {
                         .map(|p| (p.entered_at, p.entered_ts))
                         .unwrap_or((Instant::now(), now_ts));
                     let prev_entry_z = state.position.as_ref().and_then(|p| p.entry_z);
+                    // Preserve existing β / re-hedge state if recovering
+                    // an in-flight position; new positions have no β yet
+                    // until #463 Phase 2 lands the exchange-side recovery.
+                    let prev_entry_beta = state.position.as_ref().and_then(|p| p.entry_beta);
+                    let prev_last_rehedge_ts = state.position.as_ref().and_then(|p| p.last_rehedge_ts);
                     state.position = Some(Position {
                         direction,
                         entered_at,
@@ -392,6 +397,8 @@ impl PairTradeEngine {
                         entry_size_a: Some(b.size),
                         entry_size_b: Some(q.size),
                         entry_z: prev_entry_z,
+                        entry_beta: prev_entry_beta,
+                        last_rehedge_ts: prev_last_rehedge_ts,
                     });
                     state.position_guard = false;
                 }
