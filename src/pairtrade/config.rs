@@ -111,6 +111,14 @@ pub struct PairParams {
     /// magnitude projects to large future drift → re-hedge fires.
     /// 0.0 = disabled (legacy: only |drift| and NRV matter).
     pub rehedge_velocity_projected_drift_min: f64,
+    /// Kalman β-uncertainty entry gate (bot-strategy#462 Phase 2). When
+    /// > 0, blocks new entries while the Kalman posterior σ_β exceeds
+    /// this threshold. Calibrated from the live distribution that
+    /// Phase 1 (`pairtrade_beta_uncertainty` Prom gauge) has been
+    /// collecting since 2026-05-20. 0.0 = disabled (Phase 1 behaviour
+    /// preserved). Sensible starting value once calibrated:
+    /// ~P85 of the observed distribution.
+    pub beta_uncertainty_max: f64,
     /// Multiplicative scale applied to `entry_threshold` when the proposed
     /// direction is `ShortSpread`. 1.0 keeps the current direction-symmetric
     /// behavior; values > 1.0 require a deeper |z| for short entries (gates
@@ -377,6 +385,7 @@ pub(super) struct PairTradeYaml {
     pub(super) rehedge_require_no_revert: Option<bool>,
     pub(super) rehedge_z_no_revert_factor: Option<f64>,
     pub(super) rehedge_velocity_projected_drift_min: Option<f64>,
+    pub(super) beta_uncertainty_max: Option<f64>,
     pub(super) entry_z_short_multiplier: Option<f64>,
     pub(super) mtf_windows: Option<Vec<usize>>,
     pub(super) mtf_z_min: Option<f64>,
@@ -505,6 +514,7 @@ pub(super) struct StrategyYaml {
     pub(super) rehedge_require_no_revert: Option<bool>,
     pub(super) rehedge_z_no_revert_factor: Option<f64>,
     pub(super) rehedge_velocity_projected_drift_min: Option<f64>,
+    pub(super) beta_uncertainty_max: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -796,6 +806,7 @@ pub struct StrategyConfig {
     pub rehedge_require_no_revert: Option<bool>,
     pub rehedge_z_no_revert_factor: Option<f64>,
     pub rehedge_velocity_projected_drift_min: Option<f64>,
+    pub beta_uncertainty_max: Option<f64>,
 }
 
 impl PairTradeConfig {
@@ -1497,6 +1508,10 @@ impl PairTradeConfig {
             &mut self.default_pair_params.rehedge_velocity_projected_drift_min,
         );
         env_override(
+            "BETA_UNCERTAINTY_MAX",
+            &mut self.default_pair_params.beta_uncertainty_max,
+        );
+        env_override(
             "ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN",
             &mut self.default_pair_params.entry_velocity_block_sigma_per_min,
         );
@@ -1856,6 +1871,7 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         rehedge_require_no_revert: env_parse("REHEDGE_REQUIRE_NO_REVERT", false),
         rehedge_z_no_revert_factor: env_parse("REHEDGE_Z_NO_REVERT_FACTOR", 1.0),
         rehedge_velocity_projected_drift_min: env_parse("REHEDGE_VELOCITY_PROJECTED_DRIFT_MIN", 0.0),
+        beta_uncertainty_max: env_parse("BETA_UNCERTAINTY_MAX", 0.0),
         entry_z_short_multiplier: env_parse("ENTRY_Z_SHORT_MULTIPLIER", 1.0),
         mtf_windows: env::var("MTF_WINDOWS")
             .ok()
@@ -1952,6 +1968,7 @@ pub(super) fn resolve_strategies(
                     rehedge_require_no_revert: s.rehedge_require_no_revert,
                     rehedge_z_no_revert_factor: s.rehedge_z_no_revert_factor,
                     rehedge_velocity_projected_drift_min: s.rehedge_velocity_projected_drift_min,
+                    beta_uncertainty_max: s.beta_uncertainty_max,
                 }
             })
             .collect(),
@@ -1978,6 +1995,7 @@ pub(super) fn resolve_strategies(
             rehedge_require_no_revert: None,
             rehedge_z_no_revert_factor: None,
             rehedge_velocity_projected_drift_min: None,
+            beta_uncertainty_max: None,
         }],
     }
 }
@@ -2061,6 +2079,7 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         rehedge_require_no_revert: yaml.rehedge_require_no_revert.unwrap_or(false),
         rehedge_z_no_revert_factor: yaml.rehedge_z_no_revert_factor.unwrap_or(1.0),
         rehedge_velocity_projected_drift_min: yaml.rehedge_velocity_projected_drift_min.unwrap_or(0.0),
+        beta_uncertainty_max: yaml.beta_uncertainty_max.unwrap_or(0.0),
         entry_z_short_multiplier: yaml.entry_z_short_multiplier.unwrap_or(1.0),
         mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),
         mtf_z_min: yaml.mtf_z_min.unwrap_or(DEFAULT_MTF_Z_MIN),
