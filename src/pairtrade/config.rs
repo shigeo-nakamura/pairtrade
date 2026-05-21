@@ -80,6 +80,13 @@ pub struct PairParams {
     /// this we skip — both because the fee bps cost dominates and to
     /// avoid sub-min-order rejections. Default $50. bot-strategy#463.
     pub rehedge_min_qty_notional_usd: f64,
+    /// Live placement gate (bot-strategy#463 Phase 2). When `false`
+    /// (default), detected re-hedges in live mode are logged + counted
+    /// but no order is placed — Phase 1 behaviour. When `true`, a
+    /// taker order is submitted to the connector. Dry-run and backtest
+    /// modes ALWAYS simulate the re-hedge regardless of this flag, so
+    /// BT verification works before live opt-in.
+    pub rehedge_live_enabled: bool,
     /// Multiplicative scale applied to `entry_threshold` when the proposed
     /// direction is `ShortSpread`. 1.0 keeps the current direction-symmetric
     /// behavior; values > 1.0 require a deeper |z| for short entries (gates
@@ -342,6 +349,7 @@ pub(super) struct PairTradeYaml {
     pub(super) rehedge_drift_threshold_pct: Option<f64>,
     pub(super) rehedge_cooldown_secs: Option<u64>,
     pub(super) rehedge_min_qty_notional_usd: Option<f64>,
+    pub(super) rehedge_live_enabled: Option<bool>,
     pub(super) entry_z_short_multiplier: Option<f64>,
     pub(super) mtf_windows: Option<Vec<usize>>,
     pub(super) mtf_z_min: Option<f64>,
@@ -466,6 +474,7 @@ pub(super) struct StrategyYaml {
     pub(super) rehedge_drift_threshold_pct: Option<f64>,
     pub(super) rehedge_cooldown_secs: Option<u64>,
     pub(super) rehedge_min_qty_notional_usd: Option<f64>,
+    pub(super) rehedge_live_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -753,6 +762,7 @@ pub struct StrategyConfig {
     pub rehedge_drift_threshold_pct: Option<f64>,
     pub rehedge_cooldown_secs: Option<u64>,
     pub rehedge_min_qty_notional_usd: Option<f64>,
+    pub rehedge_live_enabled: Option<bool>,
 }
 
 impl PairTradeConfig {
@@ -1422,6 +1432,25 @@ impl PairTradeConfig {
             "EXIT_POST_ONLY_TIMEOUT_SECS",
             &mut self.default_pair_params.exit_post_only_timeout_secs,
         );
+        // bot-strategy#463 Phase 1/2: re-hedge knobs. Without these
+        // overrides the YAML-load path always uses the default
+        // (`unwrap_or(0.0)`) and ignores the env, breaking BT sweeps.
+        env_override(
+            "REHEDGE_DRIFT_THRESHOLD_PCT",
+            &mut self.default_pair_params.rehedge_drift_threshold_pct,
+        );
+        env_override(
+            "REHEDGE_COOLDOWN_SECS",
+            &mut self.default_pair_params.rehedge_cooldown_secs,
+        );
+        env_override(
+            "REHEDGE_MIN_QTY_NOTIONAL_USD",
+            &mut self.default_pair_params.rehedge_min_qty_notional_usd,
+        );
+        env_override(
+            "REHEDGE_LIVE_ENABLED",
+            &mut self.default_pair_params.rehedge_live_enabled,
+        );
         env_override(
             "ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN",
             &mut self.default_pair_params.entry_velocity_block_sigma_per_min,
@@ -1775,6 +1804,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         rehedge_drift_threshold_pct: env_parse("REHEDGE_DRIFT_THRESHOLD_PCT", 0.0),
         rehedge_cooldown_secs: env_parse("REHEDGE_COOLDOWN_SECS", 1800u64),
         rehedge_min_qty_notional_usd: env_parse("REHEDGE_MIN_QTY_NOTIONAL_USD", 50.0),
+        // bot-strategy#463 Phase 2 — live order placement is OFF by
+        // default. BT / dry_run always simulate; live opt-in requires
+        // this to be flipped (env or per-strategy YAML).
+        rehedge_live_enabled: env_parse("REHEDGE_LIVE_ENABLED", false),
         entry_z_short_multiplier: env_parse("ENTRY_Z_SHORT_MULTIPLIER", 1.0),
         mtf_windows: env::var("MTF_WINDOWS")
             .ok()
@@ -1867,6 +1900,7 @@ pub(super) fn resolve_strategies(
                     rehedge_drift_threshold_pct: s.rehedge_drift_threshold_pct,
                     rehedge_cooldown_secs: s.rehedge_cooldown_secs,
                     rehedge_min_qty_notional_usd: s.rehedge_min_qty_notional_usd,
+                    rehedge_live_enabled: s.rehedge_live_enabled,
                 }
             })
             .collect(),
@@ -1889,6 +1923,7 @@ pub(super) fn resolve_strategies(
             rehedge_drift_threshold_pct: None,
             rehedge_cooldown_secs: None,
             rehedge_min_qty_notional_usd: None,
+            rehedge_live_enabled: None,
         }],
     }
 }
@@ -1968,6 +2003,7 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         rehedge_drift_threshold_pct: yaml.rehedge_drift_threshold_pct.unwrap_or(0.0),
         rehedge_cooldown_secs: yaml.rehedge_cooldown_secs.unwrap_or(1800),
         rehedge_min_qty_notional_usd: yaml.rehedge_min_qty_notional_usd.unwrap_or(50.0),
+        rehedge_live_enabled: yaml.rehedge_live_enabled.unwrap_or(false),
         entry_z_short_multiplier: yaml.entry_z_short_multiplier.unwrap_or(1.0),
         mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),
         mtf_z_min: yaml.mtf_z_min.unwrap_or(DEFAULT_MTF_Z_MIN),

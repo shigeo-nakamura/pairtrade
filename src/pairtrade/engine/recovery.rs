@@ -388,6 +388,7 @@ impl PairTradeEngine {
                     // until #463 Phase 2 lands the exchange-side recovery.
                     let prev_entry_beta = state.position.as_ref().and_then(|p| p.entry_beta);
                     let prev_last_rehedge_ts = state.position.as_ref().and_then(|p| p.last_rehedge_ts);
+                    let prev_realized = state.position.as_ref().and_then(|p| p.rehedge_realized_pnl);
                     state.position = Some(Position {
                         direction,
                         entered_at,
@@ -399,6 +400,7 @@ impl PairTradeEngine {
                         entry_z: prev_entry_z,
                         entry_beta: prev_entry_beta,
                         last_rehedge_ts: prev_last_rehedge_ts,
+                        rehedge_realized_pnl: prev_realized,
                     });
                     state.position_guard = false;
                 }

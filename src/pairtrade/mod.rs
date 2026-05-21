@@ -372,6 +372,9 @@ impl PairTradeEngine {
             if let Some(v) = strategy.rehedge_min_qty_notional_usd {
                 inst_default.rehedge_min_qty_notional_usd = v;
             }
+            if let Some(v) = strategy.rehedge_live_enabled {
+                inst_default.rehedge_live_enabled = v;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -414,6 +417,9 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.rehedge_min_qty_notional_usd {
                     pp.rehedge_min_qty_notional_usd = v;
+                }
+                if let Some(v) = strategy.rehedge_live_enabled {
+                    pp.rehedge_live_enabled = v;
                 }
                 inst_pair_params.insert(k.clone(), pp);
             }
