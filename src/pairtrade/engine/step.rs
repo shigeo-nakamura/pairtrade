@@ -1632,9 +1632,12 @@ impl PairTradeEngine {
                                     .get(&key)
                                     .map(|s| s.beta)
                                     .unwrap_or(0.0);
+                                // #465: pass current z for the optional
+                                // no-revert gate. z is already in scope
+                                // from the `z_snapshot` destructure above.
                                 state.position.as_ref().and_then(|pos| {
                                     super::super::rehedge::should_rehedge(
-                                        pp, pos, current_beta, now_ts,
+                                        pp, pos, current_beta, Some(z), now_ts,
                                     )
                                 })
                             };

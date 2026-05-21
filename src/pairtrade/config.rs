@@ -87,6 +87,16 @@ pub struct PairParams {
     /// modes ALWAYS simulate the re-hedge regardless of this flag, so
     /// BT verification works before live opt-in.
     pub rehedge_live_enabled: bool,
+    /// Additional gate (bot-strategy#465): only fire re-hedge when the
+    /// spread is at least as far from the mean as it was at entry, i.e.
+    /// `|z_now| >= |z_entry| * rehedge_z_no_revert_factor`. Default
+    /// factor 1.0 disables the gate when `rehedge_require_no_revert =
+    /// false`. Set `rehedge_require_no_revert = true` to enable. When
+    /// active and the gate trips, the re-hedge is skipped and the
+    /// position rides the natural mean reversion instead of locking in
+    /// the drift-time β at a sub-optimal price.
+    pub rehedge_require_no_revert: bool,
+    pub rehedge_z_no_revert_factor: f64,
     /// Multiplicative scale applied to `entry_threshold` when the proposed
     /// direction is `ShortSpread`. 1.0 keeps the current direction-symmetric
     /// behavior; values > 1.0 require a deeper |z| for short entries (gates
@@ -350,6 +360,8 @@ pub(super) struct PairTradeYaml {
     pub(super) rehedge_cooldown_secs: Option<u64>,
     pub(super) rehedge_min_qty_notional_usd: Option<f64>,
     pub(super) rehedge_live_enabled: Option<bool>,
+    pub(super) rehedge_require_no_revert: Option<bool>,
+    pub(super) rehedge_z_no_revert_factor: Option<f64>,
     pub(super) entry_z_short_multiplier: Option<f64>,
     pub(super) mtf_windows: Option<Vec<usize>>,
     pub(super) mtf_z_min: Option<f64>,
@@ -475,6 +487,8 @@ pub(super) struct StrategyYaml {
     pub(super) rehedge_cooldown_secs: Option<u64>,
     pub(super) rehedge_min_qty_notional_usd: Option<f64>,
     pub(super) rehedge_live_enabled: Option<bool>,
+    pub(super) rehedge_require_no_revert: Option<bool>,
+    pub(super) rehedge_z_no_revert_factor: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -763,6 +777,8 @@ pub struct StrategyConfig {
     pub rehedge_cooldown_secs: Option<u64>,
     pub rehedge_min_qty_notional_usd: Option<f64>,
     pub rehedge_live_enabled: Option<bool>,
+    pub rehedge_require_no_revert: Option<bool>,
+    pub rehedge_z_no_revert_factor: Option<f64>,
 }
 
 impl PairTradeConfig {
@@ -1452,6 +1468,14 @@ impl PairTradeConfig {
             &mut self.default_pair_params.rehedge_live_enabled,
         );
         env_override(
+            "REHEDGE_REQUIRE_NO_REVERT",
+            &mut self.default_pair_params.rehedge_require_no_revert,
+        );
+        env_override(
+            "REHEDGE_Z_NO_REVERT_FACTOR",
+            &mut self.default_pair_params.rehedge_z_no_revert_factor,
+        );
+        env_override(
             "ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN",
             &mut self.default_pair_params.entry_velocity_block_sigma_per_min,
         );
@@ -1808,6 +1832,8 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         // default. BT / dry_run always simulate; live opt-in requires
         // this to be flipped (env or per-strategy YAML).
         rehedge_live_enabled: env_parse("REHEDGE_LIVE_ENABLED", false),
+        rehedge_require_no_revert: env_parse("REHEDGE_REQUIRE_NO_REVERT", false),
+        rehedge_z_no_revert_factor: env_parse("REHEDGE_Z_NO_REVERT_FACTOR", 1.0),
         entry_z_short_multiplier: env_parse("ENTRY_Z_SHORT_MULTIPLIER", 1.0),
         mtf_windows: env::var("MTF_WINDOWS")
             .ok()
@@ -1901,6 +1927,8 @@ pub(super) fn resolve_strategies(
                     rehedge_cooldown_secs: s.rehedge_cooldown_secs,
                     rehedge_min_qty_notional_usd: s.rehedge_min_qty_notional_usd,
                     rehedge_live_enabled: s.rehedge_live_enabled,
+                    rehedge_require_no_revert: s.rehedge_require_no_revert,
+                    rehedge_z_no_revert_factor: s.rehedge_z_no_revert_factor,
                 }
             })
             .collect(),
@@ -1924,6 +1952,8 @@ pub(super) fn resolve_strategies(
             rehedge_cooldown_secs: None,
             rehedge_min_qty_notional_usd: None,
             rehedge_live_enabled: None,
+            rehedge_require_no_revert: None,
+            rehedge_z_no_revert_factor: None,
         }],
     }
 }
@@ -2004,6 +2034,8 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         rehedge_cooldown_secs: yaml.rehedge_cooldown_secs.unwrap_or(1800),
         rehedge_min_qty_notional_usd: yaml.rehedge_min_qty_notional_usd.unwrap_or(50.0),
         rehedge_live_enabled: yaml.rehedge_live_enabled.unwrap_or(false),
+        rehedge_require_no_revert: yaml.rehedge_require_no_revert.unwrap_or(false),
+        rehedge_z_no_revert_factor: yaml.rehedge_z_no_revert_factor.unwrap_or(1.0),
         entry_z_short_multiplier: yaml.entry_z_short_multiplier.unwrap_or(1.0),
         mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),
         mtf_z_min: yaml.mtf_z_min.unwrap_or(DEFAULT_MTF_Z_MIN),

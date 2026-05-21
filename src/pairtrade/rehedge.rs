@@ -45,6 +45,7 @@ pub(super) fn should_rehedge(
     pp: &PairParams,
     position: &Position,
     current_beta: f64,
+    current_z: Option<f64>,
     now_ts: i64,
 ) -> Option<RehedgeDecision> {
     let threshold = pp.rehedge_drift_threshold_pct;
@@ -60,6 +61,21 @@ pub(super) fn should_rehedge(
     let drift = (current_beta - entry_beta).abs() / entry_beta.abs();
     if drift < threshold {
         return None;
+    }
+    // bot-strategy#465: optional gate — only re-hedge when the spread
+    // has NOT reverted toward the mean since entry. If `|z_now|` has
+    // already dropped below `|z_entry| * rehedge_z_no_revert_factor`,
+    // the position is mid-reversion and the β-drift will likely correct
+    // itself; locking in a rebalance now caps the win. Skip the
+    // re-hedge.
+    if pp.rehedge_require_no_revert {
+        if let (Some(z_now), Some(z_entry)) = (current_z, position.entry_z) {
+            let z_entry_abs = z_entry.abs();
+            let z_now_abs = z_now.abs();
+            if z_now_abs < z_entry_abs * pp.rehedge_z_no_revert_factor {
+                return None;
+            }
+        }
     }
     // Cool-down: only consult `last_rehedge_ts`; if `None` we have
     // never re-hedged this position, so the cool-down is trivially OK.
@@ -191,14 +207,14 @@ mod tests {
     #[test]
     fn disabled_when_threshold_is_zero() {
         let p = pp(0.0, 1800, 50.0);
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.5, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.5, None, 2_000_000);
         assert_eq!(r, None);
     }
 
     #[test]
     fn skipped_when_entry_beta_unknown() {
         let p = pp(0.15, 1800, 50.0);
-        let r = should_rehedge(&p, &pos(None, None), 1.5, 2_000_000);
+        let r = should_rehedge(&p, &pos(None, None), 1.5, None, 2_000_000);
         assert_eq!(r, None);
     }
 
@@ -206,7 +222,7 @@ mod tests {
     fn skipped_when_drift_under_threshold() {
         let p = pp(0.20, 1800, 50.0);
         // drift = |1.10 - 1.00| / 1.00 = 0.10 < 0.20
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.10, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.10, None, 2_000_000);
         assert_eq!(r, None);
     }
 
@@ -215,7 +231,7 @@ mod tests {
         let p = pp(0.15, 1800, 5.0);
         // drift = |0.70 - 1.00| / 1.00 = 0.30 >= 0.15
         // notional swing = 0.30 * 0.025 * 2000 = $15.00 >= $5
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.70, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.70, None, 2_000_000);
         let d = r.expect("should fire");
         assert!((d.drift_pct - 0.30).abs() < 1e-9);
         assert!((d.notional_swing_usd - 15.0).abs() < 1e-9);
@@ -225,7 +241,7 @@ mod tests {
     fn skipped_when_inside_cooldown() {
         let p = pp(0.15, 1800, 5.0);
         // last rehedge 900 s ago < 1800 s cool-down
-        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 900)), 0.70, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 900)), 0.70, None, 2_000_000);
         assert_eq!(r, None);
     }
 
@@ -233,7 +249,7 @@ mod tests {
     fn fires_after_cooldown_elapses() {
         let p = pp(0.15, 1800, 5.0);
         // 1801 s ago > 1800 s
-        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 1801)), 0.70, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 1801)), 0.70, None, 2_000_000);
         assert!(r.is_some());
     }
 
@@ -241,7 +257,7 @@ mod tests {
     fn skipped_when_swing_below_min_notional() {
         let p = pp(0.15, 1800, 100.0);
         // notional swing = 0.30 * 0.025 * 2000 = $15.00 < $100 floor
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.70, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.70, None, 2_000_000);
         assert_eq!(r, None);
     }
 
@@ -249,10 +265,10 @@ mod tests {
     fn handles_negative_drift_direction() {
         let p = pp(0.20, 1800, 5.0);
         // β grew 60% (drift = +0.60), still triggers
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.60, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 1.60, None, 2_000_000);
         assert!(r.is_some());
         // β shrunk 60% (drift = +0.60 still — absolute value),
-        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.40, 2_000_000);
+        let r = should_rehedge(&p, &pos(Some(1.0), None), 0.40, None, 2_000_000);
         assert!(r.is_some());
     }
 
