@@ -195,3 +195,21 @@ strategies:
     beta_gap_entry_z_scale: 0.0
     beta_gap_notional_scale: 1.0
     beta_gap_notional_floor: 0.5
+    # Round 5 / bot-strategy#465 follow-up: opt variant C into the
+    # mid-hold re-hedge with the NRV (no-revert) gate. R3+R4 BT
+    # (43 trades, 17 days) showed the simple |drift| gate hurts PnL
+    # by ~33%; the NRV gate restores baseline-equivalent PnL while
+    # firing 11 re-hedges that correspond to the live R5 cycle pattern
+    # (β drifted while spread still at entry depth). BT cannot prove
+    # upside here — R3+R4 has too few of those cycles to be conclusive.
+    # Live A/B/C comparison will tell us.
+    # If C ≈ A/B over 2 weeks → keep as Round-5 standard.
+    # If C underperforms → revert this block (set rehedge_drift_threshold_pct
+    # back to 0.0 OR set rehedge_live_enabled to false; the rest of
+    # variant C's substitution-mode config stays).
+    rehedge_drift_threshold_pct: 0.15
+    rehedge_cooldown_secs: 1800
+    rehedge_min_qty_notional_usd: 50.0
+    rehedge_require_no_revert: true
+    rehedge_z_no_revert_factor: 1.0
+    rehedge_live_enabled: true
