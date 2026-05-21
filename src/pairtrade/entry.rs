@@ -15,7 +15,7 @@ fn median_of(values: &VecDeque<f64>) -> Option<f64> {
     let mut buf: Vec<f64> = values.iter().copied().collect();
     buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = buf.len() / 2;
-    if buf.len() % 2 == 0 {
+    if buf.len().is_multiple_of(2) {
         Some((buf[mid - 1] + buf[mid]) / 2.0)
     } else {
         Some(buf[mid])
@@ -344,9 +344,10 @@ mod tests {
     }
 
     fn cooldown_params(stop_loss_cooldown_secs: u64) -> PairParams {
-        let mut p = PairParams::default();
-        p.stop_loss_cooldown_secs = stop_loss_cooldown_secs;
-        p
+        PairParams {
+            stop_loss_cooldown_secs,
+            ..PairParams::default()
+        }
     }
 
     #[test]
@@ -428,9 +429,10 @@ mod tests {
     // ---- bot-strategy#358: asymmetric entry_z (short multiplier) ----
 
     fn short_mult_params(entry_z_short_multiplier: f64) -> PairParams {
-        let mut p = PairParams::default();
-        p.entry_z_short_multiplier = entry_z_short_multiplier;
-        p
+        PairParams {
+            entry_z_short_multiplier,
+            ..PairParams::default()
+        }
     }
 
     #[test]

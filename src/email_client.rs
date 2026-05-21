@@ -9,6 +9,12 @@ pub struct EmailClient {
     to_address: Option<String>,
 }
 
+impl Default for EmailClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmailClient {
     pub fn new() -> Self {
         let from_address = env::var("GMAIL_USER").ok();

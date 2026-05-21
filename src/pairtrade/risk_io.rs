@@ -261,33 +261,35 @@ mod tests {
     }
 
     fn populated_instance() -> InstanceRiskState {
-        let mut s = InstanceRiskState::default();
-        s.consecutive_losses = 3;
-        s.circuit_breaker_until_ts = Some(1_234_567_890);
-        s.last_stop_loss_per_pair.insert(
+        let mut last_stop_loss_per_pair = std::collections::HashMap::new();
+        last_stop_loss_per_pair.insert(
             "BTC/ETH".to_string(),
             StopLossMark {
                 direction: PositionDirection::LongSpread,
                 ts: 1_234_567_000,
             },
         );
-        s.session_start_equity = 500.0;
-        s.session_start_ts = 1_700_000_000;
-        s.realized_pnl_today = -4.20;
-        s.funding_carry_today = -0.85;
-        s.equity_samples.push(EquitySample {
-            ts: 1_700_000_000,
-            equity: 500.0,
-        });
-        s.session_halted = true;
-        s.session_halt_reason = Some("session_dd_500bps".to_string());
-        s.session_halt_ts = Some(1_700_000_500);
-        s.total_trades = 42;
-        s.total_wins = 30;
-        s.total_pnl = 12.5;
-        s.peak_pnl = 18.0;
-        s.max_dd = -5.5;
-        s
+        InstanceRiskState {
+            consecutive_losses: 3,
+            circuit_breaker_until_ts: Some(1_234_567_890),
+            last_stop_loss_per_pair,
+            session_start_equity: 500.0,
+            session_start_ts: 1_700_000_000,
+            realized_pnl_today: -4.20,
+            funding_carry_today: -0.85,
+            equity_samples: vec![EquitySample {
+                ts: 1_700_000_000,
+                equity: 500.0,
+            }],
+            session_halted: true,
+            session_halt_reason: Some("session_dd_500bps".to_string()),
+            session_halt_ts: Some(1_700_000_500),
+            total_trades: 42,
+            total_wins: 30,
+            total_pnl: 12.5,
+            peak_pnl: 18.0,
+            max_dd: -5.5,
+        }
     }
 
     #[test]
@@ -321,12 +323,14 @@ mod tests {
     }
 
     fn make_snapshot(round_id: Option<&str>) -> RiskStateSnapshot {
-        let mut snap = RiskStateSnapshot::default();
-        snap.version = 2;
-        snap.round_id = round_id.map(|s| s.to_string());
-        snap.instances.insert("a".to_string(), populated_instance());
-        snap.instances.insert("b".to_string(), populated_instance());
-        snap
+        let mut instances = std::collections::HashMap::new();
+        instances.insert("a".to_string(), populated_instance());
+        instances.insert("b".to_string(), populated_instance());
+        RiskStateSnapshot {
+            version: 2,
+            round_id: round_id.map(|s| s.to_string()),
+            instances,
+        }
     }
 
     #[test]

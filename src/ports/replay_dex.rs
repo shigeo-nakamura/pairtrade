@@ -264,6 +264,11 @@ impl ReplayConnector {
         self.data.len()
     }
 
+    /// True when no replay data has been loaded.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     // Advances the simulation by one step. Returns false if the end is reached.
     pub fn tick(&self) -> bool {
         let current_cursor = self.cursor.load(AtomicOrdering::SeqCst);

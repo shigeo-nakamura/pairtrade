@@ -86,7 +86,7 @@ impl CurrentInstanceGuard {
     pub fn enter(id: &str) -> Self {
         let prev = CURRENT_INSTANCE.with(|c| {
             let mut slot = c.borrow_mut();
-            std::mem::replace(&mut *slot, Some(id.to_string()))
+            (*slot).replace(id.to_string())
         });
         Self { prev }
     }
@@ -298,12 +298,12 @@ fn merge_buckets(buckets: &[Arc<Bucket>], cutoff: i64) -> ErrorSummary {
         error_total += b.error_total.load(Ordering::Relaxed);
         warn_total += b.warn_total.load(Ordering::Relaxed);
         if let Some(entry) = b.last_error.lock().unwrap().clone() {
-            if last_error.as_ref().map_or(true, |cur| entry.0 > cur.0) {
+            if last_error.as_ref().is_none_or(|cur| entry.0 > cur.0) {
                 last_error = Some(entry);
             }
         }
         if let Some(entry) = b.last_warn.lock().unwrap().clone() {
-            if last_warn.as_ref().map_or(true, |cur| entry.0 > cur.0) {
+            if last_warn.as_ref().is_none_or(|cur| entry.0 > cur.0) {
                 last_warn = Some(entry);
             }
         }

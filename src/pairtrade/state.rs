@@ -192,8 +192,8 @@ pub(super) struct PairState {
     pub(super) bt_deferred_exit: Option<BtDeferredExit>,
     /// Reason classifier for the in-flight exit, set when `exit_reason()`
     /// decides a close and consumed at the exit-fill site so we can tag
-    /// post-stop state without plumbing the reason through `TradeAction`
-    /// + `PendingOrders` + reconcile. Cleared after consumption.
+    /// post-stop state without plumbing the reason through `TradeAction`,
+    /// `PendingOrders`, and reconcile. Cleared after consumption.
     /// bot-strategy#316.
     pub(super) pending_exit_reason: Option<&'static str>,
     /// Direction + replay timestamp of the most recent stop_loss_z exit.
