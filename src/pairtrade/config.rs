@@ -259,7 +259,7 @@ impl StringOrVec {
 /// YAML knob in place keeps the operator-facing schema and the engine
 /// code path symmetrical.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) struct PairTradeYaml {
     pub(super) dex_name: Option<String>,
     pub(super) rest_endpoint: Option<String>,
@@ -369,7 +369,7 @@ pub(super) struct PairTradeYaml {
 /// daily DD; Phase 3 (bot-strategy#185) adds session-level DD with
 /// auto-flatten + manual ack and an absolute notional cap per hedge leg.
 #[derive(Debug, Deserialize, Clone, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) struct RiskYaml {
     /// Threshold in basis points of `session_start_equity`, expressed in
     /// 1x-equivalent (market-move) units. The bot multiplies this by
@@ -424,7 +424,7 @@ pub(super) struct RiskYaml {
 /// `Option<T>` here, (2) carry it into `StrategyConfig`, (3) consume it
 /// in `pairtrade::mod` when building each `StrategyInstance`.
 #[derive(Debug, Deserialize, Clone, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) struct StrategyYaml {
     pub(super) id: Option<String>,
     pub(super) agent_name: Option<String>,
@@ -919,10 +919,22 @@ impl PairTradeConfig {
         let dex_name = env::var("DEX_NAME").unwrap_or_else(|_| "lighter".to_string());
         let rest_endpoint = env::var("REST_ENDPOINT").unwrap_or_default();
         let web_socket_endpoint = env::var("WEB_SOCKET_ENDPOINT").unwrap_or_default();
-        let dry_run = env::var("DRY_RUN")
-            .unwrap_or_else(|_| "true".to_string())
-            .to_lowercase()
-            == "true";
+        // bot-strategy#439: DRY_RUN is trading-critical — a silent typo here
+        // (e.g. `DRY_RUN=ture`) would flip the bot live. Accept only an
+        // unambiguous "true" / "false" (case-insensitive) and refuse to start
+        // on anything else.
+        let dry_run = match env::var("DRY_RUN") {
+            Err(_) => true,
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                other => panic!(
+                    "[CONFIG] trading-critical env DRY_RUN={:?} is not 'true' or 'false'; \
+                     refusing to start. Fix the env var or unset it (default = true). (bot-strategy#439)",
+                    other
+                ),
+            },
+        };
         let agent_name = env::var("AGENT_NAME").ok();
         let interval_secs = env::var("INTERVAL_SECS")
             .ok()
@@ -944,10 +956,14 @@ impl PairTradeConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_RISK_PCT_PER_TRADE);
-        let equity_reference_usd = env::var("EQUITY_REFERENCE_USD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_EQUITY_USD);
+        // bot-strategy#439: trading-critical. Hard-fail on parse error.
+        let equity_reference_usd = match env::var("EQUITY_REFERENCE_USD") {
+            Err(_) => DEFAULT_EQUITY_USD,
+            Ok(value) => value.parse::<f64>().unwrap_or_else(|e| panic!(
+                "[CONFIG] trading-critical env EQUITY_REFERENCE_USD={:?} failed to parse ({}); refusing to start. (bot-strategy#439)",
+                value, e
+            )),
+        };
         let universe = parse_universe_pairs()?;
         let slippage_bps = env::var("SLIPPAGE_BPS")
             .ok()
@@ -1137,7 +1153,17 @@ impl PairTradeConfig {
             }
         }
         if let Ok(value) = env::var("DRY_RUN") {
-            self.dry_run = value.to_lowercase() == "true";
+            // bot-strategy#439: same strict parse as the constructor. Reject
+            // typos rather than silently flipping live.
+            self.dry_run = match value.trim().to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                other => panic!(
+                    "[CONFIG] trading-critical env DRY_RUN={:?} is not 'true' or 'false'; \
+                     refusing to start. (bot-strategy#439)",
+                    other
+                ),
+            };
         }
         if let Ok(value) = env::var("AGENT_NAME") {
             if !value.trim().is_empty() {
@@ -1183,12 +1209,16 @@ impl PairTradeConfig {
             "SPREAD_VELOCITY_MAX_SIGMA_PER_MIN",
             &mut self.default_pair_params.spread_velocity_max_sigma_per_min,
         );
-        env_override("RISK_PCT_PER_TRADE", &mut self.risk_pct_per_trade);
+        // bot-strategy#439: hard-fail on a parse error for the trading-
+        // critical knobs. A typo on RISK_PCT_PER_TRADE / EQUITY_REFERENCE_USD
+        // / MAX_LEVERAGE / FEE_BPS / SLIPPAGE_BPS used to silently revert to
+        // the default and place real orders against the wrong risk model.
+        env_override_critical("RISK_PCT_PER_TRADE", &mut self.risk_pct_per_trade);
         env_override(
             "MAX_LOSS_R_MULT",
             &mut self.default_pair_params.max_loss_r_mult,
         );
-        env_override("EQUITY_REFERENCE_USD", &mut self.equity_reference_usd);
+        env_override_critical("EQUITY_REFERENCE_USD", &mut self.equity_reference_usd);
         env_override(
             "PAIR_SELECTION_LOOKBACK_HOURS_SHORT",
             &mut self.default_pair_params.lookback_hours_short,
@@ -1209,13 +1239,12 @@ impl PairTradeConfig {
             "ENTRY_VOL_LOOKBACK_HOURS",
             &mut self.default_pair_params.entry_vol_lookback_hours,
         );
-        if let Ok(value) = env::var("SLIPPAGE_BPS") {
-            if let Ok(parsed) = value.parse::<i32>() {
-                self.slippage_bps = parsed;
-            }
-        }
-        env_override("FEE_BPS", &mut self.fee_bps);
-        env_override("MAX_LEVERAGE", &mut self.max_leverage);
+        // bot-strategy#439: SLIPPAGE_BPS feeds the size calculation; a silent
+        // parse failure used to revert to default and place orders against the
+        // wrong cost model.
+        env_override_critical("SLIPPAGE_BPS", &mut self.slippage_bps);
+        env_override_critical("FEE_BPS", &mut self.fee_bps);
+        env_override_critical("MAX_LEVERAGE", &mut self.max_leverage);
         env_override(
             "REEVAL_JUMP_Z_MULT",
             &mut self.default_pair_params.reeval_jump_z_mult,
@@ -1462,12 +1491,12 @@ pub enum WarmStartMode {
 }
 
 impl std::str::FromStr for WarmStartMode {
-    type Err = ();
+    type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "strict" => Ok(WarmStartMode::Strict),
             "relaxed" => Ok(WarmStartMode::Relaxed),
-            _ => Err(()),
+            other => Err(format!("expected 'strict' or 'relaxed', got {:?}", other)),
         }
     }
 }
@@ -1510,19 +1539,96 @@ fn sanitize_symbol_for_filename(symbol: &str) -> String {
     out
 }
 
-fn env_parse<T: std::str::FromStr>(key: &str, fallback: T) -> T {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(fallback)
+/// Parse an env var, falling back to a default on unset OR parse failure.
+///
+/// Distinguishes the two failure modes:
+/// - **Unset** — silent (this is the documented expectation; the bot keeps
+///   running with the compile-time / YAML default).
+/// - **Set but parse fails** — `log::warn!` at WARN level naming the env var
+///   and the rejected value, then return the fallback. Pre bot-strategy#439
+///   this case was silent and indistinguishable from "unset", so a typo in
+///   a deploy script could silently revert the field to its default.
+///
+/// Trading-critical fields (max_leverage, equity reference, risk caps, etc.)
+/// should use `env_parse_critical` / `env_override_critical` instead — those
+/// hard-fail at startup on parse failure rather than reverting to a default
+/// that may be unsafe in production.
+fn env_parse<T: std::str::FromStr>(key: &str, fallback: T) -> T
+where
+    T::Err: std::fmt::Display,
+{
+    match env::var(key) {
+        Ok(value) => match value.parse::<T>() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                log::warn!(
+                    "[CONFIG] env {}={:?} failed to parse ({}); using fallback",
+                    key,
+                    value,
+                    e
+                );
+                fallback
+            }
+        },
+        Err(_) => fallback,
+    }
 }
 
-/// If `key` is set in the environment AND parses, overwrite `target`. Used by
-/// `apply_env_overrides` to collapse the dozens of `if let Ok(value)…` blocks.
-fn env_override<T: std::str::FromStr>(key: &str, target: &mut T) {
+/// If `key` is set AND parses, overwrite `target`. Mirrors `env_parse`'s
+/// silent-vs-warn distinction: unset is silent, parse failure logs a WARN
+/// and leaves `target` untouched.
+fn env_override<T: std::str::FromStr>(key: &str, target: &mut T)
+where
+    T::Err: std::fmt::Display,
+{
     if let Ok(value) = env::var(key) {
-        if let Ok(parsed) = value.parse() {
-            *target = parsed;
+        match value.parse::<T>() {
+            Ok(parsed) => *target = parsed,
+            Err(e) => log::warn!(
+                "[CONFIG] env {}={:?} failed to parse ({}); leaving previous value",
+                key,
+                value,
+                e
+            ),
+        }
+    }
+}
+
+/// Trading-critical version of `env_parse`. Behaviour matches `env_parse`
+/// for unset and success cases, but on parse failure it panics at startup
+/// rather than reverting to the fallback. Use for fields whose silent
+/// revert could place an unsafe trade (max_leverage, equity reference,
+/// risk caps, dry_run, etc.). bot-strategy#439.
+fn env_parse_critical<T: std::str::FromStr>(key: &str, fallback: T) -> T
+where
+    T::Err: std::fmt::Display,
+{
+    match env::var(key) {
+        Ok(value) => match value.parse::<T>() {
+            Ok(parsed) => parsed,
+            Err(e) => panic!(
+                "[CONFIG] trading-critical env {}={:?} failed to parse ({}); refusing to start with default fallback. \
+                 Fix the env var or unset it explicitly. (bot-strategy#439)",
+                key, value, e
+            ),
+        },
+        Err(_) => fallback,
+    }
+}
+
+/// Trading-critical version of `env_override`. Panics on parse failure.
+fn env_override_critical<T: std::str::FromStr>(key: &str, target: &mut T)
+where
+    T::Err: std::fmt::Display,
+{
+    if let Ok(value) = env::var(key) {
+        match value.parse::<T>() {
+            Ok(parsed) => *target = parsed,
+            Err(e) => panic!(
+                "[CONFIG] trading-critical env {}={:?} failed to parse ({}); refusing to start. \
+                 Fix the env var or unset it explicitly. (bot-strategy#439)",
+                key, value, e
+            ),
         }
     }
 }
@@ -1580,7 +1686,9 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
             "STOP_LOSS_COOLDOWN_SECS",
             DEFAULT_STOP_LOSS_COOLDOWN_SECS,
         ),
-        max_loss_r_mult: env_parse("MAX_LOSS_R_MULT", DEFAULT_MAX_LOSS_R_MULT),
+        // bot-strategy#439: stop-loss multiplier — silent default revert
+        // could place a trade with a much wider stop than intended.
+        max_loss_r_mult: env_parse_critical("MAX_LOSS_R_MULT", DEFAULT_MAX_LOSS_R_MULT),
         half_life_max_hours: env_parse("HALF_LIFE_MAX_HOURS", DEFAULT_HALF_LIFE_MAX_HOURS),
         adf_p_threshold: env_parse("ADF_P_THRESHOLD", DEFAULT_ADF_P_THRESHOLD),
         spread_velocity_max_sigma_per_min: env_parse(
@@ -1692,13 +1800,23 @@ pub(super) fn resolve_strategies(
                 // over both the per-strategy yaml field and the top-level
                 // reference. Lets one shared yaml deploy with different
                 // per-instance reference equity per region.
-                let equity_reference_usd =
-                    env::var(format!("EQUITY_REFERENCE_USD_{}", id.to_ascii_uppercase()))
-                        .ok()
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or_else(|| {
-                            s.equity_usd_reference.unwrap_or(cfg.equity_reference_usd)
-                        });
+                // bot-strategy#439: per-variant equity reference is trading-
+                // critical (drives position sizing); a silent parse failure on
+                // `EQUITY_REFERENCE_USD_<ID>` used to revert to whichever yaml
+                // / top-level default landed first and could place 7× the
+                // intended notional. Hard-fail on parse error instead.
+                let equity_env_key = format!("EQUITY_REFERENCE_USD_{}", id.to_ascii_uppercase());
+                let equity_reference_usd = match env::var(&equity_env_key) {
+                    Err(_) => s.equity_usd_reference.unwrap_or(cfg.equity_reference_usd),
+                    Ok(value) => match value.parse::<f64>() {
+                        Ok(parsed) => parsed,
+                        Err(e) => panic!(
+                            "[CONFIG] trading-critical env {}={:?} failed to parse ({}); refusing to start. \
+                             Fix the env var or unset it explicitly. (bot-strategy#439)",
+                            equity_env_key, value, e
+                        ),
+                    },
+                };
                 StrategyConfig {
                     id,
                     agent_name: s.agent_name.clone().or_else(|| cfg.agent_name.clone()),
