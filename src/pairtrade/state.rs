@@ -57,6 +57,13 @@ pub(super) struct Position {
     /// total cost basis stays consistent across the position lifecycle.
     /// `None` when no re-hedge has fired yet.
     pub(super) rehedge_realized_pnl: Option<Decimal>,
+    /// Most recent (β, ts) seen by `should_rehedge` — drives the
+    /// β-velocity gate (bot-strategy#465). Updated every tick the
+    /// position is open, so the velocity = (β_now - prev_β) /
+    /// (now_ts - prev_ts) captures the *recent* drift rate rather
+    /// than the cumulative drift since entry. None until the first
+    /// eval after a re-hedge / entry.
+    pub(super) prev_beta_for_velocity: Option<(f64, i64)>,
 }
 
 #[derive(Debug, Clone)]
