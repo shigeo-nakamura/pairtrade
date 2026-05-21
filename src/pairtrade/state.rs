@@ -48,6 +48,15 @@ pub(super) struct Position {
     /// re-hedge. Phase 1 records the would-have-rehedged time; Phase 2
     /// will set this on actual fill. bot-strategy#463.
     pub(super) last_rehedge_ts: Option<i64>,
+    /// Accumulated leg-B realized PnL from mid-hold re-hedges (#463
+    /// Phase 2). When a re-hedge SHRINKS the position, the closed qty
+    /// realizes its P/L at the current market price; that amount lands
+    /// here and `compute_pnl` adds it to the final-close PnL on the
+    /// remaining position. GROW re-hedges instead update the
+    /// volume-weighted `entry_price_b` (no realization yet) so the
+    /// total cost basis stays consistent across the position lifecycle.
+    /// `None` when no re-hedge has fired yet.
+    pub(super) rehedge_realized_pnl: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +204,11 @@ pub(super) struct PairState {
     pub(super) last_exit_ts: Option<i64>,
     pub(super) pending_entry: Option<PendingOrders>,
     pub(super) pending_exit: Option<PendingOrders>,
+    /// One-sided in-flight re-hedge order (bot-strategy#463 Phase 2).
+    /// `legs.len() == 1` always — re-hedge only ever trades the quote
+    /// leg. Reconcile updates `Position::entry_size_b` and
+    /// `Position::entry_beta` on fill, then clears this field.
+    pub(super) pending_rehedge: Option<PendingOrders>,
     pub(super) position_guard: bool,
     /// BT fill-delay: when an exit is decided in dry_run + backtest mode with
     /// `bt_fill_delay_secs > 0`, we defer clearing `position` until the replay
@@ -338,6 +352,7 @@ impl PairState {
             last_exit_ts: None,
             pending_entry: None,
             pending_exit: None,
+            pending_rehedge: None,
             position_guard: false,
             bt_deferred_exit: None,
             pending_exit_reason: None,

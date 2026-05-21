@@ -89,6 +89,7 @@ impl PairTradeEngine {
                         entry_z: z_at_entry,
                         entry_beta: beta_at_entry,
                         last_rehedge_ts: None,
+                        rehedge_realized_pnl: None,
                     });
                     state.pending_entry = None;
                 }

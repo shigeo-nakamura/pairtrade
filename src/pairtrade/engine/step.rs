@@ -93,6 +93,213 @@ struct StepSetup {
 }
 
 impl PairTradeEngine {
+    /// Phase 2 of bot-strategy#463: dispatch a re-hedge order for an
+    /// open position whose β has drifted past the configured threshold.
+    ///
+    /// Behaviour by mode (cascade):
+    ///   1. Skip if `pending_entry` / `pending_exit` is in flight — we
+    ///      do not want to fight the position state machine.
+    ///   2. Plan the one-sided leg-B order via `plan_rehedge_order`.
+    ///      Skip if planning returns `None` (missing entry sizes).
+    ///   3. **Dry-run / backtest**: simulate the fill synchronously —
+    ///      update `Position::entry_size_b`, `entry_beta`, and
+    ///      `last_rehedge_ts` in place; increment counter with
+    ///      `mode="dry_run"`. This is what BT measures.
+    ///   4. **Live, `rehedge_live_enabled=true`**: place a taker order
+    ///      via `connector::create_order`, await the response, then
+    ///      apply the same Position-state update with the
+    ///      venue-reported filled qty; counter `mode="live"`.
+    ///   5. **Live, `rehedge_live_enabled=false`**: log
+    ///      `[REHEDGE_LIVE_DISABLED]` and return — preserves the
+    ///      Phase 1 detect-only behaviour.
+    ///
+    /// Returns `Ok(())` on every branch including the disabled-live
+    /// path; only an unexpected internal error (state missing, bad
+    /// plan) bubbles up.
+    async fn dispatch_rehedge(
+        &mut self,
+        inst_idx: usize,
+        key: &str,
+        pair: &crate::pairtrade::config::PairSpec,
+        current_beta: f64,
+        current_price_b: Decimal,
+        now_ts: i64,
+    ) -> Result<()> {
+        // Guard: no in-flight pair-level orders.
+        let (has_pending_entry, has_pending_exit, has_pending_rehedge) = {
+            let state = self.instances[inst_idx]
+                .states
+                .get(key)
+                .ok_or_else(|| anyhow!("missing state for {}", key))?;
+            (
+                state.pending_entry.is_some(),
+                state.pending_exit.is_some(),
+                state.pending_rehedge.is_some(),
+            )
+        };
+        if has_pending_entry || has_pending_exit || has_pending_rehedge {
+            log::info!(
+                "[REHEDGE_SKIP] variant={} pair={} reason=pending_order_in_flight \
+                 entry={} exit={} rehedge={}",
+                self.instances[inst_idx].id,
+                key,
+                has_pending_entry,
+                has_pending_exit,
+                has_pending_rehedge,
+            );
+            return Ok(());
+        }
+
+        // Plan the order shape.
+        let plan = {
+            let position = self.instances[inst_idx]
+                .states
+                .get(key)
+                .and_then(|s| s.position.as_ref())
+                .cloned();
+            match position
+                .as_ref()
+                .and_then(|pos| crate::pairtrade::rehedge::plan_rehedge_order(pos, current_beta))
+            {
+                Some(p) => p,
+                None => {
+                    log::info!(
+                        "[REHEDGE_SKIP] variant={} pair={} reason=plan_unavailable",
+                        self.instances[inst_idx].id,
+                        key,
+                    );
+                    return Ok(());
+                }
+            }
+        };
+
+        let pp = self.pair_params_for(inst_idx, key).clone();
+        let mode_label = if self.cfg.backtest_mode || self.cfg.dry_run {
+            "dry_run"
+        } else if pp.rehedge_live_enabled {
+            "live"
+        } else {
+            // Live + opt-in flag off → preserve Phase 1 behaviour.
+            log::info!(
+                "[REHEDGE_LIVE_DISABLED] variant={} pair={} side={:?} qty={} new_size_b={} \
+                 (set rehedge_live_enabled=true to opt in)",
+                self.instances[inst_idx].id,
+                key,
+                plan.side,
+                plan.qty,
+                plan.expected_new_entry_size_b,
+            );
+            return Ok(());
+        };
+
+        // Live: actually submit the taker order.
+        if mode_label == "live" {
+            match self
+                .connector
+                .create_order(&pair.quote, plan.qty, plan.side, None, None, false, None)
+                .await
+            {
+                Ok(resp) => {
+                    log::info!(
+                        "[REHEDGE_LIVE] variant={} pair={} side={:?} qty={} order_id={} new_size_b={}",
+                        self.instances[inst_idx].id,
+                        key,
+                        plan.side,
+                        plan.qty,
+                        resp.order_id,
+                        plan.expected_new_entry_size_b,
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[REHEDGE_LIVE_FAIL] variant={} pair={} side={:?} qty={} error={:?} — position state unchanged",
+                        self.instances[inst_idx].id,
+                        key,
+                        plan.side,
+                        plan.qty,
+                        e,
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Update Position state. The accounting depends on whether the
+        // re-hedge GROWS or SHRINKS the position:
+        //   * Grow: new quote units priced at `current_price_b`. Update
+        //     `entry_price_b` to the volume-weighted average so the
+        //     final-close PnL uses the right cost basis.
+        //   * Shrink: close `|delta|` quote units NOW at `current_price_b`,
+        //     realize the partial PnL into `rehedge_realized_pnl`, and
+        //     keep `entry_price_b` unchanged for the remaining units.
+        // `entry_beta` resets to the post-rehedge β so subsequent drift
+        // detection anchors here.
+        let (new_entry_price_b, realized_delta) = {
+            let pos = self.instances[inst_idx]
+                .states
+                .get(key)
+                .and_then(|s| s.position.as_ref())
+                .cloned();
+            match pos {
+                Some(p) => {
+                    let old_size = p.entry_size_b.unwrap_or(Decimal::ZERO);
+                    let old_price = p.entry_price_b.unwrap_or(current_price_b);
+                    let new_size = plan.expected_new_entry_size_b;
+                    if new_size > old_size {
+                        let grew = new_size - old_size;
+                        // VWAP
+                        let new_price = if new_size > Decimal::ZERO {
+                            (old_size * old_price + grew * current_price_b) / new_size
+                        } else {
+                            current_price_b
+                        };
+                        (new_price, Decimal::ZERO)
+                    } else {
+                        // shrink — realize partial PnL on the closed portion
+                        let closed = old_size - new_size;
+                        let sign = match p.direction {
+                            crate::pairtrade::state::PositionDirection::LongSpread => Decimal::ONE,    // short leg
+                            crate::pairtrade::state::PositionDirection::ShortSpread => -Decimal::ONE,  // long leg
+                        };
+                        let realized = sign * (old_price - current_price_b) * closed;
+                        (old_price, realized)
+                    }
+                }
+                None => (current_price_b, Decimal::ZERO),
+            }
+        };
+        if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+            if let Some(pos) = state.position.as_mut() {
+                pos.entry_size_b = Some(plan.expected_new_entry_size_b);
+                pos.entry_price_b = Some(new_entry_price_b);
+                pos.entry_beta = Some(current_beta);
+                pos.last_rehedge_ts = Some(now_ts);
+                let acc = pos.rehedge_realized_pnl.unwrap_or(Decimal::ZERO) + realized_delta;
+                pos.rehedge_realized_pnl = Some(acc);
+            }
+        }
+        log::info!(
+            "[REHEDGE_EXECUTED] variant={} pair={} mode={} side={:?} qty={} new_size_b={} new_entry_price_b={} realized_delta={} new_entry_beta={:.4}",
+            self.instances[inst_idx].id,
+            key,
+            mode_label,
+            plan.side,
+            plan.qty,
+            plan.expected_new_entry_size_b,
+            new_entry_price_b,
+            realized_delta,
+            current_beta,
+        );
+        crate::pairtrade::prom::REHEDGE_EXECUTED_TOTAL
+            .with_label_values(&[
+                self.instances[inst_idx].id.as_str(),
+                key,
+                mode_label,
+            ])
+            .inc();
+        Ok(())
+    }
+
     /// Dump the `pairtrade_entry_reject_total` counter as a single
     /// `[ENTRY_REJECT_SUMMARY]` log block. Used at BT end-of-data so the
     /// breakdown is recoverable from the BT log without a /metrics
@@ -1425,9 +1632,12 @@ impl PairTradeEngine {
                                     .get(&key)
                                     .map(|s| s.beta)
                                     .unwrap_or(0.0);
+                                // #465: pass current z for the optional
+                                // no-revert gate. z is already in scope
+                                // from the `z_snapshot` destructure above.
                                 state.position.as_ref().and_then(|pos| {
                                     super::super::rehedge::should_rehedge(
-                                        pp, pos, current_beta, now_ts,
+                                        pp, pos, current_beta, Some(z), now_ts,
                                     )
                                 })
                             };
@@ -1447,6 +1657,26 @@ impl PairTradeEngine {
                                         key.as_str(),
                                     ])
                                     .inc();
+                                // bot-strategy#463 Phase 2: dispatch the
+                                // actual re-hedge if no other order is in
+                                // flight on this position. Dry-run / BT
+                                // always simulate; live opt-in via
+                                // `rehedge_live_enabled` (default false,
+                                // safety gate).
+                                let current_price_b = price_map
+                                    .get(&pair.quote)
+                                    .map(|s| s.price)
+                                    .unwrap_or(Decimal::ZERO);
+                                self.dispatch_rehedge(inst_idx, &key, pair, dec.current_beta, current_price_b, now_ts)
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        log::warn!(
+                                            "[REHEDGE_DISPATCH] variant={} pair={} failed: {}",
+                                            self.instances[inst_idx].id,
+                                            key,
+                                            e
+                                        );
+                                    });
                             }
                             let equity_base = equity_reference_snapshot;
                             let reason_opt = {
@@ -2121,6 +2351,7 @@ impl PairTradeEngine {
                             // as the reference for re-balance qty.
                             entry_beta: Some(beta),
                             last_rehedge_ts: None,
+                            rehedge_realized_pnl: None,
                         });
                         super::super::prom::LAST_ENTRY_Z
                             .with_label_values(&[&inst_id, plan.key.as_str()])

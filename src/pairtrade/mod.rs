@@ -372,6 +372,15 @@ impl PairTradeEngine {
             if let Some(v) = strategy.rehedge_min_qty_notional_usd {
                 inst_default.rehedge_min_qty_notional_usd = v;
             }
+            if let Some(v) = strategy.rehedge_live_enabled {
+                inst_default.rehedge_live_enabled = v;
+            }
+            if let Some(v) = strategy.rehedge_require_no_revert {
+                inst_default.rehedge_require_no_revert = v;
+            }
+            if let Some(v) = strategy.rehedge_z_no_revert_factor {
+                inst_default.rehedge_z_no_revert_factor = v;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -414,6 +423,15 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.rehedge_min_qty_notional_usd {
                     pp.rehedge_min_qty_notional_usd = v;
+                }
+                if let Some(v) = strategy.rehedge_live_enabled {
+                    pp.rehedge_live_enabled = v;
+                }
+                if let Some(v) = strategy.rehedge_require_no_revert {
+                    pp.rehedge_require_no_revert = v;
+                }
+                if let Some(v) = strategy.rehedge_z_no_revert_factor {
+                    pp.rehedge_z_no_revert_factor = v;
                 }
                 inst_pair_params.insert(k.clone(), pp);
             }

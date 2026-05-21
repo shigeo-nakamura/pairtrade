@@ -92,5 +92,9 @@ pub(super) fn compute_pnl(
             (exit_price_b - entry_price_b) * entry_size_b,
         ),
     };
-    Some(pnl_a + pnl_b)
+    // bot-strategy#463 Phase 2: include realized PnL from any
+    // mid-hold re-hedges that shrunk the position. Grows are absorbed
+    // into the volume-weighted `entry_price_b` and do not appear here.
+    let realized = pos.rehedge_realized_pnl.unwrap_or(Decimal::ZERO);
+    Some(pnl_a + pnl_b + realized)
 }

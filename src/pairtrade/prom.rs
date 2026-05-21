@@ -153,6 +153,18 @@ pub static ENTRY_Z_THRESHOLD_EFFECTIVE: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static REHEDGE_EXECUTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_rehedge_executed_total",
+        "Cumulative count of re-hedges that actually fired (#463 Phase 2). \
+         `mode` is `dry_run` (BT or live DRY_RUN — simulated fill) or \
+         `live` (taker order placed on the venue). Always ≤ \
+         `pairtrade_rehedge_needed_total` because the dispatch can still \
+         skip on pending-order-in-flight / missing-plan / live-disabled.",
+        &["variant", "pair", "mode"],
+    )
+});
+
 pub static REHEDGE_NEEDED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter(
         "pairtrade_rehedge_needed_total",
