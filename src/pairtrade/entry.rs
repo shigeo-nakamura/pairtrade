@@ -246,6 +246,18 @@ pub(super) fn should_enter(
     if pp.beta_min > 0.0 && shared.beta < pp.beta_min {
         return Err("beta_min");
     }
+    // bot-strategy#462 Phase 2 — Kalman β-uncertainty gate. Rigorous
+    // alternative to the beta_gap proxy: the filter's posterior σ_β
+    // tells us exactly how uncertain the current β estimate is. Skip
+    // entries while σ_β exceeds the configured ceiling. Disabled when
+    // `beta_uncertainty_max <= 0.0` (= Phase 1 behaviour preserved).
+    if pp.beta_uncertainty_max > 0.0 {
+        if let Some(kalman) = shared.kalman.as_ref() {
+            if kalman.posterior_std() > pp.beta_uncertainty_max {
+                return Err("beta_uncertainty");
+            }
+        }
+    }
     // Account for estimated cost (fees + slippage) in sigma units
     let total_cost_bps = cfg.fee_bps * 2.0 + cfg.slippage_cost_bps() * 2.0; // two legs
     let cost_ratio = total_cost_bps / 10_000.0;

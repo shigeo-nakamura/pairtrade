@@ -384,6 +384,9 @@ impl PairTradeEngine {
             if let Some(v) = strategy.rehedge_velocity_projected_drift_min {
                 inst_default.rehedge_velocity_projected_drift_min = v;
             }
+            if let Some(v) = strategy.beta_uncertainty_max {
+                inst_default.beta_uncertainty_max = v;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -438,6 +441,9 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.rehedge_velocity_projected_drift_min {
                     pp.rehedge_velocity_projected_drift_min = v;
+                }
+                if let Some(v) = strategy.beta_uncertainty_max {
+                    pp.beta_uncertainty_max = v;
                 }
                 inst_pair_params.insert(k.clone(), pp);
             }

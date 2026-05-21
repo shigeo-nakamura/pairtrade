@@ -316,6 +316,7 @@ pub const KNOWN_ENTRY_REJECT_REASONS: &[&str] = &[
     "spread_trend",
     "beta_divergence",
     "beta_min",
+    "beta_uncertainty",
     "z_below_threshold",
     "mtf",
     "net_funding_min",
