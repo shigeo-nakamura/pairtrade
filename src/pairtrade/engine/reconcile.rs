@@ -546,12 +546,12 @@ impl PairTradeEngine {
             } else if pending.placed_at.elapsed() >= timeout
                 || pending
                     .exit_taker_takeover_at
-                    .map_or(false, |t| Instant::now() >= t)
+                    .is_some_and(|t| Instant::now() >= t)
                 || status.open_remaining == 0
             {
                 let takeover_fired = pending
                     .exit_taker_takeover_at
-                    .map_or(false, |t| Instant::now() >= t)
+                    .is_some_and(|t| Instant::now() >= t)
                     && pending.placed_at.elapsed() < timeout
                     && status.open_remaining > 0;
                 if takeover_fired {
@@ -885,25 +885,24 @@ impl PairTradeEngine {
             .unwrap_or(Decimal::ZERO)
     }
 
-    /// Per-leg slippage / fee / fill-latency observation (#314 Group 4-B
-    /// + 4-C). Reads the volume-weighted fill price out of
+    /// Per-leg slippage / fee / fill-latency observation (#314 Group 4-B,
+    /// 4-C). Reads the volume-weighted fill price out of
     /// `status.filled_values`, fee out of `status.filled_fees`, and
-    /// completion timestamp out of `status.filled_ts_ms_max`. Only fires
-    /// per metric when the necessary inputs are present:
-    /// - slippage: requires a non-zero `leg.reference_price` and a
-    ///   positive filled value. Reference price is the decision-time
-    ///   best quote on the trading side, captured at order placement
-    ///   for both limit/post-only and taker orders so taker fallbacks
-    ///   (`limit_price = None`) still produce a slippage signal
-    ///   (#314 Group 4-B-2). Falls back to `limit_price` for legs that
-    ///   pre-date the field.
-    /// - fee: requires a venue-reported `filled_fee` for the leg;
-    /// - latency: requires a venue-reported `filled_ts_ms` for the leg
-    ///   (Extended populates, Lighter omits).
-    /// Sign convention on slippage: positive = cost (paid more /
-    /// received less than the reference). The `order_type` label
-    /// ("post_only" or "taker") lets the two distributions be
-    /// inspected separately.
+    /// completion timestamp out of `status.filled_ts_ms_max`. Each metric
+    /// fires only when its inputs are present.
+    ///
+    /// Slippage requires a non-zero `leg.reference_price` and a positive
+    /// filled value. Reference price is the decision-time best quote on the
+    /// trading side, captured at order placement for both limit/post-only
+    /// and taker orders so taker fallbacks (`limit_price = None`) still
+    /// produce a slippage signal (#314 Group 4-B-2). Falls back to
+    /// `limit_price` for legs that pre-date the field. Sign convention:
+    /// positive = cost (paid more / received less than the reference).
+    ///
+    /// Fee requires a venue-reported `filled_fee` for the leg. Latency
+    /// requires a venue-reported `filled_ts_ms` (Extended populates,
+    /// Lighter omits). The `order_type` label ("post_only" or "taker")
+    /// lets the post-only-vs-taker distributions be inspected separately.
     fn observe_leg_execution_quality(
         variant: &str,
         pair: &str,

@@ -47,11 +47,11 @@ pub(super) fn quantize_order_size(
         return size;
     }
     if let Some(snapshot) = prices.get(symbol) {
-        let min_order = snapshot.min_order.clone();
+        let min_order = snapshot.min_order;
         let step = snapshot
             .size_decimals
             .map(|d| Decimal::new(1, d.min(28)))
-            .or_else(|| min_order.clone());
+            .or(min_order);
         if let Some(step) = step {
             let quantized = quantize_size_by_step(size, step, min_order);
             if quantized > Decimal::ZERO {
@@ -71,11 +71,11 @@ pub(super) fn quantize_order_size_exit(
         return size;
     }
     if let Some(snapshot) = prices.get(symbol) {
-        let min_order = snapshot.min_order.clone();
+        let min_order = snapshot.min_order;
         let step = snapshot
             .size_decimals
             .map(|d| Decimal::new(1, d.min(28)))
-            .or_else(|| min_order.clone());
+            .or(min_order);
         if let Some(step) = step {
             let quantized = quantize_size_by_step_ceiling(size, step, min_order);
             if quantized > Decimal::ZERO {
@@ -98,7 +98,7 @@ pub(super) fn quantize_order_size_close(
         let step = snapshot
             .size_decimals
             .map(|d| Decimal::new(1, d.min(28)))
-            .or_else(|| snapshot.min_order.clone());
+            .or(snapshot.min_order);
         if let Some(step) = step {
             let quantized = quantize_size_by_step_ceiling(size, step, None);
             if quantized > Decimal::ZERO {
@@ -139,7 +139,7 @@ pub(super) fn pick_entry_quantize(
                 .abs()
                 .to_f64()
                 .unwrap_or(f64::INFINITY);
-            if best.map_or(true, |(_, _, d)| dev < d) {
+            if best.is_none_or(|(_, _, d)| dev < d) {
                 best = Some((a, b, dev));
             }
         }

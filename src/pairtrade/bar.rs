@@ -427,7 +427,7 @@ mod tests {
         let mut wsi = 0;
         for sec in 1..=(total_secs + 5) {
             // Drain WS up to this second for both bots
-            while wsi < ws.len() && ws[wsi].0 / 1000 <= sec - 1 {
+            while wsi < ws.len() && ws[wsi].0 / 1000 < sec {
                 let (ts_ms_inner, price) = ws[wsi];
                 let ts = base_ts + ts_ms_inner as i64;
                 let dp = d(price);

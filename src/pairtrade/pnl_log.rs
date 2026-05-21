@@ -154,7 +154,7 @@ impl PnlLogger {
         fs::create_dir_all(&self.dir)?;
         let path = self.log_path();
         let line = serde_json::to_string(&record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(file, "{line}")?;
         self.maybe_cleanup();
@@ -298,7 +298,7 @@ pub(super) fn log_startup_force_close(
             funding_ticks_observed: None,
         };
         let line = serde_json::to_string(&record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         writeln!(file, "{line}")?;
     }
     Ok(())

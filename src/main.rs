@@ -56,7 +56,7 @@ async fn run_single() -> std::io::Result<()> {
     engine
         .run()
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .map_err(std::io::Error::other)
 }
 
 // Startup hardening for transient Lighter errors (bot-strategy#120). If
@@ -165,8 +165,7 @@ async fn run_batch(batch_file: &str) -> std::io::Result<()> {
         param_sets.len()
     );
     let replay = Arc::new(ReplayConnector::new(&backtest_file).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::io::Error::other(
             format!("failed to load replay data: {}", e),
         )
     })?);

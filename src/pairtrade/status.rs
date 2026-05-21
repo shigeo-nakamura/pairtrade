@@ -442,7 +442,7 @@ impl StatusReporter {
         let interval_secs = cfg.interval_secs.max(1);
         let snapshot_every = {
             let target_secs = 60_u64;
-            let n = ((target_secs + interval_secs - 1) / interval_secs).max(1);
+            let n = target_secs.div_ceil(interval_secs).max(1);
             Duration::from_secs(interval_secs.saturating_mul(n).max(1))
         };
 
@@ -611,7 +611,7 @@ impl StatusReporter {
             fs::create_dir_all(parent)?;
         }
         let line = serde_json::to_string(event)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -751,7 +751,7 @@ impl StatusReporter {
             risk_history: self.risk_history.iter().cloned().collect(),
         };
         let payload = serde_json::to_string(&snapshot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }

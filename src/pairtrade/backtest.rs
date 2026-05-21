@@ -43,7 +43,7 @@ pub(super) async fn create_connector(
         )?);
         let primary: Arc<dyn DexConnector + Send + Sync> = replay.clone();
         let n = cfg.strategies.len().max(1);
-        let instance_connectors = std::iter::repeat(primary.clone()).take(n).collect();
+        let instance_connectors = std::iter::repeat_n(primary.clone(), n).collect();
         return Ok((primary, instance_connectors, Some(replay)));
     }
 

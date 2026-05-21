@@ -684,7 +684,7 @@ impl PairTradeEngine {
                 || res_a
                     .exchange_order_id
                     .as_ref()
-                    .map_or(false, |id| order_id == id)
+                    .is_some_and(|id| order_id == id)
         };
         let Some(filled_order) = filled_orders
             .orders
@@ -787,15 +787,14 @@ impl PairTradeEngine {
         // 1137 noise. Lighter does not — skipping the extra get_positions RPC
         // there avoids unnecessary load against Lighter's stricter rate limit.
         let preflight_reduce_only = self.cfg.dex_name.contains("extended");
-        if qty_a > Decimal::ZERO && preflight_reduce_only {
-            if self.confirm_reduce_only_position_missing(&pair.base).await {
+        if qty_a > Decimal::ZERO && preflight_reduce_only
+            && self.confirm_reduce_only_position_missing(&pair.base).await {
                 log::info!(
                     "[ORDER] {} reduce-only close skipped (preflight); position already closed",
                     pair.base
                 );
                 skipped_already_closed = true;
             }
-        }
         if qty_a > Decimal::ZERO && !skipped_already_closed {
             let res = if use_market {
                 self.connector
@@ -862,8 +861,8 @@ impl PairTradeEngine {
         }
 
         let mut quote_already_flat = false;
-        if qty_b > Decimal::ZERO && preflight_reduce_only {
-            if self.confirm_reduce_only_position_missing(&pair.quote).await {
+        if qty_b > Decimal::ZERO && preflight_reduce_only
+            && self.confirm_reduce_only_position_missing(&pair.quote).await {
                 log::info!(
                     "[ORDER] {} reduce-only close skipped (preflight); position already closed",
                     pair.quote
@@ -871,7 +870,6 @@ impl PairTradeEngine {
                 quote_already_flat = true;
                 skipped_already_closed = true;
             }
-        }
         if qty_b > Decimal::ZERO && !quote_already_flat {
             let res_b = if use_market {
                 self.connector

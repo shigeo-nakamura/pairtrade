@@ -685,7 +685,7 @@ impl PairTradeEngine {
                     let entry = self
                         .history
                         .entry(symbol.clone())
-                        .or_insert_with(VecDeque::new);
+                        .or_default();
                     let log_price = close_price
                         .to_f64()
                         .ok_or_else(|| anyhow!("invalid price for {}", symbol))?
@@ -703,7 +703,7 @@ impl PairTradeEngine {
                     if !self.cfg.backtest_mode {
                         self.bar_emit_log
                             .entry(symbol.clone())
-                            .or_insert_with(VecDeque::new)
+                            .or_default()
                             .push_back(Instant::now());
                     }
                 }
@@ -1363,8 +1363,8 @@ impl PairTradeEngine {
                 }
                 continue;
             }
-            if self.instances[inst_idx].states[&key].position_guard {
-                if matches!(action, TradeAction::None) {
+            if self.instances[inst_idx].states[&key].position_guard
+                && matches!(action, TradeAction::None) {
                     if self.should_log_position_warn(&key) {
                         log::warn!(
                             "[POSITION] {} in unhedged/mismatch state; skipping new actions",
@@ -1374,7 +1374,6 @@ impl PairTradeEngine {
                     }
                     continue;
                 }
-            }
 
             let mut log_positions_not_ready = false;
             let circuit_breaker_until_ts_snapshot =
@@ -1483,7 +1482,7 @@ impl PairTradeEngine {
                             } else if daily_loss_blocks_snapshot {
                                 Some("daily_loss")
                             } else if circuit_breaker_until_ts_snapshot
-                                .map_or(false, |until| now_ts < until)
+                                .is_some_and(|until| now_ts < until)
                             {
                                 Some("circuit_breaker")
                             } else if last_eval_ts.is_none() {

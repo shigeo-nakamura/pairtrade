@@ -266,7 +266,7 @@ impl PairTradeEngine {
         replay.reset();
         let primary: Arc<dyn DexConnector + Send + Sync> = replay.clone();
         let n = cfg.strategies.len().max(1);
-        let instance_connectors = std::iter::repeat(primary.clone()).take(n).collect();
+        let instance_connectors = std::iter::repeat_n(primary.clone(), n).collect();
         Self::new_inner(cfg, primary, instance_connectors, Some(replay)).await
     }
 
@@ -666,7 +666,7 @@ impl PairTradeEngine {
             return;
         }
         let mut lines = Vec::new();
-        for (k, _) in &self.instances[inst_idx].states {
+        for k in self.instances[inst_idx].states.keys() {
             let Some(shared) = self.per_pair_state.get(k) else {
                 continue;
             };
@@ -1506,13 +1506,6 @@ mod tests {
         assert_eq!(quantized, dec("0.003"));
     }
 
-    // 2026-04-23 18:29:50 UTC — 1745432990 — Thu of day 20203 (UNIX/86400)
-    const TS_2026_04_23_18_29: i64 = 1_745_432_990;
-    // 2026-04-24 00:00:05 UTC — 1745452805 — Fri of day 20204
-    const TS_2026_04_24_00_00: i64 = 1_745_452_805;
-    // 2026-04-23 23:59:55 UTC — 1745452795 — still Thu of day 20203
-    const TS_2026_04_23_23_59: i64 = 1_745_452_795;
-
     // bot-strategy#185 Phase 3-1: rolling-peak DD calculations.
 
     // bot-strategy#185 leverage-neutralization amendment:
@@ -1718,9 +1711,13 @@ mod pending_tests {
         Decimal::from_str(value).unwrap()
     }
 
+    /// Per-call record captured by the test-only `DummyConnector`:
+    /// `(symbol, size, side, limit_price, post_only)`.
+    type DummyCall = (String, Decimal, OrderSide, Option<Decimal>, bool);
+
     #[derive(Default)]
     struct DummyConnector {
-        calls: Mutex<Vec<(String, Decimal, OrderSide, Option<Decimal>, bool)>>,
+        calls: Mutex<Vec<DummyCall>>,
         next_id: AtomicUsize,
         balance_calls: AtomicUsize,
         balance_equity: Mutex<Option<Decimal>>,
@@ -1839,7 +1836,7 @@ mod pending_tests {
             _expiry_secs: Option<u64>,
         ) -> Result<CreateOrderResponse, DexError> {
             let order_id = format!("test-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
-            let ordered_price = price.unwrap_or_else(|| Decimal::ONE);
+            let ordered_price = price.unwrap_or(Decimal::ONE);
             self.calls
                 .lock()
                 .unwrap()
