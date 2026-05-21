@@ -1408,6 +1408,46 @@ impl PairTradeEngine {
                             .map(|s| s.position.is_some())
                             .unwrap_or(false);
                         if position_open {
+                            // bot-strategy#463 Phase 1: detect β-drift
+                            // requiring a re-hedge. No order placed yet —
+                            // we log + count so operators can tune
+                            // threshold / cooldown / min-notional from
+                            // live data before Phase 2 enables the actual
+                            // re-balance. Disabled by default
+                            // (`rehedge_drift_threshold_pct=0`).
+                            let rehedge_decision = {
+                                let state = self.instances[inst_idx]
+                                    .states
+                                    .get(&key)
+                                    .ok_or_else(|| anyhow!("missing state for {}", key))?;
+                                let current_beta = self
+                                    .per_pair_state
+                                    .get(&key)
+                                    .map(|s| s.beta)
+                                    .unwrap_or(0.0);
+                                state.position.as_ref().and_then(|pos| {
+                                    super::super::rehedge::should_rehedge(
+                                        pp, pos, current_beta, now_ts,
+                                    )
+                                })
+                            };
+                            if let Some(dec) = rehedge_decision {
+                                log::info!(
+                                    "[REHEDGE_NEEDED] variant={} pair={} entry_beta={:.4} current_beta={:.4} drift_pct={:.4} swing_usd={:.2}",
+                                    self.instances[inst_idx].id,
+                                    key,
+                                    dec.entry_beta,
+                                    dec.current_beta,
+                                    dec.drift_pct,
+                                    dec.notional_swing_usd,
+                                );
+                                crate::pairtrade::prom::REHEDGE_NEEDED_TOTAL
+                                    .with_label_values(&[
+                                        self.instances[inst_idx].id.as_str(),
+                                        key.as_str(),
+                                    ])
+                                    .inc();
+                            }
                             let equity_base = equity_reference_snapshot;
                             let reason_opt = {
                                 let state = self.instances[inst_idx]
@@ -2075,6 +2115,12 @@ impl PairTradeEngine {
                             entry_size_a: Some(qtys.0),
                             entry_size_b: Some(qtys.1),
                             entry_z: Some(z),
+                            // bot-strategy#463: snapshot the effective β
+                            // used to size this hedge. Phase 1 only reads
+                            // it for drift detection; Phase 2 will use it
+                            // as the reference for re-balance qty.
+                            entry_beta: Some(beta),
+                            last_rehedge_ts: None,
                         });
                         super::super::prom::LAST_ENTRY_Z
                             .with_label_values(&[&inst_id, plan.key.as_str()])

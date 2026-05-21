@@ -1938,6 +1938,48 @@
           "mode": "multi"
         }
       }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Re-hedge needed events (24h, per variant) \u2014 #463 Phase 1",
+      "description": "`increase(pairtrade_rehedge_needed_total[24h])` per Frankfurt variant. Phase 1 is **detection only** \u2014 these events fire when `|\u03b2_now \u2212 \u03b2_entry| / \u03b2_entry \u2265 rehedge_drift_threshold_pct` and the cool-down + min-notional floors allow firing, but no order is placed. Use this to calibrate the three thresholds (`rehedge_drift_threshold_pct`, `rehedge_cooldown_secs`, `rehedge_min_qty_notional_usd`) before enabling Phase 2's actual re-hedge. Default config has the feature disabled (threshold=0.0) so this panel shows 0 until an operator opts in.",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 166
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance, variant) (increase(pairtrade_rehedge_needed_total{instance!~\"debot-tokyo-extended.*\",variant!=\"\"}[24h]))",
+          "legendFormat": "{{instance}} {{variant}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
     }
   ]
 }

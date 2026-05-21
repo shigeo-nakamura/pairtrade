@@ -68,6 +68,18 @@ pub struct PairParams {
     /// constraints stay satisfied. 0.0 still works as long as no min-
     /// notional issues; 1.0 disables (no shrink ever).
     pub beta_gap_notional_floor: f64,
+    /// Re-hedge drift threshold (#463). Triggers a mid-hold re-hedge
+    /// when `|β_now − β_entry| / β_entry ≥ rehedge_drift_threshold_pct`
+    /// (a fraction, NOT a percentage — 0.15 = 15%). 0.0 = disabled.
+    /// Phase 1 of #463 only logs / counts; Phase 2 places orders.
+    pub rehedge_drift_threshold_pct: f64,
+    /// Minimum seconds between re-hedges on the same position to avoid
+    /// chasing β oscillation. Default 1800 (30 min). bot-strategy#463.
+    pub rehedge_cooldown_secs: u64,
+    /// Minimum *notional* (USD) of the would-be re-hedge order. Below
+    /// this we skip — both because the fee bps cost dominates and to
+    /// avoid sub-min-order rejections. Default $50. bot-strategy#463.
+    pub rehedge_min_qty_notional_usd: f64,
     /// Multiplicative scale applied to `entry_threshold` when the proposed
     /// direction is `ShortSpread`. 1.0 keeps the current direction-symmetric
     /// behavior; values > 1.0 require a deeper |z| for short entries (gates
@@ -327,6 +339,9 @@ pub(super) struct PairTradeYaml {
     pub(super) beta_gap_entry_z_scale: Option<f64>,
     pub(super) beta_gap_notional_scale: Option<f64>,
     pub(super) beta_gap_notional_floor: Option<f64>,
+    pub(super) rehedge_drift_threshold_pct: Option<f64>,
+    pub(super) rehedge_cooldown_secs: Option<u64>,
+    pub(super) rehedge_min_qty_notional_usd: Option<f64>,
     pub(super) entry_z_short_multiplier: Option<f64>,
     pub(super) mtf_windows: Option<Vec<usize>>,
     pub(super) mtf_z_min: Option<f64>,
@@ -447,6 +462,10 @@ pub(super) struct StrategyYaml {
     pub(super) beta_gap_notional_scale: Option<f64>,
     /// Per-strategy override of `beta_gap_notional_floor` (bot-strategy#461).
     pub(super) beta_gap_notional_floor: Option<f64>,
+    /// Per-strategy overrides for #463 mid-hold re-hedge (Phase 1: detection only).
+    pub(super) rehedge_drift_threshold_pct: Option<f64>,
+    pub(super) rehedge_cooldown_secs: Option<u64>,
+    pub(super) rehedge_min_qty_notional_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -730,6 +749,10 @@ pub struct StrategyConfig {
     pub beta_gap_entry_z_scale: Option<f64>,
     pub beta_gap_notional_scale: Option<f64>,
     pub beta_gap_notional_floor: Option<f64>,
+    /// Per-strategy overrides for #463 mid-hold re-hedge.
+    pub rehedge_drift_threshold_pct: Option<f64>,
+    pub rehedge_cooldown_secs: Option<u64>,
+    pub rehedge_min_qty_notional_usd: Option<f64>,
 }
 
 impl PairTradeConfig {
@@ -1748,6 +1771,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         beta_gap_entry_z_scale: env_parse("BETA_GAP_ENTRY_Z_SCALE", 0.0),
         beta_gap_notional_scale: env_parse("BETA_GAP_NOTIONAL_SCALE", 0.0),
         beta_gap_notional_floor: env_parse("BETA_GAP_NOTIONAL_FLOOR", 0.5),
+        // bot-strategy#463 Phase 1 — default DISABLED (threshold=0.0).
+        rehedge_drift_threshold_pct: env_parse("REHEDGE_DRIFT_THRESHOLD_PCT", 0.0),
+        rehedge_cooldown_secs: env_parse("REHEDGE_COOLDOWN_SECS", 1800u64),
+        rehedge_min_qty_notional_usd: env_parse("REHEDGE_MIN_QTY_NOTIONAL_USD", 50.0),
         entry_z_short_multiplier: env_parse("ENTRY_Z_SHORT_MULTIPLIER", 1.0),
         mtf_windows: env::var("MTF_WINDOWS")
             .ok()
@@ -1837,6 +1864,9 @@ pub(super) fn resolve_strategies(
                     beta_gap_entry_z_scale: s.beta_gap_entry_z_scale,
                     beta_gap_notional_scale: s.beta_gap_notional_scale,
                     beta_gap_notional_floor: s.beta_gap_notional_floor,
+                    rehedge_drift_threshold_pct: s.rehedge_drift_threshold_pct,
+                    rehedge_cooldown_secs: s.rehedge_cooldown_secs,
+                    rehedge_min_qty_notional_usd: s.rehedge_min_qty_notional_usd,
                 }
             })
             .collect(),
@@ -1856,6 +1886,9 @@ pub(super) fn resolve_strategies(
             beta_gap_entry_z_scale: None,
             beta_gap_notional_scale: None,
             beta_gap_notional_floor: None,
+            rehedge_drift_threshold_pct: None,
+            rehedge_cooldown_secs: None,
+            rehedge_min_qty_notional_usd: None,
         }],
     }
 }
@@ -1931,6 +1964,10 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
         beta_gap_notional_scale: yaml.beta_gap_notional_scale.unwrap_or(0.0),
         beta_gap_notional_floor: yaml.beta_gap_notional_floor.unwrap_or(0.5),
+        // bot-strategy#463 Phase 1 defaults — disabled.
+        rehedge_drift_threshold_pct: yaml.rehedge_drift_threshold_pct.unwrap_or(0.0),
+        rehedge_cooldown_secs: yaml.rehedge_cooldown_secs.unwrap_or(1800),
+        rehedge_min_qty_notional_usd: yaml.rehedge_min_qty_notional_usd.unwrap_or(50.0),
         entry_z_short_multiplier: yaml.entry_z_short_multiplier.unwrap_or(1.0),
         mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),
         mtf_z_min: yaml.mtf_z_min.unwrap_or(DEFAULT_MTF_Z_MIN),

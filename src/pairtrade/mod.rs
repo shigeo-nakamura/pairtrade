@@ -26,6 +26,7 @@ mod pair_eval;
 mod pnl_log;
 pub(crate) mod prom;
 mod regime;
+mod rehedge;
 mod risk_io;
 mod s3_mirror;
 mod sizing;
@@ -362,6 +363,15 @@ impl PairTradeEngine {
             if let Some(v) = strategy.beta_gap_notional_floor {
                 inst_default.beta_gap_notional_floor = v;
             }
+            if let Some(v) = strategy.rehedge_drift_threshold_pct {
+                inst_default.rehedge_drift_threshold_pct = v;
+            }
+            if let Some(v) = strategy.rehedge_cooldown_secs {
+                inst_default.rehedge_cooldown_secs = v;
+            }
+            if let Some(v) = strategy.rehedge_min_qty_notional_usd {
+                inst_default.rehedge_min_qty_notional_usd = v;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -395,6 +405,15 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.beta_gap_notional_floor {
                     pp.beta_gap_notional_floor = v;
+                }
+                if let Some(v) = strategy.rehedge_drift_threshold_pct {
+                    pp.rehedge_drift_threshold_pct = v;
+                }
+                if let Some(v) = strategy.rehedge_cooldown_secs {
+                    pp.rehedge_cooldown_secs = v;
+                }
+                if let Some(v) = strategy.rehedge_min_qty_notional_usd {
+                    pp.rehedge_min_qty_notional_usd = v;
                 }
                 inst_pair_params.insert(k.clone(), pp);
             }
