@@ -242,6 +242,22 @@ pub static LAST_EXIT_Z: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+/// Cumulative count of entry-side partial-fill reissues where the
+/// exchange-reported position size already met (or exceeded) `leg.target`
+/// at the moment the bot was about to send a fresh order — i.e. the
+/// race that bot-strategy#470 patched. Should normally stay at 0;
+/// every increment is a near-miss / actual over-fill prevented.
+pub static ENTRY_OVERSIZE_CAPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_entry_oversize_capped_total",
+        "Entry reissue attempts where exchange-reported position equalled \
+         or exceeded leg target, prompting the cap in reissue_partial_legs \
+         (bot-strategy#470). Normally 0; any increment indicates the \
+         cancel-then-reissue race fired.",
+        &["variant", "pair", "symbol"],
+    )
+});
+
 pub static CLOSE_REASON_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter(
         "pairtrade_close_reason_total",

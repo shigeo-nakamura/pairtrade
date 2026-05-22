@@ -1638,6 +1638,87 @@ mod tests {
         );
     }
 
+    // bot-strategy#470: entry-side cap covering the cancel-then-reissue
+    // race that produced the variant C ETH leg double-fill on Frankfurt
+    // 2026-05-22 06:27 UTC (target 0.8905 → actual 1.7810).
+
+    #[test]
+    fn cap_entry_reissue_returns_zero_when_exchange_already_at_target() {
+        // The actual variant C scenario: local thinks 0 filled, exchange
+        // already has the entire target sitting there. Must not reissue.
+        let q = PairTradeEngine::cap_entry_reissue_remaining(
+            dec("0.8905"),
+            Decimal::ZERO,
+            Some(dec("0.8905")),
+        );
+        assert_eq!(
+            q,
+            Decimal::ZERO,
+            "exchange already at target — reissue must be 0 or we double the leg"
+        );
+    }
+
+    #[test]
+    fn cap_entry_reissue_returns_remaining_when_exchange_partial() {
+        // Normal partial fill — local lags, exchange shows the real
+        // partial, reissue only the gap.
+        let q = PairTradeEngine::cap_entry_reissue_remaining(
+            dec("1.0"),
+            Decimal::ZERO,
+            Some(dec("0.4")),
+        );
+        assert_eq!(q, dec("0.6"));
+    }
+
+    #[test]
+    fn cap_entry_reissue_falls_back_to_local_when_exchange_query_failed() {
+        // Network / API hiccup: get_positions returned None. Fall back
+        // to the existing local-only arithmetic (`target - local`).
+        let q = PairTradeEngine::cap_entry_reissue_remaining(
+            dec("1.0"),
+            dec("0.3"),
+            None,
+        );
+        assert_eq!(q, dec("0.7"));
+    }
+
+    #[test]
+    fn cap_entry_reissue_trusts_higher_local_when_exchange_lags() {
+        // The reverse race: local recorded fills via WS but exchange
+        // /positions REST hasn't propagated yet. Trust the larger value
+        // so we don't redundantly re-send already-filled qty.
+        let q = PairTradeEngine::cap_entry_reissue_remaining(
+            dec("1.0"),
+            dec("0.7"),
+            Some(dec("0.2")),
+        );
+        assert_eq!(q, dec("0.3"));
+    }
+
+    #[test]
+    fn cap_entry_reissue_returns_zero_when_exchange_over_target() {
+        // Exchange somehow shows more than target (e.g. pre-existing
+        // residual not force-closed). Cap remaining at zero — operator
+        // recovery should run, not another order.
+        let q = PairTradeEngine::cap_entry_reissue_remaining(
+            dec("1.0"),
+            Decimal::ZERO,
+            Some(dec("2.0")),
+        );
+        assert_eq!(q, Decimal::ZERO);
+    }
+
+    #[test]
+    fn cap_entry_reissue_returns_full_target_when_nothing_filled() {
+        // Cold-start reissue path: nothing on either side.
+        let q = PairTradeEngine::cap_entry_reissue_remaining(
+            dec("1.0"),
+            Decimal::ZERO,
+            Some(Decimal::ZERO),
+        );
+        assert_eq!(q, dec("1.0"));
+    }
+
     fn make_leg(symbol: &str, target: Decimal) -> PendingLeg {
         PendingLeg {
             symbol: symbol.to_string(),

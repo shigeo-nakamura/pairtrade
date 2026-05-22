@@ -25,6 +25,7 @@ use rust_decimal::Decimal;
 use tokio::time::sleep;
 
 use super::super::config::PairSpec;
+use super::super::prom;
 use super::super::defaults::{
     POST_ONLY_ENTRY_ATTEMPTS, POST_ONLY_EXIT_ATTEMPTS, POST_ONLY_RETRY_DELAY_MS,
     POST_ONLY_RETRY_MAX_ELAPSED_MS,
@@ -49,14 +50,52 @@ impl PairTradeEngine {
     ) -> Result<Option<PendingOrders>> {
         let mut new_legs = Vec::new();
         let stage = if reduce_only { "exit" } else { "entry" };
-        for leg in &pending.legs {
-            let filled = filled_qtys
+        // Clone the legs first so each iteration can call `&mut self`
+        // helpers (exchange-position fetch / order placement) without
+        // tripping the borrow against `&pending.legs`.
+        let pending_legs: Vec<PendingLeg> = pending.legs.clone();
+        for leg in &pending_legs {
+            let local_filled = filled_qtys
                 .get(&leg.order_id)
                 .cloned()
                 .unwrap_or(Decimal::ZERO)
                 .max(leg.filled)
                 .min(leg.target);
-            let remaining = (leg.target - filled).max(Decimal::ZERO);
+            // bot-strategy#470: on the entry-side reissue path, cross-
+            // check the exchange position against the local fill state.
+            // The cancel-then-reissue boundary can drop fills from the
+            // local map (or carry over a stale `leg.filled = 0`), and the
+            // unconditional `target - local` arithmetic then sends a full
+            // duplicate order on top of qty already sitting on the
+            // exchange. Frankfurt 2026-05-22 06:27 UTC variant C ETH leg
+            // ended at 2× target (0.8905 → 1.7810) via this race.
+            let (filled, remaining) = if !reduce_only {
+                let exch = self.fetch_residual_position_size(&leg.symbol).await;
+                let r =
+                    Self::cap_entry_reissue_remaining(leg.target, local_filled, exch);
+                let effective = leg.target - r;
+                if let Some(exch_qty) = exch {
+                    if exch_qty > local_filled {
+                        log::warn!(
+                            "[ENTRY_CAP] {} exchange position {} exceeds local filled {} (target {}); \
+                             capping reissue remaining to {}",
+                            leg.symbol, exch_qty, local_filled, leg.target, r,
+                        );
+                        let variant_id =
+                            self.instances.first().map(|i| i.id.as_str()).unwrap_or("?");
+                        // The reconcile loop drives only one (variant,
+                        // pair) at a time, so labelling with `*` for pair
+                        // is fine — the symbol label is the discriminator.
+                        prom::ENTRY_OVERSIZE_CAPPED_TOTAL
+                            .with_label_values(&[variant_id, "*", &leg.symbol])
+                            .inc();
+                    }
+                }
+                (effective, r)
+            } else {
+                let r = (leg.target - local_filled).max(Decimal::ZERO);
+                (local_filled, r)
+            };
             if remaining <= Decimal::ZERO {
                 let mut kept = leg.clone();
                 kept.filled = filled;
