@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use super::config::{PairParams, PairTradeConfig};
 use super::state::{PairSharedState, PairState, PositionDirection};
-use super::stats::spread_slope_sigma;
+use super::stats::{spread_slope_sigma, BETA_CLAMP_MAX, BETA_CLAMP_MIN};
 use super::util::tail_std;
 
 fn median_of(values: &VecDeque<f64>) -> Option<f64> {
@@ -138,6 +138,21 @@ pub(super) fn post_stop_cooldown_allows(
     false
 }
 
+/// bot-strategy#474 Phase 1 — true when `beta` has saturated at either
+/// the OLS / Kalman floor (`BETA_CLAMP_MIN`) or ceiling
+/// (`BETA_CLAMP_MAX`). A clamped β is not a meaningful estimate; it
+/// signals the regression ran out of dynamic range, and any entry
+/// sized against it would mis-hedge by ~1/β (floor) or ~β (ceiling).
+/// The reconcile loop pre-`should_enter` chain consumes this gate so
+/// the `beta_clamp` reject reason flows through the same Prom counter
+/// as the other entry rejects. `BETA_CLAMP_EPSILON` absorbs numerical
+/// jitter on the boundary (the estimator can land exactly at the
+/// constant after `.clamp(...)`).
+const BETA_CLAMP_EPSILON: f64 = 1e-3;
+pub(super) fn beta_at_clamp(beta: f64) -> bool {
+    beta <= BETA_CLAMP_MIN + BETA_CLAMP_EPSILON || beta >= BETA_CLAMP_MAX - BETA_CLAMP_EPSILON
+}
+
 /// Result of `should_enter`. `Ok(())` means take the entry. `Err(reason)` is
 /// the static identifier of the gate that fired — kept in sync with
 /// `prom::KNOWN_ENTRY_REJECT_REASONS`.
@@ -245,6 +260,10 @@ pub(super) fn should_enter(
     // Beta minimum filter: block entry if beta is too low (hedge leg too small)
     if pp.beta_min > 0.0 && shared.beta < pp.beta_min {
         return Err("beta_min");
+    }
+    // bot-strategy#474 Phase 1 — β-clamp halt (see `beta_at_clamp`).
+    if beta_at_clamp(shared.beta) {
+        return Err("beta_clamp");
     }
     // bot-strategy#462 Phase 2 — Kalman β-uncertainty gate. Rigorous
     // alternative to the beta_gap proxy: the filter's posterior σ_β
@@ -532,5 +551,69 @@ mod tests {
         let even = make_history(&[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(median_of(&even), Some(2.5));
         assert_eq!(median_of(&VecDeque::<f64>::new()), None);
+    }
+
+    // bot-strategy#474 Phase 1 — `beta_at_clamp` gate. The OLS clamp
+    // is [0.1, 5.0] (stats.rs); Kalman is [0.1, 10.0] (kalman.rs) but
+    // the post-update value is read back via `shared.beta` which the
+    // pair_eval composes from OLS + Kalman with the same effective
+    // bounds. Tests assert: both floor and ceiling reject, interior
+    // accepts, and the ε absorbs jitter on either side of the clamp.
+
+    #[test]
+    fn beta_at_clamp_blocks_at_floor() {
+        assert!(beta_at_clamp(0.1));
+    }
+
+    #[test]
+    fn beta_at_clamp_blocks_at_ceiling() {
+        assert!(beta_at_clamp(5.0));
+    }
+
+    #[test]
+    fn beta_at_clamp_blocks_within_epsilon_of_floor() {
+        // Numerical jitter: regression_beta can land at 0.10005 after
+        // float ops on the clamp output.
+        assert!(beta_at_clamp(0.1005));
+    }
+
+    #[test]
+    fn beta_at_clamp_blocks_within_epsilon_of_ceiling() {
+        assert!(beta_at_clamp(4.9995));
+    }
+
+    #[test]
+    fn beta_at_clamp_allows_interior_low() {
+        // 0.15 is past the ε window (1e-3); a low-but-real β should
+        // still be allowed through this gate. `beta_min` is the
+        // strategy-level filter for "low but valid" β.
+        assert!(!beta_at_clamp(0.15));
+    }
+
+    #[test]
+    fn beta_at_clamp_allows_typical_market_beta() {
+        // The Frankfurt 5/22 06:27 entry beta was 1.12 — the canonical
+        // healthy-β value the gate must not block.
+        assert!(!beta_at_clamp(1.12));
+    }
+
+    #[test]
+    fn beta_at_clamp_allows_interior_high() {
+        assert!(!beta_at_clamp(3.0));
+    }
+
+    // Regression guard: `prom::KNOWN_ENTRY_REJECT_REASONS` MUST list
+    // every reason `should_enter` returns. The reason string here is
+    // the source of truth for the `beta_clamp` label; the prom-side
+    // unit test (in prom.rs) walks the symbol table and would fail if
+    // these drift. This local test asserts the literal so a refactor
+    // doesn't silently rename the reason without updating prom.rs.
+    #[test]
+    fn beta_clamp_reject_reason_matches_prom_constant() {
+        use super::super::prom::KNOWN_ENTRY_REJECT_REASONS;
+        assert!(
+            KNOWN_ENTRY_REJECT_REASONS.contains(&"beta_clamp"),
+            "beta_clamp reject reason must appear in prom::KNOWN_ENTRY_REJECT_REASONS"
+        );
     }
 }
