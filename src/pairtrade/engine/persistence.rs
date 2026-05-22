@@ -179,6 +179,21 @@ impl PairTradeEngine {
             inst.total_pnl = state.total_pnl;
             inst.peak_pnl = state.peak_pnl;
             inst.max_dd = state.max_dd;
+            // bot-strategy#469: surface the persisted lifetime totals on the
+            // dashboard immediately. Without this seed the status reporter's
+            // `trade_stats` stays at its `Some(zeros)` initial value until
+            // `write_pnl_record` fires for the first post-restart trade — so
+            // a variant that doesn't trade for hours (e.g. under a raised
+            // entry_z threshold) looks freshly-zeroed even though the on-disk
+            // state has the real counts.
+            if let Some(reporter) = inst.status_reporter.as_mut() {
+                reporter.set_trade_stats_totals(
+                    inst.total_trades,
+                    inst.total_wins,
+                    inst.total_pnl,
+                    inst.max_dd,
+                );
+            }
             for (pair_key, mark) in &state.last_stop_loss_per_pair {
                 if let Some(pair_state) = inst.states.get_mut(pair_key) {
                     pair_state.last_stop_loss_at = Some((mark.direction, mark.ts));
