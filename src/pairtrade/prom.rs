@@ -242,6 +242,23 @@ pub static LAST_EXIT_Z: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+/// Single-shot warning counter for β estimator collapses — every
+/// transition from a healthy interior β (> 0.5) to near-floor
+/// (≤ 0.15) within a single eval tick. Defense-in-depth #1 from the
+/// bot-strategy#472 RCA. The primary fix is the WS-arm
+/// `tick_sanity_check`; this counter surfaces any future event that
+/// slips past that gate so we hear about it immediately instead of
+/// via downstream symptom (PnL anomaly, dashboard sleuthing).
+pub static BETA_COLLAPSE_EVENT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_beta_collapse_event_total",
+        "Single-tick β transitions from > 0.5 to ≤ 0.15. Should normally \
+         stay at 0; every increment indicates a corrupt-bar event that \
+         the WS-arm tick_sanity_check did not catch (bot-strategy#472).",
+        &["variant", "pair"],
+    )
+});
+
 /// Cumulative count of entry-side partial-fill reissues where the
 /// exchange-reported position size already met (or exceeded) `leg.target`
 /// at the moment the bot was about to send a fresh order — i.e. the
