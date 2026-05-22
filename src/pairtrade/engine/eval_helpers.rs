@@ -102,6 +102,31 @@ impl PairTradeEngine {
         )
     }
 
+    /// Cap the entry reissue qty so a stale local `leg.filled` (e.g.
+    /// across the cancel-then-reissue boundary in `reissue_partial_legs`)
+    /// cannot cause a second full-size order on top of a leg the
+    /// exchange has already filled. Returns the qty that should be
+    /// reissued — `target - max(local_filled, exchange)` clamped to 0.
+    /// `exchange = None` (query failed) falls back to local accounting.
+    ///
+    /// Entry-side analogue of [`Self::cap_exit_qty`] (bot-strategy#259) —
+    /// the observed failure mode is the mirror image: bot thinks 0 was
+    /// filled, exchange has `target` already filled, and the MARKET
+    /// fallback path piles full-target on top, ending up at 2× target.
+    /// First seen on Frankfurt 2026-05-22 06:27 UTC, variant C ETH leg
+    /// (0.8905 target → 1.7810 actual). See bot-strategy#470.
+    pub(in crate::pairtrade) fn cap_entry_reissue_remaining(
+        target: Decimal,
+        local_filled: Decimal,
+        exchange: Option<Decimal>,
+    ) -> Decimal {
+        let effective_filled = match exchange {
+            Some(exch) => local_filled.max(exch),
+            None => local_filled,
+        };
+        (target - effective_filled).max(Decimal::ZERO)
+    }
+
     /// Defensive cap for exit-leg sizing on Extended (and any other venue
     /// where `get_positions` can momentarily over-report after partial-fill
     /// retry recovery). When the exchange-reported size exceeds the
