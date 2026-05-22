@@ -55,7 +55,7 @@ use engine::risk::risk_state_path_for;
 use state::{PairSharedState, PairState, PositionDirection};
 #[cfg(test)]
 use state::{PendingLeg, PendingOrders};
-use status::{PairTradeStats, StatusReporter};
+use status::StatusReporter;
 use util::{enforce_post_only_passive, round_price_by_tick, tail_std};
 
 /// Max age of the per-instance equity cache before `refresh_equity_if_needed`
@@ -463,17 +463,8 @@ impl PairTradeEngine {
                 .cloned()
                 .unwrap_or_else(|| connector.clone());
             let pnl_logger = PnlLogger::from_env_for_instance(&cfg, &strategy.id, multi_instance);
-            let mut status_reporter =
+            let status_reporter =
                 StatusReporter::from_env_for_instance(&cfg, &strategy.id, multi_instance);
-            if let Some(reporter) = status_reporter.as_mut() {
-                reporter.trade_stats = Some(PairTradeStats {
-                    trades: 0,
-                    wins: 0,
-                    win_rate: 0.0,
-                    max_dd: 0.0,
-                    pnl: 0.0,
-                });
-            }
 
             // Stagger the per-instance equity-refresh cycle so N instances
             // don't all hit `/account` inside the same 5-min expiry boundary.
@@ -627,18 +618,12 @@ impl PairTradeEngine {
         // Update status reporter
         let inst = &mut self.instances[inst_idx];
         if let Some(reporter) = &mut inst.status_reporter {
-            let wr = if inst.total_trades > 0 {
-                inst.total_wins as f64 / inst.total_trades as f64 * 100.0
-            } else {
-                0.0
-            };
-            reporter.trade_stats = Some(PairTradeStats {
-                trades: inst.total_trades,
-                wins: inst.total_wins,
-                win_rate: wr,
-                max_dd: inst.max_dd,
-                pnl: inst.total_pnl,
-            });
+            reporter.set_trade_stats_totals(
+                inst.total_trades,
+                inst.total_wins,
+                inst.total_pnl,
+                inst.max_dd,
+            );
         }
 
         if let Some(logger) = &mut self.instances[inst_idx].pnl_logger {
@@ -2376,6 +2361,74 @@ mod pending_tests {
         assert!((inst.total_pnl - 11.5).abs() < 1e-9);
         assert!((inst.peak_pnl - 20.0).abs() < 1e-9);
         assert!((inst.max_dd - 8.5).abs() < 1e-9);
+    }
+
+    // bot-strategy#469: on restart, the status reporter's `trade_stats`
+    // must be seeded from the persisted lifetime totals — not left at
+    // its `Some(zeros)` init value until the first post-restart trade.
+    // Frankfurt 2026-05-21 19:24 UTC restart surfaced this: A/B had 11
+    // lifetime trades each on disk, but dashboard showed 0/0 for ~10h
+    // until they next traded.
+    #[test]
+    fn status_reporter_seeded_from_persisted_totals_on_load() {
+        use tempfile::TempDir;
+
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("risk_state.json");
+        engine.risk_state_path = path.clone();
+        engine.cfg.round_id = Some("round-5".to_string());
+
+        // Attach an in-memory StatusReporter to the default instance
+        // (test_instance constructs one with status_reporter = None).
+        engine.instances[0].status_reporter = Some(status::StatusReporter::for_test(
+            dir.path().join("status.json"),
+        ));
+
+        let mut instances = HashMap::new();
+        instances.insert(
+            "default".to_string(),
+            risk_io::InstanceRiskState {
+                total_trades: 11,
+                total_wins: 6,
+                total_pnl: -1.6885,
+                peak_pnl: 0.0,
+                max_dd: 10.3857,
+                ..Default::default()
+            },
+        );
+        risk_io::persist_risk_state(&path, Some("round-5"), &instances);
+
+        // Reporter pre-load: still at the zero-init value from for_test.
+        let pre = engine.instances[0]
+            .status_reporter
+            .as_ref()
+            .and_then(|r| r.trade_stats_for_test())
+            .cloned()
+            .expect("trade_stats initialised by for_test");
+        assert_eq!(pre.trades, 0);
+        assert_eq!(pre.pnl, 0.0);
+
+        engine.load_risk_state();
+
+        // In-memory totals applied …
+        let inst = &engine.instances[0];
+        assert_eq!(inst.total_trades, 11);
+        assert_eq!(inst.total_wins, 6);
+        // … and immediately surfaced on the status reporter, no need to
+        // wait for a post-restart trade to call write_pnl_record.
+        let stats = inst
+            .status_reporter
+            .as_ref()
+            .and_then(|r| r.trade_stats_for_test())
+            .expect("trade_stats reseeded by load_risk_state");
+        assert_eq!(stats.trades, 11);
+        assert_eq!(stats.wins, 6);
+        assert!((stats.win_rate - (6.0 / 11.0 * 100.0)).abs() < 1e-9);
+        assert!((stats.max_dd - 10.3857).abs() < 1e-9);
+        assert!((stats.pnl - (-1.6885)).abs() < 1e-9);
     }
 
     // bot-strategy#354: unset configured round_id (legacy mode) never resets.

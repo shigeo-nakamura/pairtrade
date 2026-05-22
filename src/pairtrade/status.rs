@@ -691,6 +691,92 @@ impl StatusReporter {
         self.funding_carry_today = value;
     }
 
+    /// Minimal in-memory constructor for unit tests. All fields zeroed
+    /// except `trade_stats` which defaults to `Some(zeros)` to mirror
+    /// the live `from_env` initial state (bot-strategy#469 regression
+    /// surface). Filesystem paths point under a caller-supplied tempdir.
+    #[cfg(test)]
+    pub(in crate::pairtrade) fn for_test(path: PathBuf) -> Self {
+        let equity_baseline_path = path.with_extension("equity.json");
+        let equity_history_path = path.with_extension("equity_history.jsonl");
+        let risk_history_path = path
+            .parent()
+            .map(|dir| dir.join("risk_history.jsonl"))
+            .unwrap_or_else(|| PathBuf::from("risk_history.jsonl"));
+        Self {
+            path,
+            id: None,
+            agent: None,
+            dex: "test".to_string(),
+            dry_run: true,
+            backtest_mode: false,
+            interval_secs: 1,
+            snapshot_every: Duration::from_secs(60),
+            pnl_total: 0.0,
+            pnl_today: 0.0,
+            pnl_today_date: Utc::now().date_naive(),
+            funding_carry_today: 0.0,
+            equity_day_start: 0.0,
+            equity_day_start_set: false,
+            equity_baseline_path,
+            equity_history_path,
+            last_equity_history_ts: None,
+            last_snapshot: None,
+            process_started_at: process_started_at(),
+            kill_switch_active: false,
+            s3_mirror: None,
+            last_equity_history_uploaded_len: None,
+            last_backtest_alert_uploaded_len: None,
+            trade_stats: Some(PairTradeStats {
+                trades: 0,
+                wins: 0,
+                win_rate: 0.0,
+                max_dd: 0.0,
+                pnl: 0.0,
+            }),
+            maintenance: None,
+            shutdown: None,
+            daily_risk: None,
+            session_risk: None,
+            circuit_breaker: None,
+            risk_history: std::collections::VecDeque::with_capacity(RISK_HISTORY_BUFFER_CAP),
+            risk_history_path,
+        }
+    }
+
+    /// Expose `trade_stats` for unit tests to assert the post-init state
+    /// after `set_trade_stats_totals` or `load_risk_state` runs.
+    #[cfg(test)]
+    pub(in crate::pairtrade) fn trade_stats_for_test(&self) -> Option<&PairTradeStats> {
+        self.trade_stats.as_ref()
+    }
+
+    /// Overwrite `trade_stats` from the engine's per-instance lifetime
+    /// totals. Called from `write_pnl_record` after every closed trade
+    /// AND from `load_risk_state` on startup so the dashboard shows the
+    /// persisted lifetime numbers immediately, instead of zeros until
+    /// the first post-restart trade closes. bot-strategy#469.
+    pub(super) fn set_trade_stats_totals(
+        &mut self,
+        total_trades: u64,
+        total_wins: u64,
+        total_pnl: f64,
+        max_dd: f64,
+    ) {
+        let win_rate = if total_trades > 0 {
+            total_wins as f64 / total_trades as f64 * 100.0
+        } else {
+            0.0
+        };
+        self.trade_stats = Some(PairTradeStats {
+            trades: total_trades,
+            wins: total_wins,
+            win_rate,
+            max_dd,
+            pnl: total_pnl,
+        });
+    }
+
     pub(super) fn write_snapshot(
         &mut self,
         open_positions: &HashMap<String, PositionSnapshot>,
