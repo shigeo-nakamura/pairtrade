@@ -1108,7 +1108,38 @@ impl PairTradeEngine {
                 } else {
                     None
                 };
-                shared.beta = kf_beta_warm.unwrap_or(eval.beta_eff);
+                let new_beta = kf_beta_warm.unwrap_or(eval.beta_eff);
+                // bot-strategy#472 defense-in-depth — surface a single
+                // collapsing-β tick as a WARN + Prom counter. Threshold
+                // is "healthy interior" (> 0.5) to "near-floor" (≤ 0.15)
+                // in one eval. Caught 5/22 06:30 in retrospect; with
+                // this counter wired, a future event surfaces in the
+                // dashboard error-watch (#168) without waiting for the
+                // operator to notice a PnL anomaly.
+                const BETA_COLLAPSE_PREV_FLOOR: f64 = 0.5;
+                const BETA_COLLAPSE_NEW_CEILING: f64 = 0.15;
+                if shared.beta > BETA_COLLAPSE_PREV_FLOOR
+                    && new_beta <= BETA_COLLAPSE_NEW_CEILING
+                {
+                    log::warn!(
+                        "[BETA_COLLAPSE] {} beta {:.4} -> {:.4} \
+                         (beta_short={:.4} beta_long={:.4}) — possible corrupt-bar event; \
+                         see bot-strategy#472",
+                        key,
+                        shared.beta,
+                        new_beta,
+                        eval.beta_short,
+                        eval.beta_long,
+                    );
+                    // β is per-pair (shared across A/B/C variants), so
+                    // we use "*" for the variant label — matches the
+                    // convention used by ENTRY_OVERSIZE_CAPPED_TOTAL
+                    // for pair-level events.
+                    crate::pairtrade::prom::BETA_COLLAPSE_EVENT_TOTAL
+                        .with_label_values(&["*", key])
+                        .inc();
+                }
+                shared.beta = new_beta;
                 shared.beta_short = eval.beta_short;
                 shared.beta_long = eval.beta_long;
                 shared.half_life_hours = eval.half_life_hours;
