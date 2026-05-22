@@ -124,7 +124,30 @@ pub(super) fn tick_sanity_check(
     }
     let bid = snap.bid_price.ok_or(TickRejectReason::MissingBid)?;
     let ask = snap.ask_price.ok_or(TickRejectReason::MissingAsk)?;
-    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || snap.price <= Decimal::ZERO {
+    quote_sanity_check(Some(bid), Some(ask), snap.price, max_spread_bps, max_envelope_bps)
+}
+
+/// Price-side gates of [`tick_sanity_check`] without the `bid_size /
+/// ask_size` checks. Used by the WebSocket arm (`ingest_price_update`)
+/// where the connector's `PriceUpdate` only carries prices — no sizes,
+/// no funding. Same `TickRejectReason` enum / same constants as the
+/// polling path so the diagnostic surface stays uniform.
+///
+/// Catches the bot-strategy#472 failure mode: Lighter WS occasionally
+/// emits an orderbook frame with `bid ≈ 1770, ask ≈ 3188` (5,700 bps
+/// spread) which the unfiltered WS path (`step.rs::ingest_price_update`)
+/// committed straight to the bar close, collapsing β to floor for the
+/// next ~1h47m until the bad bar rolled out of the long lookback.
+pub(super) fn quote_sanity_check(
+    bid: Option<Decimal>,
+    ask: Option<Decimal>,
+    price: Decimal,
+    max_spread_bps: f64,
+    max_envelope_bps: f64,
+) -> Result<(), TickRejectReason> {
+    let bid = bid.ok_or(TickRejectReason::MissingBid)?;
+    let ask = ask.ok_or(TickRejectReason::MissingAsk)?;
+    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || price <= Decimal::ZERO {
         return Err(TickRejectReason::NonPositiveQuote);
     }
     if ask < bid {
@@ -140,7 +163,7 @@ pub(super) fn tick_sanity_check(
     if spread_bps > max_spread_bps {
         return Err(TickRejectReason::SpreadTooWide);
     }
-    let price_f = snap.price.to_f64().unwrap_or(0.0);
+    let price_f = price.to_f64().unwrap_or(0.0);
     let envelope = max_envelope_bps / 10_000.0;
     let lower = bid_f * (1.0 - envelope);
     let upper = ask_f * (1.0 + envelope);
@@ -311,6 +334,110 @@ mod tests {
             size_decimals: None,
             exchange_ts: None,
         }
+    }
+
+    // bot-strategy#472 regression — the WS arm of `ingest_price_update`
+    // previously bypassed `tick_sanity_check` and committed the
+    // corrupt frame straight to the bar close, collapsing β. The new
+    // `quote_sanity_check` gate uses the same constants as the
+    // polling path but is callable from the WS arm where order sizes
+    // are not available.
+
+    #[test]
+    fn quote_sanity_rejects_472_corrupt_eth_ws_frame() {
+        // Frankfurt 2026-05-22 06:31:00 UTC. Lighter book frame:
+        // bid=1770.84 ask=3188.72 mid=1948.32 — spread ≈ 71%.
+        // The polling path rejected this with reason=spread_too_wide
+        // (TICK_FILTER); the WS path silently accepted it pre-fix.
+        let r = quote_sanity_check(
+            Some(dec!(1770.84)),
+            Some(dec!(3188.72)),
+            dec!(1948.32),
+            MAX_TICK_SPREAD_BPS,
+            MAX_TICK_PRICE_ENVELOPE_BPS,
+        );
+        assert_eq!(r, Err(TickRejectReason::SpreadTooWide));
+    }
+
+    #[test]
+    fn quote_sanity_accepts_normal_btc_ws_frame() {
+        // From a normal Lighter WS update — bid/ask spread ≈ 13 bps.
+        let r = quote_sanity_check(
+            Some(dec!(77451.2)),
+            Some(dec!(77461.4)),
+            dec!(77456.3),
+            MAX_TICK_SPREAD_BPS,
+            MAX_TICK_PRICE_ENVELOPE_BPS,
+        );
+        assert_eq!(r, Ok(()));
+    }
+
+    #[test]
+    fn quote_sanity_rejects_crossed_ws_book() {
+        // Defensive: pre-fix the WS arm had no crossed-book check
+        // either. A genuine cross is rare but observable on Lighter
+        // during fast moves.
+        let r = quote_sanity_check(
+            Some(dec!(80100)),
+            Some(dec!(79900)),
+            dec!(80000),
+            MAX_TICK_SPREAD_BPS,
+            MAX_TICK_PRICE_ENVELOPE_BPS,
+        );
+        assert_eq!(r, Err(TickRejectReason::CrossedBook));
+    }
+
+    #[test]
+    fn quote_sanity_rejects_nonpositive_mid() {
+        let r = quote_sanity_check(
+            Some(dec!(80000)),
+            Some(dec!(80010)),
+            dec!(0),
+            MAX_TICK_SPREAD_BPS,
+            MAX_TICK_PRICE_ENVELOPE_BPS,
+        );
+        assert_eq!(r, Err(TickRejectReason::NonPositiveQuote));
+    }
+
+    #[test]
+    fn quote_sanity_rejects_price_outside_envelope() {
+        let r = quote_sanity_check(
+            Some(dec!(79990)),
+            Some(dec!(80010)),
+            dec!(84000),
+            MAX_TICK_SPREAD_BPS,
+            MAX_TICK_PRICE_ENVELOPE_BPS,
+        );
+        assert_eq!(r, Err(TickRejectReason::PriceOutsideEnvelope));
+    }
+
+    #[test]
+    fn quote_sanity_rejects_missing_bid() {
+        let r = quote_sanity_check(
+            None,
+            Some(dec!(80010)),
+            dec!(80000),
+            MAX_TICK_SPREAD_BPS,
+            MAX_TICK_PRICE_ENVELOPE_BPS,
+        );
+        assert_eq!(r, Err(TickRejectReason::MissingBid));
+    }
+
+    #[test]
+    fn quote_sanity_and_tick_sanity_share_gates_on_corrupt_frame() {
+        // Reusing the bot-strategy#346 BTC corrupt frame from
+        // `rejects_bot_strategy_346_corrupt_tick`. The size-side
+        // EmptyAskSize gate is unreachable from `quote_sanity_check`
+        // (WS frames don't carry sizes), but the SpreadTooWide gate
+        // should still catch this frame on the price side.
+        let r = quote_sanity_check(
+            Some(dec!(79650.4)),
+            Some(dec!(159598.8)),
+            dec!(119775.9),
+            MAX_TICK_SPREAD_BPS,
+            MAX_TICK_PRICE_ENVELOPE_BPS,
+        );
+        assert_eq!(r, Err(TickRejectReason::SpreadTooWide));
     }
 
     #[test]

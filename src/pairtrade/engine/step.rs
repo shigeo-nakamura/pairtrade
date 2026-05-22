@@ -40,8 +40,8 @@ use super::super::exit::{compute_pnl, exit_reason};
 use super::super::funding_history;
 use super::super::history_io;
 use super::super::market::{
-    liquidity_score, net_funding_for_direction, tick_sanity_check, SymbolSnapshot,
-    MAX_TICK_PRICE_ENVELOPE_BPS, MAX_TICK_SPREAD_BPS,
+    liquidity_score, net_funding_for_direction, quote_sanity_check, tick_sanity_check,
+    SymbolSnapshot, MAX_TICK_PRICE_ENVELOPE_BPS, MAX_TICK_SPREAD_BPS,
 };
 use super::super::pair_eval;
 use super::super::pnl_log::PnlLogRecord;
@@ -1202,6 +1202,36 @@ impl PairTradeEngine {
     /// silently fail to emit across a bucket boundary while the polling
     /// arm was disabled, freezing β for hours.
     pub(in crate::pairtrade) fn ingest_price_update(&mut self, update: PriceUpdate) {
+        // bot-strategy#472 — the WS arm previously passed `update.mid_price`
+        // straight to `update_close_only` with zero sanity checking. The
+        // polling arm above runs the same Lighter book through
+        // `tick_sanity_check`, but the WS arm bypassed it. Result: a
+        // corrupt orderbook frame (Frankfurt 2026-05-22 06:31 UTC, ETH
+        // bid=$1770 ask=$3188, 5,700 bps spread) committed an outlier
+        // bar close that dominated `var(ETH log-price)` in the 240-bar
+        // OLS regression and pinned β to the floor clamp for ~1h47m
+        // (issue #472 RCA). `PriceUpdate` doesn't carry order sizes, so
+        // we use the price-only `quote_sanity_check` here — same
+        // spread / envelope / crossed-book constants as the polling
+        // path; the empty_size gates that only the polling path
+        // surfaces aren't reachable from WS data.
+        if let Err(reason) = quote_sanity_check(
+            Some(update.best_bid),
+            Some(update.best_ask),
+            update.mid_price,
+            MAX_TICK_SPREAD_BPS,
+            MAX_TICK_PRICE_ENVELOPE_BPS,
+        ) {
+            log::info!(
+                "[TICK_FILTER_WS] rejected {} reason={} mid={} bid={} ask={}",
+                update.symbol,
+                reason.as_str(),
+                update.mid_price,
+                update.best_bid,
+                update.best_ask,
+            );
+            return;
+        }
         let Some(builder) = self.bar_builders.get_mut(&update.symbol) else {
             log::debug!("[WS_BARS] no bar builder for {}", update.symbol);
             return;
