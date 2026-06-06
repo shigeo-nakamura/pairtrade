@@ -110,15 +110,33 @@ circuit_breaker_tier2_cooldown_secs: 3600
 # Risk gates (bot-strategy#185). All bps fields are leverage-invariant
 # (multiplied by max_leverage internally), typical 100–500 bps.
 # Enabled per bot-strategy#229 once #216/#217 size-rounding verification
-# cleared. max_leverage=1 here, so the bps fields apply at face value
-# against equity_usd_reference=$500.
+# cleared. equity_usd_reference=$45 and max_leverage=7 are set in the
+# host drop-in (bot-strategy#306, /etc/systemd/system/.../equity-
+# override.conf), so the bps fields below are scaled by 7 at the
+# comparison site in engine/risk.rs.
 risk:
-  # Phase 2: 3% daily DD = $15 cap.
+  # Phase 2: daily DD cap. With max_leverage=7 set in the host
+  # drop-in, 300 × 7 = 2100 bps = 21% intraday equity DD, block-only
+  # (refuses new entries, existing positions exit normally, auto-
+  # resume at next UTC midnight). Acts as the "extreme intraday spike"
+  # backup; Session DD below is the primary operational stop.
   max_daily_loss_bps: 300
   max_daily_loss_action: block
   daily_reset_utc_hour: 0
-  # Phase 3-1: 5% rolling-peak session DD over 30d = $25 cap.
-  max_session_loss_bps: 500
+  # Phase 3-1: rolling-peak session DD over 30d. Sticky halt + auto-
+  # flatten of the breaching instance, cleared only by `sudo touch
+  # /opt/debot/RISK_ACK`. With max_leverage=7, 70 × 7 = 490 bps DD =
+  # ~4.9% equity, matching Frankfurt's 5% effective Session DD (where
+  # 50 × max_leverage(10) = 500 bps). Keeps the safety ordering
+  # Daily > Session so Session is the primary catch on sustained
+  # losses and Daily is the wider backup.
+  #
+  # Pre-#483 this was 500, which scaled to 3500 bps = 35% equity —
+  # a leftover from when the host drop-in (bot-strategy#306) bumped
+  # max_leverage 1 → 7 without re-tightening this field, inverting
+  # the safety ordering (Daily 21% < Session 35%) and leaving the
+  # sticky halt mechanism functionally disabled.
+  max_session_loss_bps: 70
   session_dd_lookback_secs: 2592000
   session_dd_sample_secs: 3600
   # Phase 3-4: per-leg notional cap as a multiplier of
