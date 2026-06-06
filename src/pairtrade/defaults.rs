@@ -37,6 +37,17 @@ pub(super) const DEFAULT_MAX_ACTIVE_PAIRS: usize = 3;
 pub(super) const DEFAULT_WARM_START_MODE: &str = "strict";
 pub(super) const DEFAULT_ORDER_TIMEOUT_SECS: u64 = 120;
 pub(super) const DEFAULT_ENTRY_PARTIAL_FILL_MAX_RETRIES: u32 = 3;
+/// Hard cap on `hedge_retry_count` for the partial-fill reissue loop
+/// (bot-strategy#480). Once the per-tick reconcile has rotated through
+/// this many reissues without `all_filled` clearing, the bot gives up:
+/// pending orders are cancelled, any filled legs are flattened via
+/// `force_close_all_positions`, and `pending_entry` is cleared so the
+/// next ENTRY signal can fire from a clean slate. 0 disables the cap
+/// (legacy unbounded behaviour). Default 30 = 10× the post-only retry
+/// budget, ~2.5 min at the 5 s tick cadence — long enough to absorb
+/// normal partial-fill recovery, short enough to surface a stuck loop
+/// before it spans hours / days.
+pub(super) const DEFAULT_ENTRY_PARTIAL_FILL_GIVEUP_RETRIES: u32 = 30;
 pub(super) const DEFAULT_FORCE_CLOSE_ON_STARTUP: bool = true;
 pub(super) const DEFAULT_STARTUP_FORCE_CLOSE_ATTEMPTS: u32 = 3;
 pub(super) const DEFAULT_STARTUP_FORCE_CLOSE_WAIT_SECS: u64 = 3;

@@ -275,6 +275,24 @@ pub static ENTRY_OVERSIZE_CAPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// bot-strategy#480 hard-cap counter. Cumulative count of partial-fill
+/// reissue loops that crossed `entry_partial_fill_giveup_retries`
+/// without `all_filled` clearing. Each increment corresponds to a
+/// `[ORDER][GIVEUP]` ERROR log line + `force_close_all_positions` on
+/// the pair. Should normally stay at 0 in steady state; any increment
+/// surfaces a stuck-loop episode where reissues never converged
+/// (e.g. the Tokyo Extended 54 k-retry incident on 2026-06-03..06-06).
+pub static ENTRY_REISSUE_GIVEUP_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_entry_reissue_giveup_total",
+        "Partial-fill reissue loops that hit the hard cap \
+         (entry_partial_fill_giveup_retries) and flattened any filled \
+         leg via force_close_all_positions. Normally 0; any increment \
+         indicates a stuck reissue loop was broken out of.",
+        &["variant", "pair"],
+    )
+});
+
 pub static CLOSE_REASON_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter(
         "pairtrade_close_reason_total",

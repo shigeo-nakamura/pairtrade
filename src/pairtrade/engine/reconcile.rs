@@ -106,6 +106,63 @@ impl PairTradeEngine {
             } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
                 let next_retry = pending.hedge_retry_count.saturating_add(1);
                 let max_retries = self.cfg.entry_partial_fill_max_retries;
+                let giveup_retries = self.cfg.entry_partial_fill_giveup_retries;
+                // bot-strategy#480: hard cap on the reissue loop. Once
+                // `hedge_retry_count` crosses this, give up entirely —
+                // cancel pending, flatten any filled legs via
+                // `force_close_all_positions`, and clear `pending_entry`
+                // so the next ENTRY signal starts from a clean slate.
+                // Pre-#480 this loop was unbounded: a stuck reissue
+                // (MARKET reissue not progressing because the underlying
+                // `create_order(price=None)` was emitting LIMIT GTT on
+                // Extended, dex-connector#9) ran for ~75 h / 54 k
+                // retries on `debot-pair-btceth-extended`, blocking all
+                // entries / exits while burning no capital but leaving
+                // operators to discover the loop by hand. The connector
+                // fix removes the underlying cause; this cap is the
+                // defense-in-depth so any future failure mode that
+                // breaks the reissue convergence surfaces as a single
+                // ERROR + flatten instead of an unbounded loop.
+                //
+                // 0 disables the cap (legacy unbounded behaviour) so
+                // existing deployments can opt out via yaml or env
+                // override during the rollout window if needed.
+                if giveup_retries > 0 && next_retry > giveup_retries {
+                    let filled_summary: Vec<String> = pending
+                        .legs
+                        .iter()
+                        .filter_map(|leg| {
+                            let q = filled_qtys
+                                .get(&leg.order_id)
+                                .copied()
+                                .unwrap_or(Decimal::ZERO);
+                            if q > Decimal::ZERO {
+                                Some(format!("{}={}", leg.symbol, q))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    log::error!(
+                        "[ORDER][GIVEUP] {} entry-reissue hit hard cap ({} > {}); cancelling pending and flattening filled legs [{}]",
+                        key,
+                        next_retry,
+                        giveup_retries,
+                        filled_summary.join(" ")
+                    );
+                    let variant_id =
+                        self.instances[inst_idx].id.clone();
+                    self.cancel_pending_orders(&pending).await?;
+                    self.force_close_all_positions(key, "entry_reissue_giveup")
+                        .await;
+                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                        state.pending_entry = None;
+                    }
+                    super::super::prom::ENTRY_REISSUE_GIVEUP_TOTAL
+                        .with_label_values(&[&variant_id, key])
+                        .inc();
+                    return Ok(());
+                }
                 let use_market = max_retries > 0 && next_retry > max_retries;
                 if use_market {
                     log::info!(
