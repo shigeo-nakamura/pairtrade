@@ -350,6 +350,7 @@ pub(super) struct PairTradeYaml {
     pub(super) warm_start_min_bars: Option<usize>,
     pub(super) order_timeout_secs: Option<u64>,
     pub(super) entry_partial_fill_max_retries: Option<u32>,
+    pub(super) entry_partial_fill_giveup_retries: Option<u32>,
     pub(super) startup_force_close_attempts: Option<u32>,
     pub(super) startup_force_close_wait_secs: Option<u64>,
     pub(super) force_close_on_startup: Option<bool>,
@@ -538,6 +539,10 @@ pub struct PairTradeConfig {
     pub warm_start_mode: WarmStartMode,
     pub order_timeout_secs: u64,
     pub entry_partial_fill_max_retries: u32,
+    /// Hard cap on partial-fill reissue retries before the bot gives up,
+    /// flattens any filled legs and clears `pending_entry`. See
+    /// `DEFAULT_ENTRY_PARTIAL_FILL_GIVEUP_RETRIES` and bot-strategy#480.
+    pub entry_partial_fill_giveup_retries: u32,
     pub startup_force_close_attempts: u32,
     pub startup_force_close_wait_secs: u64,
     pub force_close_on_startup: bool,
@@ -937,6 +942,9 @@ impl PairTradeConfig {
             entry_partial_fill_max_retries: yaml
                 .entry_partial_fill_max_retries
                 .unwrap_or(DEFAULT_ENTRY_PARTIAL_FILL_MAX_RETRIES),
+            entry_partial_fill_giveup_retries: yaml
+                .entry_partial_fill_giveup_retries
+                .unwrap_or(DEFAULT_ENTRY_PARTIAL_FILL_GIVEUP_RETRIES),
             startup_force_close_attempts: yaml
                 .startup_force_close_attempts
                 .unwrap_or(DEFAULT_STARTUP_FORCE_CLOSE_ATTEMPTS),
@@ -1071,6 +1079,10 @@ impl PairTradeConfig {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(DEFAULT_ENTRY_PARTIAL_FILL_MAX_RETRIES);
+        let entry_partial_fill_giveup_retries = env::var("ENTRY_PARTIAL_FILL_GIVEUP_RETRIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_ENTRY_PARTIAL_FILL_GIVEUP_RETRIES);
         let startup_force_close_attempts = env::var("STARTUP_FORCE_CLOSE_ATTEMPTS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -1147,6 +1159,7 @@ impl PairTradeConfig {
             warm_start_mode,
             order_timeout_secs,
             entry_partial_fill_max_retries,
+            entry_partial_fill_giveup_retries,
             startup_force_close_attempts,
             startup_force_close_wait_secs,
             force_close_on_startup,
@@ -1350,6 +1363,10 @@ impl PairTradeConfig {
         env_override(
             "ENTRY_PARTIAL_FILL_MAX_RETRIES",
             &mut self.entry_partial_fill_max_retries,
+        );
+        env_override(
+            "ENTRY_PARTIAL_FILL_GIVEUP_RETRIES",
+            &mut self.entry_partial_fill_giveup_retries,
         );
         if let Ok(value) = env::var("STARTUP_FORCE_CLOSE_ATTEMPTS") {
             if let Ok(parsed) = value.parse::<u32>() {

@@ -1296,6 +1296,7 @@ impl PairTradeEngine {
             warm_start_mode: WarmStartMode::Strict,
             order_timeout_secs: DEFAULT_ORDER_TIMEOUT_SECS,
             entry_partial_fill_max_retries: DEFAULT_ENTRY_PARTIAL_FILL_MAX_RETRIES,
+            entry_partial_fill_giveup_retries: DEFAULT_ENTRY_PARTIAL_FILL_GIVEUP_RETRIES,
             startup_force_close_attempts: DEFAULT_STARTUP_FORCE_CLOSE_ATTEMPTS,
             startup_force_close_wait_secs: DEFAULT_STARTUP_FORCE_CLOSE_WAIT_SECS,
             force_close_on_startup: false,
