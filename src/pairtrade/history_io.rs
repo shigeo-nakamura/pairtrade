@@ -553,27 +553,35 @@ pub(super) fn load_history_from_disk(
         //   2. Per-tick count drift — `load_history_from_disk` filters
         //      samples by `max_age_ms`, so as wall-clock advances the
         //      oldest sample slides out of the window and the loaded
-        //      count oscillates by ±1 between persists. Bucket the count
-        //      to the nearest 10 in the fingerprint so this micro-drift
-        //      doesn't keep flipping the key. The emitted log line still
-        //      shows the actual count for operator visibility — only the
-        //      dedup decision uses the bucket.
+        //      count oscillates by ±1 between persists.
+        //
+        // bot-strategy#466: collapse the count into a single "is the
+        // window full?" boolean (`>= 90 % of max_history_len`) instead
+        // of the prior `c / 10 * 10` floor bucket. The floor approach
+        // still had boundaries every 10 samples, and in production the
+        // typical count sits **on** the boundary (`max_history_len = 240`):
+        // a 239 ↔ 240 oscillation flipped between buckets 230 and 240
+        // tick after tick, defeating dedup entirely. Frankfurt emitted
+        // 2.6 lines/min, Tokyo Extended 3.7/min, both saturating
+        // `[WARM_START]` log volume to no operator value. The 90 %
+        // threshold makes routine ± 1 wobble at any point inside the
+        // full / not-full band collapse to a single key. The emitted log
+        // line still surfaces the actual count for operator visibility —
+        // only the dedup key uses the boolean.
         //
         // A meaningful rollback (e.g. 240-sample → 50-sample snapshot,
-        // or symbol set change) crosses bucket boundaries and emits as
-        // intended; routine ±1 wobble stays quiet.
+        // or symbol set change) crosses the full/not-full boundary or
+        // changes the symbol set and emits as intended; routine ± 1
+        // wobble stays quiet.
         let mut sorted_prices = loaded_summary.clone();
         sorted_prices.sort_by(|a, b| a.0.cmp(&b.0));
         let mut sorted_spreads = spreads_loaded.clone();
         sorted_spreads.sort_by(|a, b| a.0.cmp(&b.0));
-        let bucket = |v: &[(String, usize)]| -> Vec<(String, usize)> {
-            v.iter().map(|(s, c)| (s.clone(), c / 10 * 10)).collect()
-        };
-        let key = format!(
-            "v{} {:?} {:?}",
+        let key = warm_start_success_dedup_key(
             snap.version,
-            bucket(&sorted_prices),
-            bucket(&sorted_spreads),
+            &sorted_prices,
+            &sorted_spreads,
+            max_history_len,
         );
         if last_logged_key.as_deref() != Some(key.as_str()) {
             log::info!(
@@ -586,6 +594,41 @@ pub(super) fn load_history_from_disk(
             *last_logged_key = Some(key);
         }
     }
+}
+
+/// Dedup fingerprint for the `[WARM_START] snapshot loaded ...` success
+/// log. `load_history_from_disk` runs every tick (see `engine/step.rs`),
+/// so the success path would emit ~12 lines/min without dedup. The
+/// fingerprint must be stable under per-tick noise (count drift, HashMap
+/// iteration order — handled by the caller sorting before invoking
+/// this) and only change on operationally meaningful transitions
+/// (snapshot version change, symbol-set change, full ↔ not-full).
+///
+/// `max_history_len` is the size of the rolling window the engine
+/// expects; counts ≥ 90 % of that are reported as "full". See
+/// bot-strategy#466 for the boundary bug that motivated the boolean
+/// representation (the prior `c / 10 * 10` floor flipped buckets every
+/// time the count crossed a multiple of 10, defeating dedup whenever
+/// the typical count sat on a multiple — which is the production case
+/// at `max_history_len = 240`).
+pub(super) fn warm_start_success_dedup_key(
+    version: u32,
+    sorted_prices: &[(String, usize)],
+    sorted_spreads: &[(String, usize)],
+    max_history_len: usize,
+) -> String {
+    let full_threshold = max_history_len.saturating_mul(9) / 10;
+    let bucket = |v: &[(String, usize)]| -> Vec<(String, bool)> {
+        v.iter()
+            .map(|(s, c)| (s.clone(), *c >= full_threshold))
+            .collect()
+    };
+    format!(
+        "v{} {:?} {:?}",
+        version,
+        bucket(sorted_prices),
+        bucket(sorted_spreads),
+    )
 }
 
 #[cfg(test)]
@@ -718,5 +761,76 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let err = parse_snapshot_file(path).unwrap_err();
         assert!(err.contains("read failed"), "got: {}", err);
+    }
+
+    // bot-strategy#466: production observation — Frankfurt + Tokyo
+    // Extended both emit `[WARM_START] snapshot loaded ...` at 2-4 / min
+    // because the loaded count oscillates 239 ↔ 240 (one sample slides
+    // out of the `max_age_ms` window each ~30 s persist cycle) and the
+    // pre-fix `c / 10 * 10` bucket flipped between 230 and 240 each
+    // time, never matching the previous key. Locks in the boolean
+    // "full / not full" key so 239 ↔ 240 stays in the same fingerprint.
+    #[test]
+    fn warm_start_dedup_key_stable_across_one_sample_drift_at_full_window() {
+        let max_len = 240;
+        let prices_239 = vec![
+            ("BTC".to_string(), 239),
+            ("ETH".to_string(), 239),
+        ];
+        let prices_240 = vec![
+            ("BTC".to_string(), 240),
+            ("ETH".to_string(), 240),
+        ];
+        let prices_mixed = vec![
+            ("BTC".to_string(), 239),
+            ("ETH".to_string(), 240),
+        ];
+        let spreads = vec![("BTC/ETH".to_string(), 240)];
+        let key_239 = warm_start_success_dedup_key(4, &prices_239, &spreads, max_len);
+        let key_240 = warm_start_success_dedup_key(4, &prices_240, &spreads, max_len);
+        let key_mixed = warm_start_success_dedup_key(4, &prices_mixed, &spreads, max_len);
+        assert_eq!(key_239, key_240, "239 vs 240 must dedup");
+        assert_eq!(key_239, key_mixed, "(239, 240) mixed must dedup with (239, 239)");
+    }
+
+    // The dedup must still fire on meaningful transitions, otherwise
+    // operators rolling back a snapshot from 240 → 50 samples would not
+    // see confirmation in the log.
+    #[test]
+    fn warm_start_dedup_key_changes_on_full_to_partial_rollback() {
+        let max_len = 240;
+        let prices_full = vec![("BTC".to_string(), 240), ("ETH".to_string(), 240)];
+        let prices_partial = vec![("BTC".to_string(), 50), ("ETH".to_string(), 50)];
+        let spreads = vec![("BTC/ETH".to_string(), 240)];
+        let key_full = warm_start_success_dedup_key(4, &prices_full, &spreads, max_len);
+        let key_partial = warm_start_success_dedup_key(4, &prices_partial, &spreads, max_len);
+        assert_ne!(
+            key_full, key_partial,
+            "240→50 rollback must cross the full/not-full boundary and re-emit"
+        );
+    }
+
+    #[test]
+    fn warm_start_dedup_key_changes_on_version_bump() {
+        let max_len = 240;
+        let prices = vec![("BTC".to_string(), 240), ("ETH".to_string(), 240)];
+        let spreads = vec![("BTC/ETH".to_string(), 240)];
+        let key_v3 = warm_start_success_dedup_key(3, &prices, &spreads, max_len);
+        let key_v4 = warm_start_success_dedup_key(4, &prices, &spreads, max_len);
+        assert_ne!(key_v3, key_v4, "snapshot version change must re-emit");
+    }
+
+    #[test]
+    fn warm_start_dedup_key_changes_on_symbol_set_change() {
+        let max_len = 240;
+        let spreads = vec![("BTC/ETH".to_string(), 240)];
+        let prices_two = vec![("BTC".to_string(), 240), ("ETH".to_string(), 240)];
+        let prices_one = vec![("BTC".to_string(), 240)];
+        let key_two = warm_start_success_dedup_key(4, &prices_two, &spreads, max_len);
+        let key_one = warm_start_success_dedup_key(4, &prices_one, &spreads, max_len);
+        assert_ne!(
+            key_two, key_one,
+            "ETH dropping out of the snapshot must re-emit"
+        );
     }
 }
