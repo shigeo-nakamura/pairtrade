@@ -1,0 +1,15 @@
+[Unit]
+Description=Archive yesterday's Extended [EVAL] + restart timestamps to S3 (bot-strategy#492)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/debot
+Environment=SERVICE=debot-pair-btceth-extended
+ExecStart=/opt/debot/scripts/archive_bt_replay_events.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

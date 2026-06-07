@@ -88,23 +88,29 @@ with open(out, 'w') as f:
 print(f"[archive_bt_replay]   eval lines: {len(seen)}")
 PYEOF
 
-# Restart timestamps: parse the journalctl outer stamp. We pinned --utc
-# above so journalctl emits ISO-8601-ish stamps with UTC; that lets us
-# avoid the year-inference dance the original extractor needs.
-python3 - "$WORK/restart_raw.txt" "$WORK/restart_ts.txt" <<'PYEOF'
-import re, sys
+# Restart timestamps: parse the journalctl outer stamp. systemd 252's
+# `--utc` only shifts timezone, not format — the default is still
+# `Jun 06 21:11:58 ip-...` (yearless `%b %d %H:%M:%S`). We inject the
+# year from DATE since the cron always archives a single calendar day.
+python3 - "$WORK/restart_raw.txt" "$WORK/restart_ts.txt" "$DATE" <<'PYEOF'
+import sys
 from datetime import datetime, timezone
-raw, out = sys.argv[1], sys.argv[2]
+raw, out, date_str = sys.argv[1], sys.argv[2], sys.argv[3]
+year = int(date_str.split('-')[0])
 ts = []
 with open(raw) as f:
     for line in f:
-        # journalctl --utc format: "2026-04-30 00:30:14 UTC ip-... systemd[1]: Started ..."
-        m = re.match(r'^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+UTC\s', line)
-        if not m:
+        parts = line.strip().split()
+        if len(parts) < 3:
             continue
-        dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
-        dt = dt.replace(tzinfo=timezone.utc)
-        ts.append(int(dt.timestamp()))
+        try:
+            dt = datetime.strptime(
+                f"{year} {parts[0]} {parts[1]} {parts[2]}",
+                "%Y %b %d %H:%M:%S",
+            ).replace(tzinfo=timezone.utc)
+            ts.append(int(dt.timestamp()))
+        except Exception:
+            pass
 ts = sorted(set(ts))
 with open(out, 'w') as f:
     for t in ts:
