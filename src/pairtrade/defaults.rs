@@ -79,6 +79,15 @@ pub(super) const DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS: u64 = 0;
 // (`interval_secs`, typically 5s) and reuses `cancel_pending_orders` for
 // cancellation, so these knobs no longer have a use site.
 
+/// Use frozen-β z for exit-side gates (`exit_z`, `stop_loss_z`, and the
+/// expected-value gate). When `true`, exit-side z is recomputed against
+/// `Position.entry_beta` and the position's current log prices instead
+/// of `shared.beta`, so a β drift during the hold does not produce a
+/// "z reverted but no actual mean-reversion" false signal. Default
+/// `false` preserves legacy behaviour. Entry / regime / dashboards keep
+/// using the rolling-β z regardless. See bot-strategy#473.
+pub(super) const DEFAULT_USE_FROZEN_BETA_EXIT_Z: bool = false;
+
 // Multi-timeframe z-score confluence (disabled by default)
 pub(super) const DEFAULT_MTF_Z_MIN: f64 = 0.0;
 

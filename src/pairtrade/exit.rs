@@ -1,6 +1,6 @@
 //! Exit-decision helpers extracted from the monolithic pairtrade module.
 
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
 use super::config::{PairParams, PairTradeConfig};
@@ -20,13 +20,26 @@ pub(super) fn exit_reason(
     now_ts: i64,
 ) -> Option<&'static str> {
     let pos = state.position.as_ref()?;
-    if z.abs() >= pp.stop_loss_z {
+
+    // bot-strategy#473: when the YAML opts into frozen-β exit and the
+    // position has an entry_beta on file, recompute z under entry_beta
+    // and use it for the exit-side gates (`stop_loss_z`, `exit_z`,
+    // `expected_value`). Entry / regime / dashboards keep using the
+    // rolling-β z that came in via the `z` arg, so the rest of the bot
+    // is unaffected.
+    let (z_for_exit, std_for_exit) = if pp.use_frozen_beta_exit_z {
+        position_z_for_exit(shared, pos, p1, p2).unwrap_or((z, std))
+    } else {
+        (z, std)
+    };
+
+    if z_for_exit.abs() >= pp.stop_loss_z {
         return Some("stop_loss_z");
     }
     if now_ts.saturating_sub(pos.entered_ts) >= pp.force_close_secs as i64 {
         return Some("force_close");
     }
-    if pp.exit_z > 0.0 && z.abs() <= pp.exit_z {
+    if pp.exit_z > 0.0 && z_for_exit.abs() <= pp.exit_z {
         return Some("exit_z");
     }
     let pnl = compute_pnl(pos, p1.price, p2.price);
@@ -47,7 +60,7 @@ pub(super) fn exit_reason(
             }
         }
     }
-    if std > 1e-9 {
+    if std_for_exit > 1e-9 {
         if let Some(pnl) = pnl {
             if pnl > Decimal::ZERO {
                 let half_life_hours = shared.half_life_hours;
@@ -58,10 +71,10 @@ pub(super) fn exit_reason(
                         let half_life_secs = half_life_hours * 3600.0;
                         let k = (2.0_f64).ln() / half_life_secs;
                         let decay = (-k * remaining_secs).exp();
-                        let expected_improvement = z.abs() * (1.0 - decay);
+                        let expected_improvement = z_for_exit.abs() * (1.0 - decay);
                         let total_cost_bps = cfg.fee_bps * 2.0 + cfg.slippage_cost_bps() * 2.0;
                         let cost_ratio = total_cost_bps / 10_000.0;
-                        let cost_in_sigma = cost_ratio / std;
+                        let cost_in_sigma = cost_ratio / std_for_exit;
                         if expected_improvement <= cost_in_sigma {
                             return Some("expected_value");
                         }
@@ -71,6 +84,24 @@ pub(super) fn exit_reason(
         }
     }
     None
+}
+
+/// Compute the position-frozen z (and std) for exit-side gates.
+/// Returns `None` when entry_beta is missing or current prices can't be
+/// converted to f64 — callers should fall back to the rolling-β z.
+fn position_z_for_exit(
+    shared: &PairSharedState,
+    pos: &Position,
+    p1: &SymbolSnapshot,
+    p2: &SymbolSnapshot,
+) -> Option<(f64, f64)> {
+    let entry_beta = pos.entry_beta?;
+    let log_a = p1.price.to_f64()?.ln();
+    let log_b = p2.price.to_f64()?.ln();
+    if !log_a.is_finite() || !log_b.is_finite() {
+        return None;
+    }
+    shared.position_z(entry_beta, log_a, log_b)
 }
 
 pub(super) fn compute_pnl(

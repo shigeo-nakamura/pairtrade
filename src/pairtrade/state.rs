@@ -323,6 +323,40 @@ impl PairSharedState {
         Some((z, std, mean, latest))
     }
 
+    /// Compute a z-score using the position's frozen `entry_beta` instead
+    /// of the rolling `self.beta`. Used by `exit_reason` when the YAML
+    /// opts in to `use_frozen_beta_exit_z` (bot-strategy#473).
+    ///
+    /// The mean / std come from the rolling `spread_history`, which was
+    /// populated under historical β at push time. The latest "spread" is
+    /// instead recomputed as `latest_log_price_a - entry_beta *
+    /// latest_log_price_b`. Result: the z is on the same distribution
+    /// shape as the live `z_score()`, but the position itself is measured
+    /// under its actual hedge ratio rather than a moving target — so a
+    /// β drift between entry and now does not move the exit signal.
+    ///
+    /// Returns `None` when the history has fewer than 2 samples; returns
+    /// `Some((0.0, std))` when std collapses below 1e-9 (same convention
+    /// as `z_score_details`).
+    pub(super) fn position_z(
+        &self,
+        entry_beta: f64,
+        latest_log_price_a: f64,
+        latest_log_price_b: f64,
+    ) -> Option<(f64, f64)> {
+        if self.spread_history.len() < 2 {
+            return None;
+        }
+        let (mean, std) = mean_std(&self.spread_history)?;
+        let position_spread = latest_log_price_a - entry_beta * latest_log_price_b;
+        let z = if std < 1e-9 {
+            0.0
+        } else {
+            (position_spread - mean) / std
+        };
+        Some((z, std))
+    }
+
     /// Compute z-score using only the last `window` bars of spread_history.
     /// Used by the multi-timeframe confluence filter.
     pub(super) fn z_score_for_window(&self, window: usize) -> Option<f64> {
@@ -397,6 +431,92 @@ mod tests {
         assert_eq!(std_a.to_bits(), std_b.to_bits());
         assert_eq!(mean_a.to_bits(), mean_b.to_bits());
         assert_eq!(latest_a.to_bits(), latest_b.to_bits());
+    }
+
+    /// bot-strategy#473: when `entry_beta == shared.beta` AND the current
+    /// log prices reproduce the latest spread in history, `position_z`
+    /// returns the same value as the rolling-β `z_score`. This is the
+    /// degenerate equivalence — anything else means the math is wrong.
+    #[test]
+    fn position_z_equals_z_score_when_betas_match() {
+        let mut s = PairSharedState::new(120);
+        s.beta = 0.7;
+        // Hand-populate a synthetic history.
+        let log_a_latest = 11.0_f64;
+        let log_b_latest = 7.4_f64;
+        let beta = s.beta;
+        for i in 0..200 {
+            // Each spread = log_a_i - beta * log_b_i; we just use a
+            // damped oscillation around the latest value.
+            let drift = 0.01 * ((i as f64) * 0.05).sin();
+            let v = (log_a_latest - beta * log_b_latest) + drift;
+            s.spread_history.push_back(v);
+        }
+        // Replace the last sample with the exact latest spread so the
+        // `latest = spread_history.back()` in `z_score` lines up with the
+        // `position_spread = log_a - beta * log_b` in `position_z`.
+        let exact = log_a_latest - beta * log_b_latest;
+        *s.spread_history.back_mut().unwrap() = exact;
+
+        let (z_rolling, std_rolling) = s.z_score().unwrap();
+        let (z_pos, std_pos) = s
+            .position_z(beta, log_a_latest, log_b_latest)
+            .expect("position_z should return Some");
+        assert_eq!(z_rolling.to_bits(), z_pos.to_bits(),
+            "z must be bitwise equal when betas + latest spread agree");
+        assert_eq!(std_rolling.to_bits(), std_pos.to_bits(),
+            "std comes from the same mean_std over spread_history");
+    }
+
+    /// bot-strategy#473: when `entry_beta != shared.beta`, `position_z`
+    /// differs from the rolling z by the expected algebraic delta: the
+    /// numerator shifts by `(shared.beta - entry_beta) * log_b`, divided
+    /// by the same std. Verifies position_z is implemented correctly,
+    /// not just that it returns *some* different number.
+    #[test]
+    fn position_z_diverges_predictably_when_betas_differ() {
+        let mut s = PairSharedState::new(120);
+        s.beta = 0.7;
+        let log_a_latest = 11.0_f64;
+        let log_b_latest = 7.4_f64;
+        for i in 0..200 {
+            let drift = 0.01 * ((i as f64) * 0.05).sin();
+            let v = (log_a_latest - s.beta * log_b_latest) + drift;
+            s.spread_history.push_back(v);
+        }
+        let exact = log_a_latest - s.beta * log_b_latest;
+        *s.spread_history.back_mut().unwrap() = exact;
+
+        let (z_rolling, std) = s.z_score().unwrap();
+        let entry_beta = 0.55; // β drifted up by +0.15 since entry
+        let (z_pos, std_pos) = s
+            .position_z(entry_beta, log_a_latest, log_b_latest)
+            .expect("position_z should return Some");
+        assert!(std_pos > 0.0);
+        // The position_z numerator differs from the rolling z numerator
+        // by `(shared.beta - entry_beta) * log_b`. Same denominator.
+        let expected_delta = (s.beta - entry_beta) * log_b_latest / std;
+        let observed_delta = z_pos - z_rolling;
+        assert!(
+            (observed_delta - expected_delta).abs() < 1e-9,
+            "expected delta {} but got {} (z_rolling={} z_pos={})",
+            expected_delta,
+            observed_delta,
+            z_rolling,
+            z_pos
+        );
+    }
+
+    /// `position_z` must return `None` when the history is empty or has
+    /// only one sample — same precondition as `z_score`. Defensive: an
+    /// out-of-window position should not silently get z=0 and exit.
+    #[test]
+    fn position_z_returns_none_when_history_too_short() {
+        let s = PairSharedState::new(120);
+        assert!(s.position_z(0.7, 11.0, 7.4).is_none());
+        let mut s = PairSharedState::new(120);
+        s.spread_history.push_back(3.7);
+        assert!(s.position_z(0.7, 11.0, 7.4).is_none());
     }
 
     /// PairState (per-instance) no longer carries β / z / spread fields.

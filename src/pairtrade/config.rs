@@ -135,6 +135,15 @@ pub struct PairParams {
     pub std_collapse_window_bars: usize,
     pub std_collapse_min_ratio: f64,
     pub std_collapse_observe_only: bool,
+    /// Use frozen-β z for exit-side gates (`exit_z`, `stop_loss_z`,
+    /// expected-value). When `true`, exit-side z is recomputed against
+    /// `Position.entry_beta` and the current log prices instead of the
+    /// rolling `shared.beta`, so a β drift during the hold does not
+    /// produce a "z reverted but no actual mean-reversion" false
+    /// signal. Default `false` preserves legacy behaviour. Entry /
+    /// regime / dashboard checks keep using rolling-β z regardless.
+    /// See bot-strategy#473.
+    pub use_frozen_beta_exit_z: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +402,8 @@ pub(super) struct PairTradeYaml {
     pub(super) std_collapse_window_bars: Option<usize>,
     pub(super) std_collapse_min_ratio: Option<f64>,
     pub(super) std_collapse_observe_only: Option<bool>,
+    /// bot-strategy#473: opt-in to frozen-β exit z. Default false.
+    pub(super) use_frozen_beta_exit_z: Option<bool>,
     /// Graceful shutdown: max seconds to wait for natural exit on SIGTERM before
     /// force-closing both legs. 0 = immediate force close (legacy behavior).
     pub(super) shutdown_grace_secs: Option<u64>,
@@ -516,6 +527,9 @@ pub(super) struct StrategyYaml {
     pub(super) rehedge_z_no_revert_factor: Option<f64>,
     pub(super) rehedge_velocity_projected_drift_min: Option<f64>,
     pub(super) beta_uncertainty_max: Option<f64>,
+    /// bot-strategy#473: per-variant override of `use_frozen_beta_exit_z`.
+    /// Round 6 C opts in; A/B inherit the global default (false).
+    pub(super) use_frozen_beta_exit_z: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -812,6 +826,8 @@ pub struct StrategyConfig {
     pub rehedge_z_no_revert_factor: Option<f64>,
     pub rehedge_velocity_projected_drift_min: Option<f64>,
     pub beta_uncertainty_max: Option<f64>,
+    /// Per-strategy override of `use_frozen_beta_exit_z` (bot-strategy#473).
+    pub use_frozen_beta_exit_z: Option<bool>,
 }
 
 impl PairTradeConfig {
@@ -1573,6 +1589,15 @@ impl PairTradeConfig {
                 matches!(lower.as_str(), "1" | "true" | "yes");
         }
 
+        // bot-strategy#473: env override on the YAML-loaded path. Applies
+        // to default_pair_params; per-strategy overrides still win at the
+        // strategy override loop in mod.rs.
+        if let Ok(value) = env::var("USE_FROZEN_BETA_EXIT_Z") {
+            let lower = value.trim().to_ascii_lowercase();
+            self.default_pair_params.use_frozen_beta_exit_z =
+                matches!(lower.as_str(), "1" | "true" | "yes");
+        }
+
         // Kalman filter
         if let Ok(value) = env::var("USE_KALMAN_BETA") {
             self.use_kalman_beta = value.to_lowercase() == "true";
@@ -1904,6 +1929,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
             .ok()
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(DEFAULT_STD_COLLAPSE_OBSERVE_ONLY),
+        use_frozen_beta_exit_z: env::var("USE_FROZEN_BETA_EXIT_Z")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(DEFAULT_USE_FROZEN_BETA_EXIT_Z),
     }
 }
 
@@ -1986,6 +2015,7 @@ pub(super) fn resolve_strategies(
                     rehedge_z_no_revert_factor: s.rehedge_z_no_revert_factor,
                     rehedge_velocity_projected_drift_min: s.rehedge_velocity_projected_drift_min,
                     beta_uncertainty_max: s.beta_uncertainty_max,
+                    use_frozen_beta_exit_z: s.use_frozen_beta_exit_z,
                 }
             })
             .collect(),
@@ -2013,6 +2043,7 @@ pub(super) fn resolve_strategies(
             rehedge_z_no_revert_factor: None,
             rehedge_velocity_projected_drift_min: None,
             beta_uncertainty_max: None,
+            use_frozen_beta_exit_z: None,
         }],
     }
 }
@@ -2109,6 +2140,9 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         std_collapse_observe_only: yaml
             .std_collapse_observe_only
             .unwrap_or(DEFAULT_STD_COLLAPSE_OBSERVE_ONLY),
+        use_frozen_beta_exit_z: yaml
+            .use_frozen_beta_exit_z
+            .unwrap_or(DEFAULT_USE_FROZEN_BETA_EXIT_Z),
     }
 }
 
