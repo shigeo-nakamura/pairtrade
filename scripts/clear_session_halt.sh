@@ -1,25 +1,35 @@
 #!/bin/bash
 # Clear a sticky session-DD halt on a pairtrade bot without using the
-# host-wide /opt/debot/RISK_ACK file. Edits the target bot's
-# risk_state.json directly, restarts the service, and waits for the
-# bot to come back up. bot-strategy#489 (follow-up to the 2026-06-07
-# canary restart documented in bot-strategy#485).
+# host-wide /opt/debot/RISK_ACK file. Stops the target service, edits
+# risk_state.json offline, restarts, and waits for the bot to come back
+# up. bot-strategy#489 (follow-up to the 2026-06-07 canary restart
+# documented in bot-strategy#485).
 #
 # Usage:
-#   clear_session_halt.sh <bot-name> [instance] [--dry-run] [--yes]
+#   clear_session_halt.sh <bot-name> [instance] [flags]
 #
 # Examples:
 #   clear_session_halt.sh debot-pair-canary
-#   clear_session_halt.sh debot-pair-btceth c
+#   clear_session_halt.sh debot-pair-btceth c --allow-main-restart
+#   clear_session_halt.sh debot-pair-btceth --all-variants --allow-main-restart
 #   clear_session_halt.sh debot-pair-btceth-extended --dry-run
 #
 # Known bots:
-#   debot-pair-btceth           — Frankfurt main (A/B/C); needs instance arg
+#   debot-pair-btceth           — Frankfurt main (A/B/C; needs instance OR --all-variants)
 #   debot-pair-canary           — Frankfurt canary (single instance 'a')
 #   debot-pair-btceth-extended  — Tokyo Extended (single instance 'a')
 #
-# When run without --yes the script prints what it would change and
-# prompts for confirmation. --dry-run skips the prompt and does nothing.
+# Flags:
+#   --dry-run                    preview only, no changes
+#   --yes / -y                   skip the interactive "proceed?" prompt
+#   --all-variants               required for main bot when no instance arg supplied
+#                                (acknowledges every halted variant is in scope)
+#   --allow-main-restart         required for debot-pair-btceth (Frankfurt main).
+#                                Restarting main triggers [Startup] force-close on any
+#                                open exchange position at ~50 bps slippage — the flag
+#                                forces the operator to confirm they accept that risk
+#   --force-with-open-position   required to proceed when status.json reports a position
+#                                on any target instance. Without it the script aborts.
 #
 # After a successful restart the script tails journalctl for ~60 s and
 # emits ✓/✗ marks for the three expected boot-time log lines:
@@ -30,17 +40,23 @@
 set -eu
 
 usage() {
-    sed -n '2,30p' "$0"
+    sed -n '2,40p' "$0"
     exit 1
 }
 
 POSITIONAL=()
 DRY_RUN=0
 YES=0
+ALL_VARIANTS=0
+ALLOW_MAIN_RESTART=0
+FORCE_WITH_OPEN_POSITION=0
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
         --yes|-y) YES=1 ;;
+        --all-variants) ALL_VARIANTS=1 ;;
+        --allow-main-restart) ALLOW_MAIN_RESTART=1 ;;
+        --force-with-open-position) FORCE_WITH_OPEN_POSITION=1 ;;
         --help|-h) usage ;;
         --*)
             echo "ERROR: unknown flag '$arg'" >&2
@@ -57,21 +73,29 @@ fi
 BOT="${POSITIONAL[0]}"
 INSTANCE_FILTER="${POSITIONAL[1]:-}"
 
+# Bot lookup: ssh_host / state_dir / service / is_main / status_dir_pattern
+# status_dir_pattern uses {variant} placeholder which is interpolated below.
 case "$BOT" in
     debot-pair-btceth)
         SSH_HOST=debot
         STATE_DIR=/opt/debot
         SERVICE=debot-pair-btceth.service
+        IS_MAIN=1
+        STATUS_DIR_BASE=/home/ec2-user/debot_status/debot-pair-btceth-{variant}
         ;;
     debot-pair-canary)
         SSH_HOST=debot
         STATE_DIR=/opt/debot-canary
         SERVICE=debot-pair-canary.service
+        IS_MAIN=0
+        STATUS_DIR_BASE=/home/ec2-user/debot_status/debot-pair-canary
         ;;
     debot-pair-btceth-extended)
         SSH_HOST=debot-tokyo
         STATE_DIR=/opt/debot-extended
         SERVICE=debot-pair-btceth-extended.service
+        IS_MAIN=0
+        STATUS_DIR_BASE=/home/ec2-user/debot_status/debot-pair-btceth-ext
         ;;
     *)
         echo "ERROR: unknown bot '$BOT'" >&2
@@ -79,6 +103,23 @@ case "$BOT" in
         exit 1
         ;;
 esac
+
+# Safety gate 1: main bot without --all-variants must specify instance.
+if [ "$IS_MAIN" = 1 ] && [ -z "$INSTANCE_FILTER" ] && [ "$ALL_VARIANTS" != 1 ]; then
+    echo "ERROR: $BOT runs multiple variants. Either pass an explicit instance" >&2
+    echo "       (e.g. \`$0 debot-pair-btceth c --allow-main-restart\`) or pass" >&2
+    echo "       --all-variants to acknowledge you intend to clear every halted variant." >&2
+    exit 1
+fi
+
+# Safety gate 2: main bot restart needs the dedicated flag.
+if [ "$IS_MAIN" = 1 ] && [ "$ALLOW_MAIN_RESTART" != 1 ]; then
+    echo "ERROR: $BOT is the Frankfurt main bot. Restarting it triggers [Startup]" >&2
+    echo "       force-close on any open exchange position at ~50 bps slippage" >&2
+    echo "       (see feedback_pairtrade_restart_force_closes). Re-run with" >&2
+    echo "       --allow-main-restart to confirm you accept that risk." >&2
+    exit 1
+fi
 
 RISK_STATE="$STATE_DIR/risk_state.json"
 TS=$(date -u +%Y%m%d_%H%M%S)
@@ -91,6 +132,8 @@ echo "  state    : $RISK_STATE"
 echo "  service  : $SERVICE"
 if [ -n "$INSTANCE_FILTER" ]; then
     echo "  instance : $INSTANCE_FILTER (only this one will be cleared)"
+elif [ "$ALL_VARIANTS" = 1 ]; then
+    echo "  instance : <all halted variants> (--all-variants)"
 else
     echo "  instance : <all halted instances>"
 fi
@@ -132,18 +175,68 @@ if [ "$WOULD_CLEAR" = "NONE" ] || [ -z "$WOULD_CLEAR" ]; then
     exit 0
 fi
 
+# Position pre-check — restart triggers [Startup] force-close at ~50 bps,
+# so flag any target instance that's mid-trade. status.json layout: per
+# variant for main (debot-pair-btceth-{a,b,c}); single dir for canary /
+# Extended.
+echo "==> Position pre-check"
+OPEN_POSITIONS=""
+IFS=',' read -ra TARGETS <<< "$WOULD_CLEAR"
+for inst in "${TARGETS[@]}"; do
+    if [ "$IS_MAIN" = 1 ]; then
+        STATUS_DIR="${STATUS_DIR_BASE/\{variant\}/$inst}"
+    else
+        STATUS_DIR="$STATUS_DIR_BASE"
+    fi
+    STATUS_JSON="$STATUS_DIR/status.json"
+    POS=$(ssh "$SSH_HOST" "sudo cat '$STATUS_JSON' 2>/dev/null" \
+        | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("UNKNOWN")
+    sys.exit(0)
+has = d.get("has_position")
+cnt = d.get("position_count", 0)
+positions = d.get("positions", [])
+if has:
+    print("OPEN n=" + str(cnt) + " " + str(positions)[:200])
+else:
+    print("CLEAN")
+' || echo "UNKNOWN")
+    echo "  $inst: $POS"
+    if [[ "$POS" == OPEN* ]]; then
+        OPEN_POSITIONS="$OPEN_POSITIONS $inst"
+    fi
+done
+
+if [ -n "$OPEN_POSITIONS" ] && [ "$FORCE_WITH_OPEN_POSITION" != 1 ]; then
+    echo "ERROR: open position(s) detected on:$OPEN_POSITIONS" >&2
+    echo "       Restart will [Startup] force-close at ~50 bps slippage." >&2
+    echo "       Re-run with --force-with-open-position to accept the cost," >&2
+    echo "       or close the position manually first and retry." >&2
+    exit 1
+fi
+
 if [ "$DRY_RUN" = 1 ]; then
     echo "==> --dry-run, no changes made"
     exit 0
 fi
 
 if [ "$YES" != 1 ]; then
-    read -r -p "Proceed (backup + clear + restart)? [y/N] " ans
+    read -r -p "Proceed (stop + backup + clear + start)? [y/N] " ans
     if [ "$ans" != "y" ] && [ "$ans" != "Y" ]; then
         echo "Aborted"
         exit 1
     fi
 fi
+
+# Stop → edit → start eliminates the race where the running bot's own
+# persist_risk_state() tick could overwrite the cleared fields before /
+# after the restart command. PR #74 review item 2.
+echo "==> Stopping $SERVICE"
+ssh "$SSH_HOST" "sudo systemctl stop '$SERVICE'"
 
 echo "==> Backing up to $BACKUP"
 ssh "$SSH_HOST" "sudo cp '$RISK_STATE' '$BACKUP'"
@@ -166,8 +259,8 @@ with open('$RISK_STATE', 'w') as f:
     json.dump(d, f, indent=2)
 PY"
 
-echo "==> Restarting $SERVICE"
-ssh "$SSH_HOST" "sudo systemctl restart '$SERVICE'"
+echo "==> Starting $SERVICE"
+ssh "$SSH_HOST" "sudo systemctl start '$SERVICE'"
 
 echo "==> Waiting 60s for boot…"
 sleep 60
