@@ -29,7 +29,11 @@
 #                                open exchange position at ~50 bps slippage — the flag
 #                                forces the operator to confirm they accept that risk
 #   --force-with-open-position   required to proceed when status.json reports a position
-#                                on any target instance. Without it the script aborts.
+#                                on ANY variant the service owns (not just the cleared
+#                                ones — restart force-closes service-wide) OR when status
+#                                is UNKNOWN (file missing / unreadable / unparseable).
+#                                UNKNOWN is treated as equivalent to OPEN because it's
+#                                the worst case for this restart path.
 #
 # After a successful restart the script tails journalctl for ~60 s and
 # emits ✓/✗ marks for the three expected boot-time log lines:
@@ -82,6 +86,7 @@ case "$BOT" in
         SERVICE=debot-pair-btceth.service
         IS_MAIN=1
         STATUS_DIR_BASE=/home/ec2-user/debot_status/debot-pair-btceth-{variant}
+        SERVICE_VARIANTS=(a b c)
         ;;
     debot-pair-canary)
         SSH_HOST=debot
@@ -89,6 +94,7 @@ case "$BOT" in
         SERVICE=debot-pair-canary.service
         IS_MAIN=0
         STATUS_DIR_BASE=/home/ec2-user/debot_status/debot-pair-canary
+        SERVICE_VARIANTS=(a)
         ;;
     debot-pair-btceth-extended)
         SSH_HOST=debot-tokyo
@@ -96,6 +102,7 @@ case "$BOT" in
         SERVICE=debot-pair-btceth-extended.service
         IS_MAIN=0
         STATUS_DIR_BASE=/home/ec2-user/debot_status/debot-pair-btceth-ext
+        SERVICE_VARIANTS=(a)
         ;;
     *)
         echo "ERROR: unknown bot '$BOT'" >&2
@@ -175,14 +182,20 @@ if [ "$WOULD_CLEAR" = "NONE" ] || [ -z "$WOULD_CLEAR" ]; then
     exit 0
 fi
 
-# Position pre-check — restart triggers [Startup] force-close at ~50 bps,
-# so flag any target instance that's mid-trade. status.json layout: per
-# variant for main (debot-pair-btceth-{a,b,c}); single dir for canary /
-# Extended.
-echo "==> Position pre-check"
-OPEN_POSITIONS=""
-IFS=',' read -ra TARGETS <<< "$WOULD_CLEAR"
-for inst in "${TARGETS[@]}"; do
+# Position pre-check — restart triggers [Startup] force-close on EVERY
+# variant on the service, not just the ones we're clearing. So we read
+# status.json for every variant the service owns (a/b/c for main, just
+# 'a' for canary / Extended). status.json layout: per-variant dir for
+# main (debot-pair-btceth-{a,b,c}); single dir for canary / Extended.
+#
+# UNKNOWN (file missing / unreadable / unparseable) is the worst-case
+# state for this restart path — we have no idea whether a position is
+# open or not, but restart will still force-close whatever is there. So
+# UNKNOWN is treated as equivalent to OPEN for the gating decision and
+# requires --force-with-open-position to override. PR #74 review item 5.
+echo "==> Position pre-check (service-wide — restart force-closes every open position)"
+BLOCKED_POSITIONS=""
+for inst in "${SERVICE_VARIANTS[@]}"; do
     if [ "$IS_MAIN" = 1 ]; then
         STATUS_DIR="${STATUS_DIR_BASE/\{variant\}/$inst}"
     else
@@ -192,30 +205,38 @@ for inst in "${TARGETS[@]}"; do
     POS=$(ssh "$SSH_HOST" "sudo cat '$STATUS_JSON' 2>/dev/null" \
         | python3 -c '
 import json, sys
+raw = sys.stdin.read()
+if not raw.strip():
+    print("UNKNOWN empty-or-missing")
+    sys.exit(0)
 try:
-    d = json.load(sys.stdin)
-except Exception:
-    print("UNKNOWN")
+    d = json.loads(raw)
+except Exception as exc:
+    print("UNKNOWN parse-error " + type(exc).__name__)
     sys.exit(0)
 has = d.get("has_position")
 cnt = d.get("position_count", 0)
 positions = d.get("positions", [])
-if has:
+if has is None:
+    print("UNKNOWN no-has_position-field")
+elif has:
     print("OPEN n=" + str(cnt) + " " + str(positions)[:200])
 else:
     print("CLEAN")
-' || echo "UNKNOWN")
+' || echo "UNKNOWN ssh-or-pipe-error")
     echo "  $inst: $POS"
-    if [[ "$POS" == OPEN* ]]; then
-        OPEN_POSITIONS="$OPEN_POSITIONS $inst"
+    if [[ "$POS" == OPEN* ]] || [[ "$POS" == UNKNOWN* ]]; then
+        BLOCKED_POSITIONS="$BLOCKED_POSITIONS $inst($POS)"
     fi
 done
 
-if [ -n "$OPEN_POSITIONS" ] && [ "$FORCE_WITH_OPEN_POSITION" != 1 ]; then
-    echo "ERROR: open position(s) detected on:$OPEN_POSITIONS" >&2
-    echo "       Restart will [Startup] force-close at ~50 bps slippage." >&2
-    echo "       Re-run with --force-with-open-position to accept the cost," >&2
-    echo "       or close the position manually first and retry." >&2
+if [ -n "$BLOCKED_POSITIONS" ] && [ "$FORCE_WITH_OPEN_POSITION" != 1 ]; then
+    echo "ERROR: cannot confirm clean position state on:$BLOCKED_POSITIONS" >&2
+    echo "       Restart will [Startup] force-close every open position on the" >&2
+    echo "       service at ~50 bps slippage. UNKNOWN status means the bot may" >&2
+    echo "       still hold a position we can't see, which is the most dangerous" >&2
+    echo "       state for this restart path. Re-run with --force-with-open-position" >&2
+    echo "       to accept the cost, or close positions / fix status.json first." >&2
     exit 1
 fi
 
