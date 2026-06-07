@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use classification::{
     is_step_overrun_event, is_step_overrun_recovery_event, is_ws_recovery_event,
-    is_ws_transient_event, WS_RESET_PHRASE,
+    is_ws_reset_event, is_ws_transient_event,
 };
 use deferral::{
     flush_all_expired_pending, PendingEntry, STEP_OVERRUN_DEFER_WINDOW_SECS, WS_DEFER_WINDOW_SECS,
@@ -177,11 +177,14 @@ struct Counters {
     /// `STEP_OVERRUN_DEFER_WINDOW_SECS`. See bot-strategy#267.
     pending_step_overrun: Mutex<VecDeque<PendingEntry>>,
     /// Timestamps (epoch seconds) of WS reset events in the last 24h —
-    /// any log line that contains `Connection reset without closing
-    /// handshake`. Surfaced as `ws_reset_24h_count` in `status.json` so
-    /// the dashboard does not need a journalctl SSM probe. Stays
+    /// any log line matching `classification::is_ws_reset_event`
+    /// (Extended SDK's `Connection reset without closing handshake` plus
+    /// Lighter's `WebSocket error: IO error: Connection reset` primary
+    /// line). Surfaced as `ws_reset_24h_count` in `status.json` so the
+    /// dashboard does not need a journalctl SSM probe. Stays
     /// process-global because the metric represents fleet-level WS
-    /// health, not per-variant attribution. See bot-strategy#343.
+    /// health, not per-variant attribution. See bot-strategy#343
+    /// (introduction) / #486 (Lighter pattern coverage fix).
     ws_resets_24h: Mutex<VecDeque<i64>>,
 }
 
@@ -382,7 +385,7 @@ impl Log for ErrorCountingLogger {
             // counts, regardless of `is_counting_suppressed`, because
             // maintenance suppression should not hide reset volume from
             // the dashboard.
-            if msg.contains(WS_RESET_PHRASE) {
+            if is_ws_reset_event(&msg) {
                 let cutoff = ts - WS_RESET_24H_WINDOW_SECS;
                 let mut q = self.counters.ws_resets_24h.lock().unwrap();
                 while let Some(&front) = q.front() {
@@ -478,7 +481,7 @@ mod tests {
     /// `log()` body. `instance = None` matches the shared / unattributed
     /// path the connector layer takes today.
     fn fake_log_for(counters: &Counters, instance: Option<&str>, ts: i64, level: Level, msg: &str) {
-        if msg.contains(WS_RESET_PHRASE) {
+        if is_ws_reset_event(msg) {
             let cutoff = ts - WS_RESET_24H_WINDOW_SECS;
             let mut q = counters.ws_resets_24h.lock().unwrap();
             while let Some(&front) = q.front() {
@@ -1005,8 +1008,11 @@ mod tests {
     }
 
     // bot-strategy#343: ws_reset_24h_count replaces the dashboard's old
-    // journalctl `Connection reset without closing handshake` SSM probe
-    // with a self-reported counter. Tests live in this module because
+    // journalctl `Connection reset...` SSM probe with a self-reported
+    // counter. Coverage broadened in #486 to also catch Lighter's
+    // `WebSocket error: IO error: Connection reset` primary error after
+    // dex-connector dropped the original `without closing handshake`
+    // phrase on the Lighter path. Tests live in this module because
     // the substring match + 24h ring lives in `Counters`.
 
     fn ws_reset_count(counters: &Counters, now: i64) -> u64 {
@@ -1114,15 +1120,11 @@ mod tests {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 15_000_000;
-        // Closely-related but not exact phrases must not contribute. The
-        // dashboard's old journalctl probe matched the exact substring;
-        // the bot self-reported counter must match the same set.
-        fake_log(
-            &c,
-            t0,
-            Level::Warn,
-            "Connection reset by peer (os error 104)",
-        );
+        // Bare `Connection reset by peer` without the `WebSocket error: IO
+        // error:` prefix is some other socket — e.g. an Extended REST
+        // retry chain — and must not contribute. Same for closely-related
+        // but unmatched phrases.
+        fake_log(&c, t0, Level::Warn, "Connection reset by peer somewhere");
         fake_log(&c, t0 + 1, Level::Warn, "WebSocket reset");
         fake_log(
             &c,
@@ -1131,6 +1133,45 @@ mod tests {
             "Connection reset without graceful close",
         );
         assert_eq!(ws_reset_count(&c, t0 + 5), 0);
+    }
+
+    #[test]
+    fn ws_reset_24h_counts_lighter_primary_error() {
+        // bot-strategy#486: dex-connector now emits Lighter / tungstenite
+        // WS resets as `WebSocket error: IO error: Connection reset by
+        // peer (os error 104)` instead of `... Connection reset without
+        // closing handshake`. Both forms must increment the counter so
+        // the dashboard alert stops silently missing Frankfurt resets.
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 15_500_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer (os error 104)",
+        );
+        fake_log(
+            &c,
+            t0 + 1,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset by peer",
+        );
+        fake_log(
+            &c,
+            t0 + 2,
+            Level::Error,
+            "WebSocket error: IO error: Connection reset",
+        );
+        // The follow-up `WebSocket IO error detail:` line for the SAME
+        // reset must NOT double-count.
+        fake_log(
+            &c,
+            t0 + 3,
+            Level::Error,
+            "WebSocket IO error detail: kind=ConnectionReset, error=Connection reset by peer",
+        );
+        assert_eq!(ws_reset_count(&c, t0 + 5), 3);
     }
 
     // bot-strategy#367: per-instance attribution. A WARN emitted inside

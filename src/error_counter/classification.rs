@@ -2,11 +2,20 @@
 //! transient WS events, STEP_OVERRUN warns, and their recovery markers.
 //! Co-located with the substring constants they reference.
 
-/// Substring used to identify a WS reset event in the log stream. The
-/// dashboard's old journalctl probe matched the same exact phrase, so
-/// the bot-self-reported counter and the journalctl-derived counter
-/// are interchangeable.
-pub(super) const WS_RESET_PHRASE: &str = "Connection reset without closing handshake";
+/// Match log lines that represent a WS reset event for the 24h counter.
+/// Covers two distinct connector vocabularies:
+///
+/// - Extended SDK emits `... Connection reset without closing handshake ...`
+///   (orderbook / public trades / account stream errors)
+/// - Lighter (tungstenite) emits the primary error as
+///   `WebSocket error: IO error: Connection reset (by peer|...)` followed by
+///   a `WebSocket IO error detail:` line. Only the primary line counts —
+///   the detail line is intentionally excluded so each reset increments the
+///   counter exactly once (bot-strategy#486).
+pub(super) fn is_ws_reset_event(msg: &str) -> bool {
+    msg.contains("Connection reset without closing handshake")
+        || msg.starts_with("WebSocket error: IO error: Connection reset")
+}
 
 /// Match log lines that signal a transient connectivity event whose effect
 /// should be suppressed if the bot recovers within `WS_DEFER_WINDOW_SECS`.
