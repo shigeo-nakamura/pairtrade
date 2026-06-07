@@ -145,22 +145,10 @@ risk:
 strategies:
   - id: a
     agent_name: debot-pair-btceth-a
-    exit_z_score: 0.2
-    stop_loss_z_score: 4.0
-    max_loss_r_mult: 1.0
-    # bot-strategy#222: Frankfurt A/B/C reference levelled to $1000 each.
-    # B and C require deposit top-up from $500 → $1000 before redeploy.
-    equity_usd_reference: 1000
-    # A/B/C round 3 (2026-04-25): role-swap, A becomes the stable best (MTF+fc=7200 unchanged from round 2).
-    mtf_windows: [15]
-    mtf_z_min: 0.5
-    force_close_time_secs: 7200
-  - id: b
-    agent_name: debot-pair-btceth-b
-    # Round 4 (#278): B becomes A clone + force_close_time_secs=10800 (FC%-attack).
-    # Round 3 B config (no MTF, fc=3600, ez=0.3, sl=6, mlr=3) was a structural
-    # loser (-$8.35 over 13d, Calmar -0.64). 5d byte-exact BT showed fc=10800
-    # gives Calmar 1.75x baseline (4.36 vs 2.49) and FC% 32% → 18%.
+    # Round 6 (2026-06-07, bot-strategy#355): A inherits Round-5 B's
+    # `force_close_time_secs=10800` winning config — Round-5 outcome
+    # showed B (fc=10800) ≈ 2× A's net PnL with +76% Calmar, +84% Sharpe
+    # vs the old fc=7200 baseline. Promoted as the new stable best.
     exit_z_score: 0.2
     stop_loss_z_score: 4.0
     max_loss_r_mult: 1.0
@@ -168,22 +156,12 @@ strategies:
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 10800
-  - id: c
-    agent_name: debot-pair-btceth-c
-    # Round 5 (bot-strategy#461, 2026-05-20): C transitions to the
-    # "substitution mode" β-handling: threshold-side scaling OFF, notional
-    # shrink ON. byte-exact BT on R3 + R4 windows showed +40% (R3) /
-    # +484% (R4) gross PnL, Calmar 1.66→2.98 (R3) and 0.75→2.89 (R4), with
-    # MaxDD reduced ~23%. Substitutes the entry-killing
-    # `beta_gap_entry_z_scale=3.0` with size-shrink at the same risk budget,
-    # capturing the z fires the threshold gate was discarding (R4 entry
-    # rate recovers to R3 levels: 10→23 trades over the same window).
-    # A and B continue Round-4 baseline (#278) so the leverage / fc /
-    # MTF evaluation completes alongside the Round-5 challenger.
-    # The previous Round-4 C config (entry_z_base=2.5, "selectivity
-    # hill-climb") was inconclusive — Round-4 sample too small under the
-    # new R4 market regime — and is superseded by the structural fix
-    # rather than another threshold-tweak iteration.
+  - id: b
+    agent_name: debot-pair-btceth-b
+    # Round 6 (2026-06-07): B reverts to fc=7200 — the previous A baseline —
+    # as the 1-knob control vs new A (fc=10800). Keeps the A/B comparison
+    # honest: if Round-6 A underperforms B in a different regime, we know
+    # the fc=10800 win was regime-specific rather than structural.
     exit_z_score: 0.2
     stop_loss_z_score: 4.0
     max_loss_r_mult: 1.0
@@ -191,25 +169,30 @@ strategies:
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 7200
-    # Substitution mode (Round 5 / bot-strategy#461):
-    beta_gap_entry_z_scale: 0.0
-    beta_gap_notional_scale: 1.0
-    beta_gap_notional_floor: 0.5
-    # Round 5 / bot-strategy#465 follow-up: opt variant C into the
-    # mid-hold re-hedge with the NRV (no-revert) gate. R3+R4 BT
-    # (43 trades, 17 days) showed the simple |drift| gate hurts PnL
-    # by ~33%; the NRV gate restores baseline-equivalent PnL while
-    # firing 11 re-hedges that correspond to the live R5 cycle pattern
-    # (β drifted while spread still at entry depth). BT cannot prove
-    # upside here — R3+R4 has too few of those cycles to be conclusive.
-    # Live A/B/C comparison will tell us.
-    # If C ≈ A/B over 2 weeks → keep as Round-5 standard.
-    # If C underperforms → revert this block (set rehedge_drift_threshold_pct
-    # back to 0.0 OR set rehedge_live_enabled to false; the rest of
-    # variant C's substitution-mode config stays).
-    rehedge_drift_threshold_pct: 0.15
-    rehedge_cooldown_secs: 1800
-    rehedge_min_qty_notional_usd: 50.0
-    rehedge_require_no_revert: true
-    rehedge_z_no_revert_factor: 1.0
-    rehedge_live_enabled: true
+  - id: c
+    agent_name: debot-pair-btceth-c
+    # Round 6 (2026-06-07, bot-strategy#473): C = A's config +
+    # `use_frozen_beta_exit_z=true`. Exit-side z (`exit_z`, `stop_loss_z`,
+    # expected-value gate) recomputed against `Position.entry_beta` instead
+    # of rolling `shared.beta`, so a β drift between entry and now does
+    # not produce false z-reversion exit signals.
+    #
+    # Round-5 byte-exact BT (5/30→6/07): vs same-config baseline,
+    # PnL -$33 → -$5 (+$28 over 8.5 days), MaxDD -36%, per-trade Sharpe
+    # +84%, Calmar +76%, `exit_z` close count 10 → 2 (-80%). All Round-6
+    # acceptance thresholds passed. Same trade count as baseline (entries
+    # unaffected) — only exit timing changes.
+    #
+    # Round-5 C's substitution-mode + re-hedge config (#461 + #463+#465)
+    # is dropped: synthetic analysis + live result showed it underperforms
+    # A and halted out on session_dd. Rehedge axis shelved (deferred);
+    # substitution mode rejected. Future #473 follow-up #355 if frozen-β
+    # alone insufficient.
+    exit_z_score: 0.2
+    stop_loss_z_score: 4.0
+    max_loss_r_mult: 1.0
+    equity_usd_reference: 1000
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 10800
+    use_frozen_beta_exit_z: true
