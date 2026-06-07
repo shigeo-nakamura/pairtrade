@@ -103,15 +103,22 @@ circuit_breaker_tier1_cooldown_secs: 600
 circuit_breaker_tier2_losses: 8
 circuit_breaker_tier2_cooldown_secs: 3600
 
-# Risk gates — same shape as main but lower max_leverage means effective
-# session DD threshold is 50 bps × 5 = 250 bps = 2.5% equity (vs main's 5%).
-# Canary takes any DD event sooner; that's intentional, an early-detect signal
-# for "regression hit canary first".
+# Risk gates — canary budget ($50 collateral, 5x leverage) makes the original
+# 50 bps × 5 = 250 bps = $1.25 threshold same-order as per-trade taker noise
+# ($0.10–0.20 per round-trip on Lighter standard), so a few unfavorable
+# trades trip the sticky halt and smoke coverage silently disappears for
+# weeks (bot-strategy#485 — halted 16 days before detection). Relaxed to
+# 200 bps × 5 = 1000 bps = 10% equity = $5; this trades away the
+# "regression hits canary first" early-warning property (main A/B/C still
+# fire at 5%, but canary now fires at 10%) for the ability to actually keep
+# the live-execution smoke loop running. Acceptable since the canary's
+# primary value is exercising the deploy/execution path, not being the
+# tightest risk tripwire.
 risk:
   max_daily_loss_bps: 300
   max_daily_loss_action: block
   daily_reset_utc_hour: 0
-  max_session_loss_bps: 50
+  max_session_loss_bps: 200
   session_dd_lookback_secs: 2592000
   session_dd_sample_secs: 3600
   max_notional_headroom: 1.0
