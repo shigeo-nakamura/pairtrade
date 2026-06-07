@@ -49,6 +49,13 @@ export PAIRTRADE_CONFIG_PATH="${PAIRTRADE_CONFIG_PATH:-${DEBOT_HOME}/configs/pai
 # the history archive land under the same DEBOT_HOME as the binary.
 export DATA_DUMP_FILE="${DATA_DUMP_FILE:-${DEBOT_HOME}/market_data_btceth_extended.jsonl}"
 export HISTORY_ARCHIVE_DIR="${HISTORY_ARCHIVE_DIR:-${DEBOT_HOME}/history_archive}"
+# Keep the manual-ack sentinel under DEBOT_HOME so a future host that
+# co-locates Extended with another pairtrade bot does not share a single
+# `/opt/debot/RISK_ACK` and accidentally release multiple bots at once.
+# Today Tokyo Extended is alone on its host so the practical risk is low,
+# but matching canary's path-separation now keeps future fleet
+# consolidation (#433) safe by default. bot-strategy#488.
+export RISK_ACK_PATH="${RISK_ACK_PATH:-${DEBOT_HOME}/RISK_ACK}"
 
 mkdir -p "$DEBOT_STATUS_DIR"
 

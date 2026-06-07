@@ -117,8 +117,9 @@ pub(super) const DEFAULT_DAILY_RESET_UTC_HOUR: u32 = 0;
 // Session DD + max-notional cap — bot-strategy#185 Phase 3. All disabled by
 // default. `max_session_loss_bps` is the threshold against the rolling peak
 // equity over `session_dd_lookback_secs`; on breach the bot flattens the
-// instance's positions and halts entries until `/opt/debot/RISK_ACK` is
-// dropped (manual ack — no auto-resume). `max_notional_headroom` caps each
+// instance's positions and halts entries until the manual-ack sentinel
+// (default `/opt/debot/RISK_ACK`, overridable via the `RISK_ACK_PATH` env)
+// is dropped — no auto-resume. `max_notional_headroom` caps each
 // hedge leg's USD notional at `equity_reference_usd × max_leverage × headroom`
 // so the same value works across hosts with different equity / leverage
 // (Frankfurt $1k×5x, Tokyo Lighter $150×5x, etc.). Both legs of a trade
