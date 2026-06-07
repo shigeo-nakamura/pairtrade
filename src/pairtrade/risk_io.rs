@@ -63,7 +63,8 @@ pub(super) struct InstanceRiskState {
     /// Sticky halt flag set when the rolling-peak DD threshold trips.
     /// Persists across restarts so a crash inside the cooling-off
     /// window does not silently re-arm the bot. Cleared only by the
-    /// `/opt/debot/RISK_ACK` sentinel — there is no auto-resume.
+    /// manual-ack sentinel (default `/opt/debot/RISK_ACK`, overridable
+    /// via `RISK_ACK_PATH`) — there is no auto-resume.
     #[serde(default)]
     pub session_halted: bool,
     /// Free-form tag identifying which guard tripped the halt

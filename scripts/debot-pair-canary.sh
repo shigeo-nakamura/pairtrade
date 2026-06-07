@@ -41,6 +41,12 @@ export PAIRTRADE_CONFIG_PATH=/opt/debot/configs/pairtrade/debot-pair-canary.yaml
 # Wholesale skip the spot-markets fetch (perps-only, same as main; bot-strategy#128)
 export LIGHTER_SKIP_SPOT_MARKETS=1
 
+# Separate the manual-ack sentinel from the main bot so dropping ack on one
+# bot can't accidentally release the other. bot-strategy#488 (the original
+# /opt/debot/RISK_ACK is shared host-wide and was a footgun during the
+# 2026-06-07 canary restart while variant C had to stay halted).
+export RISK_ACK_PATH="$STATE_DIR/RISK_ACK"
+
 # Deterministic startup spacing (bot-strategy#163). Even though canary only
 # has one account on this EOA's 4th sub-account, the main process is already
 # running, so /apikeys may have been hit in the recent past. ExecStartPre in

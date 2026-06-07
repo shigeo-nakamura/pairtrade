@@ -79,7 +79,19 @@ const KILL_SWITCH_PATH: &str = "/opt/debot/KILL_SWITCH";
 /// this file (any contents) on the host to lift the halt; the bot
 /// consumes it at the top of `step_shared` so the file is removed even
 /// if all instances were already clear. See bot-strategy#185 Phase 3-2.
-const RISK_ACK_PATH: &str = "/opt/debot/RISK_ACK";
+///
+/// Defaults to `/opt/debot/RISK_ACK` for backwards compatibility with the
+/// main bot's deploy. Overridable via the `RISK_ACK_PATH` env var so
+/// multi-bot hosts (canary + main, Extended + main) can each consume an
+/// independent ack file and avoid the "drop one file, release every bot"
+/// footgun. Resolved once at process start. bot-strategy#488.
+pub(in crate::pairtrade) fn risk_ack_path() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var("RISK_ACK_PATH").unwrap_or_else(|_| "/opt/debot/RISK_ACK".to_string())
+    })
+    .as_str()
+}
 
 /// Apply the post-exit state transition: clear position, stamp
 /// last_exit_{at,ts}, and — if the exit reason stashed by `exit_reason()`
@@ -182,8 +194,9 @@ struct StrategyInstance {
     equity_samples: Vec<risk_io::EquitySample>,
     /// Phase 3-1/3-2 sticky halt set on session-DD breach. Persists to
     /// `risk_state.json` so a crash inside the cool-off window does
-    /// not silently re-arm the bot. Cleared only by writing
-    /// `/opt/debot/RISK_ACK`.
+    /// not silently re-arm the bot. Cleared only by writing the
+    /// manual-ack sentinel (default `/opt/debot/RISK_ACK`, overridable
+    /// via the `RISK_ACK_PATH` env var per bot-strategy#488).
     session_halted: bool,
     session_halt_reason: Option<String>,
     session_halt_ts: Option<i64>,

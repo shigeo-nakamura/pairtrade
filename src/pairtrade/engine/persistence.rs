@@ -15,8 +15,8 @@ use super::super::history_io::{self, KalmanSnapshot};
 use super::super::kalman::KalmanBeta;
 use super::super::risk_io;
 use super::super::stats::{regression_beta, tail_samples};
+use super::super::risk_ack_path;
 use super::super::PairTradeEngine;
-use super::super::RISK_ACK_PATH;
 
 impl PairTradeEngine {
     pub(in crate::pairtrade) fn persist_history_to_disk(&self) {
@@ -217,7 +217,7 @@ impl PairTradeEngine {
                     inst.id,
                     inst.session_halt_reason.as_deref().unwrap_or("unknown"),
                     inst.session_halt_ts.unwrap_or(0),
-                    RISK_ACK_PATH
+                    risk_ack_path()
                 );
             }
             match state.circuit_breaker_until_ts {

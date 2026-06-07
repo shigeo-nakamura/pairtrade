@@ -32,8 +32,8 @@ use super::super::status;
 use super::super::PairTradeEngine;
 use super::super::StrategyInstance;
 use super::super::EQUITY_REFRESH_CACHE_SECS;
+use super::super::risk_ack_path;
 use super::super::KILL_SWITCH_PATH;
-use super::super::RISK_ACK_PATH;
 
 impl PairTradeEngine {
     pub(in crate::pairtrade) fn daily_risk_snapshot(
@@ -454,15 +454,17 @@ impl PairTradeEngine {
         }
     }
 
-    /// Consume `/opt/debot/RISK_ACK` if present and clear `session_halted`
-    /// across all instances. The file is unconditionally removed so a
-    /// stale ack from a prior incident never silently re-arms. See
-    /// bot-strategy#185 Phase 3-2.
+    /// Consume the manual-ack sentinel (default `/opt/debot/RISK_ACK`,
+    /// overridable via the `RISK_ACK_PATH` env var) if present and clear
+    /// `session_halted` across all instances. The file is unconditionally
+    /// removed so a stale ack from a prior incident never silently re-arms.
+    /// See bot-strategy#185 Phase 3-2 / bot-strategy#488.
     pub(in crate::pairtrade) fn consume_risk_ack(&mut self) {
         if self.cfg.backtest_mode {
             return;
         }
-        let path = std::path::Path::new(RISK_ACK_PATH);
+        let ack_path = risk_ack_path();
+        let path = std::path::Path::new(ack_path);
         if !path.exists() {
             return;
         }
@@ -481,7 +483,7 @@ impl PairTradeEngine {
                 log::warn!(
                     "[SESSION_DD] {} halt cleared by ack at {} (reason was: {}, ack payload: {:?})",
                     inst.id,
-                    RISK_ACK_PATH,
+                    ack_path,
                     prior_reason,
                     trimmed
                 );
@@ -509,11 +511,11 @@ impl PairTradeEngine {
         if let Err(e) = std::fs::remove_file(path) {
             log::warn!(
                 "[SESSION_DD] failed to remove {} after ack: {:?}",
-                RISK_ACK_PATH,
+                ack_path,
                 e
             );
         } else {
-            log::info!("[SESSION_DD] {} consumed", RISK_ACK_PATH);
+            log::info!("[SESSION_DD] {} consumed", ack_path);
         }
         if cleared_any {
             self.persist_risk_state();
@@ -658,7 +660,7 @@ impl PairTradeEngine {
         let reason = format!("session_dd_{}bps_lev{:.1}", threshold_bps, leverage);
         log::error!(
             "[SESSION_DD] {} breach: equity={:.2} peak={:.2} dd_bps={:.1} threshold={}bps × leverage={:.1} = effective={:.1}bps; flattening positions and halting (ack via {})",
-            inst.id, current, peak, dd_bps, threshold_bps, leverage, effective_threshold_bps, RISK_ACK_PATH
+            inst.id, current, peak, dd_bps, threshold_bps, leverage, effective_threshold_bps, risk_ack_path()
         );
         {
             let inst_mut = &mut self.instances[inst_idx];
