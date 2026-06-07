@@ -1589,6 +1589,15 @@ impl PairTradeConfig {
                 matches!(lower.as_str(), "1" | "true" | "yes");
         }
 
+        // bot-strategy#473: env override on the YAML-loaded path. Applies
+        // to default_pair_params; per-strategy overrides still win at the
+        // strategy override loop in mod.rs.
+        if let Ok(value) = env::var("USE_FROZEN_BETA_EXIT_Z") {
+            let lower = value.trim().to_ascii_lowercase();
+            self.default_pair_params.use_frozen_beta_exit_z =
+                matches!(lower.as_str(), "1" | "true" | "yes");
+        }
+
         // Kalman filter
         if let Ok(value) = env::var("USE_KALMAN_BETA") {
             self.use_kalman_beta = value.to_lowercase() == "true";
