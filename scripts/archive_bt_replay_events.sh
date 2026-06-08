@@ -98,8 +98,12 @@ from datetime import datetime, timezone
 raw, out, date_str = sys.argv[1], sys.argv[2], sys.argv[3]
 year = int(date_str.split('-')[0])
 ts = []
+raw_lines = 0
 with open(raw) as f:
     for line in f:
+        if not line.strip():
+            continue
+        raw_lines += 1
         parts = line.strip().split()
         if len(parts) < 3:
             continue
@@ -116,6 +120,11 @@ with open(out, 'w') as f:
     for t in ts:
         f.write(f"{t}\n")
 print(f"[archive_bt_replay]   restart lines: {len(ts)}")
+if raw_lines > 0 and not ts:
+    print(
+        f"WARNING: failed to parse all {raw_lines} restart journal lines",
+        file=sys.stderr,
+    )
 PYEOF
 
 EVAL_KEY="s3://${S3_BUCKET}/${S3_PREFIX}/${HOST_TAG}/${SERVICE}/eval_ts/${DATE}.txt"

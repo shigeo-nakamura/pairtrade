@@ -116,8 +116,10 @@ def parse_log(log_path: Path, cutoff: datetime, fc_secs: int) -> dict[str, float
     }
 
 
-def run_cell(args: tuple[Cell, Path, Path, Path, datetime]) -> tuple[Cell, dict]:
-    cell, out_dir, live_bin, events_dir, cutoff = args
+def run_cell(
+    args: tuple[Cell, Path, Path, Path, datetime, Path | None],
+) -> tuple[Cell, dict]:
+    cell, out_dir, live_bin, events_dir, cutoff, warm_start_snapshot = args
     work = out_dir / cell.slug
     work.mkdir(parents=True, exist_ok=True)
     config_path = work / "config.yaml"
@@ -138,7 +140,10 @@ def run_cell(args: tuple[Cell, Path, Path, Path, datetime]) -> tuple[Cell, dict]
             "UNIVERSE_PAIRS": "BTC/ETH",
         }
     )
-    env.pop("BT_WARM_START_SNAPSHOT", None)
+    if warm_start_snapshot is None:
+        env.pop("BT_WARM_START_SNAPSHOT", None)
+    else:
+        env["BT_WARM_START_SNAPSHOT"] = str(warm_start_snapshot)
     with log_path.open("wb") as log:
         subprocess.run(
             [str(BINARY)],
@@ -162,6 +167,11 @@ def main() -> int:
     parser.add_argument("--exit-timeout", default="15,30,60")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min-event-days", type=float, default=7.0)
+    parser.add_argument(
+        "--warm-start-snapshot",
+        type=Path,
+        help="v2 snapshot used to align initial beta/history with live state",
+    )
     args = parser.parse_args()
 
     for path in (PROD_YAML, BINARY, CONVERT_BINARY):
@@ -171,6 +181,10 @@ def main() -> int:
         path = args.events_dir / name
         if not path.exists() or (name == "eval_ts.txt" and path.stat().st_size == 0):
             raise SystemExit(f"ERROR: missing or empty byte-exact input {path}")
+    if args.warm_start_snapshot is not None and not args.warm_start_snapshot.exists():
+        raise SystemExit(
+            f"ERROR: missing warm-start snapshot {args.warm_start_snapshot}"
+        )
 
     cutoff = datetime.fromisoformat(args.cutoff.replace("Z", "+00:00"))
     if cutoff.tzinfo is None:
@@ -194,6 +208,12 @@ def main() -> int:
             "treat this as a smoke readout, not a parameter winner.",
             file=sys.stderr,
         )
+    if args.warm_start_snapshot is None:
+        print(
+            "WARNING: no warm-start snapshot supplied; initial beta/history will "
+            "be rebuilt from the dump and early-window z-scores may differ from live",
+            file=sys.stderr,
+        )
 
     cells = [
         Cell(entry_z, fc_secs, exit_timeout)
@@ -206,7 +226,17 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     live_bin = build_data(args.data_dir, args.out)
 
-    jobs = [(cell, args.out, live_bin, args.events_dir, cutoff) for cell in cells]
+    jobs = [
+        (
+            cell,
+            args.out,
+            live_bin,
+            args.events_dir,
+            cutoff,
+            args.warm_start_snapshot,
+        )
+        for cell in cells
+    ]
     with multiprocessing.Pool(args.workers) as pool:
         results = list(pool.imap_unordered(run_cell, jobs))
 
