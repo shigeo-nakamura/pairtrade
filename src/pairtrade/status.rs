@@ -610,8 +610,7 @@ impl StatusReporter {
         if let Some(parent) = self.risk_history_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let line = serde_json::to_string(event)
-            .map_err(std::io::Error::other)?;
+        let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -836,8 +835,7 @@ impl StatusReporter {
             circuit_breaker: self.circuit_breaker.clone(),
             risk_history: self.risk_history.iter().cloned().collect(),
         };
-        let payload = serde_json::to_string(&snapshot)
-            .map_err(std::io::Error::other)?;
+        let payload = serde_json::to_string(&snapshot).map_err(std::io::Error::other)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }

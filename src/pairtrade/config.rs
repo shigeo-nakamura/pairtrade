@@ -1538,7 +1538,9 @@ impl PairTradeConfig {
         );
         env_override(
             "REHEDGE_VELOCITY_PROJECTED_DRIFT_MIN",
-            &mut self.default_pair_params.rehedge_velocity_projected_drift_min,
+            &mut self
+                .default_pair_params
+                .rehedge_velocity_projected_drift_min,
         );
         env_override(
             "BETA_UNCERTAINTY_MAX",
@@ -1912,7 +1914,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         rehedge_live_enabled: env_parse("REHEDGE_LIVE_ENABLED", false),
         rehedge_require_no_revert: env_parse("REHEDGE_REQUIRE_NO_REVERT", false),
         rehedge_z_no_revert_factor: env_parse("REHEDGE_Z_NO_REVERT_FACTOR", 1.0),
-        rehedge_velocity_projected_drift_min: env_parse("REHEDGE_VELOCITY_PROJECTED_DRIFT_MIN", 0.0),
+        rehedge_velocity_projected_drift_min: env_parse(
+            "REHEDGE_VELOCITY_PROJECTED_DRIFT_MIN",
+            0.0,
+        ),
         beta_uncertainty_max: env_parse("BETA_UNCERTAINTY_MAX", 0.0),
         entry_z_short_multiplier: env_parse("ENTRY_Z_SHORT_MULTIPLIER", 1.0),
         mtf_windows: env::var("MTF_WINDOWS")
@@ -2126,7 +2131,9 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         rehedge_live_enabled: yaml.rehedge_live_enabled.unwrap_or(false),
         rehedge_require_no_revert: yaml.rehedge_require_no_revert.unwrap_or(false),
         rehedge_z_no_revert_factor: yaml.rehedge_z_no_revert_factor.unwrap_or(1.0),
-        rehedge_velocity_projected_drift_min: yaml.rehedge_velocity_projected_drift_min.unwrap_or(0.0),
+        rehedge_velocity_projected_drift_min: yaml
+            .rehedge_velocity_projected_drift_min
+            .unwrap_or(0.0),
         beta_uncertainty_max: yaml.beta_uncertainty_max.unwrap_or(0.0),
         entry_z_short_multiplier: yaml.entry_z_short_multiplier.unwrap_or(1.0),
         mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),

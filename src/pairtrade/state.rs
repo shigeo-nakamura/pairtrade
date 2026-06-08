@@ -462,10 +462,16 @@ mod tests {
         let (z_pos, std_pos) = s
             .position_z(beta, log_a_latest, log_b_latest)
             .expect("position_z should return Some");
-        assert_eq!(z_rolling.to_bits(), z_pos.to_bits(),
-            "z must be bitwise equal when betas + latest spread agree");
-        assert_eq!(std_rolling.to_bits(), std_pos.to_bits(),
-            "std comes from the same mean_std over spread_history");
+        assert_eq!(
+            z_rolling.to_bits(),
+            z_pos.to_bits(),
+            "z must be bitwise equal when betas + latest spread agree"
+        );
+        assert_eq!(
+            std_rolling.to_bits(),
+            std_pos.to_bits(),
+            "std comes from the same mean_std over spread_history"
+        );
     }
 
     /// bot-strategy#473: when `entry_beta != shared.beta`, `position_z`

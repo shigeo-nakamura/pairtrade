@@ -258,8 +258,10 @@ impl PairTradeEngine {
                         // shrink — realize partial PnL on the closed portion
                         let closed = old_size - new_size;
                         let sign = match p.direction {
-                            crate::pairtrade::state::PositionDirection::LongSpread => Decimal::ONE,    // short leg
-                            crate::pairtrade::state::PositionDirection::ShortSpread => -Decimal::ONE,  // long leg
+                            crate::pairtrade::state::PositionDirection::LongSpread => Decimal::ONE, // short leg
+                            crate::pairtrade::state::PositionDirection::ShortSpread => {
+                                -Decimal::ONE
+                            } // long leg
                         };
                         let realized = sign * (old_price - current_price_b) * closed;
                         (old_price, realized)
@@ -291,11 +293,7 @@ impl PairTradeEngine {
             current_beta,
         );
         crate::pairtrade::prom::REHEDGE_EXECUTED_TOTAL
-            .with_label_values(&[
-                self.instances[inst_idx].id.as_str(),
-                key,
-                mode_label,
-            ])
+            .with_label_values(&[self.instances[inst_idx].id.as_str(), key, mode_label])
             .inc();
         Ok(())
     }
@@ -714,6 +712,11 @@ impl PairTradeEngine {
     }
 
     pub async fn step(&mut self) -> Result<()> {
+        // HistogramTimer observes on drop, including early cooldown returns
+        // and error paths, so the count tracks every scheduled step attempt.
+        let _step_timer = crate::pairtrade::prom::STEP_DURATION_SECONDS
+            .with_label_values(&[])
+            .start_timer();
         // One process, one shared WS subscription is the goal of #25. Until
         // the connector layer truly merges WS, instances[0]'s connector is
         // the canonical source for the shared price fetch. The per-instance
@@ -889,10 +892,7 @@ impl PairTradeEngine {
                     }
                 }
                 for (close_price, close_ts) in emits {
-                    let entry = self
-                        .history
-                        .entry(symbol.clone())
-                        .or_default();
+                    let entry = self.history.entry(symbol.clone()).or_default();
                     let log_price = close_price
                         .to_f64()
                         .ok_or_else(|| anyhow!("invalid price for {}", symbol))?
@@ -1118,9 +1118,7 @@ impl PairTradeEngine {
                 // operator to notice a PnL anomaly.
                 const BETA_COLLAPSE_PREV_FLOOR: f64 = 0.5;
                 const BETA_COLLAPSE_NEW_CEILING: f64 = 0.15;
-                if shared.beta > BETA_COLLAPSE_PREV_FLOOR
-                    && new_beta <= BETA_COLLAPSE_NEW_CEILING
-                {
+                if shared.beta > BETA_COLLAPSE_PREV_FLOOR && new_beta <= BETA_COLLAPSE_NEW_CEILING {
                     log::warn!(
                         "[BETA_COLLAPSE] {} beta {:.4} -> {:.4} \
                          (beta_short={:.4} beta_long={:.4}) — possible corrupt-bar event; \
@@ -1632,16 +1630,17 @@ impl PairTradeEngine {
                 continue;
             }
             if self.instances[inst_idx].states[&key].position_guard
-                && matches!(action, TradeAction::None) {
-                    if self.should_log_position_warn(&key) {
-                        log::warn!(
-                            "[POSITION] {} in unhedged/mismatch state; skipping new actions",
-                            key
-                        );
-                        self.last_position_warn.insert(key.clone(), Instant::now());
-                    }
-                    continue;
+                && matches!(action, TradeAction::None)
+            {
+                if self.should_log_position_warn(&key) {
+                    log::warn!(
+                        "[POSITION] {} in unhedged/mismatch state; skipping new actions",
+                        key
+                    );
+                    self.last_position_warn.insert(key.clone(), Instant::now());
                 }
+                continue;
+            }
 
             let mut log_positions_not_ready = false;
             let circuit_breaker_until_ts_snapshot =
@@ -1683,11 +1682,8 @@ impl PairTradeEngine {
                             // live data before Phase 2 enables the actual
                             // re-balance. Disabled by default
                             // (`rehedge_drift_threshold_pct=0`).
-                            let current_beta = self
-                                .per_pair_state
-                                .get(&key)
-                                .map(|s| s.beta)
-                                .unwrap_or(0.0);
+                            let current_beta =
+                                self.per_pair_state.get(&key).map(|s| s.beta).unwrap_or(0.0);
                             let rehedge_decision = {
                                 let state = self.instances[inst_idx]
                                     .states
@@ -1743,16 +1739,23 @@ impl PairTradeEngine {
                                     .get(&pair.quote)
                                     .map(|s| s.price)
                                     .unwrap_or(Decimal::ZERO);
-                                self.dispatch_rehedge(inst_idx, &key, pair, dec.current_beta, current_price_b, now_ts)
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        log::warn!(
-                                            "[REHEDGE_DISPATCH] variant={} pair={} failed: {}",
-                                            self.instances[inst_idx].id,
-                                            key,
-                                            e
-                                        );
-                                    });
+                                self.dispatch_rehedge(
+                                    inst_idx,
+                                    &key,
+                                    pair,
+                                    dec.current_beta,
+                                    current_price_b,
+                                    now_ts,
+                                )
+                                .await
+                                .unwrap_or_else(|e| {
+                                    log::warn!(
+                                        "[REHEDGE_DISPATCH] variant={} pair={} failed: {}",
+                                        self.instances[inst_idx].id,
+                                        key,
+                                        e
+                                    );
+                                });
                             }
                             let equity_base = equity_reference_snapshot;
                             let reason_opt = {
@@ -1821,23 +1824,24 @@ impl PairTradeEngine {
                             // as one entry attempt) so the dashboard's
                             // breakdown stays comparable to in-filter
                             // rejects. bot-strategy#355 follow-up.
-                            let pre_reject_reason: Option<&'static str> = if kill_switch_active_snapshot {
-                                Some("kill_switch")
-                            } else if session_halted_snapshot {
-                                Some("session_halted")
-                            } else if daily_loss_blocks_snapshot {
-                                Some("daily_loss")
-                            } else if circuit_breaker_until_ts_snapshot
-                                .is_some_and(|until| now_ts < until)
-                            {
-                                Some("circuit_breaker")
-                            } else if last_eval_ts.is_none() {
-                                Some("waiting_first_eval")
-                            } else if !regime_ok {
-                                Some("regime")
-                            } else {
-                                None
-                            };
+                            let pre_reject_reason: Option<&'static str> =
+                                if kill_switch_active_snapshot {
+                                    Some("kill_switch")
+                                } else if session_halted_snapshot {
+                                    Some("session_halted")
+                                } else if daily_loss_blocks_snapshot {
+                                    Some("daily_loss")
+                                } else if circuit_breaker_until_ts_snapshot
+                                    .is_some_and(|until| now_ts < until)
+                                {
+                                    Some("circuit_breaker")
+                                } else if last_eval_ts.is_none() {
+                                    Some("waiting_first_eval")
+                                } else if !regime_ok {
+                                    Some("regime")
+                                } else {
+                                    None
+                                };
                             if let Some(reason) = pre_reject_reason {
                                 crate::pairtrade::prom::ENTRY_REJECT_TOTAL
                                     .with_label_values(&[
@@ -1857,10 +1861,10 @@ impl PairTradeEngine {
                                         .states
                                         .get(&key)
                                         .ok_or_else(|| anyhow!("missing state for {}", key))?;
-                                    let shared = self
-                                        .per_pair_state
-                                        .get(&key)
-                                        .ok_or_else(|| anyhow!("missing shared state for {}", key))?;
+                                    let shared =
+                                        self.per_pair_state.get(&key).ok_or_else(|| {
+                                            anyhow!("missing shared state for {}", key)
+                                        })?;
                                     should_enter(
                                         &self.cfg,
                                         pp,
@@ -2379,13 +2383,17 @@ impl PairTradeEngine {
                     notional_floor_param,
                 );
                 crate::pairtrade::prom::ENTRY_NOTIONAL_SCALE
-                    .with_label_values(&[
-                        self.instances[inst_idx].id.as_str(),
-                        pair_key.as_str(),
-                    ])
+                    .with_label_values(&[self.instances[inst_idx].id.as_str(), pair_key.as_str()])
                     .set(notional_scale);
                 let qtys = self
-                    .hedged_sizes(inst_idx, &plan.pair, beta, &plan.p1, &plan.p2, notional_scale)
+                    .hedged_sizes(
+                        inst_idx,
+                        &plan.pair,
+                        beta,
+                        &plan.p1,
+                        &plan.p2,
+                        notional_scale,
+                    )
                     .context("hedged_sizes")?;
                 let price_a = price_map
                     .get(&plan.pair.base)
@@ -2428,7 +2436,7 @@ impl PairTradeEngine {
                             entry_beta: Some(beta),
                             last_rehedge_ts: None,
                             rehedge_realized_pnl: None,
-            prev_beta_for_velocity: None,
+                            prev_beta_for_velocity: None,
                         });
                         super::super::prom::LAST_ENTRY_Z
                             .with_label_values(&[&inst_id, plan.key.as_str()])

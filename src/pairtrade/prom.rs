@@ -470,6 +470,17 @@ pub static LEG_FILL_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     )
 });
 
+pub static STEP_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram(
+        "pairtrade_step_duration_seconds",
+        "Wall-clock duration of one engine-wide Strategy::step() call.",
+        &[],
+        vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ],
+    )
+});
+
 // === Risk / kill state ===
 
 pub static KILL_SWITCH_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -527,6 +538,24 @@ pub static BOT_VERSION_INFO: Lazy<IntGaugeVec> = Lazy::new(|| {
         "pairtrade_bot_version_info",
         "Always 1; carries version and git_sha labels.",
         &["variant", "version", "git_sha", "dex_connector_sha"],
+    )
+});
+
+// === Capital / config drift ===
+
+pub static EQUITY_REFERENCE_USD: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_equity_reference_usd",
+        "Configured per-variant equity reference used for sizing.",
+        &["variant"],
+    )
+});
+
+pub static MAX_LEVERAGE_CONFIG: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_max_leverage_config",
+        "Configured process-wide maximum leverage, repeated per variant for drift comparison.",
+        &["variant"],
     )
 });
 
@@ -664,5 +693,21 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    #[test]
+    fn step_duration_histogram_has_expected_buckets() {
+        STEP_DURATION_SECONDS.with_label_values(&[]).observe(0.5);
+        let metric = REGISTRY
+            .gather()
+            .into_iter()
+            .find(|family| family.get_name() == "pairtrade_step_duration_seconds")
+            .expect("step duration metric should be registered");
+        let histogram = metric.get_metric()[0].get_histogram();
+        assert_eq!(histogram.get_sample_count(), 1);
+        assert!(histogram
+            .get_bucket()
+            .iter()
+            .any(|bucket| bucket.get_upper_bound() == 10.0));
     }
 }

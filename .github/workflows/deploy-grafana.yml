@@ -61,3 +61,65 @@ jobs:
             fi
             echo "::endgroup::"
           done
+
+      - name: Push alert rules to Grafana
+        env:
+          GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+          GRAFANA_API_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer ${GRAFANA_API_TOKEN}")
+
+          datasources=$(curl -fsS "${auth[@]}" "${GRAFANA_URL%/}/api/datasources")
+          prom_uid=$(jq -r '([.[] | select(.type == "prometheus" and .isDefault == true)][0] // [.[] | select(.type == "prometheus")][0]).uid // empty' <<<"$datasources")
+          if [ -z "$prom_uid" ]; then
+            echo "::error::No Prometheus datasource found"
+            exit 1
+          fi
+
+          folder_status=$(curl -sS -o /tmp/grafana_folder.json -w '%{http_code}' \
+            "${auth[@]}" "${GRAFANA_URL%/}/api/folders/bot-alerts")
+          if [ "$folder_status" = "404" ]; then
+            curl -fsS -X POST "${auth[@]}" -H "Content-Type: application/json" \
+              --data '{"uid":"bot-alerts","title":"Bot alerts"}' \
+              "${GRAFANA_URL%/}/api/folders" >/dev/null
+          elif [ "$folder_status" != "200" ]; then
+            cat /tmp/grafana_folder.json
+            echo "::error::Grafana folder lookup returned HTTP $folder_status"
+            exit 1
+          fi
+
+          shopt -s nullglob
+          files=(grafana/alerts/*.json)
+          for f in "${files[@]}"; do
+            jq -c '.[]' "$f" | while IFS= read -r rule; do
+              uid=$(jq -r '.uid' <<<"$rule")
+              payload=$(jq --arg ds "$prom_uid" '
+                (.data[] | select(.datasourceUid == "__PROMETHEUS_UID__") | .datasourceUid) = $ds
+              ' <<<"$rule")
+              get_status=$(curl -sS -o /tmp/grafana_rule.json -w '%{http_code}' \
+                "${auth[@]}" "${GRAFANA_URL%/}/api/v1/provisioning/alert-rules/${uid}")
+              if [ "$get_status" = "200" ]; then
+                method=PUT
+                endpoint="/api/v1/provisioning/alert-rules/${uid}"
+                expected=200
+              elif [ "$get_status" = "404" ]; then
+                method=POST
+                endpoint="/api/v1/provisioning/alert-rules"
+                expected=201
+              else
+                cat /tmp/grafana_rule.json
+                echo "::error::Grafana alert lookup for $uid returned HTTP $get_status"
+                exit 1
+              fi
+              status=$(curl -sS -o /tmp/grafana_rule.json -w '%{http_code}' \
+                -X "$method" "${auth[@]}" -H "Content-Type: application/json" \
+                --data "$payload" "${GRAFANA_URL%/}${endpoint}")
+              cat /tmp/grafana_rule.json
+              echo
+              if [ "$status" != "$expected" ]; then
+                echo "::error file=$f::Grafana alert upsert for $uid returned HTTP $status"
+                exit 1
+              fi
+            done
+          done

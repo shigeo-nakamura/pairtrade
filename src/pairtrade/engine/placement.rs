@@ -25,7 +25,6 @@ use rust_decimal::Decimal;
 use tokio::time::sleep;
 
 use super::super::config::PairSpec;
-use super::super::prom;
 use super::super::defaults::{
     POST_ONLY_ENTRY_ATTEMPTS, POST_ONLY_EXIT_ATTEMPTS, POST_ONLY_RETRY_DELAY_MS,
     POST_ONLY_RETRY_MAX_ELAPSED_MS,
@@ -33,6 +32,7 @@ use super::super::defaults::{
 use super::super::engine;
 use super::super::market::SymbolSnapshot;
 use super::super::order_pricing;
+use super::super::prom;
 use super::super::state::{
     PartialOrderPlacementError, PendingLeg, PendingOrders, PositionDirection,
 };
@@ -71,8 +71,7 @@ impl PairTradeEngine {
             // ended at 2× target (0.8905 → 1.7810) via this race.
             let (filled, remaining) = if !reduce_only {
                 let exch = self.fetch_residual_position_size(&leg.symbol).await;
-                let r =
-                    Self::cap_entry_reissue_remaining(leg.target, local_filled, exch);
+                let r = Self::cap_entry_reissue_remaining(leg.target, local_filled, exch);
                 let effective = leg.target - r;
                 if let Some(exch_qty) = exch {
                     if exch_qty > local_filled {
@@ -826,14 +825,16 @@ impl PairTradeEngine {
         // 1137 noise. Lighter does not — skipping the extra get_positions RPC
         // there avoids unnecessary load against Lighter's stricter rate limit.
         let preflight_reduce_only = self.cfg.dex_name.contains("extended");
-        if qty_a > Decimal::ZERO && preflight_reduce_only
-            && self.confirm_reduce_only_position_missing(&pair.base).await {
-                log::info!(
-                    "[ORDER] {} reduce-only close skipped (preflight); position already closed",
-                    pair.base
-                );
-                skipped_already_closed = true;
-            }
+        if qty_a > Decimal::ZERO
+            && preflight_reduce_only
+            && self.confirm_reduce_only_position_missing(&pair.base).await
+        {
+            log::info!(
+                "[ORDER] {} reduce-only close skipped (preflight); position already closed",
+                pair.base
+            );
+            skipped_already_closed = true;
+        }
         if qty_a > Decimal::ZERO && !skipped_already_closed {
             let res = if use_market {
                 self.connector
@@ -900,15 +901,17 @@ impl PairTradeEngine {
         }
 
         let mut quote_already_flat = false;
-        if qty_b > Decimal::ZERO && preflight_reduce_only
-            && self.confirm_reduce_only_position_missing(&pair.quote).await {
-                log::info!(
-                    "[ORDER] {} reduce-only close skipped (preflight); position already closed",
-                    pair.quote
-                );
-                quote_already_flat = true;
-                skipped_already_closed = true;
-            }
+        if qty_b > Decimal::ZERO
+            && preflight_reduce_only
+            && self.confirm_reduce_only_position_missing(&pair.quote).await
+        {
+            log::info!(
+                "[ORDER] {} reduce-only close skipped (preflight); position already closed",
+                pair.quote
+            );
+            quote_already_flat = true;
+            skipped_already_closed = true;
+        }
         if qty_b > Decimal::ZERO && !quote_already_flat {
             let res_b = if use_market {
                 self.connector

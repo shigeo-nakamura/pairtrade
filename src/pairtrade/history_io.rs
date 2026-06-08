@@ -773,24 +773,18 @@ mod tests {
     #[test]
     fn warm_start_dedup_key_stable_across_one_sample_drift_at_full_window() {
         let max_len = 240;
-        let prices_239 = vec![
-            ("BTC".to_string(), 239),
-            ("ETH".to_string(), 239),
-        ];
-        let prices_240 = vec![
-            ("BTC".to_string(), 240),
-            ("ETH".to_string(), 240),
-        ];
-        let prices_mixed = vec![
-            ("BTC".to_string(), 239),
-            ("ETH".to_string(), 240),
-        ];
+        let prices_239 = vec![("BTC".to_string(), 239), ("ETH".to_string(), 239)];
+        let prices_240 = vec![("BTC".to_string(), 240), ("ETH".to_string(), 240)];
+        let prices_mixed = vec![("BTC".to_string(), 239), ("ETH".to_string(), 240)];
         let spreads = vec![("BTC/ETH".to_string(), 240)];
         let key_239 = warm_start_success_dedup_key(4, &prices_239, &spreads, max_len);
         let key_240 = warm_start_success_dedup_key(4, &prices_240, &spreads, max_len);
         let key_mixed = warm_start_success_dedup_key(4, &prices_mixed, &spreads, max_len);
         assert_eq!(key_239, key_240, "239 vs 240 must dedup");
-        assert_eq!(key_239, key_mixed, "(239, 240) mixed must dedup with (239, 239)");
+        assert_eq!(
+            key_239, key_mixed,
+            "(239, 240) mixed must dedup with (239, 239)"
+        );
     }
 
     // The dedup must still fire on meaningful transitions, otherwise

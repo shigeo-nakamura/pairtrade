@@ -786,9 +786,11 @@ impl PairTradeEngine {
             prom::BETA_GAP_RELATIVE
                 .with_label_values(&labels)
                 .set(shared.map(|s| s.beta_gap).unwrap_or(0.0));
-            prom::BETA_UNCERTAINTY
-                .with_label_values(&labels)
-                .set(shared.and_then(|s| s.kalman.as_ref().map(|k| k.posterior_std())).unwrap_or(0.0));
+            prom::BETA_UNCERTAINTY.with_label_values(&labels).set(
+                shared
+                    .and_then(|s| s.kalman.as_ref().map(|k| k.posterior_std()))
+                    .unwrap_or(0.0),
+            );
             prom::HALF_LIFE_HOURS
                 .with_label_values(&labels)
                 .set(shared.map(|s| s.half_life_hours).unwrap_or(0.0));
@@ -849,6 +851,12 @@ impl PairTradeEngine {
         prom::CIRCUIT_BREAKER_ACTIVE
             .with_label_values(&[instance])
             .set(if cb_active { 1 } else { 0 });
+        prom::EQUITY_REFERENCE_USD
+            .with_label_values(&[instance])
+            .set(inst.equity_reference_usd);
+        prom::MAX_LEVERAGE_CONFIG
+            .with_label_values(&[instance])
+            .set(self.cfg.max_leverage);
         // Snapshot age — mtime of the on-disk history file. Bounded I/O
         // (single stat per tick per instance) is acceptable here; the
         // alternative is plumbing the writer's last-write timestamp
@@ -1729,11 +1737,7 @@ mod tests {
     fn cap_entry_reissue_falls_back_to_local_when_exchange_query_failed() {
         // Network / API hiccup: get_positions returned None. Fall back
         // to the existing local-only arithmetic (`target - local`).
-        let q = PairTradeEngine::cap_entry_reissue_remaining(
-            dec("1.0"),
-            dec("0.3"),
-            None,
-        );
+        let q = PairTradeEngine::cap_entry_reissue_remaining(dec("1.0"), dec("0.3"), None);
         assert_eq!(q, dec("0.7"));
     }
 
@@ -1742,11 +1746,8 @@ mod tests {
         // The reverse race: local recorded fills via WS but exchange
         // /positions REST hasn't propagated yet. Trust the larger value
         // so we don't redundantly re-send already-filled qty.
-        let q = PairTradeEngine::cap_entry_reissue_remaining(
-            dec("1.0"),
-            dec("0.7"),
-            Some(dec("0.2")),
-        );
+        let q =
+            PairTradeEngine::cap_entry_reissue_remaining(dec("1.0"), dec("0.7"), Some(dec("0.2")));
         assert_eq!(q, dec("0.3"));
     }
 
