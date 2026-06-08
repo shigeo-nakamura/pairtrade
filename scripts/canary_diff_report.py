@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 canary_diff_report.py — weekly canary-vs-main divergence report
-(bot-strategy#376 Phase 5 stage A — skeleton).
+(bot-strategy#376 Phase 5).
 
 Pulls the last 7 days of status / equity history for the Frankfurt canary
 and main Pair-A from the debot-dashboard S3 mirror, computes divergence
@@ -9,10 +9,9 @@ metrics, and emits a markdown report on stdout. The
 canary-weekly-review.yml workflow then posts the stdout as a comment on
 the bot-strategy#404 tracking issue.
 
-Stage A: script runs end-to-end and produces a populated table, but the
-ALERT / WATCH thresholds are placeholders. Stage C (~2026-05-28) sets the
-thresholds from the first 2-3 weeks of baseline data and enables the
-auto-issue trigger on ALERT.
+A partial mirrored history produces WATCH because a main-bot restart can
+truncate the local equity-history file before it is uploaded to S3. Full
+windows use conservative activity-ratio and normalized-return thresholds.
 
 Usage:
     canary_diff_report.py [--days 7]
@@ -32,13 +31,18 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-import boto3
-
 BUCKET = "debot-dashboard"
 MAIN_PREFIX = "debot/status/frankfurt"
 CANARY_PREFIX = "debot/status/frankfurt-canary"
 MAIN_AGENT = "debot-pair-btceth-a"   # we benchmark canary against Pair-A
 CANARY_AGENT = "debot-pair-canary"
+MIN_WINDOW_COVERAGE = 0.80
+ACTIVITY_RATIO_WATCH_MIN = 0.50
+ACTIVITY_RATIO_WATCH_MAX = 4.00
+ACTIVITY_RATIO_ALERT_MIN = 0.25
+ACTIVITY_RATIO_ALERT_MAX = 8.00
+RETURN_GAP_WATCH_BPS = -500.0
+RETURN_GAP_ALERT_BPS = -1_000.0
 
 
 @dataclass
@@ -52,10 +56,19 @@ class WindowSnapshot:
     funding_carry: float
     equity_start: float
     equity_end: float
+    history_start_ts_ms: float
+    history_end_ts_ms: float
+    window_coverage: float
 
     @property
     def win_rate(self) -> float:
         return self.win_count / self.trade_count if self.trade_count else 0.0
+
+    @property
+    def return_bps(self) -> float:
+        if self.equity_start == 0.0:
+            return 0.0
+        return self.cumulative_pnl / abs(self.equity_start) * 10_000.0
 
 
 def s3_get_json(client, key: str) -> dict | None:
@@ -99,17 +112,13 @@ def filter_window(samples: list[dict], cutoff_ts_ms: float) -> list[dict]:
     return [s for s in samples if s.get("ts", 0) >= cutoff_ts_ms]
 
 
-def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float) -> WindowSnapshot:
+def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
+                   now_ts_ms: float) -> WindowSnapshot:
     """Build a 7-day window summary from S3-mirrored bot state.
 
-    Source of truth is `equity_history.jsonl`, which persists across
-    process restarts. The earlier draft read `status.json.trade_stats.*`
-    directly, but `trade_stats` is per-process and resets when systemd
-    restarts the bot (canary auto-restarts on every CI deploy per
-    bot-strategy#376 design), making the report show `trades=0` whenever
-    the workflow happens to run shortly after a deploy. Equity history
-    is the only S3-side feed that survives restarts today; bringing the
-    debot_pnl/ jsonl mirror up to S3 is a follow-up.
+    Source of truth is `equity_history.jsonl`. It is more durable than
+    status.json trade_stats, but a state reset or manual main-bot restart
+    can truncate it. Window coverage therefore gates the verdict.
     """
     status = s3_get_json(client, f"{prefix}/{agent}.json") or {}
     history = s3_get_jsonl(client, f"{prefix}/{agent}.equity_history.jsonl")
@@ -128,8 +137,15 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float) -> Wind
             funding_carry=funding_carry,
             equity_start=equity_end,
             equity_end=equity_end,
+            history_start_ts_ms=0.0,
+            history_end_ts_ms=0.0,
+            window_coverage=0.0,
         )
 
+    history_start_ts_ms = float(history_in_window[0]["ts"])
+    history_end_ts_ms = float(history_in_window[-1]["ts"])
+    requested_span_ms = max(1.0, now_ts_ms - cutoff_ts_ms)
+    covered_span_ms = max(0.0, history_end_ts_ms - history_start_ts_ms)
     equity_start = float(history_in_window[0]["equity"])
     equity_end = float(history_in_window[-1]["equity"])
     cumulative_pnl = equity_end - equity_start
@@ -162,31 +178,52 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float) -> Wind
         funding_carry=funding_carry,
         equity_start=equity_start,
         equity_end=equity_end,
+        history_start_ts_ms=history_start_ts_ms,
+        history_end_ts_ms=history_end_ts_ms,
+        window_coverage=min(1.0, covered_span_ms / requested_span_ms),
     )
 
 
 def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot) -> tuple[str, str]:
-    """
-    Stage A: returns PASS unconditionally with a TODO note.
-    Stage C: real thresholds (rate ratio range, per-trade PnL sign
-    flip detection, KS test on z-distribution).
-    """
-    rate_ratio = (canary.trade_count / main.trade_count) if main.trade_count else 0.0
-    notes = []
+    notes: list[str] = []
+    if (
+        main.window_coverage < MIN_WINDOW_COVERAGE
+        or canary.window_coverage < MIN_WINDOW_COVERAGE
+    ):
+        notes.append(
+            "insufficient history coverage "
+            f"(main={main.window_coverage:.0%}, canary={canary.window_coverage:.0%}, "
+            f"required={MIN_WINDOW_COVERAGE:.0%}); a restart may have truncated "
+            "the mirrored equity history"
+        )
+        return "WATCH", " | ".join(notes)
+
+    if main.trade_count == 0:
+        return "WATCH", "main has zero activity events; activity ratio is undefined"
+
+    rate_ratio = canary.trade_count / main.trade_count
+    return_gap_bps = canary.return_bps - main.return_bps
     notes.append(
         f"activity_event_ratio={rate_ratio:.2f} "
-        f"(heuristic at ≥{TRADE_EVENT_BPS_OF_EQUITY:.0f} bps Δ; main A over-counts from "
-        f"unrealised-PnL mid-hold so the absolute target ≥ 2.0 from #376 needs "
-        f"recalibration in Stage C)"
+        f"(heuristic at >= {TRADE_EVENT_BPS_OF_EQUITY:.0f} bps delta)"
     )
     notes.append(
-        f"main_cumulative={main.cumulative_pnl:+.4f} "
-        f"canary_cumulative={canary.cumulative_pnl:+.4f} "
-        f"(equity_history Δ over window, restart-resilient)"
+        f"return_gap={return_gap_bps:+.1f}bps "
+        f"(main={main.return_bps:+.1f}bps, canary={canary.return_bps:+.1f}bps)"
     )
-    notes.append(
-        "Stage A: thresholds are placeholders, verdict always PASS until Stage C"
-    )
+
+    if (
+        rate_ratio < ACTIVITY_RATIO_ALERT_MIN
+        or rate_ratio > ACTIVITY_RATIO_ALERT_MAX
+        or return_gap_bps < RETURN_GAP_ALERT_BPS
+    ):
+        return "ALERT", " | ".join(notes)
+    if (
+        rate_ratio < ACTIVITY_RATIO_WATCH_MIN
+        or rate_ratio > ACTIVITY_RATIO_WATCH_MAX
+        or return_gap_bps < RETURN_GAP_WATCH_BPS
+    ):
+        return "WATCH", " | ".join(notes)
     return "PASS", " | ".join(notes)
 
 
@@ -206,29 +243,34 @@ def render_markdown(canary: WindowSnapshot, main: WindowSnapshot,
         f"| Wins | {main.win_count} | {canary.win_count} | — |",
         f"| Win rate | {main.win_rate*100:.1f}% | {canary.win_rate*100:.1f}% | Δ {(canary.win_rate-main.win_rate)*100:+.1f} pp |",
         f"| Cumulative PnL | ${main.cumulative_pnl:.4f} | ${canary.cumulative_pnl:.4f} | Δ ${canary.cumulative_pnl-main.cumulative_pnl:+.4f} |",
+        f"| Return | {main.return_bps:+.1f} bps | {canary.return_bps:+.1f} bps | delta {canary.return_bps-main.return_bps:+.1f} bps |",
         f"| Median per-trade PnL | ${main.median_per_trade_pnl:.4f} | ${canary.median_per_trade_pnl:.4f} | — |",
         f"| Funding carry (today) | ${main.funding_carry:.4f} | ${canary.funding_carry:.4f} | — |",
         f"| Equity (end of window) | ${main.equity_end:.4f} | ${canary.equity_end:.4f} | — |",
+        f"| History coverage | {main.window_coverage:.0%} | {canary.window_coverage:.0%} | required >= {MIN_WINDOW_COVERAGE:.0%} |",
         "",
         f"**Verdict notes**: {notes}",
         "",
         "_Generated by `pairtrade/scripts/canary_diff_report.py` via_ ",
-        "`bot-strategy/.github/workflows/canary-weekly-review.yml`. ",
+        "`debot-dashboard/.github/workflows/canary-weekly-review.yml`. ",
         "See bot-strategy#376 Phase 5 for the full design.",
     ]
     return "\n".join(lines)
 
 
 def main() -> int:
+    import boto3
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days", type=int, default=7, help="window length in days")
     args = parser.parse_args()
 
-    cutoff_ms = (datetime.now(timezone.utc) - timedelta(days=args.days)).timestamp() * 1000
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    cutoff_ms = now_ms - timedelta(days=args.days).total_seconds() * 1000
     client = boto3.client("s3", region_name="eu-central-1")
 
-    main_snap = build_snapshot(client, MAIN_PREFIX, MAIN_AGENT, cutoff_ms)
-    canary_snap = build_snapshot(client, CANARY_PREFIX, CANARY_AGENT, cutoff_ms)
+    main_snap = build_snapshot(client, MAIN_PREFIX, MAIN_AGENT, cutoff_ms, now_ms)
+    canary_snap = build_snapshot(client, CANARY_PREFIX, CANARY_AGENT, cutoff_ms, now_ms)
 
     verdict, notes = compute_verdict(canary_snap, main_snap)
     print(render_markdown(canary_snap, main_snap, args.days, verdict, notes))
