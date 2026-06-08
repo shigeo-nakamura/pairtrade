@@ -973,13 +973,47 @@ impl PairTradeEngine {
             let Some(shared) = self.per_pair_state.get_mut(key) else {
                 return;
             };
-            if let Some(ref mut kf) = shared.kalman {
-                if shared.last_spread.is_some() {
-                    if let (Some(a_prev), Some(b_prev)) = (hist_a_prev, hist_b_prev) {
-                        let dx = log_b - b_prev;
-                        let dy = log_a - a_prev;
-                        kf.update(dx, dy);
-                    }
+            // Per-bar log-return deltas, shared by the Kalman update and the
+            // innovation-responsive regime detector. Needs a prior bar
+            // (`last_spread`) and both legs' previous log prices.
+            let deltas = if shared.last_spread.is_some() {
+                match (hist_a_prev, hist_b_prev) {
+                    (Some(a_prev), Some(b_prev)) => Some((log_b - b_prev, log_a - a_prev)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((dx, dy)) = deltas {
+                if let Some(ref mut kf) = shared.kalman {
+                    kf.update(dx, dy);
+                }
+                // bot-strategy#494 Phase 1 (shadow): feed the persistent-regime
+                // detector the model's one-step innovation = Δspread under the
+                // hedging β (`dy − β·dx`), independent of whether the Kalman
+                // path is enabled. Capture the active duration before the
+                // update so a `Cleared` transition can log how long the shift
+                // lasted.
+                let innovation = dy - shared.beta * dx;
+                let beta = shared.beta;
+                let active_secs_before = shared.regime.active_secs(now_ts);
+                match shared.regime.update(innovation, now_ts) {
+                    regime::RegimeTransition::Activated => log::warn!(
+                        "[REGIME] {} persistent-shift ACTIVE cusum={:.2} scale={:.6} norm={:.2} beta={:.4}",
+                        key,
+                        shared.regime.cusum(),
+                        shared.regime.residual_scale(),
+                        shared.regime.last_normalized(),
+                        beta,
+                    ),
+                    regime::RegimeTransition::Cleared => log::info!(
+                        "[REGIME] {} persistent-shift CLEARED after {:.0}s cusum={:.2} scale={:.6}",
+                        key,
+                        active_secs_before,
+                        shared.regime.cusum(),
+                        shared.regime.residual_scale(),
+                    ),
+                    regime::RegimeTransition::None => {}
                 }
             }
             let spread = log_a - shared.beta * log_b;

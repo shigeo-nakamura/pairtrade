@@ -277,6 +277,15 @@ pub(super) fn should_enter(
             }
         }
     }
+    // bot-strategy#494 Phase 1 — innovation-responsive persistent-regime
+    // gate. The detector (CUSUM of normalised Δspread residuals) flags a
+    // *sustained* model/relationship shift, distinct from the single-bar
+    // `beta_clamp` / `beta_uncertainty` guards. Shadow by default: only
+    // blocks when the variant opts in via `regime_block_entries`, so Phase 1
+    // collects the `pairtrade_regime_*` gauges with no trading change.
+    if pp.regime_block_entries && shared.regime.is_active() {
+        return Err("regime_innovation");
+    }
     // Account for estimated cost (fees + slippage) in sigma units
     let total_cost_bps = cfg.fee_bps * 2.0 + cfg.slippage_cost_bps() * 2.0; // two legs
     let cost_ratio = total_cost_bps / 10_000.0;

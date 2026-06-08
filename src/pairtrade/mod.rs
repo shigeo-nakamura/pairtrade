@@ -791,6 +791,24 @@ impl PairTradeEngine {
                     .and_then(|s| s.kalman.as_ref().map(|k| k.posterior_std()))
                     .unwrap_or(0.0),
             );
+            // bot-strategy#494 Phase 1 — persistent-regime detector shadow
+            // gauges (pair-level state; identical across variant series).
+            prom::REGIME_ACTIVE.with_label_values(&labels).set(
+                if shared.map(|s| s.regime.is_active()).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            );
+            prom::REGIME_CUSUM
+                .with_label_values(&labels)
+                .set(shared.map(|s| s.regime.cusum()).unwrap_or(0.0));
+            prom::REGIME_RESIDUAL_SCALE
+                .with_label_values(&labels)
+                .set(shared.map(|s| s.regime.residual_scale()).unwrap_or(0.0));
+            prom::REGIME_INNOVATION_NORMALIZED
+                .with_label_values(&labels)
+                .set(shared.map(|s| s.regime.last_normalized()).unwrap_or(0.0));
             prom::HALF_LIFE_HOURS
                 .with_label_values(&labels)
                 .set(shared.map(|s| s.half_life_hours).unwrap_or(0.0));

@@ -144,6 +144,15 @@ pub struct PairParams {
     /// regime / dashboard checks keep using rolling-β z regardless.
     /// See bot-strategy#473.
     pub use_frozen_beta_exit_z: bool,
+    /// Innovation-responsive persistent-regime gate (bot-strategy#494
+    /// Phase 1). When `true`, blocks new entries while the
+    /// `RegimeDetector` (CUSUM of normalised Δspread residuals) reports a
+    /// persistent β/model shift. Default `false` keeps Phase 1 shadow
+    /// behaviour: the `pairtrade_regime_*` gauges and `[REGIME]` logs are
+    /// still emitted, but trading is unchanged. Flip on per host/variant
+    /// (env `REGIME_BLOCK_ENTRIES` or top-level YAML) once the gauges have
+    /// been calibrated and BT validates the entry-only gate.
+    pub regime_block_entries: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -404,6 +413,9 @@ pub(super) struct PairTradeYaml {
     pub(super) std_collapse_observe_only: Option<bool>,
     /// bot-strategy#473: opt-in to frozen-β exit z. Default false.
     pub(super) use_frozen_beta_exit_z: Option<bool>,
+    /// bot-strategy#494: opt-in to the persistent-regime entry gate. Default
+    /// false (shadow-only). Top-level YAML override of `regime_block_entries`.
+    pub(super) regime_block_entries: Option<bool>,
     /// Graceful shutdown: max seconds to wait for natural exit on SIGTERM before
     /// force-closing both legs. 0 = immediate force close (legacy behavior).
     pub(super) shutdown_grace_secs: Option<u64>,
@@ -1600,6 +1612,14 @@ impl PairTradeConfig {
                 matches!(lower.as_str(), "1" | "true" | "yes");
         }
 
+        // bot-strategy#494: env override on the YAML-loaded path for the
+        // persistent-regime entry gate. Default stays shadow-only.
+        if let Ok(value) = env::var("REGIME_BLOCK_ENTRIES") {
+            let lower = value.trim().to_ascii_lowercase();
+            self.default_pair_params.regime_block_entries =
+                matches!(lower.as_str(), "1" | "true" | "yes");
+        }
+
         // Kalman filter
         if let Ok(value) = env::var("USE_KALMAN_BETA") {
             self.use_kalman_beta = value.to_lowercase() == "true";
@@ -1938,6 +1958,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
             .ok()
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(DEFAULT_USE_FROZEN_BETA_EXIT_Z),
+        regime_block_entries: env::var("REGIME_BLOCK_ENTRIES")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(DEFAULT_REGIME_BLOCK_ENTRIES),
     }
 }
 
@@ -2150,6 +2174,9 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         use_frozen_beta_exit_z: yaml
             .use_frozen_beta_exit_z
             .unwrap_or(DEFAULT_USE_FROZEN_BETA_EXIT_Z),
+        regime_block_entries: yaml
+            .regime_block_entries
+            .unwrap_or(DEFAULT_REGIME_BLOCK_ENTRIES),
     }
 }
 
