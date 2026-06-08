@@ -1980,6 +1980,90 @@
           "mode": "multi"
         }
       }
+    },
+    {
+      "id": 114,
+      "type": "timeseries",
+      "title": "Strategy step duration p50 / p99",
+      "description": "Engine-wide wall-clock duration of Strategy::step(). Compare Frankfurt main/canary and Tokyo Extended; p99 tail is the regression signal tracked by bot-strategy#417.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 173
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (instance, le) (rate(pairtrade_step_duration_seconds_bucket[15m])))",
+          "legendFormat": "{{instance}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(pairtrade_step_duration_seconds_bucket[15m])))",
+          "legendFormat": "{{instance}} p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "red", "value": 2.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 115,
+      "type": "table",
+      "title": "Capital / leverage config drift",
+      "description": "Resolved runtime config per host and variant. Differences are expected only when explicitly planned; unexpected changes indicate environment/YAML drift (bot-strategy#314 Group 7).",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 181
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_equity_reference_usd",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "equity reference",
+          "refId": "A"
+        },
+        {
+          "expr": "pairtrade_max_leverage_config",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "max leverage",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
     }
   ]
 }

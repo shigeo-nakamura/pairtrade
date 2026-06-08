@@ -53,10 +53,7 @@ async fn run_single() -> std::io::Result<()> {
     let mut engine = init_engine_with_retry(cfg)
         .await
         .expect("failed to initialize pair trade engine");
-    engine
-        .run()
-        .await
-        .map_err(std::io::Error::other)
+    engine.run().await.map_err(std::io::Error::other)
 }
 
 // Startup hardening for transient Lighter errors (bot-strategy#120). If
@@ -164,11 +161,10 @@ async fn run_batch(batch_file: &str) -> std::io::Result<()> {
         backtest_file,
         param_sets.len()
     );
-    let replay = Arc::new(ReplayConnector::new(&backtest_file).map_err(|e| {
-        std::io::Error::other(
-            format!("failed to load replay data: {}", e),
-        )
-    })?);
+    let replay = Arc::new(
+        ReplayConnector::new(&backtest_file)
+            .map_err(|e| std::io::Error::other(format!("failed to load replay data: {}", e)))?,
+    );
     eprintln!("[BATCH] Data loaded: {} entries.", replay.len());
 
     // Output dir for per-run log files.

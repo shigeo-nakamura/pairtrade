@@ -124,7 +124,13 @@ pub(super) fn tick_sanity_check(
     }
     let bid = snap.bid_price.ok_or(TickRejectReason::MissingBid)?;
     let ask = snap.ask_price.ok_or(TickRejectReason::MissingAsk)?;
-    quote_sanity_check(Some(bid), Some(ask), snap.price, max_spread_bps, max_envelope_bps)
+    quote_sanity_check(
+        Some(bid),
+        Some(ask),
+        snap.price,
+        max_spread_bps,
+        max_envelope_bps,
+    )
 }
 
 /// Price-side gates of [`tick_sanity_check`] without the `bid_size /

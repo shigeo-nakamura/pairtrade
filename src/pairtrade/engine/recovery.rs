@@ -387,9 +387,14 @@ impl PairTradeEngine {
                     // an in-flight position; new positions have no β yet
                     // until #463 Phase 2 lands the exchange-side recovery.
                     let prev_entry_beta = state.position.as_ref().and_then(|p| p.entry_beta);
-                    let prev_last_rehedge_ts = state.position.as_ref().and_then(|p| p.last_rehedge_ts);
-                    let prev_realized = state.position.as_ref().and_then(|p| p.rehedge_realized_pnl);
-                    let prev_velocity = state.position.as_ref().and_then(|p| p.prev_beta_for_velocity);
+                    let prev_last_rehedge_ts =
+                        state.position.as_ref().and_then(|p| p.last_rehedge_ts);
+                    let prev_realized =
+                        state.position.as_ref().and_then(|p| p.rehedge_realized_pnl);
+                    let prev_velocity = state
+                        .position
+                        .as_ref()
+                        .and_then(|p| p.prev_beta_for_velocity);
                     state.position = Some(Position {
                         direction,
                         entered_at,

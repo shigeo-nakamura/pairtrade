@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 
 use super::super::history_io::{self, KalmanSnapshot};
 use super::super::kalman::KalmanBeta;
+use super::super::risk_ack_path;
 use super::super::risk_io;
 use super::super::stats::{regression_beta, tail_samples};
-use super::super::risk_ack_path;
 use super::super::PairTradeEngine;
 
 impl PairTradeEngine {

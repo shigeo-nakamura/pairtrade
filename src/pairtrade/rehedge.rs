@@ -89,8 +89,7 @@ pub(super) fn should_rehedge(
             if dt > 0.0 {
                 let beta_velocity = (current_beta - prev_beta) / dt;
                 let elapsed = (now_ts - position.entered_ts).max(0) as i64;
-                let remaining =
-                    (force_close_secs as i64).saturating_sub(elapsed).max(0) as f64;
+                let remaining = (force_close_secs as i64).saturating_sub(elapsed).max(0) as f64;
                 let projected_total_drift =
                     drift + (beta_velocity.abs() * remaining) / entry_beta.abs();
                 if projected_total_drift < pp.rehedge_velocity_projected_drift_min {
@@ -111,10 +110,7 @@ pub(super) fn should_rehedge(
     // `|β_new − β_old| * leg_a_qty * price_b`. Use entry_size_a /
     // entry_price_b as a robust proxy — Position records both, and
     // they reflect the actually-filled hedge.
-    let notional_swing_usd = match (
-        position.entry_size_a,
-        position.entry_price_b,
-    ) {
+    let notional_swing_usd = match (position.entry_size_a, position.entry_price_b) {
         (Some(sa), Some(pb)) => {
             let sa_f = sa.to_f64().unwrap_or(0.0);
             let pb_f = pb.to_f64().unwrap_or(0.0);
@@ -264,7 +260,14 @@ mod tests {
     fn skipped_when_inside_cooldown() {
         let p = pp(0.15, 1800, 5.0);
         // last rehedge 900 s ago < 1800 s cool-down
-        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 900)), 0.70, None, 7200u64, 2_000_000);
+        let r = should_rehedge(
+            &p,
+            &pos(Some(1.0), Some(2_000_000 - 900)),
+            0.70,
+            None,
+            7200u64,
+            2_000_000,
+        );
         assert_eq!(r, None);
     }
 
@@ -272,7 +275,14 @@ mod tests {
     fn fires_after_cooldown_elapses() {
         let p = pp(0.15, 1800, 5.0);
         // 1801 s ago > 1800 s
-        let r = should_rehedge(&p, &pos(Some(1.0), Some(2_000_000 - 1801)), 0.70, None, 7200u64, 2_000_000);
+        let r = should_rehedge(
+            &p,
+            &pos(Some(1.0), Some(2_000_000 - 1801)),
+            0.70,
+            None,
+            7200u64,
+            2_000_000,
+        );
         assert!(r.is_some());
     }
 
@@ -309,7 +319,10 @@ mod tests {
         let plan = plan_rehedge_order(&pos_full(), 1.2).expect("should plan");
         assert_eq!(plan.side, OrderSide::Short);
         assert_eq!(plan.qty, Decimal::from_str("0.2").unwrap());
-        assert_eq!(plan.expected_new_entry_size_b, Decimal::from_str("1.2").unwrap());
+        assert_eq!(
+            plan.expected_new_entry_size_b,
+            Decimal::from_str("1.2").unwrap()
+        );
     }
 
     #[test]
@@ -319,7 +332,10 @@ mod tests {
         let plan = plan_rehedge_order(&pos_full(), 0.8).expect("should plan");
         assert_eq!(plan.side, OrderSide::Long);
         assert_eq!(plan.qty, Decimal::from_str("0.2").unwrap());
-        assert_eq!(plan.expected_new_entry_size_b, Decimal::from_str("0.8").unwrap());
+        assert_eq!(
+            plan.expected_new_entry_size_b,
+            Decimal::from_str("0.8").unwrap()
+        );
     }
 
     fn pos_short_spread() -> Position {

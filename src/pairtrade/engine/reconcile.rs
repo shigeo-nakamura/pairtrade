@@ -90,7 +90,7 @@ impl PairTradeEngine {
                         entry_beta: beta_at_entry,
                         last_rehedge_ts: None,
                         rehedge_realized_pnl: None,
-            prev_beta_for_velocity: None,
+                        prev_beta_for_velocity: None,
                     });
                     state.pending_entry = None;
                 }
@@ -150,8 +150,7 @@ impl PairTradeEngine {
                         giveup_retries,
                         filled_summary.join(" ")
                     );
-                    let variant_id =
-                        self.instances[inst_idx].id.clone();
+                    let variant_id = self.instances[inst_idx].id.clone();
                     self.cancel_pending_orders(&pending).await?;
                     self.force_close_all_positions(key, "entry_reissue_giveup")
                         .await;

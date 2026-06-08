@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use classification::{
-    is_step_overrun_event, is_step_overrun_recovery_event, is_ws_recovery_event,
-    is_ws_reset_event, is_ws_transient_event,
+    is_step_overrun_event, is_step_overrun_recovery_event, is_ws_recovery_event, is_ws_reset_event,
+    is_ws_transient_event,
 };
 use deferral::{
     flush_all_expired_pending, PendingEntry, STEP_OVERRUN_DEFER_WINDOW_SECS, WS_DEFER_WINDOW_SECS,
