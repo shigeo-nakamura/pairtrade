@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily archive of Extended [EVAL] + restart timestamps (bot-strategy#492)
+
+[Timer]
+OnCalendar=*-*-* 00:35:00 UTC
+Persistent=true
+RandomizedDelaySec=60
+Unit=archive-bt-replay-extended.service
+
+[Install]
+WantedBy=timers.target
