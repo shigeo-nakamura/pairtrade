@@ -416,6 +416,9 @@ impl PairTradeEngine {
             if let Some(v) = strategy.use_frozen_beta_exit_z {
                 inst_default.use_frozen_beta_exit_z = v;
             }
+            if let Some(v) = strategy.regime_block_entries {
+                inst_default.regime_block_entries = v;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -476,6 +479,9 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.use_frozen_beta_exit_z {
                     pp.use_frozen_beta_exit_z = v;
+                }
+                if let Some(v) = strategy.regime_block_entries {
+                    pp.regime_block_entries = v;
                 }
                 inst_pair_params.insert(k.clone(), pp);
             }

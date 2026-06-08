@@ -542,6 +542,10 @@ pub(super) struct StrategyYaml {
     /// bot-strategy#473: per-variant override of `use_frozen_beta_exit_z`.
     /// Round 6 C opts in; A/B inherit the global default (false).
     pub(super) use_frozen_beta_exit_z: Option<bool>,
+    /// bot-strategy#494 Phase 1: per-variant override of `regime_block_entries`.
+    /// Lets a single challenger opt into the regime entry-gate while the
+    /// control variants inherit the global default (false).
+    pub(super) regime_block_entries: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -840,6 +844,8 @@ pub struct StrategyConfig {
     pub beta_uncertainty_max: Option<f64>,
     /// Per-strategy override of `use_frozen_beta_exit_z` (bot-strategy#473).
     pub use_frozen_beta_exit_z: Option<bool>,
+    /// Per-strategy override of `regime_block_entries` (bot-strategy#494).
+    pub regime_block_entries: Option<bool>,
 }
 
 impl PairTradeConfig {
@@ -2045,6 +2051,7 @@ pub(super) fn resolve_strategies(
                     rehedge_velocity_projected_drift_min: s.rehedge_velocity_projected_drift_min,
                     beta_uncertainty_max: s.beta_uncertainty_max,
                     use_frozen_beta_exit_z: s.use_frozen_beta_exit_z,
+                    regime_block_entries: s.regime_block_entries,
                 }
             })
             .collect(),
@@ -2073,6 +2080,7 @@ pub(super) fn resolve_strategies(
             rehedge_velocity_projected_drift_min: None,
             beta_uncertainty_max: None,
             use_frozen_beta_exit_z: None,
+            regime_block_entries: None,
         }],
     }
 }
@@ -2367,6 +2375,76 @@ strategies:
         assert_eq!(c.entry_z_base, Some(2.5), "C overrides entry_z_base");
         assert_eq!(c.entry_z_min, Some(2.0));
         assert_eq!(c.entry_z_max, Some(3.0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn per_strategy_regime_block_entries_override_resolves() {
+        // bot-strategy#494 Phase 1: on the single-process A/B/C layout, a single
+        // challenger must be able to opt into the regime entry-gate while the
+        // control variants stay on the global default (false). This guards the
+        // 4-site plumbing (StrategyYaml -> StrategyConfig -> mod.rs overlay)
+        // against the silent-global-inherit trap (memory: strategy_yaml_silent_drop).
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("pairtrade_per_strategy_regime_block.yaml");
+        let yaml = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+strategies:
+  - id: a
+  - id: b
+  - id: c
+    regime_block_entries: true
+"#;
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+
+        let cfg = PairTradeConfig::from_yaml_path(&path).expect("yaml load");
+
+        // Top-level default stays false (shadow-only) when no global override set.
+        assert!(
+            !cfg.default_pair_params.regime_block_entries,
+            "global default must be false (shadow-only)"
+        );
+
+        let by_id = |id: &str| {
+            cfg.strategies
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("missing strategy {id}"))
+                .clone()
+        };
+
+        // Only the challenger carries the per-strategy override; controls inherit.
+        assert_eq!(
+            by_id("c").regime_block_entries,
+            Some(true),
+            "C opts in via per-strategy override"
+        );
+        assert!(
+            by_id("a").regime_block_entries.is_none(),
+            "A inherits the global default (None at the override layer)"
+        );
+        assert!(
+            by_id("b").regime_block_entries.is_none(),
+            "B inherits the global default (None at the override layer)"
+        );
+
+        // Reproduce the mod.rs overlay resolution to assert the final per-variant
+        // boolean: C blocks while A/B remain false.
+        let global = cfg.default_pair_params.regime_block_entries;
+        let resolved = |id: &str| by_id(id).regime_block_entries.unwrap_or(global);
+        assert!(resolved("c"), "C resolves to regime_block_entries = true");
+        assert!(!resolved("a"), "A resolves to false (control)");
+        assert!(!resolved("b"), "B resolves to false (control)");
 
         let _ = std::fs::remove_file(&path);
     }
