@@ -42,12 +42,11 @@ stop_loss_z_score: 4.0
 force_close_time_secs: 3600
 shutdown_grace_secs: 10860  # max(force_close_time_secs across strategies) + 60s buffer. Round 4 (#278): B overrides to 10800 (FC%-attack from #70 Phase A 5d signal); A and C stay at 7200. Grace must cover 10800 + 60. See bot-strategy#50.
 
-# Post-stop cool-down (#316). 600 s blocks immediate re-entry after a
-# stop_loss_z exit on the same direction — Round 4 BT sweep on 5/3-5/8
-# byte-exact (#278): Calmar 1.330 vs 0/1800/3600/7200 baselines
-# (1.109/1.104/1.055/0.760), MaxDD -25%, PnL -9.4%. Catches the 6-min
-# re-entry pathology observed on 2026-05-04 regime shift.
-stop_loss_cooldown_secs: 600
+# Post-stop cool-down (#316, recalibrated in #362). The 35-day byte-exact
+# sweep (2026-05-04 through 2026-06-07) found 300 s preserved the full
+# cooldown=0 trade set while still blocking immediate same-direction checks.
+# 600 s removed a profitable 2026-06-01 re-entry and reduced Calmar.
+stop_loss_cooldown_secs: 300
 
 # Risk
 risk_pct_per_trade: 0.40
