@@ -40,7 +40,7 @@ entry_z_score_max: 2.0
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
 force_close_time_secs: 3600
-shutdown_grace_secs: 10860  # max(force_close_time_secs across strategies) + 60s buffer. Round 4 (#278): B overrides to 10800 (FC%-attack from #70 Phase A 5d signal); A and C stay at 7200. Grace must cover 10800 + 60. See bot-strategy#50.
+shutdown_grace_secs: 10860  # max(force_close_time_secs across strategies) + 60s buffer. Round 6: A uses 10800, B uses 7200, and C inherits A's 10800. See bot-strategy#50.
 
 # Post-stop cool-down (#316, recalibrated in #362). The 35-day byte-exact
 # sweep (2026-05-04 through 2026-06-07) found 300 s preserved the full
