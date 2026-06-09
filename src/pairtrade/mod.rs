@@ -401,6 +401,9 @@ impl PairTradeEngine {
             if let Some(v) = strategy.rehedge_live_enabled {
                 inst_default.rehedge_live_enabled = v;
             }
+            if let Some(v) = strategy.use_amend_on_partial_fill {
+                inst_default.use_amend_on_partial_fill = v;
+            }
             if let Some(v) = strategy.rehedge_require_no_revert {
                 inst_default.rehedge_require_no_revert = v;
             }
@@ -464,6 +467,9 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.rehedge_live_enabled {
                     pp.rehedge_live_enabled = v;
+                }
+                if let Some(v) = strategy.use_amend_on_partial_fill {
+                    pp.use_amend_on_partial_fill = v;
                 }
                 if let Some(v) = strategy.rehedge_require_no_revert {
                     pp.rehedge_require_no_revert = v;
@@ -1898,7 +1904,7 @@ mod pending_tests {
     use rust_decimal::Decimal;
     use std::collections::HashMap;
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -1929,6 +1935,13 @@ mod pending_tests {
         /// matching entries to simulate a successful flatten.
         positions_to_return: Mutex<Vec<PositionSnapshot>>,
         min_order_to_return: Mutex<Option<Decimal>>,
+        /// bot-strategy#471: per-call record of `modify_order`
+        /// `(symbol, order_id, target_total, open_remaining, price)`, the
+        /// count of `cancel_order` calls, and a switch to force amend
+        /// failure so the cancel+reissue fallback can be exercised.
+        modify_calls: Mutex<Vec<(String, String, Decimal, Decimal, Option<Decimal>)>>,
+        cancel_order_calls: AtomicUsize,
+        modify_should_fail: AtomicBool,
     }
 
     #[async_trait]
@@ -2071,7 +2084,39 @@ mod pending_tests {
             Err(DexError::Permanent("not used".to_string()))
         }
 
+        async fn modify_order(
+            &self,
+            symbol: &str,
+            order_id: &str,
+            _side: OrderSide,
+            target_total_size: Decimal,
+            open_remaining_size: Decimal,
+            price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+        ) -> Result<CreateOrderResponse, DexError> {
+            self.modify_calls.lock().unwrap().push((
+                symbol.to_string(),
+                order_id.to_string(),
+                target_total_size,
+                open_remaining_size,
+                price,
+            ));
+            if self.modify_should_fail.load(Ordering::SeqCst) {
+                return Err(DexError::Permanent("amend unsupported (test)".to_string()));
+            }
+            // Same order_id back == native in-place amend (Lighter shape).
+            Ok(CreateOrderResponse {
+                order_id: order_id.to_string(),
+                exchange_order_id: None,
+                ordered_price: price.unwrap_or(Decimal::ONE),
+                ordered_size: open_remaining_size,
+                client_order_id: None,
+            })
+        }
+
         async fn cancel_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {
+            self.cancel_order_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -2177,7 +2222,7 @@ mod pending_tests {
         let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
 
         let result = engine
-            .reissue_partial_legs(&pending, &filled_qtys, &price_map, false, false, 0)
+            .reissue_partial_legs(&pending, &filled_qtys, &price_map, false, false, 0, false)
             .await
             .unwrap()
             .unwrap();
@@ -2195,6 +2240,145 @@ mod pending_tests {
         assert_eq!(calls[0].0, "AAA");
         assert_eq!(calls[0].3, Some(dec("100.0")));
         assert!(!calls[0].4);
+    }
+
+    // bot-strategy#471: with `use_amend=true` and a venue that supports a
+    // native in-place amend (same order_id back), the partial-fill reissue
+    // amends the resting order instead of cancel+reissue. The order keeps its
+    // identity and is recorded as a single continuing leg (not a settled
+    // leg + fresh remainder), and no `create_order` / `cancel_order` fires.
+    #[tokio::test]
+    async fn amend_partial_entry_leg_modifies_in_place() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        let pending = PendingOrders {
+            legs: vec![PendingLeg {
+                symbol: "AAA".to_string(),
+                order_id: "leg1".to_string(),
+                exchange_order_id: None,
+                target: dec("0.05"),
+                filled: Decimal::ZERO,
+                side: OrderSide::Long,
+                limit_price: None,
+                reference_price: None,
+            }],
+            direction: PositionDirection::LongSpread,
+            placed_at: Instant::now(),
+            placed_ts_ms: 0,
+            hedge_retry_count: 0,
+            post_only_hybrid: false,
+            exit_taker_takeover_at: None,
+        };
+        let mut price_map = HashMap::new();
+        price_map.insert(
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("100.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        );
+        let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
+
+        let result = engine
+            .reissue_partial_legs(&pending, &filled_qtys, &price_map, false, false, 0, true)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Single continuing leg keeping the original order_id + total target.
+        assert_eq!(result.legs.len(), 1);
+        assert_eq!(result.legs[0].order_id, "leg1");
+        assert_eq!(result.legs[0].target, dec("0.05"));
+        assert_eq!(result.legs[0].filled, dec("0.02"));
+
+        // Amend hit the connector with the original total + capped remainder.
+        let modify_calls = connector.modify_calls.lock().unwrap();
+        assert_eq!(modify_calls.len(), 1);
+        assert_eq!(modify_calls[0].0, "AAA");
+        assert_eq!(modify_calls[0].1, "leg1");
+        assert_eq!(modify_calls[0].2, dec("0.05")); // target_total
+        assert_eq!(modify_calls[0].3, dec("0.03")); // open_remaining (capped)
+        assert_eq!(modify_calls[0].4, Some(dec("100.0")));
+
+        // No cancel+reissue on the amend happy path.
+        assert!(connector.calls.lock().unwrap().is_empty());
+        assert_eq!(connector.cancel_order_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // bot-strategy#471: when the venue rejects the amend (or doesn't support
+    // it), the reissue falls back to cancel+reissue for that leg — cancelling
+    // the resting order and placing a fresh remainder order — so the end
+    // state matches the legacy path (settled filled leg + new remainder leg).
+    #[tokio::test]
+    async fn amend_falls_back_to_cancel_reissue_on_error() {
+        let connector = Arc::new(DummyConnector::default());
+        connector.modify_should_fail.store(true, Ordering::SeqCst);
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        let pending = PendingOrders {
+            legs: vec![PendingLeg {
+                symbol: "AAA".to_string(),
+                order_id: "leg1".to_string(),
+                exchange_order_id: None,
+                target: dec("0.05"),
+                filled: Decimal::ZERO,
+                side: OrderSide::Long,
+                limit_price: None,
+                reference_price: None,
+            }],
+            direction: PositionDirection::LongSpread,
+            placed_at: Instant::now(),
+            placed_ts_ms: 0,
+            hedge_retry_count: 0,
+            post_only_hybrid: false,
+            exit_taker_takeover_at: None,
+        };
+        let mut price_map = HashMap::new();
+        price_map.insert(
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("100.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        );
+        let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
+
+        let result = engine
+            .reissue_partial_legs(&pending, &filled_qtys, &price_map, false, false, 0, true)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Same two-leg shape as the legacy cancel+reissue path.
+        assert_eq!(result.legs.len(), 2);
+        assert!(result
+            .legs
+            .iter()
+            .any(|leg| leg.target == dec("0.02") && leg.filled == dec("0.02")));
+        assert!(result
+            .legs
+            .iter()
+            .any(|leg| leg.target == dec("0.03") && leg.filled == Decimal::ZERO));
+
+        // Amend was attempted, then fell back to cancel + create.
+        assert_eq!(connector.modify_calls.lock().unwrap().len(), 1);
+        assert_eq!(connector.cancel_order_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(connector.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2222,7 +2406,7 @@ mod pending_tests {
         let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
 
         let result = engine
-            .reissue_partial_legs(&pending, &filled_qtys, &HashMap::new(), false, false, 0)
+            .reissue_partial_legs(&pending, &filled_qtys, &HashMap::new(), false, false, 0, false)
             .await
             .unwrap()
             .unwrap();

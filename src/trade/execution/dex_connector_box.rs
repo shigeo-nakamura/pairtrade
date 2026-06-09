@@ -395,6 +395,47 @@ impl DexConnector for DexConnectorBox {
         result
     }
 
+    // bot-strategy#471: explicit forward so the amend path reaches the
+    // connector impl instead of silently degrading to the trait default
+    // (`DexError::Permanent`). Per feedback_dex_connector_box_forward.md.
+    #[allow(clippy::too_many_arguments)] // mirrors the DexConnector::modify_order signature.
+    async fn modify_order(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        side: OrderSide,
+        target_total_size: Decimal,
+        open_remaining_size: Decimal,
+        price: Option<Decimal>,
+        spread: Option<i64>,
+        reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        let result = self
+            .inner
+            .modify_order(
+                symbol,
+                order_id,
+                side,
+                target_total_size,
+                open_remaining_size,
+                price,
+                spread,
+                reduce_only,
+            )
+            .await;
+        if let Err(ref err) = result {
+            self.report_rate_limit(
+                "modify_order",
+                &format!(
+                    "{} | order_id={} side={:?} remaining={}",
+                    symbol, order_id, side, open_remaining_size
+                ),
+                err,
+            );
+        }
+        result
+    }
+
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<(), DexError> {
         let result = self.inner.cancel_order(symbol, order_id).await;
         if let Err(ref err) = result {
