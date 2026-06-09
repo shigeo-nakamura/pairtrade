@@ -1923,6 +1923,12 @@ mod pending_tests {
         positions_calls: AtomicUsize,
         close_all_calls: AtomicUsize,
         cancel_all_calls: AtomicUsize,
+        /// bot-strategy#487: positions get_positions returns, and the venue
+        /// min order size get_ticker advertises, so the startup force-close
+        /// dust filter can be exercised. `close_all_positions` clears the
+        /// matching entries to simulate a successful flatten.
+        positions_to_return: Mutex<Vec<PositionSnapshot>>,
+        min_order_to_return: Mutex<Option<Decimal>>,
     }
 
     #[async_trait]
@@ -1945,10 +1951,14 @@ mod pending_tests {
 
         async fn get_ticker(
             &self,
-            _symbol: &str,
+            symbol: &str,
             _test_price: Option<Decimal>,
         ) -> Result<TickerResponse, DexError> {
-            Err(DexError::Permanent("not used".to_string()))
+            Ok(TickerResponse {
+                symbol: symbol.to_string(),
+                min_order: *self.min_order_to_return.lock().unwrap(),
+                ..Default::default()
+            })
         }
 
         async fn get_filled_orders(&self, _symbol: &str) -> Result<FilledOrdersResponse, DexError> {
@@ -1985,7 +1995,7 @@ mod pending_tests {
 
         async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
             self.positions_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![])
+            Ok(self.positions_to_return.lock().unwrap().clone())
         }
 
         async fn get_last_trades(&self, _symbol: &str) -> Result<LastTradesResponse, DexError> {
@@ -2078,8 +2088,16 @@ mod pending_tests {
             Ok(())
         }
 
-        async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
+        async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
             self.close_all_calls.fetch_add(1, Ordering::SeqCst);
+            // Simulate a successful flatten so the startup retry loop can
+            // converge (bot-strategy#487 tests): clear the requested symbol,
+            // or every position when `None`.
+            let mut positions = self.positions_to_return.lock().unwrap();
+            match symbol {
+                Some(sym) => positions.retain(|p| p.symbol != sym),
+                None => positions.clear(),
+            }
             Ok(())
         }
 
@@ -2867,6 +2885,62 @@ mod pending_tests {
             connector.close_all_calls.load(Ordering::SeqCst),
             0,
             "dry_run must not issue close_all_positions"
+        );
+    }
+
+    /// bot-strategy#487: a position below the venue min order size (0.00001
+    /// BTC vs Extended's 0.0001 min) can never be submitted to
+    /// `close_all_positions` — the connector rejects sub-min sizes — so the
+    /// startup force-close must treat it as already flat: no close attempt,
+    /// no "still open" ERROR/email that re-fires error-watch on every restart.
+    #[tokio::test]
+    async fn force_close_on_startup_skips_sub_min_dust() {
+        let connector = Arc::new(DummyConnector::default());
+        *connector.positions_to_return.lock().unwrap() = vec![PositionSnapshot {
+            symbol: "BTC".to_string(),
+            size: dec("0.00001"),
+            sign: -1,
+            entry_price: Some(dec("61674")),
+        }];
+        *connector.min_order_to_return.lock().unwrap() = Some(dec("0.0001"));
+
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        engine.cfg.dry_run = false;
+        engine.cfg.startup_force_close_wait_secs = 0;
+        engine.cfg.startup_force_close_attempts = 1;
+
+        engine.force_close_on_startup().await.unwrap();
+
+        assert_eq!(
+            connector.close_all_calls.load(Ordering::SeqCst),
+            0,
+            "sub-min dust must never be submitted to close_all_positions"
+        );
+    }
+
+    /// Complement to the dust test: a position at or above the venue min is
+    /// genuinely force-closed, so the dust filter must not over-skip.
+    #[tokio::test]
+    async fn force_close_on_startup_closes_above_min_position() {
+        let connector = Arc::new(DummyConnector::default());
+        *connector.positions_to_return.lock().unwrap() = vec![PositionSnapshot {
+            symbol: "BTC".to_string(),
+            size: dec("0.05"),
+            sign: 1,
+            entry_price: Some(dec("70000")),
+        }];
+        *connector.min_order_to_return.lock().unwrap() = Some(dec("0.0001"));
+
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        engine.cfg.dry_run = false;
+        engine.cfg.startup_force_close_wait_secs = 0;
+        engine.cfg.startup_force_close_attempts = 1;
+
+        engine.force_close_on_startup().await.unwrap();
+
+        assert!(
+            connector.close_all_calls.load(Ordering::SeqCst) >= 1,
+            "an above-min position must be submitted to close_all_positions"
         );
     }
 
