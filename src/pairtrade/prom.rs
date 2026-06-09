@@ -147,9 +147,9 @@ pub static REGIME_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
 pub static REGIME_CUSUM: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_regime_cusum",
-        "max(cusum_pos, cusum_neg) of the regime detector — the statistic \
-         compared against the activation (h_on) / deactivation (h_off) \
-         thresholds. (bot-strategy#494)",
+        "magnitude-CUSUM statistic of the regime detector (excess of \
+         |normalised innovation| over its null mean) — compared against the \
+         activation (h_on) / deactivation (h_off) thresholds. (bot-strategy#494)",
         &["variant", "pair"],
     )
 });
