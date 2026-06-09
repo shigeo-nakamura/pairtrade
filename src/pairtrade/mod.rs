@@ -2090,13 +2090,31 @@ mod pending_tests {
 
         async fn close_all_positions(&self, symbol: Option<String>) -> Result<(), DexError> {
             self.close_all_calls.fetch_add(1, Ordering::SeqCst);
-            // Simulate a successful flatten so the startup retry loop can
-            // converge (bot-strategy#487 tests): clear the requested symbol,
-            // or every position when `None`.
+            // Faithfully model the Extended connector for bot-strategy#487:
+            // a sub-min position aborts the close with InvalidInput
+            // (round_size_for_market) before any later leg is flattened.
+            // `None` therefore strands everything when dust is present;
+            // `Some(dust_symbol)` rejects outright. Above-min closes clear.
+            let min_order = *self.min_order_to_return.lock().unwrap();
+            let is_dust = |p: &PositionSnapshot| min_order.is_some_and(|min| p.size < min);
+            let reject = |p: &PositionSnapshot| DexError::InvalidInput {
+                field: "size".to_string(),
+                value: format!("{} below min for {}", p.size, p.symbol),
+            };
             let mut positions = self.positions_to_return.lock().unwrap();
             match symbol {
-                Some(sym) => positions.retain(|p| p.symbol != sym),
-                None => positions.clear(),
+                Some(sym) => {
+                    if let Some(dust) = positions.iter().find(|p| p.symbol == sym && is_dust(p)) {
+                        return Err(reject(dust));
+                    }
+                    positions.retain(|p| p.symbol != sym);
+                }
+                None => {
+                    if let Some(dust) = positions.iter().find(|p| is_dust(p)) {
+                        return Err(reject(dust));
+                    }
+                    positions.clear();
+                }
             }
             Ok(())
         }
@@ -2941,6 +2959,50 @@ mod pending_tests {
         assert!(
             connector.close_all_calls.load(Ordering::SeqCst) >= 1,
             "an above-min position must be submitted to close_all_positions"
+        );
+    }
+
+    /// bot-strategy#487 (review): the load-bearing mixed case. A dust leg
+    /// (sorted first) alongside a genuine above-min leg. The connector
+    /// rejects any close that includes the sub-min size, so a
+    /// `close_all_positions(None)` would abort on the dust and leave the
+    /// real leg open — startup would continue with live exposure. The fix
+    /// closes per-symbol, so the real leg is flattened and only the dust
+    /// remains (treated as flat, no ERROR/email).
+    #[tokio::test]
+    async fn force_close_on_startup_closes_real_leg_despite_dust() {
+        let connector = Arc::new(DummyConnector::default());
+        *connector.positions_to_return.lock().unwrap() = vec![
+            PositionSnapshot {
+                symbol: "BTC".to_string(),
+                size: dec("0.00001"),
+                sign: -1,
+                entry_price: Some(dec("61674")),
+            },
+            PositionSnapshot {
+                symbol: "ETH".to_string(),
+                size: dec("1.5"),
+                sign: 1,
+                entry_price: Some(dec("3500")),
+            },
+        ];
+        *connector.min_order_to_return.lock().unwrap() = Some(dec("0.0001"));
+
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        engine.cfg.dry_run = false;
+        engine.cfg.startup_force_close_wait_secs = 0;
+        engine.cfg.startup_force_close_attempts = 1;
+
+        engine.force_close_on_startup().await.unwrap();
+
+        // The genuine ETH leg must be flattened; only the dust BTC leg may
+        // remain. With the old close_all_positions(None) path the connector
+        // would reject on the dust and ETH would still be open here.
+        let remaining = connector.positions_to_return.lock().unwrap().clone();
+        assert_eq!(remaining.len(), 1, "only the dust leg should remain open");
+        assert_eq!(
+            remaining[0].symbol, "BTC",
+            "the dust leg (not the real leg) is what remains"
         );
     }
 

@@ -201,8 +201,26 @@ impl PairTradeEngine {
                             log::warn!("[Startup] log_startup_force_close failed: {:?}", err);
                         }
                     }
-                    if let Err(err) = self.connector.close_all_positions(None).await {
-                        log::error!("[Startup] close_all_positions failed: {:?}", err);
+                    // bot-strategy#487: close each closable leg by symbol
+                    // rather than close_all_positions(None). The connector's
+                    // close-all aborts on the first sub-min position
+                    // (round_size_for_market → InvalidInput), which in a
+                    // real+dust mix could strand a genuine position and leave
+                    // startup running with live exposure. Per-symbol closes
+                    // never pass dust to the connector, so the abort cannot
+                    // block a real leg.
+                    for position in &closable {
+                        if let Err(err) = self
+                            .connector
+                            .close_all_positions(Some(position.symbol.clone()))
+                            .await
+                        {
+                            log::error!(
+                                "[Startup] close_all_positions({}) failed: {:?}",
+                                position.symbol,
+                                err
+                            );
+                        }
                     }
                 }
                 Err(err) => {
