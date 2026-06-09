@@ -191,7 +191,9 @@ impl PairTradeEngine {
                 // error, and cancels any leg it does NOT amend, so the end
                 // state matches the legacy path.
                 let use_amend = !use_market
-                    && self.pair_params_for(inst_idx, key).use_amend_on_partial_fill;
+                    && self
+                        .pair_params_for(inst_idx, key)
+                        .use_amend_on_partial_fill;
                 if !use_amend {
                     self.cancel_pending_orders(&pending).await?;
                 }
