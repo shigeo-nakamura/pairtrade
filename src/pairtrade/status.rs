@@ -302,6 +302,30 @@ pub(super) struct ShutdownPosition {
     pub(super) force_close_eta_ts: i64,
 }
 
+/// Build the `StatusPosition` list for the status snapshot from the live
+/// open-position map. Pure: drops flat / zero-size legs and maps the
+/// position sign to the LONG / SHORT / FLAT label. Extracted from
+/// `write_snapshot` so the snapshot assembler stays focused on the
+/// snapshot + persistence path (bot-strategy#502).
+fn status_positions_from(
+    open_positions: &HashMap<String, PositionSnapshot>,
+) -> Vec<StatusPosition> {
+    open_positions
+        .values()
+        .filter(|pos| pos.sign != 0 && pos.size > Decimal::ZERO)
+        .map(|pos| StatusPosition {
+            symbol: pos.symbol.clone(),
+            side: match pos.sign.cmp(&0) {
+                Ordering::Greater => "LONG".to_string(),
+                Ordering::Less => "SHORT".to_string(),
+                Ordering::Equal => "FLAT".to_string(),
+            },
+            size: pos.size.to_string(),
+            entry_price: pos.entry_price.map(|v| v.to_string()),
+        })
+        .collect()
+}
+
 impl StatusReporter {
     /// Per-instance variant of `from_env` for the multi-strategy
     /// single-process architecture (shigeo-nakamura/bot-strategy#25).
@@ -782,20 +806,7 @@ impl StatusReporter {
         positions_ready: bool,
     ) -> std::io::Result<()> {
         self.reset_daily_if_needed();
-        let positions: Vec<StatusPosition> = open_positions
-            .values()
-            .filter(|pos| pos.sign != 0 && pos.size > Decimal::ZERO)
-            .map(|pos| StatusPosition {
-                symbol: pos.symbol.clone(),
-                side: match pos.sign.cmp(&0) {
-                    Ordering::Greater => "LONG".to_string(),
-                    Ordering::Less => "SHORT".to_string(),
-                    Ordering::Equal => "FLAT".to_string(),
-                },
-                size: pos.size.to_string(),
-                entry_price: pos.entry_price.map(|v| v.to_string()),
-            })
-            .collect();
+        let positions = status_positions_from(open_positions);
         let snapshot = StatusSnapshot {
             ts: Utc::now().timestamp(),
             updated_at: Utc::now().to_rfc3339(),
