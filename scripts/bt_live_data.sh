@@ -77,6 +77,14 @@ echo "=== Converting to bin ==="
 cargo run --release --bin convert-data -- "$WORK_DIR/combined.jsonl" "$WORK_DIR/live.bin" 0 2>&1
 
 echo ""
+echo "=== Building backtest binary ==="
+# `cargo run --bin convert-data` only guarantees that the converter and its
+# library dependencies are current. The standalone `target/release/debot`
+# may otherwise be left over from an older commit, silently invalidating an
+# A/B backtest after strategy changes.
+cargo build --release --bin debot 2>&1
+
+echo ""
 echo "=== Running backtest ==="
 BACKTEST_MODE=true \
 BACKTEST_FILE="$WORK_DIR/live.bin" \

@@ -999,16 +999,18 @@ impl PairTradeEngine {
                 let active_secs_before = shared.regime.active_secs(now_ts);
                 match shared.regime.update(innovation, now_ts) {
                     regime::RegimeTransition::Activated => log::warn!(
-                        "[REGIME] {} persistent-shift ACTIVE cusum={:.2} scale={:.6} norm={:.2} beta={:.4}",
+                        "[REGIME] {} persistent-shift ACTIVE event_ts={} cusum={:.2} scale={:.6} norm={:.2} beta={:.4}",
                         key,
+                        now_ts,
                         shared.regime.cusum(),
                         shared.regime.residual_scale(),
                         shared.regime.last_normalized(),
                         beta,
                     ),
                     regime::RegimeTransition::Cleared => log::info!(
-                        "[REGIME] {} persistent-shift CLEARED after {:.0}s cusum={:.2} scale={:.6}",
+                        "[REGIME] {} persistent-shift CLEARED event_ts={} after {:.0}s cusum={:.2} scale={:.6}",
                         key,
+                        now_ts,
                         active_secs_before,
                         shared.regime.cusum(),
                         shared.regime.residual_scale(),
