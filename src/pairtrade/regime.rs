@@ -137,13 +137,11 @@ const SCALE_SPIKE_CAP: f64 = 8.0;
 /// is what lets the detector see such a shift at all.
 const MAG_REF: f64 = 1.0;
 
-/// `|normalised innovation|` at or above this is treated as a single corrupted
-/// bar (an outlier). Such a tick is winsorised out of the scale EWMA and, when
-/// *isolated* (its predecessor was not an outlier), contributes only the slack
-/// decay to the CUSUM — never growth. It also clamps the magnitude fed to the
-/// CUSUM during a sustained large shift so the per-tick step stays bounded. A
-/// genuine shift shows up as *many* moderately-elevated bars (~2-4 sigma), not
-/// one much-larger-than-4-sigma spike.
+/// `|normalised innovation|` at or above this is treated as an outlier:
+/// winsorised out of the scale EWMA and contributing only the slack decay
+/// (never growth) to the CUSUM. A genuine persistent shift shows up as *many*
+/// moderately-elevated bars (~2-4 sigma) once the scale absorbs it, not as the
+/// much-larger-than-4-sigma spike(s) of a corrupted observation.
 const INNOVATION_CLIP: f64 = 4.0;
 
 /// CUSUM slack / reference value `k` (Page's test). Once the per-tick excess
@@ -165,25 +163,29 @@ const CUSUM_H_OFF: f64 = 3.0;
 /// unstable early scale estimate cannot create false activations.
 const MIN_UPDATES: u64 = 60;
 
-// The detectable band must be non-empty: a sustained shift whose magnitude
-// sits at the outlier cutoff has to produce a *positive* CUSUM increment
-// (`INNOVATION_CLIP - MAG_REF - CUSUM_K > 0`), otherwise nothing short of an
-// (ignored) outlier could ever accumulate.
+// The detectable band must be non-empty: only bars with `|z| < INNOVATION_CLIP`
+// accumulate, and a moderately-elevated such bar has to produce a *positive*
+// CUSUM increment (`mag - MAG_REF - CUSUM_K > 0` for some `mag < INNOVATION_CLIP`),
+// otherwise nothing could ever accumulate. Equivalent to the cutoff sitting
+// above the slack+baseline.
 const _: () = assert!(
     MAG_REF + CUSUM_K < INNOVATION_CLIP,
-    "sub-outlier sustained magnitude shifts must be able to accumulate",
+    "sub-outlier elevated bars must be able to accumulate",
 );
 const _: () = assert!(
     CUSUM_H_OFF < CUSUM_H_ON,
     "hysteresis requires the clear threshold below the activation threshold",
 );
-// NOTE on single-corrupted-bar immunity: it is enforced in `update`'s control
-// flow, not by a numeric inequality. An *isolated* outlier (one whose previous
-// tick was not an outlier) only ever *decays* the CUSUM, so no single bar — at
-// any pre-existing CUSUM level, not just zero — can push the detector toward
-// activation. A sustained large shift is told apart by persistence: it
-// accumulates (at the clamped magnitude) from the second consecutive outlier
-// on. See `isolated_outlier_after_preload_does_not_activate`.
+// NOTE on corrupted-observation immunity: it is enforced in `update`'s control
+// flow, not by a numeric inequality. *Every* outlier (`|z| ≥ INNOVATION_CLIP`)
+// only ever *decays* the CUSUM. A single corrupted price bar is a difference
+// input, so it spans a *pair* of consecutive outlier innovations (spike +
+// reversal); because both — and any-length outlier burst — are decay-only, no
+// corrupted observation can push the detector toward activation from any
+// pre-existing CUSUM level. A genuine persistent shift is still caught once the
+// winsorised scale EWMA absorbs the new level (a few bars) and the residual
+// drops into the accumulating `|z| < INNOVATION_CLIP` band. See
+// `single_corrupted_price_bar_roundtrip_does_not_activate`.
 
 /// Outcome of a single `RegimeDetector::update`, used by the caller to log
 /// state transitions exactly once (not every tick).
@@ -233,11 +235,6 @@ pub(super) struct RegimeDetector {
     /// `MAG_REF`. Detects a persistent rise in residual *magnitude* (a
     /// β/relationship shift), independent of the innovation's sign.
     cusum: f64,
-    /// Whether the previous post-warm-up tick was an outlier (`|z| ≥
-    /// INNOVATION_CLIP`). Lets `update` distinguish a single corrupted bar
-    /// (isolated outlier → decay only) from a sustained large shift (a run of
-    /// outliers → accumulate at the clamped magnitude).
-    prev_outlier: bool,
     updates: u64,
     active: bool,
     /// Replay timestamp at which the current active state began; `None`
@@ -276,23 +273,26 @@ impl RegimeDetector {
         // Magnitude CUSUM with slack `k`. The increment is the excess of the
         // normalised residual magnitude over its null mean (`MAG_REF`), so the
         // statistic decays under normal noise and only climbs on a *persistent*
-        // magnitude shift — the signed sign of the innovation is irrelevant, so
-        // an alternating-sign β break accumulates just like a one-sided drift.
+        // magnitude shift — the innovation's sign is irrelevant, so an
+        // alternating-sign β break accumulates just like a one-sided drift.
         if mag >= INNOVATION_CLIP {
-            if self.prev_outlier {
-                // Second+ consecutive outlier → a sustained large shift, not a
-                // single corrupted bar: accumulate at the clamped magnitude.
-                self.cusum = (self.cusum + (INNOVATION_CLIP - MAG_REF) - CUSUM_K).max(0.0);
-            } else {
-                // First (possibly isolated) outlier: only the slack decay, never
-                // growth. A single corrupted bar thus cannot move the CUSUM
-                // toward activation from any pre-existing level.
-                self.cusum = (self.cusum - CUSUM_K).max(0.0);
-            }
-            self.prev_outlier = true;
+            // Outlier. A single corrupted *price* observation is a difference
+            // input, so it shows up as a *pair* of consecutive outlier
+            // innovations — the spike on entry and its opposite-sign reversal
+            // when the price returns — and an extreme genuine shift looks like
+            // outliers too until the scale adapts. None of these carry a
+            // reliable persistence signal, so every outlier contributes ONLY
+            // the slack decay, never growth. No corrupted observation, however
+            // many outlier innovations it spans, can move the CUSUM toward
+            // activation from any pre-existing level (structural immunity).
+            //
+            // A genuine persistent shift is still caught: the winsorised scale
+            // EWMA absorbs the new level within a few bars, after which the
+            // residual sits in the moderately-elevated (`|z| < INNOVATION_CLIP`)
+            // band and accumulates normally.
+            self.cusum = (self.cusum - CUSUM_K).max(0.0);
         } else {
             self.cusum = (self.cusum + (mag - MAG_REF) - CUSUM_K).max(0.0);
-            self.prev_outlier = false;
         }
         let stat = self.cusum;
 
@@ -553,19 +553,21 @@ mod tests {
     }
 
     #[test]
-    fn isolated_outlier_after_preload_does_not_activate() {
-        // Regression for the worst-case-pre-load gap: build the CUSUM to a
-        // sub-threshold level high enough that a naive `clip − k` single-tick
-        // contribution would have crossed h_on, then fire one isolated outlier.
-        // Because an isolated outlier only decays the CUSUM, it must not flip
-        // the state from any pre-existing level.
+    fn single_corrupted_price_bar_roundtrip_does_not_activate() {
+        // Regression for the difference-input corruption shape: the detector
+        // sees Δspread, so ONE corrupted price observation produces a *pair* of
+        // consecutive outlier innovations — a large spike on entry and a
+        // large opposite-sign reversal when the price returns. Build the CUSUM
+        // to a sub-threshold "danger zone" (high enough that a naive design
+        // crediting the second outlier as persistence would tip it over h_on),
+        // then fire the +1000σ / −1000σ round-trip. Neither bar may activate.
         let mut det = RegimeDetector::default();
         let scale = 1e-3;
         let mut ts = warmup(&mut det, scale, 0);
 
-        // A naive clamped single-bar step on top of the CUSUM would add
-        // `INNOVATION_CLIP − MAG_REF − CUSUM_K`; any pre-load above this margin
-        // below h_on is in the "danger zone" a single bar could tip over.
+        // A naive design that accumulated the (clamped) second consecutive
+        // outlier would add `INNOVATION_CLIP − MAG_REF − CUSUM_K`; any pre-load
+        // above that margin below h_on is in the danger zone.
         let danger = CUSUM_H_ON - (INNOVATION_CLIP - MAG_REF - CUSUM_K);
         // Sustained ~2.5σ (non-outlier) pre-loads the CUSUM into that zone
         // without activating; stop as soon as we are safely inside it.
@@ -586,26 +588,56 @@ mod tests {
         }
         assert!(
             pre > danger,
-            "pre-load {pre} should reach the danger zone (> {danger}) a naive clamp could tip over h_on",
+            "pre-load {pre} should reach the danger zone (> {danger}) a naive design could tip over h_on",
         );
         assert!(
             pre < CUSUM_H_ON,
             "pre-load {pre} must still be sub-threshold"
         );
 
-        // One isolated corrupted bar: must NOT activate, and must not grow the
-        // statistic (it can only decay).
-        assert_eq!(
-            det.update(1000.0 * scale, ts),
-            RegimeTransition::None,
-            "an isolated outlier must not activate even from a high pre-load",
-        );
-        assert!(!det.is_active());
+        // The corrupted bar's spike, then its reversal on the next bar. A
+        // single corrupted observation must not create a persistent regime
+        // state: neither outlier activates, and the statistic only decays.
+        for innov in [1000.0 * scale, -1000.0 * scale] {
+            assert_eq!(
+                det.update(innov, ts),
+                RegimeTransition::None,
+                "a corrupted-bar outlier ({innov}) must not activate from a high pre-load",
+            );
+            assert!(!det.is_active());
+            ts += 60;
+        }
         assert!(
             det.cusum() < pre,
-            "an isolated outlier must decay (not grow) the CUSUM: {} !< {}",
+            "the spike+reversal pair must decay (not grow) the CUSUM: {} !< {}",
             det.cusum(),
             pre,
         );
+    }
+
+    #[test]
+    fn extreme_persistent_shift_still_activates_after_scale_adapts() {
+        // The flip side of decay-only outliers: a genuine *persistent* large
+        // shift must still be detected. Its first few bars read as outliers
+        // (decay-only) while the winsorised scale catches up, after which the
+        // residual drops into the accumulating band and the CUSUM climbs.
+        let mut det = RegimeDetector::default();
+        let scale = 1e-3;
+        let mut ts = warmup(&mut det, scale, 0);
+
+        let mut activated = false;
+        for _ in 0..120 {
+            if det.update(6.0 * scale, ts) == RegimeTransition::Activated {
+                activated = true;
+                break;
+            }
+            ts += 60;
+        }
+        assert!(
+            activated,
+            "a sustained 6-sigma shift must still activate once the scale adapts (cusum={})",
+            det.cusum(),
+        );
+        assert!(det.is_active());
     }
 }
