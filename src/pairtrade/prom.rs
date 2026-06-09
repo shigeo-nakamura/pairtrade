@@ -129,6 +129,49 @@ pub static HALF_LIFE_HOURS: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+// --- Innovation-responsive persistent-regime detector (bot-strategy#494) ---
+// Phase 1 shadow gauges. The detector state is pair-level (shared across
+// A/B/C), so all variant series for a pair carry identical values.
+
+pub static REGIME_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_regime_active",
+        "1 while the innovation-responsive detector flags a persistent \
+         β/model shift (CUSUM of normalised Δspread residuals past h_on, \
+         with hysteresis). Phase 1: shadow only — gates entries solely for \
+         variants that opt in via `regime_block_entries`. (bot-strategy#494)",
+        &["variant", "pair"],
+    )
+});
+
+pub static REGIME_CUSUM: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_regime_cusum",
+        "magnitude-CUSUM statistic of the regime detector (excess of \
+         |normalised innovation| over its null mean) — compared against the \
+         activation (h_on) / deactivation (h_off) thresholds. (bot-strategy#494)",
+        &["variant", "pair"],
+    )
+});
+
+pub static REGIME_RESIDUAL_SCALE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_regime_residual_scale",
+        "Robust residual scale (winsorised EWMA of |innovation|) used to \
+         normalise the model's one-step Δspread residual. (bot-strategy#494)",
+        &["variant", "pair"],
+    )
+});
+
+pub static REGIME_INNOVATION_NORMALIZED: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_regime_innovation_normalized",
+        "Latest normalised innovation (Δspread / residual_scale) fed to the \
+         regime CUSUM. (bot-strategy#494)",
+        &["variant", "pair"],
+    )
+});
+
 pub static ADF_PVALUE: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_adf_pvalue",
@@ -369,6 +412,7 @@ pub const KNOWN_ENTRY_REJECT_REASONS: &[&str] = &[
     "beta_min",
     "beta_uncertainty",
     "beta_clamp",
+    "regime_innovation",
     "z_below_threshold",
     "mtf",
     "net_funding_min",

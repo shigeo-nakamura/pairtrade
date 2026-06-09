@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::config::PairTradeConfig;
 use super::kalman::KalmanBeta;
+use super::regime::RegimeDetector;
 use super::util::mean_std;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +195,11 @@ pub(super) struct PairSharedState {
     /// far below its recent median — a sign that the z-score is no longer a
     /// trustworthy mean-reversion signal.
     pub(super) std_history: VecDeque<f64>,
+    /// Innovation-responsive persistent-regime detector (bot-strategy#494).
+    /// Pair-level (shared across A/B/C) since it is a property of the β
+    /// model. Shadow-only in Phase 1; not persisted across restart (warms
+    /// back up in `MIN_UPDATES` bars).
+    pub(super) regime: RegimeDetector,
 }
 
 #[derive(Debug)]
@@ -262,6 +268,7 @@ impl PairSharedState {
             beta_gap: 0.0,
             kalman: None,
             std_history: VecDeque::new(),
+            regime: RegimeDetector::default(),
         }
     }
 

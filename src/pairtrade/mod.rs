@@ -416,6 +416,9 @@ impl PairTradeEngine {
             if let Some(v) = strategy.use_frozen_beta_exit_z {
                 inst_default.use_frozen_beta_exit_z = v;
             }
+            if let Some(v) = strategy.regime_block_entries {
+                inst_default.regime_block_entries = v;
+            }
 
             let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
             for (k, v) in cfg.pair_params.iter() {
@@ -476,6 +479,9 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.use_frozen_beta_exit_z {
                     pp.use_frozen_beta_exit_z = v;
+                }
+                if let Some(v) = strategy.regime_block_entries {
+                    pp.regime_block_entries = v;
                 }
                 inst_pair_params.insert(k.clone(), pp);
             }
@@ -791,6 +797,24 @@ impl PairTradeEngine {
                     .and_then(|s| s.kalman.as_ref().map(|k| k.posterior_std()))
                     .unwrap_or(0.0),
             );
+            // bot-strategy#494 Phase 1 — persistent-regime detector shadow
+            // gauges (pair-level state; identical across variant series).
+            prom::REGIME_ACTIVE.with_label_values(&labels).set(
+                if shared.map(|s| s.regime.is_active()).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            );
+            prom::REGIME_CUSUM
+                .with_label_values(&labels)
+                .set(shared.map(|s| s.regime.cusum()).unwrap_or(0.0));
+            prom::REGIME_RESIDUAL_SCALE
+                .with_label_values(&labels)
+                .set(shared.map(|s| s.regime.residual_scale()).unwrap_or(0.0));
+            prom::REGIME_INNOVATION_NORMALIZED
+                .with_label_values(&labels)
+                .set(shared.map(|s| s.regime.last_normalized()).unwrap_or(0.0));
             prom::HALF_LIFE_HOURS
                 .with_label_values(&labels)
                 .set(shared.map(|s| s.half_life_hours).unwrap_or(0.0));

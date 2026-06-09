@@ -144,6 +144,15 @@ pub struct PairParams {
     /// regime / dashboard checks keep using rolling-β z regardless.
     /// See bot-strategy#473.
     pub use_frozen_beta_exit_z: bool,
+    /// Innovation-responsive persistent-regime gate (bot-strategy#494
+    /// Phase 1). When `true`, blocks new entries while the
+    /// `RegimeDetector` (CUSUM of normalised Δspread residuals) reports a
+    /// persistent β/model shift. Default `false` keeps Phase 1 shadow
+    /// behaviour: the `pairtrade_regime_*` gauges and `[REGIME]` logs are
+    /// still emitted, but trading is unchanged. Flip on per host/variant
+    /// (env `REGIME_BLOCK_ENTRIES` or top-level YAML) once the gauges have
+    /// been calibrated and BT validates the entry-only gate.
+    pub regime_block_entries: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -404,6 +413,9 @@ pub(super) struct PairTradeYaml {
     pub(super) std_collapse_observe_only: Option<bool>,
     /// bot-strategy#473: opt-in to frozen-β exit z. Default false.
     pub(super) use_frozen_beta_exit_z: Option<bool>,
+    /// bot-strategy#494: opt-in to the persistent-regime entry gate. Default
+    /// false (shadow-only). Top-level YAML override of `regime_block_entries`.
+    pub(super) regime_block_entries: Option<bool>,
     /// Graceful shutdown: max seconds to wait for natural exit on SIGTERM before
     /// force-closing both legs. 0 = immediate force close (legacy behavior).
     pub(super) shutdown_grace_secs: Option<u64>,
@@ -530,6 +542,10 @@ pub(super) struct StrategyYaml {
     /// bot-strategy#473: per-variant override of `use_frozen_beta_exit_z`.
     /// Round 6 C opts in; A/B inherit the global default (false).
     pub(super) use_frozen_beta_exit_z: Option<bool>,
+    /// bot-strategy#494 Phase 1: per-variant override of `regime_block_entries`.
+    /// Lets a single challenger opt into the regime entry-gate while the
+    /// control variants inherit the global default (false).
+    pub(super) regime_block_entries: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -828,6 +844,8 @@ pub struct StrategyConfig {
     pub beta_uncertainty_max: Option<f64>,
     /// Per-strategy override of `use_frozen_beta_exit_z` (bot-strategy#473).
     pub use_frozen_beta_exit_z: Option<bool>,
+    /// Per-strategy override of `regime_block_entries` (bot-strategy#494).
+    pub regime_block_entries: Option<bool>,
 }
 
 impl PairTradeConfig {
@@ -1600,6 +1618,14 @@ impl PairTradeConfig {
                 matches!(lower.as_str(), "1" | "true" | "yes");
         }
 
+        // bot-strategy#494: env override on the YAML-loaded path for the
+        // persistent-regime entry gate. Default stays shadow-only.
+        if let Ok(value) = env::var("REGIME_BLOCK_ENTRIES") {
+            let lower = value.trim().to_ascii_lowercase();
+            self.default_pair_params.regime_block_entries =
+                matches!(lower.as_str(), "1" | "true" | "yes");
+        }
+
         // Kalman filter
         if let Ok(value) = env::var("USE_KALMAN_BETA") {
             self.use_kalman_beta = value.to_lowercase() == "true";
@@ -1938,6 +1964,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
             .ok()
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(DEFAULT_USE_FROZEN_BETA_EXIT_Z),
+        regime_block_entries: env::var("REGIME_BLOCK_ENTRIES")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(DEFAULT_REGIME_BLOCK_ENTRIES),
     }
 }
 
@@ -2021,6 +2051,7 @@ pub(super) fn resolve_strategies(
                     rehedge_velocity_projected_drift_min: s.rehedge_velocity_projected_drift_min,
                     beta_uncertainty_max: s.beta_uncertainty_max,
                     use_frozen_beta_exit_z: s.use_frozen_beta_exit_z,
+                    regime_block_entries: s.regime_block_entries,
                 }
             })
             .collect(),
@@ -2049,6 +2080,7 @@ pub(super) fn resolve_strategies(
             rehedge_velocity_projected_drift_min: None,
             beta_uncertainty_max: None,
             use_frozen_beta_exit_z: None,
+            regime_block_entries: None,
         }],
     }
 }
@@ -2150,6 +2182,9 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         use_frozen_beta_exit_z: yaml
             .use_frozen_beta_exit_z
             .unwrap_or(DEFAULT_USE_FROZEN_BETA_EXIT_Z),
+        regime_block_entries: yaml
+            .regime_block_entries
+            .unwrap_or(DEFAULT_REGIME_BLOCK_ENTRIES),
     }
 }
 
@@ -2340,6 +2375,76 @@ strategies:
         assert_eq!(c.entry_z_base, Some(2.5), "C overrides entry_z_base");
         assert_eq!(c.entry_z_min, Some(2.0));
         assert_eq!(c.entry_z_max, Some(3.0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn per_strategy_regime_block_entries_override_resolves() {
+        // bot-strategy#494 Phase 1: on the single-process A/B/C layout, a single
+        // challenger must be able to opt into the regime entry-gate while the
+        // control variants stay on the global default (false). This guards the
+        // 4-site plumbing (StrategyYaml -> StrategyConfig -> mod.rs overlay)
+        // against the silent-global-inherit trap (memory: strategy_yaml_silent_drop).
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("pairtrade_per_strategy_regime_block.yaml");
+        let yaml = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+strategies:
+  - id: a
+  - id: b
+  - id: c
+    regime_block_entries: true
+"#;
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+
+        let cfg = PairTradeConfig::from_yaml_path(&path).expect("yaml load");
+
+        // Top-level default stays false (shadow-only) when no global override set.
+        assert!(
+            !cfg.default_pair_params.regime_block_entries,
+            "global default must be false (shadow-only)"
+        );
+
+        let by_id = |id: &str| {
+            cfg.strategies
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("missing strategy {id}"))
+                .clone()
+        };
+
+        // Only the challenger carries the per-strategy override; controls inherit.
+        assert_eq!(
+            by_id("c").regime_block_entries,
+            Some(true),
+            "C opts in via per-strategy override"
+        );
+        assert!(
+            by_id("a").regime_block_entries.is_none(),
+            "A inherits the global default (None at the override layer)"
+        );
+        assert!(
+            by_id("b").regime_block_entries.is_none(),
+            "B inherits the global default (None at the override layer)"
+        );
+
+        // Reproduce the mod.rs overlay resolution to assert the final per-variant
+        // boolean: C blocks while A/B remain false.
+        let global = cfg.default_pair_params.regime_block_entries;
+        let resolved = |id: &str| by_id(id).regime_block_entries.unwrap_or(global);
+        assert!(resolved("c"), "C resolves to regime_block_entries = true");
+        assert!(!resolved("a"), "A resolves to false (control)");
+        assert!(!resolved("b"), "B resolves to false (control)");
 
         let _ = std::fs::remove_file(&path);
     }

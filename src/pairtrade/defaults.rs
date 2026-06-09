@@ -98,6 +98,11 @@ pub(super) const DEFAULT_KALMAN_R: f64 = 1e-3;
 pub(super) const DEFAULT_KALMAN_INITIAL_P: f64 = 1.0;
 pub(super) const DEFAULT_KALMAN_MIN_UPDATES: u64 = 60;
 
+// Innovation-responsive persistent-regime gate (bot-strategy#494). Phase 1
+// is shadow-only: the detector and its gauges always run, but blocking
+// entries is opt-in and OFF by default.
+pub(super) const DEFAULT_REGIME_BLOCK_ENTRIES: bool = false;
+
 // Std collapse guard (disabled by default: window=0 or ratio=0.0 → filter inactive).
 // See bot-strategy#62: on 2026-04-15 the BTC/ETH spread std collapsed from
 // 1.018 → 0.0016 within minutes, producing meaningless z-scores that all three
