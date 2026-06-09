@@ -242,6 +242,11 @@ pub(super) struct RegimeDetector {
     active_since_ts: Option<i64>,
     /// Last normalised innovation, surfaced as a shadow gauge.
     last_normalized: f64,
+    /// Highest CUSUM observed since process start and its replay/market
+    /// timestamp. Used by byte-exact calibration even when `h_on` is never
+    /// crossed and no transition log is emitted.
+    peak_cusum: f64,
+    peak_cusum_ts: Option<i64>,
 }
 
 impl RegimeDetector {
@@ -295,6 +300,10 @@ impl RegimeDetector {
             self.cusum = (self.cusum + (mag - MAG_REF) - CUSUM_K).max(0.0);
         }
         let stat = self.cusum;
+        if stat > self.peak_cusum {
+            self.peak_cusum = stat;
+            self.peak_cusum_ts = Some(now_ts);
+        }
 
         if !self.active {
             if stat >= CUSUM_H_ON {
@@ -326,6 +335,14 @@ impl RegimeDetector {
 
     pub(super) fn last_normalized(&self) -> f64 {
         self.last_normalized
+    }
+
+    pub(super) fn peak_cusum(&self) -> f64 {
+        self.peak_cusum
+    }
+
+    pub(super) fn peak_cusum_ts(&self) -> Option<i64> {
+        self.peak_cusum_ts
     }
 
     /// Seconds the detector has been continuously active, or 0 when
@@ -505,6 +522,8 @@ mod tests {
         );
         assert!(det.is_active());
         assert!(det.active_secs(ts) > 0.0);
+        assert!(det.peak_cusum() >= CUSUM_H_ON);
+        assert!(det.peak_cusum_ts().is_some());
 
         // Relationship repairs: innovations fall back inside the band and the
         // state clears (hysteresis lets it ride out a couple of ticks first).

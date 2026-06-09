@@ -93,7 +93,7 @@ ENABLE_DATA_DUMP=false \
 RUST_LOG="warn,debot::pairtrade=info" \
 UNIVERSE_PAIRS="BTC/ETH" \
 PAIRTRADE_CONFIG_PATH="$CONFIG" \
-"$@" \
+env "$@" \
 $BINARY > "$WORK_DIR/bt.log" 2>&1
 
 echo "BT log: $WORK_DIR/bt.log ($(wc -l < "$WORK_DIR/bt.log") lines)"
