@@ -29,15 +29,19 @@ mod regime;
 mod rehedge;
 mod risk_io;
 mod s3_mirror;
+mod sentinel;
 mod sizing;
 mod state;
 mod stats;
 mod status;
 mod util;
+// Re-exported at the pairtrade module root so existing `super::super::`
+// references in engine submodules resolve unchanged (bot-strategy#502).
 use bar::BarBuilder;
 pub use config::{PairTradeConfig, WarmStartMode};
 use market::SymbolSnapshot;
 use pnl_log::{PnlLogRecord, PnlLogger};
+pub(in crate::pairtrade) use sentinel::{risk_ack_path, KILL_SWITCH_PATH};
 use stats::PriceSample;
 
 /// Spawn the Prometheus exporter when `PROM_LISTEN` is set in the env.
@@ -66,45 +70,6 @@ use util::{enforce_post_only_passive, round_price_by_tick, tail_std};
 /// branch of `step()`), which after dex-connector v4.2.83 is a WS-derived
 /// cache hit in steady state. See bot-strategy#156, #239.
 const EQUITY_REFRESH_CACHE_SECS: u64 = 300;
-
-/// Sentinel file that, when present, blocks all new entries without
-/// requiring `systemctl stop`. Existing positions still exit normally.
-/// Manage via `ssh debot "sudo touch /opt/debot/KILL_SWITCH"` to engage
-/// and `sudo rm /opt/debot/KILL_SWITCH` to release. Engages at the top
-/// of every `step_shared` tick, so reaction latency matches
-/// `interval_secs`. See bot-strategy#185 Phase 1-2.
-const KILL_SWITCH_PATH: &str = "/opt/debot/KILL_SWITCH";
-
-/// Manual-ack sentinel for clearing a session-DD halt (Phase 3-2). Drop
-/// this file (any contents) on the host to lift the halt; the bot
-/// consumes it at the top of `step_shared` so the file is removed even
-/// if all instances were already clear. See bot-strategy#185 Phase 3-2.
-///
-/// Defaults to `/opt/debot/RISK_ACK` for backwards compatibility with the
-/// main bot's deploy. Overridable via the `RISK_ACK_PATH` env var so
-/// multi-bot hosts (canary + main, Extended + main) can each consume an
-/// independent ack file and avoid the "drop one file, release every bot"
-/// footgun. Resolved once at process start. bot-strategy#488.
-const DEFAULT_RISK_ACK_PATH: &str = "/opt/debot/RISK_ACK";
-
-pub(in crate::pairtrade) fn risk_ack_path() -> &'static str {
-    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| resolve_risk_ack_path(std::env::var("RISK_ACK_PATH").ok()))
-        .as_str()
-}
-
-/// Pure resolver split out of `risk_ack_path` so the env precedence is
-/// unit-testable without touching the process-global `OnceLock`. A
-/// present, non-blank `RISK_ACK_PATH` wins; unset *or* blank falls back to
-/// the default. The blank guard stops an accidental `RISK_ACK_PATH=`
-/// (empty export) from silently pointing the ack file at the process cwd.
-/// bot-strategy#488.
-fn resolve_risk_ack_path(env_val: Option<String>) -> String {
-    match env_val {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => DEFAULT_RISK_ACK_PATH.to_string(),
-    }
-}
 
 /// Apply the post-exit state transition: clear position, stamp
 /// last_exit_{at,ts}, and — if the exit reason stashed by `exit_reason()`
@@ -1497,28 +1462,6 @@ mod tests {
 
     fn dec(value: &str) -> Decimal {
         Decimal::from_str(value).unwrap()
-    }
-
-    #[test]
-    fn resolve_risk_ack_path_prefers_env_then_falls_back() {
-        // bot-strategy#488: a non-blank override wins so co-located bots
-        // (canary / Extended) consume their own ack file...
-        assert_eq!(
-            resolve_risk_ack_path(Some("/opt/debot-canary/RISK_ACK".to_string())),
-            "/opt/debot-canary/RISK_ACK"
-        );
-        // ...while unset preserves the main bot's historical path.
-        assert_eq!(resolve_risk_ack_path(None), DEFAULT_RISK_ACK_PATH);
-        // Blank / whitespace-only exports fall back rather than aiming the
-        // ack file at the process cwd.
-        assert_eq!(
-            resolve_risk_ack_path(Some(String::new())),
-            DEFAULT_RISK_ACK_PATH
-        );
-        assert_eq!(
-            resolve_risk_ack_path(Some("   ".to_string())),
-            DEFAULT_RISK_ACK_PATH
-        );
     }
 
     #[test]
