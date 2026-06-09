@@ -416,6 +416,9 @@ impl PairTradeEngine {
             if let Some(v) = strategy.beta_uncertainty_max {
                 inst_default.beta_uncertainty_max = v;
             }
+            if let Some(v) = strategy.std_collapse_hold_down_secs {
+                inst_default.std_collapse_hold_down_secs = v;
+            }
             if let Some(v) = strategy.use_frozen_beta_exit_z {
                 inst_default.use_frozen_beta_exit_z = v;
             }
@@ -482,6 +485,9 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.beta_uncertainty_max {
                     pp.beta_uncertainty_max = v;
+                }
+                if let Some(v) = strategy.std_collapse_hold_down_secs {
+                    pp.std_collapse_hold_down_secs = v;
                 }
                 if let Some(v) = strategy.use_frozen_beta_exit_z {
                     pp.use_frozen_beta_exit_z = v;
@@ -2406,7 +2412,15 @@ mod pending_tests {
         let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
 
         let result = engine
-            .reissue_partial_legs(&pending, &filled_qtys, &HashMap::new(), false, false, 0, false)
+            .reissue_partial_legs(
+                &pending,
+                &filled_qtys,
+                &HashMap::new(),
+                false,
+                false,
+                0,
+                false,
+            )
             .await
             .unwrap()
             .unwrap();

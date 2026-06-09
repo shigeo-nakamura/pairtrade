@@ -142,6 +142,9 @@ pub struct PairParams {
     // Std collapse guard (both 0 = disabled). See bot-strategy#62.
     pub std_collapse_window_bars: usize,
     pub std_collapse_min_ratio: f64,
+    /// Entry hold-down after a recent std-collapse sample. 0 = disabled
+    /// (legacy point-in-time guard only). bot-strategy#500.
+    pub std_collapse_hold_down_secs: u64,
     pub std_collapse_observe_only: bool,
     /// Use frozen-β z for exit-side gates (`exit_z`, `stop_loss_z`,
     /// expected-value). When `true`, exit-side z is recomputed against
@@ -419,6 +422,7 @@ pub(super) struct PairTradeYaml {
     pub(super) mtf_z_min: Option<f64>,
     pub(super) std_collapse_window_bars: Option<usize>,
     pub(super) std_collapse_min_ratio: Option<f64>,
+    pub(super) std_collapse_hold_down_secs: Option<u64>,
     pub(super) std_collapse_observe_only: Option<bool>,
     /// bot-strategy#473: opt-in to frozen-β exit z. Default false.
     pub(super) use_frozen_beta_exit_z: Option<bool>,
@@ -549,6 +553,10 @@ pub(super) struct StrategyYaml {
     pub(super) rehedge_z_no_revert_factor: Option<f64>,
     pub(super) rehedge_velocity_projected_drift_min: Option<f64>,
     pub(super) beta_uncertainty_max: Option<f64>,
+    /// bot-strategy#500: per-variant override of `std_collapse_hold_down_secs`.
+    /// Lets a single challenger test the defensive hold-down while controls
+    /// inherit the global default.
+    pub(super) std_collapse_hold_down_secs: Option<u64>,
     /// bot-strategy#473: per-variant override of `use_frozen_beta_exit_z`.
     /// Round 6 C opts in; A/B inherit the global default (false).
     pub(super) use_frozen_beta_exit_z: Option<bool>,
@@ -855,6 +863,8 @@ pub struct StrategyConfig {
     pub rehedge_z_no_revert_factor: Option<f64>,
     pub rehedge_velocity_projected_drift_min: Option<f64>,
     pub beta_uncertainty_max: Option<f64>,
+    /// Per-strategy override of `std_collapse_hold_down_secs` (bot-strategy#500).
+    pub std_collapse_hold_down_secs: Option<u64>,
     /// Per-strategy override of `use_frozen_beta_exit_z` (bot-strategy#473).
     pub use_frozen_beta_exit_z: Option<bool>,
     /// Per-strategy override of `regime_block_entries` (bot-strategy#494).
@@ -888,12 +898,64 @@ impl PairTradeConfig {
         m
     }
 
+    fn warn_std_collapse_hold_down_cap(&self) {
+        fn warn_scope(
+            scope: &str,
+            hold_down_secs: u64,
+            window_bars: usize,
+            trading_period_secs: u64,
+        ) {
+            if hold_down_secs == 0 || window_bars == 0 || trading_period_secs == 0 {
+                return;
+            }
+            let max_effective_secs = (window_bars as u64).saturating_mul(trading_period_secs);
+            if hold_down_secs > max_effective_secs {
+                log::warn!(
+                    "{} std_collapse_hold_down_secs={} exceeds retained std-history span {}s \
+                     (std_collapse_window_bars={} * trading_period_secs={}); effective hold-down is capped. \
+                     See bot-strategy#500.",
+                    scope,
+                    hold_down_secs,
+                    max_effective_secs,
+                    window_bars,
+                    trading_period_secs,
+                );
+            }
+        }
+
+        warn_scope(
+            "default_pair_params",
+            self.default_pair_params.std_collapse_hold_down_secs,
+            self.default_pair_params.std_collapse_window_bars,
+            self.trading_period_secs,
+        );
+        for (pair, pp) in &self.pair_params {
+            warn_scope(
+                &format!("pair_params.{pair}"),
+                pp.std_collapse_hold_down_secs,
+                pp.std_collapse_window_bars,
+                self.trading_period_secs,
+            );
+        }
+        for strategy in &self.strategies {
+            if let Some(hold_down_secs) = strategy.std_collapse_hold_down_secs {
+                warn_scope(
+                    &format!("strategies.{}", strategy.id),
+                    hold_down_secs,
+                    self.default_pair_params.std_collapse_window_bars,
+                    self.trading_period_secs,
+                );
+            }
+        }
+    }
+
     /// Assert that `shutdown_grace_secs` covers the longest per-strategy /
     /// per-pair `force_close_secs` plus a small buffer. Catches config drift
     /// like bot-strategy#50, where a strategy's `force_close_time_secs` was
     /// extended without raising the global shutdown grace.
     fn validate(&self) -> Result<()> {
         const BUFFER_SECS: u64 = 60;
+        self.warn_std_collapse_hold_down_cap();
         // 0 = legacy immediate force-close on SIGTERM; no grace window to
         // validate.
         if self.shutdown_grace_secs == 0 {
@@ -1620,6 +1682,10 @@ impl PairTradeConfig {
             "STD_COLLAPSE_MIN_RATIO",
             &mut self.default_pair_params.std_collapse_min_ratio,
         );
+        env_override(
+            "STD_COLLAPSE_HOLD_DOWN_SECS",
+            &mut self.default_pair_params.std_collapse_hold_down_secs,
+        );
         if let Ok(value) = env::var("STD_COLLAPSE_OBSERVE_ONLY") {
             let lower = value.trim().to_ascii_lowercase();
             self.default_pair_params.std_collapse_observe_only =
@@ -1977,6 +2043,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
             DEFAULT_STD_COLLAPSE_WINDOW_BARS,
         ),
         std_collapse_min_ratio: env_parse("STD_COLLAPSE_MIN_RATIO", DEFAULT_STD_COLLAPSE_MIN_RATIO),
+        std_collapse_hold_down_secs: env_parse(
+            "STD_COLLAPSE_HOLD_DOWN_SECS",
+            DEFAULT_STD_COLLAPSE_HOLD_DOWN_SECS,
+        ),
         std_collapse_observe_only: env::var("STD_COLLAPSE_OBSERVE_ONLY")
             .ok()
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
@@ -2072,6 +2142,7 @@ pub(super) fn resolve_strategies(
                     rehedge_z_no_revert_factor: s.rehedge_z_no_revert_factor,
                     rehedge_velocity_projected_drift_min: s.rehedge_velocity_projected_drift_min,
                     beta_uncertainty_max: s.beta_uncertainty_max,
+                    std_collapse_hold_down_secs: s.std_collapse_hold_down_secs,
                     use_frozen_beta_exit_z: s.use_frozen_beta_exit_z,
                     regime_block_entries: s.regime_block_entries,
                 }
@@ -2102,6 +2173,7 @@ pub(super) fn resolve_strategies(
             rehedge_z_no_revert_factor: None,
             rehedge_velocity_projected_drift_min: None,
             beta_uncertainty_max: None,
+            std_collapse_hold_down_secs: None,
             use_frozen_beta_exit_z: None,
             regime_block_entries: None,
         }],
@@ -2200,6 +2272,9 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         std_collapse_min_ratio: yaml
             .std_collapse_min_ratio
             .unwrap_or(DEFAULT_STD_COLLAPSE_MIN_RATIO),
+        std_collapse_hold_down_secs: yaml
+            .std_collapse_hold_down_secs
+            .unwrap_or(DEFAULT_STD_COLLAPSE_HOLD_DOWN_SECS),
         std_collapse_observe_only: yaml
             .std_collapse_observe_only
             .unwrap_or(DEFAULT_STD_COLLAPSE_OBSERVE_ONLY),
@@ -2399,6 +2474,51 @@ strategies:
         assert_eq!(c.entry_z_base, Some(2.5), "C overrides entry_z_base");
         assert_eq!(c.entry_z_min, Some(2.0));
         assert_eq!(c.entry_z_max, Some(3.0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn per_strategy_std_collapse_hold_down_override_resolves() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("pairtrade_per_strategy_std_hold_down.yaml");
+        let yaml = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+std_collapse_hold_down_secs: 0
+strategies:
+  - id: a
+  - id: c
+    std_collapse_hold_down_secs: 3600
+"#;
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+
+        let cfg = PairTradeConfig::from_yaml_path(&path).expect("yaml load");
+        assert_eq!(cfg.default_pair_params.std_collapse_hold_down_secs, 0);
+
+        let by_id = |id: &str| {
+            cfg.strategies
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("missing strategy {id}"))
+                .clone()
+        };
+
+        assert_eq!(by_id("c").std_collapse_hold_down_secs, Some(3600));
+        assert!(by_id("a").std_collapse_hold_down_secs.is_none());
+
+        let global = cfg.default_pair_params.std_collapse_hold_down_secs;
+        let resolved = |id: &str| by_id(id).std_collapse_hold_down_secs.unwrap_or(global);
+        assert_eq!(resolved("a"), 0);
+        assert_eq!(resolved("c"), 3600);
 
         let _ = std::fs::remove_file(&path);
     }

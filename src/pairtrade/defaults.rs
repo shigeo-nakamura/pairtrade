@@ -111,6 +111,9 @@ pub(super) const DEFAULT_REGIME_BLOCK_ENTRIES: bool = false;
 // median of recent stds, i.e. the z denominator is no longer trustworthy.
 pub(super) const DEFAULT_STD_COLLAPSE_WINDOW_BARS: usize = 0;
 pub(super) const DEFAULT_STD_COLLAPSE_MIN_RATIO: f64 = 0.0;
+/// Optional hold-down after a recent std-collapse sample. 0 = disabled and
+/// preserves the legacy point-in-time guard. See bot-strategy#500.
+pub(super) const DEFAULT_STD_COLLAPSE_HOLD_DOWN_SECS: u64 = 0;
 /// Observe-only mode: when true, the guard only logs that it *would* block
 /// the entry, but lets the trade through. Lets operators measure trigger
 /// frequency against live data before enabling the block. See bot-strategy#62.

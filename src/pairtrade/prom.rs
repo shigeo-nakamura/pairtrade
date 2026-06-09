@@ -382,7 +382,7 @@ pub static ENTRY_REJECT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
          gate that fired. Counts pre-`should_enter` gates (KILL_SWITCH, \
          session_halted, daily_loss, circuit_breaker, waiting_first_eval, \
          regime) and the in-`should_enter` filters \
-         (cooldown, post_stop_cooldown, velocity, std_collapse, \
+         (cooldown, post_stop_cooldown, velocity, std_collapse, std_collapse_hold_down, \
          stop_loss_z, spread_trend, beta_divergence, beta_min, \
          z_below_threshold, mtf, net_funding_min). Round-4 follow-up \
          (bot-strategy#355).",
@@ -406,6 +406,7 @@ pub const KNOWN_ENTRY_REJECT_REASONS: &[&str] = &[
     "post_stop_cooldown",
     "velocity",
     "std_collapse",
+    "std_collapse_hold_down",
     "stop_loss_z",
     "spread_trend",
     "beta_divergence",

@@ -48,6 +48,41 @@ pub(super) fn std_collapsed(
     std / median < min_ratio
 }
 
+/// Returns the most recent collapse sample inside the configured hold-down
+/// window, if any. This intentionally reuses `std_history` rather than adding
+/// mutable timestamp state. Sample age x `trading_period_secs` is deterministic
+/// and byte-exact, but it is a bar-sample estimate rather than strict wall
+/// clock time because invalid std samples are not appended. `std_history` is
+/// also capped by `window_bars`, so the effective hold-down cannot exceed the
+/// retained std-history span.
+pub(super) fn recent_std_collapse(
+    std_history: &VecDeque<f64>,
+    window_bars: usize,
+    min_ratio: f64,
+    hold_down_secs: u64,
+    trading_period_secs: u64,
+) -> Option<(usize, f64, f64)> {
+    if window_bars == 0 || min_ratio <= 0.0 || hold_down_secs == 0 || trading_period_secs == 0 {
+        return None;
+    }
+    let min_samples = (window_bars / 2).max(2);
+    if std_history.len() < min_samples {
+        return None;
+    }
+    let median = median_of(std_history)?;
+    if median <= 1e-9 {
+        return None;
+    }
+    let recent_bars = hold_down_secs.div_ceil(trading_period_secs).max(1) as usize;
+    for (bars_ago, sample) in std_history.iter().rev().take(recent_bars).enumerate() {
+        let ratio = *sample / median;
+        if ratio < min_ratio {
+            return Some((bars_ago, ratio, median));
+        }
+    }
+    None
+}
+
 /// Lower bound for any dynamic entry-z scaling factor (vol or funding).
 /// Prevents the threshold from collapsing on noisy single-bar inputs.
 const ENTRY_Z_SCALE_MIN: f64 = 0.5;
@@ -192,12 +227,13 @@ pub(super) fn should_enter(
     // In observe_only mode the guard logs but lets the entry through — lets
     // operators measure trigger frequency on live data without disturbing
     // the #41 A/B/C test window.
-    if std_collapsed(
+    let current_std_collapsed = std_collapsed(
         std,
         &shared.std_history,
         pp.std_collapse_window_bars,
         pp.std_collapse_min_ratio,
-    ) {
+    );
+    if current_std_collapsed {
         let median = median_of(&shared.std_history).unwrap_or(0.0);
         let ratio = if median > 1e-9 { std / median } else { 0.0 };
         if pp.std_collapse_observe_only {
@@ -219,6 +255,41 @@ pub(super) fn should_enter(
                 pp.std_collapse_min_ratio,
             );
             return Err("std_collapse");
+        }
+    } else if let Some((bars_ago, ratio, median)) = recent_std_collapse(
+        &shared.std_history,
+        pp.std_collapse_window_bars,
+        pp.std_collapse_min_ratio,
+        pp.std_collapse_hold_down_secs,
+        cfg.trading_period_secs,
+    ) {
+        let elapsed_secs = bars_ago as u64 * cfg.trading_period_secs;
+        let effective_hold_down_secs = pp
+            .std_collapse_hold_down_secs
+            .min((pp.std_collapse_window_bars as u64).saturating_mul(cfg.trading_period_secs));
+        if pp.std_collapse_observe_only {
+            log::warn!(
+                    "[STD_COLLAPSE_HOLD_DOWN_OBSERVE] z={:.2} ratio={:.4} threshold={:.4} median={:.6} elapsed_est={}s hold_down={}s effective_hold_down={}s (observe-only, entry allowed)",
+                    z,
+                    ratio,
+                    pp.std_collapse_min_ratio,
+                    median,
+                    elapsed_secs,
+                    pp.std_collapse_hold_down_secs,
+                    effective_hold_down_secs,
+                );
+        } else {
+            log::warn!(
+                    "[STD_COLLAPSE_HOLD_DOWN_BLOCK] z={:.2} ratio={:.4} threshold={:.4} median={:.6} elapsed_est={}s hold_down={}s effective_hold_down={}s",
+                    z,
+                    ratio,
+                    pp.std_collapse_min_ratio,
+                    median,
+                    elapsed_secs,
+                    pp.std_collapse_hold_down_secs,
+                    effective_hold_down_secs,
+                );
+            return Err("std_collapse_hold_down");
         }
     }
 
@@ -373,6 +444,31 @@ mod tests {
         let samples: Vec<f64> = vec![0.0; 30];
         let h = make_history(&samples);
         assert!(!std_collapsed(0.001, &h, 30, 0.2));
+    }
+
+    #[test]
+    fn recent_std_collapse_disabled_when_hold_down_zero() {
+        let h = make_history(&[1.0, 1.0, 0.1, 1.0]);
+        assert_eq!(recent_std_collapse(&h, 4, 0.2, 0, 60), None);
+    }
+
+    #[test]
+    fn recent_std_collapse_detects_prior_sample_inside_window() {
+        let h = make_history(&[1.0, 1.0, 0.1, 1.0, 1.0]);
+        let found = recent_std_collapse(&h, 4, 0.2, 180, 60)
+            .expect("collapse sample should be inside 3-bar hold-down");
+        assert_eq!(found.0, 2, "collapse was two bars ago");
+        assert!(
+            (found.1 - 0.1).abs() < 1e-9,
+            "ratio should be sample/median"
+        );
+        assert!((found.2 - 1.0).abs() < 1e-9, "median should be 1.0");
+    }
+
+    #[test]
+    fn recent_std_collapse_ignores_sample_outside_window() {
+        let h = make_history(&[1.0, 0.1, 1.0, 1.0, 1.0]);
+        assert_eq!(recent_std_collapse(&h, 4, 0.2, 120, 60), None);
     }
 
     // ---- bot-strategy#316: post-stop_loss_z cool-down ----
