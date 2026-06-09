@@ -54,6 +54,47 @@ impl PairTradeEngine {
         parts.join(", ")
     }
 
+    /// Partition a position list into `(closable, dust)`.
+    ///
+    /// A position whose size is below the venue's per-symbol minimum order
+    /// size can never be submitted to `close_all_positions` — the connector
+    /// rejects sub-min sizes (`round_size_for_market` → `InvalidInput`), so
+    /// the startup force-close would retry it `attempts` times and then
+    /// escalate with a "still open" ERROR + email on every restart
+    /// (bot-strategy#487: a 0.00001 BTC dust SHORT below Extended's 0.0001
+    /// min). Such positions are treated as already flat: never closed, never
+    /// escalated. Symbols whose min order size is unavailable (ticker fetch
+    /// failed, or the venue advertises no minimum) are treated as closable so
+    /// a genuine position is never silently skipped.
+    async fn split_dust_positions(
+        &self,
+        positions: Vec<PositionSnapshot>,
+    ) -> (Vec<PositionSnapshot>, Vec<PositionSnapshot>) {
+        let mut closable = Vec::new();
+        let mut dust = Vec::new();
+        for position in positions {
+            let is_dust = match self.connector.get_ticker(&position.symbol, None).await {
+                Ok(ticker) => ticker
+                    .min_order
+                    .is_some_and(|min_order| position.size < min_order),
+                Err(err) => {
+                    log::warn!(
+                        "[Startup] dust check: get_ticker {} failed, treating as closable: {:?}",
+                        position.symbol,
+                        err
+                    );
+                    false
+                }
+            };
+            if is_dust {
+                dust.push(position);
+            } else {
+                closable.push(position);
+            }
+        }
+        (closable, dust)
+    }
+
     /// Poll `get_positions()` until the WS account snapshot has arrived or
     /// `timeout` elapses. Lighter's connector returns
     /// `DexError::Transient("positions not ready from websocket")` until the
@@ -123,20 +164,32 @@ impl PairTradeEngine {
         for attempt in 1..=attempts {
             let positions_result = self.connector.get_positions().await;
             match positions_result {
-                Ok(positions) if positions.is_empty() => {
-                    if attempt == 1 {
-                        log::info!("[Startup] No open positions detected");
-                    } else {
-                        log::info!("[Startup] All positions closed");
-                    }
-                    return Ok(());
-                }
                 Ok(positions) => {
+                    // bot-strategy#487: drop sub-min dust before deciding
+                    // whether anything is left to close. Dust can never be
+                    // submitted to close_all_positions, so counting it as
+                    // "open" would spin the retry loop and escalate forever.
+                    let (closable, dust) = self.split_dust_positions(positions).await;
+                    if closable.is_empty() {
+                        if dust.is_empty() {
+                            if attempt == 1 {
+                                log::info!("[Startup] No open positions detected");
+                            } else {
+                                log::info!("[Startup] All positions closed");
+                            }
+                        } else {
+                            log::warn!(
+                                "[Startup] only sub-min dust remains, treating as flat (bot-strategy#487): {}",
+                                Self::format_positions_summary(&dust)
+                            );
+                        }
+                        return Ok(());
+                    }
                     log::info!(
                         "[Startup] close attempt {}/{}: {}",
                         attempt,
                         attempts,
-                        Self::format_positions_summary(&positions)
+                        Self::format_positions_summary(&closable)
                     );
                     if attempt == 1 {
                         // bot-strategy#269 Phase 3: record what is about to be
@@ -144,12 +197,30 @@ impl PairTradeEngine {
                         // journalctl's 7-day retention. Only on the first
                         // attempt — subsequent retries see partial / shrinking
                         // residue of the same position set and would double-count.
-                        if let Err(err) = pnl_log::log_startup_force_close(&self.cfg, &positions) {
+                        if let Err(err) = pnl_log::log_startup_force_close(&self.cfg, &closable) {
                             log::warn!("[Startup] log_startup_force_close failed: {:?}", err);
                         }
                     }
-                    if let Err(err) = self.connector.close_all_positions(None).await {
-                        log::error!("[Startup] close_all_positions failed: {:?}", err);
+                    // bot-strategy#487: close each closable leg by symbol
+                    // rather than close_all_positions(None). The connector's
+                    // close-all aborts on the first sub-min position
+                    // (round_size_for_market → InvalidInput), which in a
+                    // real+dust mix could strand a genuine position and leave
+                    // startup running with live exposure. Per-symbol closes
+                    // never pass dust to the connector, so the abort cannot
+                    // block a real leg.
+                    for position in &closable {
+                        if let Err(err) = self
+                            .connector
+                            .close_all_positions(Some(position.symbol.clone()))
+                            .await
+                        {
+                            log::error!(
+                                "[Startup] close_all_positions({}) failed: {:?}",
+                                position.symbol,
+                                err
+                            );
+                        }
                     }
                 }
                 Err(err) => {
@@ -177,11 +248,23 @@ impl PairTradeEngine {
             sleep(Duration::from_secs(wait_secs)).await;
         }
         match self.connector.get_positions().await {
-            Ok(positions) if positions.is_empty() => {
-                log::info!("[Startup] All positions closed");
-            }
             Ok(positions) => {
-                let summary = Self::format_positions_summary(&positions);
+                // bot-strategy#487: sub-min dust is not a force-close failure —
+                // it can never be flattened, so do not ERROR/email on it.
+                let (closable, dust) = self.split_dust_positions(positions).await;
+                if closable.is_empty() {
+                    if dust.is_empty() {
+                        log::info!("[Startup] All positions closed");
+                    } else {
+                        log::warn!(
+                            "[Startup] only sub-min dust remains after {} attempts, treating as flat (bot-strategy#487): {}",
+                            attempts,
+                            Self::format_positions_summary(&dust)
+                        );
+                    }
+                    return Ok(());
+                }
+                let summary = Self::format_positions_summary(&closable);
                 log::error!(
                     "[Startup] positions still open after {} attempts: {}",
                     attempts,
