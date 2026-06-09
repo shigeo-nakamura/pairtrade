@@ -39,6 +39,22 @@ use super::super::state::{
 use super::super::PairTradeEngine;
 
 impl PairTradeEngine {
+    /// In amend mode the caller skips the upstream blanket cancel so the
+    /// order we are about to amend stays alive. Any leg we end up NOT
+    /// amending (fully filled, below tick, missing price) may still have an
+    /// open remainder resting, so cancel it here to reproduce the legacy
+    /// cancel-then-reissue end state (bot-strategy#471). No-op when not
+    /// amending.
+    async fn cancel_amend_skipped_leg(&self, use_amend: bool, leg: &PendingLeg) {
+        if use_amend {
+            let _ = self
+                .connector
+                .cancel_order(&leg.symbol, &leg.order_id)
+                .await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // entry/exit reissue param shape + the bot-strategy#471 amend toggle.
     pub(in crate::pairtrade) async fn reissue_partial_legs(
         &mut self,
         pending: &PendingOrders,
@@ -47,6 +63,7 @@ impl PairTradeEngine {
         reduce_only: bool,
         use_market: bool,
         retry_count: u32,
+        use_amend: bool,
     ) -> Result<Option<PendingOrders>> {
         let mut new_legs = Vec::new();
         let stage = if reduce_only { "exit" } else { "entry" };
@@ -96,6 +113,7 @@ impl PairTradeEngine {
                 (local_filled, r)
             };
             if remaining <= Decimal::ZERO {
+                self.cancel_amend_skipped_leg(use_amend, leg).await;
                 let mut kept = leg.clone();
                 kept.filled = filled;
                 new_legs.push(kept);
@@ -112,6 +130,7 @@ impl PairTradeEngine {
                         stage,
                         leg.symbol
                     );
+                    self.cancel_amend_skipped_leg(use_amend, leg).await;
                     let mut kept = leg.clone();
                     kept.filled = filled;
                     new_legs.push(kept);
@@ -130,6 +149,7 @@ impl PairTradeEngine {
                     leg.symbol,
                     remaining
                 );
+                self.cancel_amend_skipped_leg(use_amend, leg).await;
                 let mut kept = leg.clone();
                 kept.filled = filled;
                 new_legs.push(kept);
@@ -151,6 +171,7 @@ impl PairTradeEngine {
                     stage,
                     leg.symbol
                 );
+                self.cancel_amend_skipped_leg(use_amend, leg).await;
                 let mut kept = leg.clone();
                 kept.filled = filled;
                 new_legs.push(kept);
@@ -174,52 +195,129 @@ impl PairTradeEngine {
                 new_legs.push(kept);
                 continue;
             }
-            match self
-                .connector
-                .create_order(
-                    &leg.symbol,
-                    quantized_size,
-                    leg.side,
-                    limit,
-                    spread,
-                    reduce_only,
-                    None,
-                )
-                .await
-            {
+            // bot-strategy#471: amend in place of cancel+reissue when opted
+            // in. `target_total_size = leg.target` re-asserts the original
+            // total (native-amend venues keep the filled portion and re-open
+            // only the remainder); `open_remaining_size = quantized_size` is
+            // the #470-capped remainder that cancel-replace venues place
+            // afresh. On any amend error fall back to cancel+reissue for this
+            // leg (the upstream blanket cancel was skipped in amend mode).
+            let placement = if use_amend {
+                match self
+                    .connector
+                    .modify_order(
+                        &leg.symbol,
+                        &leg.order_id,
+                        leg.side,
+                        leg.target,
+                        quantized_size,
+                        limit,
+                        spread,
+                        reduce_only,
+                    )
+                    .await
+                {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => {
+                        log::warn!(
+                            "[ORDER] amend failed for {} leg {} ({:?}); falling back to cancel+reissue",
+                            stage,
+                            leg.symbol,
+                            e
+                        );
+                        let _ = self
+                            .connector
+                            .cancel_order(&leg.symbol, &leg.order_id)
+                            .await;
+                        self.connector
+                            .create_order(
+                                &leg.symbol,
+                                quantized_size,
+                                leg.side,
+                                limit,
+                                spread,
+                                reduce_only,
+                                None,
+                            )
+                            .await
+                    }
+                }
+            } else {
+                self.connector
+                    .create_order(
+                        &leg.symbol,
+                        quantized_size,
+                        leg.side,
+                        limit,
+                        spread,
+                        reduce_only,
+                        None,
+                    )
+                    .await
+            };
+            match placement {
                 Ok(resp) => {
-                    log::info!(
-                        "[ORDER] Reissued {} leg {} size={}",
-                        stage,
-                        leg.symbol,
-                        quantized_size
-                    );
-                    if filled > Decimal::ZERO {
-                        // Preserved record of the already-filled portion
-                        // of the original leg. No new fill expected on
-                        // this entry, so both decision-time fields stay
-                        // None.
+                    // Native in-place amend keeps the order's identity: the
+                    // same order_id continues to fill toward the original
+                    // target with its already-filled portion intact. Record
+                    // it as ONE continuing leg so fill aggregation (keyed by
+                    // order_id) doesn't double-count. A cancel-replace amend
+                    // (Extended) or a plain reissue/create returns a NEW id —
+                    // those keep the original two-leg shape (a settled
+                    // already-filled leg + a fresh remainder leg).
+                    let amended_in_place = use_amend && resp.order_id == leg.order_id;
+                    if amended_in_place {
+                        log::info!(
+                            "[ORDER] Amended {} leg {} remaining={} in place (order {})",
+                            stage,
+                            leg.symbol,
+                            quantized_size,
+                            leg.order_id
+                        );
                         new_legs.push(PendingLeg {
                             symbol: leg.symbol.clone(),
-                            order_id: leg.order_id.clone(),
+                            order_id: resp.order_id,
                             exchange_order_id: leg.exchange_order_id.clone(),
-                            target: filled,
+                            target: leg.target,
                             filled,
                             side: leg.side,
-                            limit_price: None,
-                            reference_price: None,
+                            limit_price: limit,
+                            reference_price: ref_price_reissue,
+                        });
+                    } else {
+                        log::info!(
+                            "[ORDER] Reissued {} leg {} size={}",
+                            stage,
+                            leg.symbol,
+                            quantized_size
+                        );
+                        if filled > Decimal::ZERO {
+                            // Preserved record of the already-filled portion
+                            // of the original leg. No new fill expected on
+                            // this entry, so both decision-time fields stay
+                            // None.
+                            new_legs.push(PendingLeg {
+                                symbol: leg.symbol.clone(),
+                                order_id: leg.order_id.clone(),
+                                exchange_order_id: leg.exchange_order_id.clone(),
+                                target: filled,
+                                filled,
+                                side: leg.side,
+                                limit_price: None,
+                                reference_price: None,
+                            });
+                        }
+                        new_legs.push(PendingLeg {
+                            symbol: leg.symbol.clone(),
+                            order_id: resp.order_id,
+                            exchange_order_id: resp.exchange_order_id,
+                            target: quantized_size,
+                            filled: Decimal::ZERO,
+                            side: leg.side,
+                            limit_price: limit,
+                            reference_price: ref_price_reissue,
                         });
                     }
-                    new_legs.push(PendingLeg {
-                        symbol: leg.symbol.clone(),
-                        order_id: resp.order_id,
-                        exchange_order_id: resp.exchange_order_id,
-                        target: quantized_size,
-                        filled: Decimal::ZERO,
-                        side: leg.side,
-                        limit_price: limit,
-                        reference_price: ref_price_reissue,
-                    });
                 }
                 Err(e) => {
                     let symbol = leg.symbol.clone();

@@ -183,7 +183,18 @@ impl PairTradeEngine {
                         key
                     );
                 }
-                self.cancel_pending_orders(&pending).await?;
+                // bot-strategy#471: when amend-on-partial-fill is enabled (and
+                // we're not escalating to a market takeover, which a native
+                // amend can't retarget the TIF for), skip the blanket cancel
+                // so `reissue_partial_legs` can amend the resting order in
+                // place. It falls back to cancel+reissue per-leg on any amend
+                // error, and cancels any leg it does NOT amend, so the end
+                // state matches the legacy path.
+                let use_amend = !use_market
+                    && self.pair_params_for(inst_idx, key).use_amend_on_partial_fill;
+                if !use_amend {
+                    self.cancel_pending_orders(&pending).await?;
+                }
                 if let Some(new_pending) = self
                     .reissue_partial_legs(
                         &pending,
@@ -192,6 +203,7 @@ impl PairTradeEngine {
                         false,
                         use_market,
                         next_retry,
+                        use_amend,
                     )
                     .await?
                 {
@@ -597,7 +609,15 @@ impl PairTradeEngine {
                 );
                 self.cancel_pending_orders(&pending).await?;
                 if let Some(new_pending) = self
-                    .reissue_partial_legs(&pending, &filled_qtys, price_map, true, true, next_retry)
+                    .reissue_partial_legs(
+                        &pending,
+                        &filled_qtys,
+                        price_map,
+                        true,
+                        true,
+                        next_retry,
+                        false,
+                    )
                     .await?
                 {
                     if let Some(state) = self.instances[inst_idx].states.get_mut(key) {

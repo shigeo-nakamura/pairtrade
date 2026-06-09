@@ -87,6 +87,14 @@ pub struct PairParams {
     /// modes ALWAYS simulate the re-hedge regardless of this flag, so
     /// BT verification works before live opt-in.
     pub rehedge_live_enabled: bool,
+    /// bot-strategy#471: when `true`, the entry partial-fill reissue path
+    /// amends the still-open order in place (atomic `modify_order`) instead
+    /// of cancel + reissue, eliminating the race the bot-strategy#470 cap
+    /// papers over. Opt-in per host; default `false` falls back to the
+    /// legacy cancel+reissue path. Any `modify_order` error (incl. venues
+    /// that don't support amend) also falls back, so the #470 cap stays the
+    /// backstop.
+    pub use_amend_on_partial_fill: bool,
     /// Additional gate (bot-strategy#465): only fire re-hedge when the
     /// spread is at least as far from the mean as it was at entry, i.e.
     /// `|z_now| >= |z_entry| * rehedge_z_no_revert_factor`. Default
@@ -401,6 +409,7 @@ pub(super) struct PairTradeYaml {
     pub(super) rehedge_cooldown_secs: Option<u64>,
     pub(super) rehedge_min_qty_notional_usd: Option<f64>,
     pub(super) rehedge_live_enabled: Option<bool>,
+    pub(super) use_amend_on_partial_fill: Option<bool>,
     pub(super) rehedge_require_no_revert: Option<bool>,
     pub(super) rehedge_z_no_revert_factor: Option<f64>,
     pub(super) rehedge_velocity_projected_drift_min: Option<f64>,
@@ -535,6 +544,7 @@ pub(super) struct StrategyYaml {
     pub(super) rehedge_cooldown_secs: Option<u64>,
     pub(super) rehedge_min_qty_notional_usd: Option<f64>,
     pub(super) rehedge_live_enabled: Option<bool>,
+    pub(super) use_amend_on_partial_fill: Option<bool>,
     pub(super) rehedge_require_no_revert: Option<bool>,
     pub(super) rehedge_z_no_revert_factor: Option<f64>,
     pub(super) rehedge_velocity_projected_drift_min: Option<f64>,
@@ -838,6 +848,9 @@ pub struct StrategyConfig {
     pub rehedge_cooldown_secs: Option<u64>,
     pub rehedge_min_qty_notional_usd: Option<f64>,
     pub rehedge_live_enabled: Option<bool>,
+    /// bot-strategy#471 per-strategy override for the entry partial-fill
+    /// amend path (see PairParams::use_amend_on_partial_fill).
+    pub use_amend_on_partial_fill: Option<bool>,
     pub rehedge_require_no_revert: Option<bool>,
     pub rehedge_z_no_revert_factor: Option<f64>,
     pub rehedge_velocity_projected_drift_min: Option<f64>,
@@ -1547,6 +1560,10 @@ impl PairTradeConfig {
             &mut self.default_pair_params.rehedge_live_enabled,
         );
         env_override(
+            "USE_AMEND_ON_PARTIAL_FILL",
+            &mut self.default_pair_params.use_amend_on_partial_fill,
+        );
+        env_override(
             "REHEDGE_REQUIRE_NO_REVERT",
             &mut self.default_pair_params.rehedge_require_no_revert,
         );
@@ -1938,6 +1955,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         // default. BT / dry_run always simulate; live opt-in requires
         // this to be flipped (env or per-strategy YAML).
         rehedge_live_enabled: env_parse("REHEDGE_LIVE_ENABLED", false),
+        // bot-strategy#471 — amend-on-partial-fill is OFF by default; flip
+        // per host (env or per-strategy YAML) after the Tokyo Extended
+        // dry_run soak.
+        use_amend_on_partial_fill: env_parse("USE_AMEND_ON_PARTIAL_FILL", false),
         rehedge_require_no_revert: env_parse("REHEDGE_REQUIRE_NO_REVERT", false),
         rehedge_z_no_revert_factor: env_parse("REHEDGE_Z_NO_REVERT_FACTOR", 1.0),
         rehedge_velocity_projected_drift_min: env_parse(
@@ -2046,6 +2067,7 @@ pub(super) fn resolve_strategies(
                     rehedge_cooldown_secs: s.rehedge_cooldown_secs,
                     rehedge_min_qty_notional_usd: s.rehedge_min_qty_notional_usd,
                     rehedge_live_enabled: s.rehedge_live_enabled,
+                    use_amend_on_partial_fill: s.use_amend_on_partial_fill,
                     rehedge_require_no_revert: s.rehedge_require_no_revert,
                     rehedge_z_no_revert_factor: s.rehedge_z_no_revert_factor,
                     rehedge_velocity_projected_drift_min: s.rehedge_velocity_projected_drift_min,
@@ -2075,6 +2097,7 @@ pub(super) fn resolve_strategies(
             rehedge_cooldown_secs: None,
             rehedge_min_qty_notional_usd: None,
             rehedge_live_enabled: None,
+            use_amend_on_partial_fill: None,
             rehedge_require_no_revert: None,
             rehedge_z_no_revert_factor: None,
             rehedge_velocity_projected_drift_min: None,
@@ -2161,6 +2184,7 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         rehedge_cooldown_secs: yaml.rehedge_cooldown_secs.unwrap_or(1800),
         rehedge_min_qty_notional_usd: yaml.rehedge_min_qty_notional_usd.unwrap_or(50.0),
         rehedge_live_enabled: yaml.rehedge_live_enabled.unwrap_or(false),
+        use_amend_on_partial_fill: yaml.use_amend_on_partial_fill.unwrap_or(false),
         rehedge_require_no_revert: yaml.rehedge_require_no_revert.unwrap_or(false),
         rehedge_z_no_revert_factor: yaml.rehedge_z_no_revert_factor.unwrap_or(1.0),
         rehedge_velocity_projected_drift_min: yaml
