@@ -331,6 +331,22 @@ impl PairTradeEngine {
         }
     }
 
+    /// Dump peak detector state at BT end-of-data. Transition-only logs are
+    /// insufficient for threshold calibration when a known shift raises the
+    /// CUSUM but does not cross the current `h_on`.
+    fn log_regime_summary(&self) {
+        for (pair, shared) in &self.per_pair_state {
+            log::info!(
+                "[REGIME_SUMMARY] pair={} peak_cusum={:.4} peak_event_ts={} final_cusum={:.4} active={}",
+                pair,
+                shared.regime.peak_cusum(),
+                shared.regime.peak_cusum_ts().unwrap_or(0),
+                shared.regime.cusum(),
+                shared.regime.is_active(),
+            );
+        }
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         log::info!("[CONFIG] DEX_NAME is: {}", self.cfg.dex_name);
         log::info!(
@@ -409,6 +425,7 @@ impl PairTradeEngine {
                 if !has_more {
                     log::info!("[BACKTEST] End of data file reached. Backtest finished.");
                     self.log_entry_reject_summary();
+                    self.log_regime_summary();
                     break;
                 }
             }
