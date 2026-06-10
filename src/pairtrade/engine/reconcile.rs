@@ -73,6 +73,38 @@ impl PairTradeEngine {
         }
     }
 
+    /// Pure derivation of the entry-fill snapshot's per-leg prices and
+    /// sizes: split the `base/quote` pair key, look up each side's mark
+    /// price in `price_map`, and sum the filled-leg sizes by symbol.
+    /// Returns `(price_a, price_b, size_a, size_b)`; all `None` when `key`
+    /// is not a `base/quote` pair. Extracted from `reconcile_pending_orders`
+    /// so the entry-snapshot field derivation is auditable/testable
+    /// (bot-strategy#502).
+    #[allow(clippy::type_complexity)]
+    fn entry_prices_and_sizes(
+        key: &str,
+        price_map: &HashMap<String, SymbolSnapshot>,
+        legs: &[PendingLeg],
+    ) -> (
+        Option<Decimal>,
+        Option<Decimal>,
+        Option<Decimal>,
+        Option<Decimal>,
+    ) {
+        match key.split_once('/') {
+            Some((base, quote)) => {
+                let (es_a, es_b) = Self::sum_entry_sizes_by_symbol(legs, base, quote);
+                (
+                    price_map.get(base).map(|s| s.price),
+                    price_map.get(quote).map(|s| s.price),
+                    es_a,
+                    es_b,
+                )
+            }
+            None => (None, None, None, None),
+        }
+    }
+
     pub(in crate::pairtrade) async fn reconcile_pending_orders(
         &mut self,
         inst_idx: usize,
@@ -103,15 +135,8 @@ impl PairTradeEngine {
                 // hedged ratio, not against a later re-estimation.
                 let beta_at_entry = self.per_pair_state.get(key).map(|s| s.beta);
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                    let (mut ep_a, mut ep_b, mut es_a, mut es_b) = (None, None, None, None);
-                    if let Some((base, quote)) = key.split_once('/') {
-                        ep_a = price_map.get(base).map(|s| s.price);
-                        ep_b = price_map.get(quote).map(|s| s.price);
-                        let (sum_a, sum_b) =
-                            Self::sum_entry_sizes_by_symbol(&pending.legs, base, quote);
-                        es_a = sum_a;
-                        es_b = sum_b;
-                    }
+                    let (ep_a, ep_b, es_a, es_b) =
+                        Self::entry_prices_and_sizes(key, price_map, &pending.legs);
                     state.position = Some(Position {
                         direction: pending.direction,
                         entered_at: Instant::now(),
@@ -1167,6 +1192,7 @@ mod tests {
     use dex_connector::OrderSide;
     use rust_decimal::Decimal;
 
+    use super::super::super::market::SymbolSnapshot;
     use super::super::super::state::{PendingLeg, PendingOrders, PositionDirection};
     use super::PairTradeEngine;
 
@@ -1418,5 +1444,29 @@ mod tests {
     fn partial_fill_reissue_next_retry_saturates() {
         let d = PairTradeEngine::decide_partial_fill_reissue(u32::MAX, 0, 0);
         assert_eq!(d.next_retry, u32::MAX);
+    }
+
+    #[test]
+    fn entry_prices_and_sizes_non_pair_key_is_all_none() {
+        let legs = vec![leg("BTC", "ord-1", "0.5", "0.5")];
+        let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+        let got = PairTradeEngine::entry_prices_and_sizes("NOTAPAIR", &prices, &legs);
+        assert_eq!(got, (None, None, None, None));
+    }
+
+    #[test]
+    fn entry_prices_and_sizes_sums_legs_when_prices_absent() {
+        // Empty price_map: prices stay None, but the split + per-symbol size
+        // summing still runs (BTC long leg, ETH short leg).
+        let legs = vec![
+            leg("BTC", "ord-1", "0.5", "0.5"),
+            leg("ETH", "ord-2", "2.0", "2.0"),
+        ];
+        let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+        let (pa, pb, sa, sb) = PairTradeEngine::entry_prices_and_sizes("BTC/ETH", &prices, &legs);
+        assert_eq!((pa, pb), (None, None));
+        // sum_entry_sizes_by_symbol aggregates filled size per side.
+        assert_eq!(sa, Some(dec("0.5")));
+        assert_eq!(sb, Some(dec("2.0")));
     }
 }
