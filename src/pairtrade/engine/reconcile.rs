@@ -121,375 +121,12 @@ impl PairTradeEngine {
             (state.pending_entry.take(), state.pending_exit.take())
         };
 
-        if let Some(mut pending) = pending_entry {
-            let status = self.pending_status(&pending).await?;
-            Self::update_pending_fills(&mut pending, &status.fills);
-            let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
-            if Self::all_filled(&pending, &status.fills) {
-                let z_at_entry = self
-                    .per_pair_state
-                    .get(key)
-                    .and_then(|s| s.z_score().map(|(z, _)| z));
-                // bot-strategy#463: snapshot β at fill time so the
-                // re-hedge guard measures drift against the actually-
-                // hedged ratio, not against a later re-estimation.
-                let beta_at_entry = self.per_pair_state.get(key).map(|s| s.beta);
-                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                    let (ep_a, ep_b, es_a, es_b) =
-                        Self::entry_prices_and_sizes(key, price_map, &pending.legs);
-                    state.position = Some(Position {
-                        direction: pending.direction,
-                        entered_at: Instant::now(),
-                        entered_ts: now_ts,
-                        entry_price_a: ep_a,
-                        entry_price_b: ep_b,
-                        entry_size_a: es_a,
-                        entry_size_b: es_b,
-                        entry_z: z_at_entry,
-                        entry_beta: beta_at_entry,
-                        last_rehedge_ts: None,
-                        rehedge_realized_pnl: None,
-                        prev_beta_for_velocity: None,
-                    });
-                    state.pending_entry = None;
-                }
-                Self::observe_leg_execution_quality(
-                    &self.instances[inst_idx].id,
-                    key,
-                    "entry",
-                    &pending.legs,
-                    &status,
-                    pending.placed_ts_ms,
-                );
-                log::info!("[ORDER] {} entry orders filled", key);
-            } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
-                let max_retries = self.cfg.entry_partial_fill_max_retries;
-                let giveup_retries = self.cfg.entry_partial_fill_giveup_retries;
-                let decision = Self::decide_partial_fill_reissue(
-                    pending.hedge_retry_count,
-                    max_retries,
-                    giveup_retries,
-                );
-                let next_retry = decision.next_retry;
-                // bot-strategy#480: hard cap on the reissue loop. Once
-                // `hedge_retry_count` crosses this, give up entirely —
-                // cancel pending, flatten any filled legs via
-                // `force_close_all_positions`, and clear `pending_entry`
-                // so the next ENTRY signal starts from a clean slate.
-                // Pre-#480 this loop was unbounded: a stuck reissue
-                // (MARKET reissue not progressing because the underlying
-                // `create_order(price=None)` was emitting LIMIT GTT on
-                // Extended, dex-connector#9) ran for ~75 h / 54 k
-                // retries on `debot-pair-btceth-extended`, blocking all
-                // entries / exits while burning no capital but leaving
-                // operators to discover the loop by hand. The connector
-                // fix removes the underlying cause; this cap is the
-                // defense-in-depth so any future failure mode that
-                // breaks the reissue convergence surfaces as a single
-                // ERROR + flatten instead of an unbounded loop.
-                //
-                // 0 disables the cap (legacy unbounded behaviour) so
-                // existing deployments can opt out via yaml or env
-                // override during the rollout window if needed.
-                if decision.give_up {
-                    let filled_summary: Vec<String> = pending
-                        .legs
-                        .iter()
-                        .filter_map(|leg| {
-                            let q = filled_qtys
-                                .get(&leg.order_id)
-                                .copied()
-                                .unwrap_or(Decimal::ZERO);
-                            if q > Decimal::ZERO {
-                                Some(format!("{}={}", leg.symbol, q))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    log::error!(
-                        "[ORDER][GIVEUP] {} entry-reissue hit hard cap ({} > {}); cancelling pending and flattening filled legs [{}]",
-                        key,
-                        next_retry,
-                        giveup_retries,
-                        filled_summary.join(" ")
-                    );
-                    let variant_id = self.instances[inst_idx].id.clone();
-                    self.cancel_pending_orders(&pending).await?;
-                    self.force_close_all_positions(key, "entry_reissue_giveup")
-                        .await;
-                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                        state.pending_entry = None;
-                    }
-                    super::super::prom::ENTRY_REISSUE_GIVEUP_TOTAL
-                        .with_label_values(&[&variant_id, key])
-                        .inc();
-                    return Ok(());
-                }
-                let use_market = decision.use_market;
-                if use_market {
-                    log::info!(
-                        "[ORDER] {} entry leg partially filled, retries exceeded ({} > {}); reissuing remaining legs as MARKET",
-                        key,
-                        next_retry,
-                        max_retries
-                    );
-                } else if max_retries > 0 {
-                    log::info!(
-                        "[ORDER] {} entry leg partially filled, reissuing remaining legs (retry {}/{})",
-                        key,
-                        next_retry,
-                        max_retries
-                    );
-                } else {
-                    log::warn!(
-                        "[ORDER] {} entry leg partially filled, reissuing remaining legs",
-                        key
-                    );
-                }
-                // bot-strategy#471: when amend-on-partial-fill is enabled (and
-                // we're not escalating to a market takeover, which a native
-                // amend can't retarget the TIF for), skip the blanket cancel
-                // so `reissue_partial_legs` can amend the resting order in
-                // place. It falls back to cancel+reissue per-leg on any amend
-                // error, and cancels any leg it does NOT amend, so the end
-                // state matches the legacy path.
-                let use_amend = !use_market
-                    && self
-                        .pair_params_for(inst_idx, key)
-                        .use_amend_on_partial_fill;
-                if !use_amend {
-                    self.cancel_pending_orders(&pending).await?;
-                }
-                if let Some(new_pending) = self
-                    .reissue_partial_legs(
-                        &pending,
-                        &filled_qtys,
-                        price_map,
-                        false,
-                        use_market,
-                        next_retry,
-                        use_amend,
-                    )
-                    .await?
-                {
-                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                        state.pending_entry = Some(new_pending);
-                    }
-                } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                    state.pending_entry = None;
-                }
+        if let Some(pending) = pending_entry {
+            if self
+                .reconcile_entry(inst_idx, key, price_map, pending, now_ts, timeout)
+                .await?
+            {
                 return Ok(());
-            } else if pending.post_only_hybrid {
-                let recon_pp = self.pair_params_for(inst_idx, key).clone();
-                let recon_pp = &recon_pp;
-                let timeout_elapsed = recon_pp.entry_post_only_timeout_secs > 0
-                    && pending.placed_at.elapsed()
-                        >= Duration::from_secs(recon_pp.entry_post_only_timeout_secs);
-                if !timeout_elapsed {
-                    // Post-only entry still within timeout window — keep pending
-                    // alive so the next ENTRY signal sees active_symbols and
-                    // doesn't fire a duplicate. Fires when
-                    // entry_post_only_timeout_secs > trading_period_secs (e.g.
-                    // Tokyo Extended 120s vs 60s tick): the first reconcile
-                    // tick after ENTRY hits this branch with elapsed < timeout
-                    // and the catch-all at the end of the if-chain is
-                    // unreachable. See bot-strategy#243.
-                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                        state.pending_entry = Some(pending);
-                    }
-                } else {
-                    // Phase 0 instrumentation (bot-strategy#165): capture per-leg
-                    // fill status, posted limit vs current book, and z-movement
-                    // from entry to timeout so we can tell why the post-only
-                    // legs didn't fill before falling back to taker.
-                    let (z_entry, z_now) = {
-                        let state_ref = self.instances[inst_idx].states.get(key);
-                        let ze = state_ref.map(|s| s.z_entry).unwrap_or(0.0);
-                        let zn = self
-                            .per_pair_state
-                            .get(key)
-                            .and_then(|s| s.z_score().map(|(z, _)| z))
-                            .unwrap_or(0.0);
-                        (ze, zn)
-                    };
-                    let leg_details: Vec<String> = pending
-                        .legs
-                        .iter()
-                        .map(|leg| {
-                            let filled = status
-                                .fills
-                                .get(&leg.order_id)
-                                .cloned()
-                                .unwrap_or(Decimal::ZERO);
-                            let open = status.open_ids.contains(&leg.order_id);
-                            let snap = price_map.get(&leg.symbol);
-                            let bid = snap.and_then(|s| s.bid_price);
-                            let ask = snap.and_then(|s| s.ask_price);
-                            let tick = snap.and_then(|s| s.min_tick);
-                            format!(
-                                "[{}|{:?}|tgt={}|filled={}|open={}|limit={}|bid={}|ask={}|tick={}]",
-                                leg.symbol,
-                                leg.side,
-                                leg.target,
-                                filled,
-                                open,
-                                leg.limit_price
-                                    .map(|d| d.to_string())
-                                    .unwrap_or_else(|| "none".into()),
-                                bid.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
-                                ask.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
-                                tick.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
-                            )
-                        })
-                        .collect();
-                    log::info!(
-                        "[ORDER_FALLBACK_DETAIL] {} elapsed={}s dir={:?} z_entry={:.2} z_now={:.2} legs={}",
-                        key,
-                        pending.placed_at.elapsed().as_secs(),
-                        pending.direction,
-                        z_entry,
-                        z_now,
-                        leg_details.join(" ")
-                    );
-
-                    // Post-only entry timed out; cancel and reissue as taker
-                    log::info!(
-                        "[ORDER] {} post-only entry timeout ({}s), falling back to taker",
-                        key,
-                        recon_pp.entry_post_only_timeout_secs
-                    );
-                    self.cancel_pending_orders(&pending).await?;
-                    let new_pending = self
-                        .reissue_entry_as_taker(key, &pending, price_map)
-                        .await?;
-                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                        state.pending_entry = new_pending;
-                    }
-                }
-            } else if pending.placed_at.elapsed() >= timeout {
-                // Partial fill or stuck orders; cancel and flatten any filled leg
-                if status.open_remaining > 0 {
-                    log::warn!(
-                        "[ORDER] {} entry orders stale ({}s), cancelling {} legs",
-                        key,
-                        pending.placed_at.elapsed().as_secs(),
-                        status.open_remaining
-                    );
-                    for leg in &pending.legs {
-                        let filled = filled_qtys
-                            .get(&leg.order_id)
-                            .cloned()
-                            .unwrap_or(Decimal::ZERO);
-                        let is_open = status.open_ids.contains(&leg.order_id);
-                        log::debug!(
-                            "[ORDER] {} entry leg status symbol={} order_id={} target={} filled={} open={}",
-                            key,
-                            leg.symbol,
-                            leg.order_id,
-                            leg.target,
-                            filled,
-                            is_open
-                        );
-                    }
-                    self.cancel_pending_orders(&pending).await?;
-                }
-                let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
-                let mut flattened_any = false;
-                let mut hedge_failed = false;
-                let mut retry_count = pending.hedge_retry_count;
-                let max_retries = 3u32;
-                for leg in &pending.legs {
-                    let filled = filled_qtys
-                        .get(&leg.order_id)
-                        .cloned()
-                        .unwrap_or(Decimal::ZERO);
-                    if filled > Decimal::ZERO {
-                        if price_map.contains_key(&leg.symbol) {
-                            let hedge_side = match leg.side {
-                                dex_connector::OrderSide::Long => dex_connector::OrderSide::Short,
-                                dex_connector::OrderSide::Short => dex_connector::OrderSide::Long,
-                            };
-                            let use_market = retry_count + 1 >= max_retries;
-                            let limit = if use_market {
-                                None
-                            } else {
-                                self.limit_price_for(&leg.symbol, hedge_side, price_map)
-                            };
-                            if !use_market && limit.is_none() {
-                                log::warn!(
-                                    "[ORDER] Missing reference price for hedge {} leg {}",
-                                    leg.symbol,
-                                    leg.order_id
-                                );
-                                hedge_failed = true;
-                                continue;
-                            }
-                            let spread = self.order_spread_param(limit, false);
-                            if let Err(e) = self
-                                .connector
-                                .create_order(
-                                    &leg.symbol,
-                                    filled,
-                                    hedge_side,
-                                    limit,
-                                    spread,
-                                    true,
-                                    None,
-                                )
-                                .await
-                            {
-                                log::error!(
-                                    "[ORDER] Failed to hedge partial entry {} ({}): {:?}",
-                                    leg.symbol,
-                                    leg.order_id,
-                                    e
-                                );
-                                hedge_failed = true;
-                            } else {
-                                flattened_any = true;
-                                let mode = if use_market { "MARKET" } else { "LIMIT" };
-                                log::warn!(
-                                    "[ORDER] Hedged partial entry on {} size={} mode={} retries={}",
-                                    leg.symbol,
-                                    filled,
-                                    mode,
-                                    retry_count
-                                );
-                            }
-                        } else {
-                            log::warn!(
-                                "[ORDER] Missing price map entry for hedge {} leg {}",
-                                leg.symbol,
-                                leg.order_id
-                            );
-                            hedge_failed = true;
-                        }
-                    }
-                }
-                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                    if hedge_failed {
-                        retry_count = retry_count.saturating_add(1);
-                        pending.hedge_retry_count = retry_count;
-                        log::warn!(
-                            "[ORDER] Hedge retry scheduled for {} (retry {} of {})",
-                            key,
-                            retry_count,
-                            max_retries
-                        );
-                        pending.placed_at = Instant::now();
-                        state.pending_entry = Some(pending);
-                    } else {
-                        state.last_exit_at = Some(Instant::now());
-                        state.last_exit_ts = Some(now_ts);
-                        state.pending_entry = None;
-                        if flattened_any {
-                            state.position = None;
-                        }
-                    }
-                }
-            } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                state.pending_entry = Some(pending);
             }
         }
 
@@ -903,6 +540,393 @@ impl PairTradeEngine {
         }
 
         Ok(())
+    }
+
+    /// Entry-side branch of `reconcile_pending_orders`, extracted to a
+    /// `&mut self` helper (bot-strategy#502 item2). Returns `true` when the
+    /// caller should return early (skip exit reconciliation this tick) —
+    /// matching the original in-block `return Ok(())` sites; `false` falls
+    /// through so the caller proceeds to any pending exit. Pure structural
+    /// move: the body is the former entry if-let block verbatim.
+    async fn reconcile_entry(
+        &mut self,
+        inst_idx: usize,
+        key: &str,
+        price_map: &HashMap<String, SymbolSnapshot>,
+        mut pending: PendingOrders,
+        now_ts: i64,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let status = self.pending_status(&pending).await?;
+        Self::update_pending_fills(&mut pending, &status.fills);
+        let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
+        if Self::all_filled(&pending, &status.fills) {
+            let z_at_entry = self
+                .per_pair_state
+                .get(key)
+                .and_then(|s| s.z_score().map(|(z, _)| z));
+            // bot-strategy#463: snapshot β at fill time so the
+            // re-hedge guard measures drift against the actually-
+            // hedged ratio, not against a later re-estimation.
+            let beta_at_entry = self.per_pair_state.get(key).map(|s| s.beta);
+            if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                let (ep_a, ep_b, es_a, es_b) =
+                    Self::entry_prices_and_sizes(key, price_map, &pending.legs);
+                state.position = Some(Position {
+                    direction: pending.direction,
+                    entered_at: Instant::now(),
+                    entered_ts: now_ts,
+                    entry_price_a: ep_a,
+                    entry_price_b: ep_b,
+                    entry_size_a: es_a,
+                    entry_size_b: es_b,
+                    entry_z: z_at_entry,
+                    entry_beta: beta_at_entry,
+                    last_rehedge_ts: None,
+                    rehedge_realized_pnl: None,
+                    prev_beta_for_velocity: None,
+                });
+                state.pending_entry = None;
+            }
+            Self::observe_leg_execution_quality(
+                &self.instances[inst_idx].id,
+                key,
+                "entry",
+                &pending.legs,
+                &status,
+                pending.placed_ts_ms,
+            );
+            log::info!("[ORDER] {} entry orders filled", key);
+        } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
+            let max_retries = self.cfg.entry_partial_fill_max_retries;
+            let giveup_retries = self.cfg.entry_partial_fill_giveup_retries;
+            let decision = Self::decide_partial_fill_reissue(
+                pending.hedge_retry_count,
+                max_retries,
+                giveup_retries,
+            );
+            let next_retry = decision.next_retry;
+            // bot-strategy#480: hard cap on the reissue loop. Once
+            // `hedge_retry_count` crosses this, give up entirely —
+            // cancel pending, flatten any filled legs via
+            // `force_close_all_positions`, and clear `pending_entry`
+            // so the next ENTRY signal starts from a clean slate.
+            // Pre-#480 this loop was unbounded: a stuck reissue
+            // (MARKET reissue not progressing because the underlying
+            // `create_order(price=None)` was emitting LIMIT GTT on
+            // Extended, dex-connector#9) ran for ~75 h / 54 k
+            // retries on `debot-pair-btceth-extended`, blocking all
+            // entries / exits while burning no capital but leaving
+            // operators to discover the loop by hand. The connector
+            // fix removes the underlying cause; this cap is the
+            // defense-in-depth so any future failure mode that
+            // breaks the reissue convergence surfaces as a single
+            // ERROR + flatten instead of an unbounded loop.
+            //
+            // 0 disables the cap (legacy unbounded behaviour) so
+            // existing deployments can opt out via yaml or env
+            // override during the rollout window if needed.
+            if decision.give_up {
+                let filled_summary: Vec<String> = pending
+                    .legs
+                    .iter()
+                    .filter_map(|leg| {
+                        let q = filled_qtys
+                            .get(&leg.order_id)
+                            .copied()
+                            .unwrap_or(Decimal::ZERO);
+                        if q > Decimal::ZERO {
+                            Some(format!("{}={}", leg.symbol, q))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                log::error!(
+                        "[ORDER][GIVEUP] {} entry-reissue hit hard cap ({} > {}); cancelling pending and flattening filled legs [{}]",
+                        key,
+                        next_retry,
+                        giveup_retries,
+                        filled_summary.join(" ")
+                    );
+                let variant_id = self.instances[inst_idx].id.clone();
+                self.cancel_pending_orders(&pending).await?;
+                self.force_close_all_positions(key, "entry_reissue_giveup")
+                    .await;
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                    state.pending_entry = None;
+                }
+                super::super::prom::ENTRY_REISSUE_GIVEUP_TOTAL
+                    .with_label_values(&[&variant_id, key])
+                    .inc();
+                return Ok(true);
+            }
+            let use_market = decision.use_market;
+            if use_market {
+                log::info!(
+                        "[ORDER] {} entry leg partially filled, retries exceeded ({} > {}); reissuing remaining legs as MARKET",
+                        key,
+                        next_retry,
+                        max_retries
+                    );
+            } else if max_retries > 0 {
+                log::info!(
+                    "[ORDER] {} entry leg partially filled, reissuing remaining legs (retry {}/{})",
+                    key,
+                    next_retry,
+                    max_retries
+                );
+            } else {
+                log::warn!(
+                    "[ORDER] {} entry leg partially filled, reissuing remaining legs",
+                    key
+                );
+            }
+            // bot-strategy#471: when amend-on-partial-fill is enabled (and
+            // we're not escalating to a market takeover, which a native
+            // amend can't retarget the TIF for), skip the blanket cancel
+            // so `reissue_partial_legs` can amend the resting order in
+            // place. It falls back to cancel+reissue per-leg on any amend
+            // error, and cancels any leg it does NOT amend, so the end
+            // state matches the legacy path.
+            let use_amend = !use_market
+                && self
+                    .pair_params_for(inst_idx, key)
+                    .use_amend_on_partial_fill;
+            if !use_amend {
+                self.cancel_pending_orders(&pending).await?;
+            }
+            if let Some(new_pending) = self
+                .reissue_partial_legs(
+                    &pending,
+                    &filled_qtys,
+                    price_map,
+                    false,
+                    use_market,
+                    next_retry,
+                    use_amend,
+                )
+                .await?
+            {
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                    state.pending_entry = Some(new_pending);
+                }
+            } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                state.pending_entry = None;
+            }
+            return Ok(true);
+        } else if pending.post_only_hybrid {
+            let recon_pp = self.pair_params_for(inst_idx, key).clone();
+            let recon_pp = &recon_pp;
+            let timeout_elapsed = recon_pp.entry_post_only_timeout_secs > 0
+                && pending.placed_at.elapsed()
+                    >= Duration::from_secs(recon_pp.entry_post_only_timeout_secs);
+            if !timeout_elapsed {
+                // Post-only entry still within timeout window — keep pending
+                // alive so the next ENTRY signal sees active_symbols and
+                // doesn't fire a duplicate. Fires when
+                // entry_post_only_timeout_secs > trading_period_secs (e.g.
+                // Tokyo Extended 120s vs 60s tick): the first reconcile
+                // tick after ENTRY hits this branch with elapsed < timeout
+                // and the catch-all at the end of the if-chain is
+                // unreachable. See bot-strategy#243.
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                    state.pending_entry = Some(pending);
+                }
+            } else {
+                // Phase 0 instrumentation (bot-strategy#165): capture per-leg
+                // fill status, posted limit vs current book, and z-movement
+                // from entry to timeout so we can tell why the post-only
+                // legs didn't fill before falling back to taker.
+                let (z_entry, z_now) = {
+                    let state_ref = self.instances[inst_idx].states.get(key);
+                    let ze = state_ref.map(|s| s.z_entry).unwrap_or(0.0);
+                    let zn = self
+                        .per_pair_state
+                        .get(key)
+                        .and_then(|s| s.z_score().map(|(z, _)| z))
+                        .unwrap_or(0.0);
+                    (ze, zn)
+                };
+                let leg_details: Vec<String> = pending
+                    .legs
+                    .iter()
+                    .map(|leg| {
+                        let filled = status
+                            .fills
+                            .get(&leg.order_id)
+                            .cloned()
+                            .unwrap_or(Decimal::ZERO);
+                        let open = status.open_ids.contains(&leg.order_id);
+                        let snap = price_map.get(&leg.symbol);
+                        let bid = snap.and_then(|s| s.bid_price);
+                        let ask = snap.and_then(|s| s.ask_price);
+                        let tick = snap.and_then(|s| s.min_tick);
+                        format!(
+                            "[{}|{:?}|tgt={}|filled={}|open={}|limit={}|bid={}|ask={}|tick={}]",
+                            leg.symbol,
+                            leg.side,
+                            leg.target,
+                            filled,
+                            open,
+                            leg.limit_price
+                                .map(|d| d.to_string())
+                                .unwrap_or_else(|| "none".into()),
+                            bid.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                            ask.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                            tick.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                        )
+                    })
+                    .collect();
+                log::info!(
+                        "[ORDER_FALLBACK_DETAIL] {} elapsed={}s dir={:?} z_entry={:.2} z_now={:.2} legs={}",
+                        key,
+                        pending.placed_at.elapsed().as_secs(),
+                        pending.direction,
+                        z_entry,
+                        z_now,
+                        leg_details.join(" ")
+                    );
+
+                // Post-only entry timed out; cancel and reissue as taker
+                log::info!(
+                    "[ORDER] {} post-only entry timeout ({}s), falling back to taker",
+                    key,
+                    recon_pp.entry_post_only_timeout_secs
+                );
+                self.cancel_pending_orders(&pending).await?;
+                let new_pending = self
+                    .reissue_entry_as_taker(key, &pending, price_map)
+                    .await?;
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                    state.pending_entry = new_pending;
+                }
+            }
+        } else if pending.placed_at.elapsed() >= timeout {
+            // Partial fill or stuck orders; cancel and flatten any filled leg
+            if status.open_remaining > 0 {
+                log::warn!(
+                    "[ORDER] {} entry orders stale ({}s), cancelling {} legs",
+                    key,
+                    pending.placed_at.elapsed().as_secs(),
+                    status.open_remaining
+                );
+                for leg in &pending.legs {
+                    let filled = filled_qtys
+                        .get(&leg.order_id)
+                        .cloned()
+                        .unwrap_or(Decimal::ZERO);
+                    let is_open = status.open_ids.contains(&leg.order_id);
+                    log::debug!(
+                            "[ORDER] {} entry leg status symbol={} order_id={} target={} filled={} open={}",
+                            key,
+                            leg.symbol,
+                            leg.order_id,
+                            leg.target,
+                            filled,
+                            is_open
+                        );
+                }
+                self.cancel_pending_orders(&pending).await?;
+            }
+            let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
+            let mut flattened_any = false;
+            let mut hedge_failed = false;
+            let mut retry_count = pending.hedge_retry_count;
+            let max_retries = 3u32;
+            for leg in &pending.legs {
+                let filled = filled_qtys
+                    .get(&leg.order_id)
+                    .cloned()
+                    .unwrap_or(Decimal::ZERO);
+                if filled > Decimal::ZERO {
+                    if price_map.contains_key(&leg.symbol) {
+                        let hedge_side = match leg.side {
+                            dex_connector::OrderSide::Long => dex_connector::OrderSide::Short,
+                            dex_connector::OrderSide::Short => dex_connector::OrderSide::Long,
+                        };
+                        let use_market = retry_count + 1 >= max_retries;
+                        let limit = if use_market {
+                            None
+                        } else {
+                            self.limit_price_for(&leg.symbol, hedge_side, price_map)
+                        };
+                        if !use_market && limit.is_none() {
+                            log::warn!(
+                                "[ORDER] Missing reference price for hedge {} leg {}",
+                                leg.symbol,
+                                leg.order_id
+                            );
+                            hedge_failed = true;
+                            continue;
+                        }
+                        let spread = self.order_spread_param(limit, false);
+                        if let Err(e) = self
+                            .connector
+                            .create_order(
+                                &leg.symbol,
+                                filled,
+                                hedge_side,
+                                limit,
+                                spread,
+                                true,
+                                None,
+                            )
+                            .await
+                        {
+                            log::error!(
+                                "[ORDER] Failed to hedge partial entry {} ({}): {:?}",
+                                leg.symbol,
+                                leg.order_id,
+                                e
+                            );
+                            hedge_failed = true;
+                        } else {
+                            flattened_any = true;
+                            let mode = if use_market { "MARKET" } else { "LIMIT" };
+                            log::warn!(
+                                "[ORDER] Hedged partial entry on {} size={} mode={} retries={}",
+                                leg.symbol,
+                                filled,
+                                mode,
+                                retry_count
+                            );
+                        }
+                    } else {
+                        log::warn!(
+                            "[ORDER] Missing price map entry for hedge {} leg {}",
+                            leg.symbol,
+                            leg.order_id
+                        );
+                        hedge_failed = true;
+                    }
+                }
+            }
+            if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                if hedge_failed {
+                    retry_count = retry_count.saturating_add(1);
+                    pending.hedge_retry_count = retry_count;
+                    log::warn!(
+                        "[ORDER] Hedge retry scheduled for {} (retry {} of {})",
+                        key,
+                        retry_count,
+                        max_retries
+                    );
+                    pending.placed_at = Instant::now();
+                    state.pending_entry = Some(pending);
+                } else {
+                    state.last_exit_at = Some(Instant::now());
+                    state.last_exit_ts = Some(now_ts);
+                    state.pending_entry = None;
+                    if flattened_any {
+                        state.position = None;
+                    }
+                }
+            }
+        } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+            state.pending_entry = Some(pending);
+        }
+        Ok(false)
     }
 
     async fn cancel_pending_orders(&self, pending: &PendingOrders) -> Result<()> {
