@@ -131,252 +131,274 @@ impl PairTradeEngine {
         }
 
         if let Some(pending) = pending_exit {
-            let status = self.pending_status(&pending).await?;
-            let mut pending = pending;
-            Self::update_pending_fills(&mut pending, &status.fills);
-            let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
-            // (record, realized_pnl, funding_carry_usd) — the third element
-            // is folded into `inst.funding_carry_today` at the same site as
-            // `realized_pnl_today` below. 0.0 when no ticks were observed.
-            let mut pnl_record: Option<(PnlLogRecord, f64, f64)> = None;
-            if status.open_remaining == 0 && Self::all_filled(&pending, &status.fills) {
-                let inst_id = self.instances[inst_idx].id.clone();
-                let z_exit = self
-                    .per_pair_state
-                    .get(key)
-                    .and_then(|s| s.z_score().map(|(z, _)| z));
-                let beta_val = self.per_pair_state.get(key).map(|s| s.beta);
-                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                    if let Some(pos) = state.position.as_ref() {
-                        if let Some((base, quote)) = key.split_once('/') {
-                            if let (Some(p1), Some(p2)) =
-                                (price_map.get(base), price_map.get(quote))
+            self.reconcile_exit(inst_idx, key, price_map, pending, now_ts, timeout)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Exit-side branch of `reconcile_pending_orders`, extracted to a
+    /// `&mut self` helper (bot-strategy#502 item2). The exit branch was the
+    /// final block in the method, so no early-return signalling is needed:
+    /// the in-block `return Ok(())` sites simply return from the helper and
+    /// the caller falls through to its own `Ok(())`, matching the original.
+    /// Pure structural move: the body is the former exit if-let block verbatim.
+    async fn reconcile_exit(
+        &mut self,
+        inst_idx: usize,
+        key: &str,
+        price_map: &HashMap<String, SymbolSnapshot>,
+        pending: PendingOrders,
+        now_ts: i64,
+        timeout: Duration,
+    ) -> Result<()> {
+        let status = self.pending_status(&pending).await?;
+        let mut pending = pending;
+        Self::update_pending_fills(&mut pending, &status.fills);
+        let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
+        // (record, realized_pnl, funding_carry_usd) — the third element
+        // is folded into `inst.funding_carry_today` at the same site as
+        // `realized_pnl_today` below. 0.0 when no ticks were observed.
+        let mut pnl_record: Option<(PnlLogRecord, f64, f64)> = None;
+        if status.open_remaining == 0 && Self::all_filled(&pending, &status.fills) {
+            let inst_id = self.instances[inst_idx].id.clone();
+            let z_exit = self
+                .per_pair_state
+                .get(key)
+                .and_then(|s| s.z_score().map(|(z, _)| z));
+            let beta_val = self.per_pair_state.get(key).map(|s| s.beta);
+            if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                if let Some(pos) = state.position.as_ref() {
+                    if let Some((base, quote)) = key.split_once('/') {
+                        if let (Some(p1), Some(p2)) = (price_map.get(base), price_map.get(quote)) {
+                            if let Some(pnl) =
+                                compute_pnl(pos, p1.price, p2.price).and_then(|p| p.to_f64())
                             {
-                                if let Some(pnl) =
-                                    compute_pnl(pos, p1.price, p2.price).and_then(|p| p.to_f64())
-                                {
-                                    let hold_secs =
-                                        Some(now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
-                                    let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
-                                    let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
-                                    let (carry_usd, ticks_observed) = match (
-                                        pos.entry_size_a,
-                                        pos.entry_price_a,
-                                        pos.entry_size_b,
-                                        pos.entry_price_b,
-                                    ) {
-                                        (Some(sa), Some(pa), Some(sb), Some(pb)) => {
-                                            funding_history::compute_carry_usd(
-                                                &self.funding_history,
-                                                base,
-                                                quote,
-                                                pos.entered_ts,
-                                                now_ts,
-                                                pos.direction,
-                                                sa,
-                                                pa,
-                                                sb,
-                                                pb,
-                                            )
-                                        }
-                                        _ => (0.0, 0),
-                                    };
-                                    let mut record = PnlLogRecord::new(
-                                        base,
-                                        quote,
-                                        pos.direction,
-                                        pnl,
-                                        now_ts,
-                                        "exit_fill",
-                                    )
-                                    .with_trade_details(
-                                        entry_a,
-                                        entry_b,
-                                        p1.price.to_f64(),
-                                        p2.price.to_f64(),
-                                        beta_val,
-                                        pos.entry_z,
-                                        z_exit,
-                                        hold_secs,
-                                    );
-                                    if ticks_observed > 0 {
-                                        record = record.with_funding(carry_usd, ticks_observed);
+                                let hold_secs =
+                                    Some(now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
+                                let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
+                                let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
+                                let (carry_usd, ticks_observed) = match (
+                                    pos.entry_size_a,
+                                    pos.entry_price_a,
+                                    pos.entry_size_b,
+                                    pos.entry_price_b,
+                                ) {
+                                    (Some(sa), Some(pa), Some(sb), Some(pb)) => {
+                                        funding_history::compute_carry_usd(
+                                            &self.funding_history,
+                                            base,
+                                            quote,
+                                            pos.entered_ts,
+                                            now_ts,
+                                            pos.direction,
+                                            sa,
+                                            pa,
+                                            sb,
+                                            pb,
+                                        )
                                     }
-                                    // #314 Group 4: emit gross/funding bps to
-                                    // Prometheus. Same Some(...,...,...,...)
-                                    // gate as the funding compute above so the
-                                    // bps denominator stays consistent. `reason`
-                                    // is the same Option<&'static str> that
-                                    // apply_post_exit_state consumes immediately
-                                    // after this — read without .take() so the
-                                    // close-reason counter still receives it
-                                    // (bot-strategy#421).
-                                    let reason = state.pending_exit_reason.unwrap_or("unknown");
-                                    if let (Some(sa), Some(pa), Some(sb), Some(pb)) = (
-                                        pos.entry_size_a,
-                                        pos.entry_price_a,
-                                        pos.entry_size_b,
-                                        pos.entry_price_b,
-                                    ) {
-                                        let leg_a = (sa * pa).abs().to_f64();
-                                        let leg_b = (sb * pb).abs().to_f64();
-                                        if let (Some(a), Some(b)) = (leg_a, leg_b) {
-                                            let notional = a + b;
-                                            if notional > 0.0 {
-                                                super::super::prom::CLOSE_GROSS_PNL_BPS
-                                                    .with_label_values(&[&inst_id, key, reason])
-                                                    .observe(pnl / notional * 10_000.0);
-                                                if ticks_observed > 0 {
-                                                    super::super::prom::CLOSE_FUNDING_BPS
-                                                        .with_label_values(&[&inst_id, key])
-                                                        .observe(carry_usd / notional * 10_000.0);
-                                                }
+                                    _ => (0.0, 0),
+                                };
+                                let mut record = PnlLogRecord::new(
+                                    base,
+                                    quote,
+                                    pos.direction,
+                                    pnl,
+                                    now_ts,
+                                    "exit_fill",
+                                )
+                                .with_trade_details(
+                                    entry_a,
+                                    entry_b,
+                                    p1.price.to_f64(),
+                                    p2.price.to_f64(),
+                                    beta_val,
+                                    pos.entry_z,
+                                    z_exit,
+                                    hold_secs,
+                                );
+                                if ticks_observed > 0 {
+                                    record = record.with_funding(carry_usd, ticks_observed);
+                                }
+                                // #314 Group 4: emit gross/funding bps to
+                                // Prometheus. Same Some(...,...,...,...)
+                                // gate as the funding compute above so the
+                                // bps denominator stays consistent. `reason`
+                                // is the same Option<&'static str> that
+                                // apply_post_exit_state consumes immediately
+                                // after this — read without .take() so the
+                                // close-reason counter still receives it
+                                // (bot-strategy#421).
+                                let reason = state.pending_exit_reason.unwrap_or("unknown");
+                                if let (Some(sa), Some(pa), Some(sb), Some(pb)) = (
+                                    pos.entry_size_a,
+                                    pos.entry_price_a,
+                                    pos.entry_size_b,
+                                    pos.entry_price_b,
+                                ) {
+                                    let leg_a = (sa * pa).abs().to_f64();
+                                    let leg_b = (sb * pb).abs().to_f64();
+                                    if let (Some(a), Some(b)) = (leg_a, leg_b) {
+                                        let notional = a + b;
+                                        if notional > 0.0 {
+                                            super::super::prom::CLOSE_GROSS_PNL_BPS
+                                                .with_label_values(&[&inst_id, key, reason])
+                                                .observe(pnl / notional * 10_000.0);
+                                            if ticks_observed > 0 {
+                                                super::super::prom::CLOSE_FUNDING_BPS
+                                                    .with_label_values(&[&inst_id, key])
+                                                    .observe(carry_usd / notional * 10_000.0);
                                             }
                                         }
                                     }
-                                    pnl_record = Some((record, pnl, carry_usd));
                                 }
+                                pnl_record = Some((record, pnl, carry_usd));
                             }
                         }
                     }
-                    apply_post_exit_state(
-                        state,
-                        self.per_pair_state.get(key),
-                        pending.direction,
-                        now_ts,
-                        &inst_id,
-                        key,
-                    );
-                    state.pending_exit = None;
                 }
-                Self::observe_leg_execution_quality(
+                apply_post_exit_state(
+                    state,
+                    self.per_pair_state.get(key),
+                    pending.direction,
+                    now_ts,
                     &inst_id,
                     key,
-                    "exit",
-                    &pending.legs,
-                    &status,
-                    pending.placed_ts_ms,
                 );
-                log::info!("[ORDER] {} exit orders filled", key);
-                if let Some((record, pnl_value, funding_value)) = pnl_record {
-                    self.write_pnl_record(inst_idx, record);
-                    self.instances[inst_idx].realized_pnl_today += pnl_value;
-                    self.instances[inst_idx].funding_carry_today += funding_value;
-                    // write_pnl_record always bumps total_trades / total_pnl
-                    // (now persisted, bot-strategy#320), so the snapshot is
-                    // dirty regardless of pnl sign.
-                    let mut risk_state_dirty = true;
-                    if pnl_value < 0.0 {
-                        self.instances[inst_idx].consecutive_losses += 1;
-                        risk_state_dirty = true;
-                        if let Some(cooldown) = self.cfg.circuit_breaker_cooldown_for(
+                state.pending_exit = None;
+            }
+            Self::observe_leg_execution_quality(
+                &inst_id,
+                key,
+                "exit",
+                &pending.legs,
+                &status,
+                pending.placed_ts_ms,
+            );
+            log::info!("[ORDER] {} exit orders filled", key);
+            if let Some((record, pnl_value, funding_value)) = pnl_record {
+                self.write_pnl_record(inst_idx, record);
+                self.instances[inst_idx].realized_pnl_today += pnl_value;
+                self.instances[inst_idx].funding_carry_today += funding_value;
+                // write_pnl_record always bumps total_trades / total_pnl
+                // (now persisted, bot-strategy#320), so the snapshot is
+                // dirty regardless of pnl sign.
+                let mut risk_state_dirty = true;
+                if pnl_value < 0.0 {
+                    self.instances[inst_idx].consecutive_losses += 1;
+                    risk_state_dirty = true;
+                    if let Some(cooldown) = self
+                        .cfg
+                        .circuit_breaker_cooldown_for(self.instances[inst_idx].consecutive_losses)
+                    {
+                        self.instances[inst_idx].circuit_breaker_until =
+                            Some(Instant::now() + cooldown);
+                        self.instances[inst_idx].circuit_breaker_until_ts =
+                            Some(now_ts + cooldown.as_secs() as i64);
+                        log::warn!(
+                            "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
                             self.instances[inst_idx].consecutive_losses,
-                        ) {
-                            self.instances[inst_idx].circuit_breaker_until =
-                                Some(Instant::now() + cooldown);
-                            self.instances[inst_idx].circuit_breaker_until_ts =
-                                Some(now_ts + cooldown.as_secs() as i64);
-                            log::warn!(
-                                "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
-                                self.instances[inst_idx].consecutive_losses, cooldown.as_secs()
-                            );
-                        }
-                    } else if pnl_value > 0.0 {
-                        if self.instances[inst_idx].consecutive_losses > 0 {
-                            log::info!(
-                                "[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)",
-                                self.instances[inst_idx].consecutive_losses
-                            );
-                            risk_state_dirty = true;
-                        }
-                        self.instances[inst_idx].consecutive_losses = 0;
-                        self.instances[inst_idx].circuit_breaker_until = None;
-                        self.instances[inst_idx].circuit_breaker_until_ts = None;
+                            cooldown.as_secs()
+                        );
                     }
-                    if risk_state_dirty {
-                        self.persist_risk_state();
+                } else if pnl_value > 0.0 {
+                    if self.instances[inst_idx].consecutive_losses > 0 {
+                        log::info!(
+                            "[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)",
+                            self.instances[inst_idx].consecutive_losses
+                        );
+                        risk_state_dirty = true;
                     }
+                    self.instances[inst_idx].consecutive_losses = 0;
+                    self.instances[inst_idx].circuit_breaker_until = None;
+                    self.instances[inst_idx].circuit_breaker_until_ts = None;
                 }
-            } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
-                let next_retry = pending.hedge_retry_count.saturating_add(1);
-                if next_retry > MAX_EXIT_RETRIES {
-                    self.force_close_all_positions(key, "partial_fill").await;
-                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                        state.pending_exit = None;
-                    }
-                    return Ok(());
+                if risk_state_dirty {
+                    self.persist_risk_state();
                 }
-                log::info!(
-                    "[ORDER] {} exit leg partially filled, reissuing remaining legs",
-                    key
-                );
-                self.cancel_pending_orders(&pending).await?;
-                if let Some(new_pending) = self
-                    .reissue_partial_legs(
-                        &pending,
-                        &filled_qtys,
-                        price_map,
-                        true,
-                        true,
-                        next_retry,
-                        false,
-                    )
-                    .await?
-                {
-                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                        state.pending_exit = Some(new_pending);
-                    }
-                } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+            }
+        } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
+            let next_retry = pending.hedge_retry_count.saturating_add(1);
+            if next_retry > MAX_EXIT_RETRIES {
+                self.force_close_all_positions(key, "partial_fill").await;
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.pending_exit = None;
                 }
                 return Ok(());
-            } else if pending.placed_at.elapsed() >= timeout
-                || pending
-                    .exit_taker_takeover_at
-                    .is_some_and(|t| Instant::now() >= t)
-                || status.open_remaining == 0
+            }
+            log::info!(
+                "[ORDER] {} exit leg partially filled, reissuing remaining legs",
+                key
+            );
+            self.cancel_pending_orders(&pending).await?;
+            if let Some(new_pending) = self
+                .reissue_partial_legs(
+                    &pending,
+                    &filled_qtys,
+                    price_map,
+                    true,
+                    true,
+                    next_retry,
+                    false,
+                )
+                .await?
             {
-                let takeover_fired = pending
-                    .exit_taker_takeover_at
-                    .is_some_and(|t| Instant::now() >= t)
-                    && pending.placed_at.elapsed() < timeout
-                    && status.open_remaining > 0;
-                if takeover_fired {
-                    // bot-strategy#408: post-only exit hit its dedicated taker-
-                    // takeover deadline (Extended `exit_post_only_timeout_secs`)
-                    // before `order_timeout_secs` elapsed. Drop one
-                    // grep-friendly WARN that mirrors the legacy in-step
-                    // monitor's `[EXIT_FILL_TIMEOUT]` log so error-watch /
-                    // dashboards keep working.
-                    log::warn!(
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                    state.pending_exit = Some(new_pending);
+                }
+            } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                state.pending_exit = None;
+            }
+            return Ok(());
+        } else if pending.placed_at.elapsed() >= timeout
+            || pending
+                .exit_taker_takeover_at
+                .is_some_and(|t| Instant::now() >= t)
+            || status.open_remaining == 0
+        {
+            let takeover_fired = pending
+                .exit_taker_takeover_at
+                .is_some_and(|t| Instant::now() >= t)
+                && pending.placed_at.elapsed() < timeout
+                && status.open_remaining > 0;
+            if takeover_fired {
+                // bot-strategy#408: post-only exit hit its dedicated taker-
+                // takeover deadline (Extended `exit_post_only_timeout_secs`)
+                // before `order_timeout_secs` elapsed. Drop one
+                // grep-friendly WARN that mirrors the legacy in-step
+                // monitor's `[EXIT_FILL_TIMEOUT]` log so error-watch /
+                // dashboards keep working.
+                log::warn!(
                         "[EXIT_FILL_TIMEOUT] {} post-only takeover after {}s; cancelling {} legs and reissuing as taker",
                         key,
                         pending.placed_at.elapsed().as_secs(),
                         status.open_remaining,
                     );
+            }
+            let next_retry = pending.hedge_retry_count.saturating_add(1);
+            if next_retry > MAX_EXIT_RETRIES {
+                self.force_close_all_positions(key, "timeout").await;
+                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                    state.pending_exit = None;
                 }
-                let next_retry = pending.hedge_retry_count.saturating_add(1);
-                if next_retry > MAX_EXIT_RETRIES {
-                    self.force_close_all_positions(key, "timeout").await;
-                    if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                        state.pending_exit = None;
-                    }
-                    return Ok(());
-                }
-                if status.open_remaining > 0 && !takeover_fired {
-                    log::warn!(
-                        "[ORDER] {} exit orders stale ({}s), cancelling {} legs",
-                        key,
-                        pending.placed_at.elapsed().as_secs(),
-                        status.open_remaining
-                    );
-                    for leg in &pending.legs {
-                        let filled = filled_qtys
-                            .get(&leg.order_id)
-                            .cloned()
-                            .unwrap_or(Decimal::ZERO);
-                        let is_open = status.open_ids.contains(&leg.order_id);
-                        log::debug!(
+                return Ok(());
+            }
+            if status.open_remaining > 0 && !takeover_fired {
+                log::warn!(
+                    "[ORDER] {} exit orders stale ({}s), cancelling {} legs",
+                    key,
+                    pending.placed_at.elapsed().as_secs(),
+                    status.open_remaining
+                );
+                for leg in &pending.legs {
+                    let filled = filled_qtys
+                        .get(&leg.order_id)
+                        .cloned()
+                        .unwrap_or(Decimal::ZERO);
+                    let is_open = status.open_ids.contains(&leg.order_id);
+                    log::debug!(
                             "[ORDER] {} exit leg status symbol={} order_id={} target={} filled={} open={}",
                             key,
                             leg.symbol,
@@ -385,58 +407,58 @@ impl PairTradeEngine {
                             filled,
                             is_open
                         );
-                    }
-                    self.cancel_pending_orders(&pending).await?;
                 }
-                // Re-attempt closing missing legs based on filled qty
-                // reusing filled_qtys defined earlier
-                let mut new_legs = Vec::new();
-                for leg in &pending.legs {
-                    let filled = filled_qtys
-                        .get(&leg.order_id)
-                        .cloned()
-                        .unwrap_or(Decimal::ZERO);
-                    let remaining_qty = (leg.target - filled).max(Decimal::ZERO);
-                    if remaining_qty > Decimal::ZERO {
-                        let quantized =
-                            self.quantize_order_size_exit(&leg.symbol, remaining_qty, price_map);
-                        if quantized <= Decimal::ZERO {
-                            continue;
+                self.cancel_pending_orders(&pending).await?;
+            }
+            // Re-attempt closing missing legs based on filled qty
+            // reusing filled_qtys defined earlier
+            let mut new_legs = Vec::new();
+            for leg in &pending.legs {
+                let filled = filled_qtys
+                    .get(&leg.order_id)
+                    .cloned()
+                    .unwrap_or(Decimal::ZERO);
+                let remaining_qty = (leg.target - filled).max(Decimal::ZERO);
+                if remaining_qty > Decimal::ZERO {
+                    let quantized =
+                        self.quantize_order_size_exit(&leg.symbol, remaining_qty, price_map);
+                    if quantized <= Decimal::ZERO {
+                        continue;
+                    }
+                    let limit = None;
+                    // Reference for the taker retry — feeds the
+                    // taker-side slippage histogram (#314 Group
+                    // 4-B-2). The downsized retry below uses the
+                    // same captured value.
+                    let ref_price_retry =
+                        self.order_reference_price(&leg.symbol, leg.side, price_map);
+                    match self
+                        .connector
+                        .create_order(&leg.symbol, quantized, leg.side, limit, None, true, None)
+                        .await
+                    {
+                        Ok(resp) => {
+                            new_legs.push(PendingLeg {
+                                symbol: leg.symbol.clone(),
+                                order_id: resp.order_id,
+                                exchange_order_id: resp.exchange_order_id,
+                                target: quantized,
+                                filled: Decimal::ZERO,
+                                side: leg.side,
+                                limit_price: None,
+                                reference_price: ref_price_retry,
+                            });
+                            log::warn!(
+                                "[ORDER] Retrying exit leg {} size={} mode=MARKET",
+                                leg.symbol,
+                                quantized
+                            );
                         }
-                        let limit = None;
-                        // Reference for the taker retry — feeds the
-                        // taker-side slippage histogram (#314 Group
-                        // 4-B-2). The downsized retry below uses the
-                        // same captured value.
-                        let ref_price_retry =
-                            self.order_reference_price(&leg.symbol, leg.side, price_map);
-                        match self
-                            .connector
-                            .create_order(&leg.symbol, quantized, leg.side, limit, None, true, None)
-                            .await
-                        {
-                            Ok(resp) => {
-                                new_legs.push(PendingLeg {
-                                    symbol: leg.symbol.clone(),
-                                    order_id: resp.order_id,
-                                    exchange_order_id: resp.exchange_order_id,
-                                    target: quantized,
-                                    filled: Decimal::ZERO,
-                                    side: leg.side,
-                                    limit_price: None,
-                                    reference_price: ref_price_retry,
-                                });
-                                log::warn!(
-                                    "[ORDER] Retrying exit leg {} size={} mode=MARKET",
-                                    leg.symbol,
-                                    quantized
-                                );
-                            }
-                            Err(e) if engine::error_class::is_reduce_only_rejection(&e) => {
-                                // Extended code 1136/1137: bot-side qty exceeds the actual
-                                // residual position. Query the exchange for residual size
-                                // and resubmit with min(quantized, actual). 0 → already flat.
-                                match self
+                        Err(e) if engine::error_class::is_reduce_only_rejection(&e) => {
+                            // Extended code 1136/1137: bot-side qty exceeds the actual
+                            // residual position. Query the exchange for residual size
+                            // and resubmit with min(quantized, actual). 0 → already flat.
+                            match self
                                     .fetch_residual_position_size(&leg.symbol)
                                     .await
                                 {
@@ -505,40 +527,36 @@ impl PairTradeEngine {
                                         e
                                     ),
                                 }
-                            }
-                            Err(e) => log::error!(
-                                "[ORDER] Failed to retry exit leg {}: {:?}",
-                                leg.symbol,
-                                e
-                            ),
+                        }
+                        Err(e) => {
+                            log::error!("[ORDER] Failed to retry exit leg {}: {:?}", leg.symbol, e)
                         }
                     }
                 }
-                if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                    if new_legs.is_empty() {
-                        state.pending_exit = None;
-                        // Keep position state unchanged; will retry next loop
-                    } else {
-                        state.pending_exit = Some(PendingOrders {
-                            legs: new_legs,
-                            direction: pending.direction,
-                            placed_at: Instant::now(),
-                            placed_ts_ms: chrono::Utc::now().timestamp_millis(),
-                            hedge_retry_count: next_retry,
-                            post_only_hybrid: false,
-                            // This branch reissues remaining exit legs (post-
-                            // only retry, not taker); the dedicated post-only
-                            // takeover deadline does not apply here — the
-                            // generic `order_timeout_secs` will govern.
-                            exit_taker_takeover_at: None,
-                        });
-                    }
-                }
-            } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                state.pending_exit = Some(pending);
             }
+            if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                if new_legs.is_empty() {
+                    state.pending_exit = None;
+                    // Keep position state unchanged; will retry next loop
+                } else {
+                    state.pending_exit = Some(PendingOrders {
+                        legs: new_legs,
+                        direction: pending.direction,
+                        placed_at: Instant::now(),
+                        placed_ts_ms: chrono::Utc::now().timestamp_millis(),
+                        hedge_retry_count: next_retry,
+                        post_only_hybrid: false,
+                        // This branch reissues remaining exit legs (post-
+                        // only retry, not taker); the dedicated post-only
+                        // takeover deadline does not apply here — the
+                        // generic `order_timeout_secs` will govern.
+                        exit_taker_takeover_at: None,
+                    });
+                }
+            }
+        } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+            state.pending_exit = Some(pending);
         }
-
         Ok(())
     }
 
