@@ -38,7 +38,41 @@ use super::super::pnl_log::PnlLogRecord;
 use super::super::state::{PendingLeg, PendingOrders, PendingStatus, Position};
 use super::super::PairTradeEngine;
 
+/// Pure outcome of the entry partial-fill reissue policy. Extracted from
+/// `reconcile_pending_orders` so the retry/escalation thresholds are
+/// auditable and unit-testable without driving the async state machine
+/// (bot-strategy#502).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartialFillDecision {
+    /// `hedge_retry_count + 1`: the retry index this reissue would become.
+    next_retry: u32,
+    /// Hard cap hit (bot-strategy#480): cancel pending, flatten filled
+    /// legs, and clear `pending_entry`. Takes precedence over `use_market`.
+    give_up: bool,
+    /// Escalate the remaining legs to MARKET (taker) instead of another
+    /// limit reissue.
+    use_market: bool,
+}
+
 impl PairTradeEngine {
+    /// Pure decision for the partial-fill entry-reissue branch: from the
+    /// current retry count and the configured caps, derive the next retry
+    /// index, whether to give up (hard cap), and whether to escalate to
+    /// MARKET. `0` for either cap disables that cap (legacy behaviour).
+    /// Mirrors the inline logic this replaced exactly. bot-strategy#502.
+    fn decide_partial_fill_reissue(
+        hedge_retry_count: u32,
+        max_retries: u32,
+        giveup_retries: u32,
+    ) -> PartialFillDecision {
+        let next_retry = hedge_retry_count.saturating_add(1);
+        PartialFillDecision {
+            next_retry,
+            give_up: giveup_retries > 0 && next_retry > giveup_retries,
+            use_market: max_retries > 0 && next_retry > max_retries,
+        }
+    }
+
     pub(in crate::pairtrade) async fn reconcile_pending_orders(
         &mut self,
         inst_idx: usize,
@@ -104,9 +138,14 @@ impl PairTradeEngine {
                 );
                 log::info!("[ORDER] {} entry orders filled", key);
             } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
-                let next_retry = pending.hedge_retry_count.saturating_add(1);
                 let max_retries = self.cfg.entry_partial_fill_max_retries;
                 let giveup_retries = self.cfg.entry_partial_fill_giveup_retries;
+                let decision = Self::decide_partial_fill_reissue(
+                    pending.hedge_retry_count,
+                    max_retries,
+                    giveup_retries,
+                );
+                let next_retry = decision.next_retry;
                 // bot-strategy#480: hard cap on the reissue loop. Once
                 // `hedge_retry_count` crosses this, give up entirely —
                 // cancel pending, flatten any filled legs via
@@ -127,7 +166,7 @@ impl PairTradeEngine {
                 // 0 disables the cap (legacy unbounded behaviour) so
                 // existing deployments can opt out via yaml or env
                 // override during the rollout window if needed.
-                if giveup_retries > 0 && next_retry > giveup_retries {
+                if decision.give_up {
                     let filled_summary: Vec<String> = pending
                         .legs
                         .iter()
@@ -162,7 +201,7 @@ impl PairTradeEngine {
                         .inc();
                     return Ok(());
                 }
-                let use_market = max_retries > 0 && next_retry > max_retries;
+                let use_market = decision.use_market;
                 if use_market {
                     log::info!(
                         "[ORDER] {} entry leg partially filled, retries exceeded ({} > {}); reissuing remaining legs as MARKET",
@@ -1314,5 +1353,70 @@ mod tests {
         let p = pending(vec![leg("BTC", "ord-1", "1.0", "1.0")]);
         let fills: HashMap<String, Decimal> = HashMap::new();
         assert!(PairTradeEngine::all_filled(&p, &fills));
+    }
+
+    #[test]
+    fn partial_fill_reissue_limit_then_market_then_giveup() {
+        // max=2, giveup=4. retry index = count + 1.
+        let d = |count| PairTradeEngine::decide_partial_fill_reissue(count, 2, 4);
+        // counts 0,1 -> next 1,2 <= max: limit reissue, no give-up
+        assert_eq!(
+            d(0),
+            super::PartialFillDecision {
+                next_retry: 1,
+                give_up: false,
+                use_market: false
+            }
+        );
+        assert_eq!(
+            d(1),
+            super::PartialFillDecision {
+                next_retry: 2,
+                give_up: false,
+                use_market: false
+            }
+        );
+        // count 2 -> next 3 > max(2): escalate to MARKET, still < giveup
+        assert_eq!(
+            d(2),
+            super::PartialFillDecision {
+                next_retry: 3,
+                give_up: false,
+                use_market: true
+            }
+        );
+        // count 3 -> next 4 == giveup(4): not yet (strictly >)
+        assert_eq!(
+            d(3),
+            super::PartialFillDecision {
+                next_retry: 4,
+                give_up: false,
+                use_market: true
+            }
+        );
+        // count 4 -> next 5 > giveup(4): give up (precedence over market)
+        assert_eq!(
+            d(4),
+            super::PartialFillDecision {
+                next_retry: 5,
+                give_up: true,
+                use_market: true
+            }
+        );
+    }
+
+    #[test]
+    fn partial_fill_reissue_caps_zero_disables() {
+        // Both caps 0 = legacy unbounded: never give up, never escalate.
+        let d = PairTradeEngine::decide_partial_fill_reissue(10_000, 0, 0);
+        assert_eq!(d.next_retry, 10_001);
+        assert!(!d.give_up);
+        assert!(!d.use_market);
+    }
+
+    #[test]
+    fn partial_fill_reissue_next_retry_saturates() {
+        let d = PairTradeEngine::decide_partial_fill_reissue(u32::MAX, 0, 0);
+        assert_eq!(d.next_retry, u32::MAX);
     }
 }
