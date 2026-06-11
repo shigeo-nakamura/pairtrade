@@ -6,11 +6,13 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use super::super::defaults::*;
+
+use super::params::default_pair_params_from_yaml;
 use super::risk::resolve_risk_config;
 use super::schema::PairTradeYaml;
 use super::strategy::resolve_strategies;
 use super::universe::{default_history_file, resolve_universe_from_yaml};
-use super::{PairParams, PairTradeConfig, WarmStartMode};
+use super::{PairTradeConfig, WarmStartMode};
 
 impl PairTradeConfig {
     pub fn from_env_or_yaml() -> Result<Self> {
@@ -144,116 +146,5 @@ impl PairTradeConfig {
         cfg.strategies = resolve_strategies(&cfg, yaml.strategies.as_deref());
         cfg.validate()?;
         Ok(cfg)
-    }
-}
-
-/// Resolve global per-pair defaults directly from a YAML document, falling
-/// back to compile-time `DEFAULT_*` constants for any missing fields.
-fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams {
-    PairParams {
-        entry_z_base: yaml.entry_z_score_base.unwrap_or(DEFAULT_ENTRY_Z_BASE),
-        entry_z_min: yaml.entry_z_score_min.unwrap_or(DEFAULT_ENTRY_Z_MIN),
-        entry_z_max: yaml.entry_z_score_max.unwrap_or(DEFAULT_ENTRY_Z_MAX),
-        exit_z: yaml.exit_z_score.unwrap_or(DEFAULT_EXIT_Z),
-        stop_loss_z: yaml.stop_loss_z_score.unwrap_or(DEFAULT_STOP_LOSS_Z),
-        force_close_secs: yaml
-            .force_close_time_secs
-            .unwrap_or(DEFAULT_FORCE_CLOSE_SECS),
-        cooldown_secs: yaml.cooldown_secs.unwrap_or(DEFAULT_COOLDOWN_SECS),
-        stop_loss_cooldown_secs: yaml
-            .stop_loss_cooldown_secs
-            .unwrap_or(DEFAULT_STOP_LOSS_COOLDOWN_SECS),
-        max_loss_r_mult: yaml.max_loss_r_mult.unwrap_or(DEFAULT_MAX_LOSS_R_MULT),
-        half_life_max_hours: yaml
-            .half_life_max_hours
-            .unwrap_or(DEFAULT_HALF_LIFE_MAX_HOURS),
-        adf_p_threshold: yaml.adf_p_threshold.unwrap_or(DEFAULT_ADF_P_THRESHOLD),
-        spread_velocity_max_sigma_per_min: yaml
-            .spread_velocity_max_sigma_per_min
-            .unwrap_or(DEFAULT_SPREAD_VELOCITY_MAX_SIGMA_PER_MIN),
-        spread_trend_max_slope_sigma: yaml
-            .spread_trend_max_slope_sigma
-            .unwrap_or(DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA),
-        beta_divergence_max: yaml
-            .beta_divergence_max
-            .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
-        beta_min: yaml.beta_min.unwrap_or(0.0),
-        hedge_ratio_max_deviation: yaml.hedge_ratio_max_deviation.unwrap_or(1.0),
-        lookback_hours_short: yaml
-            .pair_selection_lookback_hours_short
-            .unwrap_or(DEFAULT_LOOKBACK_HOURS_SHORT),
-        lookback_hours_long: yaml
-            .pair_selection_lookback_hours_long
-            .unwrap_or(DEFAULT_LOOKBACK_HOURS_LONG),
-        entry_vol_lookback_hours: yaml
-            .entry_vol_lookback_hours
-            .unwrap_or(DEFAULT_ENTRY_VOL_LOOKBACK_HOURS),
-        // Caller is responsible for clamping warm_start_min_bars to
-        // metrics_window when omitted (it has a cross-field default).
-        warm_start_min_bars: yaml.warm_start_min_bars.unwrap_or(0),
-        reeval_jump_z_mult: yaml
-            .reeval_jump_z_mult
-            .unwrap_or(DEFAULT_REEVAL_JUMP_Z_MULT),
-        vol_spike_mult: yaml.vol_spike_mult.unwrap_or(DEFAULT_VOL_SPIKE_MULT),
-        circuit_breaker_tier1_losses: yaml
-            .circuit_breaker_tier1_losses
-            .unwrap_or(DEFAULT_CB_TIER1_LOSSES),
-        circuit_breaker_tier1_cooldown_secs: yaml
-            .circuit_breaker_tier1_cooldown_secs
-            .unwrap_or(DEFAULT_CB_TIER1_COOLDOWN_SECS),
-        circuit_breaker_tier2_losses: yaml
-            .circuit_breaker_tier2_losses
-            .unwrap_or(DEFAULT_CB_TIER2_LOSSES),
-        circuit_breaker_tier2_cooldown_secs: yaml
-            .circuit_breaker_tier2_cooldown_secs
-            .unwrap_or(DEFAULT_CB_TIER2_COOLDOWN_SECS),
-        entry_post_only_timeout_secs: yaml
-            .entry_post_only_timeout_secs
-            .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
-        exit_post_only_timeout_secs: yaml
-            .exit_post_only_timeout_secs
-            .unwrap_or(DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS),
-        entry_velocity_block_sigma_per_min: yaml.entry_velocity_block_sigma_per_min.unwrap_or(0.0),
-        funding_entry_z_scale: yaml.funding_entry_z_scale.unwrap_or(0.0),
-        beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
-        beta_gap_notional_scale: yaml.beta_gap_notional_scale.unwrap_or(0.0),
-        beta_gap_notional_floor: yaml.beta_gap_notional_floor.unwrap_or(0.5),
-        // bot-strategy#515 defaults — disabled.
-        depth_size_slope: yaml.depth_size_slope.unwrap_or(0.0),
-        depth_size_min: yaml.depth_size_min.unwrap_or(0.5),
-        depth_size_max: yaml.depth_size_max.unwrap_or(1.5),
-        // bot-strategy#463 Phase 1 defaults — disabled.
-        rehedge_drift_threshold_pct: yaml.rehedge_drift_threshold_pct.unwrap_or(0.0),
-        rehedge_cooldown_secs: yaml.rehedge_cooldown_secs.unwrap_or(1800),
-        rehedge_min_qty_notional_usd: yaml.rehedge_min_qty_notional_usd.unwrap_or(50.0),
-        rehedge_live_enabled: yaml.rehedge_live_enabled.unwrap_or(false),
-        use_amend_on_partial_fill: yaml.use_amend_on_partial_fill.unwrap_or(false),
-        rehedge_require_no_revert: yaml.rehedge_require_no_revert.unwrap_or(false),
-        rehedge_z_no_revert_factor: yaml.rehedge_z_no_revert_factor.unwrap_or(1.0),
-        rehedge_velocity_projected_drift_min: yaml
-            .rehedge_velocity_projected_drift_min
-            .unwrap_or(0.0),
-        beta_uncertainty_max: yaml.beta_uncertainty_max.unwrap_or(0.0),
-        entry_z_short_multiplier: yaml.entry_z_short_multiplier.unwrap_or(1.0),
-        mtf_windows: yaml.mtf_windows.clone().unwrap_or_default(),
-        mtf_z_min: yaml.mtf_z_min.unwrap_or(DEFAULT_MTF_Z_MIN),
-        std_collapse_window_bars: yaml
-            .std_collapse_window_bars
-            .unwrap_or(DEFAULT_STD_COLLAPSE_WINDOW_BARS),
-        std_collapse_min_ratio: yaml
-            .std_collapse_min_ratio
-            .unwrap_or(DEFAULT_STD_COLLAPSE_MIN_RATIO),
-        std_collapse_hold_down_secs: yaml
-            .std_collapse_hold_down_secs
-            .unwrap_or(DEFAULT_STD_COLLAPSE_HOLD_DOWN_SECS),
-        std_collapse_observe_only: yaml
-            .std_collapse_observe_only
-            .unwrap_or(DEFAULT_STD_COLLAPSE_OBSERVE_ONLY),
-        use_frozen_beta_exit_z: yaml
-            .use_frozen_beta_exit_z
-            .unwrap_or(DEFAULT_USE_FROZEN_BETA_EXIT_Z),
-        regime_block_entries: yaml
-            .regime_block_entries
-            .unwrap_or(DEFAULT_REGIME_BLOCK_ENTRIES),
     }
 }

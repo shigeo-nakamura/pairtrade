@@ -4,9 +4,8 @@ use std::env;
 use anyhow::{anyhow, Result};
 
 use super::super::defaults::*;
-use super::env_util::{
-    env_parse, env_parse_critical, load_bt_eval_timestamps, load_bt_restart_timestamps,
-};
+use super::env_util::{env_parse, load_bt_eval_timestamps, load_bt_restart_timestamps};
+use super::params::default_pair_params_from_env;
 use super::strategy::resolve_strategies;
 use super::universe::{default_history_file, parse_universe_pairs};
 use super::{PairParams, PairTradeConfig, RiskConfig, WarmStartMode};
@@ -232,135 +231,5 @@ impl PairTradeConfig {
         cfg.strategies = resolve_strategies(&cfg, None);
         cfg.validate()?;
         Ok(cfg)
-    }
-}
-
-/// Resolve global per-pair defaults from environment variables, falling back
-/// to compile-time `DEFAULT_*` constants for any missing entries.
-fn default_pair_params_from_env() -> PairParams {
-    PairParams {
-        entry_z_base: env_parse("ENTRY_Z_SCORE_BASE", DEFAULT_ENTRY_Z_BASE),
-        entry_z_min: env_parse("ENTRY_Z_SCORE_MIN", DEFAULT_ENTRY_Z_MIN),
-        entry_z_max: env_parse("ENTRY_Z_SCORE_MAX", DEFAULT_ENTRY_Z_MAX),
-        exit_z: env_parse("EXIT_Z_SCORE", DEFAULT_EXIT_Z),
-        stop_loss_z: env_parse("STOP_LOSS_Z_SCORE", DEFAULT_STOP_LOSS_Z),
-        force_close_secs: env_parse("FORCE_CLOSE_TIME_SECS", DEFAULT_FORCE_CLOSE_SECS),
-        cooldown_secs: env_parse("COOLDOWN_SECS", DEFAULT_COOLDOWN_SECS),
-        stop_loss_cooldown_secs: env_parse(
-            "STOP_LOSS_COOLDOWN_SECS",
-            DEFAULT_STOP_LOSS_COOLDOWN_SECS,
-        ),
-        // bot-strategy#439: stop-loss multiplier — silent default revert
-        // could place a trade with a much wider stop than intended.
-        max_loss_r_mult: env_parse_critical("MAX_LOSS_R_MULT", DEFAULT_MAX_LOSS_R_MULT),
-        half_life_max_hours: env_parse("HALF_LIFE_MAX_HOURS", DEFAULT_HALF_LIFE_MAX_HOURS),
-        adf_p_threshold: env_parse("ADF_P_THRESHOLD", DEFAULT_ADF_P_THRESHOLD),
-        spread_velocity_max_sigma_per_min: env_parse(
-            "SPREAD_VELOCITY_MAX_SIGMA_PER_MIN",
-            DEFAULT_SPREAD_VELOCITY_MAX_SIGMA_PER_MIN,
-        ),
-        spread_trend_max_slope_sigma: env_parse(
-            "SPREAD_TREND_MAX_SLOPE_SIGMA",
-            DEFAULT_SPREAD_TREND_MAX_SLOPE_SIGMA,
-        ),
-        beta_divergence_max: env_parse("BETA_DIVERGENCE_MAX", DEFAULT_BETA_DIVERGENCE_MAX),
-        beta_min: env_parse("BETA_MIN", 0.0),
-        hedge_ratio_max_deviation: env_parse("HEDGE_RATIO_MAX_DEVIATION", 1.0),
-        lookback_hours_short: env_parse(
-            "PAIR_SELECTION_LOOKBACK_HOURS_SHORT",
-            DEFAULT_LOOKBACK_HOURS_SHORT,
-        ),
-        lookback_hours_long: env_parse(
-            "PAIR_SELECTION_LOOKBACK_HOURS_LONG",
-            DEFAULT_LOOKBACK_HOURS_LONG,
-        ),
-        entry_vol_lookback_hours: env_parse(
-            "ENTRY_VOL_LOOKBACK_HOURS",
-            DEFAULT_ENTRY_VOL_LOOKBACK_HOURS,
-        ),
-        // Caller is responsible for filling warm_start_min_bars from
-        // metrics_window when omitted.
-        warm_start_min_bars: env_parse::<usize>("WARM_START_MIN_BARS", 0),
-        reeval_jump_z_mult: env_parse("REEVAL_JUMP_Z_MULT", DEFAULT_REEVAL_JUMP_Z_MULT),
-        vol_spike_mult: env_parse("VOL_SPIKE_MULT", DEFAULT_VOL_SPIKE_MULT),
-        circuit_breaker_tier1_losses: env_parse(
-            "CIRCUIT_BREAKER_TIER1_LOSSES",
-            DEFAULT_CB_TIER1_LOSSES,
-        ),
-        circuit_breaker_tier1_cooldown_secs: env_parse(
-            "CIRCUIT_BREAKER_TIER1_COOLDOWN_SECS",
-            DEFAULT_CB_TIER1_COOLDOWN_SECS,
-        ),
-        circuit_breaker_tier2_losses: env_parse(
-            "CIRCUIT_BREAKER_TIER2_LOSSES",
-            DEFAULT_CB_TIER2_LOSSES,
-        ),
-        circuit_breaker_tier2_cooldown_secs: env_parse(
-            "CIRCUIT_BREAKER_TIER2_COOLDOWN_SECS",
-            DEFAULT_CB_TIER2_COOLDOWN_SECS,
-        ),
-        entry_post_only_timeout_secs: env_parse(
-            "ENTRY_POST_ONLY_TIMEOUT_SECS",
-            DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS,
-        ),
-        exit_post_only_timeout_secs: env_parse(
-            "EXIT_POST_ONLY_TIMEOUT_SECS",
-            DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS,
-        ),
-        entry_velocity_block_sigma_per_min: env_parse("ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN", 0.0),
-        funding_entry_z_scale: env_parse("FUNDING_ENTRY_Z_SCALE", 0.0),
-        beta_gap_entry_z_scale: env_parse("BETA_GAP_ENTRY_Z_SCALE", 0.0),
-        beta_gap_notional_scale: env_parse("BETA_GAP_NOTIONAL_SCALE", 0.0),
-        beta_gap_notional_floor: env_parse("BETA_GAP_NOTIONAL_FLOOR", 0.5),
-        // bot-strategy#515 — default DISABLED (slope=0.0).
-        depth_size_slope: env_parse("DEPTH_SIZE_SLOPE", 0.0),
-        depth_size_min: env_parse("DEPTH_SIZE_MIN", 0.5),
-        depth_size_max: env_parse("DEPTH_SIZE_MAX", 1.5),
-        // bot-strategy#463 Phase 1 — default DISABLED (threshold=0.0).
-        rehedge_drift_threshold_pct: env_parse("REHEDGE_DRIFT_THRESHOLD_PCT", 0.0),
-        rehedge_cooldown_secs: env_parse("REHEDGE_COOLDOWN_SECS", 1800u64),
-        rehedge_min_qty_notional_usd: env_parse("REHEDGE_MIN_QTY_NOTIONAL_USD", 50.0),
-        // bot-strategy#463 Phase 2 — live order placement is OFF by
-        // default. BT / dry_run always simulate; live opt-in requires
-        // this to be flipped (env or per-strategy YAML).
-        rehedge_live_enabled: env_parse("REHEDGE_LIVE_ENABLED", false),
-        // bot-strategy#471 — amend-on-partial-fill is OFF by default; flip
-        // per host (env or per-strategy YAML) after the Tokyo Extended
-        // dry_run soak.
-        use_amend_on_partial_fill: env_parse("USE_AMEND_ON_PARTIAL_FILL", false),
-        rehedge_require_no_revert: env_parse("REHEDGE_REQUIRE_NO_REVERT", false),
-        rehedge_z_no_revert_factor: env_parse("REHEDGE_Z_NO_REVERT_FACTOR", 1.0),
-        rehedge_velocity_projected_drift_min: env_parse(
-            "REHEDGE_VELOCITY_PROJECTED_DRIFT_MIN",
-            0.0,
-        ),
-        beta_uncertainty_max: env_parse("BETA_UNCERTAINTY_MAX", 0.0),
-        entry_z_short_multiplier: env_parse("ENTRY_Z_SHORT_MULTIPLIER", 1.0),
-        mtf_windows: env::var("MTF_WINDOWS")
-            .ok()
-            .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
-            .unwrap_or_default(),
-        mtf_z_min: env_parse("MTF_Z_MIN", DEFAULT_MTF_Z_MIN),
-        std_collapse_window_bars: env_parse(
-            "STD_COLLAPSE_WINDOW_BARS",
-            DEFAULT_STD_COLLAPSE_WINDOW_BARS,
-        ),
-        std_collapse_min_ratio: env_parse("STD_COLLAPSE_MIN_RATIO", DEFAULT_STD_COLLAPSE_MIN_RATIO),
-        std_collapse_hold_down_secs: env_parse(
-            "STD_COLLAPSE_HOLD_DOWN_SECS",
-            DEFAULT_STD_COLLAPSE_HOLD_DOWN_SECS,
-        ),
-        std_collapse_observe_only: env::var("STD_COLLAPSE_OBSERVE_ONLY")
-            .ok()
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(DEFAULT_STD_COLLAPSE_OBSERVE_ONLY),
-        use_frozen_beta_exit_z: env::var("USE_FROZEN_BETA_EXIT_Z")
-            .ok()
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(DEFAULT_USE_FROZEN_BETA_EXIT_Z),
-        regime_block_entries: env::var("REGIME_BLOCK_ENTRIES")
-            .ok()
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(DEFAULT_REGIME_BLOCK_ENTRIES),
     }
 }
