@@ -2,21 +2,24 @@
 """
 Build a live pairtrade attribution report from exchange accounting first.
 
-The DEX-side realized_pnl.csv is treated as the accounting source of truth.
-Bot pnl jsonl and journal fragments are optional enrichment inputs; when they
-are absent or cannot be matched, the report keeps the gap explicit instead of
-guessing.
+The DEX export is treated as the accounting source of truth. Bot pnl JSONL and
+journal logs are optional enrichment inputs; missing fields are reported as
+gaps instead of being guessed.
 
-Example:
-    scripts/live_trade_attribution.py \
-        --dex-zip ~/bot/logs/extended-202697.zip \
-        --since 2026-06-04T00:00:00Z \
-        --until 2026-06-11T06:00:00Z \
-        --venue extended \
-        --journal-log /tmp/extended-0604-0611.log \
-        --pnl-jsonl '/tmp/extended-pnl/pnl-*.jsonl' \
-        --report-out /tmp/extended-0604-0611-attribution.md \
-        --csv-out /tmp/extended-0604-0611-attribution.csv
+Examples:
+  scripts/live_trade_attribution.py \
+    --dex-zip ~/bot/logs/extended-202697.zip \
+    --venue extended \
+    --since 2026-06-04T00:00:00Z \
+    --until 2026-06-11T06:00:00Z \
+    --report-out /tmp/extended-0604-0611-attribution.md \
+    --csv-out /tmp/extended-0604-0611-attribution.csv
+
+  scripts/live_trade_attribution.py \
+    --dex-path ~/bot/logs/lighter-trade-export-2026-06-11T07_14_03.801Z-UTC.csv \
+    --venue lighter \
+    --since 2026-06-10T00:00:00Z \
+    --until 2026-06-11T08:00:00Z
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ import json
 import re
 import sys
 import zipfile
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -36,45 +40,52 @@ from typing import Iterable
 
 
 BASE_MARKET_SUFFIX = "-USD"
-ENTRY_EXIT_MATCH_SECS = 300.0
-JOURNAL_ENTRY_LOOKBACK_SECS = 6 * 3600.0
-JOURNAL_EXIT_WINDOW_SECS = 10 * 60.0
-FILL_BUNDLE_SECS = 2.0
-FILL_QTY_TOLERANCE_RATIO = Decimal("0.025")
+DEFAULT_GROUP_WINDOW_SECS = 300.0
+DEFAULT_PNL_MATCH_SECS = 300.0
+DEFAULT_JOURNAL_MATCH_SECS = 600.0
+FILL_MATCH_LOOKBACK_SECS = 12 * 3600.0
+FILL_QTY_TOLERANCE = Decimal("0.00000001")
+REALIZED_LEG_AGGREGATE_SECS = 2.0
 
 LOG_PREFIX_RE = re.compile(
     r"(?P<wall>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4})"
     r"\s+\[(?P<level>[A-Z]+)\]\s+-\s+(?P<msg>.*)"
 )
 KV_RE = re.compile(r"\b(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|[^\s,]+)")
-MARKER_PATTERNS = ("FILL_DETECTION", "partial", "reissue", "timeout")
+ENTRY_RE = re.compile(r"\[ENTRY\].*?(?P<direction>LongSpread|ShortSpread)", re.IGNORECASE)
+EXIT_REASON_RE = re.compile(r"(?:reason|close_reason)=([A-Za-z0-9_:/.-]+)")
+MARKER_WORDS = ("FILL_DETECTION", "partial", "reissue", "timeout", "amend", "ENTRY_CAP")
+
+
+@dataclass
+class DexFill:
+    market: str
+    side: str
+    price: Decimal
+    qty: Decimal
+    fee: Decimal
+    role: str
+    time: datetime
 
 
 @dataclass
 class RealizedLeg:
     market: str
-    side: str
+    position_side: str
     size: Decimal
-    entry_price: Decimal
-    realised_pnl: Decimal
-    trade_pnl: Decimal
-    funding_fees: Decimal
-    trading_fees: Decimal
+    entry_price: Decimal | None
     exit_price: Decimal
-    exit_type: str
+    realized_pnl: Decimal
+    trade_pnl: Decimal | None
+    funding: Decimal | None
+    trading_fees: Decimal | None
+    close_type: str
     closed_at: datetime
-
-
-@dataclass
-class Fill:
-    market: str
-    side: str
-    price: Decimal
-    qty: Decimal
-    total_value: Decimal
-    fee: Decimal
-    trade_type: str
-    time: datetime
+    entry_at: datetime | None = None
+    exit_at: datetime | None = None
+    entry_role: str = ""
+    exit_role: str = ""
+    gaps: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -84,49 +95,26 @@ class PnlRecord:
     direction: str
     pnl: Decimal
     source: str
-    beta: Decimal | None
-    z_entry: Decimal | None
-    z_exit: Decimal | None
-    hold_secs: Decimal | None
-    funding_carry_usd: Decimal | None
     pnl_available: bool
     close_reason: str
     recovery_reason: str
-
-
-@dataclass
-class JournalEntry:
-    ts: datetime
-    pair: str | None
-    direction: str | None
-    size_a: Decimal | None
-    price_a: Decimal | None
-    size_b: Decimal | None
-    price_b: Decimal | None
-    z: Decimal | None
+    z_entry: Decimal | None
+    z_exit: Decimal | None
     beta: Decimal | None
+    hold_secs: Decimal | None
+    funding_carry_usd: Decimal | None
 
 
 @dataclass
-class JournalExit:
+class JournalEvent:
     ts: datetime
-    pair: str | None
-    reason: str | None
-    raw_type: str
-
-
-@dataclass
-class JournalMarker:
-    ts: datetime
-    label: str
-
-
-@dataclass
-class JournalData:
-    entries: list[JournalEntry] = field(default_factory=list)
-    exits: list[JournalExit] = field(default_factory=list)
-    markers: list[JournalMarker] = field(default_factory=list)
-    line_count: int = 0
+    kind: str
+    direction: str = ""
+    reason: str = ""
+    z: Decimal | None = None
+    beta: Decimal | None = None
+    exit_z: Decimal | None = None
+    message: str = ""
 
 
 @dataclass
@@ -135,93 +123,143 @@ class AttributedTrade:
     venue: str
     variant: str
     pair: str
-    legs: list[RealizedLeg]
     base_market: str
     quote_market: str
-    direction: str
-    close_at: datetime
-    entry_fills: dict[str, Fill] = field(default_factory=dict)
-    exit_fills: dict[str, Fill] = field(default_factory=dict)
+    legs: list[RealizedLeg]
     pnl_record: PnlRecord | None = None
-    journal_entry: JournalEntry | None = None
-    journal_exit: JournalExit | None = None
-    journal_markers: list[JournalMarker] = field(default_factory=list)
+    journal_entry: JournalEvent | None = None
+    journal_exit: JournalEvent | None = None
+    markers: list[JournalEvent] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
 
     @property
-    def realised_pnl(self) -> Decimal:
-        return sum_decimal(leg.realised_pnl for leg in self.legs)
-
-    @property
-    def trade_pnl(self) -> Decimal:
-        return sum_decimal(leg.trade_pnl for leg in self.legs)
-
-    @property
-    def funding_fees(self) -> Decimal:
-        return sum_decimal(leg.funding_fees for leg in self.legs)
-
-    @property
-    def trading_fees(self) -> Decimal:
-        return sum_decimal(leg.trading_fees for leg in self.legs)
+    def close_at(self) -> datetime:
+        return max(leg.closed_at for leg in self.legs)
 
     @property
     def entry_at(self) -> datetime | None:
-        if not self.entry_fills:
-            return self.journal_entry.ts if self.journal_entry else None
-        return min(fill.time for fill in self.entry_fills.values())
+        times = [leg.entry_at for leg in self.legs if leg.entry_at is not None]
+        if times:
+            return min(times)
+        if self.journal_entry:
+            return self.journal_entry.ts
+        return None
 
     @property
     def full_entry_at(self) -> datetime | None:
-        if len(self.entry_fills) < 2:
-            return None
-        return max(fill.time for fill in self.entry_fills.values())
+        times = [leg.entry_at for leg in self.legs if leg.entry_at is not None]
+        if len(times) >= 2:
+            return max(times)
+        return None
 
     @property
-    def exit_at(self) -> datetime | None:
-        if not self.exit_fills:
-            return self.close_at
-        return max(fill.time for fill in self.exit_fills.values())
+    def exit_at(self) -> datetime:
+        times = [leg.exit_at for leg in self.legs if leg.exit_at is not None]
+        return max(times) if times else self.close_at
+
+    @property
+    def direction(self) -> str:
+        sides = {leg.market: leg.position_side for leg in self.legs}
+        base_side = sides.get(self.base_market)
+        quote_side = sides.get(self.quote_market)
+        if base_side == "LONG" and quote_side == "SHORT":
+            return "LongSpread"
+        if base_side == "SHORT" and quote_side == "LONG":
+            return "ShortSpread"
+        if base_side:
+            return f"{base_side.title()}Base"
+        if self.pnl_record and self.pnl_record.direction:
+            return self.pnl_record.direction
+        if self.journal_entry and self.journal_entry.direction:
+            return self.journal_entry.direction
+        return "unknown"
+
+    @property
+    def realized_pnl(self) -> Decimal:
+        return sum_decimal(leg.realized_pnl for leg in self.legs)
+
+    @property
+    def trade_pnl(self) -> Decimal | None:
+        values = [leg.trade_pnl for leg in self.legs if leg.trade_pnl is not None]
+        if len(values) != len(self.legs):
+            return None
+        return sum_decimal(values)
+
+    @property
+    def funding(self) -> Decimal | None:
+        values = [leg.funding for leg in self.legs if leg.funding is not None]
+        if len(values) != len(self.legs):
+            return None
+        return sum_decimal(values)
+
+    @property
+    def trading_fees(self) -> Decimal | None:
+        values = [leg.trading_fees for leg in self.legs if leg.trading_fees is not None]
+        if len(values) != len(self.legs):
+            return None
+        return sum_decimal(values)
+
+    @property
+    def hold_secs(self) -> float | None:
+        start = self.full_entry_at or self.entry_at
+        if start is None:
+            return None
+        return max(0.0, (self.exit_at - start).total_seconds())
 
     @property
     def entry_sync_secs(self) -> float | None:
-        if len(self.entry_fills) < 2:
+        times = [leg.entry_at for leg in self.legs if leg.entry_at is not None]
+        if len(times) < 2:
             return None
-        times = [fill.time for fill in self.entry_fills.values()]
         return (max(times) - min(times)).total_seconds()
 
     @property
     def exit_sync_secs(self) -> float | None:
-        if len(self.exit_fills) < 2:
+        times = [leg.exit_at for leg in self.legs if leg.exit_at is not None]
+        if len(times) < 2:
             return None
-        times = [fill.time for fill in self.exit_fills.values()]
         return (max(times) - min(times)).total_seconds()
 
     @property
-    def dex_hold_secs(self) -> float | None:
-        start = self.full_entry_at or self.entry_at
-        end = self.exit_at
-        if start is None or end is None:
-            return None
-        return max(0.0, (end - start).total_seconds())
-
-    @property
-    def model_pnl(self) -> Decimal | None:
-        if self.pnl_record is None or not self.pnl_record.pnl_available:
+    def bot_pnl(self) -> Decimal | None:
+        if not self.pnl_record or not self.pnl_record.pnl_available:
             return None
         return self.pnl_record.pnl
 
     @property
     def execution_leakage(self) -> Decimal | None:
-        if self.model_pnl is None:
+        if self.bot_pnl is None:
             return None
-        return self.realised_pnl - self.model_pnl
+        return self.realized_pnl - self.bot_pnl
 
     @property
     def close_reason(self) -> str:
         if self.journal_exit and self.journal_exit.reason:
             return self.journal_exit.reason
-        exit_types = sorted({leg.exit_type for leg in self.legs if leg.exit_type})
-        return "/".join(exit_types) if exit_types else "n/a"
+        close_types = sorted({leg.close_type for leg in self.legs if leg.close_type})
+        return "/".join(close_types) if close_types else "n/a"
+
+    def all_gaps(self) -> list[str]:
+        gaps = list(self.gaps)
+        for leg in self.legs:
+            gaps.extend(leg.gaps)
+        if self.trade_pnl is None:
+            gaps.append("trade_pnl split unavailable")
+        if self.funding is None:
+            gaps.append("funding split unavailable")
+        if self.trading_fees is None:
+            gaps.append("trading fee split unavailable")
+        if self.pnl_record is None:
+            gaps.append("bot pnl jsonl unmatched")
+        elif not self.pnl_record.pnl_available and not any(
+            gap.startswith("bot pnl unavailable:") for gap in gaps
+        ):
+            gaps.append("bot pnl unavailable")
+        if self.journal_entry is None:
+            gaps.append("journal ENTRY unmatched")
+        if self.journal_exit is None:
+            gaps.append("journal exit reason unmatched")
+        return sorted(set(gaps))
 
 
 def sum_decimal(values: Iterable[Decimal]) -> Decimal:
@@ -236,22 +274,37 @@ def parse_decimal(raw: object, default: Decimal | None = None) -> Decimal:
         if default is not None:
             return default
         raise ValueError("missing decimal")
+    text = str(raw).strip()
+    if not text or text == "-":
+        if default is not None:
+            return default
+        raise ValueError("missing decimal")
     try:
-        return Decimal(str(raw).strip())
-    except (InvalidOperation, AttributeError) as exc:
+        return Decimal(text)
+    except InvalidOperation as exc:
         raise ValueError(f"invalid decimal {raw!r}") from exc
 
 
 def optional_decimal(raw: object) -> Decimal | None:
-    if raw is None:
-        return None
-    text = str(raw).strip()
-    if not text:
-        return None
     try:
-        return Decimal(text)
-    except InvalidOperation:
+        return parse_decimal(raw)
+    except ValueError:
         return None
+
+
+def parse_bool(raw: object, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return raw != 0
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    return default
 
 
 def parse_ts(raw: str) -> datetime:
@@ -262,37 +315,35 @@ def parse_ts(raw: str) -> datetime:
         text = f"{text}T00:00:00Z"
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", text):
+        text = text.replace(" ", "T") + "+00:00"
     dt = datetime.fromisoformat(text)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
-def parse_log_ts(wall: str, values: dict[str, str]) -> datetime:
-    if values.get("ts"):
-        try:
-            return datetime.fromtimestamp(int(values["ts"]), tz=timezone.utc)
-        except ValueError:
-            pass
-    return datetime.strptime(wall, "%Y-%m-%dT%H:%M:%S%z").astimezone(timezone.utc)
+def fmt_ts(dt: datetime | None) -> str:
+    if dt is None:
+        return ""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_bool(raw: object, default: bool = True) -> bool:
-    if raw is None:
-        return default
-    if isinstance(raw, bool):
-        return raw
-    text = str(raw).strip().lower()
-    if text in {"0", "false", "no"}:
-        return False
-    if text in {"1", "true", "yes"}:
-        return True
-    return default
+def fmt_decimal(value: Decimal | None, places: int = 6) -> str:
+    if value is None:
+        return ""
+    quant = Decimal("1").scaleb(-places)
+    return str(value.quantize(quant))
+
+
+def fmt_float(value: float | None, places: int = 1) -> str:
+    if value is None:
+        return ""
+    return f"{value:.{places}f}"
 
 
 def parse_pair(pair: str) -> tuple[str, str]:
-    normalized = pair.replace("_", "/").replace("-", "/")
-    parts = [p for p in normalized.split("/") if p]
+    parts = [part for part in pair.replace("-", "/").replace("_", "/").split("/") if part]
     if len(parts) != 2:
         raise ValueError(f"pair must look like BTC/ETH, got {pair!r}")
     return parts[0].upper(), parts[1].upper()
@@ -303,101 +354,305 @@ def market_for(symbol: str) -> str:
     return symbol if "-" in symbol else f"{symbol}{BASE_MARKET_SUFFIX}"
 
 
-def expand_path(path: Path) -> Path:
-    return Path(str(path)).expanduser()
+def infer_venue(path: Path, explicit: str) -> str:
+    if explicit != "auto":
+        return explicit
+    if path.suffix.lower() == ".zip" or "extended" in path.name.lower():
+        return "extended"
+    return "lighter"
 
 
-def zip_csv_reader(dex_zip: Path, name: str) -> list[dict[str, str]]:
-    with zipfile.ZipFile(dex_zip) as archive:
-        try:
-            with archive.open(name) as raw:
-                text = io.TextIOWrapper(raw, encoding="utf-8")
-                return list(csv.DictReader(text))
-        except KeyError as exc:
-            raise FileNotFoundError(f"{name} not found in {dex_zip}") from exc
+def read_csv_from_zip(path: Path, member: str) -> list[dict[str, str]]:
+    with zipfile.ZipFile(path) as archive:
+        with archive.open(member) as raw:
+            text = io.TextIOWrapper(raw, encoding="utf-8")
+            return list(csv.DictReader(text))
 
 
-def load_realized_legs(dex_zip: Path) -> list[RealizedLeg]:
-    rows = zip_csv_reader(dex_zip, "realized_pnl.csv")
+def read_plain_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def load_extended(path: Path) -> tuple[list[RealizedLeg], list[DexFill], list[str]]:
+    warnings: list[str] = []
+    realized_rows = read_csv_from_zip(path, "realized_pnl.csv")
+    trade_rows = read_csv_from_zip(path, "trades.csv")
+
     legs: list[RealizedLeg] = []
-    for row in rows:
+    for row in realized_rows:
+        gaps: list[str] = []
+        fees = parse_decimal(row.get("trading_fees"), default=Decimal("0"))
+        realized_pnl = optional_decimal(row.get("realised_pnl"))
+        if realized_pnl is None:
+            realized_pnl = Decimal("0")
+            gaps.append("realised_pnl unavailable")
         legs.append(
             RealizedLeg(
-                market=row["market"],
-                side=row["side"].upper(),
+                market=row["market"].upper(),
+                position_side=row["side"].upper(),
                 size=parse_decimal(row["size"]),
                 entry_price=parse_decimal(row["entry_price"]),
-                realised_pnl=parse_decimal(row["realised_pnl"]),
-                trade_pnl=parse_decimal(row["trade_pnl"]),
-                funding_fees=parse_decimal(row["funding_fees"]),
-                trading_fees=parse_decimal(row["trading_fees"]),
                 exit_price=parse_decimal(row["exit_price"]),
-                exit_type=row.get("exit_type", ""),
+                realized_pnl=realized_pnl,
+                trade_pnl=optional_decimal(row.get("trade_pnl")),
+                funding=optional_decimal(row.get("funding_fees")),
+                trading_fees=fees,
+                close_type=row.get("exit_type", ""),
                 closed_at=parse_ts(row["closed_at"]),
+                gaps=gaps,
             )
         )
-    legs.sort(key=lambda leg: leg.closed_at)
-    return legs
 
-
-def load_fills(dex_zip: Path) -> list[Fill]:
-    rows = zip_csv_reader(dex_zip, "trades.csv")
-    fills: list[Fill] = []
-    for row in rows:
+    fills: list[DexFill] = []
+    for row in trade_rows:
         fills.append(
-            Fill(
-                market=row["market"],
+            DexFill(
+                market=row["market"].upper(),
                 side=row["side"].upper(),
                 price=parse_decimal(row["price"]),
                 qty=parse_decimal(row["qty"]),
-                total_value=parse_decimal(row["total_value"]),
-                fee=parse_decimal(row["fee"], default=Decimal("0")),
-                trade_type=row.get("trade_type", ""),
+                fee=parse_decimal(row.get("fee"), default=Decimal("0")),
+                role=row.get("trade_type", ""),
                 time=parse_ts(row["time"]),
             )
         )
-    fills.sort(key=lambda fill: fill.time)
-    return fills
+
+    match_extended_fills(legs, fills)
+    legs = aggregate_realized_legs(legs, REALIZED_LEG_AGGREGATE_SECS)
+    return sorted(legs, key=lambda leg: leg.closed_at), sorted(fills, key=lambda fill: fill.time), warnings
 
 
-def infer_venue(dex_zip: Path, explicit: str | None) -> str:
-    if explicit:
-        return explicit
-    name = dex_zip.name.lower()
-    if "extended" in name:
-        return "extended"
-    if "bot-a" in name or "-a" in name:
-        return "lighter-a"
-    if "bot-b" in name or "-b" in name:
-        return "lighter-b"
-    if "bot-c" in name or "-c" in name:
-        return "lighter-c"
-    return dex_zip.stem
+def load_lighter(path: Path) -> tuple[list[RealizedLeg], list[DexFill], list[str]]:
+    warnings = [
+        "Lighter CSV has no separate funding/trade PnL split; Closed PnL is used as realized and trade PnL",
+        "Lighter CSV reconstructs entry price by FIFO matching Open rows to Close rows",
+    ]
+    rows = read_plain_csv(path)
+    rows.sort(key=lambda row: parse_ts(row["Date"]))
+    open_lots: dict[tuple[str, str], deque[dict[str, object]]] = defaultdict(deque)
+    legs: list[RealizedLeg] = []
+    fills: list[DexFill] = []
+
+    for row in rows:
+        market = market_for(row["Market"])
+        side_text = row["Side"].strip()
+        parts = side_text.split()
+        if len(parts) != 2 or parts[0] not in {"Open", "Close"}:
+            warnings.append(f"unrecognized Lighter side {side_text!r}")
+            continue
+        action, position = parts[0].upper(), parts[1].upper()
+        ts = parse_ts(row["Date"])
+        size = parse_decimal(row["Size"])
+        price = parse_decimal(row["Price"])
+        fee = parse_decimal(row.get("Fee"), default=Decimal("0"))
+        role = row.get("Role", "")
+        trade_side = "BUY" if (action == "OPEN" and position == "LONG") or (action == "CLOSE" and position == "SHORT") else "SELL"
+        fills.append(DexFill(market=market, side=trade_side, price=price, qty=size, fee=fee, role=role, time=ts))
+
+        key = (market, position)
+        if action == "OPEN":
+            open_lots[key].append(
+                {
+                    "remaining": size,
+                    "original_size": size,
+                    "price": price,
+                    "time": ts,
+                    "fee": fee,
+                    "role": role,
+                }
+            )
+            continue
+
+        closed_pnl = parse_decimal(row.get("Closed PnL"), default=Decimal("0"))
+        remaining_close = size
+        matched_entry_value = Decimal("0")
+        matched_entry_fee = Decimal("0")
+        entry_times: list[datetime] = []
+        entry_roles: list[str] = []
+        gaps: list[str] = []
+
+        while remaining_close > Decimal("0") and open_lots[key]:
+            lot = open_lots[key][0]
+            lot_remaining = lot["remaining"]
+            lot_original_size = lot["original_size"]
+            take = min(remaining_close, lot_remaining)
+            matched_entry_value += take * lot["price"]
+            matched_entry_fee += lot["fee"] * (take / lot_original_size) if lot_original_size else Decimal("0")
+            entry_times.append(lot["time"])
+            if lot["role"]:
+                entry_roles.append(str(lot["role"]))
+            lot["remaining"] = lot_remaining - take
+            remaining_close -= take
+            if lot["remaining"] <= FILL_QTY_TOLERANCE:
+                open_lots[key].popleft()
+
+        if remaining_close > FILL_QTY_TOLERANCE:
+            gaps.append(f"unmatched Lighter open lot qty={remaining_close}")
+
+        entry_price = matched_entry_value / (size - remaining_close) if size > remaining_close else None
+        total_fees = matched_entry_fee + fee
+        legs.append(
+            RealizedLeg(
+                market=market,
+                position_side=position,
+                size=size,
+                entry_price=entry_price,
+                exit_price=price,
+                realized_pnl=closed_pnl,
+                trade_pnl=closed_pnl,
+                funding=None,
+                trading_fees=total_fees,
+                close_type=row.get("Type", ""),
+                closed_at=ts,
+                entry_at=min(entry_times) if entry_times else None,
+                exit_at=ts,
+                entry_role="+".join(sorted(set(entry_roles))),
+                exit_role=role,
+                gaps=gaps,
+            )
+        )
+
+    legs = aggregate_realized_legs(legs, REALIZED_LEG_AGGREGATE_SECS)
+    return sorted(legs, key=lambda leg: leg.closed_at), sorted(fills, key=lambda fill: fill.time), warnings
 
 
-def infer_variant(explicit: str | None, venue: str) -> str:
-    if explicit:
-        return explicit
-    for suffix in ("-a", "-b", "-c"):
-        if venue.endswith(suffix):
-            return suffix[-1]
-    return "n/a"
+def aggregate_realized_legs(legs: list[RealizedLeg], window_secs: float) -> list[RealizedLeg]:
+    grouped: list[list[RealizedLeg]] = []
+    for leg in sorted(legs, key=lambda item: (item.market, item.position_side, item.close_type, item.closed_at)):
+        if not grouped:
+            grouped.append([leg])
+            continue
+        current = grouped[-1]
+        first = current[0]
+        same_key = (
+            leg.market == first.market
+            and leg.position_side == first.position_side
+            and leg.close_type == first.close_type
+        )
+        close_delta = abs((leg.closed_at - first.closed_at).total_seconds())
+        if same_key and close_delta <= window_secs:
+            current.append(leg)
+        else:
+            grouped.append([leg])
+
+    result: list[RealizedLeg] = []
+    for group in grouped:
+        if len(group) == 1:
+            result.append(group[0])
+            continue
+        size = sum_decimal(leg.size for leg in group)
+        entry_price = None
+        if size and all(leg.entry_price is not None for leg in group):
+            entry_value = sum_decimal(leg.entry_price * leg.size for leg in group if leg.entry_price is not None)
+            entry_price = entry_value / size
+        exit_price = sum_decimal(leg.exit_price * leg.size for leg in group) / size if size else group[0].exit_price
+        result.append(
+            RealizedLeg(
+                market=group[0].market,
+                position_side=group[0].position_side,
+                size=size,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                realized_pnl=sum_decimal(leg.realized_pnl for leg in group),
+                trade_pnl=values_or_none([leg.trade_pnl for leg in group]),
+                funding=values_or_none([leg.funding for leg in group]),
+                trading_fees=values_or_none([leg.trading_fees for leg in group]),
+                close_type=group[0].close_type,
+                closed_at=max(leg.closed_at for leg in group),
+                entry_at=min((leg.entry_at for leg in group if leg.entry_at is not None), default=None),
+                exit_at=max((leg.exit_at for leg in group if leg.exit_at is not None), default=None),
+                entry_role="+".join(sorted({leg.entry_role for leg in group if leg.entry_role})),
+                exit_role="+".join(sorted({leg.exit_role for leg in group if leg.exit_role})),
+                gaps=sorted({gap for leg in group for gap in leg.gaps}),
+            )
+        )
+    return sorted(result, key=lambda leg: leg.closed_at)
 
 
-def direction_from_legs(legs: list[RealizedLeg], base_market: str, quote_market: str) -> str:
-    by_market = {leg.market: leg.side for leg in legs}
-    base_side = by_market.get(base_market)
-    quote_side = by_market.get(quote_market)
-    if base_side == "LONG" and quote_side == "SHORT":
-        return "LongSpread"
-    if base_side == "SHORT" and quote_side == "LONG":
-        return "ShortSpread"
-    if base_side:
-        return f"{base_side.title()}Base"
-    return "unknown"
+def side_for_entry(position_side: str) -> str:
+    return "BUY" if position_side == "LONG" else "SELL"
 
 
-def group_realized_trades(
+def side_for_exit(position_side: str) -> str:
+    return "SELL" if position_side == "LONG" else "BUY"
+
+
+def match_extended_fills(legs: list[RealizedLeg], fills: list[DexFill]) -> None:
+    used: set[int] = set()
+    for leg in sorted(legs, key=lambda item: item.closed_at):
+        entry = find_fill(
+            fills=fills,
+            used=used,
+            market=leg.market,
+            side=side_for_entry(leg.position_side),
+            qty=leg.size,
+            price=leg.entry_price,
+            end=leg.closed_at,
+            kind="entry",
+        )
+        if entry is not None:
+            idx, fill = entry
+            used.add(idx)
+            leg.entry_at = fill.time
+            leg.entry_role = fill.role
+        else:
+            leg.gaps.append("entry fill unmatched")
+
+        exit_fill = find_fill(
+            fills=fills,
+            used=used,
+            market=leg.market,
+            side=side_for_exit(leg.position_side),
+            qty=leg.size,
+            price=leg.exit_price,
+            end=leg.closed_at,
+            kind="exit",
+        )
+        if exit_fill is not None:
+            idx, fill = exit_fill
+            used.add(idx)
+            leg.exit_at = fill.time
+            leg.exit_role = fill.role
+        else:
+            leg.gaps.append("exit fill unmatched")
+
+
+def find_fill(
+    fills: list[DexFill],
+    used: set[int],
+    market: str,
+    side: str,
+    qty: Decimal,
+    price: Decimal | None,
+    end: datetime,
+    kind: str,
+) -> tuple[int, DexFill] | None:
+    candidates: list[tuple[float, int, DexFill]] = []
+    for idx, fill in enumerate(fills):
+        if idx in used or fill.market != market or fill.side != side:
+            continue
+        if abs(fill.qty - qty) > FILL_QTY_TOLERANCE:
+            continue
+        if price is not None and fill.price != price:
+            continue
+        delta = (end - fill.time).total_seconds()
+        if kind == "entry":
+            if delta < 0 or delta > FILL_MATCH_LOOKBACK_SECS:
+                continue
+            score = delta
+        else:
+            score = abs(delta)
+            if score > DEFAULT_GROUP_WINDOW_SECS:
+                continue
+        candidates.append((score, idx, fill))
+    if not candidates:
+        return None
+    _, idx, fill = min(candidates, key=lambda item: item[0])
+    return idx, fill
+
+
+def group_trades(
     legs: list[RealizedLeg],
     since: datetime,
     until: datetime,
@@ -406,14 +661,12 @@ def group_realized_trades(
     pair: str,
     base_market: str,
     quote_market: str,
-    group_window_secs: float,
+    window_secs: float,
 ) -> list[AttributedTrade]:
     expected = {base_market, quote_market}
-    scoped = [
-        leg
-        for leg in legs
-        if since <= leg.closed_at < until and leg.market in expected
-    ]
+    scoped = [leg for leg in legs if since <= leg.closed_at < until and leg.market in expected]
+    scoped.sort(key=lambda leg: leg.closed_at)
+
     groups: list[list[RealizedLeg]] = []
     current: list[RealizedLeg] = []
     for leg in scoped:
@@ -421,9 +674,9 @@ def group_realized_trades(
             current = [leg]
             continue
         first = current[0]
-        has_market = {item.market for item in current}
-        close_delta = (leg.closed_at - first.closed_at).total_seconds()
-        if close_delta <= group_window_secs and leg.market not in has_market:
+        markets = {item.market for item in current}
+        close_delta = abs((leg.closed_at - first.closed_at).total_seconds())
+        if close_delta <= window_secs and leg.market not in markets:
             current.append(leg)
             groups.append(current)
             current = []
@@ -434,19 +687,15 @@ def group_realized_trades(
         groups.append(current)
 
     trades: list[AttributedTrade] = []
-    for idx, group in enumerate(groups, start=1):
-        close_at = max(leg.closed_at for leg in group)
-        direction = direction_from_legs(group, base_market, quote_market)
+    for index, group in enumerate(groups, start=1):
         trade = AttributedTrade(
-            index=idx,
+            index=index,
             venue=venue,
             variant=variant,
             pair=pair,
-            legs=group,
             base_market=base_market,
             quote_market=quote_market,
-            direction=direction,
-            close_at=close_at,
+            legs=group,
         )
         markets = {leg.market for leg in group}
         missing = sorted(expected - markets)
@@ -458,568 +707,361 @@ def group_realized_trades(
     return trades
 
 
-def entry_side_for_leg(leg: RealizedLeg) -> str:
-    if leg.side == "LONG":
-        return "BUY"
-    if leg.side == "SHORT":
-        return "SELL"
-    return "UNKNOWN"
-
-
-def exit_side_for_leg(leg: RealizedLeg) -> str:
-    if leg.side == "LONG":
-        return "SELL"
-    if leg.side == "SHORT":
-        return "BUY"
-    return "UNKNOWN"
-
-
-def fill_matches_exact(fill: Fill, leg: RealizedLeg, side: str, price: Decimal) -> bool:
-    return (
-        fill.market == leg.market
-        and fill.side == side
-        and fill.qty == leg.size
-        and fill.price == price
-    )
-
-
-def qty_tolerance(target: Decimal) -> Decimal:
-    return max(abs(target) * FILL_QTY_TOLERANCE_RATIO, Decimal("0.00000001"))
-
-
-def aggregate_fills(items: list[Fill]) -> Fill:
-    if not items:
-        raise ValueError("cannot aggregate empty fill list")
-    total_qty = sum_decimal(fill.qty for fill in items)
-    total_value = sum_decimal(fill.total_value for fill in items)
-    fee = sum_decimal(fill.fee for fill in items)
-    if total_qty != Decimal("0"):
-        price = total_value / total_qty
-    else:
-        price = items[0].price
-    return Fill(
-        market=items[0].market,
-        side=items[0].side,
-        price=price,
-        qty=total_qty,
-        total_value=total_value,
-        fee=fee,
-        trade_type="+".join(sorted({fill.trade_type for fill in items if fill.trade_type})),
-        time=max(fill.time for fill in items),
-    )
-
-
-def match_fill_bundle(
-    fills: list[Fill],
-    used: set[int],
-    leg: RealizedLeg,
-    target_side: str,
-    target_price: Decimal,
-    close_at: datetime,
-    kind: str,
-    match_window_secs: float,
-) -> tuple[list[int], Fill | None, bool]:
-    candidates: list[tuple[float, int, Fill]] = []
-    for idx, fill in enumerate(fills):
-        if idx in used:
-            continue
-        if fill.market != leg.market or fill.side != target_side or fill.price != target_price:
-            continue
-        if kind == "entry":
-            if fill.time > close_at:
-                continue
-            score = -(close_at - fill.time).total_seconds()
-        else:
-            distance = abs((fill.time - close_at).total_seconds())
-            if distance > match_window_secs:
-                continue
-            score = -distance
-        candidates.append((score, idx, fill))
-    if not candidates:
-        return [], None, False
-
-    exact = [
-        (score, idx, fill)
-        for score, idx, fill in candidates
-        if fill_matches_exact(fill, leg, target_side, target_price)
-    ]
-    if exact:
-        _, idx, fill = max(exact, key=lambda item: item[0])
-        return [idx], fill, False
-
-    tolerance = qty_tolerance(leg.size)
-    preferred = sorted(candidates, key=lambda item: item[0], reverse=True)
-    for _, seed_idx, seed in preferred:
-        bundle: list[tuple[int, Fill]] = []
-        for _, idx, fill in candidates:
-            if abs((fill.time - seed.time).total_seconds()) <= FILL_BUNDLE_SECS:
-                bundle.append((idx, fill))
-        aggregate = aggregate_fills([fill for _, fill in bundle])
-        if abs(aggregate.qty - leg.size) <= tolerance:
-            return [idx for idx, _ in bundle], aggregate, aggregate.qty != leg.size
-
-    # Last resort: take the closest single fill if its quantity is near the
-    # realized leg size. This keeps leg-sync timing available while surfacing
-    # the quantity mismatch as a report gap.
-    _, idx, fill = preferred[0]
-    if abs(fill.qty - leg.size) <= tolerance:
-        return [idx], fill, fill.qty != leg.size
-    return [], None, False
-
-
-def attach_fills(trades: list[AttributedTrade], fills: list[Fill], match_window_secs: float) -> None:
-    used: set[int] = set()
-    for trade in trades:
-        for leg in trade.legs:
-            entry_indices, entry_fill, entry_qty_mismatch = match_fill_bundle(
-                fills=fills,
-                used=used,
-                leg=leg,
-                target_side=entry_side_for_leg(leg),
-                target_price=leg.entry_price,
-                close_at=trade.close_at,
-                kind="entry",
-                match_window_secs=match_window_secs,
-            )
-            if entry_fill:
-                used.update(entry_indices)
-                trade.entry_fills[leg.market] = entry_fill
-                if entry_qty_mismatch:
-                    trade.gaps.append(f"entry fill qty mismatch {leg.market}")
-            else:
-                trade.gaps.append(f"unmatched entry fill {leg.market}")
-
-            exit_indices, exit_fill, exit_qty_mismatch = match_fill_bundle(
-                fills=fills,
-                used=used,
-                leg=leg,
-                target_side=exit_side_for_leg(leg),
-                target_price=leg.exit_price,
-                close_at=trade.close_at,
-                kind="exit",
-                match_window_secs=match_window_secs,
-            )
-            if exit_fill:
-                used.update(exit_indices)
-                trade.exit_fills[leg.market] = exit_fill
-                if exit_qty_mismatch:
-                    trade.gaps.append(f"exit fill qty mismatch {leg.market}")
-            else:
-                trade.gaps.append(f"unmatched exit fill {leg.market}")
-
-
-def resolve_pnl_paths(patterns: list[str]) -> list[Path]:
+def load_pnl_records(patterns: list[str]) -> list[PnlRecord]:
+    records: list[PnlRecord] = []
     paths: list[Path] = []
     for pattern in patterns:
-        expanded = str(Path(pattern).expanduser())
-        matches = [Path(p) for p in glob.glob(expanded)]
-        if not matches:
-            candidate = Path(expanded)
-            if candidate.is_dir():
-                matches = sorted(candidate.glob("pnl-*.jsonl"))
-            elif candidate.exists():
-                matches = [candidate]
-        for path in matches:
-            if path.is_dir():
-                paths.extend(sorted(path.glob("pnl-*.jsonl")))
-            elif path.exists():
-                paths.append(path)
-    return sorted(dict.fromkeys(paths))
-
-
-def load_pnl_records(patterns: list[str], since: datetime, until: datetime) -> list[PnlRecord]:
-    records: list[PnlRecord] = []
-    for path in resolve_pnl_paths(patterns):
-        with path.open() as handle:
+        matches = glob.glob(str(Path(pattern).expanduser()))
+        paths.extend(Path(match) for match in matches)
+    for path in sorted(set(paths)):
+        with path.open(encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
                     continue
-                data = json.loads(line)
-                ts = datetime.fromtimestamp(int(data["ts"]), tz=timezone.utc)
-                if not (since <= ts < until):
-                    continue
+                raw = json.loads(line)
                 records.append(
                     PnlRecord(
-                        ts=ts,
-                        pair=str(data.get("pair", "")),
-                        direction=str(data.get("direction", "")),
-                        pnl=parse_decimal(data.get("pnl", "0")),
-                        source=str(data.get("source", "")),
-                        beta=optional_decimal(data.get("beta")),
-                        z_entry=optional_decimal(data.get("z_entry")),
-                        z_exit=optional_decimal(data.get("z_exit")),
-                        hold_secs=optional_decimal(data.get("hold_secs")),
-                        funding_carry_usd=optional_decimal(data.get("funding_carry_usd")),
-                        pnl_available=parse_bool(data.get("pnl_available"), True),
-                        close_reason=str(data.get("close_reason", "")),
-                        recovery_reason=str(data.get("recovery_reason", "")),
+                        ts=parse_pnl_ts(raw.get("ts")),
+                        pair=str(raw.get("pair", "")),
+                        direction=str(raw.get("direction", "")),
+                        pnl=parse_decimal(raw.get("pnl"), default=Decimal("0")),
+                        source=str(raw.get("source", "")),
+                        pnl_available=parse_bool(raw.get("pnl_available"), default=True),
+                        close_reason=str(raw.get("close_reason", "")),
+                        recovery_reason=str(raw.get("recovery_reason", "")),
+                        z_entry=optional_decimal(raw.get("z_entry")),
+                        z_exit=optional_decimal(raw.get("z_exit")),
+                        beta=optional_decimal(raw.get("beta")),
+                        hold_secs=optional_decimal(raw.get("hold_secs")),
+                        funding_carry_usd=optional_decimal(raw.get("funding_carry_usd")),
                     )
                 )
     records.sort(key=lambda record: record.ts)
     return records
 
 
-def normalize_direction(value: str | None) -> str:
-    text = (value or "").replace("_", "").replace("-", "").lower()
-    if text in {"longspread", "long"}:
-        return "longspread"
-    if text in {"shortspread", "short"}:
-        return "shortspread"
-    return text
+def parse_pnl_ts(raw: object) -> datetime:
+    if isinstance(raw, (int, float)):
+        return datetime.fromtimestamp(raw, tz=timezone.utc)
+    text = str(raw)
+    if re.fullmatch(r"\d+", text):
+        return datetime.fromtimestamp(int(text), tz=timezone.utc)
+    return parse_ts(text)
 
 
-def attach_pnl_records(
-    trades: list[AttributedTrade],
-    records: list[PnlRecord],
-    match_window_secs: float,
-) -> None:
-    if not records:
-        for trade in trades:
-            trade.gaps.append("no matched pnl jsonl")
-        return
+def match_pnl_records(trades: list[AttributedTrade], records: list[PnlRecord], max_secs: float) -> None:
     used: set[int] = set()
     for trade in trades:
         candidates: list[tuple[float, int, PnlRecord]] = []
-        target_dir = normalize_direction(trade.direction)
         for idx, record in enumerate(records):
             if idx in used:
                 continue
-            if target_dir and normalize_direction(record.direction) != target_dir:
+            if record.pair and record.pair.replace("_", "/").upper() != trade.pair.upper():
                 continue
             distance = abs((record.ts - trade.close_at).total_seconds())
-            if distance > match_window_secs:
-                continue
-            candidates.append((-distance, idx, record))
+            if distance <= max_secs:
+                candidates.append((distance, idx, record))
         if not candidates:
-            trade.gaps.append("no matched pnl jsonl")
             continue
-        _, idx, record = max(candidates, key=lambda item: item[0])
+        _, idx, record = min(candidates, key=lambda item: item[0])
         used.add(idx)
         trade.pnl_record = record
         if not record.pnl_available:
-            trade.gaps.append("matched pnl jsonl has pnl_available=false")
+            reason = record.recovery_reason or record.close_reason or record.source or "unknown"
+            trade.gaps.append(f"bot pnl unavailable: {reason}")
 
 
-def parse_kv_pairs(msg: str) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for match in KV_RE.finditer(msg):
-        value = match.group("value")
-        if value.startswith('"') and value.endswith('"'):
-            value = value[1:-1]
-        values[match.group("key")] = value
-    return values
+def load_journal(paths: list[str]) -> list[JournalEvent]:
+    events: list[JournalEvent] = []
+    expanded: list[Path] = []
+    for pattern in paths:
+        expanded.extend(Path(match) for match in glob.glob(str(Path(pattern).expanduser())))
+    for path in sorted(set(expanded)):
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                event = parse_journal_line(line)
+                if event:
+                    events.append(event)
+    events.sort(key=lambda event: event.ts)
+    return events
 
 
-def marker_label(line: str) -> str | None:
-    lower = line.lower()
-    for pattern in MARKER_PATTERNS:
-        if pattern == "FILL_DETECTION" and pattern in line:
-            return pattern
-        if pattern != "FILL_DETECTION" and pattern in lower:
-            return pattern
+def parse_journal_line(line: str) -> JournalEvent | None:
+    match = LOG_PREFIX_RE.search(line)
+    if not match:
+        return None
+    message = match.group("msg")
+    values = {m.group("key"): m.group("value").strip('"') for m in KV_RE.finditer(message)}
+    ts = parse_log_ts(match.group("wall"), values)
+    if "[ENTRY]" in message:
+        direction = ""
+        entry_match = ENTRY_RE.search(message)
+        if entry_match:
+            direction = entry_match.group("direction")
+        return JournalEvent(
+            ts=ts,
+            kind="entry",
+            direction=direction,
+            z=optional_decimal(values.get("z")),
+            beta=optional_decimal(values.get("beta")),
+            message=message,
+        )
+    if "[EXIT_CHECK]" in message or "[EXIT]" in message or "[CLOSE" in message:
+        reason = ""
+        reason_match = EXIT_REASON_RE.search(message)
+        if reason_match:
+            reason = reason_match.group(1)
+        return JournalEvent(
+            ts=ts,
+            kind="exit",
+            reason=reason,
+            z=optional_decimal(values.get("z")),
+            exit_z=optional_decimal(values.get("exit_z")),
+            message=message,
+        )
+    if any(word.lower() in message.lower() for word in MARKER_WORDS):
+        return JournalEvent(ts=ts, kind="marker", message=message)
     return None
 
 
-def load_journal(path: Path | None, since: datetime, until: datetime) -> JournalData:
-    data = JournalData()
-    if path is None:
-        return data
-    path = expand_path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"journal log not found: {path}")
-    with path.open(errors="replace") as handle:
-        for line in handle:
-            data.line_count += 1
-            m = LOG_PREFIX_RE.search(line)
-            if not m:
-                continue
-            msg = m.group("msg")
-            values = parse_kv_pairs(msg)
-            ts = parse_log_ts(m.group("wall"), values)
-            if not (since <= ts < until):
-                continue
-            if "[ENTRY]" in msg:
-                data.entries.append(
-                    JournalEntry(
-                        ts=ts,
-                        pair=values.get("pair"),
-                        direction=values.get("direction"),
-                        size_a=optional_decimal(values.get("size_a")),
-                        price_a=optional_decimal(values.get("price_a")),
-                        size_b=optional_decimal(values.get("size_b")),
-                        price_b=optional_decimal(values.get("price_b")),
-                        z=optional_decimal(values.get("z")),
-                        beta=optional_decimal(values.get("beta")),
-                    )
-                )
-            elif "[EXIT_CHECK]" in msg:
-                data.exits.append(
-                    JournalExit(
-                        ts=ts,
-                        pair=values.get("pair"),
-                        reason=values.get("reason"),
-                        raw_type="EXIT_CHECK",
-                    )
-                )
-            elif "[EXIT]" in msg:
-                data.exits.append(
-                    JournalExit(
-                        ts=ts,
-                        pair=values.get("pair"),
-                        reason=values.get("reason") or "exit",
-                        raw_type="EXIT",
-                    )
-                )
-            label = marker_label(line)
-            if label:
-                data.markers.append(JournalMarker(ts=ts, label=label))
-    data.entries.sort(key=lambda item: item.ts)
-    data.exits.sort(key=lambda item: item.ts)
-    data.markers.sort(key=lambda item: item.ts)
-    return data
+def parse_log_ts(wall: str, values: dict[str, str]) -> datetime:
+    if "ts" in values:
+        try:
+            return datetime.fromtimestamp(int(values["ts"]), tz=timezone.utc)
+        except ValueError:
+            pass
+    return datetime.strptime(wall, "%Y-%m-%dT%H:%M:%S%z").astimezone(timezone.utc)
 
 
-def attach_journal(trades: list[AttributedTrade], journal: JournalData) -> None:
-    if journal.line_count == 0:
-        for trade in trades:
-            trade.gaps.append("no journal log")
-        return
-
-    used_entries: set[int] = set()
-    used_exits: set[int] = set()
+def match_journal(trades: list[AttributedTrade], events: list[JournalEvent], max_secs: float) -> None:
+    entries = [event for event in events if event.kind == "entry"]
+    exits = [event for event in events if event.kind == "exit"]
+    markers = [event for event in events if event.kind == "marker"]
     for trade in trades:
-        target_dir = normalize_direction(trade.direction)
-        ref_entry = trade.entry_at or trade.close_at
-        entry_candidates: list[tuple[float, int, JournalEntry]] = []
-        for idx, entry in enumerate(journal.entries):
-            if idx in used_entries:
-                continue
-            if target_dir and normalize_direction(entry.direction) != target_dir:
-                continue
-            if entry.ts > trade.close_at:
-                continue
-            if (trade.close_at - entry.ts).total_seconds() > JOURNAL_ENTRY_LOOKBACK_SECS:
-                continue
-            distance = abs((entry.ts - ref_entry).total_seconds())
-            entry_candidates.append((-distance, idx, entry))
-        if entry_candidates:
-            _, idx, entry = max(entry_candidates, key=lambda item: item[0])
-            used_entries.add(idx)
-            trade.journal_entry = entry
-        else:
-            trade.gaps.append("no matched journal ENTRY")
-
-        exit_candidates: list[tuple[int, float, int, JournalExit]] = []
-        for idx, exit_event in enumerate(journal.exits):
-            if idx in used_exits:
-                continue
-            distance = abs((exit_event.ts - trade.close_at).total_seconds())
-            if distance > JOURNAL_EXIT_WINDOW_SECS:
-                continue
-            priority = 1 if exit_event.raw_type == "EXIT_CHECK" else 0
-            exit_candidates.append((priority, -distance, idx, exit_event))
-        if exit_candidates:
-            _, _, idx, exit_event = max(exit_candidates, key=lambda item: (item[0], item[1]))
-            used_exits.add(idx)
-            trade.journal_exit = exit_event
-        else:
-            trade.gaps.append("no matched journal close reason")
-
-        window_start = trade.journal_entry.ts if trade.journal_entry else (trade.entry_at or trade.close_at)
-        window_end = trade.exit_at or trade.close_at
-        trade.journal_markers = [
-            marker for marker in journal.markers if window_start <= marker.ts <= window_end
+        entry_anchor = trade.entry_at or trade.close_at
+        entry_lookback_secs = max_secs if trade.entry_at else FILL_MATCH_LOOKBACK_SECS
+        before = [
+            event
+            for event in entries
+            if event.ts <= entry_anchor and (entry_anchor - event.ts).total_seconds() <= entry_lookback_secs
+        ]
+        if before:
+            trade.journal_entry = max(before, key=lambda event: event.ts)
+        close_candidates = [
+            event
+            for event in exits
+            if abs((event.ts - trade.close_at).total_seconds()) <= max_secs
+        ]
+        if close_candidates:
+            trade.journal_exit = min(close_candidates, key=lambda event: abs((event.ts - trade.close_at).total_seconds()))
+        trade.markers = [
+            event
+            for event in markers
+            if trade.entry_at
+            and trade.entry_at <= event.ts <= trade.close_at
         ]
 
 
-def fmt_dt(dt: datetime | None) -> str:
-    if dt is None:
-        return "n/a"
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+def marker_count(trade: AttributedTrade, needle: str) -> int:
+    lower = needle.lower()
+    return sum(1 for event in trade.markers if lower in event.message.lower())
 
 
-def fmt_money(value: Decimal | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"${value:+.4f}"
+def bucket_stats(label: str, trades: list[AttributedTrade], selected: list[AttributedTrade]) -> dict[str, object]:
+    selected_ids = {id(trade) for trade in selected}
+    kept = [trade for trade in trades if id(trade) not in selected_ids]
+    blocked_pnl = sum_decimal(trade.realized_pnl for trade in selected)
+    kept_pnl = sum_decimal(trade.realized_pnl for trade in kept)
+    fees = values_or_none([trade.trading_fees for trade in selected])
+    losses_total = sum_decimal(-trade.realized_pnl for trade in trades if trade.realized_pnl < 0)
+    blocked_losses = sum_decimal(-trade.realized_pnl for trade in selected if trade.realized_pnl < 0)
+    wins_total = sum(1 for trade in trades if trade.realized_pnl > 0)
+    blocked_wins = sum(1 for trade in selected if trade.realized_pnl > 0)
+    loss_recall = float(blocked_losses / losses_total * Decimal("100")) if losses_total > 0 else 0.0
+    win_kill = (blocked_wins / wins_total * 100.0) if wins_total else 0.0
+    score = loss_recall - win_kill
+    wins = sum(1 for trade in selected if trade.realized_pnl > 0)
+    return {
+        "label": label,
+        "n": len(selected),
+        "pnl": blocked_pnl,
+        "win_rate": (wins / len(selected) * 100.0) if selected else 0.0,
+        "avg_pnl": (blocked_pnl / Decimal(len(selected))) if selected else Decimal("0"),
+        "fees": fees,
+        "loss_recall": loss_recall,
+        "win_kill": win_kill,
+        "kept_n": len(kept),
+        "kept_pnl": kept_pnl,
+        "score": score,
+    }
 
 
-def fmt_decimal(value: Decimal | None, places: int = 3) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.{places}f}"
+def feature_matrix(trades: list[AttributedTrade]) -> list[dict[str, object]]:
+    scoped = [trade for trade in trades if len(trade.legs) == 2]
+    if not scoped:
+        return []
 
+    def by(label: str, predicate) -> dict[str, object]:
+        return bucket_stats(label, scoped, [trade for trade in scoped if predicate(trade)])
 
-def fmt_secs(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.1f}"
-
-
-def fmt_hours(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value / 3600.0:.2f}"
-
-
-def marker_summary(markers: list[JournalMarker]) -> str:
-    if not markers:
-        return "none"
-    counts: dict[str, int] = {}
-    for marker in markers:
-        counts[marker.label] = counts.get(marker.label, 0) + 1
-    return ",".join(f"{key}:{counts[key]}" for key in sorted(counts))
-
-
-def leg_for(trade: AttributedTrade, market: str) -> RealizedLeg | None:
-    for leg in trade.legs:
-        if leg.market == market:
-            return leg
-    return None
-
-
-def fmt_leg_detail(leg: RealizedLeg | None) -> str:
-    if leg is None:
-        return "n/a"
-    return f"{leg.side} {leg.size} {leg.entry_price}->{leg.exit_price}"
-
-
-def leg_csv_value(leg: RealizedLeg | None, field: str) -> str:
-    if leg is None:
-        return ""
-    value = getattr(leg, field)
-    return str(value)
-
-
-def gap_summary(trade: AttributedTrade) -> str:
-    if not trade.gaps:
-        return "ok"
-    seen: list[str] = []
-    for gap in trade.gaps:
-        if gap not in seen:
-            seen.append(gap)
-    return "; ".join(seen)
-
-
-def render_markdown(
-    trades: list[AttributedTrade],
-    dex_zip: Path,
-    since: datetime,
-    until: datetime,
-    journal: JournalData,
-    pnl_records: list[PnlRecord],
-) -> str:
-    complete = [t for t in trades if len(t.legs) == 2]
-    legs = [leg for trade in trades for leg in trade.legs]
-    total_realized = sum_decimal(leg.realised_pnl for leg in legs)
-    total_trade = sum_decimal(leg.trade_pnl for leg in legs)
-    total_funding = sum_decimal(leg.funding_fees for leg in legs)
-    total_fees = sum_decimal(leg.trading_fees for leg in legs)
-    matched_model = [trade for trade in trades if trade.model_pnl is not None]
-    total_model = sum_decimal(t.model_pnl for t in matched_model if t.model_pnl is not None)
-    total_leakage = sum_decimal(
-        t.execution_leakage for t in matched_model if t.execution_leakage is not None
+    candidates = [
+        by("close_reason=force_close", lambda trade: trade.close_reason == "force_close"),
+        by("close_reason=ineligible", lambda trade: trade.close_reason == "ineligible"),
+        by("close_reason=partial_fill", lambda trade: trade.close_reason == "partial_fill"),
+        by("close_reason=stop_loss_z", lambda trade: trade.close_reason == "stop_loss_z"),
+        by(
+            "partial/reissue markers present",
+            lambda trade: marker_count(trade, "partial") > 0 or marker_count(trade, "reissu") > 0,
+        ),
+        by("reissue markers present", lambda trade: marker_count(trade, "reissu") > 0),
+        by("amend markers present", lambda trade: marker_count(trade, "amend") > 0),
+        by("bot pnl unavailable", lambda trade: trade.pnl_record is not None and not trade.pnl_record.pnl_available),
+        by(
+            "abs(entry_z) >= 3.0",
+            lambda trade: trade.journal_entry is not None
+            and trade.journal_entry.z is not None
+            and abs(trade.journal_entry.z) >= Decimal("3.0"),
+        ),
+        by(
+            "abs(entry_z) >= 3.5",
+            lambda trade: trade.journal_entry is not None
+            and trade.journal_entry.z is not None
+            and abs(trade.journal_entry.z) >= Decimal("3.5"),
+        ),
+        by(
+            "abs(entry_z) >= 4.0",
+            lambda trade: trade.journal_entry is not None
+            and trade.journal_entry.z is not None
+            and abs(trade.journal_entry.z) >= Decimal("4.0"),
+        ),
+        by(
+            "beta < 0.9",
+            lambda trade: trade.journal_entry is not None
+            and trade.journal_entry.beta is not None
+            and trade.journal_entry.beta < Decimal("0.9"),
+        ),
+        by(
+            "beta >= 0.9",
+            lambda trade: trade.journal_entry is not None
+            and trade.journal_entry.beta is not None
+            and trade.journal_entry.beta >= Decimal("0.9"),
+        ),
+        by("entry_z missing", lambda trade: trade.journal_entry is None or trade.journal_entry.z is None),
+        by("hold >= 2h", lambda trade: trade.hold_secs is not None and trade.hold_secs >= 7200.0),
+        by("exit_sync >= 30s", lambda trade: trade.exit_sync_secs is not None and trade.exit_sync_secs >= 30.0),
+        by("entry_sync >= 5s", lambda trade: trade.entry_sync_secs is not None and trade.entry_sync_secs >= 5.0),
+    ]
+    return sorted(
+        [row for row in candidates if row["n"]],
+        key=lambda row: (row["score"], -float(row["pnl"])),
+        reverse=True,
     )
 
-    out: list[str] = []
-    out.append("# Pairtrade Live Trade Attribution")
-    out.append("")
-    out.append("## Inputs")
-    out.append("")
-    out.append(f"- DEX ZIP: `{dex_zip}`")
-    out.append(f"- Window UTC: `{fmt_dt(since)}` to `{fmt_dt(until)}`")
-    out.append(f"- Journal lines parsed: {journal.line_count}")
-    out.append(f"- PnL jsonl records parsed in window: {len(pnl_records)}")
-    out.append("")
-    out.append("## Summary")
-    out.append("")
-    out.append("| Metric | Value |")
-    out.append("|---|---:|")
-    out.append(f"| DEX legs | {len(legs)} |")
-    out.append(f"| Complete round trips | {len(complete)} |")
-    out.append(f"| Incomplete DEX groups | {len(trades) - len(complete)} |")
-    out.append(f"| DEX realised PnL | {fmt_money(total_realized)} |")
-    out.append(f"| DEX trade PnL | {fmt_money(total_trade)} |")
-    out.append(f"| DEX funding | {fmt_money(total_funding)} |")
-    out.append(f"| DEX trading fees | {fmt_money(total_fees)} |")
-    if matched_model:
-        out.append(f"| Matched bot/model PnL | {fmt_money(total_model)} |")
-        out.append(f"| Realised minus model | {fmt_money(total_leakage)} |")
-    else:
-        out.append("| Matched bot/model PnL | n/a |")
-        out.append("| Realised minus model | n/a |")
-    out.append("")
-    out.append("## Per Trade")
-    out.append("")
-    columns = [
-        "#",
-        "close_utc",
-        "direction",
-        "base_leg",
-        "quote_leg",
-        "dex_realized",
-        "trade",
-        "funding",
-        "fees",
-        "model",
-        "leakage",
-        "hold_h",
-        "entry_sync_s",
-        "exit_sync_s",
-        "close_reason",
-        "markers",
-        "gaps",
-    ]
-    out.append("| " + " | ".join(columns) + " |")
-    out.append("|" + "|".join("---" for _ in columns) + "|")
+def summarize(trades: list[AttributedTrade], warnings: list[str], since: datetime, until: datetime) -> str:
+    total = sum_decimal(trade.realized_pnl for trade in trades)
+    trade_split = values_or_none([trade.trade_pnl for trade in trades])
+    funding = values_or_none([trade.funding for trade in trades])
+    fees = values_or_none([trade.trading_fees for trade in trades])
+    wins = sum(1 for trade in trades if trade.realized_pnl > 0)
+    complete = sum(1 for trade in trades if len(trade.legs) == 2)
+    gap_count = sum(1 for trade in trades if trade.all_gaps())
+
+    by_direction: dict[str, list[AttributedTrade]] = defaultdict(list)
     for trade in trades:
-        base_leg = leg_for(trade, trade.base_market)
-        quote_leg = leg_for(trade, trade.quote_market)
-        out.append(
-            "| "
-            + " | ".join(
-                [
-                    str(trade.index),
-                    fmt_dt(trade.close_at),
-                    trade.direction,
-                    fmt_leg_detail(base_leg),
-                    fmt_leg_detail(quote_leg),
-                    fmt_money(trade.realised_pnl),
-                    fmt_money(trade.trade_pnl),
-                    fmt_money(trade.funding_fees),
-                    fmt_money(trade.trading_fees),
-                    fmt_money(trade.model_pnl),
-                    fmt_money(trade.execution_leakage),
-                    fmt_hours(trade.dex_hold_secs),
-                    fmt_secs(trade.entry_sync_secs),
-                    fmt_secs(trade.exit_sync_secs),
-                    trade.close_reason,
-                    marker_summary(trade.journal_markers),
-                    gap_summary(trade),
-                ]
+        by_direction[trade.direction].append(trade)
+
+    lines: list[str] = []
+    lines.append("# Live Trade Attribution")
+    lines.append("")
+    lines.append(f"Window: `{since.isoformat()}` to `{until.isoformat()}`")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---:|")
+    lines.append(f"| Trades | {len(trades)} |")
+    lines.append(f"| Complete two-leg trades | {complete} |")
+    lines.append(f"| Win rate | {(wins / len(trades) * 100.0) if trades else 0.0:.1f}% |")
+    lines.append(f"| DEX realised PnL | ${fmt_decimal(total, 6)} |")
+    lines.append(f"| Trade PnL split | {money_or_gap(trade_split)} |")
+    lines.append(f"| Funding split | {money_or_gap(funding)} |")
+    lines.append(f"| Trading fees split | {money_or_gap(fees)} |")
+    lines.append(f"| Trades with explicit gaps | {gap_count} |")
+    lines.append("")
+
+    if by_direction:
+        lines.append("## Direction")
+        lines.append("")
+        lines.append("| Direction | N | DEX realised PnL | Win rate |")
+        lines.append("|---|---:|---:|---:|")
+        for direction, items in sorted(by_direction.items()):
+            pnl = sum_decimal(trade.realized_pnl for trade in items)
+            direction_wins = sum(1 for trade in items if trade.realized_pnl > 0)
+            lines.append(
+                f"| {direction} | {len(items)} | ${fmt_decimal(pnl, 6)} | "
+                f"{(direction_wins / len(items) * 100.0):.1f}% |"
             )
-            + " |"
+        lines.append("")
+
+    matrix = feature_matrix(trades)
+    if matrix:
+        scoped_count = sum(1 for trade in trades if len(trade.legs) == 2)
+        lines.append("## Feature Matrix")
+        lines.append("")
+        lines.append(f"Scope: complete two-leg trades only (`N={scoped_count}`). `Loss recall` is the share of realised losses captured by the bucket. `Win kill` is the share of winning trades captured by the bucket.")
+        lines.append("Journal-derived buckets such as entry z, beta, and partial/reissue markers require `--journal-log`; without journal input, missing-entry buckets are data-completeness diagnostics only.")
+        lines.append("")
+        lines.append("| Rank | Candidate bucket | N | Bucket PnL | Win rate | Avg PnL | Fees | Loss recall | Win kill | Kept N | Kept PnL |")
+        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for rank, row in enumerate(matrix, start=1):
+            lines.append(
+                f"| {rank} | {row['label']} | {row['n']} | ${fmt_decimal(row['pnl'], 6)} | "
+                f"{row['win_rate']:.1f}% | ${fmt_decimal(row['avg_pnl'], 6)} | "
+                f"{money_or_gap(row['fees'])} | {row['loss_recall']:.1f}% | {row['win_kill']:.1f}% | "
+                f"{row['kept_n']} | ${fmt_decimal(row['kept_pnl'], 6)} |"
+            )
+        lines.append("")
+
+    lines.append("## Trades")
+    lines.append("")
+    lines.append(
+        "| # | Close UTC | Direction | Legs | Realised | Trade | Funding | Fees | "
+        "Entry sync s | Exit sync s | Hold min | Close reason | Gaps |"
+    )
+    lines.append("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+    for trade in trades:
+        gaps = "; ".join(trade.all_gaps())
+        lines.append(
+            f"| {trade.index} | {fmt_ts(trade.close_at)} | {trade.direction} | {len(trade.legs)} | "
+            f"${fmt_decimal(trade.realized_pnl, 6)} | {money_or_gap(trade.trade_pnl)} | "
+            f"{money_or_gap(trade.funding)} | {money_or_gap(trade.trading_fees)} | "
+            f"{fmt_float(trade.entry_sync_secs)} | {fmt_float(trade.exit_sync_secs)} | "
+            f"{fmt_float((trade.hold_secs / 60.0) if trade.hold_secs is not None else None)} | "
+            f"{trade.close_reason} | {gaps} |"
         )
-    out.append("")
-    out.append("## Explicit Gaps")
-    out.append("")
-    gaps = sorted({gap for trade in trades for gap in trade.gaps})
-    if gaps:
-        for gap in gaps:
-            out.append(f"- {gap}")
-    else:
-        out.append("- none")
-    if not matched_model:
-        out.append("- Signal/model PnL is not populated because no pnl jsonl or BT model row matched this window.")
-    if journal.line_count == 0:
-        out.append("- Close reason and partial-fill markers require a journal fragment.")
-    out.append("")
-    out.append("## Notes")
-    out.append("")
-    out.append("- DEX realised PnL is the live accounting source of truth.")
-    out.append("- `model` is populated only from matched pairtrade pnl jsonl records; it is not minimum-exec BT.")
-    out.append("- `leakage` is `DEX realised - model` and remains n/a when model PnL is unavailable.")
-    return "\n".join(out)
+    lines.append("")
+
+    if warnings:
+        lines.append("## Input Warnings")
+        lines.append("")
+        for warning in sorted(set(warnings)):
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def values_or_none(values: list[Decimal | None]) -> Decimal | None:
+    if not values or any(value is None for value in values):
+        return None
+    return sum_decimal(value for value in values if value is not None)
+
+
+def money_or_gap(value: Decimal | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"${fmt_decimal(value, 6)}"
 
 
 def write_csv(path: Path, trades: list[AttributedTrade]) -> None:
@@ -1029,41 +1071,37 @@ def write_csv(path: Path, trades: list[AttributedTrade]) -> None:
         "variant",
         "pair",
         "direction",
-        "entry_utc",
-        "close_utc",
-        "base_market",
-        "base_side",
-        "base_size",
-        "base_entry_price",
-        "base_exit_price",
-        "quote_market",
-        "quote_side",
-        "quote_size",
-        "quote_entry_price",
-        "quote_exit_price",
-        "dex_realized",
+        "entry_at_utc",
+        "close_at_utc",
+        "legs",
+        "realized_pnl",
         "trade_pnl",
-        "funding_fees",
+        "funding",
         "trading_fees",
-        "model_pnl",
         "pnl_source",
         "pnl_available",
         "pnl_close_reason",
         "pnl_recovery_reason",
+        "bot_pnl",
         "execution_leakage",
-        "hold_secs",
         "entry_sync_secs",
         "exit_sync_secs",
+        "hold_secs",
+        "journal_entry_z",
+        "journal_entry_beta",
+        "journal_exit_z",
+        "journal_exit_target_z",
+        "journal_marker_count",
+        "partial_marker_count",
+        "reissue_marker_count",
+        "amend_marker_count",
         "close_reason",
-        "markers",
         "gaps",
     ]
-    with path.open("w", newline="") as handle:
+    with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for trade in trades:
-            base_leg = leg_for(trade, trade.base_market)
-            quote_leg = leg_for(trade, trade.quote_market)
             writer.writerow(
                 {
                     "index": trade.index,
@@ -1071,115 +1109,102 @@ def write_csv(path: Path, trades: list[AttributedTrade]) -> None:
                     "variant": trade.variant,
                     "pair": trade.pair,
                     "direction": trade.direction,
-                    "entry_utc": fmt_dt(trade.entry_at),
-                    "close_utc": fmt_dt(trade.close_at),
-                    "base_market": trade.base_market,
-                    "base_side": leg_csv_value(base_leg, "side"),
-                    "base_size": leg_csv_value(base_leg, "size"),
-                    "base_entry_price": leg_csv_value(base_leg, "entry_price"),
-                    "base_exit_price": leg_csv_value(base_leg, "exit_price"),
-                    "quote_market": trade.quote_market,
-                    "quote_side": leg_csv_value(quote_leg, "side"),
-                    "quote_size": leg_csv_value(quote_leg, "size"),
-                    "quote_entry_price": leg_csv_value(quote_leg, "entry_price"),
-                    "quote_exit_price": leg_csv_value(quote_leg, "exit_price"),
-                    "dex_realized": str(trade.realised_pnl),
-                    "trade_pnl": str(trade.trade_pnl),
-                    "funding_fees": str(trade.funding_fees),
-                    "trading_fees": str(trade.trading_fees),
-                    "model_pnl": "" if trade.model_pnl is None else str(trade.model_pnl),
-                    "pnl_source": "" if trade.pnl_record is None else trade.pnl_record.source,
-                    "pnl_available": "" if trade.pnl_record is None else str(trade.pnl_record.pnl_available).lower(),
-                    "pnl_close_reason": "" if trade.pnl_record is None else trade.pnl_record.close_reason,
-                    "pnl_recovery_reason": "" if trade.pnl_record is None else trade.pnl_record.recovery_reason,
-                    "execution_leakage": ""
-                    if trade.execution_leakage is None
-                    else str(trade.execution_leakage),
-                    "hold_secs": "" if trade.dex_hold_secs is None else f"{trade.dex_hold_secs:.3f}",
-                    "entry_sync_secs": ""
-                    if trade.entry_sync_secs is None
-                    else f"{trade.entry_sync_secs:.3f}",
-                    "exit_sync_secs": ""
-                    if trade.exit_sync_secs is None
-                    else f"{trade.exit_sync_secs:.3f}",
+                    "entry_at_utc": fmt_ts(trade.entry_at),
+                    "close_at_utc": fmt_ts(trade.close_at),
+                    "legs": len(trade.legs),
+                    "realized_pnl": fmt_decimal(trade.realized_pnl, 10),
+                    "trade_pnl": fmt_decimal(trade.trade_pnl, 10),
+                    "funding": fmt_decimal(trade.funding, 10),
+                    "trading_fees": fmt_decimal(trade.trading_fees, 10),
+                    "pnl_source": trade.pnl_record.source if trade.pnl_record else "",
+                    "pnl_available": str(trade.pnl_record.pnl_available).lower() if trade.pnl_record else "",
+                    "pnl_close_reason": trade.pnl_record.close_reason if trade.pnl_record else "",
+                    "pnl_recovery_reason": trade.pnl_record.recovery_reason if trade.pnl_record else "",
+                    "bot_pnl": fmt_decimal(trade.bot_pnl, 10),
+                    "execution_leakage": fmt_decimal(trade.execution_leakage, 10),
+                    "entry_sync_secs": fmt_float(trade.entry_sync_secs, 3),
+                    "exit_sync_secs": fmt_float(trade.exit_sync_secs, 3),
+                    "hold_secs": fmt_float(trade.hold_secs, 3),
+                    "journal_entry_z": fmt_decimal(trade.journal_entry.z if trade.journal_entry else None, 10),
+                    "journal_entry_beta": fmt_decimal(trade.journal_entry.beta if trade.journal_entry else None, 10),
+                    "journal_exit_z": fmt_decimal(trade.journal_exit.z if trade.journal_exit else None, 10),
+                    "journal_exit_target_z": fmt_decimal(trade.journal_exit.exit_z if trade.journal_exit else None, 10),
+                    "journal_marker_count": len(trade.markers),
+                    "partial_marker_count": sum(1 for event in trade.markers if "partial" in event.message.lower()),
+                    "reissue_marker_count": sum(1 for event in trade.markers if "reissu" in event.message.lower()),
+                    "amend_marker_count": sum(1 for event in trade.markers if "amend" in event.message.lower()),
                     "close_reason": trade.close_reason,
-                    "markers": marker_summary(trade.journal_markers),
-                    "gaps": gap_summary(trade),
+                    "gaps": "; ".join(trade.all_gaps()),
                 }
             )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--dex-zip", required=True, type=Path, help="DEX export zip with trades.csv and realized_pnl.csv")
-    parser.add_argument("--since", required=True, help="UTC ISO start, inclusive")
-    parser.add_argument("--until", required=True, help="UTC ISO end, exclusive")
-    parser.add_argument("--pair", default="BTC/ETH", help="Pair symbol, default BTC/ETH")
-    parser.add_argument("--venue", default=None, help="Venue label for the report")
-    parser.add_argument("--variant", default=None, help="Variant label for the report")
-    parser.add_argument("--journal-log", type=Path, default=None, help="Optional journalctl grep output")
-    parser.add_argument(
-        "--pnl-jsonl",
-        action="append",
-        default=[],
-        help="Optional pnl jsonl file, directory, or glob. Repeatable.",
-    )
-    parser.add_argument("--group-window-secs", type=float, default=10.0)
-    parser.add_argument("--match-window-secs", type=float, default=ENTRY_EXIT_MATCH_SECS)
-    parser.add_argument("--report-out", type=Path, default=None)
-    parser.add_argument("--csv-out", type=Path, default=None)
-    return parser.parse_args()
-
-
 def main() -> int:
-    args = parse_args()
-    dex_zip = expand_path(args.dex_zip)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dex-path",
+        "--dex-zip",
+        dest="dex_path",
+        required=True,
+        type=Path,
+        help="DEX export ZIP/CSV path",
+    )
+    parser.add_argument("--venue", choices=["auto", "extended", "lighter"], default="auto")
+    parser.add_argument("--variant", default="n/a")
+    parser.add_argument("--pair", default="BTC/ETH")
+    parser.add_argument("--since", required=True)
+    parser.add_argument("--until", required=True)
+    parser.add_argument("--group-window-secs", type=float, default=DEFAULT_GROUP_WINDOW_SECS)
+    parser.add_argument("--pnl-jsonl", action="append", default=[], help="Optional pnl jsonl glob")
+    parser.add_argument("--journal-log", action="append", default=[], help="Optional journal log glob")
+    parser.add_argument("--csv-out", type=Path)
+    parser.add_argument("--report-out", type=Path)
+    args = parser.parse_args()
+
+    dex_path = args.dex_path.expanduser()
     since = parse_ts(args.since)
     until = parse_ts(args.until)
-    if since >= until:
-        print("--since must be earlier than --until", file=sys.stderr)
-        return 2
-
+    venue = infer_venue(dex_path, args.venue)
     base, quote = parse_pair(args.pair)
     base_market = market_for(base)
     quote_market = market_for(quote)
-    venue = infer_venue(dex_zip, args.venue)
-    variant = infer_variant(args.variant, venue)
 
-    legs = load_realized_legs(dex_zip)
-    fills = load_fills(dex_zip)
-    trades = group_realized_trades(
+    if venue == "extended":
+        legs, _fills, warnings = load_extended(dex_path)
+    elif venue == "lighter":
+        legs, _fills, warnings = load_lighter(dex_path)
+    else:
+        raise AssertionError(f"unexpected venue {venue}")
+
+    trades = group_trades(
         legs=legs,
         since=since,
         until=until,
         venue=venue,
-        variant=variant,
+        variant=args.variant,
         pair=f"{base}/{quote}",
         base_market=base_market,
         quote_market=quote_market,
-        group_window_secs=args.group_window_secs,
+        window_secs=args.group_window_secs,
     )
-    attach_fills(trades, fills, args.match_window_secs)
 
-    pnl_records = load_pnl_records(args.pnl_jsonl, since, until)
-    attach_pnl_records(trades, pnl_records, args.match_window_secs)
+    if args.pnl_jsonl:
+        pnl_records = load_pnl_records(args.pnl_jsonl)
+        match_pnl_records(trades, pnl_records, DEFAULT_PNL_MATCH_SECS)
+    if args.journal_log:
+        journal_events = load_journal(args.journal_log)
+        match_journal(trades, journal_events, DEFAULT_JOURNAL_MATCH_SECS)
 
-    journal = load_journal(args.journal_log, since, until)
-    attach_journal(trades, journal)
-
-    report = render_markdown(trades, dex_zip, since, until, journal, pnl_records)
+    report = summarize(trades, warnings, since, until)
     if args.report_out:
-        report_path = expand_path(args.report_out)
-        report_path.write_text(report + "\n")
-    print(report)
-
+        args.report_out.expanduser().write_text(report + "\n", encoding="utf-8")
+    else:
+        print(report)
     if args.csv_out:
-        write_csv(expand_path(args.csv_out), trades)
+        write_csv(args.csv_out.expanduser(), trades)
+
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
