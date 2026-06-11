@@ -87,6 +87,12 @@ class PairResult:
     avg_funding_diff_bps_per_h: Optional[float]
 
 
+@dataclass
+class ReportContext:
+    input_count: int
+    snapshot_count: int
+
+
 def parse_float(value) -> Optional[float]:
     if value is None:
         return None
@@ -209,6 +215,8 @@ def parse_pairtrade_record(record: dict) -> Optional[Snapshot]:
         top_depth_usd = None
         if bid_size is not None and ask_size is not None:
             top_depth_usd = max(0.0, min(bid_size, ask_size) * price)
+        # Pairtrade bot dumps store funding_rate as fraction per hour after
+        # dex-connector normalization. Raw collector files must match that unit.
         funding_per_hour = parse_float(raw.get("funding_rate"))
         symbols[str(symbol)] = SymbolSample(
             price=price,
@@ -420,6 +428,8 @@ def pair_cost_bps(
     fee_bps: float,
     hold_hours: Optional[float],
 ) -> Tuple[float, Optional[float], Optional[float], Optional[float], Optional[float]]:
+    # Coarse round-trip model: one full quoted spread per leg, four
+    # per-fill fees, plus absolute funding-rate difference times hold.
     spreads_a = [x.spread_bps for x in sa if x.spread_bps is not None]
     spreads_b = [x.spread_bps for x in sb if x.spread_bps is not None]
     avg_spread_a = mean(spreads_a)
@@ -510,18 +520,24 @@ def analyze(snapshots: List[Snapshot], args: argparse.Namespace) -> Tuple[Dict[s
     return stats, results
 
 
-def render_markdown(stats: Dict[str, SymbolStats], results: List[PairResult], args: argparse.Namespace) -> str:
+def render_markdown(
+    stats: Dict[str, SymbolStats],
+    results: List[PairResult],
+    args: argparse.Namespace,
+    context: ReportContext,
+) -> str:
     lines = []
     lines.append("# Pair/universe pre-screen")
     lines.append("")
     lines.append(
         "Caveat: this is a coarse residual screen from synchronized market snapshots, "
-        "not byte-exact trade PnL. `ideal net med bps` subtracts rough cost "
-        "from idealized residual reversion amplitude; promote candidates only after replay-quality follow-up."
+        "not byte-exact trade PnL. Entry z-scores use full-window residual "
+        "mean/std, so `ideal net med bps` subtracts rough cost from idealized "
+        "in-sample residual reversion amplitude; promote candidates only after replay-quality follow-up."
     )
     lines.append("")
     lines.append(
-        f"Inputs: files={args.input_count}, snapshots={args.snapshot_count}, "
+        f"Inputs: files={context.input_count}, snapshots={context.snapshot_count}, "
         f"entry_z={args.entry_z:g}, exit_z={args.exit_z:g}, max_hold_h={args.max_hold_hours:g}, "
         f"fee_bps_per_fill={args.fee_bps:g}"
     )
@@ -624,15 +640,14 @@ def main() -> int:
         print("ERROR: no input files", file=sys.stderr)
         return 2
     snapshots = load_snapshots(paths, args.source)
-    args.input_count = len(paths)
-    args.snapshot_count = len(snapshots)
+    context = ReportContext(input_count=len(paths), snapshot_count=len(snapshots))
     if not snapshots:
         print("ERROR: no usable snapshots", file=sys.stderr)
         return 2
     stats, results = analyze(snapshots, args)
     if args.csv_out:
         write_csv(args.csv_out, results)
-    report = render_markdown(stats, results, args)
+    report = render_markdown(stats, results, args, context)
     if args.markdown_out:
         with open(args.markdown_out, "w", encoding="utf-8") as fh:
             fh.write(report)
