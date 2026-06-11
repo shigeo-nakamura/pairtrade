@@ -1,7 +1,7 @@
 use std::env;
 
 use super::schema::StrategyYaml;
-use super::PairTradeConfig;
+use super::{PairParams, PairTradeConfig};
 
 /// Resolved per-strategy config for one A/B/C variant. Fields here override
 /// the top-level scalar of the same name when an instance runs.
@@ -18,7 +18,7 @@ pub struct StrategyConfig {
     pub equity_reference_usd: f64,
     // Per-strategy PairParams overrides. `None` = inherit from top-level
     // resolved value; `Some` wins over the top-level scalar at instance build
-    // time (see `pairtrade::mod::build_instance_default_params`).
+    // time (see `StrategyConfig::apply_pair_param_overrides`).
     pub force_close_time_secs: Option<u64>,
     pub mtf_windows: Option<Vec<usize>>,
     pub mtf_z_min: Option<f64>,
@@ -176,5 +176,85 @@ pub(super) fn resolve_strategies(
             use_frozen_beta_exit_z: None,
             regime_block_entries: None,
         }],
+    }
+}
+
+impl StrategyConfig {
+    pub(in crate::pairtrade) fn apply_pair_param_overrides(&self, params: &mut PairParams) {
+        params.exit_z = self.exit_z;
+        params.stop_loss_z = self.stop_loss_z;
+        params.max_loss_r_mult = self.max_loss_r_mult;
+        if let Some(fc) = self.force_close_time_secs {
+            params.force_close_secs = fc;
+        }
+        if let Some(ref w) = self.mtf_windows {
+            params.mtf_windows = w.clone();
+        }
+        if let Some(z) = self.mtf_z_min {
+            params.mtf_z_min = z;
+        }
+        if let Some(z) = self.entry_z_base {
+            params.entry_z_base = z;
+        }
+        if let Some(z) = self.entry_z_min {
+            params.entry_z_min = z;
+        }
+        if let Some(z) = self.entry_z_max {
+            params.entry_z_max = z;
+        }
+        if let Some(v) = self.beta_gap_entry_z_scale {
+            params.beta_gap_entry_z_scale = v;
+        }
+        if let Some(v) = self.beta_gap_notional_scale {
+            params.beta_gap_notional_scale = v;
+        }
+        if let Some(v) = self.beta_gap_notional_floor {
+            params.beta_gap_notional_floor = v;
+        }
+        if let Some(v) = self.depth_size_slope {
+            params.depth_size_slope = v;
+        }
+        if let Some(v) = self.depth_size_min {
+            params.depth_size_min = v;
+        }
+        if let Some(v) = self.depth_size_max {
+            params.depth_size_max = v;
+        }
+        if let Some(v) = self.rehedge_drift_threshold_pct {
+            params.rehedge_drift_threshold_pct = v;
+        }
+        if let Some(v) = self.rehedge_cooldown_secs {
+            params.rehedge_cooldown_secs = v;
+        }
+        if let Some(v) = self.rehedge_min_qty_notional_usd {
+            params.rehedge_min_qty_notional_usd = v;
+        }
+        if let Some(v) = self.rehedge_live_enabled {
+            params.rehedge_live_enabled = v;
+        }
+        if let Some(v) = self.use_amend_on_partial_fill {
+            params.use_amend_on_partial_fill = v;
+        }
+        if let Some(v) = self.rehedge_require_no_revert {
+            params.rehedge_require_no_revert = v;
+        }
+        if let Some(v) = self.rehedge_z_no_revert_factor {
+            params.rehedge_z_no_revert_factor = v;
+        }
+        if let Some(v) = self.rehedge_velocity_projected_drift_min {
+            params.rehedge_velocity_projected_drift_min = v;
+        }
+        if let Some(v) = self.beta_uncertainty_max {
+            params.beta_uncertainty_max = v;
+        }
+        if let Some(v) = self.std_collapse_hold_down_secs {
+            params.std_collapse_hold_down_secs = v;
+        }
+        if let Some(v) = self.use_frozen_beta_exit_z {
+            params.use_frozen_beta_exit_z = v;
+        }
+        if let Some(v) = self.regime_block_entries {
+            params.regime_block_entries = v;
+        }
     }
 }
