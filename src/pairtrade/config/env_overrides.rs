@@ -5,7 +5,8 @@ use anyhow::{anyhow, Result};
 use super::env_util::{
     env_override, env_override_critical, load_bt_eval_timestamps, load_bt_restart_timestamps,
 };
-use super::{default_history_file, parse_universe_pairs, PairTradeConfig};
+use super::universe::{default_history_file, parse_universe_pairs};
+use super::PairTradeConfig;
 
 impl PairTradeConfig {
     pub(super) fn apply_env_overrides(
