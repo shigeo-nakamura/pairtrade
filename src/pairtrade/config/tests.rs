@@ -347,3 +347,128 @@ strategies:
 
     let _ = std::fs::remove_file(&path);
 }
+
+fn strategy_config_for_overlay_test() -> StrategyConfig {
+    StrategyConfig {
+        id: "test".to_string(),
+        agent_name: None,
+        exit_z: 1.25,
+        stop_loss_z: 6.5,
+        max_loss_r_mult: 2.5,
+        equity_reference_usd: 100.0,
+        force_close_time_secs: None,
+        mtf_windows: None,
+        mtf_z_min: None,
+        entry_z_base: None,
+        entry_z_min: None,
+        entry_z_max: None,
+        beta_gap_entry_z_scale: None,
+        beta_gap_notional_scale: None,
+        beta_gap_notional_floor: None,
+        depth_size_slope: None,
+        depth_size_min: None,
+        depth_size_max: None,
+        rehedge_drift_threshold_pct: None,
+        rehedge_cooldown_secs: None,
+        rehedge_min_qty_notional_usd: None,
+        rehedge_live_enabled: None,
+        use_amend_on_partial_fill: None,
+        rehedge_require_no_revert: None,
+        rehedge_z_no_revert_factor: None,
+        rehedge_velocity_projected_drift_min: None,
+        beta_uncertainty_max: None,
+        std_collapse_hold_down_secs: None,
+        use_frozen_beta_exit_z: None,
+        regime_block_entries: None,
+    }
+}
+
+#[test]
+fn strategy_pair_param_overlay_applies_all_strategy_overrides() {
+    let mut strategy = strategy_config_for_overlay_test();
+    strategy.force_close_time_secs = Some(123);
+    strategy.mtf_windows = Some(vec![5, 15]);
+    strategy.mtf_z_min = Some(0.7);
+    strategy.entry_z_base = Some(2.1);
+    strategy.entry_z_min = Some(1.2);
+    strategy.entry_z_max = Some(3.4);
+    strategy.beta_gap_entry_z_scale = Some(0.11);
+    strategy.beta_gap_notional_scale = Some(0.22);
+    strategy.beta_gap_notional_floor = Some(0.33);
+    strategy.depth_size_slope = Some(0.44);
+    strategy.depth_size_min = Some(0.55);
+    strategy.depth_size_max = Some(1.66);
+    strategy.rehedge_drift_threshold_pct = Some(0.77);
+    strategy.rehedge_cooldown_secs = Some(88);
+    strategy.rehedge_min_qty_notional_usd = Some(99.0);
+    strategy.rehedge_live_enabled = Some(true);
+    strategy.use_amend_on_partial_fill = Some(true);
+    strategy.rehedge_require_no_revert = Some(true);
+    strategy.rehedge_z_no_revert_factor = Some(1.2);
+    strategy.rehedge_velocity_projected_drift_min = Some(0.03);
+    strategy.beta_uncertainty_max = Some(0.04);
+    strategy.std_collapse_hold_down_secs = Some(3600);
+    strategy.use_frozen_beta_exit_z = Some(true);
+    strategy.regime_block_entries = Some(true);
+
+    let mut params = PairParams::default();
+    strategy.apply_pair_param_overrides(&mut params);
+
+    assert_eq!(params.exit_z, 1.25);
+    assert_eq!(params.stop_loss_z, 6.5);
+    assert_eq!(params.max_loss_r_mult, 2.5);
+    assert_eq!(params.force_close_secs, 123);
+    assert_eq!(params.mtf_windows, vec![5, 15]);
+    assert_eq!(params.mtf_z_min, 0.7);
+    assert_eq!(params.entry_z_base, 2.1);
+    assert_eq!(params.entry_z_min, 1.2);
+    assert_eq!(params.entry_z_max, 3.4);
+    assert_eq!(params.beta_gap_entry_z_scale, 0.11);
+    assert_eq!(params.beta_gap_notional_scale, 0.22);
+    assert_eq!(params.beta_gap_notional_floor, 0.33);
+    assert_eq!(params.depth_size_slope, 0.44);
+    assert_eq!(params.depth_size_min, 0.55);
+    assert_eq!(params.depth_size_max, 1.66);
+    assert_eq!(params.rehedge_drift_threshold_pct, 0.77);
+    assert_eq!(params.rehedge_cooldown_secs, 88);
+    assert_eq!(params.rehedge_min_qty_notional_usd, 99.0);
+    assert!(params.rehedge_live_enabled);
+    assert!(params.use_amend_on_partial_fill);
+    assert!(params.rehedge_require_no_revert);
+    assert_eq!(params.rehedge_z_no_revert_factor, 1.2);
+    assert_eq!(params.rehedge_velocity_projected_drift_min, 0.03);
+    assert_eq!(params.beta_uncertainty_max, 0.04);
+    assert_eq!(params.std_collapse_hold_down_secs, 3600);
+    assert!(params.use_frozen_beta_exit_z);
+    assert!(params.regime_block_entries);
+}
+
+#[test]
+fn strategy_pair_param_overlay_preserves_inherited_optionals() {
+    let strategy = strategy_config_for_overlay_test();
+    let mut params = PairParams {
+        force_close_secs: 777,
+        mtf_windows: vec![60],
+        entry_z_base: 1.8,
+        beta_gap_entry_z_scale: 0.5,
+        rehedge_live_enabled: true,
+        std_collapse_hold_down_secs: 120,
+        use_frozen_beta_exit_z: true,
+        regime_block_entries: true,
+        ..PairParams::default()
+    };
+
+    strategy.apply_pair_param_overrides(&mut params);
+
+    assert_eq!(params.exit_z, 1.25);
+    assert_eq!(params.stop_loss_z, 6.5);
+    assert_eq!(params.max_loss_r_mult, 2.5);
+    assert_eq!(params.force_close_secs, 777);
+    assert_eq!(params.mtf_windows, vec![60]);
+    assert_eq!(params.entry_z_base, 1.8);
+    assert_eq!(params.beta_gap_entry_z_scale, 0.5);
+    assert!(params.rehedge_live_enabled);
+    assert_eq!(params.std_collapse_hold_down_secs, 120);
+    assert!(params.use_frozen_beta_exit_z);
+    assert!(params.regime_block_entries);
+}
