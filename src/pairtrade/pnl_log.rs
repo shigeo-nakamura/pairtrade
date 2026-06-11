@@ -64,11 +64,10 @@ pub(super) struct PnlLogRecord {
     /// Computed by walking the rolling WS funding-rate history per leg
     /// during `[entry_ts, exit_ts)`; per-leg notionals captured at entry.
     /// Sign convention matches the exchange `Payment` column (CSV
-    /// funding-history export): positive ⇒ strategy received. Note this
-    /// is the opposite sign of `market::net_funding_for_direction`, which
-    /// is left as-is for the (latent) entry-threshold filter only — the
-    /// two log lines no longer share a convention as of
-    /// bot-strategy#414. Field is added at exit time only — `None` on
+    /// funding-history export): positive ⇒ strategy received. Since
+    /// bot-strategy#517, `market::net_funding_for_direction` (the
+    /// entry-threshold filter input) follows the same received-carry
+    /// convention. Field is added at exit time only — `None` on
     /// records that pre-date the cycle's entry or on
     /// `startup_force_close`. bot-strategy#364 / #414.
     #[serde(skip_serializing_if = "Option::is_none")]
