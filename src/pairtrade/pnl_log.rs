@@ -26,6 +26,16 @@ pub(super) struct PnlLogRecord {
     pub(super) direction: String,
     pub(super) pnl: f64,
     pub(super) source: String,
+    /// `false` marks a structured context record where the exchange has
+    /// realised PnL but the bot cannot safely compute a model PnL on this
+    /// path. Tooling may still use z/beta/hold fields, but must not treat
+    /// `pnl` as a model/accounting value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) pnl_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) close_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) recovery_reason: Option<String>,
     // Trade log fields for backtest calibration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) entry_price_a: Option<f64>,
@@ -148,6 +158,16 @@ impl PnlLogger {
             retain_days,
             last_cleanup: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            tag: Some("test".to_string()),
+            retain_days: 7,
+            last_cleanup: None,
+        }
     }
 
     pub(super) fn log(&mut self, record: PnlLogRecord) -> std::io::Result<()> {
@@ -284,6 +304,9 @@ pub(super) fn log_startup_force_close(
             direction: direction.to_string(),
             pnl: 0.0,
             source: "startup_force_close".to_string(),
+            pnl_available: None,
+            close_reason: None,
+            recovery_reason: None,
             entry_price_a: entry,
             entry_price_b: None,
             exit_price_a: None,
@@ -345,6 +368,9 @@ impl PnlLogRecord {
             direction: direction_label(direction).to_string(),
             pnl,
             source: source.to_string(),
+            pnl_available: None,
+            close_reason: None,
+            recovery_reason: None,
             entry_price_a: None,
             entry_price_b: None,
             exit_price_a: None,
@@ -384,6 +410,21 @@ impl PnlLogRecord {
         self.z_entry = z_entry;
         self.z_exit = z_exit;
         self.hold_secs = hold_secs;
+        self
+    }
+
+    pub(super) fn with_unavailable_pnl(mut self) -> Self {
+        self.pnl_available = Some(false);
+        self
+    }
+
+    pub(super) fn with_recovery_context(
+        mut self,
+        close_reason: Option<&str>,
+        recovery_reason: &str,
+    ) -> Self {
+        self.close_reason = close_reason.map(str::to_string);
+        self.recovery_reason = Some(recovery_reason.to_string());
         self
     }
 }

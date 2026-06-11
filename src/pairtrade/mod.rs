@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use dex_connector::{DexConnector, PositionSnapshot};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -646,6 +647,56 @@ impl PairTradeEngine {
                 log::warn!("[PNL] failed to write pnl log: {:?}", err);
             }
         }
+    }
+
+    fn write_pnl_context_record(&mut self, inst_idx: usize, record: PnlLogRecord) {
+        if let Some(logger) = &mut self.instances[inst_idx].pnl_logger {
+            if let Err(err) = logger.log(record) {
+                log::warn!("[PNL] failed to write context pnl log: {:?}", err);
+            }
+        }
+    }
+
+    fn write_recovery_no_pnl_record(
+        &mut self,
+        inst_idx: usize,
+        key: &str,
+        fallback_direction: PositionDirection,
+        recovery_reason: &str,
+        now_ts: i64,
+        price_map: &HashMap<String, SymbolSnapshot>,
+    ) {
+        let Some((base, quote)) = key.split_once('/') else {
+            return;
+        };
+
+        let inst = &self.instances[inst_idx];
+        let state = inst.states.get(key);
+        let pos = state.and_then(|s| s.position.as_ref());
+        let direction = pos.map(|p| p.direction).unwrap_or(fallback_direction);
+        let close_reason = state.and_then(|s| s.pending_exit_reason);
+        let z_exit = self
+            .per_pair_state
+            .get(key)
+            .and_then(|s| s.z_score().map(|(z, _)| z));
+        let beta = pos
+            .and_then(|p| p.entry_beta)
+            .or_else(|| self.per_pair_state.get(key).map(|s| s.beta));
+        let entry_a = pos.and_then(|p| p.entry_price_a.and_then(|v| v.to_f64()));
+        let entry_b = pos.and_then(|p| p.entry_price_b.and_then(|v| v.to_f64()));
+        let z_entry = pos.and_then(|p| p.entry_z);
+        let hold_secs = pos.map(|p| now_ts.saturating_sub(p.entered_ts).max(0) as f64);
+        let exit_a = price_map.get(base).and_then(|p| p.price.to_f64());
+        let exit_b = price_map.get(quote).and_then(|p| p.price.to_f64());
+
+        let record = PnlLogRecord::new(base, quote, direction, 0.0, now_ts, "recovery_no_pnl")
+            .with_unavailable_pnl()
+            .with_recovery_context(close_reason, recovery_reason)
+            .with_trade_details(
+                entry_a, entry_b, exit_a, exit_b, beta, z_entry, z_exit, hold_secs,
+            );
+
+        self.write_pnl_context_record(inst_idx, record);
     }
 
     fn latest_log_price(&self, symbol: &str) -> Option<f64> {
@@ -3145,6 +3196,103 @@ mod pending_tests {
             remaining[0].symbol, "BTC",
             "the dust leg (not the real leg) is what remains"
         );
+    }
+
+    #[test]
+    fn recovery_no_pnl_record_logs_context_without_trade_stats() {
+        use tempfile::TempDir;
+
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        let dir = TempDir::new().unwrap();
+        engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+        engine.instances[0].total_trades = 7;
+        engine.instances[0].total_pnl = 12.5;
+
+        let key = "AAA/BBB";
+        let now_ts = 1_700_000_300;
+        let mut state = PairState::new(2.0);
+        state.pending_exit_reason = Some("force_close");
+        state.position = Some(super::state::Position {
+            direction: PositionDirection::LongSpread,
+            entered_at: Instant::now(),
+            entered_ts: now_ts - 300,
+            entry_price_a: Some(dec("100")),
+            entry_price_b: Some(dec("50")),
+            entry_size_a: Some(dec("0.01")),
+            entry_size_b: Some(dec("0.02")),
+            entry_z: Some(2.4),
+            entry_beta: Some(1.2),
+            last_rehedge_ts: None,
+            rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
+        });
+        engine.instances[0].states.insert(key.to_string(), state);
+
+        let price_map = HashMap::from([
+            (
+                "AAA".to_string(),
+                SymbolSnapshot {
+                    price: dec("101"),
+                    funding_rate: Decimal::ZERO,
+                    bid_price: None,
+                    ask_price: None,
+                    bid_size: Decimal::ZERO,
+                    ask_size: Decimal::ZERO,
+                    min_order: None,
+                    min_tick: None,
+                    size_decimals: None,
+                    exchange_ts: None,
+                },
+            ),
+            (
+                "BBB".to_string(),
+                SymbolSnapshot {
+                    price: dec("49"),
+                    funding_rate: Decimal::ZERO,
+                    bid_price: None,
+                    ask_price: None,
+                    bid_size: Decimal::ZERO,
+                    ask_size: Decimal::ZERO,
+                    min_order: None,
+                    min_tick: None,
+                    size_decimals: None,
+                    exchange_ts: None,
+                },
+            ),
+        ]);
+
+        engine.write_recovery_no_pnl_record(
+            0,
+            key,
+            PositionDirection::ShortSpread,
+            "timeout",
+            now_ts,
+            &price_map,
+        );
+
+        assert_eq!(engine.instances[0].total_trades, 7);
+        assert!((engine.instances[0].total_pnl - 12.5).abs() < 1e-9);
+
+        let path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let line = std::fs::read_to_string(path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(json["source"], "recovery_no_pnl");
+        assert_eq!(json["pnl_available"], false);
+        assert_eq!(json["close_reason"], "force_close");
+        assert_eq!(json["recovery_reason"], "timeout");
+        assert_eq!(json["direction"], "long_spread");
+        assert_eq!(json["pnl"], 0.0);
+        assert_eq!(json["z_entry"], 2.4);
+        assert_eq!(json["beta"], 1.2);
+        assert_eq!(json["hold_secs"], 300.0);
+        assert_eq!(json["exit_price_a"], 101.0);
+        assert_eq!(json["exit_price_b"], 49.0);
     }
 
     /// `force_close_all_positions` (reconcile-loop emergency path) is
