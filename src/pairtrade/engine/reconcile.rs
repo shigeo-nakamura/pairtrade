@@ -254,6 +254,7 @@ impl PairTradeEngine {
                                         }
                                     }
                                 }
+                                record = record.with_close_reason(reason);
                                 pnl_record = Some((record, pnl, carry_usd));
                             }
                         }

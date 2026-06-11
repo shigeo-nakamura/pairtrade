@@ -1390,6 +1390,12 @@ impl PairTradeEngine {
                             if ticks_observed > 0 {
                                 record = record.with_funding(carry_usd, ticks_observed);
                             }
+                            let close_reason = self.instances[inst_idx]
+                                .states
+                                .get(&plan.key)
+                                .and_then(|s| s.pending_exit_reason)
+                                .unwrap_or("unknown");
+                            record = record.with_close_reason(close_reason);
                             self.write_pnl_record(inst_idx, record);
                             self.instances[inst_idx].realized_pnl_today += pnl_value;
                             self.instances[inst_idx].funding_carry_today += carry_usd;

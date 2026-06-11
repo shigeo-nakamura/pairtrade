@@ -426,4 +426,13 @@ impl PnlLogRecord {
         self.recovery_reason = Some(recovery_reason.to_string());
         self
     }
+
+    /// Close reason for normal (non-recovery) exits, mirroring the value the
+    /// `pairtrade_close_reason_total` Prom counter receives. Lets attribution
+    /// tooling recover close reasons beyond journal retention
+    /// (bot-strategy#514 / #531).
+    pub(super) fn with_close_reason(mut self, reason: &str) -> Self {
+        self.close_reason = Some(reason.to_string());
+        self
+    }
 }
