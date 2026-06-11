@@ -1,0 +1,121 @@
+# SOL/ETH observe-only data collector (bot-strategy#519 Phase 1)
+#
+# Runs alongside the main `debot-pair-btceth` A/B/C process and the canary on
+# the Frankfurt instance. Its only job is to record the Lighter SOL/ETH feed
+# to /opt/debot-sol/market_data_soleth_*.jsonl so the #519 second-pair study
+# can backtest on real venue data after 2-3 weeks of accumulation.
+#
+# Design notes:
+# - observe_only + dry_run are BOTH set: no orders, real or simulated, ever
+#   reach the venue. The strategy block below (a live-A clone) only exists so
+#   the engine has one instance to evaluate; its hypothetical signals are a
+#   free preview for the later DRY_RUN soak phase, not a deliverable.
+# - The dump filename deliberately does NOT match the disk-cleanup workflow's
+#   `market_data_btceth_[0-9]*.jsonl` pattern, so dated SOL dumps accumulate
+#   past the 7-day cleanup horizon (~8 MB/day; disk-watch still covers us).
+# - Credentials are shared with the canary sub-account (sourced by the
+#   wrapper). In observe mode the process signs no transactions, so there is
+#   no nonce contention with the canary; it only adds WS/REST read load.
+
+dex_name: lighter
+rest_endpoint: https://mainnet.zklighter.elliot.ai/
+web_socket_endpoint: wss://mainnet.zklighter.elliot.ai/stream
+dry_run: true
+agent_name: debot-pair-soleth-observe
+
+enable_data_dump: true
+data_dump_file: /opt/debot-sol/market_data_soleth.jsonl
+observe_only: true
+
+history_archive_dir: /opt/debot-sol/history_archive
+history_archive_retention_days: 60
+
+universe_pairs:
+- SOL/ETH
+max_active_pairs: 1
+
+interval_secs: 5
+trading_period_secs: 60
+
+# Same diagnostics as main BTC/ETH so the [METRICS] eligibility stream is
+# directly comparable across pairs.
+pair_selection_lookback_hours_short: 1
+pair_selection_lookback_hours_long: 2
+adf_p_threshold: 0.15
+half_life_max_hours: 2.0
+metrics_window_length: 240
+warm_start_mode: relaxed
+warm_start_min_bars: 60
+
+# Core MR params — live Round-6 A clone (signal preview only; observe_only).
+entry_z_score_base: 1.5
+entry_z_score_min: 1.0
+entry_z_score_max: 2.0
+exit_z_score: 0.2
+stop_loss_z_score: 4.0
+force_close_time_secs: 10800
+shutdown_grace_secs: 10860
+stop_loss_cooldown_secs: 600
+
+# Risk — values are irrelevant in observe mode but kept sane.
+risk_pct_per_trade: 0.40
+equity_usd_reference: 50
+max_leverage: 1
+max_loss_r_mult: 1.0
+
+# Execution
+cooldown_secs: 60
+slippage_bps: 0
+fee_bps: 0
+entry_post_only_timeout_secs: 30
+
+# Filters (identical to main)
+spread_velocity_max_sigma_per_min: 0.15
+spread_trend_max_slope_sigma: 1.0
+beta_divergence_max: 0.30
+beta_min: 0.30
+hedge_ratio_max_deviation: 0.20
+entry_vol_lookback_hours: 2
+vol_spike_mult: 3.0
+net_funding_min_per_hour: -0.01
+reeval_jump_z_mult: 1.5
+
+# Phase 2 filters (identical to main)
+entry_velocity_block_sigma_per_min: 0.0
+funding_entry_z_scale: 0.0
+beta_gap_entry_z_scale: 3.0
+
+# Std collapse guard (identical to main)
+std_collapse_window_bars: 60
+std_collapse_min_ratio: 0.2
+std_collapse_observe_only: false
+
+# Circuit breaker (identical to main; cannot fire in observe mode)
+circuit_breaker_tier1_losses: 5
+circuit_breaker_tier1_cooldown_secs: 600
+circuit_breaker_tier2_losses: 8
+circuit_breaker_tier2_cooldown_secs: 3600
+
+risk:
+  max_daily_loss_bps: 300
+  max_daily_loss_action: block
+  daily_reset_utc_hour: 0
+  max_session_loss_bps: 200
+  session_dd_lookback_secs: 2592000
+  session_dd_sample_secs: 3600
+  max_notional_headroom: 1.0
+
+# Single instance — observer has no A/B/C split.
+strategies:
+  - id: a
+    agent_name: debot-pair-soleth-observe
+    exit_z_score: 0.2
+    stop_loss_z_score: 4.0
+    max_loss_r_mult: 1.0
+    equity_usd_reference: 50
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 10800
+    entry_z_score_base: 1.5
+    entry_z_score_min: 1.0
+    entry_z_score_max: 2.0
