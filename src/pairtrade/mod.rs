@@ -38,7 +38,7 @@ mod util;
 // Re-exported at the pairtrade module root so existing `super::super::`
 // references in engine submodules resolve unchanged (bot-strategy#502).
 use bar::BarBuilder;
-pub use config::{PairTradeConfig, WarmStartMode};
+pub use config::{DailyLossAction, PairTradeConfig, WarmStartMode};
 use market::SymbolSnapshot;
 use pnl_log::{PnlLogRecord, PnlLogger};
 pub(in crate::pairtrade) use sentinel::{risk_ack_path, KILL_SWITCH_PATH};

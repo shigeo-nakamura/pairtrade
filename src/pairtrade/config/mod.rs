@@ -12,7 +12,7 @@ use env_util::{
     load_bt_restart_timestamps,
 };
 use risk::resolve_risk_config;
-pub use risk::RiskConfig;
+pub use risk::{DailyLossAction, RiskConfig};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
@@ -1672,7 +1672,6 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
 
 #[cfg(test)]
 mod tests {
-    use super::risk::DailyLossAction;
     use super::schema::RiskYaml;
     use super::*;
 
