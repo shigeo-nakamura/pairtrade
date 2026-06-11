@@ -454,11 +454,13 @@ mod tests {
         // semantics — that the returned value is the inverse of
         // strategy-side received-carry — are documented on
         // `net_funding_for_direction` and tracked as a latent issue.)
-        let p1 = snap_with_funding(dec!(0.0012));
-        let p2 = snap_with_funding(dec!(-0.0003));
+        // Realistic Lighter-scale inputs: 0.0000125 fraction/h is
+        // 0.125 bps/h (about 1 bp over an 8h funding interval).
+        let p1 = snap_with_funding(dec!(0.0000125));
+        let p2 = snap_with_funding(dec!(-0.0000035));
         let z_pos = net_funding_for_direction(1.0, &p1, &p2);
         let z_neg = net_funding_for_direction(-1.0, &p1, &p2);
-        assert!((z_pos - (-0.0015)).abs() < 1e-12, "z_pos was {}", z_pos);
-        assert!((z_neg - 0.0015).abs() < 1e-12, "z_neg was {}", z_neg);
+        assert!((z_pos - (-0.000016)).abs() < 1e-15, "z_pos was {}", z_pos);
+        assert!((z_neg - 0.000016).abs() < 1e-15, "z_neg was {}", z_neg);
     }
 }
