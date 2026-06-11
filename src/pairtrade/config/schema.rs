@@ -7,7 +7,7 @@
 //! resolved/public config shapes and the env/validation logic stay in
 //! `config/mod.rs`.
 
-use super::*;
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
