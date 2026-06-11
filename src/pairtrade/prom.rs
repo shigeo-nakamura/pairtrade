@@ -224,10 +224,11 @@ pub static REHEDGE_NEEDED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 pub static ENTRY_NOTIONAL_SCALE: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_entry_notional_scale",
-        "Multiplicative shrink applied to per-leg notional on the most \
-         recent entry, driven by `beta_gap_notional_scale × beta_gap` \
-         (clamped to `beta_gap_notional_floor`). 1.0 = no shrink. \
-         (bot-strategy#461)",
+        "Multiplicative scale applied to per-leg notional on the most \
+         recent entry: beta-gap shrink (`beta_gap_notional_scale × \
+         beta_gap`, clamped to `beta_gap_notional_floor`, bot-strategy#461) \
+         × signal-depth multiplier (`depth_size_slope`, bot-strategy#515, \
+         may exceed 1.0). 1.0 = flat sizing.",
         &["variant", "pair"],
     )
 });

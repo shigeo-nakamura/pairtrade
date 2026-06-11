@@ -355,6 +355,15 @@ impl PairTradeEngine {
             if let Some(v) = strategy.beta_gap_notional_floor {
                 inst_default.beta_gap_notional_floor = v;
             }
+            if let Some(v) = strategy.depth_size_slope {
+                inst_default.depth_size_slope = v;
+            }
+            if let Some(v) = strategy.depth_size_min {
+                inst_default.depth_size_min = v;
+            }
+            if let Some(v) = strategy.depth_size_max {
+                inst_default.depth_size_max = v;
+            }
             if let Some(v) = strategy.rehedge_drift_threshold_pct {
                 inst_default.rehedge_drift_threshold_pct = v;
             }
@@ -424,6 +433,15 @@ impl PairTradeEngine {
                 }
                 if let Some(v) = strategy.beta_gap_notional_floor {
                     pp.beta_gap_notional_floor = v;
+                }
+                if let Some(v) = strategy.depth_size_slope {
+                    pp.depth_size_slope = v;
+                }
+                if let Some(v) = strategy.depth_size_min {
+                    pp.depth_size_min = v;
+                }
+                if let Some(v) = strategy.depth_size_max {
+                    pp.depth_size_max = v;
                 }
                 if let Some(v) = strategy.rehedge_drift_threshold_pct {
                     pp.rehedge_drift_threshold_pct = v;

@@ -1653,15 +1653,48 @@ impl PairTradeEngine {
                     .get(&pair_key)
                     .map(|s| s.beta_gap)
                     .unwrap_or(0.0);
-                let (notional_scale_param, notional_floor_param) = {
+                let (
+                    notional_scale_param,
+                    notional_floor_param,
+                    depth_slope,
+                    depth_s_min,
+                    depth_s_max,
+                    entry_z_base,
+                ) = {
                     let pp = self.pair_params_for(inst_idx, &pair_key);
-                    (pp.beta_gap_notional_scale, pp.beta_gap_notional_floor)
+                    (
+                        pp.beta_gap_notional_scale,
+                        pp.beta_gap_notional_floor,
+                        pp.depth_size_slope,
+                        pp.depth_size_min,
+                        pp.depth_size_max,
+                        pp.entry_z_base,
+                    )
                 };
+                // bot-strategy#515: concentrate capital on deeper entries.
+                // Resolved once here and frozen for the hold (the position
+                // qtys carry it implicitly).
+                let depth_mult = crate::pairtrade::sizing::depth_size_mult(
+                    z.abs(),
+                    entry_z_base,
+                    depth_slope,
+                    depth_s_min,
+                    depth_s_max,
+                );
+                if depth_mult != 1.0 {
+                    log::info!(
+                        "[DEPTH_SIZE] pair={} z={:.2} entry_z_base={:.2} mult={:.3}",
+                        pair_key,
+                        z,
+                        entry_z_base,
+                        depth_mult
+                    );
+                }
                 let notional_scale = crate::pairtrade::sizing::beta_gap_notional_scale(
                     beta_gap,
                     notional_scale_param,
                     notional_floor_param,
-                );
+                ) * depth_mult;
                 crate::pairtrade::prom::ENTRY_NOTIONAL_SCALE
                     .with_label_values(&[self.instances[inst_idx].id.as_str(), pair_key.as_str()])
                     .set(notional_scale);

@@ -81,6 +81,23 @@ pub struct PairParams {
     /// constraints stay satisfied. 0.0 still works as long as no min-
     /// notional issues; 1.0 disables (no shrink ever).
     pub beta_gap_notional_floor: f64,
+    /// Signal-depth position sizing (bot-strategy#515): entry notional is
+    /// multiplied by `clamp(depth_size_min + depth_size_slope *
+    /// (|z_entry| - entry_z_base), depth_size_min, depth_size_max)`,
+    /// concentrating capital on deeper (higher-|z|) entries without
+    /// changing the entry threshold or trade count. The multiplier is
+    /// resolved once at entry and frozen for the hold. 0.0 = disabled
+    /// (multiplier 1.0).
+    pub depth_size_slope: f64,
+    /// Lower bound of the depth-sizing multiplier (default 0.5). Keep
+    /// high enough that venue min-order / dust constraints stay
+    /// satisfied at the smallest per-variant equity.
+    pub depth_size_min: f64,
+    /// Upper bound of the depth-sizing multiplier (default 1.5, hard
+    /// cap 2.0). The absolute notional cap (`equity × max_leverage ×
+    /// max_notional_headroom`) still applies after scaling, so leverage
+    /// headroom is never exceeded.
+    pub depth_size_max: f64,
     /// Re-hedge drift threshold (#463). Triggers a mid-hold re-hedge
     /// when `|β_now − β_entry| / β_entry ≥ rehedge_drift_threshold_pct`
     /// (a fraction, NOT a percentage — 0.15 = 15%). 0.0 = disabled.
@@ -453,6 +470,10 @@ pub struct StrategyConfig {
     pub beta_gap_entry_z_scale: Option<f64>,
     pub beta_gap_notional_scale: Option<f64>,
     pub beta_gap_notional_floor: Option<f64>,
+    /// Per-strategy overrides for #515 signal-depth sizing.
+    pub depth_size_slope: Option<f64>,
+    pub depth_size_min: Option<f64>,
+    pub depth_size_max: Option<f64>,
     /// Per-strategy overrides for #463 mid-hold re-hedge.
     pub rehedge_drift_threshold_pct: Option<f64>,
     pub rehedge_cooldown_secs: Option<u64>,
@@ -984,6 +1005,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         beta_gap_entry_z_scale: env_parse("BETA_GAP_ENTRY_Z_SCALE", 0.0),
         beta_gap_notional_scale: env_parse("BETA_GAP_NOTIONAL_SCALE", 0.0),
         beta_gap_notional_floor: env_parse("BETA_GAP_NOTIONAL_FLOOR", 0.5),
+        // bot-strategy#515 — default DISABLED (slope=0.0).
+        depth_size_slope: env_parse("DEPTH_SIZE_SLOPE", 0.0),
+        depth_size_min: env_parse("DEPTH_SIZE_MIN", 0.5),
+        depth_size_max: env_parse("DEPTH_SIZE_MAX", 1.5),
         // bot-strategy#463 Phase 1 — default DISABLED (threshold=0.0).
         rehedge_drift_threshold_pct: env_parse("REHEDGE_DRIFT_THRESHOLD_PCT", 0.0),
         rehedge_cooldown_secs: env_parse("REHEDGE_COOLDOWN_SECS", 1800u64),
@@ -1104,6 +1129,9 @@ pub(super) fn resolve_strategies(
                     beta_gap_entry_z_scale: s.beta_gap_entry_z_scale,
                     beta_gap_notional_scale: s.beta_gap_notional_scale,
                     beta_gap_notional_floor: s.beta_gap_notional_floor,
+                    depth_size_slope: s.depth_size_slope,
+                    depth_size_min: s.depth_size_min,
+                    depth_size_max: s.depth_size_max,
                     rehedge_drift_threshold_pct: s.rehedge_drift_threshold_pct,
                     rehedge_cooldown_secs: s.rehedge_cooldown_secs,
                     rehedge_min_qty_notional_usd: s.rehedge_min_qty_notional_usd,
@@ -1135,6 +1163,9 @@ pub(super) fn resolve_strategies(
             beta_gap_entry_z_scale: None,
             beta_gap_notional_scale: None,
             beta_gap_notional_floor: None,
+            depth_size_slope: None,
+            depth_size_min: None,
+            depth_size_max: None,
             rehedge_drift_threshold_pct: None,
             rehedge_cooldown_secs: None,
             rehedge_min_qty_notional_usd: None,
@@ -1222,6 +1253,10 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         beta_gap_entry_z_scale: yaml.beta_gap_entry_z_scale.unwrap_or(0.0),
         beta_gap_notional_scale: yaml.beta_gap_notional_scale.unwrap_or(0.0),
         beta_gap_notional_floor: yaml.beta_gap_notional_floor.unwrap_or(0.5),
+        // bot-strategy#515 defaults — disabled.
+        depth_size_slope: yaml.depth_size_slope.unwrap_or(0.0),
+        depth_size_min: yaml.depth_size_min.unwrap_or(0.5),
+        depth_size_max: yaml.depth_size_max.unwrap_or(1.5),
         // bot-strategy#463 Phase 1 defaults — disabled.
         rehedge_drift_threshold_pct: yaml.rehedge_drift_threshold_pct.unwrap_or(0.0),
         rehedge_cooldown_secs: yaml.rehedge_cooldown_secs.unwrap_or(1800),

@@ -355,6 +355,18 @@ impl PairTradeConfig {
             "ENTRY_Z_SHORT_MULTIPLIER",
             &mut self.default_pair_params.entry_z_short_multiplier,
         );
+        env_override(
+            "DEPTH_SIZE_SLOPE",
+            &mut self.default_pair_params.depth_size_slope,
+        );
+        env_override(
+            "DEPTH_SIZE_MIN",
+            &mut self.default_pair_params.depth_size_min,
+        );
+        env_override(
+            "DEPTH_SIZE_MAX",
+            &mut self.default_pair_params.depth_size_max,
+        );
         if let Ok(value) = env::var("MTF_WINDOWS") {
             self.default_pair_params.mtf_windows = value
                 .split(',')

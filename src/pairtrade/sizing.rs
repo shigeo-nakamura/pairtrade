@@ -44,6 +44,37 @@ pub(super) fn beta_gap_notional_scale(beta_gap: f64, scale_param: f64, floor_par
     raw.clamp(floor, 1.0)
 }
 
+/// Defensive ceiling on the combined notional scale passed into
+/// `hedged_sizes`. Depth sizing (bot-strategy#515) legitimately pushes the
+/// scale above 1.0, so the old `clamp(0.0, 1.0)` no longer applies; this
+/// cap only guards against a mis-configured `depth_size_max`. The absolute
+/// dollar cap (`equity × max_leverage × max_notional_headroom`) is still
+/// enforced downstream by `cap_leg_notional`.
+const MAX_NOTIONAL_SCALE: f64 = 2.0;
+
+/// Resolve the signal-depth size multiplier (bot-strategy#515). Returns
+/// 1.0 when disabled (`slope <= 0.0`). Otherwise computes
+/// `clamp(s_min + slope * (|z_entry| - entry_z_base), s_min, s_max)` —
+/// capital concentrates on deeper entries while the entry threshold (and
+/// therefore trade count) stays unchanged. The multiplier is resolved
+/// once at entry and frozen for the lifetime of the position, same
+/// principle as `entry_beta` (#463).
+pub(super) fn depth_size_mult(
+    abs_z: f64,
+    entry_z_base: f64,
+    slope: f64,
+    s_min: f64,
+    s_max: f64,
+) -> f64 {
+    if slope <= 0.0 {
+        return 1.0;
+    }
+    let s_min = s_min.clamp(0.0, MAX_NOTIONAL_SCALE);
+    let s_max = s_max.clamp(s_min, MAX_NOTIONAL_SCALE);
+    let depth = (abs_z - entry_z_base).max(0.0);
+    (s_min + slope * depth).clamp(s_min, s_max)
+}
+
 pub(super) fn hedged_sizes(
     cfg: &PairTradeConfig,
     equity: f64,
@@ -58,9 +89,10 @@ pub(super) fn hedged_sizes(
     // and bot-strategy#222.
     let total_risk = equity * cfg.risk_pct_per_trade * cfg.max_leverage;
     let base_leg = (total_risk / 2.0).max(10.0);
-    // bot-strategy#461: shrink notional under beta-uncertainty before the
-    // notional cap (caller supplies the resolved scale, default 1.0).
-    let scale = notional_scale.clamp(0.0, 1.0);
+    // Combined per-entry scale: beta-gap shrink (#461, ≤ 1.0) × depth
+    // sizing (#515, may exceed 1.0). Applied before the notional cap
+    // (caller supplies the resolved product, default 1.0).
+    let scale = notional_scale.clamp(0.0, MAX_NOTIONAL_SCALE);
     let mut leg_notional = (base_leg * scale).max(10.0);
     let notional_cap = equity * cfg.max_leverage * cfg.risk.max_notional_headroom;
     if let Some(capped) = cap_leg_notional(leg_notional, beta, notional_cap) {
@@ -184,5 +216,43 @@ mod tests {
     fn beta_gap_notional_scale_negative_gap_is_zero() {
         // Defensive: beta_gap should never be negative, but clamp to 0.
         assert_eq!(beta_gap_notional_scale(-0.5, 1.0, 0.5), 1.0);
+    }
+
+    #[test]
+    fn depth_size_disabled_returns_one() {
+        // slope == 0 → feature disabled regardless of z depth.
+        assert_eq!(depth_size_mult(5.0, 2.0, 0.0, 0.5, 1.5), 1.0);
+        assert_eq!(depth_size_mult(2.0, 2.0, -1.0, 0.5, 1.5), 1.0);
+    }
+
+    #[test]
+    fn depth_size_at_threshold_is_s_min() {
+        // |z| == entry_z_base → depth 0 → multiplier bottoms out at s_min.
+        assert_eq!(depth_size_mult(2.0, 2.0, 0.5, 0.5, 1.5), 0.5);
+        // Below threshold (shouldn't happen at entry, but defensive):
+        // negative depth clamps to 0 → still s_min.
+        assert_eq!(depth_size_mult(1.5, 2.0, 0.5, 0.5, 1.5), 0.5);
+    }
+
+    #[test]
+    fn depth_size_linear_in_depth() {
+        // slope=0.5: |z|=3.0 vs base 2.0 → 0.5 + 0.5*1.0 = 1.0.
+        assert!((depth_size_mult(3.0, 2.0, 0.5, 0.5, 1.5) - 1.0).abs() < 1e-9);
+        // |z|=3.5 → 0.5 + 0.75 = 1.25.
+        assert!((depth_size_mult(3.5, 2.0, 0.5, 0.5, 1.5) - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn depth_size_clamps_at_s_max() {
+        // Deep |z|=6.0 → raw 0.5 + 2.0 = 2.5, clamp to s_max=1.5.
+        assert_eq!(depth_size_mult(6.0, 2.0, 0.5, 0.5, 1.5), 1.5);
+    }
+
+    #[test]
+    fn depth_size_guards_misconfigured_bounds() {
+        // s_max above the hard cap clamps to MAX_NOTIONAL_SCALE.
+        assert_eq!(depth_size_mult(20.0, 2.0, 1.0, 0.5, 10.0), 2.0);
+        // s_max below s_min collapses to s_min (degenerate but safe).
+        assert_eq!(depth_size_mult(3.0, 2.0, 0.5, 1.0, 0.4), 1.0);
     }
 }
