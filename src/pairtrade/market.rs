@@ -54,10 +54,15 @@ pub(super) struct SymbolSnapshot {
 /// (`FUNDING_CARRY_ENTRY_DISCOUNT`, `funding_entry_z_scale`,
 /// `net_funding_min_per_hour`) assume: all treat positive as
 /// carry-favorable. Before #517 this helper returned the inverse
-/// (documented latent since #414); the flip changes only the
-/// `[METRICS] net_funding_per_hour` log sign in practice because all
-/// live configs run with the funding gates disabled / non-binding
-/// (`funding_entry_z_scale: 0.0`, `net_funding_min_per_hour: -0.01`).
+/// (documented latent since #414). The flip IS an entry-behavior
+/// change: `FUNDING_CARRY_ENTRY_DISCOUNT` in `entry.rs` is always-on
+/// (not config-gated) and previously eased the entry threshold for
+/// carry-*adverse* positions — the opposite of its stated intent. It
+/// now eases carry-favorable entries as intended. Multi-pair candidate
+/// ordering in `engine/step.rs` also sorts on this value (non-binding
+/// on live single-pair BTC/ETH configs). The configurable gates remain
+/// disabled / non-binding live (`funding_entry_z_scale: 0.0`,
+/// `net_funding_min_per_hour: -0.01`).
 pub(super) fn net_funding_for_direction(z: f64, p1: &SymbolSnapshot, p2: &SymbolSnapshot) -> f64 {
     if z > 0.0 {
         // plan to short base (p1) and long quote (p2): receive p1's
