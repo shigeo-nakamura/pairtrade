@@ -14,10 +14,10 @@
 //! strategy **received** carry over the window (matches the CSV/exchange
 //! `Payment` column sign). Since a long position with a positive rate
 //! pays out, per-leg P&L is `-rate × notional` for long legs and
-//! `+rate × notional` for short legs (bot-strategy#414). This is the
-//! opposite sign of `market::net_funding_for_direction`, which is used
-//! only for the entry-threshold filter and is documented separately as a
-//! latent bug; the two no longer share a sign convention.
+//! `+rate × notional` for short legs (bot-strategy#414). Since
+//! bot-strategy#517, `market::net_funding_for_direction` (the
+//! entry-threshold filter input) follows the same received-carry
+//! convention.
 
 use std::collections::{HashMap, VecDeque};
 

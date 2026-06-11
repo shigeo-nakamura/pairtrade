@@ -45,24 +45,28 @@ pub(super) struct SymbolSnapshot {
 /// #414, magnitude matches `/api/v1/funding-rates` and the CSV-settled
 /// `Rate` column.
 ///
-/// **Sign caveat (bot-strategy#414, latent).** The expression below is
-/// the *inverse* of strategy-side received-carry: with perp-funding sign
-/// (`+rate ⇒ longs pay`), a planned LongSpread with `p1.funding_rate > 0`
-/// actually pays out, but this returns `+`. The entry-filter consumer
-/// (`funding_entry_z_scale`, `net_funding_min_per_hour`) currently runs
-/// with such loose gates that the sign doesn't bind any live decision;
-/// flipping it would change `[METRICS] net_funding_per_hour` log values
-/// and entry behavior, so it is deferred to a separate ticket. Carry
-/// reporting (`PnlLogRecord::funding_carry_usd`) was migrated to the
-/// strategy-side convention in #414 and no longer shares signs with this
-/// helper.
+/// **Sign convention (bot-strategy#517).** Returns strategy-side
+/// *received* carry per hour: positive ⇒ the planned position collects
+/// funding, negative ⇒ it pays. With perp-funding sign (`+rate ⇒ longs
+/// pay`), a short leg receives its symbol's rate and a long leg pays
+/// its symbol's rate. This matches the `PnlLogRecord::funding_carry_usd`
+/// convention (#414) and what the entry-filter consumers
+/// (`FUNDING_CARRY_ENTRY_DISCOUNT`, `funding_entry_z_scale`,
+/// `net_funding_min_per_hour`) assume: all treat positive as
+/// carry-favorable. Before #517 this helper returned the inverse
+/// (documented latent since #414); the flip changes only the
+/// `[METRICS] net_funding_per_hour` log sign in practice because all
+/// live configs run with the funding gates disabled / non-binding
+/// (`funding_entry_z_scale: 0.0`, `net_funding_min_per_hour: -0.01`).
 pub(super) fn net_funding_for_direction(z: f64, p1: &SymbolSnapshot, p2: &SymbolSnapshot) -> f64 {
     if z > 0.0 {
-        // plan to short base (p1) and long quote (p2)
-        (p2.funding_rate - p1.funding_rate).to_f64().unwrap_or(0.0)
-    } else {
-        // plan to long base (p1) and short quote (p2)
+        // plan to short base (p1) and long quote (p2): receive p1's
+        // rate on the short leg, pay p2's rate on the long leg
         (p1.funding_rate - p2.funding_rate).to_f64().unwrap_or(0.0)
+    } else {
+        // plan to long base (p1) and short quote (p2): pay p1's rate
+        // on the long leg, receive p2's rate on the short leg
+        (p2.funding_rate - p1.funding_rate).to_f64().unwrap_or(0.0)
     }
 }
 
@@ -450,17 +454,17 @@ mod tests {
     fn net_funding_passes_per_hour_through_unchanged() {
         // Inputs are fraction-per-hour after the bot-strategy#414
         // normalization in dex-connector; this verifies both direction
-        // branches return the raw delta with no further scaling. (Sign
-        // semantics — that the returned value is the inverse of
-        // strategy-side received-carry — are documented on
-        // `net_funding_for_direction` and tracked as a latent issue.)
+        // branches return the raw delta with no further scaling, in the
+        // strategy-side received-carry convention (bot-strategy#517):
+        // z > 0 plans short-p1/long-p2, which receives p1's rate and
+        // pays p2's, so positive p1 + negative p2 is carry-favorable.
         // Realistic Lighter-scale inputs: 0.0000125 fraction/h is
         // 0.125 bps/h (about 1 bp over an 8h funding interval).
         let p1 = snap_with_funding(dec!(0.0000125));
         let p2 = snap_with_funding(dec!(-0.0000035));
         let z_pos = net_funding_for_direction(1.0, &p1, &p2);
         let z_neg = net_funding_for_direction(-1.0, &p1, &p2);
-        assert!((z_pos - (-0.000016)).abs() < 1e-15, "z_pos was {}", z_pos);
-        assert!((z_neg - 0.000016).abs() < 1e-15, "z_neg was {}", z_neg);
+        assert!((z_pos - 0.000016).abs() < 1e-15, "z_pos was {}", z_pos);
+        assert!((z_neg - (-0.000016)).abs() < 1e-15, "z_neg was {}", z_neg);
     }
 }
