@@ -7,8 +7,9 @@ use super::super::defaults::*;
 use super::env_util::{
     env_parse, env_parse_critical, load_bt_eval_timestamps, load_bt_restart_timestamps,
 };
+use super::strategy::resolve_strategies;
 use super::universe::{default_history_file, parse_universe_pairs};
-use super::{resolve_strategies, PairParams, PairTradeConfig, RiskConfig, WarmStartMode};
+use super::{PairParams, PairTradeConfig, RiskConfig, WarmStartMode};
 
 impl PairTradeConfig {
     pub fn from_env() -> Result<Self> {

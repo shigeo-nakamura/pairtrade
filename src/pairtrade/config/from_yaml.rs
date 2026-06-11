@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use super::super::defaults::*;
 use super::risk::resolve_risk_config;
 use super::schema::PairTradeYaml;
+use super::strategy::resolve_strategies;
 use super::universe::{default_history_file, resolve_universe_from_yaml};
-use super::{resolve_strategies, PairParams, PairTradeConfig, WarmStartMode};
+use super::{PairParams, PairTradeConfig, WarmStartMode};
 
 impl PairTradeConfig {
     pub fn from_env_or_yaml() -> Result<Self> {
