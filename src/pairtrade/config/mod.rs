@@ -1278,6 +1278,17 @@ impl PairTradeConfig {
         } else if universe_overridden && !history_file_from_yaml {
             self.history_file = default_history_file(&self.universe, self.agent_name.as_deref());
         }
+        if let Ok(value) = env::var("HISTORY_ARCHIVE_DIR") {
+            self.history_archive_dir = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value.trim().to_string())
+            };
+        }
+        env_override(
+            "HISTORY_ARCHIVE_RETENTION_DAYS",
+            &mut self.history_archive_retention_days,
+        );
 
         if let Ok(value) = env::var("BACKTEST_MODE") {
             self.backtest_mode = value.to_lowercase() == "true";
@@ -2102,6 +2113,50 @@ mod tests {
             ..RiskYaml::default()
         };
         assert!(resolve_risk_config(Some(&yaml)).is_err());
+    }
+
+    #[test]
+    fn history_archive_env_overrides_yaml() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join("pairtrade_history_archive_env.yaml");
+        let yaml = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+history_archive_dir: /yaml/archive
+history_archive_retention_days: 12
+"#;
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+
+        let prev_dir = std::env::var("HISTORY_ARCHIVE_DIR").ok();
+        let prev_retention = std::env::var("HISTORY_ARCHIVE_RETENTION_DAYS").ok();
+        std::env::set_var("HISTORY_ARCHIVE_DIR", "/env/archive");
+        std::env::set_var("HISTORY_ARCHIVE_RETENTION_DAYS", "34");
+
+        let cfg = PairTradeConfig::from_yaml_path(&path).expect("yaml load");
+        assert_eq!(
+            cfg.history_archive_dir.as_deref(),
+            Some("/env/archive"),
+            "env archive dir overrides yaml"
+        );
+        assert_eq!(cfg.history_archive_retention_days, 34);
+
+        match prev_dir {
+            Some(v) => std::env::set_var("HISTORY_ARCHIVE_DIR", v),
+            None => std::env::remove_var("HISTORY_ARCHIVE_DIR"),
+        }
+        match prev_retention {
+            Some(v) => std::env::set_var("HISTORY_ARCHIVE_RETENTION_DAYS", v),
+            None => std::env::remove_var("HISTORY_ARCHIVE_RETENTION_DAYS"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
