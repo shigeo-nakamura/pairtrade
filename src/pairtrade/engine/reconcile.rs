@@ -322,6 +322,14 @@ impl PairTradeEngine {
         } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
             let next_retry = pending.hedge_retry_count.saturating_add(1);
             if next_retry > MAX_EXIT_RETRIES {
+                self.write_recovery_no_pnl_record(
+                    inst_idx,
+                    key,
+                    pending.direction,
+                    "partial_fill",
+                    now_ts,
+                    price_map,
+                );
                 self.force_close_all_positions(key, "partial_fill").await;
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.pending_exit = None;
@@ -379,6 +387,14 @@ impl PairTradeEngine {
             }
             let next_retry = pending.hedge_retry_count.saturating_add(1);
             if next_retry > MAX_EXIT_RETRIES {
+                self.write_recovery_no_pnl_record(
+                    inst_idx,
+                    key,
+                    pending.direction,
+                    "timeout",
+                    now_ts,
+                    price_map,
+                );
                 self.force_close_all_positions(key, "timeout").await;
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.pending_exit = None;
@@ -669,6 +685,14 @@ impl PairTradeEngine {
                     );
                 let variant_id = self.instances[inst_idx].id.clone();
                 self.cancel_pending_orders(&pending).await?;
+                self.write_recovery_no_pnl_record(
+                    inst_idx,
+                    key,
+                    pending.direction,
+                    "entry_reissue_giveup",
+                    now_ts,
+                    price_map,
+                );
                 self.force_close_all_positions(key, "entry_reissue_giveup")
                     .await;
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {

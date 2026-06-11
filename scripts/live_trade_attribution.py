@@ -89,6 +89,9 @@ class PnlRecord:
     z_exit: Decimal | None
     hold_secs: Decimal | None
     funding_carry_usd: Decimal | None
+    pnl_available: bool
+    close_reason: str
+    recovery_reason: str
 
 
 @dataclass
@@ -203,7 +206,9 @@ class AttributedTrade:
 
     @property
     def model_pnl(self) -> Decimal | None:
-        return self.pnl_record.pnl if self.pnl_record else None
+        if self.pnl_record is None or not self.pnl_record.pnl_available:
+            return None
+        return self.pnl_record.pnl
 
     @property
     def execution_leakage(self) -> Decimal | None:
@@ -270,6 +275,19 @@ def parse_log_ts(wall: str, values: dict[str, str]) -> datetime:
         except ValueError:
             pass
     return datetime.strptime(wall, "%Y-%m-%dT%H:%M:%S%z").astimezone(timezone.utc)
+
+
+def parse_bool(raw: object, default: bool = True) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text in {"0", "false", "no"}:
+        return False
+    if text in {"1", "true", "yes"}:
+        return True
+    return default
 
 
 def parse_pair(pair: str) -> tuple[str, str]:
@@ -632,6 +650,9 @@ def load_pnl_records(patterns: list[str], since: datetime, until: datetime) -> l
                         z_exit=optional_decimal(data.get("z_exit")),
                         hold_secs=optional_decimal(data.get("hold_secs")),
                         funding_carry_usd=optional_decimal(data.get("funding_carry_usd")),
+                        pnl_available=parse_bool(data.get("pnl_available"), True),
+                        close_reason=str(data.get("close_reason", "")),
+                        recovery_reason=str(data.get("recovery_reason", "")),
                     )
                 )
     records.sort(key=lambda record: record.ts)
@@ -675,6 +696,8 @@ def attach_pnl_records(
         _, idx, record = max(candidates, key=lambda item: item[0])
         used.add(idx)
         trade.pnl_record = record
+        if not record.pnl_available:
+            trade.gaps.append("matched pnl jsonl has pnl_available=false")
 
 
 def parse_kv_pairs(msg: str) -> dict[str, str]:
@@ -1023,6 +1046,10 @@ def write_csv(path: Path, trades: list[AttributedTrade]) -> None:
         "funding_fees",
         "trading_fees",
         "model_pnl",
+        "pnl_source",
+        "pnl_available",
+        "pnl_close_reason",
+        "pnl_recovery_reason",
         "execution_leakage",
         "hold_secs",
         "entry_sync_secs",
@@ -1061,6 +1088,10 @@ def write_csv(path: Path, trades: list[AttributedTrade]) -> None:
                     "funding_fees": str(trade.funding_fees),
                     "trading_fees": str(trade.trading_fees),
                     "model_pnl": "" if trade.model_pnl is None else str(trade.model_pnl),
+                    "pnl_source": "" if trade.pnl_record is None else trade.pnl_record.source,
+                    "pnl_available": "" if trade.pnl_record is None else str(trade.pnl_record.pnl_available).lower(),
+                    "pnl_close_reason": "" if trade.pnl_record is None else trade.pnl_record.close_reason,
+                    "pnl_recovery_reason": "" if trade.pnl_record is None else trade.pnl_record.recovery_reason,
                     "execution_leakage": ""
                     if trade.execution_leakage is None
                     else str(trade.execution_leakage),
