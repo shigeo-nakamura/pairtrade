@@ -381,7 +381,12 @@ def load_extended(path: Path) -> tuple[list[RealizedLeg], list[DexFill], list[st
 
     legs: list[RealizedLeg] = []
     for row in realized_rows:
+        gaps: list[str] = []
         fees = parse_decimal(row.get("trading_fees"), default=Decimal("0"))
+        realized_pnl = optional_decimal(row.get("realised_pnl"))
+        if realized_pnl is None:
+            realized_pnl = Decimal("0")
+            gaps.append("realised_pnl unavailable")
         legs.append(
             RealizedLeg(
                 market=row["market"].upper(),
@@ -389,13 +394,13 @@ def load_extended(path: Path) -> tuple[list[RealizedLeg], list[DexFill], list[st
                 size=parse_decimal(row["size"]),
                 entry_price=parse_decimal(row["entry_price"]),
                 exit_price=parse_decimal(row["exit_price"]),
-                realized_pnl=parse_decimal(row["realised_pnl"]),
-                trade_pnl=parse_decimal(row["trade_pnl"]),
-                funding=parse_decimal(row["funding_fees"]),
+                realized_pnl=realized_pnl,
+                trade_pnl=optional_decimal(row.get("trade_pnl")),
+                funding=optional_decimal(row.get("funding_fees")),
                 trading_fees=fees,
                 close_type=row.get("exit_type", ""),
                 closed_at=parse_ts(row["closed_at"]),
-                gaps=[],
+                gaps=gaps,
             )
         )
 
@@ -450,6 +455,7 @@ def load_lighter(path: Path) -> tuple[list[RealizedLeg], list[DexFill], list[str
             open_lots[key].append(
                 {
                     "remaining": size,
+                    "original_size": size,
                     "price": price,
                     "time": ts,
                     "fee": fee,
@@ -469,9 +475,10 @@ def load_lighter(path: Path) -> tuple[list[RealizedLeg], list[DexFill], list[str
         while remaining_close > Decimal("0") and open_lots[key]:
             lot = open_lots[key][0]
             lot_remaining = lot["remaining"]
+            lot_original_size = lot["original_size"]
             take = min(remaining_close, lot_remaining)
             matched_entry_value += take * lot["price"]
-            matched_entry_fee += lot["fee"] * (take / lot_remaining) if lot_remaining else Decimal("0")
+            matched_entry_fee += lot["fee"] * (take / lot_original_size) if lot_original_size else Decimal("0")
             entry_times.append(lot["time"])
             if lot["role"]:
                 entry_roles.append(str(lot["role"]))
@@ -1003,6 +1010,7 @@ def summarize(trades: list[AttributedTrade], warnings: list[str], since: datetim
         lines.append("## Feature Matrix")
         lines.append("")
         lines.append(f"Scope: complete two-leg trades only (`N={scoped_count}`). `Loss recall` is the share of realised losses captured by the bucket. `Win kill` is the share of winning trades captured by the bucket.")
+        lines.append("Journal-derived buckets such as entry z, beta, and partial/reissue markers require `--journal-log`; without journal input, missing-entry buckets are data-completeness diagnostics only.")
         lines.append("")
         lines.append("| Rank | Candidate bucket | N | Bucket PnL | Win rate | Avg PnL | Fees | Loss recall | Win kill | Kept N | Kept PnL |")
         lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
