@@ -136,3 +136,17 @@ aws s3 cp --no-progress "$WORK/restart_ts.txt" "$RESTART_KEY"
 echo "[archive_bt_replay] uploaded:"
 echo "[archive_bt_replay]   $EVAL_KEY"
 echo "[archive_bt_replay]   $RESTART_KEY"
+
+# --- bot-strategy#529: daily realized-PnL jsonl archive ----------------
+# `aws s3 sync` is idempotent and uploads every file still on disk, so
+# this both ships yesterday's file and backfills anything not yet
+# archived. Files are tiny (KB). PNL_DIR is overridable per-unit
+# (Tokyo Extended sets /opt/debot-extended/debot_pnl via a drop-in).
+PNL_DIR="${PNL_DIR:-/opt/debot/debot_pnl}"
+if [ -d "$PNL_DIR" ]; then
+    PNL_KEY_PREFIX="s3://${S3_BUCKET}/${S3_PREFIX}/${HOST_TAG}/${SERVICE}/pnl/"
+    aws s3 sync --no-progress "$PNL_DIR/" "$PNL_KEY_PREFIX"
+    echo "[archive_bt_replay]   pnl: synced $PNL_DIR -> $PNL_KEY_PREFIX"
+else
+    echo "[archive_bt_replay]   pnl: $PNL_DIR missing, skipped"
+fi
