@@ -27,7 +27,7 @@ shift 2>/dev/null || true
 BINARY=./target/release/debot
 CONFIG=$REPO_ROOT/configs/pairtrade/debot-pair-btceth.yaml
 ANALYZER=$SCRIPT_DIR/log_analyzer.py
-WORK_DIR=/tmp/bt_live_data
+WORK_DIR="${BT_WORK_DIR:-/tmp/bt_live_data}"
 WARMUP_SECS=14400  # 4 hours (ignored when BT_WARM_START_SNAPSHOT is set)
 
 mkdir -p "$WORK_DIR"

@@ -118,6 +118,10 @@ pub(in crate::pairtrade) struct PairTradeYaml {
     pub(super) beta_gap_entry_z_scale: Option<f64>,
     pub(super) beta_gap_notional_scale: Option<f64>,
     pub(super) beta_gap_notional_floor: Option<f64>,
+    // Signal-depth sizing (bot-strategy#515, default off: slope 0.0 disables)
+    pub(super) depth_size_slope: Option<f64>,
+    pub(super) depth_size_min: Option<f64>,
+    pub(super) depth_size_max: Option<f64>,
     pub(super) rehedge_drift_threshold_pct: Option<f64>,
     pub(super) rehedge_cooldown_secs: Option<u64>,
     pub(super) rehedge_min_qty_notional_usd: Option<f64>,
@@ -253,6 +257,12 @@ pub(in crate::pairtrade) struct StrategyYaml {
     pub(super) beta_gap_notional_scale: Option<f64>,
     /// Per-strategy override of `beta_gap_notional_floor` (bot-strategy#461).
     pub(super) beta_gap_notional_floor: Option<f64>,
+    /// Per-strategy overrides for #515 signal-depth sizing — lets one
+    /// challenger arm enable sizing while control variants inherit the
+    /// disabled global default.
+    pub(super) depth_size_slope: Option<f64>,
+    pub(super) depth_size_min: Option<f64>,
+    pub(super) depth_size_max: Option<f64>,
     /// Per-strategy overrides for #463 mid-hold re-hedge (Phase 1: detection only).
     pub(super) rehedge_drift_threshold_pct: Option<f64>,
     pub(super) rehedge_cooldown_secs: Option<u64>,
