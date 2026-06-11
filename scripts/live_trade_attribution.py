@@ -236,8 +236,34 @@ class AttributedTrade:
     def close_reason(self) -> str:
         if self.journal_exit and self.journal_exit.reason:
             return self.journal_exit.reason
+        if self.pnl_record and self.pnl_record.close_reason:
+            return self.pnl_record.close_reason
         close_types = sorted({leg.close_type for leg in self.legs if leg.close_type})
         return "/".join(close_types) if close_types else "n/a"
+
+    @property
+    def entry_z(self) -> Decimal | None:
+        if self.journal_entry and self.journal_entry.z is not None:
+            return self.journal_entry.z
+        if self.pnl_record and self.pnl_record.z_entry is not None:
+            return self.pnl_record.z_entry
+        return None
+
+    @property
+    def entry_beta(self) -> Decimal | None:
+        if self.journal_entry and self.journal_entry.beta is not None:
+            return self.journal_entry.beta
+        if self.pnl_record and self.pnl_record.beta is not None:
+            return self.pnl_record.beta
+        return None
+
+    @property
+    def entry_feature_source(self) -> str:
+        if self.journal_entry and (self.journal_entry.z is not None or self.journal_entry.beta is not None):
+            return "journal"
+        if self.pnl_record and (self.pnl_record.z_entry is not None or self.pnl_record.beta is not None):
+            return "pnl_jsonl"
+        return ""
 
     def all_gaps(self) -> list[str]:
         gaps = list(self.gaps)
@@ -919,35 +945,31 @@ def feature_matrix(trades: list[AttributedTrade]) -> list[dict[str, object]]:
         by("bot pnl unavailable", lambda trade: trade.pnl_record is not None and not trade.pnl_record.pnl_available),
         by(
             "abs(entry_z) >= 3.0",
-            lambda trade: trade.journal_entry is not None
-            and trade.journal_entry.z is not None
-            and abs(trade.journal_entry.z) >= Decimal("3.0"),
+            lambda trade: trade.entry_z is not None and abs(trade.entry_z) >= Decimal("3.0"),
         ),
         by(
             "abs(entry_z) >= 3.5",
-            lambda trade: trade.journal_entry is not None
-            and trade.journal_entry.z is not None
-            and abs(trade.journal_entry.z) >= Decimal("3.5"),
+            lambda trade: trade.entry_z is not None and abs(trade.entry_z) >= Decimal("3.5"),
         ),
         by(
             "abs(entry_z) >= 4.0",
-            lambda trade: trade.journal_entry is not None
-            and trade.journal_entry.z is not None
-            and abs(trade.journal_entry.z) >= Decimal("4.0"),
+            lambda trade: trade.entry_z is not None and abs(trade.entry_z) >= Decimal("4.0"),
         ),
         by(
             "beta < 0.9",
-            lambda trade: trade.journal_entry is not None
-            and trade.journal_entry.beta is not None
-            and trade.journal_entry.beta < Decimal("0.9"),
+            lambda trade: trade.entry_beta is not None and trade.entry_beta < Decimal("0.9"),
         ),
         by(
             "beta >= 0.9",
-            lambda trade: trade.journal_entry is not None
-            and trade.journal_entry.beta is not None
-            and trade.journal_entry.beta >= Decimal("0.9"),
+            lambda trade: trade.entry_beta is not None and trade.entry_beta >= Decimal("0.9"),
         ),
-        by("entry_z missing", lambda trade: trade.journal_entry is None or trade.journal_entry.z is None),
+        by("entry_z missing", lambda trade: trade.entry_z is None),
+        by(
+            "funding carry < 0 (pnl)",
+            lambda trade: trade.pnl_record is not None
+            and trade.pnl_record.funding_carry_usd is not None
+            and trade.pnl_record.funding_carry_usd < 0,
+        ),
         by("hold >= 2h", lambda trade: trade.hold_secs is not None and trade.hold_secs >= 7200.0),
         by("exit_sync >= 30s", lambda trade: trade.exit_sync_secs is not None and trade.exit_sync_secs >= 30.0),
         by("entry_sync >= 5s", lambda trade: trade.entry_sync_secs is not None and trade.entry_sync_secs >= 5.0),
@@ -1010,7 +1032,7 @@ def summarize(trades: list[AttributedTrade], warnings: list[str], since: datetim
         lines.append("## Feature Matrix")
         lines.append("")
         lines.append(f"Scope: complete two-leg trades only (`N={scoped_count}`). `Loss recall` is the share of realised losses captured by the bucket. `Win kill` is the share of winning trades captured by the bucket.")
-        lines.append("Journal-derived buckets such as entry z, beta, and partial/reissue markers require `--journal-log`; without journal input, missing-entry buckets are data-completeness diagnostics only.")
+        lines.append("Entry z / beta buckets use journal values first and fall back to bot pnl jsonl (`z_entry` / `beta`); partial/reissue marker buckets still require `--journal-log`. Without either input, missing-entry buckets are data-completeness diagnostics only.")
         lines.append("")
         lines.append("| Rank | Candidate bucket | N | Bucket PnL | Win rate | Avg PnL | Fees | Loss recall | Win kill | Kept N | Kept PnL |")
         lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
@@ -1087,6 +1109,10 @@ def write_csv(path: Path, trades: list[AttributedTrade]) -> None:
         "entry_sync_secs",
         "exit_sync_secs",
         "hold_secs",
+        "entry_z",
+        "entry_beta",
+        "entry_feature_source",
+        "pnl_funding_carry_usd",
         "journal_entry_z",
         "journal_entry_beta",
         "journal_exit_z",
@@ -1125,6 +1151,12 @@ def write_csv(path: Path, trades: list[AttributedTrade]) -> None:
                     "entry_sync_secs": fmt_float(trade.entry_sync_secs, 3),
                     "exit_sync_secs": fmt_float(trade.exit_sync_secs, 3),
                     "hold_secs": fmt_float(trade.hold_secs, 3),
+                    "entry_z": fmt_decimal(trade.entry_z, 10),
+                    "entry_beta": fmt_decimal(trade.entry_beta, 10),
+                    "entry_feature_source": trade.entry_feature_source,
+                    "pnl_funding_carry_usd": fmt_decimal(
+                        trade.pnl_record.funding_carry_usd if trade.pnl_record else None, 10
+                    ),
                     "journal_entry_z": fmt_decimal(trade.journal_entry.z if trade.journal_entry else None, 10),
                     "journal_entry_beta": fmt_decimal(trade.journal_entry.beta if trade.journal_entry else None, 10),
                     "journal_exit_z": fmt_decimal(trade.journal_exit.z if trade.journal_exit else None, 10),
