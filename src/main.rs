@@ -8,6 +8,8 @@ use std::env;
 use std::io::Write;
 use std::sync::Arc;
 
+mod fd_redirect;
+
 fn init_logger() {
     let offset_seconds = env::var("TIMEZONE_OFFSET")
         .unwrap_or_else(|_| "3600".to_string())
@@ -123,26 +125,7 @@ async fn init_engine_with_retry(cfg: PairTradeConfig) -> Result<PairTradeEngine,
 }
 
 async fn run_batch(batch_file: &str) -> std::io::Result<()> {
-    use std::io::{BufRead, BufReader};
-
-    // Read all param sets from the batch file (JSONL format).
-    let file = std::fs::File::open(batch_file).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("failed to open batch file {}: {}", batch_file, e),
-        )
-    })?;
-    let reader = BufReader::new(file);
-    let param_sets: Vec<HashMap<String, String>> = reader
-        .lines()
-        .filter_map(|line| {
-            let line = line.ok()?;
-            if line.trim().is_empty() {
-                return None;
-            }
-            serde_json::from_str(&line).ok()
-        })
-        .collect();
+    let param_sets = load_batch_params(batch_file)?;
 
     if param_sets.is_empty() {
         eprintln!("[BATCH] No param sets found in {}", batch_file);
@@ -236,30 +219,8 @@ async fn run_batch(batch_file: &str) -> std::io::Result<()> {
         // Run backtest, capturing log output to a file.
         {
             let log_file = std::fs::File::create(&log_file_path)?;
-            let log_file_clone = log_file.try_clone()?;
-            // Redirect stdout to the log file for this run.
-            use std::os::unix::io::AsRawFd;
-            let stdout_fd = std::io::stdout().as_raw_fd();
-            let saved_stdout = unsafe { libc::dup(stdout_fd) };
-            unsafe {
-                libc::dup2(log_file.as_raw_fd(), stdout_fd);
-            }
-            // Also redirect stderr for log output.
-            let stderr_fd = std::io::stderr().as_raw_fd();
-            let saved_stderr = unsafe { libc::dup(stderr_fd) };
-            unsafe {
-                libc::dup2(log_file_clone.as_raw_fd(), stderr_fd);
-            }
-
+            let _redirect = fd_redirect::StdioRedirect::to_file(&log_file)?;
             let _result = engine.run().await;
-
-            // Restore stdout/stderr.
-            unsafe {
-                libc::dup2(saved_stdout, stdout_fd);
-                libc::close(saved_stdout);
-                libc::dup2(saved_stderr, stderr_fd);
-                libc::close(saved_stderr);
-            }
         }
 
         // Output result as JSON to stdout.
@@ -281,6 +242,123 @@ async fn run_batch(batch_file: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+const BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV: &str = "BATCH_JSONL_MAX_PARSE_ERROR_PCT";
+
+#[derive(Debug)]
+struct BatchJsonlParseError {
+    line_no: usize,
+    error: serde_json::Error,
+}
+
+fn load_batch_params(batch_file: &str) -> std::io::Result<Vec<HashMap<String, String>>> {
+    use std::io::{BufRead, BufReader};
+
+    let max_parse_error_pct = batch_jsonl_max_parse_error_pct()?;
+    let file = std::fs::File::open(batch_file).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("failed to open batch file {}: {}", batch_file, e),
+        )
+    })?;
+    let reader = BufReader::new(file);
+    let mut param_sets = Vec::new();
+    let mut parse_errors = Vec::new();
+    let mut non_empty_lines = 0usize;
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let line = line.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to read batch file {batch_file} line {line_no}: {e}"),
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        non_empty_lines += 1;
+        match serde_json::from_str::<HashMap<String, String>>(&line) {
+            Ok(params) => param_sets.push(params),
+            Err(error) => parse_errors.push(BatchJsonlParseError { line_no, error }),
+        }
+    }
+
+    if !parse_errors.is_empty() {
+        report_batch_parse_errors(&parse_errors, non_empty_lines, max_parse_error_pct);
+        let parse_error_pct = parse_errors.len() as f64 * 100.0 / non_empty_lines as f64;
+        if parse_error_pct > max_parse_error_pct {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "batch JSONL parse error rate {:.2}% exceeds allowed {:.2}% ({} errors / {} non-empty lines; lines: {})",
+                    parse_error_pct,
+                    max_parse_error_pct,
+                    parse_errors.len(),
+                    non_empty_lines,
+                    parse_errors
+                        .iter()
+                        .map(|err| err.line_no.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+    }
+
+    Ok(param_sets)
+}
+
+fn batch_jsonl_max_parse_error_pct() -> std::io::Result<f64> {
+    match env::var(BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV) {
+        Ok(raw) => {
+            let parsed = raw.parse::<f64>().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV} must be a percentage between 0 and 100: {e}"
+                    ),
+                )
+            })?;
+            if !(0.0..=100.0).contains(&parsed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV} must be a percentage between 0 and 100"
+                    ),
+                ));
+            }
+            Ok(parsed)
+        }
+        Err(env::VarError::NotPresent) => Ok(0.0),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV} is invalid: {e}"),
+        )),
+    }
+}
+
+fn report_batch_parse_errors(
+    parse_errors: &[BatchJsonlParseError],
+    non_empty_lines: usize,
+    max_parse_error_pct: f64,
+) {
+    let parse_error_pct = parse_errors.len() as f64 * 100.0 / non_empty_lines as f64;
+    eprintln!(
+        "[BATCH] {} malformed JSONL line(s) in {} non-empty lines ({:.2}%; allowed {:.2}%)",
+        parse_errors.len(),
+        non_empty_lines,
+        parse_error_pct,
+        max_parse_error_pct
+    );
+    for err in parse_errors {
+        eprintln!(
+            "[BATCH] malformed JSONL at line {}: {}",
+            err.line_no, err.error
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     init_logger();
@@ -289,5 +367,77 @@ async fn main() -> std::io::Result<()> {
         run_batch(&batch_file).await
     } else {
         run_single().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_parse_error_threshold<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_value = env::var(BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV).ok();
+        match value {
+            Some(value) => env::set_var(BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV, value),
+            None => env::remove_var(BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV),
+        }
+        let result = f();
+        match old_value {
+            Some(value) => env::set_var(BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV, value),
+            None => env::remove_var(BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV),
+        }
+        result
+    }
+
+    #[test]
+    fn load_batch_params_rejects_malformed_jsonl_by_default() {
+        with_parse_error_threshold(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            let batch_file = dir.path().join("batch.jsonl");
+            std::fs::write(
+                &batch_file,
+                "{\"ENTRY_Z_SCORE\":\"0.3\"}\nnot-json\n\n{\"STOP_LOSS_Z\":\"6\"}\n",
+            )
+            .unwrap();
+
+            let err = load_batch_params(batch_file.to_str().unwrap()).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            let message = err.to_string();
+            assert!(message.contains("33.33%"));
+            assert!(message.contains("1 errors / 3 non-empty lines"));
+            assert!(message.contains("lines: 2"));
+        });
+    }
+
+    #[test]
+    fn load_batch_params_allows_malformed_jsonl_under_threshold() {
+        with_parse_error_threshold(Some("50"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let batch_file = dir.path().join("batch.jsonl");
+            std::fs::write(
+                &batch_file,
+                "{\"ENTRY_Z_SCORE\":\"0.3\"}\nnot-json\n{\"STOP_LOSS_Z\":\"6\"}\n",
+            )
+            .unwrap();
+
+            let params = load_batch_params(batch_file.to_str().unwrap()).unwrap();
+            assert_eq!(params.len(), 2);
+            assert_eq!(params[0].get("ENTRY_Z_SCORE").unwrap(), "0.3");
+            assert_eq!(params[1].get("STOP_LOSS_Z").unwrap(), "6");
+        });
+    }
+
+    #[test]
+    fn load_batch_params_rejects_invalid_parse_error_threshold() {
+        with_parse_error_threshold(Some("not-a-number"), || {
+            let err = batch_jsonl_max_parse_error_pct().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err
+                .to_string()
+                .contains(BATCH_JSONL_MAX_PARSE_ERROR_PCT_ENV));
+        });
     }
 }
