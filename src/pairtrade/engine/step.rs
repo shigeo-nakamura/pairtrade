@@ -167,7 +167,11 @@ impl PairTradeEngine {
             log::info!("[BACKTEST] Running in backtest mode.");
             loop {
                 if let Err(e) = self.step().await {
-                    // In backtest, we might want to stop on error. For now, just log it.
+                    if self.regime_series_writer.is_some() {
+                        return Err(e)
+                            .context("backtest step failed while writing BT_REGIME_SERIES_FILE");
+                    }
+                    // Existing replay behavior: log step errors and keep scanning.
                     log::error!("[BACKTEST] Step failed: {:?}", e);
                 }
                 // Advance the replay connector to the next data point
@@ -184,7 +188,7 @@ impl PairTradeEngine {
                     self.log_regime_summary();
                     if let Some(writer) = self.regime_series_writer.as_mut() {
                         use std::io::Write;
-                        let _ = writer.flush();
+                        writer.flush().context("flush BT_REGIME_SERIES_FILE")?;
                     }
                     break;
                 }

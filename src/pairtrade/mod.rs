@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use dex_connector::{DexConnector, PositionSnapshot};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -316,9 +316,21 @@ impl PairTradeEngine {
         };
         let regime_series_writer = match cfg.bt_regime_series_file.as_deref() {
             Some(path) => {
+                // Backtest-only output: a non-rotating per-tick file must not
+                // be creatable by an accidentally inherited env in live mode.
+                if !cfg.backtest_mode {
+                    return Err(anyhow!(
+                        "BT_REGIME_SERIES_FILE is set but BACKTEST_MODE is not — refusing to \
+                         write a non-rotating per-tick series file in live mode"
+                    ));
+                }
                 use std::io::Write;
-                let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-                writeln!(writer, "ts,key,innovation,beta,scale,norm,cusum,active")?;
+                let mut writer = std::io::BufWriter::new(
+                    std::fs::File::create(path)
+                        .with_context(|| format!("create BT_REGIME_SERIES_FILE {path}"))?,
+                );
+                writeln!(writer, "ts,key,innovation,beta,scale,norm,cusum,active")
+                    .context("write BT_REGIME_SERIES_FILE header")?;
                 Some(writer)
             }
             None => None,
