@@ -350,6 +350,18 @@ pub(super) fn direction_label(direction: PositionDirection) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct PnlTradeDetails {
+    pub(super) entry_a: Option<f64>,
+    pub(super) entry_b: Option<f64>,
+    pub(super) exit_a: Option<f64>,
+    pub(super) exit_b: Option<f64>,
+    pub(super) beta: Option<f64>,
+    pub(super) z_entry: Option<f64>,
+    pub(super) z_exit: Option<f64>,
+    pub(super) hold_secs: Option<f64>,
+}
+
 impl PnlLogRecord {
     pub(super) fn new(
         base: &str,
@@ -390,25 +402,15 @@ impl PnlLogRecord {
         self
     }
 
-    pub(super) fn with_trade_details(
-        mut self,
-        entry_a: Option<f64>,
-        entry_b: Option<f64>,
-        exit_a: Option<f64>,
-        exit_b: Option<f64>,
-        beta: Option<f64>,
-        z_entry: Option<f64>,
-        z_exit: Option<f64>,
-        hold_secs: Option<f64>,
-    ) -> Self {
-        self.entry_price_a = entry_a;
-        self.entry_price_b = entry_b;
-        self.exit_price_a = exit_a;
-        self.exit_price_b = exit_b;
-        self.beta = beta;
-        self.z_entry = z_entry;
-        self.z_exit = z_exit;
-        self.hold_secs = hold_secs;
+    pub(super) fn with_trade_details(mut self, details: PnlTradeDetails) -> Self {
+        self.entry_price_a = details.entry_a;
+        self.entry_price_b = details.entry_b;
+        self.exit_price_a = details.exit_a;
+        self.exit_price_b = details.exit_b;
+        self.beta = details.beta;
+        self.z_entry = details.z_entry;
+        self.z_exit = details.z_exit;
+        self.hold_secs = details.hold_secs;
         self
     }
 

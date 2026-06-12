@@ -1,3 +1,4 @@
+use super::engine::placement::ReissuePartialLegsRequest;
 use super::state::{PendingLeg, PendingOrders};
 use super::*;
 use async_trait::async_trait;
@@ -330,7 +331,15 @@ async fn reissue_partial_entry_leg_reorders_remaining() {
     let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
 
     let result = engine
-        .reissue_partial_legs(&pending, &filled_qtys, &price_map, false, false, 0, false)
+        .reissue_partial_legs(ReissuePartialLegsRequest {
+            pending: &pending,
+            filled_qtys: &filled_qtys,
+            price_map: &price_map,
+            reduce_only: false,
+            use_market: false,
+            retry_count: 0,
+            use_amend: false,
+        })
         .await
         .unwrap()
         .unwrap();
@@ -397,7 +406,15 @@ async fn amend_partial_entry_leg_modifies_in_place() {
     let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
 
     let result = engine
-        .reissue_partial_legs(&pending, &filled_qtys, &price_map, false, false, 0, true)
+        .reissue_partial_legs(ReissuePartialLegsRequest {
+            pending: &pending,
+            filled_qtys: &filled_qtys,
+            price_map: &price_map,
+            reduce_only: false,
+            use_market: false,
+            retry_count: 0,
+            use_amend: true,
+        })
         .await
         .unwrap()
         .unwrap();
@@ -472,7 +489,15 @@ async fn amend_post_only_leg_reasserts_post_only() {
     let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
 
     let result = engine
-        .reissue_partial_legs(&pending, &filled_qtys, &price_map, false, false, 0, true)
+        .reissue_partial_legs(ReissuePartialLegsRequest {
+            pending: &pending,
+            filled_qtys: &filled_qtys,
+            price_map: &price_map,
+            reduce_only: false,
+            use_market: false,
+            retry_count: 0,
+            use_amend: true,
+        })
         .await
         .unwrap()
         .unwrap();
@@ -538,7 +563,15 @@ async fn amend_falls_back_to_cancel_reissue_on_error() {
     let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
 
     let result = engine
-        .reissue_partial_legs(&pending, &filled_qtys, &price_map, false, false, 0, true)
+        .reissue_partial_legs(ReissuePartialLegsRequest {
+            pending: &pending,
+            filled_qtys: &filled_qtys,
+            price_map: &price_map,
+            reduce_only: false,
+            use_market: false,
+            retry_count: 0,
+            use_amend: true,
+        })
         .await
         .unwrap()
         .unwrap();
@@ -584,17 +617,18 @@ async fn reissue_partial_entry_missing_price_keeps_pending() {
         exit_taker_takeover_at: None,
     };
     let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
+    let empty_price_map = HashMap::new();
 
     let result = engine
-        .reissue_partial_legs(
-            &pending,
-            &filled_qtys,
-            &HashMap::new(),
-            false,
-            false,
-            0,
-            false,
-        )
+        .reissue_partial_legs(ReissuePartialLegsRequest {
+            pending: &pending,
+            filled_qtys: &filled_qtys,
+            price_map: &empty_price_map,
+            reduce_only: false,
+            use_market: false,
+            retry_count: 0,
+            use_amend: false,
+        })
         .await
         .unwrap()
         .unwrap();

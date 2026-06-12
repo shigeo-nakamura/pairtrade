@@ -110,18 +110,33 @@ impl FundingHistory {
 ///
 /// Returns `(0.0, 0)` if either leg's notional is zero (defensive — never
 /// happens in production but keeps the helper total).
-pub(super) fn compute_carry_usd(
-    history: &FundingHistory,
-    base_symbol: &str,
-    quote_symbol: &str,
-    open_ts: i64,
-    close_ts: i64,
-    direction: PositionDirection,
-    entry_size_a: Decimal,
-    entry_price_a: Decimal,
-    entry_size_b: Decimal,
-    entry_price_b: Decimal,
-) -> (f64, u32) {
+pub(super) struct FundingCarryInput<'a> {
+    pub(super) history: &'a FundingHistory,
+    pub(super) base_symbol: &'a str,
+    pub(super) quote_symbol: &'a str,
+    pub(super) open_ts: i64,
+    pub(super) close_ts: i64,
+    pub(super) direction: PositionDirection,
+    pub(super) entry_size_a: Decimal,
+    pub(super) entry_price_a: Decimal,
+    pub(super) entry_size_b: Decimal,
+    pub(super) entry_price_b: Decimal,
+}
+
+pub(super) fn compute_carry_usd(input: FundingCarryInput<'_>) -> (f64, u32) {
+    let FundingCarryInput {
+        history,
+        base_symbol,
+        quote_symbol,
+        open_ts,
+        close_ts,
+        direction,
+        entry_size_a,
+        entry_price_a,
+        entry_size_b,
+        entry_price_b,
+    } = input;
+
     let notional_a = (entry_size_a * entry_price_a).to_f64().unwrap_or(0.0).abs();
     let notional_b = (entry_size_b * entry_price_b).to_f64().unwrap_or(0.0).abs();
     if notional_a <= 0.0 || notional_b <= 0.0 || close_ts <= open_ts {
@@ -210,23 +225,23 @@ mod tests {
         h.observe("ETH", 1000, dec!(0.0002));
         h.observe("ETH", 4600, dec!(-0.0001));
 
-        let (carry, n) = compute_carry_usd(
-            &h,
-            "BTC",
-            "ETH",
-            500,
-            5000,
-            PositionDirection::ShortSpread,
-            dec!(0.01),  // BTC size
-            dec!(80000), // BTC price → N_btc = $800
-            dec!(0.5),   // ETH size
-            dec!(2400),  // ETH price → N_eth = $1200
-                         // For ShortSpread: long_leg=ETH (N=1200), short_leg=BTC (N=800)
-                         // carry = short_sum * N_btc - long_sum * N_eth
-                         //       = (0.001 + 0.0005) * 800 - (0.0002 + (-0.0001)) * 1200
-                         //       = 0.0015 * 800 - 0.0001 * 1200
-                         //       = 1.2 - 0.12 = 1.08
-        );
+        let (carry, n) = compute_carry_usd(FundingCarryInput {
+            history: &h,
+            base_symbol: "BTC",
+            quote_symbol: "ETH",
+            open_ts: 500,
+            close_ts: 5000,
+            direction: PositionDirection::ShortSpread,
+            entry_size_a: dec!(0.01),   // BTC size
+            entry_price_a: dec!(80000), // BTC price -> N_btc =
+            entry_size_b: dec!(0.5),    // ETH size
+            entry_price_b: dec!(2400),  // ETH price -> N_eth =
+        });
+        // For ShortSpread: long_leg=ETH (N=1200), short_leg=BTC (N=800)
+        // carry = short_sum * N_btc - long_sum * N_eth
+        //       = (0.001 + 0.0005) * 800 - (0.0002 + (-0.0001)) * 1200
+        //       = 0.0015 * 800 - 0.0001 * 1200
+        //       = 1.2 - 0.12 = 1.08
         assert_eq!(n, 4);
         assert!((carry - 1.08).abs() < 1e-9, "carry was {}", carry);
     }
@@ -238,21 +253,21 @@ mod tests {
         let mut h = FundingHistory::new();
         h.observe("BTC", 1000, dec!(0.001));
         h.observe("ETH", 1000, dec!(0.0002));
-        let (carry, n) = compute_carry_usd(
-            &h,
-            "BTC",
-            "ETH",
-            500,
-            2000,
-            PositionDirection::LongSpread,
-            dec!(0.01),
-            dec!(80000), // N_btc = 800
-            dec!(0.5),
-            dec!(2400), // N_eth = 1200
-                        // carry = short_sum * N_eth - long_sum * N_btc
-                        //       = 0.0002 * 1200 - 0.001 * 800
-                        //       = 0.24 - 0.8 = -0.56
-        );
+        let (carry, n) = compute_carry_usd(FundingCarryInput {
+            history: &h,
+            base_symbol: "BTC",
+            quote_symbol: "ETH",
+            open_ts: 500,
+            close_ts: 2000,
+            direction: PositionDirection::LongSpread,
+            entry_size_a: dec!(0.01),
+            entry_price_a: dec!(80000), // N_btc = 800
+            entry_size_b: dec!(0.5),
+            entry_price_b: dec!(2400), // N_eth = 1200
+        });
+        // carry = short_sum * N_eth - long_sum * N_btc
+        //       = 0.0002 * 1200 - 0.001 * 800
+        //       = 0.24 - 0.8 = -0.56
         assert_eq!(n, 2);
         assert!((carry - (-0.56)).abs() < 1e-9, "carry was {}", carry);
     }
@@ -287,18 +302,18 @@ mod tests {
         h.observe("BTC", open_ts + 6_180, dec!(-0.000001));
         h.observe("ETH", open_ts + 6_180, dec!(0.000001));
 
-        let (carry, n) = compute_carry_usd(
-            &h,
-            "BTC",
-            "ETH",
+        let (carry, n) = compute_carry_usd(FundingCarryInput {
+            history: &h,
+            base_symbol: "BTC",
+            quote_symbol: "ETH",
             open_ts,
             close_ts,
-            PositionDirection::LongSpread,
-            dec!(0.02498),
-            dec!(80060.7), // N_btc = 1999.92
-            dec!(0.9161),
-            dec!(2245.64), // N_eth = 2057.13
-        );
+            direction: PositionDirection::LongSpread,
+            entry_size_a: dec!(0.02498),
+            entry_price_a: dec!(80060.7), // N_btc = 1999.92
+            entry_size_b: dec!(0.9161),
+            entry_price_b: dec!(2245.64), // N_eth = 2057.13
+        });
         assert_eq!(n, 6);
         // Expected: carry = short_sum*N_eth - long_sum*N_btc
         //   short_sum(ETH) = 3e-6 + (-1e-6) + 1e-6 = 3e-6
@@ -317,18 +332,18 @@ mod tests {
         let mut h = FundingHistory::new();
         h.observe("BTC", 100, dec!(0.001));
         h.observe("ETH", 100, dec!(0.0002));
-        let (carry, n) = compute_carry_usd(
-            &h,
-            "BTC",
-            "ETH",
-            500,
-            1000, // window starts after the observed tick
-            PositionDirection::LongSpread,
-            dec!(0.01),
-            dec!(80000),
-            dec!(0.5),
-            dec!(2400),
-        );
+        let (carry, n) = compute_carry_usd(FundingCarryInput {
+            history: &h,
+            base_symbol: "BTC",
+            quote_symbol: "ETH",
+            open_ts: 500,
+            close_ts: 1000, // window starts after the observed tick
+            direction: PositionDirection::LongSpread,
+            entry_size_a: dec!(0.01),
+            entry_price_a: dec!(80000),
+            entry_size_b: dec!(0.5),
+            entry_price_b: dec!(2400),
+        });
         assert_eq!(n, 0);
         assert_eq!(carry, 0.0);
     }

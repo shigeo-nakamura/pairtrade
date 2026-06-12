@@ -188,20 +188,34 @@ pub(super) fn beta_at_clamp(beta: f64) -> bool {
     beta <= BETA_CLAMP_MIN + BETA_CLAMP_EPSILON || beta >= BETA_CLAMP_MAX - BETA_CLAMP_EPSILON
 }
 
+pub(super) struct EntryCheck<'a> {
+    pub(super) cfg: &'a PairTradeConfig,
+    pub(super) pp: &'a PairParams,
+    pub(super) state: &'a PairState,
+    pub(super) shared: &'a PairSharedState,
+    pub(super) z: f64,
+    pub(super) std: f64,
+    pub(super) net_funding: f64,
+    pub(super) now_ts: i64,
+    pub(super) proposed_direction: PositionDirection,
+}
+
 /// Result of `should_enter`. `Ok(())` means take the entry. `Err(reason)` is
 /// the static identifier of the gate that fired — kept in sync with
 /// `prom::KNOWN_ENTRY_REJECT_REASONS`.
-pub(super) fn should_enter(
-    cfg: &PairTradeConfig,
-    pp: &PairParams,
-    state: &PairState,
-    shared: &PairSharedState,
-    z: f64,
-    std: f64,
-    net_funding: f64,
-    now_ts: i64,
-    proposed_direction: PositionDirection,
-) -> Result<(), &'static str> {
+pub(super) fn should_enter(check: EntryCheck<'_>) -> Result<(), &'static str> {
+    let EntryCheck {
+        cfg,
+        pp,
+        state,
+        shared,
+        z,
+        std,
+        net_funding,
+        now_ts,
+        proposed_direction,
+    } = check;
+
     if let Some(last_exit_ts) = state.last_exit_ts {
         if now_ts.saturating_sub(last_exit_ts) < pp.cooldown_secs as i64 {
             return Err("cooldown");

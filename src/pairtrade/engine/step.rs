@@ -37,7 +37,7 @@ use super::super::exit::compute_pnl;
 use super::super::funding_history;
 use super::super::history_io;
 use super::super::market::SymbolSnapshot;
-use super::super::pnl_log::PnlLogRecord;
+use super::super::pnl_log::{PnlLogRecord, PnlTradeDetails};
 use super::super::regime;
 use super::super::state::{BtDeferredExit, PendingOrders, Position, PositionDirection};
 use super::super::status::{ShutdownPosition, ShutdownStatus};
@@ -766,16 +766,18 @@ impl PairTradeEngine {
                                 ) {
                                     (Some(sa), Some(pa), Some(sb), Some(pb)) => {
                                         funding_history::compute_carry_usd(
-                                            &self.funding_history,
-                                            &plan.pair.base,
-                                            &plan.pair.quote,
-                                            p.entered_ts,
-                                            now_ts,
-                                            direction,
-                                            sa,
-                                            pa,
-                                            sb,
-                                            pb,
+                                            funding_history::FundingCarryInput {
+                                                history: &self.funding_history,
+                                                base_symbol: &plan.pair.base,
+                                                quote_symbol: &plan.pair.quote,
+                                                open_ts: p.entered_ts,
+                                                close_ts: now_ts,
+                                                direction,
+                                                entry_size_a: sa,
+                                                entry_price_a: pa,
+                                                entry_size_b: sb,
+                                                entry_price_b: pb,
+                                            },
                                         )
                                     }
                                     _ => (0.0, 0),
@@ -790,18 +792,19 @@ impl PairTradeEngine {
                                 now_ts,
                                 "exit_dry_run",
                             )
-                            .with_trade_details(
+                            .with_trade_details(PnlTradeDetails {
                                 entry_a,
                                 entry_b,
-                                price_a.to_f64(),
-                                price_b.to_f64(),
-                                Some(beta),
-                                Some(z),
-                                self.per_pair_state
+                                exit_a: price_a.to_f64(),
+                                exit_b: price_b.to_f64(),
+                                beta: Some(beta),
+                                z_entry: Some(z),
+                                z_exit: self
+                                    .per_pair_state
                                     .get(&plan.key)
                                     .and_then(|s| s.last_spread.map(|_| z)),
                                 hold_secs,
-                            );
+                            });
                             if ticks_observed > 0 {
                                 record = record.with_funding(carry_usd, ticks_observed);
                             }
