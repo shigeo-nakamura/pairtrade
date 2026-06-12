@@ -804,6 +804,31 @@ impl PairTradeEngine {
                     ),
                     regime::RegimeTransition::None => {}
                 }
+                // bot-strategy#494: periodic CUSUM series log for threshold
+                // calibration. Transition logs alone only show `h_on`
+                // crossings; calibrating an alternative threshold needs the
+                // statistic's envelope over time, so emit the point value
+                // plus the interval high-water mark every 5 event-time
+                // minutes. Event-time gating keeps byte-exact replay output
+                // at the same cadence as live.
+                const REGIME_SHADOW_LOG_INTERVAL_SECS: i64 = 300;
+                let shadow_due = shared
+                    .last_regime_shadow_ts
+                    .map(|t| now_ts - t >= REGIME_SHADOW_LOG_INTERVAL_SECS)
+                    .unwrap_or(true);
+                if shadow_due {
+                    log::info!(
+                        "[REGIME_SHADOW] {} event_ts={} cusum={:.3} peak={:.3} scale={:.6} norm={:.2} active={}",
+                        key,
+                        now_ts,
+                        shared.regime.cusum(),
+                        shared.regime.take_interval_peak(),
+                        shared.regime.residual_scale(),
+                        shared.regime.last_normalized(),
+                        shared.regime.is_active(),
+                    );
+                    shared.last_regime_shadow_ts = Some(now_ts);
+                }
             }
             let spread = log_a - shared.beta * log_b;
             shared.push_spread(spread, metrics_window, &self.cfg);

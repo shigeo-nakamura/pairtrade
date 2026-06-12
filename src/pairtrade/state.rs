@@ -207,6 +207,11 @@ pub(super) struct PairSharedState {
     /// model. Shadow-only in Phase 1; not persisted across restart (warms
     /// back up in `MIN_UPDATES` bars).
     pub(super) regime: RegimeDetector,
+    /// Replay/market timestamp of the last `[REGIME_SHADOW]` series log.
+    /// Event-time gated (not `Instant`) so byte-exact replay emits the same
+    /// cadence as live — wall-clock gating would collapse the series to a
+    /// handful of lines in a fast replay.
+    pub(super) last_regime_shadow_ts: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -276,6 +281,7 @@ impl PairSharedState {
             kalman: None,
             std_history: VecDeque::new(),
             regime: RegimeDetector::default(),
+            last_regime_shadow_ts: None,
         }
     }
 
