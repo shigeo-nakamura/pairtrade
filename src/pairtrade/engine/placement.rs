@@ -202,61 +202,101 @@ impl PairTradeEngine {
             // the #470-capped remainder that cancel-replace venues place
             // afresh. On any amend error fall back to cancel+reissue for this
             // leg (the upstream blanket cancel was skipped in amend mode).
-            let placement = if use_amend {
-                match self
-                    .connector
-                    .modify_order(
-                        &leg.symbol,
-                        &leg.order_id,
-                        leg.side,
-                        leg.target,
-                        quantized_size,
-                        limit,
-                        spread,
-                        reduce_only,
-                    )
+            //
+            // Extended's edit endpoint only permits price/size changes — the
+            // replacement order must re-assert the original post-only flag
+            // (with a maker-safe refreshed price) or the venue rejects the
+            // whole edit with 1133 InvalidOrderParameters. Without this,
+            // every first-retry amend of a post-only entry leg burned the
+            // edit and fell back (2026-06-09..12 Tokyo soak). A post-only
+            // leg with no maker-safe price available cannot be amended
+            // without flipping the flag, so it takes the fallback path.
+            let amend_pricing = if !use_amend {
+                None
+            } else if leg.post_only {
+                self.refreshed_limit_price(&leg.symbol, leg.side, price_map)
                     .await
-                {
-                    Ok(resp) => Ok(resp),
-                    Err(e) => {
+                    .filter(|px| *px > Decimal::ZERO)
+                    .or(limit)
+                    .map(|px| (Some(px), Some(-2)))
+            } else {
+                Some((limit, spread))
+            };
+            // Each placement resolves to (response, post_only, posted limit)
+            // so the rebuilt PendingLeg records how the live order actually
+            // rests on the venue, keeping later amends of the same leg
+            // consistent with the edit-endpoint constraint above.
+            let placement = match amend_pricing {
+                Some((amend_limit, amend_spread)) => {
+                    match self
+                        .connector
+                        .modify_order(
+                            &leg.symbol,
+                            &leg.order_id,
+                            leg.side,
+                            leg.target,
+                            quantized_size,
+                            amend_limit,
+                            amend_spread,
+                            reduce_only,
+                        )
+                        .await
+                    {
+                        Ok(resp) => Ok((resp, leg.post_only, amend_limit)),
+                        Err(e) => {
+                            log::warn!(
+                                "[ORDER] amend failed for {} leg {} ({:?}); falling back to cancel+reissue",
+                                stage,
+                                leg.symbol,
+                                e
+                            );
+                            let _ = self
+                                .connector
+                                .cancel_order(&leg.symbol, &leg.order_id)
+                                .await;
+                            self.connector
+                                .create_order(
+                                    &leg.symbol,
+                                    quantized_size,
+                                    leg.side,
+                                    limit,
+                                    spread,
+                                    reduce_only,
+                                    None,
+                                )
+                                .await
+                                .map(|resp| (resp, false, limit))
+                        }
+                    }
+                }
+                None => {
+                    if use_amend {
                         log::warn!(
-                            "[ORDER] amend failed for {} leg {} ({:?}); falling back to cancel+reissue",
+                            "[ORDER] cannot amend {} leg {}: no maker-safe price for post-only; falling back to cancel+reissue",
                             stage,
-                            leg.symbol,
-                            e
+                            leg.symbol
                         );
                         let _ = self
                             .connector
                             .cancel_order(&leg.symbol, &leg.order_id)
                             .await;
-                        self.connector
-                            .create_order(
-                                &leg.symbol,
-                                quantized_size,
-                                leg.side,
-                                limit,
-                                spread,
-                                reduce_only,
-                                None,
-                            )
-                            .await
                     }
+                    self.connector
+                        .create_order(
+                            &leg.symbol,
+                            quantized_size,
+                            leg.side,
+                            limit,
+                            spread,
+                            reduce_only,
+                            None,
+                        )
+                        .await
+                        .map(|resp| (resp, false, limit))
                 }
-            } else {
-                self.connector
-                    .create_order(
-                        &leg.symbol,
-                        quantized_size,
-                        leg.side,
-                        limit,
-                        spread,
-                        reduce_only,
-                        None,
-                    )
-                    .await
             };
             match placement {
-                Ok(resp) => {
+                Ok((resp, placed_post_only, placed_limit)) => {
                     // Native in-place amend keeps the order's identity: the
                     // same order_id continues to fill toward the original
                     // target with its already-filled portion intact. Record
@@ -281,8 +321,9 @@ impl PairTradeEngine {
                             target: leg.target,
                             filled,
                             side: leg.side,
-                            limit_price: limit,
+                            limit_price: placed_limit,
                             reference_price: ref_price_reissue,
+                            post_only: placed_post_only,
                         });
                     } else {
                         log::info!(
@@ -305,6 +346,7 @@ impl PairTradeEngine {
                                 side: leg.side,
                                 limit_price: None,
                                 reference_price: None,
+                                post_only: false,
                             });
                         }
                         new_legs.push(PendingLeg {
@@ -314,8 +356,9 @@ impl PairTradeEngine {
                             target: quantized_size,
                             filled: Decimal::ZERO,
                             side: leg.side,
-                            limit_price: limit,
+                            limit_price: placed_limit,
                             reference_price: ref_price_reissue,
+                            post_only: placed_post_only,
                         });
                     }
                 }
@@ -424,6 +467,7 @@ impl PairTradeEngine {
                         side: leg.side,
                         limit_price: None,
                         reference_price: ref_price_taker,
+                        post_only: false,
                     });
                 }
                 Err(e) => {
@@ -713,6 +757,10 @@ impl PairTradeEngine {
             side: side_a,
             limit_price: limit_a,
             reference_price: ref_price_a,
+            // Entry legs place with fallback_to_taker=false, so the helper's
+            // use_post_only (= allow_post_only && should_post_only()) is the
+            // flag the order actually rests with.
+            post_only,
         });
 
         let res_b = match self
@@ -757,6 +805,7 @@ impl PairTradeEngine {
             side: side_b,
             limit_price: limit_b,
             reference_price: ref_price_b,
+            post_only,
         });
         Ok(legs)
     }
@@ -976,6 +1025,11 @@ impl PairTradeEngine {
                         // resolves correctly (#314 Group 4-B-2).
                         limit_price: limit_a,
                         reference_price: ref_price_a,
+                        // Placement intent. Exit legs use fallback_to_taker=
+                        // true, so a leg whose post-only attempts exhausted
+                        // actually rests as taker — exits never amend today,
+                        // so the imprecision is unobservable.
+                        post_only,
                     });
                     res_a = Some(res);
                 }
@@ -1083,6 +1137,7 @@ impl PairTradeEngine {
                     // slippage tagging (#314 Group 4-B-2).
                     limit_price: limit_b,
                     reference_price: ref_price_b,
+                    post_only,
                 });
             }
         }
