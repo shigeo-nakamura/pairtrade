@@ -15,8 +15,8 @@ use rust_decimal::Decimal;
 
 use super::super::apply_post_exit_state;
 use super::super::config::PairSpec;
-use super::super::entry::{entry_z_for_pair, should_enter};
-use super::super::exit::exit_reason;
+use super::super::entry::{entry_z_for_pair, should_enter, EntryCheck};
+use super::super::exit::{exit_reason, ExitCheck};
 use super::super::market::{liquidity_score, net_funding_for_direction, SymbolSnapshot};
 use super::super::state::PositionDirection;
 use super::super::stats::spread_slope_sigma;
@@ -572,8 +572,8 @@ impl PairTradeEngine {
                                     .per_pair_state
                                     .get(&key)
                                     .ok_or_else(|| anyhow!("missing shared state for {}", key))?;
-                                exit_reason(
-                                    &self.cfg,
+                                exit_reason(ExitCheck {
+                                    cfg: &self.cfg,
                                     pp,
                                     state,
                                     shared,
@@ -583,7 +583,7 @@ impl PairTradeEngine {
                                     p2,
                                     equity_base,
                                     now_ts,
-                                )
+                                })
                             };
                             if let Some(reason) = reason_opt {
                                 let velocity_for_log = self
@@ -670,8 +670,8 @@ impl PairTradeEngine {
                                         self.per_pair_state.get(&key).ok_or_else(|| {
                                             anyhow!("missing shared state for {}", key)
                                         })?;
-                                    should_enter(
-                                        &self.cfg,
+                                    should_enter(EntryCheck {
+                                        cfg: &self.cfg,
                                         pp,
                                         state,
                                         shared,
@@ -679,8 +679,8 @@ impl PairTradeEngine {
                                         std,
                                         net_funding,
                                         now_ts,
-                                        direction,
-                                    )
+                                        proposed_direction: direction,
+                                    })
                                 };
                                 match decision {
                                     Ok(()) => {

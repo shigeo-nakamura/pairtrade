@@ -34,9 +34,10 @@ use super::super::engine;
 use super::super::exit::compute_pnl;
 use super::super::funding_history;
 use super::super::market::SymbolSnapshot;
-use super::super::pnl_log::PnlLogRecord;
+use super::super::pnl_log::{PnlLogRecord, PnlTradeDetails};
 use super::super::state::{PendingLeg, PendingOrders, PendingStatus, Position};
 use super::super::PairTradeEngine;
+use super::placement::ReissuePartialLegsRequest;
 
 /// Pure outcome of the entry partial-fill reissue policy. Extracted from
 /// `reconcile_pending_orders` so the retry/escalation thresholds are
@@ -187,16 +188,18 @@ impl PairTradeEngine {
                                 ) {
                                     (Some(sa), Some(pa), Some(sb), Some(pb)) => {
                                         funding_history::compute_carry_usd(
-                                            &self.funding_history,
-                                            base,
-                                            quote,
-                                            pos.entered_ts,
-                                            now_ts,
-                                            pos.direction,
-                                            sa,
-                                            pa,
-                                            sb,
-                                            pb,
+                                            funding_history::FundingCarryInput {
+                                                history: &self.funding_history,
+                                                base_symbol: base,
+                                                quote_symbol: quote,
+                                                open_ts: pos.entered_ts,
+                                                close_ts: now_ts,
+                                                direction: pos.direction,
+                                                entry_size_a: sa,
+                                                entry_price_a: pa,
+                                                entry_size_b: sb,
+                                                entry_price_b: pb,
+                                            },
                                         )
                                     }
                                     _ => (0.0, 0),
@@ -209,16 +212,16 @@ impl PairTradeEngine {
                                     now_ts,
                                     "exit_fill",
                                 )
-                                .with_trade_details(
+                                .with_trade_details(PnlTradeDetails {
                                     entry_a,
                                     entry_b,
-                                    p1.price.to_f64(),
-                                    p2.price.to_f64(),
-                                    beta_val,
-                                    pos.entry_z,
+                                    exit_a: p1.price.to_f64(),
+                                    exit_b: p2.price.to_f64(),
+                                    beta: beta_val,
+                                    z_entry: pos.entry_z,
                                     z_exit,
                                     hold_secs,
-                                );
+                                });
                                 if ticks_observed > 0 {
                                     record = record.with_funding(carry_usd, ticks_observed);
                                 }
@@ -349,15 +352,15 @@ impl PairTradeEngine {
             );
             self.cancel_pending_orders(&pending).await?;
             if let Some(new_pending) = self
-                .reissue_partial_legs(
-                    &pending,
-                    &filled_qtys,
+                .reissue_partial_legs(ReissuePartialLegsRequest {
+                    pending: &pending,
+                    filled_qtys: &filled_qtys,
                     price_map,
-                    true,
-                    true,
-                    next_retry,
-                    false,
-                )
+                    reduce_only: true,
+                    use_market: true,
+                    retry_count: next_retry,
+                    use_amend: false,
+                })
                 .await?
             {
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
@@ -755,15 +758,15 @@ impl PairTradeEngine {
                 self.cancel_pending_orders(&pending).await?;
             }
             if let Some(new_pending) = self
-                .reissue_partial_legs(
-                    &pending,
-                    &filled_qtys,
+                .reissue_partial_legs(ReissuePartialLegsRequest {
+                    pending: &pending,
+                    filled_qtys: &filled_qtys,
                     price_map,
-                    false,
+                    reduce_only: false,
                     use_market,
-                    next_retry,
+                    retry_count: next_retry,
                     use_amend,
-                )
+                })
                 .await?
             {
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {

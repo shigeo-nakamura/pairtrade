@@ -38,6 +38,27 @@ use super::super::state::{
 };
 use super::super::PairTradeEngine;
 
+pub(in crate::pairtrade) struct ReissuePartialLegsRequest<'a> {
+    pub(in crate::pairtrade) pending: &'a PendingOrders,
+    pub(in crate::pairtrade) filled_qtys: &'a HashMap<String, Decimal>,
+    pub(in crate::pairtrade) price_map: &'a HashMap<String, SymbolSnapshot>,
+    pub(in crate::pairtrade) reduce_only: bool,
+    pub(in crate::pairtrade) use_market: bool,
+    pub(in crate::pairtrade) retry_count: u32,
+    pub(in crate::pairtrade) use_amend: bool,
+}
+
+struct PostOnlyOrderRequest<'a> {
+    symbol: &'a str,
+    size: Decimal,
+    side: dex_connector::OrderSide,
+    reduce_only: bool,
+    prices: &'a HashMap<String, SymbolSnapshot>,
+    allow_post_only: bool,
+    max_post_only_attempts: usize,
+    fallback_to_taker: bool,
+}
+
 impl PairTradeEngine {
     /// In amend mode the caller skips the upstream blanket cancel so the
     /// order we are about to amend stays alive. Any leg we end up NOT
@@ -54,17 +75,19 @@ impl PairTradeEngine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)] // entry/exit reissue param shape + the bot-strategy#471 amend toggle.
     pub(in crate::pairtrade) async fn reissue_partial_legs(
         &mut self,
-        pending: &PendingOrders,
-        filled_qtys: &HashMap<String, Decimal>,
-        price_map: &HashMap<String, SymbolSnapshot>,
-        reduce_only: bool,
-        use_market: bool,
-        retry_count: u32,
-        use_amend: bool,
+        request: ReissuePartialLegsRequest<'_>,
     ) -> Result<Option<PendingOrders>> {
+        let ReissuePartialLegsRequest {
+            pending,
+            filled_qtys,
+            price_map,
+            reduce_only,
+            use_market,
+            retry_count,
+            use_amend,
+        } = request;
         let mut new_legs = Vec::new();
         let stage = if reduce_only { "exit" } else { "entry" };
         // Clone the legs first so each iteration can call `&mut self`
@@ -497,15 +520,18 @@ impl PairTradeEngine {
 
     async fn create_order_with_post_only_retry(
         &mut self,
-        symbol: &str,
-        size: Decimal,
-        side: dex_connector::OrderSide,
-        reduce_only: bool,
-        prices: &HashMap<String, SymbolSnapshot>,
-        allow_post_only: bool,
-        max_post_only_attempts: usize,
-        fallback_to_taker: bool,
+        request: PostOnlyOrderRequest<'_>,
     ) -> Result<dex_connector::CreateOrderResponse, DexError> {
+        let PostOnlyOrderRequest {
+            symbol,
+            size,
+            side,
+            reduce_only,
+            prices,
+            allow_post_only,
+            max_post_only_attempts,
+            fallback_to_taker,
+        } = request;
         let use_post_only = allow_post_only && self.should_post_only();
         let max_attempts = max_post_only_attempts.max(1);
         let max_elapsed = Duration::from_millis(POST_ONLY_RETRY_MAX_ELAPSED_MS);
@@ -723,16 +749,16 @@ impl PairTradeEngine {
         );
         let mut legs: Vec<PendingLeg> = Vec::new();
         let res_a = self
-            .create_order_with_post_only_retry(
-                &pair.base,
-                qty_a,
-                side_a,
-                false,
+            .create_order_with_post_only_retry(PostOnlyOrderRequest {
+                symbol: &pair.base,
+                size: qty_a,
+                side: side_a,
+                reduce_only: false,
                 prices,
-                true,
-                entry_attempts,
-                false,
-            )
+                allow_post_only: true,
+                max_post_only_attempts: entry_attempts,
+                fallback_to_taker: false,
+            })
             .await
             .context("place leg A")?;
         let target_a = if res_a.ordered_size > Decimal::ZERO {
@@ -764,16 +790,16 @@ impl PairTradeEngine {
         });
 
         let res_b = match self
-            .create_order_with_post_only_retry(
-                &pair.quote,
-                qty_b,
-                side_b,
-                false,
+            .create_order_with_post_only_retry(PostOnlyOrderRequest {
+                symbol: &pair.quote,
+                size: qty_b,
+                side: side_b,
+                reduce_only: false,
                 prices,
-                true,
-                entry_attempts,
-                false,
-            )
+                allow_post_only: true,
+                max_post_only_attempts: entry_attempts,
+                fallback_to_taker: false,
+            })
             .await
         {
             Ok(res) => res,
@@ -988,16 +1014,16 @@ impl PairTradeEngine {
                     .create_order(&pair.base, qty_a, side_a, None, None, true, None)
                     .await
             } else {
-                self.create_order_with_post_only_retry(
-                    &pair.base,
-                    qty_a,
-                    side_a,
-                    true,
+                self.create_order_with_post_only_retry(PostOnlyOrderRequest {
+                    symbol: &pair.base,
+                    size: qty_a,
+                    side: side_a,
+                    reduce_only: true,
                     prices,
-                    true,
-                    POST_ONLY_EXIT_ATTEMPTS,
-                    true,
-                )
+                    allow_post_only: true,
+                    max_post_only_attempts: POST_ONLY_EXIT_ATTEMPTS,
+                    fallback_to_taker: true,
+                })
                 .await
             };
             match res {
@@ -1070,16 +1096,16 @@ impl PairTradeEngine {
                     .create_order(&pair.quote, qty_b, side_b, None, None, true, None)
                     .await
             } else {
-                self.create_order_with_post_only_retry(
-                    &pair.quote,
-                    qty_b,
-                    side_b,
-                    true,
+                self.create_order_with_post_only_retry(PostOnlyOrderRequest {
+                    symbol: &pair.quote,
+                    size: qty_b,
+                    side: side_b,
+                    reduce_only: true,
                     prices,
-                    true,
-                    POST_ONLY_EXIT_ATTEMPTS,
-                    true,
-                )
+                    allow_post_only: true,
+                    max_post_only_attempts: POST_ONLY_EXIT_ATTEMPTS,
+                    fallback_to_taker: true,
+                })
                 .await
             };
             let res_b = match res_b {

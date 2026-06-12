@@ -41,7 +41,7 @@ mod util;
 use bar::BarBuilder;
 pub use config::{DailyLossAction, PairTradeConfig, WarmStartMode};
 use market::SymbolSnapshot;
-use pnl_log::{PnlLogRecord, PnlLogger};
+use pnl_log::{PnlLogRecord, PnlLogger, PnlTradeDetails};
 pub(in crate::pairtrade) use sentinel::{risk_ack_path, KILL_SWITCH_PATH};
 use stats::PriceSample;
 
@@ -566,9 +566,16 @@ impl PairTradeEngine {
         let record = PnlLogRecord::new(base, quote, direction, 0.0, now_ts, "recovery_no_pnl")
             .with_unavailable_pnl()
             .with_recovery_context(close_reason, recovery_reason)
-            .with_trade_details(
-                entry_a, entry_b, exit_a, exit_b, beta, z_entry, z_exit, hold_secs,
-            );
+            .with_trade_details(PnlTradeDetails {
+                entry_a,
+                entry_b,
+                exit_a,
+                exit_b,
+                beta,
+                z_entry,
+                z_exit,
+                hold_secs,
+            });
 
         self.write_pnl_context_record(inst_idx, record);
     }

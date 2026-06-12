@@ -7,18 +7,33 @@ use super::config::{PairParams, PairTradeConfig};
 use super::market::SymbolSnapshot;
 use super::state::{PairSharedState, PairState, Position, PositionDirection};
 
-pub(super) fn exit_reason(
-    cfg: &PairTradeConfig,
-    pp: &PairParams,
-    state: &PairState,
-    shared: &PairSharedState,
-    z: f64,
-    std: f64,
-    p1: &SymbolSnapshot,
-    p2: &SymbolSnapshot,
-    equity_base: f64,
-    now_ts: i64,
-) -> Option<&'static str> {
+pub(super) struct ExitCheck<'a> {
+    pub(super) cfg: &'a PairTradeConfig,
+    pub(super) pp: &'a PairParams,
+    pub(super) state: &'a PairState,
+    pub(super) shared: &'a PairSharedState,
+    pub(super) z: f64,
+    pub(super) std: f64,
+    pub(super) p1: &'a SymbolSnapshot,
+    pub(super) p2: &'a SymbolSnapshot,
+    pub(super) equity_base: f64,
+    pub(super) now_ts: i64,
+}
+
+pub(super) fn exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
+    let ExitCheck {
+        cfg,
+        pp,
+        state,
+        shared,
+        z,
+        std,
+        p1,
+        p2,
+        equity_base,
+        now_ts,
+    } = check;
+
     let pos = state.position.as_ref()?;
 
     // bot-strategy#473: when the YAML opts into frozen-β exit and the

@@ -355,17 +355,31 @@ pub(super) fn load_history_snapshot_for_bt(
     }
 }
 
-pub(super) fn load_history_from_disk(
-    cfg: &PairTradeConfig,
-    history: &mut HashMap<String, VecDeque<PriceSample>>,
-    spread_histories_out: &mut HashMap<String, VecDeque<f64>>,
-    betas_out: &mut HashMap<String, f64>,
-    kalman_states_out: &mut HashMap<String, KalmanSnapshot>,
-    history_path: &std::path::Path,
-    now_ts: i64,
-    max_history_len: usize,
-    last_logged_key: &mut Option<String>,
-) {
+pub(super) struct LoadHistoryRequest<'a> {
+    pub(super) cfg: &'a PairTradeConfig,
+    pub(super) history: &'a mut HashMap<String, VecDeque<PriceSample>>,
+    pub(super) spread_histories_out: &'a mut HashMap<String, VecDeque<f64>>,
+    pub(super) betas_out: &'a mut HashMap<String, f64>,
+    pub(super) kalman_states_out: &'a mut HashMap<String, KalmanSnapshot>,
+    pub(super) history_path: &'a std::path::Path,
+    pub(super) now_ts: i64,
+    pub(super) max_history_len: usize,
+    pub(super) last_logged_key: &'a mut Option<String>,
+}
+
+pub(super) fn load_history_from_disk(request: LoadHistoryRequest<'_>) {
+    let LoadHistoryRequest {
+        cfg,
+        history,
+        spread_histories_out,
+        betas_out,
+        kalman_states_out,
+        history_path,
+        now_ts,
+        max_history_len,
+        last_logged_key,
+    } = request;
+
     if cfg.disable_history_persist {
         return;
     }

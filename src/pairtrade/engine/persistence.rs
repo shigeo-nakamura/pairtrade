@@ -66,17 +66,17 @@ impl PairTradeEngine {
         let mut loaded_spreads: HashMap<String, VecDeque<f64>> = HashMap::new();
         let mut loaded_betas: HashMap<String, f64> = HashMap::new();
         let mut loaded_kalman: HashMap<String, KalmanSnapshot> = HashMap::new();
-        history_io::load_history_from_disk(
-            &self.cfg,
-            &mut self.history,
-            &mut loaded_spreads,
-            &mut loaded_betas,
-            &mut loaded_kalman,
-            &self.history_path,
-            now,
-            max_len,
-            &mut self.last_warm_start_key,
-        );
+        history_io::load_history_from_disk(history_io::LoadHistoryRequest {
+            cfg: &self.cfg,
+            history: &mut self.history,
+            spread_histories_out: &mut loaded_spreads,
+            betas_out: &mut loaded_betas,
+            kalman_states_out: &mut loaded_kalman,
+            history_path: &self.history_path,
+            now_ts: now,
+            max_history_len: max_len,
+            last_logged_key: &mut self.last_warm_start_key,
+        });
         if loaded_spreads.is_empty() && loaded_betas.is_empty() && loaded_kalman.is_empty() {
             return;
         }
