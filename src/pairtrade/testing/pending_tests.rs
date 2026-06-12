@@ -1508,8 +1508,12 @@ async fn force_close_all_positions_dry_run_skips_connector_calls() {
     let connector = Arc::new(DummyConnector::default());
     let mut engine = PairTradeEngine::test_instance(connector.clone());
 
-    engine.force_close_all_positions("AAA/BBB", "timeout").await;
+    let close_confirmed = engine.force_close_all_positions("AAA/BBB", "timeout").await;
 
+    assert!(
+        !close_confirmed,
+        "dry_run skip must not report a confirmed close"
+    );
     assert_eq!(
         connector.positions_calls.load(Ordering::SeqCst),
         0,
@@ -1519,6 +1523,54 @@ async fn force_close_all_positions_dry_run_skips_connector_calls() {
         connector.close_all_calls.load(Ordering::SeqCst),
         0,
         "dry_run must not invoke close_all_positions"
+    );
+}
+
+/// bot-strategy#514 review fix: the emergency close outcome decides
+/// whether the later exchange-snapshot recovery record is suppressed.
+/// A failed close must NOT report confirmation, an already-flat or
+/// successfully submitted close must.
+#[tokio::test]
+async fn force_close_all_positions_reports_outcome() {
+    // Failure: a dust position makes close_all_positions(None) error.
+    let connector = Arc::new(DummyConnector::default());
+    *connector.positions_to_return.lock().unwrap() = vec![PositionSnapshot {
+        symbol: "AAA".to_string(),
+        size: dec("0.00001"),
+        sign: 1,
+        entry_price: Some(dec("100")),
+    }];
+    *connector.min_order_to_return.lock().unwrap() = Some(dec("0.0001"));
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    assert!(
+        !engine.force_close_all_positions("AAA/BBB", "timeout").await,
+        "failed close must not be confirmed"
+    );
+
+    // Success: above-min position clears.
+    *connector.min_order_to_return.lock().unwrap() = None;
+    *connector.positions_to_return.lock().unwrap() = vec![PositionSnapshot {
+        symbol: "AAA".to_string(),
+        size: dec("0.05"),
+        sign: 1,
+        entry_price: Some(dec("100")),
+    }];
+    assert!(
+        engine.force_close_all_positions("AAA/BBB", "timeout").await,
+        "submitted close must be confirmed"
+    );
+
+    // Already flat: confirmed without invoking close_all_positions again.
+    let close_calls_before = connector.close_all_calls.load(Ordering::SeqCst);
+    assert!(
+        engine.force_close_all_positions("AAA/BBB", "timeout").await,
+        "already-flat must be confirmed"
+    );
+    assert_eq!(
+        connector.close_all_calls.load(Ordering::SeqCst),
+        close_calls_before,
+        "already-flat must not invoke close_all_positions"
     );
 }
 

@@ -294,18 +294,24 @@ impl PairTradeEngine {
         Ok(())
     }
 
+    /// Returns `true` when the close is confirmed (positions already flat
+    /// on the exchange, or `close_all_positions` was submitted without
+    /// error). `false` means nothing was flattened (mode skip or connector
+    /// failure) — callers must not assume the exchange position is gone,
+    /// and in particular must not suppress the later exchange-snapshot
+    /// recovery record (bot-strategy#514).
     pub(in crate::pairtrade) async fn force_close_all_positions(
         &mut self,
         key: &str,
         reason: &str,
-    ) {
+    ) -> bool {
         if self.cfg.dry_run || self.cfg.observe_only {
             log::warn!(
                 "[EXIT] {} force close skipped (mode) reason={}",
                 key,
                 reason
             );
-            return;
+            return false;
         }
         if let Some((base, quote)) = key.split_once('/') {
             if let Ok(positions) = self.connector.get_positions().await {
@@ -322,7 +328,7 @@ impl PairTradeEngine {
                         key,
                         reason
                     );
-                    return;
+                    return true;
                 }
             }
         }
@@ -333,7 +339,9 @@ impl PairTradeEngine {
         );
         if let Err(err) = self.connector.close_all_positions(None).await {
             log::error!("[EXIT] close_all_positions failed: {:?}", err);
+            return false;
         }
+        true
     }
 
     pub(in crate::pairtrade) async fn sync_positions_from_exchange(
