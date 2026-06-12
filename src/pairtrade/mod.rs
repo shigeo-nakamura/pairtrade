@@ -1685,6 +1685,7 @@ mod tests {
             side: dex_connector::OrderSide::Long,
             limit_price: None,
             reference_price: None,
+            post_only: false,
         }
     }
 
@@ -1806,10 +1807,19 @@ mod pending_tests {
         positions_to_return: Mutex<Vec<PositionSnapshot>>,
         min_order_to_return: Mutex<Option<Decimal>>,
         /// bot-strategy#471: per-call record of `modify_order`
-        /// `(symbol, order_id, target_total, open_remaining, price)`, the
-        /// count of `cancel_order` calls, and a switch to force amend
+        /// `(symbol, order_id, target_total, open_remaining, price, spread)`,
+        /// the count of `cancel_order` calls, and a switch to force amend
         /// failure so the cancel+reissue fallback can be exercised.
-        modify_calls: Mutex<Vec<(String, String, Decimal, Decimal, Option<Decimal>)>>,
+        modify_calls: Mutex<
+            Vec<(
+                String,
+                String,
+                Decimal,
+                Decimal,
+                Option<Decimal>,
+                Option<i64>,
+            )>,
+        >,
         cancel_order_calls: AtomicUsize,
         modify_should_fail: AtomicBool,
     }
@@ -1962,7 +1972,7 @@ mod pending_tests {
             target_total_size: Decimal,
             open_remaining_size: Decimal,
             price: Option<Decimal>,
-            _spread: Option<i64>,
+            spread: Option<i64>,
             _reduce_only: bool,
         ) -> Result<CreateOrderResponse, DexError> {
             self.modify_calls.lock().unwrap().push((
@@ -1971,6 +1981,7 @@ mod pending_tests {
                 target_total_size,
                 open_remaining_size,
                 price,
+                spread,
             ));
             if self.modify_should_fail.load(Ordering::SeqCst) {
                 return Err(DexError::Permanent("amend unsupported (test)".to_string()));
@@ -2065,6 +2076,7 @@ mod pending_tests {
                 side: OrderSide::Long,
                 limit_price: None,
                 reference_price: None,
+                post_only: false,
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
@@ -2131,6 +2143,7 @@ mod pending_tests {
                 side: OrderSide::Long,
                 limit_price: None,
                 reference_price: None,
+                post_only: false,
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
@@ -2177,8 +2190,77 @@ mod pending_tests {
         assert_eq!(modify_calls[0].2, dec("0.05")); // target_total
         assert_eq!(modify_calls[0].3, dec("0.03")); // open_remaining (capped)
         assert_eq!(modify_calls[0].4, Some(dec("100.0")));
+        assert_eq!(modify_calls[0].5, None); // non-post-only leg → plain limit
 
         // No cancel+reissue on the amend happy path.
+        assert!(connector.calls.lock().unwrap().is_empty());
+        assert_eq!(connector.cancel_order_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // bot-strategy#471: Extended's edit endpoint only permits price/size
+    // changes — an edit that flips postOnly is rejected wholesale with 1133
+    // InvalidOrderParameters (every first-retry amend of a post-only entry
+    // leg failed this way on the 2026-06-09..12 Tokyo soak). The amend must
+    // re-assert the original order's post-only flag (spread Some(-2)) and
+    // carry it onto the rebuilt continuing leg so later amends of the same
+    // leg stay consistent.
+    #[tokio::test]
+    async fn amend_post_only_leg_reasserts_post_only() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector.clone());
+        let pending = PendingOrders {
+            legs: vec![PendingLeg {
+                symbol: "AAA".to_string(),
+                order_id: "leg1".to_string(),
+                exchange_order_id: None,
+                target: dec("0.05"),
+                filled: Decimal::ZERO,
+                side: OrderSide::Long,
+                limit_price: Some(dec("100.0")),
+                reference_price: None,
+                post_only: true,
+            }],
+            direction: PositionDirection::LongSpread,
+            placed_at: Instant::now(),
+            placed_ts_ms: 0,
+            hedge_retry_count: 0,
+            post_only_hybrid: true,
+            exit_taker_takeover_at: None,
+        };
+        let mut price_map = HashMap::new();
+        price_map.insert(
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("100.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        );
+        let filled_qtys = HashMap::from([(pending.legs[0].order_id.clone(), dec("0.02"))]);
+
+        let result = engine
+            .reissue_partial_legs(&pending, &filled_qtys, &price_map, false, false, 0, true)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let modify_calls = connector.modify_calls.lock().unwrap();
+        assert_eq!(modify_calls.len(), 1);
+        // Post-only re-asserted: spread Some(-2) with a maker price (the
+        // mock ticker has no book, so the price_map limit is the fallback).
+        assert_eq!(modify_calls[0].4, Some(dec("100.0")));
+        assert_eq!(modify_calls[0].5, Some(-2));
+        // The continuing leg still knows it rests post-only.
+        assert_eq!(result.legs.len(), 1);
+        assert!(result.legs[0].post_only);
+        // Happy path: no cancel+reissue fired.
         assert!(connector.calls.lock().unwrap().is_empty());
         assert_eq!(connector.cancel_order_calls.load(Ordering::SeqCst), 0);
     }
@@ -2202,6 +2284,7 @@ mod pending_tests {
                 side: OrderSide::Long,
                 limit_price: None,
                 reference_price: None,
+                post_only: false,
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
@@ -2265,6 +2348,7 @@ mod pending_tests {
                 side: OrderSide::Long,
                 limit_price: None,
                 reference_price: None,
+                post_only: false,
             }],
             direction: PositionDirection::LongSpread,
             placed_at: Instant::now(),
@@ -2812,6 +2896,7 @@ mod pending_tests {
             side: OrderSide::Long,
             limit_price: None,
             reference_price: None,
+            post_only: false,
         }];
         let partial_err: anyhow::Error = state::PartialOrderPlacementError::new(
             placed_legs.clone(),
@@ -2857,6 +2942,7 @@ mod pending_tests {
             side: OrderSide::Short,
             limit_price: None,
             reference_price: None,
+            post_only: false,
         }];
         let partial_err: anyhow::Error = state::PartialOrderPlacementError::new(
             placed_legs,

@@ -90,6 +90,13 @@ pub(super) struct PendingLeg {
     /// 4-B-2) so taker fallbacks — where `limit_price = None` — still
     /// produce a measurable adverse-slippage signal.
     pub(super) reference_price: Option<Decimal>,
+    /// Whether the resting order was placed post-only (maker). The amend
+    /// path (bot-strategy#471) must re-assert this flag verbatim:
+    /// Extended's cancel-replace edit only permits price/size changes, and
+    /// an edit that flips postOnly is rejected wholesale with code 1133
+    /// InvalidOrderParameters — observed on every first-retry amend of a
+    /// post-only entry leg during the 2026-06-09..12 Tokyo soak.
+    pub(super) post_only: bool,
 }
 
 #[derive(Debug)]

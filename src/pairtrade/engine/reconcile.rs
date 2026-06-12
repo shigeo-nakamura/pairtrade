@@ -464,6 +464,7 @@ impl PairTradeEngine {
                                 side: leg.side,
                                 limit_price: None,
                                 reference_price: ref_price_retry,
+                                post_only: false,
                             });
                             log::warn!(
                                 "[ORDER] Retrying exit leg {} size={} mode=MARKET",
@@ -523,6 +524,7 @@ impl PairTradeEngine {
                                                     side: leg.side,
                                                     limit_price: None,
                                                     reference_price: ref_price_retry,
+                                                    post_only: false,
                                                 });
                                                 log::warn!(
                                                     "[ORDER] Retrying exit leg {} size={} mode=MARKET (sized down from {})",
@@ -1277,6 +1279,7 @@ mod tests {
             side: OrderSide::Long,
             limit_price: None,
             reference_price: None,
+            post_only: false,
         }
     }
 
@@ -1295,6 +1298,7 @@ mod tests {
             side: OrderSide::Long,
             limit_price: None,
             reference_price: None,
+            post_only: false,
         }
     }
 
