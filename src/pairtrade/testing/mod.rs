@@ -1,0 +1,155 @@
+use super::config::{self, PairParams, PairSpec};
+use super::defaults::*;
+use super::engine::risk::risk_state_path_for;
+use super::{funding_history, PairTradeConfig, PairTradeEngine, StrategyInstance, WarmStartMode};
+use dex_connector::DexConnector;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+impl PairTradeEngine {
+    /// Construct a single-instance, no-state engine wired to `connector`.
+    /// Universe = AAA/BBB, dry_run=true, default PairParams. Tests that
+    /// need pair state seed `engine.instances[0].states` directly.
+    /// `pub(in crate::pairtrade)` so cluster-module tests under
+    /// `engine/<x>.rs` can drive engine state-mutation paths without
+    /// duplicating the constructor. bot-strategy#396.
+    pub(in crate::pairtrade) fn test_instance(
+        connector: Arc<dyn DexConnector + Send + Sync>,
+    ) -> Self {
+        let cfg = PairTradeConfig {
+            dex_name: "test".to_string(),
+            rest_endpoint: "http://localhost".to_string(),
+            web_socket_endpoint: "ws://localhost".to_string(),
+            dry_run: true,
+            agent_name: None,
+            interval_secs: 1,
+            trading_period_secs: 1,
+            metrics_window: 1,
+            net_funding_min_per_hour: 0.0,
+            risk_pct_per_trade: 0.01,
+            equity_reference_usd: DEFAULT_EQUITY_USD,
+            universe: vec![PairSpec {
+                base: "AAA".to_string(),
+                quote: "BBB".to_string(),
+            }],
+            slippage_bps: 0,
+            fee_bps: 0.0,
+            max_leverage: 1.0,
+            max_active_pairs: 1,
+            warm_start_mode: WarmStartMode::Strict,
+            order_timeout_secs: DEFAULT_ORDER_TIMEOUT_SECS,
+            entry_partial_fill_max_retries: DEFAULT_ENTRY_PARTIAL_FILL_MAX_RETRIES,
+            entry_partial_fill_giveup_retries: DEFAULT_ENTRY_PARTIAL_FILL_GIVEUP_RETRIES,
+            startup_force_close_attempts: DEFAULT_STARTUP_FORCE_CLOSE_ATTEMPTS,
+            startup_force_close_wait_secs: DEFAULT_STARTUP_FORCE_CLOSE_WAIT_SECS,
+            force_close_on_startup: false,
+            enable_data_dump: false,
+            data_dump_file: None,
+            observe_only: false,
+            disable_history_persist: true,
+            history_file: "test-history.json".to_string(),
+            history_archive_dir: None,
+            history_archive_retention_days: 14,
+            backtest_mode: false,
+            backtest_file: None,
+            bt_warm_start_snapshot: None,
+            bt_eval_timestamps: None,
+            bt_restart_timestamps: None,
+            shutdown_grace_secs: 0,
+            pair_params: HashMap::new(),
+            default_pair_params: PairParams {
+                entry_z_base: 2.0,
+                entry_z_min: 1.8,
+                entry_z_max: 2.3,
+                exit_z: 0.5,
+                stop_loss_z: 3.0,
+                force_close_secs: 60,
+                cooldown_secs: 1,
+                max_loss_r_mult: 1.0,
+                half_life_max_hours: 1.0,
+                adf_p_threshold: 0.05,
+                spread_velocity_max_sigma_per_min: 0.1,
+                lookback_hours_short: 1,
+                lookback_hours_long: 1,
+                entry_vol_lookback_hours: 1,
+                warm_start_min_bars: 1,
+                hedge_ratio_max_deviation: 1.0,
+                ..PairParams::default()
+            },
+            strategies: Vec::new(),
+            use_kalman_beta: DEFAULT_USE_KALMAN_BETA,
+            kalman_q: DEFAULT_KALMAN_Q,
+            kalman_r: DEFAULT_KALMAN_R,
+            kalman_initial_p: DEFAULT_KALMAN_INITIAL_P,
+            kalman_min_updates: DEFAULT_KALMAN_MIN_UPDATES,
+            regime_vol_window: DEFAULT_REGIME_VOL_WINDOW,
+            regime_vol_max: DEFAULT_REGIME_VOL_MAX,
+            regime_trend_window: DEFAULT_REGIME_TREND_WINDOW,
+            regime_trend_max: DEFAULT_REGIME_TREND_MAX,
+            regime_reference_symbol: DEFAULT_REGIME_REFERENCE_SYMBOL.to_string(),
+            bt_fill_delay_secs: 0,
+            risk: config::RiskConfig::default(),
+            round_id: None,
+        };
+
+        let history_path = PathBuf::from(cfg.history_file.as_str());
+        let risk_state_path = risk_state_path_for(&history_path);
+
+        Self {
+            cfg,
+            connector: connector.clone(),
+            per_pair_state: HashMap::new(),
+            instances: vec![StrategyInstance {
+                id: "default".to_string(),
+                connector,
+                equity_cache: DEFAULT_EQUITY_USD,
+                last_equity_fetch: None,
+                equity_initialized: false,
+                equity_reference_usd: DEFAULT_EQUITY_USD,
+                states: HashMap::new(),
+                pnl_logger: None,
+                status_reporter: None,
+                consecutive_losses: 0,
+                circuit_breaker_until: None,
+                circuit_breaker_until_ts: None,
+                session_start_equity: 0.0,
+                session_start_ts: 0,
+                realized_pnl_today: 0.0,
+                funding_carry_today: 0.0,
+                daily_loss_halted: false,
+                equity_samples: Vec::new(),
+                session_halted: false,
+                session_halt_reason: None,
+                session_halt_ts: None,
+                total_trades: 0,
+                total_wins: 0,
+                total_pnl: 0.0,
+                peak_pnl: 0.0,
+                max_dd: 0.0,
+                pair_params: HashMap::new(),
+                default_pair_params: PairParams::default(),
+            }],
+            history: HashMap::new(),
+            bar_builders: HashMap::new(),
+            last_metrics_log: None,
+            last_ob_warn: HashMap::new(),
+            last_ticker_warn: HashMap::new(),
+            last_position_warn: HashMap::new(),
+            min_order_warned: HashSet::new(),
+            min_tick_warned: HashSet::new(),
+            positions_ready: false,
+            open_positions: HashMap::new(),
+            history_path,
+            risk_state_path,
+            kill_switch_active: false,
+            data_dump_writer: None,
+            replay_connector: None,
+            funding_history: funding_history::FundingHistory::new(),
+            shutdown_pending: false,
+            bar_emit_log: HashMap::new(),
+            last_bar_rate_warn: HashMap::new(),
+            last_warm_start_key: None,
+        }
+    }
+}
