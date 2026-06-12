@@ -3068,6 +3068,28 @@ mod pending_tests {
         );
     }
 
+    /// Normal exits must carry `close_reason` in the pnl record so
+    /// attribution tooling can recover close reasons beyond journal
+    /// retention (bot-strategy#514 / #531).
+    #[test]
+    fn exit_record_serializes_close_reason_without_recovery_fields() {
+        let record = PnlLogRecord::new(
+            "BTC",
+            "ETH",
+            PositionDirection::LongSpread,
+            1.5,
+            1_700_000_000,
+            "exit_fill",
+        )
+        .with_close_reason("ineligible");
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(json["source"], "exit_fill");
+        assert_eq!(json["close_reason"], "ineligible");
+        assert!(json.get("recovery_reason").is_none());
+        assert!(json.get("pnl_available").is_none());
+    }
+
     #[test]
     fn recovery_no_pnl_record_logs_context_without_trade_stats() {
         use tempfile::TempDir;
