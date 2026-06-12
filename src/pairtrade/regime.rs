@@ -247,6 +247,11 @@ pub(super) struct RegimeDetector {
     /// crossed and no transition log is emitted.
     peak_cusum: f64,
     peak_cusum_ts: Option<i64>,
+    /// Highest CUSUM observed since the last `take_interval_peak` call.
+    /// Drives the periodic `[REGIME_SHADOW]` series log so threshold
+    /// calibration sees the per-interval envelope, not just the sampled
+    /// point value (the CUSUM can spike and decay between samples).
+    interval_peak: f64,
 }
 
 impl RegimeDetector {
@@ -304,6 +309,9 @@ impl RegimeDetector {
             self.peak_cusum = stat;
             self.peak_cusum_ts = Some(now_ts);
         }
+        if stat > self.interval_peak {
+            self.interval_peak = stat;
+        }
 
         if !self.active {
             if stat >= CUSUM_H_ON {
@@ -343,6 +351,16 @@ impl RegimeDetector {
 
     pub(super) fn peak_cusum_ts(&self) -> Option<i64> {
         self.peak_cusum_ts
+    }
+
+    /// Highest CUSUM since the previous call, for the periodic
+    /// `[REGIME_SHADOW]` series log. Resets the tracker to the *current*
+    /// statistic so the next interval's peak starts from the present level
+    /// rather than zero.
+    pub(super) fn take_interval_peak(&mut self) -> f64 {
+        let peak = self.interval_peak;
+        self.interval_peak = self.cusum;
+        peak
     }
 
     /// Seconds the detector has been continuously active, or 0 when
@@ -631,6 +649,44 @@ mod tests {
             "the spike+reversal pair must decay (not grow) the CUSUM: {} !< {}",
             det.cusum(),
             pre,
+        );
+    }
+
+    #[test]
+    fn interval_peak_tracks_max_and_resets_to_current() {
+        let mut det = RegimeDetector::default();
+        let scale = 1e-3;
+        let mut ts = warmup(&mut det, scale, 0);
+
+        // Build the CUSUM up with sustained elevated bars, then let it decay
+        // with quiet bars. The interval peak must remember the high-water
+        // mark even after the decay.
+        for _ in 0..6 {
+            det.update(3.0 * scale, ts);
+            ts += 60;
+        }
+        let high = det.cusum();
+        assert!(high > 0.0, "elevated bars must accumulate (cusum={high})");
+        for i in 0..4 {
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            det.update(sign * scale, ts);
+            ts += 60;
+        }
+        let decayed = det.cusum();
+        assert!(decayed < high, "quiet bars must decay the cusum");
+
+        let peak = det.take_interval_peak();
+        assert!(
+            (peak - high).abs() < 1e-12,
+            "interval peak {peak} must equal the high-water mark {high}",
+        );
+        // After the take, the tracker restarts from the *current* statistic,
+        // not zero: a second take with no further updates returns the
+        // decayed level.
+        let peak2 = det.take_interval_peak();
+        assert!(
+            (peak2 - decayed).abs() < 1e-12,
+            "post-reset peak {peak2} must equal the current statistic {decayed}",
         );
     }
 
