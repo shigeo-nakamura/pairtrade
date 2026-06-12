@@ -3,6 +3,7 @@ pub(super) mod eval_helpers;
 pub(super) mod persistence;
 pub(super) mod placement;
 pub(super) mod plan;
+pub(super) mod prom_metrics;
 pub(super) mod reconcile;
 pub(super) mod recovery;
 pub(super) mod risk;
