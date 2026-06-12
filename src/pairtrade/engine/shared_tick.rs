@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use dex_connector::PriceUpdate;
 use rust_decimal::prelude::ToPrimitive;
@@ -222,7 +222,7 @@ impl PairTradeEngine {
             if !(updated.contains(&pair.base) && updated.contains(&pair.quote)) {
                 continue;
             }
-            self.step_pair_shared(pair, &key, now_ts_shared);
+            self.step_pair_shared(pair, &key, now_ts_shared)?;
         }
 
         self.persist_history_to_disk();
@@ -237,12 +237,12 @@ impl PairTradeEngine {
     /// β / spread_history / std / z. Emits the canonical [ZCHECK] +
     /// [KALMAN] diagnostic logs once per pair per tick (was 3× per tick
     /// pre-#413).
-    fn step_pair_shared(&mut self, pair: &PairSpec, key: &str, now_ts: i64) {
+    fn step_pair_shared(&mut self, pair: &PairSpec, key: &str, now_ts: i64) -> Result<()> {
         let Some(log_a) = self.latest_log_price(&pair.base) else {
-            return;
+            return Ok(());
         };
         let Some(log_b) = self.latest_log_price(&pair.quote) else {
-            return;
+            return Ok(());
         };
         let hist_a_prev = self
             .history
@@ -259,7 +259,7 @@ impl PairTradeEngine {
         let metrics_window = self.cfg.metrics_window;
         {
             let Some(shared) = self.per_pair_state.get_mut(key) else {
-                return;
+                return Ok(());
             };
             // Per-bar log-return deltas, shared by the Kalman update and the
             // innovation-responsive regime detector. Needs a prior bar
@@ -330,6 +330,26 @@ impl PairTradeEngine {
                     );
                     shared.last_regime_shadow_ts = Some(now_ts);
                 }
+                // bot-strategy#534: per-tick raw series for offline governor
+                // calibration. The 300s shadow cadence cannot rebuild an
+                // alternative (e.g. dual-timescale) statistic; that needs
+                // the raw innovation at every tick.
+                if let Some(writer) = self.regime_series_writer.as_mut() {
+                    use std::io::Write;
+                    writeln!(
+                        writer,
+                        "{},{},{:.6e},{:.6},{:.6e},{:.4},{:.4},{}",
+                        now_ts,
+                        key,
+                        innovation,
+                        beta,
+                        shared.regime.residual_scale(),
+                        shared.regime.last_normalized(),
+                        shared.regime.cusum(),
+                        u8::from(shared.regime.is_active()),
+                    )
+                    .context("write BT_REGIME_SERIES_FILE")?;
+                }
             }
             let spread = log_a - shared.beta * log_b;
             shared.push_spread(spread, metrics_window, &self.cfg);
@@ -338,7 +358,7 @@ impl PairTradeEngine {
         // Snapshot derived state post-push.
         let (z_snapshot, velocity, prev_eligible, last_eval_ts) = {
             let Some(shared) = self.per_pair_state.get(key) else {
-                return;
+                return Ok(());
             };
             (
                 shared.z_score_details(),
@@ -567,6 +587,7 @@ impl PairTradeEngine {
                 }
             }
         }
+        Ok(())
     }
 
     /// Feed a single WebSocket price tick into the BarBuilder for `symbol`,

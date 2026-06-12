@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use dex_connector::{DexConnector, PositionSnapshot};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -223,6 +223,10 @@ pub struct PairTradeEngine {
     /// entries across all instances.
     kill_switch_active: bool,
     data_dump_writer: Option<data_dump::RotatingDumpWriter>,
+    /// Per-tick regime-detector series CSV writer (BT calibration aid for
+    /// bot-strategy#534/#494). `Some` only when `cfg.bt_regime_series_file`
+    /// is set; flushed at backtest end-of-data.
+    regime_series_writer: Option<std::io::BufWriter<std::fs::File>>,
     replay_connector: Option<Arc<ReplayConnector>>,
     /// Rolling per-symbol funding-rate history observed from WS, used by
     /// `exit_fill` to compute `funding_carry_usd` on each cycle without an
@@ -309,6 +313,27 @@ impl PairTradeEngine {
             Some(data_dump::RotatingDumpWriter::new(file_path)?)
         } else {
             None
+        };
+        let regime_series_writer = match cfg.bt_regime_series_file.as_deref() {
+            Some(path) => {
+                // Backtest-only output: a non-rotating per-tick file must not
+                // be creatable by an accidentally inherited env in live mode.
+                if !cfg.backtest_mode {
+                    return Err(anyhow!(
+                        "BT_REGIME_SERIES_FILE is set but BACKTEST_MODE is not — refusing to \
+                         write a non-rotating per-tick series file in live mode"
+                    ));
+                }
+                use std::io::Write;
+                let mut writer = std::io::BufWriter::new(
+                    std::fs::File::create(path)
+                        .with_context(|| format!("create BT_REGIME_SERIES_FILE {path}"))?,
+                );
+                writeln!(writer, "ts,key,innovation,beta,scale,norm,cusum,active")
+                    .context("write BT_REGIME_SERIES_FILE header")?;
+                Some(writer)
+            }
+            None => None,
         };
 
         let backtest_mode = cfg.backtest_mode;
@@ -431,6 +456,7 @@ impl PairTradeEngine {
             risk_state_path,
             kill_switch_active: false,
             data_dump_writer,
+            regime_series_writer,
             funding_history: funding_history::FundingHistory::new(),
             shutdown_pending: false,
             bar_emit_log: HashMap::new(),

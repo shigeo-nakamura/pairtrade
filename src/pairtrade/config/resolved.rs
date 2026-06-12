@@ -82,6 +82,14 @@ pub struct PairTradeConfig {
     /// many replay-seconds, keeping the position "held" during the delay.
     /// Env: BT_FILL_DELAY_SECS (default 0 = legacy instant-fill).
     pub bt_fill_delay_secs: i64,
+    /// Path for a per-tick regime-detector series dump (CSV). When set,
+    /// every shared-tick regime update appends one row of
+    /// `ts,key,innovation,beta,scale,norm,cusum,active`. Calibration aid
+    /// for bot-strategy#534/#494: the 300s `[REGIME_SHADOW]` cadence is
+    /// too coarse to rebuild alternative (e.g. dual-timescale) statistics
+    /// offline, which needs the raw innovation at every tick.
+    /// Env: BT_REGIME_SERIES_FILE.
+    pub bt_regime_series_file: Option<String>,
     /// All per-pair tunables — z-score thresholds, hedge gates, lookback
     /// windows, circuit-breaker tiers, Phase 2 filters — live here. Engine
     /// reads them via `params_for(key)` so per-pair YAML overrides win.
