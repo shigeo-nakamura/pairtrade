@@ -21,7 +21,7 @@ use super::super::market::{liquidity_score, net_funding_for_direction, SymbolSna
 use super::super::state::PositionDirection;
 use super::super::stats::spread_slope_sigma;
 use super::super::PairTradeEngine;
-use super::step::StepSetup;
+use super::gating::StepSetup;
 
 pub(super) struct PlannedAction {
     pub(super) pair: PairSpec,

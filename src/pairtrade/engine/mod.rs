@@ -1,5 +1,7 @@
 pub(super) mod error_class;
 pub(super) mod eval_helpers;
+pub(super) mod execute;
+pub(super) mod gating;
 pub(super) mod persistence;
 pub(super) mod placement;
 pub(super) mod plan;
