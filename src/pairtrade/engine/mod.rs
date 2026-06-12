@@ -7,4 +7,6 @@ pub(super) mod prom_metrics;
 pub(super) mod reconcile;
 pub(super) mod recovery;
 pub(super) mod risk;
+pub(super) mod shared_tick;
+pub(super) mod status_snapshot;
 pub(super) mod step;
