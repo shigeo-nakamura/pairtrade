@@ -9,7 +9,29 @@
 /// and `sudo rm /opt/debot/KILL_SWITCH` to release. Engages at the top
 /// of every `step_shared` tick, so reaction latency matches
 /// `interval_secs`. See bot-strategy#185 Phase 1-2.
-pub(in crate::pairtrade) const KILL_SWITCH_PATH: &str = "/opt/debot/KILL_SWITCH";
+///
+/// Overridable via the `KILL_SWITCH_PATH` env var (same pattern as
+/// `RISK_ACK_PATH`, bot-strategy#488) so multi-bot hosts can engage a
+/// per-bot kill switch and the halt-gate integration tests
+/// (bot-strategy#537) can exercise the sentinel without touching
+/// `/opt/debot/`. Resolved once at process start.
+const DEFAULT_KILL_SWITCH_PATH: &str = "/opt/debot/KILL_SWITCH";
+
+pub(in crate::pairtrade) fn kill_switch_path() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| resolve_kill_switch_path(std::env::var("KILL_SWITCH_PATH").ok()))
+        .as_str()
+}
+
+/// Pure resolver for the kill-switch sentinel path; same env precedence
+/// rules as `resolve_risk_ack_path` below (present + non-blank env wins,
+/// unset or blank falls back to the default).
+fn resolve_kill_switch_path(env_val: Option<String>) -> String {
+    match env_val {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => DEFAULT_KILL_SWITCH_PATH.to_string(),
+    }
+}
 
 /// Manual-ack sentinel for clearing a session-DD halt (Phase 3-2). Drop
 /// this file (any contents) on the host to lift the halt; the bot
@@ -44,7 +66,30 @@ fn resolve_risk_ack_path(env_val: Option<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_risk_ack_path, DEFAULT_RISK_ACK_PATH};
+    use super::{
+        resolve_kill_switch_path, resolve_risk_ack_path, DEFAULT_KILL_SWITCH_PATH,
+        DEFAULT_RISK_ACK_PATH,
+    };
+
+    #[test]
+    fn resolve_kill_switch_path_prefers_env_then_falls_back() {
+        // bot-strategy#537: env override for per-bot kill switches and
+        // for the halt-gate integration tests...
+        assert_eq!(
+            resolve_kill_switch_path(Some("/opt/debot-canary/KILL_SWITCH".to_string())),
+            "/opt/debot-canary/KILL_SWITCH"
+        );
+        // ...while unset / blank preserves the historical path.
+        assert_eq!(resolve_kill_switch_path(None), DEFAULT_KILL_SWITCH_PATH);
+        assert_eq!(
+            resolve_kill_switch_path(Some(String::new())),
+            DEFAULT_KILL_SWITCH_PATH
+        );
+        assert_eq!(
+            resolve_kill_switch_path(Some("   ".to_string())),
+            DEFAULT_KILL_SWITCH_PATH
+        );
+    }
 
     #[test]
     fn resolve_risk_ack_path_prefers_env_then_falls_back() {

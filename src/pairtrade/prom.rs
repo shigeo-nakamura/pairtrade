@@ -743,14 +743,30 @@ mod tests {
 
     #[test]
     fn step_duration_histogram_has_expected_buckets() {
+        // The histogram is process-global and the halt-gate integration
+        // tests (bot-strategy#537) drive real `step()` ticks that observe
+        // into it concurrently, so assert on the delta produced by our own
+        // observation rather than an absolute sample count.
+        fn sample_count() -> u64 {
+            let metric = REGISTRY
+                .gather()
+                .into_iter()
+                .find(|family| family.get_name() == "pairtrade_step_duration_seconds")
+                .expect("step duration metric should be registered");
+            metric.get_metric()[0].get_histogram().get_sample_count()
+        }
+        let before = sample_count();
         STEP_DURATION_SECONDS.with_label_values(&[]).observe(0.5);
+        assert!(
+            sample_count() >= before + 1,
+            "our observation must land in the registered histogram"
+        );
         let metric = REGISTRY
             .gather()
             .into_iter()
             .find(|family| family.get_name() == "pairtrade_step_duration_seconds")
             .expect("step duration metric should be registered");
         let histogram = metric.get_metric()[0].get_histogram();
-        assert_eq!(histogram.get_sample_count(), 1);
         assert!(histogram
             .get_bucket()
             .iter()

@@ -42,7 +42,7 @@ use bar::BarBuilder;
 pub use config::{DailyLossAction, PairTradeConfig, WarmStartMode};
 use market::SymbolSnapshot;
 use pnl_log::{PnlLogRecord, PnlLogger, PnlTradeDetails};
-pub(in crate::pairtrade) use sentinel::{risk_ack_path, KILL_SWITCH_PATH};
+pub(in crate::pairtrade) use sentinel::{kill_switch_path, risk_ack_path};
 use stats::PriceSample;
 
 /// Spawn the Prometheus exporter when `PROM_LISTEN` is set in the env.
@@ -218,7 +218,7 @@ pub struct PairTradeEngine {
     /// Path for the risk-state persistence file (circuit breaker counters
     /// + cool-down deadline). Sibling of `history_path`. See bot-strategy#185.
     risk_state_path: PathBuf,
-    /// Cached result of the most recent `KILL_SWITCH_PATH` existence check.
+    /// Cached result of the most recent `kill_switch_path()` existence check.
     /// Refreshed at the top of every `step_shared` tick. True blocks new
     /// entries across all instances.
     kill_switch_active: bool,
@@ -1124,6 +1124,9 @@ impl PairTradeEngine {
     }
 }
 
+#[cfg(test)]
+#[path = "testing/halt_gate_tests.rs"]
+mod halt_gate_tests;
 #[cfg(test)]
 #[path = "testing/pending_tests.rs"]
 mod pending_tests;
