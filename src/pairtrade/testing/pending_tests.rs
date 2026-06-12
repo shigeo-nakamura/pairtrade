@@ -191,6 +191,19 @@ impl DexConnector for DummyConnector {
         Err(DexError::Permanent("not used".to_string()))
     }
 
+    // Required since bot-strategy#536 (no trait default): tests never use
+    // the IOC taker path.
+    async fn create_order_taker_ioc(
+        &self,
+        _symbol: &str,
+        _size: Decimal,
+        _side: OrderSide,
+        _slippage_bps: u32,
+        _reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        Err(DexError::Permanent("not used".to_string()))
+    }
+
     async fn modify_order(
         &self,
         symbol: &str,
@@ -286,6 +299,14 @@ impl DexConnector for DummyConnector {
 
     async fn sign_evm_65b_with_eip191(&self, _message: &str) -> Result<String, DexError> {
         Ok("signed".to_string())
+    }
+
+    // Required since bot-strategy#536 (no trait default): tests never
+    // subscribe to the push price feed.
+    fn subscribe_price_updates(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>, DexError> {
+        Err(DexError::Permanent("not used".to_string()))
     }
 }
 

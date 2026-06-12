@@ -27,13 +27,13 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rust_decimal::prelude::ToPrimitive;
 
+use super::super::kill_switch_path;
 use super::super::risk_ack_path;
 use super::super::risk_io;
 use super::super::status;
 use super::super::PairTradeEngine;
 use super::super::StrategyInstance;
 use super::super::EQUITY_REFRESH_CACHE_SECS;
-use super::super::KILL_SWITCH_PATH;
 
 impl PairTradeEngine {
     pub(in crate::pairtrade) fn daily_risk_snapshot(
@@ -367,29 +367,30 @@ impl PairTradeEngine {
         if self.cfg.backtest_mode {
             return;
         }
-        let present = std::path::Path::new(KILL_SWITCH_PATH).exists();
+        let sentinel = kill_switch_path();
+        let present = std::path::Path::new(sentinel).exists();
         if present && !self.kill_switch_active {
             log::warn!(
                 "[KILL_SWITCH] activated: {} detected; new entries blocked, existing positions will exit normally",
-                KILL_SWITCH_PATH
+                sentinel
             );
             self.kill_switch_active = true;
             self.record_risk_event_all_instances(
                 "kill_switch",
                 "activated",
-                Some(KILL_SWITCH_PATH.to_string()),
+                Some(sentinel.to_string()),
                 None,
             );
         } else if !present && self.kill_switch_active {
             log::warn!(
                 "[KILL_SWITCH] cleared: {} removed; new entries resumed",
-                KILL_SWITCH_PATH
+                sentinel
             );
             self.kill_switch_active = false;
             self.record_risk_event_all_instances(
                 "kill_switch",
                 "cleared",
-                Some(KILL_SWITCH_PATH.to_string()),
+                Some(sentinel.to_string()),
                 None,
             );
         }

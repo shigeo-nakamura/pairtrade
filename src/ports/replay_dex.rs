@@ -549,6 +549,46 @@ impl DexConnector for ReplayConnector {
     async fn sign_evm_65b_with_eip191(&self, message: &str) -> Result<String, DexError> {
         Ok(format!("signed_eip191:{}", message))
     }
+
+    // Required since bot-strategy#536 (no trait defaults): replay never
+    // exercises the IOC taker, amend or push price-feed paths.
+    async fn create_order_taker_ioc(
+        &self,
+        _symbol: &str,
+        _size: Decimal,
+        _side: OrderSide,
+        _slippage_bps: u32,
+        _reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        Err(DexError::Permanent(
+            "create_order_taker_ioc not supported in replay".to_string(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn modify_order(
+        &self,
+        _symbol: &str,
+        _order_id: &str,
+        _side: OrderSide,
+        _target_total_size: Decimal,
+        _open_remaining_size: Decimal,
+        _price: Option<Decimal>,
+        _spread: Option<i64>,
+        _reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        Err(DexError::Permanent(
+            "modify_order not supported in replay".to_string(),
+        ))
+    }
+
+    fn subscribe_price_updates(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>, DexError> {
+        Err(DexError::Permanent(
+            "subscribe_price_updates not supported in replay".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]
