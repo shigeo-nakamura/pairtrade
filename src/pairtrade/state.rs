@@ -253,6 +253,13 @@ pub(super) struct PairState {
     /// Persisted via `InstanceRiskState.last_stop_loss_per_pair` so the
     /// guard survives restart. bot-strategy#316.
     pub(super) last_stop_loss_at: Option<(PositionDirection, i64)>,
+    /// Set when a `recovery_no_pnl` context record has already been written
+    /// for the in-flight close (reconcile partial-fill / timeout recovery),
+    /// so the exchange-snapshot clear in `sync_positions_from_exchange` does
+    /// not emit a duplicate record for the same close. Reset whenever the
+    /// position is cleared or a new position is created. Not persisted.
+    /// bot-strategy#514.
+    pub(super) recovery_recorded: bool,
 }
 
 /// Deferred exit info for BT fill-delay simulation.
@@ -418,6 +425,7 @@ impl PairState {
             bt_deferred_exit: None,
             pending_exit_reason: None,
             last_stop_loss_at: None,
+            recovery_recorded: false,
         }
     }
 }

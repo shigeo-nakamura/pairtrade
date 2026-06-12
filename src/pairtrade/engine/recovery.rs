@@ -294,18 +294,24 @@ impl PairTradeEngine {
         Ok(())
     }
 
+    /// Returns `true` when the close is confirmed (positions already flat
+    /// on the exchange, or `close_all_positions` was submitted without
+    /// error). `false` means nothing was flattened (mode skip or connector
+    /// failure) — callers must not assume the exchange position is gone,
+    /// and in particular must not suppress the later exchange-snapshot
+    /// recovery record (bot-strategy#514).
     pub(in crate::pairtrade) async fn force_close_all_positions(
         &mut self,
         key: &str,
         reason: &str,
-    ) {
+    ) -> bool {
         if self.cfg.dry_run || self.cfg.observe_only {
             log::warn!(
                 "[EXIT] {} force close skipped (mode) reason={}",
                 key,
                 reason
             );
-            return;
+            return false;
         }
         if let Some((base, quote)) = key.split_once('/') {
             if let Ok(positions) = self.connector.get_positions().await {
@@ -322,7 +328,7 @@ impl PairTradeEngine {
                         key,
                         reason
                     );
-                    return;
+                    return true;
                 }
             }
         }
@@ -333,7 +339,9 @@ impl PairTradeEngine {
         );
         if let Err(err) = self.connector.close_all_positions(None).await {
             log::error!("[EXIT] close_all_positions failed: {:?}", err);
+            return false;
         }
+        true
     }
 
     pub(in crate::pairtrade) async fn sync_positions_from_exchange(
@@ -413,6 +421,11 @@ impl PairTradeEngine {
 
         let mut unhedged_attempted: HashSet<String> = HashSet::new();
         let mut unhedged_closures: Vec<(String, String, i32, Decimal)> = Vec::new();
+        // bot-strategy#514: (key, reason kind, position_guard after clear)
+        // for positions that vanished from the exchange snapshot. The clear
+        // is deferred past the loop so the recovery_no_pnl context record is
+        // written while the entry context (z/beta/hold) is still in state.
+        let mut cleared_positions: Vec<(String, &'static str, bool)> = Vec::new();
         for pair in &self.cfg.universe {
             let key = format!("{}/{}", pair.base, pair.quote);
             let log_warn = self.should_log_position_warn(&key);
@@ -434,8 +447,11 @@ impl PairTradeEngine {
                     if state.position.is_some() || state.position_guard {
                         log::info!("[POSITION] {} cleared by exchange snapshot", key);
                     }
-                    state.position = None;
-                    state.position_guard = false;
+                    if state.position.is_some() {
+                        cleared_positions.push((key.clone(), "exchange_snapshot_clear", false));
+                    } else {
+                        state.position_guard = false;
+                    }
                 }
                 (Some(b), Some(q)) => {
                     if b.sign * q.sign >= 0 {
@@ -450,8 +466,11 @@ impl PairTradeEngine {
                         if log_warn {
                             self.last_position_warn.insert(key.clone(), Instant::now());
                         }
-                        state.position = None;
-                        state.position_guard = true;
+                        if state.position.is_some() {
+                            cleared_positions.push((key.clone(), "mismatched_legs", true));
+                        } else {
+                            state.position_guard = true;
+                        }
                         continue;
                     }
 
@@ -528,6 +547,40 @@ impl PairTradeEngine {
                     if !active_for_warn {
                         state.position = None;
                     }
+                }
+            }
+        }
+
+        // bot-strategy#514: positions that vanished from the exchange
+        // snapshot without an in-flight strategy exit were closed
+        // out-of-band (risk-layer flatten, manual close, liquidation, or
+        // an earlier recovery close). Write a recovery_no_pnl context
+        // record before clearing local state so attribution keeps the
+        // z/beta/hold context. Skipped when the reconcile recovery path
+        // already recorded this close (`recovery_recorded`).
+        if !cleared_positions.is_empty() {
+            let flatten_reason = self.instances[inst_idx].external_flatten_reason.take();
+            for (key, kind, guard_after) in cleared_positions {
+                let record_direction = match self.instances[inst_idx].states.get(&key) {
+                    Some(state) => match state.position.as_ref() {
+                        Some(position) if !state.recovery_recorded => Some(position.direction),
+                        _ => None,
+                    },
+                    None => continue,
+                };
+                if let Some(direction) = record_direction {
+                    let reason = match kind {
+                        "exchange_snapshot_clear" => flatten_reason.as_deref().unwrap_or(kind),
+                        other => other,
+                    };
+                    self.write_recovery_no_pnl_record(
+                        inst_idx, &key, direction, reason, now_ts, prices,
+                    );
+                }
+                if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                    state.position = None;
+                    state.position_guard = guard_after;
+                    state.recovery_recorded = false;
                 }
             }
         }

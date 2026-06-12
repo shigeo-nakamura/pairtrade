@@ -331,9 +331,15 @@ impl PairTradeEngine {
                     now_ts,
                     price_map,
                 );
-                self.force_close_all_positions(key, "partial_fill").await;
+                let close_confirmed = self.force_close_all_positions(key, "partial_fill").await;
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.pending_exit = None;
+                    // bot-strategy#514: the context record above covers this
+                    // close; suppress the duplicate exchange-snapshot record —
+                    // but only when the close was actually confirmed. On a
+                    // failed close the position is still live on the exchange
+                    // and its eventual out-of-band close must still record.
+                    state.recovery_recorded = close_confirmed;
                 }
                 return Ok(());
             }
@@ -396,9 +402,15 @@ impl PairTradeEngine {
                     now_ts,
                     price_map,
                 );
-                self.force_close_all_positions(key, "timeout").await;
+                let close_confirmed = self.force_close_all_positions(key, "timeout").await;
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.pending_exit = None;
+                    // bot-strategy#514: the context record above covers this
+                    // close; suppress the duplicate exchange-snapshot record —
+                    // but only when the close was actually confirmed. On a
+                    // failed close the position is still live on the exchange
+                    // and its eventual out-of-band close must still record.
+                    state.recovery_recorded = close_confirmed;
                 }
                 return Ok(());
             }
@@ -624,6 +636,7 @@ impl PairTradeEngine {
                     prev_beta_for_velocity: None,
                 });
                 state.pending_entry = None;
+                state.recovery_recorded = false;
             }
             Self::observe_leg_execution_quality(
                 &self.instances[inst_idx].id,
@@ -965,6 +978,7 @@ impl PairTradeEngine {
                     state.pending_entry = None;
                     if flattened_any {
                         state.position = None;
+                        state.recovery_recorded = false;
                     }
                 }
             }

@@ -490,6 +490,10 @@ impl PairTradeEngine {
                 inst.session_halted = false;
                 inst.session_halt_reason = None;
                 inst.session_halt_ts = None;
+                // bot-strategy#514: drop any unconsumed flatten marker with
+                // the halt — after an ack the next snapshot clear belongs to
+                // a new incident and must not inherit this halt's reason.
+                inst.external_flatten_reason = None;
                 cleared_any = true;
                 cleared_indices.push((inst_idx, prior_reason));
             }
@@ -672,7 +676,7 @@ impl PairTradeEngine {
             inst_idx,
             "session_dd",
             "activated",
-            Some(reason),
+            Some(reason.clone()),
             Some(serde_json::json!({
                 "current_equity": current,
                 "peak_equity": peak,
@@ -698,6 +702,17 @@ impl PairTradeEngine {
                     "[SESSION_DD] {} close_all_positions invoked",
                     self.instances[inst_idx].id
                 );
+                // bot-strategy#514: tag the out-of-band flatten so the
+                // exchange-snapshot clear writes a recovery_no_pnl record
+                // with the real trigger instead of `exchange_snapshot_clear`.
+                // Armed only after a successful close submission AND only
+                // when a local position exists for the snapshot clear to
+                // consume it on — otherwise the one-shot marker would leak
+                // onto a future unrelated clear and mislabel it.
+                let inst_mut = &mut self.instances[inst_idx];
+                if inst_mut.states.values().any(|s| s.position.is_some()) {
+                    inst_mut.external_flatten_reason = Some(reason.clone());
+                }
             }
         }
         true
