@@ -71,6 +71,9 @@ SYMBOLS = [
     ("QQQ", 129),
     # Commodity
     ("XAU", 92),
+    ("XAG", 93),
+    ("WTI", 145),
+    ("BRENTOIL", 159),
 ]
 
 OUTPUT_FILE = "pair_data.jsonl"
