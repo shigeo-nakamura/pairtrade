@@ -334,6 +334,9 @@ impl PairTradeEngine {
                 self.force_close_all_positions(key, "partial_fill").await;
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.pending_exit = None;
+                    // bot-strategy#514: the context record above covers this
+                    // close; suppress the duplicate exchange-snapshot record.
+                    state.recovery_recorded = true;
                 }
                 return Ok(());
             }
@@ -399,6 +402,9 @@ impl PairTradeEngine {
                 self.force_close_all_positions(key, "timeout").await;
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                     state.pending_exit = None;
+                    // bot-strategy#514: the context record above covers this
+                    // close; suppress the duplicate exchange-snapshot record.
+                    state.recovery_recorded = true;
                 }
                 return Ok(());
             }
@@ -624,6 +630,7 @@ impl PairTradeEngine {
                     prev_beta_for_velocity: None,
                 });
                 state.pending_entry = None;
+                state.recovery_recorded = false;
             }
             Self::observe_leg_execution_quality(
                 &self.instances[inst_idx].id,
@@ -965,6 +972,7 @@ impl PairTradeEngine {
                     state.pending_entry = None;
                     if flattened_any {
                         state.position = None;
+                        state.recovery_recorded = false;
                     }
                 }
             }

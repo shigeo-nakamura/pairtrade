@@ -667,6 +667,10 @@ impl PairTradeEngine {
             inst_mut.session_halted = true;
             inst_mut.session_halt_reason = Some(reason.clone());
             inst_mut.session_halt_ts = Some(now_ts);
+            // bot-strategy#514: tag the upcoming out-of-band flatten so the
+            // exchange-snapshot clear writes a recovery_no_pnl record with
+            // the real trigger instead of `exchange_snapshot_clear`.
+            inst_mut.external_flatten_reason = Some(reason.clone());
         }
         self.record_risk_event_for_instance(
             inst_idx,

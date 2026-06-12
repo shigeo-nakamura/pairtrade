@@ -22,6 +22,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
@@ -45,7 +46,7 @@ use super::super::market::{
 use super::super::pair_eval;
 use super::super::pnl_log::PnlLogRecord;
 use super::super::regime;
-use super::super::state::{BtDeferredExit, PendingOrders, Position};
+use super::super::state::{BtDeferredExit, PendingOrders, Position, PositionDirection};
 use super::super::stats::PriceSample;
 use super::super::status::{ShutdownPosition, ShutdownStatus};
 use super::super::util::tail_std;
@@ -478,6 +479,45 @@ impl PairTradeEngine {
                 log::info!("[PAIR] Force-closing all open positions on shutdown");
                 if let Err(e) = self.connector.close_all_positions(None).await {
                     log::error!("[PAIR] close_all_positions on shutdown failed: {:?}", e);
+                } else if !self.cfg.dry_run && !self.cfg.observe_only {
+                    // bot-strategy#514: the shutdown bulk close realises DEX
+                    // PnL without flowing through reconcile, and the process
+                    // exits before the exchange-snapshot clear could record
+                    // it. Only instances on the canonical connector are
+                    // covered by this close_all_positions call, so only
+                    // record those. On failure the position survives and the
+                    // next boot's startup force close records it instead.
+                    let now_ts = self.current_now_ts();
+                    let to_record: Vec<(usize, String, PositionDirection)> = self
+                        .instances
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, inst)| Arc::ptr_eq(&inst.connector, &self.connector))
+                        .flat_map(|(idx, inst)| {
+                            inst.states.iter().filter_map(move |(key, state)| {
+                                state
+                                    .position
+                                    .as_ref()
+                                    .filter(|_| !state.recovery_recorded)
+                                    .map(|p| (idx, key.clone(), p.direction))
+                            })
+                        })
+                        .collect();
+                    let no_prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+                    for (idx, key, direction) in to_record {
+                        self.write_recovery_no_pnl_record(
+                            idx,
+                            &key,
+                            direction,
+                            "shutdown_force_close",
+                            now_ts,
+                            &no_prices,
+                        );
+                        if let Some(state) = self.instances[idx].states.get_mut(&key) {
+                            state.position = None;
+                            state.recovery_recorded = false;
+                        }
+                    }
                 }
             }
         }
@@ -1322,8 +1362,27 @@ impl PairTradeEngine {
                         "[EXIT] {} no open position sizes available; clearing state",
                         plan.key
                     );
+                    // bot-strategy#514: record the close context before the
+                    // position state is dropped — DEX-side accounting may
+                    // still realise PnL for whatever was actually open.
+                    let already_recorded = self.instances[inst_idx]
+                        .states
+                        .get(&plan.key)
+                        .map(|s| s.position.is_none() || s.recovery_recorded)
+                        .unwrap_or(true);
+                    if !already_recorded {
+                        self.write_recovery_no_pnl_record(
+                            inst_idx,
+                            &plan.key,
+                            direction,
+                            "no_exit_sizes",
+                            now_ts,
+                            price_map,
+                        );
+                    }
                     if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
                         state.position = None;
+                        state.recovery_recorded = false;
                         state.pending_exit = None;
                         state.position_guard = false;
                         state.last_exit_at = Some(Instant::now());
@@ -1782,6 +1841,7 @@ impl PairTradeEngine {
                             rehedge_realized_pnl: None,
                             prev_beta_for_velocity: None,
                         });
+                        state.recovery_recorded = false;
                         super::super::prom::LAST_ENTRY_Z
                             .with_label_values(&[&inst_id, plan.key.as_str()])
                             .set(z);

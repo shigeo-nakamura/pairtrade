@@ -1521,3 +1521,166 @@ async fn force_close_all_positions_dry_run_skips_connector_calls() {
         "dry_run must not invoke close_all_positions"
     );
 }
+
+/// bot-strategy#514 helpers: a PairState holding an open LongSpread
+/// position with full entry context, as the recovery-record paths see it.
+fn seeded_position_state() -> PairState {
+    let mut state = PairState::new(2.0);
+    state.position = Some(super::state::Position {
+        direction: PositionDirection::LongSpread,
+        entered_at: Instant::now(),
+        entered_ts: 1_700_000_000,
+        entry_price_a: Some(dec("100")),
+        entry_price_b: Some(dec("50")),
+        entry_size_a: Some(dec("0.01")),
+        entry_size_b: Some(dec("0.02")),
+        entry_z: Some(2.4),
+        entry_beta: Some(1.2),
+        last_rehedge_ts: None,
+        rehedge_realized_pnl: None,
+        prev_beta_for_velocity: None,
+    });
+    state
+}
+
+fn read_single_pnl_record(dir: &std::path::Path) -> serde_json::Value {
+    let path = std::fs::read_dir(dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let content = std::fs::read_to_string(path).unwrap();
+    let mut lines = content.lines();
+    let json: serde_json::Value = serde_json::from_str(lines.next().unwrap().trim()).unwrap();
+    assert!(lines.next().is_none(), "expected exactly one pnl record");
+    json
+}
+
+#[tokio::test]
+async fn snapshot_clear_writes_recovery_record_and_clears_position() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    let mut state = seeded_position_state();
+    state.pending_exit_reason = Some("ineligible");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "recovery_no_pnl");
+    assert_eq!(json["pnl_available"], false);
+    assert_eq!(json["recovery_reason"], "exchange_snapshot_clear");
+    assert_eq!(json["close_reason"], "ineligible");
+    assert_eq!(json["direction"], "long_spread");
+    assert_eq!(json["z_entry"], 2.4);
+
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.position.is_none());
+    assert!(!state.position_guard);
+    assert!(!state.recovery_recorded);
+}
+
+#[tokio::test]
+async fn snapshot_clear_skips_duplicate_after_recovery_record() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    let mut state = seeded_position_state();
+    // Reconcile's partial-fill / timeout recovery already wrote the
+    // context record for this close.
+    state.recovery_recorded = true;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "no duplicate record expected"
+    );
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.position.is_none());
+    assert!(!state.recovery_recorded, "flag must reset on clear");
+}
+
+#[tokio::test]
+async fn snapshot_clear_tags_external_flatten_reason() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    engine.instances[0].external_flatten_reason = Some("session_dd_50bps_lev5.0".to_string());
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["recovery_reason"], "session_dd_50bps_lev5.0");
+    assert!(
+        engine.instances[0].external_flatten_reason.is_none(),
+        "one-shot marker must be consumed"
+    );
+}
+
+#[test]
+fn stale_pending_clear_writes_recovery_record() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    let dir = TempDir::new().unwrap();
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    let mut state = seeded_position_state();
+    state.pending_exit = Some(PendingOrders {
+        legs: Vec::new(),
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+
+    engine.clear_stale_pending(0, std::time::Duration::from_secs(0), "ws_not_ready");
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "recovery_no_pnl");
+    assert_eq!(json["recovery_reason"], "stale_pending_ws_not_ready");
+
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.position.is_none());
+    assert!(state.pending_exit.is_none());
+}

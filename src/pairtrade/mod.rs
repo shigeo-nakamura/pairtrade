@@ -82,6 +82,7 @@ pub(in crate::pairtrade) fn apply_post_exit_state(
     pair: &str,
 ) {
     state.position = None;
+    state.recovery_recorded = false;
     state.last_exit_at = Some(Instant::now());
     state.last_exit_ts = Some(now_ts);
     // Capture the z observed at exit before the post-take pending_exit_reason
@@ -184,6 +185,14 @@ struct StrategyInstance {
     /// `PairTradeEngine::pair_params_for(inst_idx, key)`.
     pair_params: HashMap<String, PairParams>,
     default_pair_params: PairParams,
+    /// One-shot reason marker set when the risk layer flattens this
+    /// instance's positions outside the strategy exit path (e.g. the
+    /// session-DD halt). Consumed by `sync_positions_from_exchange` when
+    /// the exchange snapshot confirms the positions are gone, so the
+    /// `recovery_no_pnl` context record carries the real trigger instead
+    /// of the generic `exchange_snapshot_clear`. Not persisted.
+    /// bot-strategy#514.
+    external_flatten_reason: Option<String>,
 }
 
 pub struct PairTradeEngine {
@@ -390,6 +399,7 @@ impl PairTradeEngine {
                 max_dd: 0.0,
                 pair_params: inst_pair_params,
                 default_pair_params: inst_default,
+                external_flatten_reason: None,
             });
         }
 
@@ -572,7 +582,8 @@ impl PairTradeEngine {
 
     fn clear_stale_pending(&mut self, inst_idx: usize, max_age: Duration, reason: &str) {
         let now_ts = self.current_now_ts();
-        for (key, state) in self.instances[inst_idx].states.iter_mut() {
+        let mut stale: Vec<String> = Vec::new();
+        for (key, state) in self.instances[inst_idx].states.iter() {
             let entry_age = state.pending_entry.as_ref().map(|p| p.placed_at.elapsed());
             let exit_age = state.pending_exit.as_ref().map(|p| p.placed_at.elapsed());
             let age = match (entry_age, exit_age) {
@@ -589,13 +600,42 @@ impl PairTradeEngine {
                         reason,
                         age.as_secs()
                     );
-                    state.pending_entry = None;
-                    state.pending_exit = None;
-                    state.position = None;
-                    state.position_guard = false;
-                    state.last_exit_at = Some(Instant::now());
-                    state.last_exit_ts = Some(now_ts);
+                    stale.push(key.clone());
                 }
+            }
+        }
+        for key in stale {
+            // bot-strategy#514: dropping a position here loses the close
+            // context — record it first. If the exchange still holds the
+            // legs, the next snapshot sync rebuilds the position, so this
+            // record can occasionally describe a clear that was not a real
+            // close; attribution treats recovery_no_pnl as context-only.
+            let record_direction = self.instances[inst_idx].states.get(&key).and_then(|s| {
+                s.position
+                    .as_ref()
+                    .filter(|_| !s.recovery_recorded)
+                    .map(|p| p.direction)
+            });
+            if let Some(direction) = record_direction {
+                let recovery_reason = format!("stale_pending_{}", reason);
+                let no_prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+                self.write_recovery_no_pnl_record(
+                    inst_idx,
+                    &key,
+                    direction,
+                    &recovery_reason,
+                    now_ts,
+                    &no_prices,
+                );
+            }
+            if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                state.pending_entry = None;
+                state.pending_exit = None;
+                state.position = None;
+                state.recovery_recorded = false;
+                state.position_guard = false;
+                state.last_exit_at = Some(Instant::now());
+                state.last_exit_ts = Some(now_ts);
             }
         }
     }
