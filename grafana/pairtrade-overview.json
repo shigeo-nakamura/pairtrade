@@ -248,7 +248,7 @@
         },
         "overrides": []
       },
-      "description": "Relative beta divergence = |beta_s - beta_l| / beta_eff. This is the value the entry filter compares against `beta_divergence_max` (default 0.30) \u2014 exceeding the red line hard-blocks entries, and `beta_gap_entry_z_scale` linearly raises the entry-z threshold even below it. Replaces the prior `pairtrade_beta_divergence` plot which showed the absolute gap on the same threshold line and was not comparable to the gate."
+      "description": "Relative beta divergence = |beta_s - beta_l| / beta_eff. This is the value the entry filter compares against `beta_divergence_max` (default 0.30) — exceeding the red line hard-blocks entries, and `beta_gap_entry_z_scale` linearly raises the entry-z threshold even below it. Replaces the prior `pairtrade_beta_divergence` plot which showed the absolute gap on the same threshold line and was not comparable to the gate."
     },
     {
       "id": 9,
@@ -532,8 +532,8 @@
     {
       "id": 16,
       "type": "timeseries",
-      "title": "Close gross PnL \u2014 per close (bps of entry notional)",
-      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point \u2248 1 close). pairtrade closes ~1-2/day per variant; the prior heatmap form (pairtrade#35) was too sparse to show signal. Replaced per bot-strategy#420. Source for #306 BT/live gap analysis. (#314 Group 4-A)",
+      "title": "Close gross PnL — per close (bps of entry notional)",
+      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point ≈ 1 close). pairtrade closes ~1-2/day per variant; the prior heatmap form (pairtrade#35) was too sparse to show signal. Replaced per bot-strategy#420. Source for #306 BT/live gap analysis. (#314 Group 4-A)",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -804,7 +804,7 @@
       "id": 22,
       "type": "timeseries",
       "title": "Canary / main-A trade rate ratio (24h)",
-      "description": "bot-strategy#412 signal #5 supplement. Ratio of canary trade count to main A trade count (`pairtrade_close_gross_pnl_bps_count`). Target >= 2.0 per #376 (canary entry_z=1.0 vs main A 1.5 \u2192 ~2-3x). Below 1.5 means canary stopped trading at its expected aggressive pace, e.g. a binary that silently breaks entry logic.",
+      "description": "bot-strategy#412 signal #5 supplement. Ratio of canary trade count to main A trade count (`pairtrade_close_gross_pnl_bps_count`). Target >= 2.0 per #376 (canary entry_z=1.0 vs main A 1.5 → ~2-3x). Below 1.5 means canary stopped trading at its expected aggressive pace, e.g. a binary that silently breaks entry logic.",
       "gridPos": {
         "h": 6,
         "w": 12,
@@ -856,8 +856,8 @@
     {
       "id": 23,
       "type": "timeseries",
-      "title": "Canary per-leg slippage p50/p95 \u2014 entry (bps)",
-      "description": "bot-strategy#412 signal #4. Canary-only view of `pairtrade_leg_slippage_bps` for the entry leg, split by order_type (post_only vs taker). Positive bps = cost (paid more than reference). Panel 17 above mixes canary into the global `variant!=\"\"` aggregate; this panel isolates the canary path so binary regression in fill quality is visible. Baseline + threshold tuning is bot-strategy#412 Stage B/C (~2026-05-21 \u2192 2026-05-28).",
+      "title": "Canary per-leg slippage p50/p95 — entry (bps)",
+      "description": "bot-strategy#412 signal #4. Canary-only view of `pairtrade_leg_slippage_bps` for the entry leg, split by order_type (post_only vs taker). Positive bps = cost (paid more than reference). Panel 17 above mixes canary into the global `variant!=\"\"` aggregate; this panel isolates the canary path so binary regression in fill quality is visible. Baseline + threshold tuning is bot-strategy#412 Stage B/C (~2026-05-21 → 2026-05-28).",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -897,8 +897,8 @@
     {
       "id": 24,
       "type": "timeseries",
-      "title": "Canary per-leg slippage p50/p95 \u2014 exit (bps)",
-      "description": "bot-strategy#412 signal #4, exit-leg companion to panel 23. Exit-side slippage is the leg-sync tail that pairtrade#23 / bot-strategy#258 cared about \u2014 for canary the regression signal is the same shape as entry but on the exit path.",
+      "title": "Canary per-leg slippage p50/p95 — exit (bps)",
+      "description": "bot-strategy#412 signal #4, exit-leg companion to panel 23. Exit-side slippage is the leg-sync tail that pairtrade#23 / bot-strategy#258 cared about — for canary the regression signal is the same shape as entry but on the exit path.",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -938,8 +938,8 @@
     {
       "id": 25,
       "type": "timeseries",
-      "title": "Canary close gross PnL \u2014 per close (bps of entry notional)",
-      "description": "bot-strategy#412 signal #5. Canary-only per-close gross PnL (fees+funding excluded), filtered to instance=debot-frankfurt-canary. Plotted as scatter (1 point \u2248 1 close); the prior heatmap form was too sparse for canary's trade cadence. A binary that breaks position sizing / exit logic shifts the mode away from zero or fattens the loss tail. Replaced per bot-strategy#420.",
+      "title": "Canary close gross PnL — per close (bps of entry notional)",
+      "description": "bot-strategy#412 signal #5. Canary-only per-close gross PnL (fees+funding excluded), filtered to instance=debot-frankfurt-canary. Plotted as scatter (1 point ≈ 1 close); the prior heatmap form was too sparse for canary's trade cadence. A binary that breaks position sizing / exit logic shifts the mode away from zero or fattens the loss tail. Replaced per bot-strategy#420.",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -1112,695 +1112,6 @@
       }
     },
     {
-      "id": 100,
-      "type": "row",
-      "title": "Tokyo Extended pairtrade (debot-pair-btceth-extended)",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 79
-      },
-      "panels": []
-    },
-    {
-      "id": 101,
-      "type": "timeseries",
-      "title": "[Tokyo Extended] z-score + position state (per pair / variant)",
-      "description": "Combined view: z-score line plus position-state bar at Y=3.0 (`pairtrade_has_position == 1` rendered as a thick step line). Tokyo Extended is single-variant so there is one z line and one position bar.",
-      "gridPos": {
-        "h": 12,
-        "w": 24,
-        "x": 0,
-        "y": 80
-      },
-      "targets": [
-        {
-          "expr": "pairtrade_z{instance=\"debot-tokyo\",variant!=\"\"}",
-          "legendFormat": "tokyo {{variant}}",
-          "refId": "A"
-        },
-        {
-          "expr": "(pairtrade_has_position{instance=\"debot-tokyo\",variant!=\"\"} == 1) * 3.0",
-          "legendFormat": "tokyo {{variant}} pos",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "min": -4,
-          "max": 4,
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "spanNulls": true,
-            "axisWidth": 120
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".*pos$"
-            },
-            "properties": [
-              {
-                "id": "custom.lineWidth",
-                "value": 10
-              },
-              {
-                "id": "custom.lineInterpolation",
-                "value": "stepAfter"
-              },
-              {
-                "id": "custom.fillOpacity",
-                "value": 30
-              },
-              {
-                "id": "custom.spanNulls",
-                "value": false
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      }
-    },
-    {
-      "id": 103,
-      "type": "timeseries",
-      "title": "[Tokyo Extended] Relative beta_gap = |beta_s - beta_l| / beta_eff (gate 0.30)",
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 98
-      },
-      "targets": [
-        {
-          "expr": "pairtrade_beta_gap_relative{instance=\"debot-tokyo\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 0.3
-              }
-            ]
-          },
-          "custom": {
-            "thresholdsStyle": {
-              "mode": "line"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "description": "Relative beta divergence = |beta_s - beta_l| / beta_eff. This is the value the entry filter compares against `beta_divergence_max` (default 0.30) \u2014 exceeding the red line hard-blocks entries, and `beta_gap_entry_z_scale` linearly raises the entry-z threshold even below it. Replaces the prior `pairtrade_beta_divergence` plot which showed the absolute gap on the same threshold line and was not comparable to the gate."
-    },
-    {
-      "id": 104,
-      "type": "stat",
-      "title": "[Tokyo Extended] Variants currently in position",
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 106
-      },
-      "targets": [
-        {
-          "expr": "sum by (instance) (pairtrade_has_position{instance=\"debot-tokyo\",variant!=\"\"})",
-          "legendFormat": "{{instance}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "gray",
-                "value": null
-              },
-              {
-                "color": "blue",
-                "value": 1
-              }
-            ]
-          },
-          "color": {
-            "mode": "thresholds"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": ""
-        },
-        "textMode": "value_and_name",
-        "colorMode": "value"
-      }
-    },
-    {
-      "id": 105,
-      "type": "timeseries",
-      "title": "[Tokyo Extended] Position age (seconds, > 0 only while in position)",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 0,
-        "y": 110
-      },
-      "targets": [
-        {
-          "expr": "pairtrade_position_age_seconds{instance=\"debot-tokyo\",variant!=\"\"} > 0",
-          "legendFormat": "{{instance}} {{variant}} {{pair}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        },
-        "overrides": []
-      }
-    },
-    {
-      "id": 106,
-      "type": "state-timeline",
-      "title": "[Tokyo Extended] Eligibility (cointegration filter)",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 110
-      },
-      "targets": [
-        {
-          "expr": "pairtrade_eligible{instance=\"debot-tokyo\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} {{pair}}",
-          "refId": "A"
-        }
-      ],
-      "options": {
-        "mergeValues": true,
-        "showValue": "never",
-        "rowHeight": 0.9
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "color": "red",
-                  "text": "NOT ELIGIBLE"
-                },
-                "1": {
-                  "color": "green",
-                  "text": "ELIGIBLE"
-                }
-              }
-            }
-          ]
-        },
-        "overrides": []
-      }
-    },
-    {
-      "id": 107,
-      "type": "timeseries",
-      "title": "[Tokyo Extended] Time since last trade (seconds, -1 before first trade)",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 0,
-        "y": 117
-      },
-      "targets": [
-        {
-          "expr": "pairtrade_time_since_last_trade_seconds{instance=\"debot-tokyo\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}} {{pair}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        },
-        "overrides": []
-      }
-    },
-    {
-      "id": 108,
-      "type": "table",
-      "title": "[Tokyo Extended] Close reasons (count last 24h)",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 117
-      },
-      "targets": [
-        {
-          "expr": "sum by (instance, variant, reason) (increase(pairtrade_close_reason_total{instance=\"debot-tokyo\",variant!=\"\"}[24h]))",
-          "format": "table",
-          "instant": true,
-          "refId": "A"
-        }
-      ],
-      "transformations": [
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "Time": true,
-              "__name__": true,
-              "job": true
-            },
-            "indexByName": {
-              "instance": 0,
-              "variant": 1,
-              "reason": 2,
-              "Value #A": 3
-            },
-            "renameByName": {
-              "instance": "host",
-              "Value #A": "count"
-            }
-          }
-        },
-        {
-          "id": "sortBy",
-          "options": {
-            "fields": {},
-            "sort": [
-              {
-                "field": "host"
-              },
-              {
-                "field": "variant"
-              },
-              {
-                "field": "reason"
-              }
-            ]
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "filterable": true
-          },
-          "noValue": "0"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "count"
-            },
-            "properties": [
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-background",
-                  "mode": "gradient"
-                }
-              },
-              {
-                "id": "color",
-                "value": {
-                  "mode": "continuous-GrYlRd"
-                }
-              },
-              {
-                "id": "custom.align",
-                "value": "center"
-              },
-              {
-                "id": "custom.width",
-                "value": 80
-              }
-            ]
-          }
-        ]
-      }
-    },
-    {
-      "id": 109,
-      "type": "stat",
-      "title": "[Tokyo Extended] Snapshot age (seconds)",
-      "gridPos": {
-        "h": 5,
-        "w": 24,
-        "x": 0,
-        "y": 124
-      },
-      "targets": [
-        {
-          "expr": "pairtrade_snapshot_age_seconds{instance=\"debot-tokyo\",variant!=\"\"}",
-          "legendFormat": "{{instance}} {{variant}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 120
-              },
-              {
-                "color": "red",
-                "value": 600
-              }
-            ]
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "id": 110,
-      "type": "timeseries",
-      "title": "[Tokyo Extended] Close gross PnL \u2014 per close (bps of entry notional)",
-      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point \u2248 1 close). pairtrade closes ~1-2/day per variant; the prior heatmap form (pairtrade#35) was too sparse to show signal. Replaced per bot-strategy#420. Source for #306 BT/live gap analysis. (#314 Group 4-A) Tokyo Extended uses [$__range] (vs Frankfurt [$__rate_interval]) so the mean survives the panel window at single-bot, sub-1-trade/h cadence.",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 129
-      },
-      "targets": [
-        {
-          "expr": "increase(pairtrade_close_gross_pnl_bps_sum{instance=\"debot-tokyo\",variant!=\"\"}[$__range]) / increase(pairtrade_close_gross_pnl_bps_count{instance=\"debot-tokyo\",variant!=\"\"}[$__range])",
-          "legendFormat": "{{instance}} {{variant}} {{reason}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "points",
-            "pointSize": 6,
-            "spanNulls": false,
-            "lineWidth": 0
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".* exit_z$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".* expected_value$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "blue"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".* stop_loss_z$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "red"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".* max_loss_r$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "orange"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".* risk_budget$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "magenta"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".* force_close$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "dark-red"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".* maintenance_preempt$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#5DADE2"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".* ineligible$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#888888"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".* unknown$"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#CCCCCC"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "tooltip": {
-          "mode": "multi"
-        },
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      }
-    },
-    {
-      "id": 111,
-      "type": "timeseries",
-      "title": "[Tokyo Extended] Slippage fill samples (count by order_type)",
-      "description": "Cumulative fill-event count over the panel window, broken down by order_type (post_only vs taker). Replaces the Frankfurt-style p50/p90 view because Extended single-bot cadence (~1 trade/day) gives too few samples to compute meaningful quantiles per scrape interval. Revisit p50/p90 once trade density rises. (#314)",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 129
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (order_type) (increase(pairtrade_leg_slippage_bps_count{instance=\"debot-tokyo\",variant!=\"\"}[$__range]))",
-          "legendFormat": "{{order_type}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "bars",
-            "lineWidth": 1,
-            "spanNulls": true,
-            "fillOpacity": 60,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      }
-    },
-    {
-      "id": 112,
-      "type": "timeseries",
-      "title": "[Tokyo Extended] Fee samples (count by leg)",
-      "description": "Cumulative fee-event count over the panel window, broken down by leg (entry vs exit). Confirms fee samples are reaching the histogram. p50/p90 replaced because single-bot cadence floors rate() to zero outside the scrape window. (#314)",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 0,
-        "y": 137
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (leg) (increase(pairtrade_leg_fee_bps_count{instance=\"debot-tokyo\",variant!=\"\"}[$__range]))",
-          "legendFormat": "{{leg}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "bars",
-            "lineWidth": 1,
-            "spanNulls": true,
-            "fillOpacity": 60,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "id": 113,
-      "type": "timeseries",
-      "title": "[Tokyo Extended] Fill latency samples (count by leg)",
-      "description": "Cumulative fill-latency sample count over the panel window, by leg. p50/p90 replaced for the same reason as the slippage/fee panels \u2014 quantiles need denser samples than Extended currently produces. (#314)",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 137
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (leg) (increase(pairtrade_leg_fill_latency_ms_count{instance=\"debot-tokyo\",variant!=\"\"}[$__range]))",
-          "legendFormat": "{{leg}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "bars",
-            "lineWidth": 1,
-            "spanNulls": true,
-            "fillOpacity": 60,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
       "id": 30,
       "type": "state-timeline",
       "title": "Maintenance / degraded windows (#427)",
@@ -1852,8 +1163,8 @@
     {
       "id": 31,
       "type": "timeseries",
-      "title": "Entry rejects breakdown (24h, by gate) \u2014 Frankfurt + Tokyo Lighter",
-      "description": "Stacked area of `increase(pairtrade_entry_reject_total[24h])` summed over the Frankfurt + Tokyo Lighter pairtrade fleet, broken down by the gate that fired. Use this to see which filter is responsible for blocked entries \u2014 especially when the live trade rate looks low. Common reasons in production: `z_below_threshold` (most cycles' z is just under the dynamic threshold; influenced by `beta_gap_entry_z_scale`), `beta_divergence` (hard gate at `beta_divergence_max=0.30`), `beta_min` (hedge leg too small), `mtf` (multi-timeframe z-confluence). Added for bot-strategy#355 Round-4 follow-up.",
+      "title": "Entry rejects breakdown (24h, by gate) — Frankfurt + Tokyo Lighter",
+      "description": "Stacked area of `increase(pairtrade_entry_reject_total[24h])` summed over the Frankfurt + Tokyo Lighter pairtrade fleet, broken down by the gate that fired. Use this to see which filter is responsible for blocked entries — especially when the live trade rate looks low. Common reasons in production: `z_below_threshold` (most cycles' z is just under the dynamic threshold; influenced by `beta_gap_entry_z_scale`), `beta_divergence` (hard gate at `beta_divergence_max=0.30`), `beta_min` (hedge leg too small), `mtf` (multi-timeframe z-confluence). Added for bot-strategy#355 Round-4 follow-up.",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -1899,8 +1210,8 @@
     {
       "id": 32,
       "type": "timeseries",
-      "title": "Kalman beta uncertainty (sqrt(P)) \u2014 calibration view",
-      "description": "`pairtrade_beta_uncertainty` = sqrt of the Kalman filter's posterior variance. This is the rigorous 1-sigma uncertainty of the current beta estimate; it dominates the beta_s/beta_l divergence proxy used today. Phase 1 of bot-strategy#462: gauge only \u2014 we observe the distribution for 1-2 weeks across calm and unstable periods, then set `beta_uncertainty_max` from the calibration data and flip the gate. Frankfurt + Tokyo Lighter shown; Tokyo Extended excluded (single-bot, different cadence).",
+      "title": "Kalman beta uncertainty (sqrt(P)) — calibration view",
+      "description": "`pairtrade_beta_uncertainty` = sqrt of the Kalman filter's posterior variance. This is the rigorous 1-sigma uncertainty of the current beta estimate; it dominates the beta_s/beta_l divergence proxy used today. Phase 1 of bot-strategy#462: gauge only — we observe the distribution for 1-2 weeks across calm and unstable periods, then set `beta_uncertainty_max` from the calibration data and flip the gate. Frankfurt + Tokyo Lighter shown; Tokyo Extended excluded (single-bot, different cadence).",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -1942,8 +1253,8 @@
     {
       "id": 33,
       "type": "timeseries",
-      "title": "Re-hedge needed events (24h, per variant) \u2014 #463 Phase 1",
-      "description": "`increase(pairtrade_rehedge_needed_total[24h])` per Frankfurt variant. Phase 1 is **detection only** \u2014 these events fire when `|\u03b2_now \u2212 \u03b2_entry| / \u03b2_entry \u2265 rehedge_drift_threshold_pct` and the cool-down + min-notional floors allow firing, but no order is placed. Use this to calibrate the three thresholds (`rehedge_drift_threshold_pct`, `rehedge_cooldown_secs`, `rehedge_min_qty_notional_usd`) before enabling Phase 2's actual re-hedge. Default config has the feature disabled (threshold=0.0) so this panel shows 0 until an operator opts in.",
+      "title": "Re-hedge needed events (24h, per variant) — #463 Phase 1",
+      "description": "`increase(pairtrade_rehedge_needed_total[24h])` per Frankfurt variant. Phase 1 is **detection only** — these events fire when `|β_now − β_entry| / β_entry ≥ rehedge_drift_threshold_pct` and the cool-down + min-notional floors allow firing, but no order is placed. Use this to calibrate the three thresholds (`rehedge_drift_threshold_pct`, `rehedge_cooldown_secs`, `rehedge_min_qty_notional_usd`) before enabling Phase 2's actual re-hedge. Default config has the feature disabled (threshold=0.0) so this panel shows 0 until an operator opts in.",
       "gridPos": {
         "h": 7,
         "w": 24,
@@ -2016,17 +1327,31 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 0.5 },
-              { "color": "red", "value": 2.5 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 2.5
+              }
             ]
           }
         },
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "table", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
       }
     },
     {
