@@ -115,6 +115,7 @@ impl PairTradeConfig {
             bt_eval_timestamps: None,     // env-only, not in YAML
             bt_restart_timestamps: None,  // env-only, not in YAML
             bt_fill_delay_secs: 0,        // env-only, not in YAML
+            bt_regime_series_file: None,  // env-only, not in YAML
             shutdown_grace_secs: yaml
                 .shutdown_grace_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),

@@ -258,6 +258,12 @@ impl PairTradeConfig {
             self.bt_restart_timestamps = load_bt_restart_timestamps();
         }
         env_override("BT_FILL_DELAY_SECS", &mut self.bt_fill_delay_secs);
+        // Per-tick regime series dump — see struct field doc.
+        if let Ok(value) = env::var("BT_REGIME_SERIES_FILE") {
+            if !value.trim().is_empty() {
+                self.bt_regime_series_file = Some(value);
+            }
+        }
 
         env_override(
             "SPREAD_TREND_MAX_SLOPE_SIGMA",

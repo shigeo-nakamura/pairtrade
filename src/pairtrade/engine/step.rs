@@ -182,6 +182,10 @@ impl PairTradeEngine {
                     log::info!("[BACKTEST] End of data file reached. Backtest finished.");
                     self.log_entry_reject_summary();
                     self.log_regime_summary();
+                    if let Some(writer) = self.regime_series_writer.as_mut() {
+                        use std::io::Write;
+                        let _ = writer.flush();
+                    }
                     break;
                 }
             }

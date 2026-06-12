@@ -330,6 +330,25 @@ impl PairTradeEngine {
                     );
                     shared.last_regime_shadow_ts = Some(now_ts);
                 }
+                // bot-strategy#534: per-tick raw series for offline governor
+                // calibration. The 300s shadow cadence cannot rebuild an
+                // alternative (e.g. dual-timescale) statistic; that needs
+                // the raw innovation at every tick.
+                if let Some(writer) = self.regime_series_writer.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        writer,
+                        "{},{},{:.6e},{:.6},{:.6e},{:.4},{:.4},{}",
+                        now_ts,
+                        key,
+                        innovation,
+                        beta,
+                        shared.regime.residual_scale(),
+                        shared.regime.last_normalized(),
+                        shared.regime.cusum(),
+                        u8::from(shared.regime.is_active()),
+                    );
+                }
             }
             let spread = log_a - shared.beta * log_b;
             shared.push_spread(spread, metrics_window, &self.cfg);

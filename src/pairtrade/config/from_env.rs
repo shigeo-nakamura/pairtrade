@@ -197,6 +197,9 @@ impl PairTradeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            bt_regime_series_file: env::var("BT_REGIME_SERIES_FILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             shutdown_grace_secs: env::var("SHUTDOWN_GRACE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

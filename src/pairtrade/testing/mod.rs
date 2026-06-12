@@ -89,6 +89,7 @@ impl PairTradeEngine {
             regime_trend_max: DEFAULT_REGIME_TREND_MAX,
             regime_reference_symbol: DEFAULT_REGIME_REFERENCE_SYMBOL.to_string(),
             bt_fill_delay_secs: 0,
+            bt_regime_series_file: None,
             risk: config::RiskConfig::default(),
             round_id: None,
         };
@@ -145,6 +146,7 @@ impl PairTradeEngine {
             risk_state_path,
             kill_switch_active: false,
             data_dump_writer: None,
+            regime_series_writer: None,
             replay_connector: None,
             funding_history: funding_history::FundingHistory::new(),
             shutdown_pending: false,
