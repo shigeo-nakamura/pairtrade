@@ -59,6 +59,20 @@ struct PostOnlyOrderRequest<'a> {
     fallback_to_taker: bool,
 }
 
+/// Per-leg inputs for `place_or_amend_reissue_leg`, grouped so the amend /
+/// cancel+reissue decision can live in one named helper without widening
+/// its argument list past the clippy boundary (bot-strategy#502).
+struct ReissueLegPlacement<'a> {
+    stage: &'a str,
+    leg: &'a PendingLeg,
+    quantized_size: Decimal,
+    limit: Option<Decimal>,
+    spread: Option<i64>,
+    reduce_only: bool,
+    use_amend: bool,
+    price_map: &'a HashMap<String, SymbolSnapshot>,
+}
+
 impl PairTradeEngine {
     /// In amend mode the caller skips the upstream blanket cancel so the
     /// order we are about to amend stays alive. Any leg we end up NOT
@@ -72,6 +86,179 @@ impl PairTradeEngine {
                 .connector
                 .cancel_order(&leg.symbol, &leg.order_id)
                 .await;
+        }
+    }
+
+    /// Clone `leg` with its `filled` field overwritten — the "keep this leg
+    /// as-is and carry the observed fill" pattern repeated across every
+    /// skip/failure branch of the reissue loop (bot-strategy#502).
+    fn kept_leg(leg: &PendingLeg, filled: Decimal) -> PendingLeg {
+        let mut kept = leg.clone();
+        kept.filled = filled;
+        kept
+    }
+
+    /// Derive the effective `(filled, remaining)` for one reissue leg.
+    /// On the entry-side path this cross-checks the exchange position
+    /// against the local fill state (bot-strategy#470): the
+    /// cancel-then-reissue boundary can drop fills from the local map (or
+    /// carry over a stale `leg.filled = 0`), and the unconditional
+    /// `target - local` arithmetic then sends a full duplicate order on top
+    /// of qty already sitting on the exchange (Frankfurt 2026-05-22 variant
+    /// C ETH leg ended at 2× target via this race). Pure relocation from
+    /// `reissue_partial_legs` (bot-strategy#502).
+    async fn reissue_leg_fill_state(
+        &mut self,
+        leg: &PendingLeg,
+        local_filled: Decimal,
+        reduce_only: bool,
+    ) -> (Decimal, Decimal) {
+        if !reduce_only {
+            let exch = self.fetch_residual_position_size(&leg.symbol).await;
+            let r = Self::cap_entry_reissue_remaining(leg.target, local_filled, exch);
+            let effective = leg.target - r;
+            if let Some(exch_qty) = exch {
+                if exch_qty > local_filled {
+                    log::warn!(
+                        "[ENTRY_CAP] {} exchange position {} exceeds local filled {} (target {}); \
+                         capping reissue remaining to {}",
+                        leg.symbol,
+                        exch_qty,
+                        local_filled,
+                        leg.target,
+                        r,
+                    );
+                    let variant_id = self.instances.first().map(|i| i.id.as_str()).unwrap_or("?");
+                    // The reconcile loop drives only one (variant,
+                    // pair) at a time, so labelling with `*` for pair
+                    // is fine — the symbol label is the discriminator.
+                    prom::ENTRY_OVERSIZE_CAPPED_TOTAL
+                        .with_label_values(&[variant_id, "*", &leg.symbol])
+                        .inc();
+                }
+            }
+            (effective, r)
+        } else {
+            let r = (leg.target - local_filled).max(Decimal::ZERO);
+            (local_filled, r)
+        }
+    }
+
+    /// Place one reissue leg: native amend when opted in (bot-strategy#471),
+    /// falling back to cancel+reissue on any amend error or when no
+    /// maker-safe price exists for a post-only leg. Resolves to
+    /// `(response, post_only, posted limit)` so the rebuilt `PendingLeg`
+    /// records how the live order actually rests on the venue. Pure
+    /// relocation from `reissue_partial_legs` (bot-strategy#502).
+    async fn place_or_amend_reissue_leg(
+        &mut self,
+        req: ReissueLegPlacement<'_>,
+    ) -> Result<(dex_connector::CreateOrderResponse, bool, Option<Decimal>), DexError> {
+        let ReissueLegPlacement {
+            stage,
+            leg,
+            quantized_size,
+            limit,
+            spread,
+            reduce_only,
+            use_amend,
+            price_map,
+        } = req;
+        // bot-strategy#471: amend in place of cancel+reissue when opted
+        // in. `target_total_size = leg.target` re-asserts the original
+        // total (native-amend venues keep the filled portion and re-open
+        // only the remainder); `open_remaining_size = quantized_size` is
+        // the #470-capped remainder that cancel-replace venues place
+        // afresh. On any amend error fall back to cancel+reissue for this
+        // leg (the upstream blanket cancel was skipped in amend mode).
+        //
+        // Extended's edit endpoint only permits price/size changes — the
+        // replacement order must re-assert the original post-only flag
+        // (with a maker-safe refreshed price) or the venue rejects the
+        // whole edit with 1133 InvalidOrderParameters. Without this,
+        // every first-retry amend of a post-only entry leg burned the
+        // edit and fell back (2026-06-09..12 Tokyo soak). A post-only
+        // leg with no maker-safe price available cannot be amended
+        // without flipping the flag, so it takes the fallback path.
+        let amend_pricing = if !use_amend {
+            None
+        } else if leg.post_only {
+            self.refreshed_limit_price(&leg.symbol, leg.side, price_map)
+                .await
+                .filter(|px| *px > Decimal::ZERO)
+                .or(limit)
+                .map(|px| (Some(px), Some(-2)))
+        } else {
+            Some((limit, spread))
+        };
+        match amend_pricing {
+            Some((amend_limit, amend_spread)) => {
+                match self
+                    .connector
+                    .modify_order(
+                        &leg.symbol,
+                        &leg.order_id,
+                        leg.side,
+                        leg.target,
+                        quantized_size,
+                        amend_limit,
+                        amend_spread,
+                        reduce_only,
+                    )
+                    .await
+                {
+                    Ok(resp) => Ok((resp, leg.post_only, amend_limit)),
+                    Err(e) => {
+                        log::warn!(
+                            "[ORDER] amend failed for {} leg {} ({:?}); falling back to cancel+reissue",
+                            stage,
+                            leg.symbol,
+                            e
+                        );
+                        let _ = self
+                            .connector
+                            .cancel_order(&leg.symbol, &leg.order_id)
+                            .await;
+                        self.connector
+                            .create_order(
+                                &leg.symbol,
+                                quantized_size,
+                                leg.side,
+                                limit,
+                                spread,
+                                reduce_only,
+                                None,
+                            )
+                            .await
+                            .map(|resp| (resp, false, limit))
+                    }
+                }
+            }
+            None => {
+                if use_amend {
+                    log::warn!(
+                        "[ORDER] cannot amend {} leg {}: no maker-safe price for post-only; falling back to cancel+reissue",
+                        stage,
+                        leg.symbol
+                    );
+                    let _ = self
+                        .connector
+                        .cancel_order(&leg.symbol, &leg.order_id)
+                        .await;
+                }
+                self.connector
+                    .create_order(
+                        &leg.symbol,
+                        quantized_size,
+                        leg.side,
+                        limit,
+                        spread,
+                        reduce_only,
+                        None,
+                    )
+                    .await
+                    .map(|resp| (resp, false, limit))
+            }
         }
     }
 
@@ -109,37 +296,12 @@ impl PairTradeEngine {
             // duplicate order on top of qty already sitting on the
             // exchange. Frankfurt 2026-05-22 06:27 UTC variant C ETH leg
             // ended at 2× target (0.8905 → 1.7810) via this race.
-            let (filled, remaining) = if !reduce_only {
-                let exch = self.fetch_residual_position_size(&leg.symbol).await;
-                let r = Self::cap_entry_reissue_remaining(leg.target, local_filled, exch);
-                let effective = leg.target - r;
-                if let Some(exch_qty) = exch {
-                    if exch_qty > local_filled {
-                        log::warn!(
-                            "[ENTRY_CAP] {} exchange position {} exceeds local filled {} (target {}); \
-                             capping reissue remaining to {}",
-                            leg.symbol, exch_qty, local_filled, leg.target, r,
-                        );
-                        let variant_id =
-                            self.instances.first().map(|i| i.id.as_str()).unwrap_or("?");
-                        // The reconcile loop drives only one (variant,
-                        // pair) at a time, so labelling with `*` for pair
-                        // is fine — the symbol label is the discriminator.
-                        prom::ENTRY_OVERSIZE_CAPPED_TOTAL
-                            .with_label_values(&[variant_id, "*", &leg.symbol])
-                            .inc();
-                    }
-                }
-                (effective, r)
-            } else {
-                let r = (leg.target - local_filled).max(Decimal::ZERO);
-                (local_filled, r)
-            };
+            let (filled, remaining) = self
+                .reissue_leg_fill_state(leg, local_filled, reduce_only)
+                .await;
             if remaining <= Decimal::ZERO {
                 self.cancel_amend_skipped_leg(use_amend, leg).await;
-                let mut kept = leg.clone();
-                kept.filled = filled;
-                new_legs.push(kept);
+                new_legs.push(Self::kept_leg(leg, filled));
                 continue;
             }
             if !use_market {
@@ -154,9 +316,7 @@ impl PairTradeEngine {
                         leg.symbol
                     );
                     self.cancel_amend_skipped_leg(use_amend, leg).await;
-                    let mut kept = leg.clone();
-                    kept.filled = filled;
-                    new_legs.push(kept);
+                    new_legs.push(Self::kept_leg(leg, filled));
                     continue;
                 }
             }
@@ -173,9 +333,7 @@ impl PairTradeEngine {
                     remaining
                 );
                 self.cancel_amend_skipped_leg(use_amend, leg).await;
-                let mut kept = leg.clone();
-                kept.filled = filled;
-                new_legs.push(kept);
+                new_legs.push(Self::kept_leg(leg, filled));
                 continue;
             }
             let limit = if use_market {
@@ -195,9 +353,7 @@ impl PairTradeEngine {
                     leg.symbol
                 );
                 self.cancel_amend_skipped_leg(use_amend, leg).await;
-                let mut kept = leg.clone();
-                kept.filled = filled;
-                new_legs.push(kept);
+                new_legs.push(Self::kept_leg(leg, filled));
                 continue;
             }
             let spread = self.order_spread_param(limit, false);
@@ -213,111 +369,25 @@ impl PairTradeEngine {
                     stage,
                     leg.symbol
                 );
-                let mut kept = leg.clone();
-                kept.filled = leg.target;
-                new_legs.push(kept);
+                new_legs.push(Self::kept_leg(leg, leg.target));
                 continue;
             }
-            // bot-strategy#471: amend in place of cancel+reissue when opted
-            // in. `target_total_size = leg.target` re-asserts the original
-            // total (native-amend venues keep the filled portion and re-open
-            // only the remainder); `open_remaining_size = quantized_size` is
-            // the #470-capped remainder that cancel-replace venues place
-            // afresh. On any amend error fall back to cancel+reissue for this
-            // leg (the upstream blanket cancel was skipped in amend mode).
-            //
-            // Extended's edit endpoint only permits price/size changes — the
-            // replacement order must re-assert the original post-only flag
-            // (with a maker-safe refreshed price) or the venue rejects the
-            // whole edit with 1133 InvalidOrderParameters. Without this,
-            // every first-retry amend of a post-only entry leg burned the
-            // edit and fell back (2026-06-09..12 Tokyo soak). A post-only
-            // leg with no maker-safe price available cannot be amended
-            // without flipping the flag, so it takes the fallback path.
-            let amend_pricing = if !use_amend {
-                None
-            } else if leg.post_only {
-                self.refreshed_limit_price(&leg.symbol, leg.side, price_map)
-                    .await
-                    .filter(|px| *px > Decimal::ZERO)
-                    .or(limit)
-                    .map(|px| (Some(px), Some(-2)))
-            } else {
-                Some((limit, spread))
-            };
             // Each placement resolves to (response, post_only, posted limit)
             // so the rebuilt PendingLeg records how the live order actually
-            // rests on the venue, keeping later amends of the same leg
-            // consistent with the edit-endpoint constraint above.
-            let placement = match amend_pricing {
-                Some((amend_limit, amend_spread)) => {
-                    match self
-                        .connector
-                        .modify_order(
-                            &leg.symbol,
-                            &leg.order_id,
-                            leg.side,
-                            leg.target,
-                            quantized_size,
-                            amend_limit,
-                            amend_spread,
-                            reduce_only,
-                        )
-                        .await
-                    {
-                        Ok(resp) => Ok((resp, leg.post_only, amend_limit)),
-                        Err(e) => {
-                            log::warn!(
-                                "[ORDER] amend failed for {} leg {} ({:?}); falling back to cancel+reissue",
-                                stage,
-                                leg.symbol,
-                                e
-                            );
-                            let _ = self
-                                .connector
-                                .cancel_order(&leg.symbol, &leg.order_id)
-                                .await;
-                            self.connector
-                                .create_order(
-                                    &leg.symbol,
-                                    quantized_size,
-                                    leg.side,
-                                    limit,
-                                    spread,
-                                    reduce_only,
-                                    None,
-                                )
-                                .await
-                                .map(|resp| (resp, false, limit))
-                        }
-                    }
-                }
-                None => {
-                    if use_amend {
-                        log::warn!(
-                            "[ORDER] cannot amend {} leg {}: no maker-safe price for post-only; falling back to cancel+reissue",
-                            stage,
-                            leg.symbol
-                        );
-                        let _ = self
-                            .connector
-                            .cancel_order(&leg.symbol, &leg.order_id)
-                            .await;
-                    }
-                    self.connector
-                        .create_order(
-                            &leg.symbol,
-                            quantized_size,
-                            leg.side,
-                            limit,
-                            spread,
-                            reduce_only,
-                            None,
-                        )
-                        .await
-                        .map(|resp| (resp, false, limit))
-                }
-            };
+            // rests on the venue (see place_or_amend_reissue_leg for the
+            // amend-vs-cancel+reissue policy, bot-strategy#471).
+            let placement = self
+                .place_or_amend_reissue_leg(ReissueLegPlacement {
+                    stage,
+                    leg,
+                    quantized_size,
+                    limit,
+                    spread,
+                    reduce_only,
+                    use_amend,
+                    price_map,
+                })
+                .await;
             match placement {
                 Ok((resp, placed_post_only, placed_limit)) => {
                     // Native in-place amend keeps the order's identity: the
@@ -394,9 +464,7 @@ impl PairTradeEngine {
                                 stage,
                                 symbol
                             );
-                            let mut kept = leg.clone();
-                            kept.filled = leg.target;
-                            new_legs.push(kept);
+                            new_legs.push(Self::kept_leg(leg, leg.target));
                         } else {
                             log::error!(
                                 "[ORDER] Failed to reissue {} leg {}: {:?}",
@@ -404,9 +472,7 @@ impl PairTradeEngine {
                                 symbol,
                                 e
                             );
-                            let mut kept = leg.clone();
-                            kept.filled = filled;
-                            new_legs.push(kept);
+                            new_legs.push(Self::kept_leg(leg, filled));
                         }
                     } else {
                         log::error!(
@@ -415,9 +481,7 @@ impl PairTradeEngine {
                             symbol,
                             e
                         );
-                        let mut kept = leg.clone();
-                        kept.filled = filled;
-                        new_legs.push(kept);
+                        new_legs.push(Self::kept_leg(leg, filled));
                     }
                 }
             }
