@@ -35,9 +35,23 @@ use super::super::exit::compute_pnl;
 use super::super::funding_history;
 use super::super::market::SymbolSnapshot;
 use super::super::pnl_log::{PnlLogRecord, PnlTradeDetails};
-use super::super::state::{PendingLeg, PendingOrders, PendingStatus, Position};
+use super::super::state::{PairState, PendingLeg, PendingOrders, PendingStatus, Position};
 use super::super::PairTradeEngine;
 use super::placement::ReissuePartialLegsRequest;
+
+/// Narrow inputs for `build_exit_fill_pnl`, grouped so the helper does not
+/// need `&self` while the caller holds a `&mut` borrow on the instance's
+/// `PairState` (bot-strategy#502).
+struct ExitFillPnlContext<'a> {
+    inst_id: &'a str,
+    key: &'a str,
+    state: &'a PairState,
+    price_map: &'a HashMap<String, SymbolSnapshot>,
+    funding_history: &'a funding_history::FundingHistory,
+    z_exit: Option<f64>,
+    beta_val: Option<f64>,
+    now_ts: i64,
+}
 
 /// Pure outcome of the entry partial-fill reissue policy. Extracted from
 /// `reconcile_pending_orders` so the retry/escalation thresholds are
@@ -106,6 +120,93 @@ impl PairTradeEngine {
         }
     }
 
+    /// Assemble the `exit_fill` PnL record for a fully-filled exit: compute
+    /// realized PnL from current mark prices, fold in funding carry when the
+    /// entry sizes/prices were captured, emit the close gross/funding bps
+    /// histograms, and stamp the close reason. Returns
+    /// `(record, realized_pnl, funding_carry_usd)`; `None` when the position
+    /// or any required price is missing — matching the original nested
+    /// if-lets it replaced. Pure relocation from `reconcile_exit`
+    /// (bot-strategy#502).
+    fn build_exit_fill_pnl(ctx: ExitFillPnlContext<'_>) -> Option<(PnlLogRecord, f64, f64)> {
+        let pos = ctx.state.position.as_ref()?;
+        let (base, quote) = ctx.key.split_once('/')?;
+        let p1 = ctx.price_map.get(base)?;
+        let p2 = ctx.price_map.get(quote)?;
+        let pnl = compute_pnl(pos, p1.price, p2.price).and_then(|p| p.to_f64())?;
+        let hold_secs = Some(ctx.now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
+        let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
+        let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
+        let (carry_usd, ticks_observed) = match (
+            pos.entry_size_a,
+            pos.entry_price_a,
+            pos.entry_size_b,
+            pos.entry_price_b,
+        ) {
+            (Some(sa), Some(pa), Some(sb), Some(pb)) => {
+                funding_history::compute_carry_usd(funding_history::FundingCarryInput {
+                    history: ctx.funding_history,
+                    base_symbol: base,
+                    quote_symbol: quote,
+                    open_ts: pos.entered_ts,
+                    close_ts: ctx.now_ts,
+                    direction: pos.direction,
+                    entry_size_a: sa,
+                    entry_price_a: pa,
+                    entry_size_b: sb,
+                    entry_price_b: pb,
+                })
+            }
+            _ => (0.0, 0),
+        };
+        let mut record =
+            PnlLogRecord::new(base, quote, pos.direction, pnl, ctx.now_ts, "exit_fill")
+                .with_trade_details(PnlTradeDetails {
+                    entry_a,
+                    entry_b,
+                    exit_a: p1.price.to_f64(),
+                    exit_b: p2.price.to_f64(),
+                    beta: ctx.beta_val,
+                    z_entry: pos.entry_z,
+                    z_exit: ctx.z_exit,
+                    hold_secs,
+                });
+        if ticks_observed > 0 {
+            record = record.with_funding(carry_usd, ticks_observed);
+        }
+        // #314 Group 4: emit gross/funding bps to Prometheus. Same
+        // Some(...,...,...,...) gate as the funding compute above so the
+        // bps denominator stays consistent. `reason` is the same
+        // Option<&'static str> that apply_post_exit_state consumes
+        // immediately after this — read without .take() so the
+        // close-reason counter still receives it (bot-strategy#421).
+        let reason = ctx.state.pending_exit_reason.unwrap_or("unknown");
+        if let (Some(sa), Some(pa), Some(sb), Some(pb)) = (
+            pos.entry_size_a,
+            pos.entry_price_a,
+            pos.entry_size_b,
+            pos.entry_price_b,
+        ) {
+            let leg_a = (sa * pa).abs().to_f64();
+            let leg_b = (sb * pb).abs().to_f64();
+            if let (Some(a), Some(b)) = (leg_a, leg_b) {
+                let notional = a + b;
+                if notional > 0.0 {
+                    super::super::prom::CLOSE_GROSS_PNL_BPS
+                        .with_label_values(&[ctx.inst_id, ctx.key, reason])
+                        .observe(pnl / notional * 10_000.0);
+                    if ticks_observed > 0 {
+                        super::super::prom::CLOSE_FUNDING_BPS
+                            .with_label_values(&[ctx.inst_id, ctx.key])
+                            .observe(carry_usd / notional * 10_000.0);
+                    }
+                }
+            }
+        }
+        record = record.with_close_reason(reason);
+        Some((record, pnl, carry_usd))
+    }
+
     pub(in crate::pairtrade) async fn reconcile_pending_orders(
         &mut self,
         inst_idx: usize,
@@ -139,6 +240,187 @@ impl PairTradeEngine {
         Ok(())
     }
 
+    /// Post-exit risk bookkeeping for a realized exit fill: fold the cycle's
+    /// PnL / funding carry into the session counters, advance or reset the
+    /// consecutive-loss circuit breaker, and persist the risk-state snapshot.
+    /// `write_pnl_record` always bumps total_trades / total_pnl (persisted,
+    /// bot-strategy#320), so the snapshot is dirty regardless of pnl sign.
+    /// Pure relocation from `reconcile_exit` (bot-strategy#502).
+    fn record_exit_realized_pnl(
+        &mut self,
+        inst_idx: usize,
+        now_ts: i64,
+        pnl_value: f64,
+        funding_value: f64,
+    ) {
+        self.instances[inst_idx].realized_pnl_today += pnl_value;
+        self.instances[inst_idx].funding_carry_today += funding_value;
+        let mut risk_state_dirty = true;
+        if pnl_value < 0.0 {
+            self.instances[inst_idx].consecutive_losses += 1;
+            risk_state_dirty = true;
+            if let Some(cooldown) = self
+                .cfg
+                .circuit_breaker_cooldown_for(self.instances[inst_idx].consecutive_losses)
+            {
+                self.instances[inst_idx].circuit_breaker_until = Some(Instant::now() + cooldown);
+                self.instances[inst_idx].circuit_breaker_until_ts =
+                    Some(now_ts + cooldown.as_secs() as i64);
+                log::warn!(
+                    "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
+                    self.instances[inst_idx].consecutive_losses,
+                    cooldown.as_secs()
+                );
+            }
+        } else if pnl_value > 0.0 {
+            if self.instances[inst_idx].consecutive_losses > 0 {
+                log::info!(
+                    "[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)",
+                    self.instances[inst_idx].consecutive_losses
+                );
+                risk_state_dirty = true;
+            }
+            self.instances[inst_idx].consecutive_losses = 0;
+            self.instances[inst_idx].circuit_breaker_until = None;
+            self.instances[inst_idx].circuit_breaker_until_ts = None;
+        }
+        if risk_state_dirty {
+            self.persist_risk_state();
+        }
+    }
+
+    /// Re-attempt closing the remaining (unfilled) exit legs as MARKET
+    /// orders, sizing each retry down to the exchange-reported residual on a
+    /// reduce-only rejection (Extended 1136/1137). Returns the freshly
+    /// placed legs; an empty vec means nothing was reissued (caller clears
+    /// `pending_exit` and retries next loop). Pure relocation of the exit
+    /// retry loop from `reconcile_exit` (bot-strategy#502).
+    async fn retry_exit_remaining_legs(
+        &mut self,
+        pending: &PendingOrders,
+        filled_qtys: &HashMap<String, Decimal>,
+        price_map: &HashMap<String, SymbolSnapshot>,
+    ) -> Vec<PendingLeg> {
+        let mut new_legs = Vec::new();
+        for leg in &pending.legs {
+            let filled = filled_qtys
+                .get(&leg.order_id)
+                .cloned()
+                .unwrap_or(Decimal::ZERO);
+            let remaining_qty = (leg.target - filled).max(Decimal::ZERO);
+            if remaining_qty > Decimal::ZERO {
+                let quantized =
+                    self.quantize_order_size_exit(&leg.symbol, remaining_qty, price_map);
+                if quantized <= Decimal::ZERO {
+                    continue;
+                }
+                let limit = None;
+                // Reference for the taker retry — feeds the
+                // taker-side slippage histogram (#314 Group
+                // 4-B-2). The downsized retry below uses the
+                // same captured value.
+                let ref_price_retry = self.order_reference_price(&leg.symbol, leg.side, price_map);
+                match self
+                    .connector
+                    .create_order(&leg.symbol, quantized, leg.side, limit, None, true, None)
+                    .await
+                {
+                    Ok(resp) => {
+                        new_legs.push(PendingLeg {
+                            symbol: leg.symbol.clone(),
+                            order_id: resp.order_id,
+                            exchange_order_id: resp.exchange_order_id,
+                            target: quantized,
+                            filled: Decimal::ZERO,
+                            side: leg.side,
+                            limit_price: None,
+                            reference_price: ref_price_retry,
+                            post_only: false,
+                        });
+                        log::warn!(
+                            "[ORDER] Retrying exit leg {} size={} mode=MARKET",
+                            leg.symbol,
+                            quantized
+                        );
+                    }
+                    Err(e) if engine::error_class::is_reduce_only_rejection(&e) => {
+                        // Extended code 1136/1137: bot-side qty exceeds the actual
+                        // residual position. Query the exchange for residual size
+                        // and resubmit with min(quantized, actual). 0 → already flat.
+                        match self.fetch_residual_position_size(&leg.symbol).await {
+                            Some(actual) if actual == Decimal::ZERO => {
+                                log::info!(
+                                    "[ORDER] {} retry skipped; positions already flat",
+                                    leg.symbol
+                                );
+                            }
+                            Some(actual) => {
+                                let target = quantized.min(actual);
+                                let downsized =
+                                    self.quantize_order_size_exit(&leg.symbol, target, price_map);
+                                if downsized <= Decimal::ZERO {
+                                    log::info!(
+                                        "[ORDER] {} retry skipped; residual {} below min lot",
+                                        leg.symbol,
+                                        actual
+                                    );
+                                    continue;
+                                }
+                                match self
+                                    .connector
+                                    .create_order(
+                                        &leg.symbol,
+                                        downsized,
+                                        leg.side,
+                                        None,
+                                        None,
+                                        true,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    Ok(resp) => {
+                                        new_legs.push(PendingLeg {
+                                            symbol: leg.symbol.clone(),
+                                            order_id: resp.order_id,
+                                            exchange_order_id: resp.exchange_order_id,
+                                            target: downsized,
+                                            filled: Decimal::ZERO,
+                                            side: leg.side,
+                                            limit_price: None,
+                                            reference_price: ref_price_retry,
+                                            post_only: false,
+                                        });
+                                        log::warn!(
+                                                "[ORDER] Retrying exit leg {} size={} mode=MARKET (sized down from {})",
+                                                leg.symbol,
+                                                downsized,
+                                                quantized
+                                            );
+                                    }
+                                    Err(e2) => log::error!(
+                                        "[ORDER] Failed to retry sized-down exit leg {}: {:?}",
+                                        leg.symbol,
+                                        e2
+                                    ),
+                                }
+                            }
+                            None => log::error!(
+                                "[ORDER] Failed to retry exit leg {}: {:?} (residual check failed)",
+                                leg.symbol,
+                                e
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("[ORDER] Failed to retry exit leg {}: {:?}", leg.symbol, e)
+                    }
+                }
+            }
+        }
+        new_legs
+    }
+
     /// Exit-side branch of `reconcile_pending_orders`, extracted to a
     /// `&mut self` helper (bot-strategy#502 item2). The exit branch was the
     /// final block in the method, so no early-return signalling is needed:
@@ -170,99 +452,16 @@ impl PairTradeEngine {
                 .and_then(|s| s.z_score().map(|(z, _)| z));
             let beta_val = self.per_pair_state.get(key).map(|s| s.beta);
             if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                if let Some(pos) = state.position.as_ref() {
-                    if let Some((base, quote)) = key.split_once('/') {
-                        if let (Some(p1), Some(p2)) = (price_map.get(base), price_map.get(quote)) {
-                            if let Some(pnl) =
-                                compute_pnl(pos, p1.price, p2.price).and_then(|p| p.to_f64())
-                            {
-                                let hold_secs =
-                                    Some(now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
-                                let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
-                                let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
-                                let (carry_usd, ticks_observed) = match (
-                                    pos.entry_size_a,
-                                    pos.entry_price_a,
-                                    pos.entry_size_b,
-                                    pos.entry_price_b,
-                                ) {
-                                    (Some(sa), Some(pa), Some(sb), Some(pb)) => {
-                                        funding_history::compute_carry_usd(
-                                            funding_history::FundingCarryInput {
-                                                history: &self.funding_history,
-                                                base_symbol: base,
-                                                quote_symbol: quote,
-                                                open_ts: pos.entered_ts,
-                                                close_ts: now_ts,
-                                                direction: pos.direction,
-                                                entry_size_a: sa,
-                                                entry_price_a: pa,
-                                                entry_size_b: sb,
-                                                entry_price_b: pb,
-                                            },
-                                        )
-                                    }
-                                    _ => (0.0, 0),
-                                };
-                                let mut record = PnlLogRecord::new(
-                                    base,
-                                    quote,
-                                    pos.direction,
-                                    pnl,
-                                    now_ts,
-                                    "exit_fill",
-                                )
-                                .with_trade_details(PnlTradeDetails {
-                                    entry_a,
-                                    entry_b,
-                                    exit_a: p1.price.to_f64(),
-                                    exit_b: p2.price.to_f64(),
-                                    beta: beta_val,
-                                    z_entry: pos.entry_z,
-                                    z_exit,
-                                    hold_secs,
-                                });
-                                if ticks_observed > 0 {
-                                    record = record.with_funding(carry_usd, ticks_observed);
-                                }
-                                // #314 Group 4: emit gross/funding bps to
-                                // Prometheus. Same Some(...,...,...,...)
-                                // gate as the funding compute above so the
-                                // bps denominator stays consistent. `reason`
-                                // is the same Option<&'static str> that
-                                // apply_post_exit_state consumes immediately
-                                // after this — read without .take() so the
-                                // close-reason counter still receives it
-                                // (bot-strategy#421).
-                                let reason = state.pending_exit_reason.unwrap_or("unknown");
-                                if let (Some(sa), Some(pa), Some(sb), Some(pb)) = (
-                                    pos.entry_size_a,
-                                    pos.entry_price_a,
-                                    pos.entry_size_b,
-                                    pos.entry_price_b,
-                                ) {
-                                    let leg_a = (sa * pa).abs().to_f64();
-                                    let leg_b = (sb * pb).abs().to_f64();
-                                    if let (Some(a), Some(b)) = (leg_a, leg_b) {
-                                        let notional = a + b;
-                                        if notional > 0.0 {
-                                            super::super::prom::CLOSE_GROSS_PNL_BPS
-                                                .with_label_values(&[&inst_id, key, reason])
-                                                .observe(pnl / notional * 10_000.0);
-                                            if ticks_observed > 0 {
-                                                super::super::prom::CLOSE_FUNDING_BPS
-                                                    .with_label_values(&[&inst_id, key])
-                                                    .observe(carry_usd / notional * 10_000.0);
-                                            }
-                                        }
-                                    }
-                                }
-                                record = record.with_close_reason(reason);
-                                pnl_record = Some((record, pnl, carry_usd));
-                            }
-                        }
-                    }
-                }
+                pnl_record = Self::build_exit_fill_pnl(ExitFillPnlContext {
+                    inst_id: &inst_id,
+                    key,
+                    state,
+                    price_map,
+                    funding_history: &self.funding_history,
+                    z_exit,
+                    beta_val,
+                    now_ts,
+                });
                 apply_post_exit_state(
                     state,
                     self.per_pair_state.get(key),
@@ -284,44 +483,7 @@ impl PairTradeEngine {
             log::info!("[ORDER] {} exit orders filled", key);
             if let Some((record, pnl_value, funding_value)) = pnl_record {
                 self.write_pnl_record(inst_idx, record);
-                self.instances[inst_idx].realized_pnl_today += pnl_value;
-                self.instances[inst_idx].funding_carry_today += funding_value;
-                // write_pnl_record always bumps total_trades / total_pnl
-                // (now persisted, bot-strategy#320), so the snapshot is
-                // dirty regardless of pnl sign.
-                let mut risk_state_dirty = true;
-                if pnl_value < 0.0 {
-                    self.instances[inst_idx].consecutive_losses += 1;
-                    risk_state_dirty = true;
-                    if let Some(cooldown) = self
-                        .cfg
-                        .circuit_breaker_cooldown_for(self.instances[inst_idx].consecutive_losses)
-                    {
-                        self.instances[inst_idx].circuit_breaker_until =
-                            Some(Instant::now() + cooldown);
-                        self.instances[inst_idx].circuit_breaker_until_ts =
-                            Some(now_ts + cooldown.as_secs() as i64);
-                        log::warn!(
-                            "[CIRCUIT_BREAKER] activated after {} consecutive losses, cooldown {}s",
-                            self.instances[inst_idx].consecutive_losses,
-                            cooldown.as_secs()
-                        );
-                    }
-                } else if pnl_value > 0.0 {
-                    if self.instances[inst_idx].consecutive_losses > 0 {
-                        log::info!(
-                            "[CIRCUIT_BREAKER] reset after win (was {} consecutive losses)",
-                            self.instances[inst_idx].consecutive_losses
-                        );
-                        risk_state_dirty = true;
-                    }
-                    self.instances[inst_idx].consecutive_losses = 0;
-                    self.instances[inst_idx].circuit_breaker_until = None;
-                    self.instances[inst_idx].circuit_breaker_until_ts = None;
-                }
-                if risk_state_dirty {
-                    self.persist_risk_state();
-                }
+                self.record_exit_realized_pnl(inst_idx, now_ts, pnl_value, funding_value);
             }
         } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
             let next_retry = pending.hedge_retry_count.saturating_add(1);
@@ -442,132 +604,11 @@ impl PairTradeEngine {
                 }
                 self.cancel_pending_orders(&pending).await?;
             }
-            // Re-attempt closing missing legs based on filled qty
-            // reusing filled_qtys defined earlier
-            let mut new_legs = Vec::new();
-            for leg in &pending.legs {
-                let filled = filled_qtys
-                    .get(&leg.order_id)
-                    .cloned()
-                    .unwrap_or(Decimal::ZERO);
-                let remaining_qty = (leg.target - filled).max(Decimal::ZERO);
-                if remaining_qty > Decimal::ZERO {
-                    let quantized =
-                        self.quantize_order_size_exit(&leg.symbol, remaining_qty, price_map);
-                    if quantized <= Decimal::ZERO {
-                        continue;
-                    }
-                    let limit = None;
-                    // Reference for the taker retry — feeds the
-                    // taker-side slippage histogram (#314 Group
-                    // 4-B-2). The downsized retry below uses the
-                    // same captured value.
-                    let ref_price_retry =
-                        self.order_reference_price(&leg.symbol, leg.side, price_map);
-                    match self
-                        .connector
-                        .create_order(&leg.symbol, quantized, leg.side, limit, None, true, None)
-                        .await
-                    {
-                        Ok(resp) => {
-                            new_legs.push(PendingLeg {
-                                symbol: leg.symbol.clone(),
-                                order_id: resp.order_id,
-                                exchange_order_id: resp.exchange_order_id,
-                                target: quantized,
-                                filled: Decimal::ZERO,
-                                side: leg.side,
-                                limit_price: None,
-                                reference_price: ref_price_retry,
-                                post_only: false,
-                            });
-                            log::warn!(
-                                "[ORDER] Retrying exit leg {} size={} mode=MARKET",
-                                leg.symbol,
-                                quantized
-                            );
-                        }
-                        Err(e) if engine::error_class::is_reduce_only_rejection(&e) => {
-                            // Extended code 1136/1137: bot-side qty exceeds the actual
-                            // residual position. Query the exchange for residual size
-                            // and resubmit with min(quantized, actual). 0 → already flat.
-                            match self
-                                    .fetch_residual_position_size(&leg.symbol)
-                                    .await
-                                {
-                                    Some(actual) if actual == Decimal::ZERO => {
-                                        log::info!(
-                                            "[ORDER] {} retry skipped; positions already flat",
-                                            leg.symbol
-                                        );
-                                    }
-                                    Some(actual) => {
-                                        let target = quantized.min(actual);
-                                        let downsized = self.quantize_order_size_exit(
-                                            &leg.symbol,
-                                            target,
-                                            price_map,
-                                        );
-                                        if downsized <= Decimal::ZERO {
-                                            log::info!(
-                                                "[ORDER] {} retry skipped; residual {} below min lot",
-                                                leg.symbol,
-                                                actual
-                                            );
-                                            continue;
-                                        }
-                                        match self
-                                            .connector
-                                            .create_order(
-                                                &leg.symbol,
-                                                downsized,
-                                                leg.side,
-                                                None,
-                                                None,
-                                                true,
-                                                None,
-                                            )
-                                            .await
-                                        {
-                                            Ok(resp) => {
-                                                new_legs.push(PendingLeg {
-                                                    symbol: leg.symbol.clone(),
-                                                    order_id: resp.order_id,
-                                                    exchange_order_id: resp.exchange_order_id,
-                                                    target: downsized,
-                                                    filled: Decimal::ZERO,
-                                                    side: leg.side,
-                                                    limit_price: None,
-                                                    reference_price: ref_price_retry,
-                                                    post_only: false,
-                                                });
-                                                log::warn!(
-                                                    "[ORDER] Retrying exit leg {} size={} mode=MARKET (sized down from {})",
-                                                    leg.symbol,
-                                                    downsized,
-                                                    quantized
-                                                );
-                                            }
-                                            Err(e2) => log::error!(
-                                                "[ORDER] Failed to retry sized-down exit leg {}: {:?}",
-                                                leg.symbol,
-                                                e2
-                                            ),
-                                        }
-                                    }
-                                    None => log::error!(
-                                        "[ORDER] Failed to retry exit leg {}: {:?} (residual check failed)",
-                                        leg.symbol,
-                                        e
-                                    ),
-                                }
-                        }
-                        Err(e) => {
-                            log::error!("[ORDER] Failed to retry exit leg {}: {:?}", leg.symbol, e)
-                        }
-                    }
-                }
-            }
+            // Re-attempt closing missing legs based on filled qty,
+            // reusing filled_qtys defined earlier.
+            let new_legs = self
+                .retry_exit_remaining_legs(&pending, &filled_qtys, price_map)
+                .await;
             if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                 if new_legs.is_empty() {
                     state.pending_exit = None;
@@ -592,6 +633,60 @@ impl PairTradeEngine {
             state.pending_exit = Some(pending);
         }
         Ok(())
+    }
+
+    /// Emit the `[ORDER_FALLBACK_DETAIL]` instrumentation line when a
+    /// post-only entry times out and falls back to taker (bot-strategy#165
+    /// Phase 0): per-leg fill status, posted limit vs current book, and the
+    /// z-movement from entry to timeout. Pure logging — relocated verbatim
+    /// from `reconcile_entry` (bot-strategy#502).
+    fn log_post_only_fallback_detail(
+        key: &str,
+        pending: &PendingOrders,
+        status: &PendingStatus,
+        price_map: &HashMap<String, SymbolSnapshot>,
+        z_entry: f64,
+        z_now: f64,
+    ) {
+        let leg_details: Vec<String> = pending
+            .legs
+            .iter()
+            .map(|leg| {
+                let filled = status
+                    .fills
+                    .get(&leg.order_id)
+                    .cloned()
+                    .unwrap_or(Decimal::ZERO);
+                let open = status.open_ids.contains(&leg.order_id);
+                let snap = price_map.get(&leg.symbol);
+                let bid = snap.and_then(|s| s.bid_price);
+                let ask = snap.and_then(|s| s.ask_price);
+                let tick = snap.and_then(|s| s.min_tick);
+                format!(
+                    "[{}|{:?}|tgt={}|filled={}|open={}|limit={}|bid={}|ask={}|tick={}]",
+                    leg.symbol,
+                    leg.side,
+                    leg.target,
+                    filled,
+                    open,
+                    leg.limit_price
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    bid.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                    ask.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                    tick.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                )
+            })
+            .collect();
+        log::info!(
+            "[ORDER_FALLBACK_DETAIL] {} elapsed={}s dir={:?} z_entry={:.2} z_now={:.2} legs={}",
+            key,
+            pending.placed_at.elapsed().as_secs(),
+            pending.direction,
+            z_entry,
+            z_now,
+            leg_details.join(" ")
+        );
     }
 
     /// Entry-side branch of `reconcile_pending_orders`, extracted to a
@@ -809,45 +904,9 @@ impl PairTradeEngine {
                         .unwrap_or(0.0);
                     (ze, zn)
                 };
-                let leg_details: Vec<String> = pending
-                    .legs
-                    .iter()
-                    .map(|leg| {
-                        let filled = status
-                            .fills
-                            .get(&leg.order_id)
-                            .cloned()
-                            .unwrap_or(Decimal::ZERO);
-                        let open = status.open_ids.contains(&leg.order_id);
-                        let snap = price_map.get(&leg.symbol);
-                        let bid = snap.and_then(|s| s.bid_price);
-                        let ask = snap.and_then(|s| s.ask_price);
-                        let tick = snap.and_then(|s| s.min_tick);
-                        format!(
-                            "[{}|{:?}|tgt={}|filled={}|open={}|limit={}|bid={}|ask={}|tick={}]",
-                            leg.symbol,
-                            leg.side,
-                            leg.target,
-                            filled,
-                            open,
-                            leg.limit_price
-                                .map(|d| d.to_string())
-                                .unwrap_or_else(|| "none".into()),
-                            bid.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
-                            ask.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
-                            tick.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
-                        )
-                    })
-                    .collect();
-                log::info!(
-                        "[ORDER_FALLBACK_DETAIL] {} elapsed={}s dir={:?} z_entry={:.2} z_now={:.2} legs={}",
-                        key,
-                        pending.placed_at.elapsed().as_secs(),
-                        pending.direction,
-                        z_entry,
-                        z_now,
-                        leg_details.join(" ")
-                    );
+                Self::log_post_only_fallback_detail(
+                    key, &pending, &status, price_map, z_entry, z_now,
+                );
 
                 // Post-only entry timed out; cancel and reissue as taker
                 log::info!(
@@ -891,78 +950,17 @@ impl PairTradeEngine {
                 self.cancel_pending_orders(&pending).await?;
             }
             let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
-            let mut flattened_any = false;
-            let mut hedge_failed = false;
             let mut retry_count = pending.hedge_retry_count;
             let max_retries = 3u32;
-            for leg in &pending.legs {
-                let filled = filled_qtys
-                    .get(&leg.order_id)
-                    .cloned()
-                    .unwrap_or(Decimal::ZERO);
-                if filled > Decimal::ZERO {
-                    if price_map.contains_key(&leg.symbol) {
-                        let hedge_side = match leg.side {
-                            dex_connector::OrderSide::Long => dex_connector::OrderSide::Short,
-                            dex_connector::OrderSide::Short => dex_connector::OrderSide::Long,
-                        };
-                        let use_market = retry_count + 1 >= max_retries;
-                        let limit = if use_market {
-                            None
-                        } else {
-                            self.limit_price_for(&leg.symbol, hedge_side, price_map)
-                        };
-                        if !use_market && limit.is_none() {
-                            log::warn!(
-                                "[ORDER] Missing reference price for hedge {} leg {}",
-                                leg.symbol,
-                                leg.order_id
-                            );
-                            hedge_failed = true;
-                            continue;
-                        }
-                        let spread = self.order_spread_param(limit, false);
-                        if let Err(e) = self
-                            .connector
-                            .create_order(
-                                &leg.symbol,
-                                filled,
-                                hedge_side,
-                                limit,
-                                spread,
-                                true,
-                                None,
-                            )
-                            .await
-                        {
-                            log::error!(
-                                "[ORDER] Failed to hedge partial entry {} ({}): {:?}",
-                                leg.symbol,
-                                leg.order_id,
-                                e
-                            );
-                            hedge_failed = true;
-                        } else {
-                            flattened_any = true;
-                            let mode = if use_market { "MARKET" } else { "LIMIT" };
-                            log::warn!(
-                                "[ORDER] Hedged partial entry on {} size={} mode={} retries={}",
-                                leg.symbol,
-                                filled,
-                                mode,
-                                retry_count
-                            );
-                        }
-                    } else {
-                        log::warn!(
-                            "[ORDER] Missing price map entry for hedge {} leg {}",
-                            leg.symbol,
-                            leg.order_id
-                        );
-                        hedge_failed = true;
-                    }
-                }
-            }
+            let (flattened_any, hedge_failed) = self
+                .hedge_partial_entry_legs(
+                    &pending,
+                    &filled_qtys,
+                    price_map,
+                    retry_count,
+                    max_retries,
+                )
+                .await;
             if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                 if hedge_failed {
                     retry_count = retry_count.saturating_add(1);
@@ -989,6 +987,85 @@ impl PairTradeEngine {
             state.pending_entry = Some(pending);
         }
         Ok(false)
+    }
+
+    /// Flatten the already-filled legs of a timed-out entry by sending the
+    /// opposing (reduce-only) order per filled leg: LIMIT for the first
+    /// retries, escalating to MARKET at `max_retries`. Returns
+    /// `(flattened_any, hedge_failed)` so the caller decides whether to
+    /// reschedule the hedge or clear the pending entry. Pure relocation of
+    /// the hedge loop from `reconcile_entry` (bot-strategy#502).
+    async fn hedge_partial_entry_legs(
+        &mut self,
+        pending: &PendingOrders,
+        filled_qtys: &HashMap<String, Decimal>,
+        price_map: &HashMap<String, SymbolSnapshot>,
+        retry_count: u32,
+        max_retries: u32,
+    ) -> (bool, bool) {
+        let mut flattened_any = false;
+        let mut hedge_failed = false;
+        for leg in &pending.legs {
+            let filled = filled_qtys
+                .get(&leg.order_id)
+                .cloned()
+                .unwrap_or(Decimal::ZERO);
+            if filled > Decimal::ZERO {
+                if price_map.contains_key(&leg.symbol) {
+                    let hedge_side = match leg.side {
+                        dex_connector::OrderSide::Long => dex_connector::OrderSide::Short,
+                        dex_connector::OrderSide::Short => dex_connector::OrderSide::Long,
+                    };
+                    let use_market = retry_count + 1 >= max_retries;
+                    let limit = if use_market {
+                        None
+                    } else {
+                        self.limit_price_for(&leg.symbol, hedge_side, price_map)
+                    };
+                    if !use_market && limit.is_none() {
+                        log::warn!(
+                            "[ORDER] Missing reference price for hedge {} leg {}",
+                            leg.symbol,
+                            leg.order_id
+                        );
+                        hedge_failed = true;
+                        continue;
+                    }
+                    let spread = self.order_spread_param(limit, false);
+                    if let Err(e) = self
+                        .connector
+                        .create_order(&leg.symbol, filled, hedge_side, limit, spread, true, None)
+                        .await
+                    {
+                        log::error!(
+                            "[ORDER] Failed to hedge partial entry {} ({}): {:?}",
+                            leg.symbol,
+                            leg.order_id,
+                            e
+                        );
+                        hedge_failed = true;
+                    } else {
+                        flattened_any = true;
+                        let mode = if use_market { "MARKET" } else { "LIMIT" };
+                        log::warn!(
+                            "[ORDER] Hedged partial entry on {} size={} mode={} retries={}",
+                            leg.symbol,
+                            filled,
+                            mode,
+                            retry_count
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "[ORDER] Missing price map entry for hedge {} leg {}",
+                        leg.symbol,
+                        leg.order_id
+                    );
+                    hedge_failed = true;
+                }
+            }
+        }
+        (flattened_any, hedge_failed)
     }
 
     async fn cancel_pending_orders(&self, pending: &PendingOrders) -> Result<()> {
