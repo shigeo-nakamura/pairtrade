@@ -36,6 +36,7 @@
 //!   serialize on `gate_lock()` because they share those sentinel files
 //!   and read the process-global Prometheus reject counters.
 
+use super::bar::BarBuilder;
 use super::defaults::DEFAULT_EQUITY_USD;
 use super::state::{PairSharedState, PairState, Position, PositionDirection};
 use super::*;

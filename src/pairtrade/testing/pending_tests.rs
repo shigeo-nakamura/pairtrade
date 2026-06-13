@@ -1,4 +1,5 @@
 use super::engine::placement::ReissuePartialLegsRequest;
+use super::pnl_log::PnlLogger;
 use super::state::{PendingLeg, PendingOrders};
 use super::*;
 use async_trait::async_trait;

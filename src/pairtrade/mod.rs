@@ -1,14 +1,10 @@
-use anyhow::{anyhow, Context, Result};
-use dex_connector::{DexConnector, PositionSnapshot};
+use anyhow::{Context, Result};
+use dex_connector::PositionSnapshot;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::Instant;
 use tokio::time::Duration;
-
-use crate::ports::replay_dex::ReplayConnector;
 
 mod backtest;
 mod bar;
@@ -20,6 +16,7 @@ mod entry;
 mod exit;
 mod funding_history;
 mod history_io;
+mod instance;
 mod kalman;
 mod market;
 mod order_pricing;
@@ -38,12 +35,12 @@ mod status;
 mod util;
 // Re-exported at the pairtrade module root so existing `super::super::`
 // references in engine submodules resolve unchanged (bot-strategy#502).
-use bar::BarBuilder;
 pub use config::{DailyLossAction, PairTradeConfig, WarmStartMode};
+pub use engine::PairTradeEngine;
+pub(in crate::pairtrade) use instance::{StrategyInstance, EQUITY_REFRESH_CACHE_SECS};
 use market::SymbolSnapshot;
-use pnl_log::{PnlLogRecord, PnlLogger, PnlTradeDetails};
+use pnl_log::{PnlLogRecord, PnlTradeDetails};
 pub(in crate::pairtrade) use sentinel::{kill_switch_path, risk_ack_path};
-use stats::PriceSample;
 
 /// Spawn the Prometheus exporter when `PROM_LISTEN` is set in the env.
 /// Safe to call at most once at process boot from `main`. See
@@ -52,19 +49,10 @@ pub fn start_metrics_exporter() {
     prom::maybe_start_exporter();
 }
 use config::PairParams;
-use engine::risk::risk_state_path_for;
-use state::{PairSharedState, PairState, PositionDirection};
-use status::StatusReporter;
-use util::{enforce_post_only_passive, round_price_by_tick, tail_std};
 
-/// Max age of the per-instance equity cache before `refresh_equity_if_needed`
-/// fetches a fresh value from the exchange. Now a low-frequency dashboard tick:
-/// exit/loss-cut uses locally-computed PnL from WS prices, so `equity_cache`
-/// only scales the slowly-drifting R-budget and feeds the status reporter.
-/// Entry sizing fetches inline (see `fetch_equity_rest` call in the entry
-/// branch of `step()`), which after dex-connector v4.2.83 is a WS-derived
-/// cache hit in steady state. See bot-strategy#156, #239.
-const EQUITY_REFRESH_CACHE_SECS: u64 = 300;
+use state::{PairSharedState, PairState, PositionDirection};
+
+use util::{enforce_post_only_passive, round_price_by_tick, tail_std};
 
 /// Apply the post-exit state transition: clear position, stamp
 /// last_exit_{at,ts}, and — if the exit reason stashed by `exit_reason()`
@@ -105,366 +93,7 @@ pub(in crate::pairtrade) fn apply_post_exit_state(
     }
 }
 
-struct StrategyInstance {
-    #[allow(dead_code)]
-    id: String,
-    /// Per-strategy connector. For single-instance deployments this is the
-    /// same `Arc` as `PairTradeEngine.connector`. For multi-strategy
-    /// deployments each instance owns its own connector pointing at its
-    /// sub-account credentials.
-    #[allow(dead_code)]
-    connector: Arc<dyn DexConnector + Send + Sync>,
-    /// Per-instance live equity from the instance's connector.
-    equity_cache: f64,
-    last_equity_fetch: Option<Instant>,
-    /// False until the first successful `fetch_equity_rest` writes a
-    /// connector-sourced balance into `equity_cache`. Not persisted —
-    /// always starts false on engine boot. Gates session-DD evaluation
-    /// and equity sampling so a restart whose `equity_samples` deque
-    /// already holds a real peak does not trip a phantom halt against
-    /// the stale `equity_reference_usd` seed before the first WS
-    /// account dump propagates. See bot-strategy#366.
-    equity_initialized: bool,
-    /// Per-strategy fixed equity reference from the YAML
-    /// `equity_usd_reference`. Used as the base for risk thresholds
-    /// (daily DD, exit risk_budget) AND position sizing so each
-    /// variant operates against its own declared capital. Revised
-    /// manually at the same monthly cadence as A/B/C parameter updates;
-    /// `equity_cache` is kept separately for live monitoring only and
-    /// is no longer mixed into the threshold/sizing math. See
-    /// bot-strategy#222.
-    equity_reference_usd: f64,
-    states: HashMap<String, PairState>,
-    pnl_logger: Option<PnlLogger>,
-    status_reporter: Option<StatusReporter>,
-    consecutive_losses: u32,
-    circuit_breaker_until: Option<Instant>,
-    /// Replay-aware companion to `circuit_breaker_until`. Compared against
-    /// the per-step `now_ts` so backtest replays can honour the same
-    /// cool-down logic as live.
-    circuit_breaker_until_ts: Option<i64>,
-    /// Daily-DD tracking (bot-strategy#185 Phase 2). Zero/None until the
-    /// first `refresh_daily_session` reset populates them.
-    session_start_equity: f64,
-    session_start_ts: i64,
-    realized_pnl_today: f64,
-    /// Running sum of `funding_carry_usd` from cycles closed during the
-    /// current UTC session. Updated at exit_fill / exit_dry_run when the
-    /// cycle's funding carry was measured (`with_funding(...)` was called
-    /// on the PnlLogRecord). Reset at the same session rollover as
-    /// `realized_pnl_today`. Persisted via `InstanceRiskState` so it
-    /// survives restarts within a single UTC day. Surfaced on
-    /// status.json as `funding_carry_today` for dashboard attribution.
-    /// bot-strategy#371.
-    funding_carry_today: f64,
-    /// True once `realized_pnl_today` has breached
-    /// `max_daily_loss_bps`. Used for transition logging only
-    /// (activate/clear); the live gate check is recomputed every tick
-    /// from current state via `daily_loss_blocks`.
-    daily_loss_halted: bool,
-    /// Phase 3-1 rolling peak equity samples. Append-only at
-    /// `risk.session_dd_sample_secs` cadence; entries older than
-    /// `risk.session_dd_lookback_secs` are pruned in-place.
-    equity_samples: Vec<risk_io::EquitySample>,
-    /// Phase 3-1/3-2 sticky halt set on session-DD breach. Persists to
-    /// `risk_state.json` so a crash inside the cool-off window does
-    /// not silently re-arm the bot. Cleared only by writing the
-    /// manual-ack sentinel (default `/opt/debot/RISK_ACK`, overridable
-    /// via the `RISK_ACK_PATH` env var per bot-strategy#488).
-    session_halted: bool,
-    session_halt_reason: Option<String>,
-    session_halt_ts: Option<i64>,
-    total_trades: u64,
-    total_wins: u64,
-    total_pnl: f64,
-    peak_pnl: f64,
-    max_dd: f64,
-    /// Per-instance pair parameter overrides. Built at `new_inner` time by
-    /// overlaying the strategy's `exit_z` / `stop_loss_z` / `max_loss_r_mult`
-    /// on top of the engine-wide defaults. Look up via
-    /// `PairTradeEngine::pair_params_for(inst_idx, key)`.
-    pair_params: HashMap<String, PairParams>,
-    default_pair_params: PairParams,
-    /// One-shot reason marker set when the risk layer flattens this
-    /// instance's positions outside the strategy exit path (e.g. the
-    /// session-DD halt). Consumed by `sync_positions_from_exchange` when
-    /// the exchange snapshot confirms the positions are gone, so the
-    /// `recovery_no_pnl` context record carries the real trigger instead
-    /// of the generic `exchange_snapshot_clear`. Not persisted.
-    /// bot-strategy#514.
-    external_flatten_reason: Option<String>,
-}
-
-pub struct PairTradeEngine {
-    cfg: PairTradeConfig,
-    connector: Arc<dyn DexConnector + Send + Sync>,
-    instances: Vec<StrategyInstance>,
-    history: HashMap<String, VecDeque<PriceSample>>,
-    /// Per-pair quantities (β / spread / z / Kalman / eval result) shared
-    /// across every `StrategyInstance` on the same pair. Computed exactly
-    /// once per tick in `step_pair_shared`, so A/B/C variants observe
-    /// byte-identical β / std / z. See bot-strategy#413.
-    per_pair_state: HashMap<String, PairSharedState>,
-    bar_builders: HashMap<String, BarBuilder>,
-    last_metrics_log: Option<Instant>,
-    last_ob_warn: HashMap<String, Instant>,
-    last_ticker_warn: HashMap<String, Instant>,
-    last_position_warn: HashMap<String, Instant>,
-    min_order_warned: HashSet<String>,
-    min_tick_warned: HashSet<String>,
-    positions_ready: bool,
-    open_positions: HashMap<String, PositionSnapshot>,
-    history_path: PathBuf,
-    /// Path for the risk-state persistence file (circuit breaker counters
-    /// + cool-down deadline). Sibling of `history_path`. See bot-strategy#185.
-    risk_state_path: PathBuf,
-    /// Cached result of the most recent `kill_switch_path()` existence check.
-    /// Refreshed at the top of every `step_shared` tick. True blocks new
-    /// entries across all instances.
-    kill_switch_active: bool,
-    data_dump_writer: Option<data_dump::RotatingDumpWriter>,
-    /// Per-tick regime-detector series CSV writer (BT calibration aid for
-    /// bot-strategy#534/#494). `Some` only when `cfg.bt_regime_series_file`
-    /// is set; flushed at backtest end-of-data.
-    regime_series_writer: Option<std::io::BufWriter<std::fs::File>>,
-    replay_connector: Option<Arc<ReplayConnector>>,
-    /// Rolling per-symbol funding-rate history observed from WS, used by
-    /// `exit_fill` to compute `funding_carry_usd` on each cycle without an
-    /// external REST fetch. bot-strategy#364.
-    funding_history: funding_history::FundingHistory,
-    /// Graceful shutdown flag. When true:
-    ///   - new entries are blocked
-    ///   - existing exit logic (exit_z / stop_loss_z / force_close_secs) runs normally
-    ///   - live loop exits as soon as open_positions is empty, or after shutdown_grace_secs
-    shutdown_pending: bool,
-    /// Recent bar-emit timestamps per symbol, for the [BAR_RATE] canary
-    /// (bot-strategy#341). Trimmed to the trailing 120 s; the canary warns
-    /// if sustained < 0.8 emits/min, which would have caught the original
-    /// Phase 2 β-freeze in <30 min instead of 78 h.
-    bar_emit_log: HashMap<String, VecDeque<Instant>>,
-    /// Last time a [BAR_RATE] WARN fired per symbol, used to rate-limit
-    /// the warning to ~once per minute so a sustained low rate doesn't
-    /// flood the journal.
-    last_bar_rate_warn: HashMap<String, Instant>,
-    /// Fingerprint of the most recently emitted `[WARM_START] snapshot
-    /// loaded ...` INFO line. `load_history_from_disk` runs on every
-    /// polling tick (engine/step.rs:511), so a naive INFO emit fires
-    /// ~12×/min on the typical 5 s polling cadence. We dedup on this
-    /// key so an operator rolling back a snapshot still sees the
-    /// "loaded" line in journalctl (content changes → key differs →
-    /// emit) while steady-state per-tick reloads stay quiet. WARN
-    /// paths (stale-guard, parse-error, partial) are always emitted.
-    last_warm_start_key: Option<String>,
-}
-
 impl PairTradeEngine {
-    /// Create a new engine with a pre-loaded ReplayConnector (for batch mode).
-    pub async fn new_with_replay(
-        cfg: PairTradeConfig,
-        replay: Arc<ReplayConnector>,
-    ) -> Result<Self> {
-        replay.reset();
-        let primary: Arc<dyn DexConnector + Send + Sync> = replay.clone();
-        let n = cfg.strategies.len().max(1);
-        let instance_connectors = std::iter::repeat_n(primary.clone(), n).collect();
-        Self::new_inner(cfg, primary, instance_connectors, Some(replay)).await
-    }
-
-    pub async fn new(cfg: PairTradeConfig) -> Result<Self> {
-        let (connector, instance_connectors, replay_connector) =
-            backtest::create_connector(&cfg).await?;
-        Self::new_inner(cfg, connector, instance_connectors, replay_connector).await
-    }
-
-    async fn new_inner(
-        cfg: PairTradeConfig,
-        connector: Arc<dyn DexConnector + Send + Sync>,
-        instance_connectors: Vec<Arc<dyn DexConnector + Send + Sync>>,
-        replay_connector: Option<Arc<ReplayConnector>>,
-    ) -> Result<Self> {
-        let mut history = HashMap::new();
-        let mut bar_builders = HashMap::new();
-        let mut per_pair_state: HashMap<String, PairSharedState> = HashMap::new();
-        for pair in &cfg.universe {
-            history.insert(pair.base.clone(), VecDeque::new());
-            history.insert(pair.quote.clone(), VecDeque::new());
-            bar_builders.insert(pair.base.clone(), BarBuilder::new(cfg.trading_period_secs));
-            bar_builders.insert(pair.quote.clone(), BarBuilder::new(cfg.trading_period_secs));
-            let pair_key = format!("{}/{}", pair.base, pair.quote);
-            let mut shared = PairSharedState::new(cfg.metrics_window);
-            if cfg.use_kalman_beta {
-                shared.kalman = Some(kalman::KalmanBeta::new(
-                    1.0,
-                    cfg.kalman_initial_p,
-                    cfg.kalman_q,
-                    cfg.kalman_r,
-                ));
-            }
-            per_pair_state.insert(pair_key, shared);
-        }
-
-        let history_path = PathBuf::from(cfg.history_file.as_str());
-        let risk_state_path = risk_state_path_for(&history_path);
-
-        let min_order_warned = HashSet::new();
-        let min_tick_warned = HashSet::new();
-        let data_dump_writer = if cfg.enable_data_dump {
-            let file_path = cfg.data_dump_file.as_ref().unwrap(); // is_none checked in from_env
-            Some(data_dump::RotatingDumpWriter::new(file_path)?)
-        } else {
-            None
-        };
-        let regime_series_writer = match cfg.bt_regime_series_file.as_deref() {
-            Some(path) => {
-                // Backtest-only output: a non-rotating per-tick file must not
-                // be creatable by an accidentally inherited env in live mode.
-                if !cfg.backtest_mode {
-                    return Err(anyhow!(
-                        "BT_REGIME_SERIES_FILE is set but BACKTEST_MODE is not — refusing to \
-                         write a non-rotating per-tick series file in live mode"
-                    ));
-                }
-                use std::io::Write;
-                let mut writer = std::io::BufWriter::new(
-                    std::fs::File::create(path)
-                        .with_context(|| format!("create BT_REGIME_SERIES_FILE {path}"))?,
-                );
-                writeln!(writer, "ts,key,innovation,beta,scale,norm,cusum,active")
-                    .context("write BT_REGIME_SERIES_FILE header")?;
-                Some(writer)
-            }
-            None => None,
-        };
-
-        let backtest_mode = cfg.backtest_mode;
-        let _ = backtest_mode;
-        let multi_instance = cfg.strategies.len() > 1;
-
-        // Build one StrategyInstance per entry in cfg.strategies. For legacy
-        // single-strategy YAML this is exactly one instance whose parameters
-        // match today's behavior (golden-test stable). For multi-strategy
-        // YAML this produces N instances that share the engine's history /
-        // bar_builders but each hold their own pair_params overlay,
-        // connector, PnL log, and status reporter.
-        let mut built_instances: Vec<StrategyInstance> = Vec::new();
-        let strategies = cfg.strategies.clone();
-        for (i, strategy) in strategies.iter().enumerate() {
-            // Overlay per-strategy exit_z / stop_loss_z / max_loss_r_mult on
-            // top of the engine's default_pair_params and per-pair overrides
-            // so each variant evaluates z-exits at its own thresholds.
-            let mut inst_default = cfg.default_pair_params.clone();
-            strategy.apply_pair_param_overrides(&mut inst_default);
-
-            let mut inst_pair_params: HashMap<String, PairParams> = HashMap::new();
-            for (k, v) in cfg.pair_params.iter() {
-                let mut pp = v.clone();
-                strategy.apply_pair_param_overrides(&mut pp);
-                inst_pair_params.insert(k.clone(), pp);
-            }
-
-            let mut states = HashMap::new();
-            for pair in &cfg.universe {
-                let pair_key = format!("{}/{}", pair.base, pair.quote);
-                let pp = inst_pair_params.get(&pair_key).unwrap_or(&inst_default);
-                let ps = PairState::new(pp.entry_z_base);
-                prom::init_close_reason_series(&strategy.id, &pair_key);
-                prom::init_entry_reject_series(&strategy.id, &pair_key);
-                states.insert(pair_key, ps);
-            }
-
-            let instance_connector = instance_connectors
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| connector.clone());
-            let pnl_logger = PnlLogger::from_env_for_instance(&cfg, &strategy.id, multi_instance);
-            let status_reporter =
-                StatusReporter::from_env_for_instance(&cfg, &strategy.id, multi_instance);
-
-            // Stagger the per-instance equity-refresh cycle so N instances
-            // don't all hit `/account` inside the same 5-min expiry boundary.
-            // Each instance is phase-shifted by i * (CACHE_SECS / N) so over
-            // a 5-min window the N calls are spread evenly (~100s apart for
-            // N=3) instead of back-to-back. Avoids Lighter's short-window
-            // 429 on the burst head (bot-strategy#142).
-            let instance_count = strategies.len();
-            let last_equity_fetch = if i == 0 || instance_count <= 1 {
-                None
-            } else {
-                let offset_secs = (EQUITY_REFRESH_CACHE_SECS * i as u64) / instance_count as u64;
-                let phase = EQUITY_REFRESH_CACHE_SECS.saturating_sub(offset_secs);
-                Some(Instant::now() - Duration::from_secs(phase))
-            };
-
-            built_instances.push(StrategyInstance {
-                id: strategy.id.clone(),
-                connector: instance_connector,
-                equity_cache: strategy.equity_reference_usd,
-                last_equity_fetch,
-                equity_initialized: false,
-                equity_reference_usd: strategy.equity_reference_usd,
-                states,
-                pnl_logger,
-                status_reporter,
-                consecutive_losses: 0,
-                circuit_breaker_until: None,
-                circuit_breaker_until_ts: None,
-                session_start_equity: 0.0,
-                session_start_ts: 0,
-                realized_pnl_today: 0.0,
-                funding_carry_today: 0.0,
-                daily_loss_halted: false,
-                equity_samples: Vec::new(),
-                session_halted: false,
-                session_halt_reason: None,
-                session_halt_ts: None,
-                total_trades: 0,
-                total_wins: 0,
-                total_pnl: 0.0,
-                peak_pnl: 0.0,
-                max_dd: 0.0,
-                pair_params: inst_pair_params,
-                default_pair_params: inst_default,
-                external_flatten_reason: None,
-            });
-        }
-
-        // Stamp Prometheus process-info gauges once per variant so the
-        // `pairtrade_bot_version_info` series shows up on /metrics even
-        // before the first tick. bot-strategy#409.
-        let process_started = status::process_started_at();
-        for inst in &built_instances {
-            prom::record_process_info(inst.id.as_str(), process_started);
-        }
-
-        Ok(Self {
-            cfg,
-            connector,
-            replay_connector,
-            instances: built_instances,
-            history,
-            per_pair_state,
-            bar_builders,
-            last_metrics_log: None,
-            last_ob_warn: HashMap::new(),
-            last_ticker_warn: HashMap::new(),
-            last_position_warn: HashMap::new(),
-            min_order_warned,
-            min_tick_warned,
-            positions_ready: backtest_mode,
-            open_positions: HashMap::new(),
-            history_path,
-            risk_state_path,
-            kill_switch_active: false,
-            data_dump_writer,
-            regime_series_writer,
-            funding_history: funding_history::FundingHistory::new(),
-            shutdown_pending: false,
-            bar_emit_log: HashMap::new(),
-            last_bar_rate_warn: HashMap::new(),
-            last_warm_start_key: None,
-        })
-    }
-
     /// Whether every strategy instance is currently flat. For single-instance
     /// deployments this is exactly today's `self.open_positions.is_empty()`
     /// check (golden-test stable). For multi-instance deployments this also
