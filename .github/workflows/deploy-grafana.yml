@@ -129,3 +129,27 @@ jobs:
               fi
             done
           done
+
+          # Prune: delete any provisioned rule in the bot-alerts folder whose
+          # UID is no longer present in grafana/alerts/*.json. The upsert loop
+          # above runs first, so every desired rule already exists before we
+          # prune. Without this, rules removed from the repo (e.g. the retired
+          # xvenue-arb rules in #559) linger in Grafana forever — the upsert
+          # loop only ever creates/updates, never deletes. Scoped to
+          # folderUID == bot-alerts so unrelated folders are untouched.
+          desired_uids=$(jq -r '.[].uid' grafana/alerts/*.json | sort -u)
+          all_rules=$(curl -fsS "${auth[@]}" "${GRAFANA_URL%/}/api/v1/provisioning/alert-rules")
+          existing_uids=$(jq -r '.[] | select(.folderUID == "bot-alerts") | .uid' <<<"$all_rules")
+          for uid in $existing_uids; do
+            if ! grep -qxF "$uid" <<<"$desired_uids"; then
+              echo "Pruning alert rule $uid (no longer in repo)"
+              del_status=$(curl -sS -o /tmp/grafana_rule.json -w '%{http_code}' \
+                -X DELETE "${auth[@]}" \
+                "${GRAFANA_URL%/}/api/v1/provisioning/alert-rules/${uid}")
+              if [ "$del_status" != "204" ]; then
+                cat /tmp/grafana_rule.json
+                echo "::error::Grafana alert delete for $uid returned HTTP $del_status"
+                exit 1
+              fi
+            fi
+          done
