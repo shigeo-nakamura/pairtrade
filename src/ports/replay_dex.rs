@@ -425,6 +425,9 @@ impl DexConnector for ReplayConnector {
                 price: symbol_data.ask_price.unwrap_or(symbol_data.price),
                 size: symbol_data.ask_size,
             }],
+            // dex-connector v4.7.1 added this field (bot-strategy#552); pairtrade
+            // does not consume feed age, so None keeps the constructor compiling.
+            book_ts_ms: None,
         })
     }
 
