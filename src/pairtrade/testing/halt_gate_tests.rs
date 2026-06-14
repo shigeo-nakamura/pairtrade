@@ -185,6 +185,8 @@ impl DexConnector for GateConnector {
                 price: price + spread,
                 size: dec("100"),
             }],
+            // dex-connector v4.7.1 (bot-strategy#552): compat-only.
+            book_ts_ms: None,
         })
     }
 
