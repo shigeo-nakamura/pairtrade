@@ -17,7 +17,7 @@
       "id": 1,
       "type": "timeseries",
       "title": "z-score + position state (per pair / variant)",
-      "description": "Combined view: z-score lines (left scale) plus per-variant position-state bars overlaid at fixed Y levels (canary a=3.5, main a=3.0, main b=2.5, main c=2.0). Position bars are `(pairtrade_has_position == 1) * Y_offset` rendered as thick step lines so the same panel timeline aligns z and position on identical x-pixels.",
+      "description": "Combined view: signed z-score lines plus main abs(z), exit band lines at +/-0.2, and per-variant position-state bars overlaid at fixed Y levels (canary a=3.5, main a=3.0, main b=2.5, main c=2.0). Position bars are `(pairtrade_has_position == 1) * Y_offset` rendered as thick step lines so the same panel timeline aligns z and position on identical x-pixels. Exit_z closes only when the decision sample abs(z_for_exit) is inside the neutral band; a visual zero-cross between samples is not sufficient.",
       "gridPos": {
         "h": 12,
         "w": 24,
@@ -49,6 +49,21 @@
           "expr": "(pairtrade_has_position{instance=\"debot-frankfurt\",variant=\"c\"} == 1) * 2.0",
           "legendFormat": "main c pos",
           "refId": "E"
+        },
+        {
+          "expr": "abs(pairtrade_z{instance=\"debot-frankfurt\",variant!=\"\"})",
+          "legendFormat": "abs main {{variant}}",
+          "refId": "F"
+        },
+        {
+          "expr": "vector(0.2)",
+          "legendFormat": "exit_z band +0.2",
+          "refId": "G"
+        },
+        {
+          "expr": "vector(-0.2)",
+          "legendFormat": "exit_z band -0.2",
+          "refId": "H"
         }
       ],
       "fieldConfig": {
@@ -144,6 +159,49 @@
               {
                 "id": "custom.spanNulls",
                 "value": false
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^abs main.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "stepAfter"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^exit_z band.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
               }
             ]
           }
