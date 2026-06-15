@@ -203,14 +203,23 @@ else
 
   if [ -n "$EXPECT_FP" ]; then
     matched=0
+    seen=0
     while IFS= read -r line; do
+      seen=$((seen + 1))
       fp=$(echo "$line" | sed -n 's/.*[,{]fp="\([^"]*\)".*/\1/p')
       variant=$(echo "$line" | sed -n 's/.*variant="\([^"]*\)".*/\1/p')
       if [ "$fp" = "$EXPECT_FP" ]; then matched=1; else
         note_drift "variant $variant fingerprint $fp ≠ expected $EXPECT_FP."
       fi
     done < <(echo "$metrics" | grep '^pairtrade_config_fingerprint{')
-    [ "$matched" -eq 1 ] && say "fingerprint  : at least one variant matches expected $EXPECT_FP"
+    # Fail closed if the series is absent entirely (reachable endpoint but old
+    # binary / wrong process / 404 / exporter missing the gauge): an --expect-fp
+    # preflight that observes zero fingerprints has verified nothing.
+    if [ "$seen" -eq 0 ]; then
+      note_drift "EXPECT_FP set but no pairtrade_config_fingerprint series in /metrics — old binary, wrong process, or exporter missing the gauge; cannot verify the running config."
+    elif [ "$matched" -eq 1 ]; then
+      say "fingerprint  : at least one variant matches expected $EXPECT_FP"
+    fi
   fi
 fi
 
