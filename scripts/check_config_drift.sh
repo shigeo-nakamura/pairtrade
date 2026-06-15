@@ -26,10 +26,13 @@
 #                                 [--expect-fc VARIANT=SECS ...]
 #                                 [--round-json PATH] [--quiet]
 #
-# --round-json loads the expected per-variant force_close / exit_z / frozen_beta
-# from a committed round file (configs/pairtrade/round.json) and asserts the
-# running effective gauges match it — the blocking preflight for the round-eval
-# harness (#3 in bot-strategy#580). Requires python3.
+# --round-json loads the expected round config from a committed file
+# (configs/pairtrade/round.json) and asserts the running effective gauges match
+# EVERY field it declares (per-variant force_close / exit_z / stop_loss_z /
+# frozen_beta / equity_reference_usd, plus top-level max_leverage) — the
+# blocking preflight for the round-eval harness (#3 in bot-strategy#580). A
+# field absent from round.json is skipped; a declared field with no matching
+# gauge is reported as drift. Requires python3.
 #
 # Env equivalents: SERVICE, CONFIG, METRICS_URL, EXPECT_FP, EXPECT_FC_<VARIANT>.
 #
@@ -44,7 +47,10 @@ QUIET=0
 ROUND_JSON="${ROUND_JSON:-}"
 declare -A EXPECT_FC=()
 declare -A EXPECT_EXITZ=()
+declare -A EXPECT_SLZ=()
 declare -A EXPECT_FROZEN=()
+declare -A EXPECT_EQUITY=()
+EXPECT_MAXLEV=""
 
 # Seed EXPECT_FC from EXPECT_FC_<VARIANT> env vars (e.g. EXPECT_FC_A=10800).
 for kv in $(env | grep -E '^EXPECT_FC_[A-Za-z0-9]+=' || true); do
@@ -74,14 +80,25 @@ note_drift() { DRIFT=1; echo "‼️  DRIFT: $*" >&2; }
 if [ -n "$ROUND_JSON" ]; then
   if [ ! -f "$ROUND_JSON" ]; then echo "round file not found: $ROUND_JSON" >&2; exit 1; fi
   if ! command -v python3 >/dev/null; then echo "--round-json needs python3" >&2; exit 1; fi
-  while IFS=$'\t' read -r v fc ez fz; do
-    EXPECT_FC["$v"]="$fc"; EXPECT_EXITZ["$v"]="$ez"; EXPECT_FROZEN["$v"]="$fz"
+  # Assert EVERY field committed in round.json (#580 review): a round that
+  # changes only one of these must not silently pass the preflight. An empty
+  # cell ('') means "not declared for this variant" → that field is skipped.
+  while IFS=$'\t' read -r kind v fc ez slz fz eq; do
+    if [ "$kind" = "maxlev" ]; then EXPECT_MAXLEV="$v"; continue; fi
+    EXPECT_FC["$v"]="$fc"; EXPECT_EXITZ["$v"]="$ez"; EXPECT_SLZ["$v"]="$slz"
+    EXPECT_FROZEN["$v"]="$fz"; EXPECT_EQUITY["$v"]="$eq"
   done < <(python3 - "$ROUND_JSON" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
+def cell(p, k):
+    v = p.get(k)
+    return "" if v is None else v
+if d.get("max_leverage") is not None:
+    print(f'maxlev\t{d["max_leverage"]}\t\t\t\t\t')
 for v, p in d.get("variants", {}).items():
-    fz = 1 if p.get("use_frozen_beta_exit_z") else 0
-    print(f'{v.lower()}\t{p.get("force_close_secs","")}\t{p.get("exit_z","")}\t{fz}')
+    fz = "" if p.get("use_frozen_beta_exit_z") is None else (1 if p["use_frozen_beta_exit_z"] else 0)
+    print(f'var\t{v.lower()}\t{cell(p,"force_close_secs")}\t{cell(p,"exit_z")}\t'
+          f'{cell(p,"stop_loss_z")}\t{fz}\t{cell(p,"equity_reference_usd")}')
 PY
 )
 fi
@@ -125,23 +142,33 @@ else
 
   # Helper: read a single per-variant gauge value (last field) for a variant.
   gauge_for() { echo "$metrics" | grep "^$1{variant=\"$2\"" | head -1 | awk '{print $NF}'; }
+  # Numeric-equality assertion: drift unless `want` is empty (not declared) or
+  # the gauge is absent. Compares numerically so "4" == "4.0" etc.
+  assert_num() { # $1=variant $2=field-name $3=want $4=got
+    [ -z "$3" ] && return 0
+    if [ -z "$4" ]; then note_drift "variant $1 $2 gauge absent — cannot verify against expected $3 (round config)."; return; fi
+    [ "$(awk -v a="$4" -v b="$3" 'BEGIN{print (a==b)?1:0}')" != "1" ] \
+      && note_drift "variant $1 effective $2=$4 ≠ expected $3 (round config)."
+  }
 
-  # Check 3: round assertion on effective per-variant params (force_close is the
-  # field that drifted in #491; exit_z / frozen_beta asserted too when known).
+  # Check 3: round assertion. Every field committed in round.json is asserted
+  # (force_close is the field that drifted in #491; the rest close the
+  # false-negative gap raised in review). Iterates per variant off the
+  # force_close series, which is present for every variant.
   while IFS= read -r line; do
     variant=$(echo "$line" | sed -n 's/.*variant="\([^"]*\)".*/\1/p')
     fc_int=$(echo "$line" | awk '{print $NF}'); fc_int=${fc_int%.*}
-    want="${EXPECT_FC[$variant]:-}"
     ez=$(gauge_for pairtrade_effective_exit_z "$variant")
+    slz=$(gauge_for pairtrade_effective_stop_loss_z "$variant")
     fz=$(gauge_for pairtrade_effective_frozen_beta_exit_z "$variant"); fz=${fz%.*}
-    say "variant $variant   : effective force_close=${fc_int}s exit_z=${ez:-?} frozen_beta=${fz:-?}"
-    if [ -n "$want" ] && [ "$fc_int" != "$want" ]; then
-      note_drift "variant $variant effective force_close=${fc_int}s ≠ expected ${want}s (round config)."
-    fi
-    want_ez="${EXPECT_EXITZ[$variant]:-}"
-    if [ -n "$want_ez" ] && [ -n "$ez" ] && [ "$(awk -v a="$ez" -v b="$want_ez" 'BEGIN{print (a==b)?1:0}')" != "1" ]; then
-      note_drift "variant $variant effective exit_z=${ez} ≠ expected ${want_ez} (round config)."
-    fi
+    eq=$(gauge_for pairtrade_equity_reference_usd "$variant")
+    mlev=$(gauge_for pairtrade_max_leverage_config "$variant")
+    say "variant $variant   : force_close=${fc_int}s exit_z=${ez:-?} stop_loss_z=${slz:-?} frozen_beta=${fz:-?} equity=${eq:-?} max_leverage=${mlev:-?}"
+    assert_num "$variant" force_close "${EXPECT_FC[$variant]:-}" "$fc_int"
+    assert_num "$variant" exit_z "${EXPECT_EXITZ[$variant]:-}" "$ez"
+    assert_num "$variant" stop_loss_z "${EXPECT_SLZ[$variant]:-}" "$slz"
+    assert_num "$variant" equity_reference_usd "${EXPECT_EQUITY[$variant]:-}" "$eq"
+    assert_num "$variant" max_leverage "$EXPECT_MAXLEV" "$mlev"
     want_fz="${EXPECT_FROZEN[$variant]:-}"
     if [ -n "$want_fz" ] && [ -n "$fz" ] && [ "$fz" != "$want_fz" ]; then
       note_drift "variant $variant frozen_beta_exit_z=${fz} ≠ expected ${want_fz} (round config)."

@@ -654,6 +654,14 @@ pub static EFFECTIVE_EXIT_Z: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static EFFECTIVE_STOP_LOSS_Z: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_stop_loss_z",
+        "Effective per-variant stop_loss z-score threshold the running process is using.",
+        &["variant"],
+    )
+});
+
 pub static EFFECTIVE_FROZEN_BETA_EXIT_Z: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_effective_frozen_beta_exit_z",
@@ -775,7 +783,10 @@ pub fn record_config_info(
     fp: &str,
     force_close_secs: u64,
     exit_z: f64,
+    stop_loss_z: f64,
     frozen_beta_exit_z: bool,
+    equity_reference_usd: f64,
+    max_leverage: f64,
     file_path: &str,
     file_sha: &str,
     file_mtime: i64,
@@ -791,9 +802,23 @@ pub fn record_config_info(
         .with_label_values(&[variant])
         .set(force_close_secs as f64);
     EFFECTIVE_EXIT_Z.with_label_values(&[variant]).set(exit_z);
+    EFFECTIVE_STOP_LOSS_Z
+        .with_label_values(&[variant])
+        .set(stop_loss_z);
     EFFECTIVE_FROZEN_BETA_EXIT_Z
         .with_label_values(&[variant])
         .set(if frozen_beta_exit_z { 1 } else { 0 });
+    // Every field committed in round.json must be assertable from /metrics at
+    // boot (bot-strategy#580 review). equity_reference_usd / max_leverage are
+    // also refreshed per-tick in prom_metrics.rs; stamping them here makes the
+    // full config set observable before the first tick so the preflight never
+    // sees a partial series.
+    EQUITY_REFERENCE_USD
+        .with_label_values(&[variant])
+        .set(equity_reference_usd);
+    MAX_LEVERAGE_CONFIG
+        .with_label_values(&[variant])
+        .set(max_leverage);
 }
 
 #[cfg(test)]
