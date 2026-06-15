@@ -1,0 +1,59 @@
+name: Grafana Prune Dashboard
+
+# Manual maintenance: delete one or more Grafana dashboards by UID.
+#
+# deploy-grafana.yml only ever upserts dashboards (POST .../api/dashboards/db);
+# it has no path to remove a dashboard once its JSON leaves the repo. When a
+# bot is retired its dedicated dashboard therefore lingers live forever (e.g.
+# the archived xvenue-arb repo's `xvenue-arb-overview` — bot-strategy#561).
+# This dispatch closes that gap explicitly: it deletes ONLY the UIDs you pass,
+# so it can never touch an unrelated dashboard.
+
+on:
+  workflow_dispatch:
+    inputs:
+      uids:
+        description: 'Comma-separated dashboard UIDs to delete from Grafana'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    environment: debot
+    steps:
+      - name: Delete dashboards by UID
+        env:
+          GRAFANA_URL: ${{ secrets.GRAFANA_URL }}
+          GRAFANA_API_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+          UIDS: ${{ inputs.uids }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GRAFANA_URL}" ] || [ -z "${GRAFANA_API_TOKEN}" ]; then
+            echo "::error::GRAFANA_URL or GRAFANA_API_TOKEN secret is not set in the 'debot' environment"
+            exit 1
+          fi
+          auth=(-H "Authorization: Bearer ${GRAFANA_API_TOKEN}")
+          IFS=',' read -ra arr <<<"$UIDS"
+          for raw in "${arr[@]}"; do
+            uid=$(printf '%s' "$raw" | xargs)   # trim surrounding whitespace
+            [ -z "$uid" ] && continue
+            echo "::group::Deleting dashboard uid=$uid"
+            code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
+              -X DELETE "${auth[@]}" \
+              "${GRAFANA_URL%/}/api/dashboards/uid/${uid}")
+            cat /tmp/resp.json
+            echo
+            if [ "$code" = "200" ]; then
+              echo "  deleted"
+            elif [ "$code" = "404" ]; then
+              echo "  already absent (HTTP 404) — nothing to do"
+            else
+              echo "::error::Grafana dashboard delete for $uid returned HTTP $code"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
