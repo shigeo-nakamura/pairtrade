@@ -5,14 +5,19 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ec2-user
+# Runs as root like debot-pair-btceth / canary (no User=): the wrapper sources
+# debot-pair-canary.env which is rw------- root:root. A User=ec2-user here hit
+# "Permission denied" on that secrets file (caught on first live start).
 WorkingDirectory=/opt/debot-shadow
-# Stagger after main A/B/C + canary startup (bot-strategy#163 spacing).
-ExecStartPre=/bin/sleep 90
+# Startup spacing after main A/B/C + canary (bot-strategy#163). Keep well under
+# TimeoutStartSec — ExecStartPre=sleep 90 collided with the 90s default start
+# timeout and the unit never started (caught on first live start).
+ExecStartPre=/bin/sleep 30
 ExecStart=/bin/bash /opt/debot/scripts/debot-pair-shadow.sh
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5
+TimeoutStartSec=300
 # Observe-only: no positions to force-close, short stop is fine.
 TimeoutStopSec=120
 StandardOutput=journal
