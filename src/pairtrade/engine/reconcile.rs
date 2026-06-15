@@ -818,26 +818,6 @@ impl PairTradeEngine {
                 return Ok(true);
             }
             let use_market = decision.use_market;
-            if use_market {
-                log::info!(
-                        "[ORDER] {} entry leg partially filled, retries exceeded ({} > {}); reissuing remaining legs as MARKET",
-                        key,
-                        next_retry,
-                        max_retries
-                    );
-            } else if max_retries > 0 {
-                log::info!(
-                    "[ORDER] {} entry leg partially filled, reissuing remaining legs (retry {}/{})",
-                    key,
-                    next_retry,
-                    max_retries
-                );
-            } else {
-                log::warn!(
-                    "[ORDER] {} entry leg partially filled, reissuing remaining legs",
-                    key
-                );
-            }
             // bot-strategy#471: when amend-on-partial-fill is enabled (and
             // we're not escalating to a market takeover, which a native
             // amend can't retarget the TIF for), skip the blanket cancel
@@ -849,6 +829,32 @@ impl PairTradeEngine {
                 && self
                     .pair_params_for(inst_idx, key)
                     .use_amend_on_partial_fill;
+            // bot-strategy#471: log the verb matching the path actually taken
+            // — "amending" the resting order in place vs "reissuing"
+            // (cancel + replace). The market-takeover branch always reissues.
+            let verb = if use_amend { "amending" } else { "reissuing" };
+            if use_market {
+                log::info!(
+                        "[ORDER] {} entry leg partially filled, retries exceeded ({} > {}); reissuing remaining legs as MARKET",
+                        key,
+                        next_retry,
+                        max_retries
+                    );
+            } else if max_retries > 0 {
+                log::info!(
+                    "[ORDER] {} entry leg partially filled, {} remaining legs (retry {}/{})",
+                    key,
+                    verb,
+                    next_retry,
+                    max_retries
+                );
+            } else {
+                log::warn!(
+                    "[ORDER] {} entry leg partially filled, {} remaining legs",
+                    key,
+                    verb
+                );
+            }
             if !use_amend {
                 self.cancel_pending_orders(&pending).await?;
             }
