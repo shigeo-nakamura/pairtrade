@@ -151,13 +151,26 @@ else
       && note_drift "variant $1 effective $2=$4 ≠ expected $3 (round config)."
   }
 
-  # Check 3: round assertion. Every field committed in round.json is asserted
-  # (force_close is the field that drifted in #491; the rest close the
-  # false-negative gap raised in review). Iterates per variant off the
-  # force_close series, which is present for every variant.
-  while IFS= read -r line; do
-    variant=$(echo "$line" | sed -n 's/.*variant="\([^"]*\)".*/\1/p')
-    fc_int=$(echo "$line" | awk '{print $NF}'); fc_int=${fc_int%.*}
+  # Check 3: round assertion. Iterate over the UNION of variants declared in
+  # round.json and variants observed in /metrics — driving off observed alone
+  # would silently skip an entire EXPECTED variant that the running process
+  # dropped/renamed (a config-not-loaded symptom). A declared variant with no
+  # gauges is drift; every committed field is asserted for the rest.
+  declared_variants=$(printf '%s\n' "${!EXPECT_FC[@]}" "${!EXPECT_EXITZ[@]}" \
+    "${!EXPECT_SLZ[@]}" "${!EXPECT_FROZEN[@]}" "${!EXPECT_EQUITY[@]}" | sort -u | grep -v '^$' || true)
+  observed_variants=$(echo "$metrics" | grep '^pairtrade_effective_force_close_secs{' \
+    | sed -n 's/.*variant="\([^"]*\)".*/\1/p' | sort -u)
+  all_variants=$(printf '%s\n%s\n' "$declared_variants" "$observed_variants" | sort -u | grep -v '^$' || true)
+  is_declared() { printf '%s\n' "$declared_variants" | grep -qx "$1"; }
+  for variant in $all_variants; do
+    fc_raw=$(gauge_for pairtrade_effective_force_close_secs "$variant")
+    if [ -z "$fc_raw" ]; then
+      if is_declared "$variant"; then
+        note_drift "expected variant $variant (round.json) is ABSENT from running metrics — config not loaded, or the variant was dropped/renamed."
+      fi
+      continue
+    fi
+    fc_int=${fc_raw%.*}
     ez=$(gauge_for pairtrade_effective_exit_z "$variant")
     slz=$(gauge_for pairtrade_effective_stop_loss_z "$variant")
     fz=$(gauge_for pairtrade_effective_frozen_beta_exit_z "$variant"); fz=${fz%.*}
@@ -173,7 +186,7 @@ else
     if [ -n "$want_fz" ] && [ -n "$fz" ] && [ "$fz" != "$want_fz" ]; then
       note_drift "variant $variant frozen_beta_exit_z=${fz} ≠ expected ${want_fz} (round config)."
     fi
-  done < <(echo "$metrics" | grep '^pairtrade_effective_force_close_secs{')
+  done
 
   if [ -n "$EXPECT_FP" ]; then
     matched=0
