@@ -123,12 +123,25 @@ if [ "$start_epoch" -gt 0 ] && [ "$file_mtime" -gt "$start_epoch" ]; then
 fi
 
 # --- Metrics-backed checks (2 + 3) -------------------------------------------
+# Did the caller request an assertion that can ONLY be verified via /metrics?
+# If so, an unreachable endpoint must FAIL CLOSED (drift) — otherwise a bad/old
+# process, an old binary without the new gauges, or a disabled exporter would
+# silently pass this blocking preflight without checking anything.
+WANT_METRICS_ASSERT=""
+if [ -n "$ROUND_JSON" ] || [ -n "$EXPECT_FP" ] || [ "${#EXPECT_FC[@]}" -gt 0 ]; then
+  WANT_METRICS_ASSERT=1
+fi
+
 metrics=""
 if [ -n "$METRICS_URL" ]; then
   metrics=$(curl -s --max-time 6 "$METRICS_URL" 2>/dev/null || true)
 fi
 if [ -z "$metrics" ]; then
-  say "metrics      : unavailable ($METRICS_URL) — skipping sha + round-assertion checks"
+  if [ -n "$WANT_METRICS_ASSERT" ]; then
+    note_drift "metrics unavailable ($METRICS_URL) but a config assertion (--round-json / --expect-fp / --expect-fc) was requested — cannot verify the running config against the round. Failing closed (old binary without the new gauges, disabled exporter, or down process all land here)."
+  else
+    say "metrics      : unavailable ($METRICS_URL) — skipping sha + round-assertion checks (none requested)"
+  fi
 else
   disk_sha=$(sha256sum "$CONFIG" | cut -c1-12)
   running_sha=$(echo "$metrics" | grep '^pairtrade_config_file_info{' | head -1 \
