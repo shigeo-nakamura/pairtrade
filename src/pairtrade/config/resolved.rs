@@ -122,6 +122,12 @@ pub struct PairTradeConfig {
     /// Round identifier from YAML. Drives the round-boundary auto-reset
     /// in `load_risk_state` (bot-strategy#354). None = legacy mode.
     pub round_id: Option<String>,
+    /// Filesystem path of the YAML this config was loaded from, when it came
+    /// from a file (`from_yaml_path`). `None` for env-only / backtest builds.
+    /// Used at startup to fingerprint the on-disk config file the running
+    /// process actually read, so a drift monitor can detect a config that was
+    /// deployed but never loaded (deploy ≠ restart, bot-strategy#580).
+    pub config_source_path: Option<String>,
 }
 
 impl PairTradeConfig {

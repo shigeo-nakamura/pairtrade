@@ -141,6 +141,7 @@ impl PairTradeConfig {
                 .unwrap_or_else(|| DEFAULT_REGIME_REFERENCE_SYMBOL.to_string()),
             risk: resolve_risk_config(yaml.risk.as_ref())?,
             round_id: yaml.round_id.clone(),
+            config_source_path: Some(path_ref.display().to_string()),
         };
 
         cfg.apply_env_overrides(history_file_from_yaml, warm_start_min_from_yaml)?;

@@ -605,6 +605,64 @@ pub static MAX_LEVERAGE_CONFIG: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+// === Effective-config fingerprint (bot-strategy#580) ===
+//
+// These make the *running* effective config observable so a drift monitor can
+// catch "deployed but not loaded" (deploy ≠ restart) within minutes instead of
+// at readout. `record_config_info` stamps them once at engine construction.
+
+pub static CONFIG_FINGERPRINT: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_config_fingerprint",
+        "Always 1; the `fp` label is a sha256-12 over the effective per-variant trading config.",
+        &["variant", "fp"],
+    )
+});
+
+pub static CONFIG_FILE_INFO: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_config_file_info",
+        "Always 1; carries the source YAML `path` and its content `sha` (sha256-12) as read at \
+         boot. Compare against `sha256sum` of the on-disk file to detect a config rewritten \
+         after the process started (deploy-not-loaded). Repeated per variant.",
+        &["variant", "path", "sha"],
+    )
+});
+
+pub static CONFIG_FILE_MTIME_SECONDS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_config_file_mtime_seconds",
+        "Unix mtime of the source config file as read at boot. mtime > process_start_timestamp \
+         on the live file means a config was deployed but not yet loaded. Repeated per variant.",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_FORCE_CLOSE_SECS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_force_close_secs",
+        "Effective per-variant force_close hold ceiling (seconds) the running process is using.",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_EXIT_Z: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_exit_z",
+        "Effective per-variant exit z-score threshold the running process is using.",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_FROZEN_BETA_EXIT_Z: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_effective_frozen_beta_exit_z",
+        "1 if the running process evaluates the exit z against a frozen entry-time beta \
+         (use_frozen_beta_exit_z) for this variant, else 0.",
+        &["variant"],
+    )
+});
+
 /// Spawn the metrics HTTP server if `PROM_LISTEN` is set in the
 /// environment. The address must parse as `host:port`. Failures during
 /// bind are logged at WARN and do not abort the bot — the gauges keep
@@ -703,6 +761,39 @@ pub fn record_process_info(variant: &str, process_started_at: i64) {
             option_env!("DEX_CONNECTOR_GIT_HASH").unwrap_or("unknown"),
         ])
         .set(1);
+}
+
+/// Stamp the effective-config / fingerprint gauges for one variant
+/// (bot-strategy#580). Called once per variant at engine construction so the
+/// running config is observable on `/metrics` before the first tick. `fp` is
+/// the sha256-12 of the effective trading params; `file_path` / `file_sha` /
+/// `file_mtime` describe the source YAML as read at boot (empty / 0 for
+/// env-only builds).
+#[allow(clippy::too_many_arguments)]
+pub fn record_config_info(
+    variant: &str,
+    fp: &str,
+    force_close_secs: u64,
+    exit_z: f64,
+    frozen_beta_exit_z: bool,
+    file_path: &str,
+    file_sha: &str,
+    file_mtime: i64,
+) {
+    CONFIG_FINGERPRINT.with_label_values(&[variant, fp]).set(1);
+    CONFIG_FILE_INFO
+        .with_label_values(&[variant, file_path, file_sha])
+        .set(1);
+    CONFIG_FILE_MTIME_SECONDS
+        .with_label_values(&[variant])
+        .set(file_mtime);
+    EFFECTIVE_FORCE_CLOSE_SECS
+        .with_label_values(&[variant])
+        .set(force_close_secs as f64);
+    EFFECTIVE_EXIT_Z.with_label_values(&[variant]).set(exit_z);
+    EFFECTIVE_FROZEN_BETA_EXIT_Z
+        .with_label_values(&[variant])
+        .set(if frozen_beta_exit_z { 1 } else { 0 });
 }
 
 #[cfg(test)]
