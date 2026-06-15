@@ -40,7 +40,7 @@ entry_z_score_max: 2.0
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
 force_close_time_secs: 3600
-shutdown_grace_secs: 10860  # max(force_close_time_secs across strategies) + 60s buffer. Round 4 (#278): B overrides to 10800 (FC%-attack from #70 Phase A 5d signal); A and C stay at 7200. Grace must cover 10800 + 60. See bot-strategy#50.
+shutdown_grace_secs: 22200  # >= max force_close (B=21600, Round 7 #581) + 60s buffer. See bot-strategy#50.
 
 # Post-stop cool-down (#316). 600 s blocks immediate re-entry after a
 # stop_loss_z exit on the same direction — Round 4 BT sweep on 5/3-5/8
@@ -145,54 +145,42 @@ risk:
 strategies:
   - id: a
     agent_name: debot-pair-btceth-a
-    # Round 6 (2026-06-07, bot-strategy#355): A inherits Round-5 B's
-    # `force_close_time_secs=10800` winning config — Round-5 outcome
-    # showed B (fc=10800) ≈ 2× A's net PnL with +76% Calmar, +84% Sharpe
-    # vs the old fc=7200 baseline. Promoted as the new stable best.
+    # Round 7 (2026-06-15, bot-strategy#581): A = incumbent control. Keeps the
+    # Round-5/6 champion exit (exit_z=0.2, fc=10800, sl_z=4.0) — the proven
+    # baseline B/C are measured against. equity raised to 1500 (largest arm).
     exit_z_score: 0.2
     stop_loss_z_score: 4.0
     max_loss_r_mult: 1.0
-    equity_usd_reference: 1000
+    equity_usd_reference: 1500
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 10800
   - id: b
     agent_name: debot-pair-btceth-b
-    # Round 6 (2026-06-07): B reverts to fc=7200 — the previous A baseline —
-    # as the 1-knob control vs new A (fc=10800). Keeps the A/B comparison
-    # honest: if Round-6 A underperforms B in a different regime, we know
-    # the fc=10800 win was regime-specific rather than structural.
-    exit_z_score: 0.2
-    stop_loss_z_score: 4.0
+    # Round 7 (2026-06-15, #581): B = combined exit-extension challenger
+    # (BT full-span winner across 5 windows incl. 2 regime weeks). exit_z 0.2→0.15
+    # + force_close 10800→21600 (hold the drift longer; §4.3/§8.1) and stop_loss
+    # 4→8 (~off; sl=4 is non-binding, §8.2). BT worst-case positive in ALL 5
+    # windows. Requires top-level shutdown_grace_secs >= 21660. Promote to
+    # incumbent next round if it confirms live.
+    exit_z_score: 0.15
+    stop_loss_z_score: 8.0
     max_loss_r_mult: 1.0
     equity_usd_reference: 1000
     mtf_windows: [15]
     mtf_z_min: 0.5
-    force_close_time_secs: 7200
+    force_close_time_secs: 21600
   - id: c
     agent_name: debot-pair-btceth-c
-    # Round 6 (2026-06-07, bot-strategy#473): C = A's config +
-    # `use_frozen_beta_exit_z=true`. Exit-side z (`exit_z`, `stop_loss_z`,
-    # expected-value gate) recomputed against `Position.entry_beta` instead
-    # of rolling `shared.beta`, so a β drift between entry and now does
-    # not produce false z-reversion exit signals.
-    #
-    # Round-5 byte-exact BT (5/30→6/07): vs same-config baseline,
-    # PnL -$33 → -$5 (+$28 over 8.5 days), MaxDD -36%, per-trade Sharpe
-    # +84%, Calmar +76%, `exit_z` close count 10 → 2 (-80%). All Round-6
-    # acceptance thresholds passed. Same trade count as baseline (entries
-    # unaffected) — only exit timing changes.
-    #
-    # Round-5 C's substitution-mode + re-hedge config (#461 + #463+#465)
-    # is dropped: synthetic analysis + live result showed it underperforms
-    # A and halted out on session_dd. Rehedge axis shelved (deferred);
-    # substitution mode rejected. Future #473 follow-up #355 if frozen-β
-    # alone insufficient.
+    # Round 7 (2026-06-15, #581): C = stop-loss-widen isolate (1-knob vs A):
+    # stop_loss_z 4→8 only, so we can attribute B's combined gain
+    # (C-A = sl effect, B-C = exit-extension effect). frozen-β (#473) is DROPPED
+    # — BT-rejected: middling on the full-span aggregate but a -$30 regime-week
+    # blow-up (W1). equity 500 (smallest single-lever probe).
     exit_z_score: 0.2
-    stop_loss_z_score: 4.0
+    stop_loss_z_score: 8.0
     max_loss_r_mult: 1.0
-    equity_usd_reference: 1000
+    equity_usd_reference: 500
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 10800
-    use_frozen_beta_exit_z: true
