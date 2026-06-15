@@ -120,6 +120,8 @@ impl PairTradeEngine {
                 funding_carry_today: 0.0,
                 daily_loss_halted: false,
                 equity_samples: Vec::new(),
+                capital_baseline_equity: 0.0,
+                flat_since: None,
                 session_halted: false,
                 session_halt_reason: None,
                 session_halt_ts: None,

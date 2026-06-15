@@ -55,6 +55,11 @@ impl PairTradeEngine {
         crate::error_counter::set_counting_suppressed(maintenance_block_entries);
 
         self.refresh_equity_if_needed(inst_idx).await?;
+        // bot-strategy#575 ①: detect a deposit / withdrawal (flat + settled
+        // equity jump) and rebaseline the rolling peak to current equity
+        // before sampling, so a top-up into a halted variant restores its DD
+        // headroom instead of leaving it pinned under a sticky 30-day peak.
+        self.detect_capital_event_and_rebaseline(inst_idx);
         // Phase 3-1: sample current equity into the rolling-peak window
         // and check the session-DD threshold. On breach, this flattens
         // the instance's positions and sets `session_halted=true`; the

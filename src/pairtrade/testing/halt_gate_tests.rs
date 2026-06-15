@@ -38,6 +38,7 @@
 
 use super::bar::BarBuilder;
 use super::defaults::DEFAULT_EQUITY_USD;
+use super::risk_io::EquitySample;
 use super::state::{PairSharedState, PairState, Position, PositionDirection};
 use super::*;
 use async_trait::async_trait;
@@ -460,6 +461,8 @@ impl Harness {
             funding_carry_today: 0.0,
             daily_loss_halted: false,
             equity_samples: Vec::new(),
+            capital_baseline_equity: 0.0,
+            flat_since: None,
             session_halted: false,
             session_halt_reason: None,
             session_halt_ts: None,
@@ -795,5 +798,274 @@ async fn variant_halt_does_not_block_peer_instances() {
         reject_count("hg-multi-a", "session_halted"),
         0,
         "variant A must not be touched by B's halt"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Scenario 6 (bot-strategy#575 ③): a halted instance keeps refreshing its
+// equity from live collateral — it must NOT freeze at the persisted sample.
+// A deposit that lands while the variant is halted is reflected in
+// `equity_cache` and the latest `equity_samples` entry on the next refresh,
+// without a restart. (① is disabled here via min_usd=0 to isolate the
+// pure equity-tracking path.)
+// ---------------------------------------------------------------------
+#[tokio::test]
+async fn halted_instance_equity_tracks_collateral_without_restart() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-halt-equity");
+    h.engine.cfg.risk.max_session_loss_bps = 500; // session DD enabled → sampling on
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 0.0; // isolate ③ from ①
+    h.engine.cfg.risk.session_dd_sample_secs = 1; // a fresh sample bucket each second
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.session_halted = true;
+        inst.session_halt_reason = Some("session_dd_500bps_lev1.0".to_string());
+        inst.session_halt_ts = Some(chrono::Utc::now().timestamp());
+    }
+
+    *h._connector.equity.lock().unwrap() = Decimal::from(950);
+    h.step().await;
+    assert!(
+        (h.engine.instances[0].equity_cache - 950.0).abs() < 1e-6,
+        "first refresh seeds equity from collateral"
+    );
+
+    // Operator tops up while the variant is still halted. Production refreshes
+    // every EQUITY_REFRESH_CACHE_SECS (300 s); clear the cache stamp so the
+    // next tick refetches deterministically in-test.
+    *h._connector.equity.lock().unwrap() = Decimal::from(960);
+    h.engine.instances[0].last_equity_fetch = None;
+    h.step().await;
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        inst.session_halted,
+        "③ refreshes equity while halted; it does not resume trading"
+    );
+    assert!(
+        (inst.equity_cache - 960.0).abs() < 1e-6,
+        "halted instance equity must follow live collateral, not freeze at the persisted sample"
+    );
+    let last = inst
+        .equity_samples
+        .last()
+        .expect("a rolling-peak sample exists");
+    assert!(
+        (last.equity - 960.0).abs() < 1e-6,
+        "the latest equity sample tracks live collateral while halted"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Scenario 7 (bot-strategy#575 ①): a deposit detected while flat + settled
+// rebaselines the rolling peak to current equity (DD → 0) and shifts the
+// daily-DD denominator — but does NOT clear the sticky halt (resuming stays
+// an explicit operator ack). A sub-threshold drift does not fire.
+// ---------------------------------------------------------------------
+#[test]
+fn deposit_while_flat_rebaselines_peak_without_clearing_halt() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-deposit");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 950.0;
+        // Sticky inflated peak from before the halt (the #471 artifact shape).
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 1_003.0,
+        }];
+        inst.capital_baseline_equity = 950.0;
+        inst.session_start_equity = 1_000.0;
+        inst.session_halted = true;
+        inst.session_halt_reason = Some("session_dd_500bps_lev1.0".to_string());
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    // No deposit yet: equity == baseline, so nothing is rebaselined.
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        (h.engine.instances[0].equity_samples[0].equity - 1_003.0).abs() < 1e-9,
+        "no rebaseline before a real capital event"
+    );
+
+    // A $3 sub-threshold drift must also not fire.
+    h.engine.instances[0].equity_cache = 953.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        (h.engine.instances[0].equity_samples[0].equity - 1_003.0).abs() < 1e-9,
+        "sub-threshold drift is not a capital event"
+    );
+
+    // Deposit lands: collateral 953 -> 1003 (+$50).
+    h.engine.instances[0].equity_cache = 1_003.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.equity_samples.len(),
+        1,
+        "the rolling peak collapses to a single current-equity sample"
+    );
+    assert!(
+        (inst.equity_samples[0].equity - 1_003.0).abs() < 1e-9,
+        "peak rebaselined to the topped-up equity"
+    );
+    // session_start_equity shifted by the full deposit delta (+$50 from the
+    // 953 baseline). realized_pnl_today is untouched by a capital event.
+    assert!(
+        (inst.session_start_equity - 1_050.0).abs() < 1e-9,
+        "daily-DD denominator shifts by the deposit delta"
+    );
+    assert!(
+        inst.session_halted,
+        "① restores headroom but never auto-resumes — the operator still acks"
+    );
+    let (peak, dd) = PairTradeEngine::rolling_peak(&inst.equity_samples, 1_003.0).unwrap();
+    assert!((peak - 1_003.0).abs() < 1e-9);
+    assert_eq!(dd, 0.0, "DD is reset to 0 at the new base");
+}
+
+// A trading loss (equity moving while a position is OPEN) must never be
+// mistaken for a withdrawal: detection only runs when flat.
+#[test]
+fn unrealized_pnl_while_in_position_does_not_rebaseline() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-trading");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 1_000.0,
+        }];
+        inst.capital_baseline_equity = 1_000.0;
+        inst.session_start_equity = 1_000.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+    // Open a position → not flat.
+    h.seed_aged_position(0);
+    // A big adverse mark: equity drops $50 (unrealized), NOT a capital event.
+    h.engine.instances[0].equity_cache = 950.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        (inst.equity_samples[0].equity - 1_000.0).abs() < 1e-9,
+        "an unrealized trading loss while in a position must not rebaseline the peak"
+    );
+    assert!(
+        (inst.session_start_equity - 1_000.0).abs() < 1e-9,
+        "the daily-DD denominator is untouched by trading PnL"
+    );
+    assert!(
+        inst.flat_since.is_none(),
+        "detection disarms while a position is open"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Scenario 8 (bot-strategy#575 ②): a RISK_ACK payload carrying
+// `reanchor=true` clears the halt AND collapses the rolling peak to current
+// equity, so the ack does not re-breach at the boundary. A plain ack clears
+// the halt but leaves the peak intact (today's behaviour).
+// ---------------------------------------------------------------------
+#[test]
+fn risk_ack_reanchor_clears_halt_and_resets_peak() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-ack-reanchor");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.session_halted = true;
+        inst.session_halt_reason = Some("session_dd_500bps_lev1.0".to_string());
+        inst.session_halt_ts = Some(now);
+        inst.equity_initialized = true;
+        inst.equity_cache = 950.0;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 1_003.0,
+        }];
+    }
+
+    std::fs::write(risk_ack_path(), "ack by op: reanchor=true").unwrap();
+    h.engine.consume_risk_ack();
+
+    let inst = &h.engine.instances[0];
+    assert!(!inst.session_halted, "ack clears the halt");
+    assert!(inst.session_halt_reason.is_none());
+    assert_eq!(
+        inst.equity_samples.len(),
+        1,
+        "reanchor collapses the rolling-peak window"
+    );
+    assert!(
+        (inst.equity_samples[0].equity - 950.0).abs() < 1e-9,
+        "peak reanchored to current equity"
+    );
+    let (_, dd) = PairTradeEngine::rolling_peak(&inst.equity_samples, 950.0).unwrap();
+    assert_eq!(
+        dd, 0.0,
+        "no residual DD → the ack will not re-breach at the boundary"
+    );
+    assert!(
+        !Path::new(risk_ack_path()).exists(),
+        "the ack sentinel is consumed"
+    );
+}
+
+#[test]
+fn risk_ack_without_reanchor_leaves_peak_intact() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-ack-plain");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.session_halted = true;
+        inst.session_halt_reason = Some("session_dd_500bps_lev1.0".to_string());
+        inst.equity_initialized = true;
+        inst.equity_cache = 950.0;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 1_003.0,
+        }];
+    }
+
+    std::fs::write(risk_ack_path(), "ack: manual review complete").unwrap();
+    h.engine.consume_risk_ack();
+
+    let inst = &h.engine.instances[0];
+    assert!(!inst.session_halted, "plain ack still clears the halt");
+    assert_eq!(
+        inst.equity_samples.len(),
+        1,
+        "plain ack must NOT collapse the peak window"
+    );
+    assert!(
+        (inst.equity_samples[0].equity - 1_003.0).abs() < 1e-9,
+        "the inflated peak survives a plain ack (today's behaviour preserved)"
     );
 }

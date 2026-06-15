@@ -8,7 +8,32 @@ fn risk_config_defaults_when_block_absent() {
     assert_eq!(cfg.max_daily_loss_bps, 0);
     assert_eq!(cfg.max_session_loss_bps, 0);
     assert_eq!(cfg.max_notional_headroom, 0.0);
+    // bot-strategy#575 ①: capital-event detection is on by default at a
+    // small USD floor, with a 60 s settle dwell.
+    assert!((cfg.session_dd_capital_event_min_usd - 5.0).abs() < 1e-9);
+    assert_eq!(cfg.session_dd_capital_settle_secs, 60);
     assert!(matches!(cfg.max_daily_loss_action, DailyLossAction::Block));
+}
+
+#[test]
+fn risk_config_resolves_capital_event_fields() {
+    let yaml = RiskYaml {
+        session_dd_capital_event_min_usd: Some(25.0),
+        session_dd_capital_settle_secs: Some(0),
+        ..RiskYaml::default()
+    };
+    let cfg = resolve_risk_config(Some(&yaml)).unwrap();
+    assert!((cfg.session_dd_capital_event_min_usd - 25.0).abs() < 1e-9);
+    assert_eq!(cfg.session_dd_capital_settle_secs, 0);
+}
+
+#[test]
+fn risk_config_rejects_negative_capital_event_min() {
+    let yaml = RiskYaml {
+        session_dd_capital_event_min_usd: Some(-1.0),
+        ..RiskYaml::default()
+    };
+    assert!(resolve_risk_config(Some(&yaml)).is_err());
 }
 
 #[test]

@@ -473,6 +473,15 @@ impl PairTradeEngine {
         // journal — useful when chasing why a halt cleared days later.
         let payload = std::fs::read_to_string(path).unwrap_or_default();
         let trimmed = payload.trim();
+        // bot-strategy#575 ②: an ack payload carrying `reanchor=true` (or
+        // JSON `{"reanchor": true}`) additionally rebaselines the rolling
+        // peak to the instance's current equity so DD → 0 on clear. Without
+        // it, the ack re-breaches in the same tick whenever equity is still
+        // below `peak × (1 − eff_threshold/10000)` — the exact failure the
+        // 2026-06-15 #471 recovery hit (two acks both re-halted at the
+        // boundary). Operator-gated and audited via the logged payload.
+        let reanchor = ack_requests_reanchor(trimmed);
+        let now_ts = self.current_now_ts();
         let mut cleared_any = false;
         let mut cleared_indices: Vec<(usize, String)> = Vec::new();
         for (inst_idx, inst) in self.instances.iter_mut().enumerate() {
@@ -481,12 +490,26 @@ impl PairTradeEngine {
                     .session_halt_reason
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
+                let reanchor_note = if reanchor {
+                    let equity = inst.equity_cache;
+                    reanchor_peak_samples(&mut inst.equity_samples, equity, now_ts);
+                    // Keep the capital-event baseline consistent with the new
+                    // peak so the next detection compares against current
+                    // equity rather than the pre-ack value.
+                    if equity > 0.0 {
+                        inst.capital_baseline_equity = equity;
+                    }
+                    format!(", peak re-anchored to equity={:.2} (DD→0)", equity)
+                } else {
+                    String::new()
+                };
                 log::warn!(
-                    "[SESSION_DD] {} halt cleared by ack at {} (reason was: {}, ack payload: {:?})",
+                    "[SESSION_DD] {} halt cleared by ack at {} (reason was: {}, ack payload: {:?}{})",
                     inst.id,
                     ack_path,
                     prior_reason,
-                    trimmed
+                    trimmed,
+                    reanchor_note
                 );
                 inst.session_halted = false;
                 inst.session_halt_reason = None;
@@ -499,16 +522,16 @@ impl PairTradeEngine {
                 cleared_indices.push((inst_idx, prior_reason));
             }
         }
-        let ack_payload = if trimmed.is_empty() {
+        let ack_payload = if trimmed.is_empty() && !reanchor {
             None
         } else {
-            Some(serde_json::json!({ "ack_payload": trimmed }))
+            Some(serde_json::json!({ "ack_payload": trimmed, "reanchor": reanchor }))
         };
         for (inst_idx, prior_reason) in cleared_indices {
             self.record_risk_event_for_instance(
                 inst_idx,
                 "session_dd",
-                "ack",
+                if reanchor { "ack_reanchor" } else { "ack" },
                 Some(prior_reason),
                 ack_payload.clone(),
             );
@@ -589,6 +612,137 @@ impl PairTradeEngine {
         // materially. Sampling refreshes cadence; `step_shared` calls
         // `evaluate_session_dd` immediately after, which triggers
         // persistence on halt transitions.
+        //
+        // bot-strategy#575 ③: this runs every tick regardless of
+        // `session_halted`, so a halted (flat) instance keeps its latest
+        // `equity_samples` entry synced to live collateral — the deposit
+        // made while halted is visible to `detect_capital_event_and_rebaseline`
+        // without a restart, instead of freezing at the persisted sample.
+    }
+
+    /// Detect a capital event (deposit / withdrawal / sub-account transfer)
+    /// and rebaseline the rolling session-DD peak to the new equity so the
+    /// drawdown budget resets (DD → 0). bot-strategy#575 ①.
+    ///
+    /// Detection is intentionally scoped to a **flat, settled** instance:
+    /// when no position is open, live equity equals pure collateral (no
+    /// unrealized mark-to-market noise), and with no trades in flight the
+    /// only thing that can move it is a capital flow. An equity change of at
+    /// least `session_dd_capital_event_min_usd` versus the last settled-flat
+    /// reading is therefore attributable to a capital event, never to trading
+    /// PnL (which moves equity only while a position is open — i.e. not flat).
+    /// The `session_dd_capital_settle_secs` dwell guards against reading a
+    /// post-close collateral-settlement lag as a deposit; a halted variant,
+    /// flat since the halt, always clears it.
+    ///
+    /// On a detected event the rolling peak is collapsed to current equity
+    /// and `session_start_equity` (the daily-DD denominator) is shifted by
+    /// the same delta so both gates reflect the new deployable capital. The
+    /// sticky `session_halted` flag is deliberately **not** cleared here —
+    /// resuming trading stays an explicit operator action (RISK_ACK), this
+    /// only restores the headroom so that ack does not immediately re-breach.
+    pub(in crate::pairtrade) fn detect_capital_event_and_rebaseline(&mut self, inst_idx: usize) {
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let threshold_bps = self.cfg.risk.max_session_loss_bps;
+        let min_usd = self.cfg.risk.session_dd_capital_event_min_usd;
+        // No peak to rebaseline when session DD is disabled, and detection
+        // off when the threshold is 0 USD.
+        if threshold_bps == 0 || min_usd <= 0.0 {
+            return;
+        }
+        let settle_secs = self.cfg.risk.session_dd_capital_settle_secs;
+        let now_ts = self.current_now_ts();
+
+        let detected: Option<(f64, f64, f64)> = {
+            let inst = &mut self.instances[inst_idx];
+            if !inst.equity_initialized {
+                return;
+            }
+            let equity = inst.equity_cache;
+            if equity <= 0.0 {
+                return;
+            }
+            let flat = inst.states.values().all(|s| {
+                s.position.is_none() && s.pending_entry.is_none() && s.pending_exit.is_none()
+            });
+            if !flat {
+                // Not flat: equity carries unrealized PnL, so any delta is
+                // ambiguous. Disarm and re-seed the baseline on the next
+                // settled-flat tick.
+                inst.flat_since = None;
+                inst.capital_baseline_equity = 0.0;
+                return;
+            }
+            // Flat: arm the dwell timer, then require it to mature before
+            // trusting the reading.
+            let settled = match inst.flat_since {
+                Some(since) => since.elapsed().as_secs() >= settle_secs,
+                None => {
+                    inst.flat_since = Some(Instant::now());
+                    settle_secs == 0
+                }
+            };
+            if !settled {
+                return;
+            }
+            let baseline = inst.capital_baseline_equity;
+            if baseline <= 0.0 {
+                // First settled reading establishes the reference; no event.
+                inst.capital_baseline_equity = equity;
+                return;
+            }
+            match classify_capital_event(baseline, equity, min_usd) {
+                None => {
+                    // Stable collateral — keep the baseline tracking current
+                    // so a future discrete jump is measured against the
+                    // latest value.
+                    inst.capital_baseline_equity = equity;
+                    None
+                }
+                Some(delta) => {
+                    // Capital event. Collapse the rolling peak to current
+                    // equity (DD → 0) and shift the daily-DD denominator by
+                    // the same delta. realized_pnl_today is left untouched —
+                    // a deposit does not erase the day's trading PnL.
+                    reanchor_peak_samples(&mut inst.equity_samples, equity, now_ts);
+                    let prev_start_equity = inst.session_start_equity;
+                    if inst.session_start_equity > 0.0 {
+                        inst.session_start_equity = (inst.session_start_equity + delta).max(0.0);
+                    }
+                    inst.capital_baseline_equity = equity;
+                    Some((delta, equity, prev_start_equity))
+                }
+            }
+        };
+
+        if let Some((delta, equity, prev_start_equity)) = detected {
+            let kind = if delta > 0.0 { "deposit" } else { "withdrawal" };
+            let new_start_equity = self.instances[inst_idx].session_start_equity;
+            log::warn!(
+                "[SESSION_DD] {} capital {} detected: Δ={:.2} equity={:.2}; rolling peak rebaselined to current (DD→0), session_start_equity {:.2} -> {:.2}",
+                self.instances[inst_idx].id,
+                kind,
+                delta,
+                equity,
+                prev_start_equity,
+                new_start_equity,
+            );
+            self.record_risk_event_for_instance(
+                inst_idx,
+                "session_dd",
+                "capital_rebaseline",
+                Some(kind.to_string()),
+                Some(serde_json::json!({
+                    "delta_usd": delta,
+                    "equity": equity,
+                    "prev_session_start_equity": prev_start_equity,
+                    "new_session_start_equity": new_start_equity,
+                })),
+            );
+            self.persist_risk_state();
+        }
     }
 
     /// Compute the rolling peak from `equity_samples` and return the
@@ -780,6 +934,65 @@ pub(in crate::pairtrade) fn session_dd_breaches_threshold(
     }
     let effective_threshold = threshold_bps as f64 * max_leverage;
     dd_bps >= effective_threshold
+}
+
+/// Collapse the rolling-peak window to a single sample at `equity` so the
+/// next `rolling_peak` computes peak == current (DD → 0). Used by both the
+/// deposit-aware rebaseline (bot-strategy#575 ①) and the RISK_ACK re-anchor
+/// path (②). A non-positive `equity` just clears the window — peak becomes
+/// whatever the next real sample is.
+pub(in crate::pairtrade) fn reanchor_peak_samples(
+    samples: &mut Vec<risk_io::EquitySample>,
+    equity: f64,
+    ts: i64,
+) {
+    samples.clear();
+    if equity > 0.0 {
+        samples.push(risk_io::EquitySample { ts, equity });
+    }
+}
+
+/// Whether an unexplained equity delta observed while flat-and-settled is a
+/// capital event (deposit / withdrawal). Returns the signed delta when
+/// `|current − baseline| ≥ min_usd`, else `None`. `baseline ≤ 0` means the
+/// reference is not yet established (no event). Pure split of the gating
+/// maths in `detect_capital_event_and_rebaseline` for unit testing.
+/// bot-strategy#575 ①.
+pub(in crate::pairtrade) fn classify_capital_event(
+    baseline: f64,
+    current: f64,
+    min_usd: f64,
+) -> Option<f64> {
+    if min_usd <= 0.0 || baseline <= 0.0 || current <= 0.0 {
+        return None;
+    }
+    let delta = current - baseline;
+    if delta.abs() >= min_usd {
+        Some(delta)
+    } else {
+        None
+    }
+}
+
+/// Parse a RISK_ACK payload for the optional re-anchor request
+/// (bot-strategy#575 ②). Accepts JSON `{"reanchor": true}` or a plain-text
+/// `reanchor=true` / `reanchor: true` token (case-insensitive), so an
+/// operator can drop either form. Any other payload (including an empty
+/// file) leaves today's clear-flag-only behaviour intact.
+pub(in crate::pairtrade) fn ack_requests_reanchor(payload: &str) -> bool {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if value.get("reanchor").and_then(|v| v.as_bool()) == Some(true) {
+            return true;
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("reanchor=true")
+        || lower.contains("reanchor: true")
+        || lower.contains("reanchor:true")
 }
 
 #[cfg(test)]
@@ -1048,5 +1261,88 @@ mod tests {
         assert_eq!(restored.total_pnl, 0.0);
         assert_eq!(restored.peak_pnl, 0.0);
         assert_eq!(restored.max_dd, 0.0);
+    }
+
+    // bot-strategy#575 ①: capital-event classification. A deposit /
+    // withdrawal of at least `min_usd` while flat is an event; a smaller
+    // drift (or an unset/zero baseline) is not.
+    #[test]
+    fn classify_capital_event_detects_deposit_and_withdrawal() {
+        assert_eq!(classify_capital_event(950.0, 960.0, 5.0), Some(10.0));
+        assert_eq!(classify_capital_event(950.0, 940.0, 5.0), Some(-10.0));
+    }
+
+    #[test]
+    fn classify_capital_event_ignores_sub_threshold_drift() {
+        assert_eq!(classify_capital_event(950.0, 953.0, 5.0), None);
+        assert_eq!(classify_capital_event(950.0, 950.0, 5.0), None);
+    }
+
+    #[test]
+    fn classify_capital_event_boundary_is_inclusive() {
+        // Exactly min_usd counts as an event (≥, not >).
+        assert_eq!(classify_capital_event(950.0, 955.0, 5.0), Some(5.0));
+    }
+
+    #[test]
+    fn classify_capital_event_unset_baseline_or_disabled() {
+        // Unset baseline (≤ 0) establishes the reference elsewhere — no event.
+        assert_eq!(classify_capital_event(0.0, 960.0, 5.0), None);
+        // min_usd = 0 disables detection.
+        assert_eq!(classify_capital_event(950.0, 9_000.0, 0.0), None);
+        // Non-positive current (connector hiccup) is not an event.
+        assert_eq!(classify_capital_event(950.0, 0.0, 5.0), None);
+    }
+
+    // bot-strategy#575 ②: RISK_ACK re-anchor token parsing.
+    #[test]
+    fn ack_requests_reanchor_json_and_plaintext() {
+        assert!(ack_requests_reanchor(r#"{"reanchor": true}"#));
+        assert!(ack_requests_reanchor(r#"{"reanchor":true,"by":"op"}"#));
+        assert!(ack_requests_reanchor("ack by op: reanchor=true"));
+        assert!(ack_requests_reanchor("reanchor: true"));
+        assert!(ack_requests_reanchor("REANCHOR=TRUE"));
+    }
+
+    #[test]
+    fn ack_requests_reanchor_absent_or_false() {
+        assert!(!ack_requests_reanchor(""));
+        assert!(!ack_requests_reanchor("ack: manual review complete"));
+        assert!(!ack_requests_reanchor(r#"{"reanchor": false}"#));
+        assert!(!ack_requests_reanchor("reanchor=false"));
+    }
+
+    // bot-strategy#575 ①/②: re-anchoring collapses the rolling window to a
+    // single current-equity sample so the next rolling_peak gives DD = 0.
+    #[test]
+    fn reanchor_peak_samples_collapses_to_current() {
+        let mut samples = vec![
+            risk_io::EquitySample {
+                ts: 100,
+                equity: 1_003.0,
+            },
+            risk_io::EquitySample {
+                ts: 200,
+                equity: 980.0,
+            },
+        ];
+        reanchor_peak_samples(&mut samples, 960.0, 300);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].ts, 300);
+        assert!((samples[0].equity - 960.0).abs() < 1e-9);
+        // Peak now equals current → DD 0.
+        let (peak, dd) = PairTradeEngine::rolling_peak(&samples, 960.0).unwrap();
+        assert!((peak - 960.0).abs() < 1e-9);
+        assert_eq!(dd, 0.0);
+    }
+
+    #[test]
+    fn reanchor_peak_samples_non_positive_equity_just_clears() {
+        let mut samples = vec![risk_io::EquitySample {
+            ts: 100,
+            equity: 1_003.0,
+        }];
+        reanchor_peak_samples(&mut samples, 0.0, 300);
+        assert!(samples.is_empty());
     }
 }
