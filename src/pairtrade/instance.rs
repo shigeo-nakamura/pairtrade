@@ -87,6 +87,17 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// `risk.session_dd_sample_secs` cadence; entries older than
     /// `risk.session_dd_lookback_secs` are pruned in-place.
     pub(in crate::pairtrade) equity_samples: Vec<risk_io::EquitySample>,
+    /// bot-strategy#575 ①: last equity captured while continuously flat and
+    /// settled, the reference for deposit / withdrawal detection. 0.0 =
+    /// unset. Persisted via `InstanceRiskState`.
+    pub(in crate::pairtrade) capital_baseline_equity: f64,
+    /// bot-strategy#575 ①: when this instance most recently became flat
+    /// (no open or pending positions). `detect_capital_event_and_rebaseline`
+    /// requires `session_dd_capital_settle_secs` of continuous flatness
+    /// before trusting an equity reading as a capital event. Runtime only —
+    /// reset to None whenever the instance is not flat, so a brief flatten
+    /// between trades does not arm detection. Not persisted.
+    pub(in crate::pairtrade) flat_since: Option<Instant>,
     /// Phase 3-1/3-2 sticky halt set on session-DD breach. Persists to
     /// `risk_state.json` so a crash inside the cool-off window does
     /// not silently re-arm the bot. Cleared only by writing the

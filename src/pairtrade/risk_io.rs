@@ -60,6 +60,14 @@ pub(super) struct InstanceRiskState {
     /// default 30 d / 1 h cadence).
     #[serde(default)]
     pub equity_samples: Vec<EquitySample>,
+    /// Last equity reading captured while the instance was continuously
+    /// flat and settled, used as the reference for deposit / withdrawal
+    /// (capital-event) detection. 0.0 = unset (re-seeded on the next
+    /// settled flat tick). Persisted so a deposit made while the bot was
+    /// stopped is caught on the next boot instead of being silently folded
+    /// into the rolling peak. bot-strategy#575 ①.
+    #[serde(default)]
+    pub capital_baseline_equity: f64,
     /// Sticky halt flag set when the rolling-peak DD threshold trips.
     /// Persists across restarts so a crash inside the cooling-off
     /// window does not silently re-arm the bot. Cleared only by the
@@ -103,6 +111,7 @@ impl InstanceRiskState {
         self.circuit_breaker_until_ts = None;
         self.last_stop_loss_per_pair.clear();
         self.equity_samples.clear();
+        self.capital_baseline_equity = 0.0;
         self.session_halted = false;
         self.session_halt_reason = None;
         self.session_halt_ts = None;
@@ -282,6 +291,7 @@ mod tests {
                 ts: 1_700_000_000,
                 equity: 500.0,
             }],
+            capital_baseline_equity: 500.0,
             session_halted: true,
             session_halt_reason: Some("session_dd_500bps".to_string()),
             session_halt_ts: Some(1_700_000_500),
@@ -307,6 +317,7 @@ mod tests {
         assert_eq!(s.circuit_breaker_until_ts, None);
         assert!(s.last_stop_loss_per_pair.is_empty());
         assert!(s.equity_samples.is_empty());
+        assert_eq!(s.capital_baseline_equity, 0.0);
         assert!(!s.session_halted);
         assert_eq!(s.session_halt_reason, None);
         assert_eq!(s.session_halt_ts, None);

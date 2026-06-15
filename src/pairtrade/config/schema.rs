@@ -214,6 +214,16 @@ pub(in crate::pairtrade) struct RiskYaml {
     /// Smaller values track the peak more tightly at the cost of more
     /// disk writes.
     pub(super) session_dd_sample_secs: Option<u64>,
+    /// bot-strategy#575 ①: minimum unexplained equity jump (USD), observed
+    /// while the instance is flat and settled, to classify a deposit /
+    /// withdrawal as a capital event and rebaseline the rolling session-DD
+    /// peak to the new equity (DD → 0). 0 disables. Default 5 USD.
+    pub(super) session_dd_capital_event_min_usd: Option<f64>,
+    /// bot-strategy#575 ①: how long (seconds) the instance must have been
+    /// continuously flat before capital-event detection trusts the equity
+    /// reading. Guards against reading a post-close collateral-settlement
+    /// lag as a deposit. Default 60 s; a halted variant always satisfies it.
+    pub(super) session_dd_capital_settle_secs: Option<u64>,
     /// Phase 3-4: hard cap on per-leg USD notional, expressed as a
     /// multiplier of `equity_reference_usd × max_leverage`. 0 disables
     /// (default). 1.0 means "exactly the intended leverage"; values in

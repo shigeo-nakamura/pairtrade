@@ -27,6 +27,13 @@ pub struct RiskConfig {
     pub session_dd_lookback_secs: u64,
     /// Phase 3-1: equity sampling cadence in seconds.
     pub session_dd_sample_secs: u64,
+    /// bot-strategy#575 ①: minimum unexplained equity jump (USD), observed
+    /// while flat and settled, that rebaselines the rolling session-DD peak
+    /// to the new equity. 0.0 = disabled.
+    pub session_dd_capital_event_min_usd: f64,
+    /// bot-strategy#575 ①: continuous-flat dwell (seconds) required before
+    /// capital-event detection trusts the equity reading.
+    pub session_dd_capital_settle_secs: u64,
     /// Phase 3-4: per-leg notional cap multiplier. 0.0 = disabled.
     /// Resolved cap = `equity_reference_usd × max_leverage × headroom`
     /// at sizing time, so the dollar threshold tracks per-instance
@@ -52,6 +59,8 @@ impl Default for RiskConfig {
             max_session_loss_bps: DEFAULT_MAX_SESSION_LOSS_BPS,
             session_dd_lookback_secs: DEFAULT_SESSION_DD_LOOKBACK_SECS,
             session_dd_sample_secs: DEFAULT_SESSION_DD_SAMPLE_SECS,
+            session_dd_capital_event_min_usd: DEFAULT_SESSION_DD_CAPITAL_EVENT_MIN_USD,
+            session_dd_capital_settle_secs: DEFAULT_SESSION_DD_CAPITAL_SETTLE_SECS,
             max_notional_headroom: DEFAULT_MAX_NOTIONAL_HEADROOM,
         }
     }
@@ -111,6 +120,18 @@ pub(super) fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig>
             sample_secs
         ));
     }
+    let session_dd_capital_event_min_usd = y
+        .session_dd_capital_event_min_usd
+        .unwrap_or(DEFAULT_SESSION_DD_CAPITAL_EVENT_MIN_USD);
+    if session_dd_capital_event_min_usd < 0.0 || !session_dd_capital_event_min_usd.is_finite() {
+        return Err(anyhow!(
+            "risk.session_dd_capital_event_min_usd must be ≥ 0 and finite (got {})",
+            session_dd_capital_event_min_usd
+        ));
+    }
+    let session_dd_capital_settle_secs = y
+        .session_dd_capital_settle_secs
+        .unwrap_or(DEFAULT_SESSION_DD_CAPITAL_SETTLE_SECS);
     let max_daily_loss_bps = y.max_daily_loss_bps.unwrap_or(DEFAULT_MAX_DAILY_LOSS_BPS);
     let max_session_loss_bps = y
         .max_session_loss_bps
@@ -147,6 +168,8 @@ pub(super) fn resolve_risk_config(yaml: Option<&RiskYaml>) -> Result<RiskConfig>
         max_session_loss_bps,
         session_dd_lookback_secs: lookback_secs,
         session_dd_sample_secs: sample_secs,
+        session_dd_capital_event_min_usd,
+        session_dd_capital_settle_secs,
         max_notional_headroom,
     })
 }

@@ -34,6 +34,14 @@
 #                                is UNKNOWN (file missing / unreadable / unparseable).
 #                                UNKNOWN is treated as equivalent to OPEN because it's
 #                                the worst case for this restart path.
+#   --reanchor-peak              also collapse the rolling-peak window (equity_samples)
+#                                to a single sample at the current equity, so DD resets
+#                                to 0 and the cleared halt does not re-breach at the
+#                                boundary. Use after a capital top-up, or whenever a
+#                                sticky 30-day peak is pinning the variant. bot-strategy#575.
+#   --collateral=<USD>           override the equity value used by --reanchor-peak with the
+#                                real post-deposit collateral (the deposit-sync case). When
+#                                omitted, the latest equity_samples value is reused.
 #
 # After a successful restart the script tails journalctl for ~60 s and
 # emits ✓/✗ marks for the three expected boot-time log lines:
@@ -44,7 +52,7 @@
 set -eu
 
 usage() {
-    sed -n '2,40p' "$0"
+    sed -n '2,48p' "$0"
     exit 1
 }
 
@@ -54,6 +62,8 @@ YES=0
 ALL_VARIANTS=0
 ALLOW_MAIN_RESTART=0
 FORCE_WITH_OPEN_POSITION=0
+REANCHOR_PEAK=0
+COLLATERAL=""
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
@@ -61,6 +71,8 @@ for arg in "$@"; do
         --all-variants) ALL_VARIANTS=1 ;;
         --allow-main-restart) ALLOW_MAIN_RESTART=1 ;;
         --force-with-open-position) FORCE_WITH_OPEN_POSITION=1 ;;
+        --reanchor-peak) REANCHOR_PEAK=1 ;;
+        --collateral=*) COLLATERAL="${arg#*=}" ;;
         --help|-h) usage ;;
         --*)
             echo "ERROR: unknown flag '$arg'" >&2
@@ -76,6 +88,19 @@ fi
 
 BOT="${POSITIONAL[0]}"
 INSTANCE_FILTER="${POSITIONAL[1]:-}"
+
+# --collateral only makes sense with --reanchor-peak (it overrides the equity
+# value the rebaseline uses). Validate it is a positive number.
+if [ -n "$COLLATERAL" ]; then
+    if [ "$REANCHOR_PEAK" != 1 ]; then
+        echo "ERROR: --collateral=<USD> requires --reanchor-peak" >&2
+        exit 1
+    fi
+    if ! echo "$COLLATERAL" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+        echo "ERROR: --collateral must be a positive number (got '$COLLATERAL')" >&2
+        exit 1
+    fi
+fi
 
 # Bot lookup: ssh_host / state_dir / service / is_main / status_dir_pattern
 # status_dir_pattern uses {variant} placeholder which is interpolated below.
@@ -262,10 +287,14 @@ ssh "$SSH_HOST" "sudo systemctl stop '$SERVICE'"
 echo "==> Backing up to $BACKUP"
 ssh "$SSH_HOST" "sudo cp '$RISK_STATE' '$BACKUP'"
 
-echo "==> Clearing session_halted for: $WOULD_CLEAR"
-ssh "$SSH_HOST" "sudo python3 - '$INSTANCE_FILTER' <<'PY'
+echo "==> Clearing session_halted for: $WOULD_CLEAR (reanchor_peak=$REANCHOR_PEAK collateral=${COLLATERAL:-<auto>})"
+NOW_TS=$(date -u +%s)
+ssh "$SSH_HOST" "sudo python3 - '$INSTANCE_FILTER' '$REANCHOR_PEAK' '$COLLATERAL' '$NOW_TS' <<'PY'
 import json, sys
 filt = sys.argv[1]
+reanchor = sys.argv[2] == '1'
+collateral = float(sys.argv[3]) if sys.argv[3] else None
+now_ts = int(sys.argv[4])
 with open('$RISK_STATE') as f:
     d = json.load(f)
 for name, inst in d.get('instances', {}).items():
@@ -275,7 +304,22 @@ for name, inst in d.get('instances', {}).items():
         inst['session_halted'] = False
         inst['session_halt_reason'] = None
         inst['session_halt_ts'] = None
-        print(f'  cleared {name}', file=sys.stderr)
+        msg = f'  cleared {name}'
+        if reanchor:
+            # bot-strategy#575: collapse the rolling-peak window to a single
+            # sample at the (possibly topped-up) collateral so DD resets to 0
+            # and the cleared halt does not re-breach at the boundary.
+            samples = inst.get('equity_samples') or []
+            base = collateral
+            if base is None:
+                base = samples[-1]['equity'] if samples else None
+            if base is not None:
+                inst['equity_samples'] = [{'ts': now_ts, 'equity': base}]
+                inst['capital_baseline_equity'] = base
+                msg += f' (peak reanchored to {base:.2f}, DD->0)'
+            else:
+                msg += ' (reanchor skipped: no equity reference available)'
+        print(msg, file=sys.stderr)
 with open('$RISK_STATE', 'w') as f:
     json.dump(d, f, indent=2)
 PY"
