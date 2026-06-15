@@ -13,7 +13,7 @@ use tokio::time::Duration;
 use crate::ports::replay_dex::ReplayConnector;
 
 use super::super::bar::BarBuilder;
-use super::super::config::{PairParams, PairTradeConfig};
+use super::super::config::{sha256_12, EffectiveConfig, PairParams, PairTradeConfig};
 use super::super::instance::{StrategyInstance, EQUITY_REFRESH_CACHE_SECS};
 use super::super::pnl_log::PnlLogger;
 use super::super::state::{PairSharedState, PairState};
@@ -203,6 +203,45 @@ impl PairTradeEngine {
             prom::record_process_info(inst.id.as_str(), process_started);
         }
 
+        // Emit the `[CONFIG]` startup line + effective-config fingerprint
+        // gauges per variant so the *running* config is observable
+        // (bot-strategy#580). Until this, a config deployed but never loaded
+        // (deploy ≠ restart, #269) left no signal anywhere — the #491 incident
+        // ran the wrong `force_close_time_secs` for ~8 days undetected. The fp
+        // is over the effective resolved trading params; the file_* labels let
+        // a drift monitor compare the on-disk YAML against what booted.
+        //
+        // Skipped in backtest mode: BT replay reconstructs engines thousands of
+        // times in grid runs (the line would be pure noise) and the golden
+        // baseline is captured with `debot::pairtrade=info`, so an extra startup
+        // line there would break byte-exact replay diffs. This is a live-ops
+        // signal; live dry_run still emits it (only `backtest_mode` is gated).
+        if !backtest_mode {
+            let (file_path, file_sha, file_mtime) = config_source_fingerprint(&cfg);
+            for (strategy, inst) in strategies.iter().zip(built_instances.iter()) {
+                let effective = EffectiveConfig::from_resolved(
+                    strategy,
+                    &inst.default_pair_params,
+                    cfg.max_leverage,
+                    cfg.dry_run,
+                );
+                log::info!("{}", effective.log_line());
+                prom::record_config_info(
+                    inst.id.as_str(),
+                    &effective.fingerprint(),
+                    effective.force_close_secs,
+                    effective.exit_z,
+                    effective.stop_loss_z,
+                    effective.use_frozen_beta_exit_z,
+                    effective.equity_reference_usd,
+                    effective.max_leverage,
+                    &file_path,
+                    &file_sha,
+                    file_mtime,
+                );
+            }
+        }
+
         Ok(Self {
             cfg,
             connector,
@@ -231,4 +270,32 @@ impl PairTradeEngine {
             last_warm_start_key: None,
         })
     }
+}
+
+/// Compute `(path, sha256-12, mtime_secs)` for the YAML the config was loaded
+/// from. Returns empty strings / 0 for env-only builds (no source file) or when
+/// the file can't be read — the fingerprint of the *effective* config is the
+/// primary drift signal, the file_* labels are a secondary "file changed since
+/// boot" check. bot-strategy#580.
+fn config_source_fingerprint(cfg: &PairTradeConfig) -> (String, String, i64) {
+    let path = match cfg.config_source_path.as_deref() {
+        Some(p) => p.to_string(),
+        None => return (String::new(), String::new(), 0),
+    };
+    let (sha, mtime) = match std::fs::read(&path) {
+        Ok(bytes) => {
+            let mtime = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            (sha256_12(&bytes), mtime)
+        }
+        Err(e) => {
+            log::warn!("[CONFIG] could not re-read config file {path} for fingerprint: {e}");
+            (String::new(), 0)
+        }
+    };
+    (path, sha, mtime)
 }

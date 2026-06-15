@@ -60,6 +60,13 @@ export DEBOT_STATUS_DIR="${DEBOT_STATUS_DIR:-/home/ec2-user/debot_status}"
 export DEBOT_STATUS_ID=debot-pair-btceth
 export PAIRTRADE_CONFIG_PATH=/opt/debot/configs/pairtrade/debot-pair-btceth.yaml
 
+# Clear the deploy-time "config deployed, restart to apply" marker
+# (bot-strategy#580). The Deploy Configs workflow drops /opt/debot/RESTART_PENDING
+# whenever a pairtrade YAML changes without restarting (#269); this restart is
+# the load, so the pending state is resolved. The [CONFIG] fingerprint logged
+# at startup is the post-restart confirmation of what was actually loaded.
+rm -f /opt/debot/RESTART_PENDING 2>/dev/null || true
+
 # Perps-only bot — skip Lighter /api/v1/orderBooks spot fetch at market-cache
 # init. That call right after the heavy orderBookDetails response was the
 # single biggest trigger of the startup 429 / WAF cooldown. See

@@ -4,6 +4,7 @@
 
 mod env_overrides;
 mod env_util;
+mod fingerprint;
 mod from_env;
 mod from_yaml;
 mod params;
@@ -14,6 +15,7 @@ mod strategy;
 mod universe;
 mod validate;
 
+pub use fingerprint::{sha256_12, EffectiveConfig};
 pub use params::PairParams;
 pub use resolved::{PairTradeConfig, WarmStartMode};
 pub use risk::{DailyLossAction, RiskConfig};

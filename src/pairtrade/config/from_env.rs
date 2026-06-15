@@ -226,6 +226,7 @@ impl PairTradeConfig {
                 .unwrap_or_else(|| DEFAULT_REGIME_REFERENCE_SYMBOL.to_string()),
             risk: RiskConfig::default(),
             round_id: env::var("ROUND_ID").ok().filter(|v| !v.trim().is_empty()),
+            config_source_path: None,
         };
         cfg.default_pair_params = default_pair_params_from_env();
         if cfg.default_pair_params.warm_start_min_bars == 0 {

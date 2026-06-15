@@ -92,6 +92,7 @@ impl PairTradeEngine {
             bt_regime_series_file: None,
             risk: config::RiskConfig::default(),
             round_id: None,
+            config_source_path: None,
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
