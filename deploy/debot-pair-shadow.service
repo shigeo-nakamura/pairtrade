@@ -1,0 +1,22 @@
+[Unit]
+Description="debot-pair-shadow (multi-pair observe-only data collector, bot-strategy#560)"
+After=network-online.target debot-pair-btceth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/debot-shadow
+# Stagger after main A/B/C + canary startup (bot-strategy#163 spacing).
+ExecStartPre=/bin/sleep 90
+ExecStart=/bin/bash /opt/debot/scripts/debot-pair-shadow.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+# Observe-only: no positions to force-close, short stop is fine.
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
