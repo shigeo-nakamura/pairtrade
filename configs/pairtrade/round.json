@@ -1,6 +1,6 @@
 {
-  "round": "round6",
-  "issue": "bot-strategy#491",
+  "round": "round7",
+  "issue": "bot-strategy#581",
   "service": "debot-pair-btceth",
   "notes": "Expected EFFECTIVE per-variant config for the live Frankfurt debot-pair-btceth A/B/C. The drift monitor / round-eval preflight (scripts/check_config_drift.sh --round-json) asserts the RUNNING process matches this. A mismatch means a config was deployed but never loaded (deploy != restart, #269), which went undetected for ~8 days in #491 — `force_close_secs` is the field that drifted. Update this file whenever the round config changes, in the SAME commit as the YAML, so the assertion tracks the intended round.",
   "max_leverage": 10,
@@ -10,21 +10,21 @@
       "exit_z": 0.2,
       "stop_loss_z": 4.0,
       "use_frozen_beta_exit_z": false,
-      "equity_reference_usd": 1000
+      "equity_reference_usd": 1500
     },
     "b": {
-      "force_close_secs": 7200,
-      "exit_z": 0.2,
-      "stop_loss_z": 4.0,
+      "force_close_secs": 21600,
+      "exit_z": 0.15,
+      "stop_loss_z": 8.0,
       "use_frozen_beta_exit_z": false,
       "equity_reference_usd": 1000
     },
     "c": {
       "force_close_secs": 10800,
       "exit_z": 0.2,
-      "stop_loss_z": 4.0,
-      "use_frozen_beta_exit_z": true,
-      "equity_reference_usd": 1000
+      "stop_loss_z": 8.0,
+      "use_frozen_beta_exit_z": false,
+      "equity_reference_usd": 500
     }
   }
 }
