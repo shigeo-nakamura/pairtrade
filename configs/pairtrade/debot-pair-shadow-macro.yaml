@@ -35,6 +35,10 @@
 # - Credentials are shared with the canary sub-account (sourced by the wrapper).
 #   In observe mode the process signs no transactions, so there is no nonce
 #   contention; it only adds WS/REST read load.
+# - Startup runs `scripts/check_lighter_config_markets.py` against
+#   /api/v1/orderBookDetails and fails the unit if any leg below is not listed.
+#   This avoids the silent failure mode where one unknown symbol aborts every
+#   tick before the dump/[METRICS] write.
 
 dex_name: lighter
 rest_endpoint: https://mainnet.zklighter.elliot.ai/

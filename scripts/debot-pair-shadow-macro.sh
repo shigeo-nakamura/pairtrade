@@ -37,6 +37,10 @@ export PAIRTRADE_CONFIG_PATH=/opt/debot/configs/pairtrade/debot-pair-shadow-macr
 # Perps-only, same as main (bot-strategy#128)
 export LIGHTER_SKIP_SPOT_MARKETS=1
 
+# Fail before the observer starts if any configured leg is not a canonical
+# Lighter perp symbol; otherwise one bad leg makes every tick fail before dump.
+python3 "$ENV_DIR/check_lighter_config_markets.py" "$PAIRTRADE_CONFIG_PATH"
+
 # Own ack sentinel (bot-strategy#488 pattern); unused in observe mode but
 # keeps the path disjoint from main/canary/sol/shadow.
 export RISK_ACK_PATH="$STATE_DIR/RISK_ACK"
