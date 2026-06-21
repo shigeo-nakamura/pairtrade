@@ -13,7 +13,16 @@
 # Three independent checks (any one firing = drift, exit 2):
 #   1. mtime > start  — on-disk config file is newer than the running process's
 #      boot time. Needs only systemd + stat; would have fired immediately on
-#      06-15. This is the canonical "deployed, not yet loaded" signal.
+#      06-15. This is the canonical "deployed, not yet loaded" signal — but it
+#      is CORROBORATED, not standalone: a newer mtime is only escalated to drift
+#      when content identity cannot be confirmed (metrics down / boot-sha gauge
+#      absent → fail closed) or the on-disk sha differs from the boot sha. When
+#      the boot sha matches the on-disk sha the file was merely re-deployed with
+#      byte-identical content (CI re-runs Deploy Configs on unrelated master
+#      pushes and re-syncs every YAML, bumping mtime without a content change —
+#      bot-strategy#608), which is benign and would otherwise nag daily until a
+#      pointless restart. The real #491 failure (different content not loaded)
+#      still trips checks 2 & 3, so this loses no coverage.
 #   2. file sha drift — sha256-12 of the on-disk file ≠ the sha the running
 #      process recorded at boot (pairtrade_config_file_info gauge). Catches an
 #      in-place edit even if mtime is ambiguous. Requires the metrics endpoint.
@@ -118,8 +127,12 @@ say "service      : $SERVICE"
 say "config       : $CONFIG"
 say "proc started : $start_raw ($start_epoch)"
 say "config mtime : $(date -d "@$file_mtime" '+%a %Y-%m-%d %H:%M:%S %Z') ($file_mtime)"
+# Defer the verdict: a newer mtime is only "deployed but not loaded" when the
+# deployed CONTENT differs from what the process booted with. Resolved AFTER the
+# metrics block, once the on-disk vs boot sha is known (see "resolve check 1").
+mtime_newer=0
 if [ "$start_epoch" -gt 0 ] && [ "$file_mtime" -gt "$start_epoch" ]; then
-  note_drift "config file mtime is newer than the running process start — deployed but NOT loaded. Restart $SERVICE to apply, then re-check the [CONFIG] fingerprint."
+  mtime_newer=1
 fi
 
 # --- Metrics-backed checks (2 + 3) -------------------------------------------
@@ -132,6 +145,10 @@ if [ -n "$ROUND_JSON" ] || [ -n "$EXPECT_FP" ] || [ "${#EXPECT_FC[@]}" -gt 0 ]; 
   WANT_METRICS_ASSERT=1
 fi
 
+# Default empty so the "resolve check 1" block below is safe under `set -u`
+# when metrics are unavailable (the else-branch never assigns these).
+disk_sha=""
+running_sha=""
 metrics=""
 if [ -n "$METRICS_URL" ]; then
   metrics=$(curl -s --max-time 6 "$METRICS_URL" 2>/dev/null || true)
@@ -220,6 +237,25 @@ else
     elif [ "$matched" -eq 1 ]; then
       say "fingerprint  : at least one variant matches expected $EXPECT_FP"
     fi
+  fi
+fi
+
+# --- Resolve check 1 (mtime), now that the on-disk vs boot sha is known -------
+# A config file newer than the running process only means "deployed but not
+# loaded" if the deployed CONTENT actually differs from what the process booted
+# with. CI re-runs Deploy Configs on unrelated master pushes, re-syncing every
+# YAML and bumping mtime even when the bytes are identical (bot-strategy#608) —
+# a benign re-deploy, not drift, and clearing it would need a pointless restart
+# that force-closes live positions. So escalate a newer mtime to drift ONLY when
+# content identity cannot be confirmed: boot sha matches on-disk sha → benign;
+# otherwise (metrics down / boot-sha gauge absent → fail closed, or sha differs)
+# → drift. The real #491 failure (different content not loaded) makes the boot
+# sha differ, so check 2 also fires and this still escalates — no lost coverage.
+if [ "$mtime_newer" -eq 1 ]; then
+  if [ -n "$running_sha" ] && [ "$running_sha" = "$disk_sha" ]; then
+    say "mtime note   : config file is newer than process start, but on-disk sha == boot sha ($disk_sha) — benign re-deploy of byte-identical content, not drift (bot-strategy#608)."
+  else
+    note_drift "config file mtime is newer than the running process start and content identity could not be confirmed (boot sha ${running_sha:-<absent>} vs on-disk ${disk_sha:-<unknown>}) — deployed but NOT loaded. Restart $SERVICE to apply, then re-check the [CONFIG] fingerprint."
   fi
 fi
 
