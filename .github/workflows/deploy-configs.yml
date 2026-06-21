@@ -3,6 +3,8 @@ name: Deploy Configs
 on:
   push:
     paths:
+      - ".github/fixtures/**"
+      - ".github/workflows/deploy-configs.yml"
       - "configs/**"
       - "scripts/**"
       - "deploy/**"
@@ -17,7 +19,26 @@ env:
   INSTALL_DIR: /opt/debot
 
 jobs:
+  validate-config-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Validate shell wrappers
+        run: bash -n debot/scripts/debot-pair-shadow-macro.sh
+
+      - name: Validate Lighter market preflight
+        run: |
+          python3 -m py_compile debot/scripts/check_lighter_config_markets.py
+          python3 debot/scripts/check_lighter_config_markets.py \
+            debot/configs/pairtrade/debot-pair-shadow-macro.yaml \
+            --markets-json debot/.github/fixtures/lighter_order_book_details_macro.json
+
   deploy-configs:
+    needs: validate-config-artifacts
     runs-on: ubuntu-latest
     if: ${{ github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' }}
     environment: debot

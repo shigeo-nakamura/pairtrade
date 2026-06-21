@@ -1,0 +1,16 @@
+{
+  "order_book_details": [
+    { "symbol": "AMD" },
+    { "symbol": "BRENTOIL" },
+    { "symbol": "EURUSD" },
+    { "symbol": "GBPUSD" },
+    { "symbol": "NVDA" },
+    { "symbol": "QQQ" },
+    { "symbol": "SPY" },
+    { "symbol": "WTI" },
+    { "symbol": "XAG" },
+    { "symbol": "XAU" },
+    { "symbol": "XPD" },
+    { "symbol": "XPT" }
+  ]
+}

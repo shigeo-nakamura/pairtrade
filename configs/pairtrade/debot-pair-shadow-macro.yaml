@@ -61,6 +61,8 @@ history_archive_retention_days: 60
 #   SPY/QQQ       index   — broad vs tech
 #   EURUSD/GBPUSD fx      — correlated majors
 #   NVDA/AMD      equity  — semiconductors
+# Canonical Lighter symbols above were verified with
+# scripts/check_lighter_config_markets.py against /api/v1/orderBookDetails.
 universe_pairs:
 - XAU/XAG
 - XPT/XPD
