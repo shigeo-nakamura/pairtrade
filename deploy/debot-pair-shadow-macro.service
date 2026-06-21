@@ -1,0 +1,33 @@
+[Unit]
+Description="debot-pair-shadow-macro (non-crypto multi-pair observe-only data collector, bot-strategy#513)"
+After=network-online.target debot-pair-btceth.service debot-pair-shadow.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root like debot-pair-btceth / canary / shadow (no User=): the wrapper
+# sources debot-pair-canary.env which is rw------- root:root (a User=ec2-user
+# here hit "Permission denied" on that secrets file for the #560 sibling).
+# Leading '-' makes a missing dir non-fatal: systemd applies WorkingDirectory
+# BEFORE ExecStartPre/ExecStart, so on a fresh host where /opt/debot-shadow-macro
+# does not exist yet (the deploy only creates /opt/debot/{scripts,configs}) an
+# un-prefixed path would CHDIR-fail the unit before the wrapper's own
+# `mkdir -p "$STATE_DIR/history_archive"` + `cd "$STATE_DIR"` could create it.
+# With '-', systemd starts in / and the wrapper makes+enters the state dir.
+WorkingDirectory=-/opt/debot-shadow-macro
+# Startup spacing after main A/B/C + canary + soleth + crypto shadow
+# (bot-strategy#163): start last among the observers. Keep well under
+# TimeoutStartSec.
+ExecStartPre=/bin/sleep 45
+ExecStart=/bin/bash /opt/debot/scripts/debot-pair-shadow-macro.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+TimeoutStartSec=300
+# Observe-only: no positions to force-close, short stop is fine.
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

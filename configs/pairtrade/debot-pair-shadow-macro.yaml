@@ -1,0 +1,159 @@
+# Multi-pair observe-only data collector for the NON-CRYPTO zero-fee universe
+# (bot-strategy#513 pair/universe screen). Sibling of debot-pair-shadow (#560),
+# which covers the crypto basket; this instance covers the asset classes that
+# the #544/#553 crypto-majors screens never touched.
+#
+# Why a separate instance (not extra rows on debot-pair-shadow):
+# - #560's shadow runs a clean 4-week crypto window; mixing non-crypto pairs in
+#   would contaminate that study's max_active_pairs rotation.
+# - The non-crypto legs (metals/energy/FX/index/equity) are NOT 24/7 — their
+#   Lighter synthetic books only tighten during the underlying's RTH and go wide
+#   overnight/weekend. Keeping them in their own instance isolates that regime
+#   from the always-on crypto control.
+#
+# Rationale (#587): a raw from-dump screen cannot PASS a candidate (window-length
+# sign-flips); only a GATED signal on the real binary can. This instance is the
+# gated first gate — real ~5s cadence dumps + the live engine's [METRICS]
+# eligibility stream — for metals/energy/FX/index/equity pairs that are all
+# listed as zero-fee Lighter perps but were never screened.
+#
+# Open question for first readout: the structural beta filters (beta_min,
+# beta_divergence_max, hedge_ratio_max_deviation) are tuned for crypto-scale
+# legs. Non-crypto pairs with very different price levels (XAU ~2000 vs XAG ~30)
+# may be rejected by the beta gate. Kept IDENTICAL to #560 for now so the
+# [METRICS] eligibility stream is directly comparable; if the gate rejects
+# everything, the readout shows it and we loosen per-class in a follow-up. The
+# raw L1 dump is collected regardless of whether entries fire.
+#
+# Design notes (identical safety model to debot-pair-shadow / soleth-observe):
+# - observe_only + dry_run are BOTH set: no orders, real or simulated, ever
+#   reach the venue. The strategy block is a live-A clone only so the engine has
+#   an instance to evaluate; signals are a preview, not a deliverable.
+# - The dump filename (market_data_pairmacro_*) does NOT match the disk-cleanup
+#   `market_data_btceth_[0-9]*` pattern, so dated dumps accumulate past 7 days
+#   (disk-watch still covers us; ~40 MB/day for 12 symbols).
+# - Credentials are shared with the canary sub-account (sourced by the wrapper).
+#   In observe mode the process signs no transactions, so there is no nonce
+#   contention; it only adds WS/REST read load.
+# - Startup runs `scripts/check_lighter_config_markets.py` against
+#   /api/v1/orderBookDetails and fails the unit if any leg below is not listed.
+#   This avoids the silent failure mode where one unknown symbol aborts every
+#   tick before the dump/[METRICS] write.
+
+dex_name: lighter
+rest_endpoint: https://mainnet.zklighter.elliot.ai/
+web_socket_endpoint: wss://mainnet.zklighter.elliot.ai/stream
+dry_run: true
+agent_name: debot-pair-shadow-macro
+
+enable_data_dump: true
+data_dump_file: /opt/debot-shadow-macro/market_data_pairmacro.jsonl
+observe_only: true
+
+history_archive_dir: /opt/debot-shadow-macro/history_archive
+history_archive_retention_days: 60
+
+# Non-crypto within-class candidates, all zero-fee Lighter perps (#513). Each
+# pair is a classic cointegration relationship in its asset class:
+#   XAU/XAG       metals  — gold/silver ratio
+#   XPT/XPD       metals  — platinum/palladium
+#   WTI/BRENTOIL  energy  — crude grade spread
+#   SPY/QQQ       index   — broad vs tech
+#   EURUSD/GBPUSD fx      — correlated majors
+#   NVDA/AMD      equity  — semiconductors
+# Canonical Lighter symbols above were verified with
+# scripts/check_lighter_config_markets.py against /api/v1/orderBookDetails.
+universe_pairs:
+- XAU/XAG
+- XPT/XPD
+- WTI/BRENTOIL
+- SPY/QQQ
+- EURUSD/GBPUSD
+- NVDA/AMD
+max_active_pairs: 6
+
+interval_secs: 5
+trading_period_secs: 60
+
+# Same diagnostics as main BTC/ETH so the [METRICS] eligibility stream is
+# directly comparable across pairs.
+pair_selection_lookback_hours_short: 1
+pair_selection_lookback_hours_long: 2
+adf_p_threshold: 0.15
+half_life_max_hours: 2.0
+metrics_window_length: 240
+warm_start_mode: relaxed
+warm_start_min_bars: 60
+
+# Core MR params — live Round-6 A clone (signal preview only; observe_only).
+entry_z_score_base: 1.5
+entry_z_score_min: 1.0
+entry_z_score_max: 2.0
+exit_z_score: 0.2
+stop_loss_z_score: 4.0
+force_close_time_secs: 10800
+shutdown_grace_secs: 10860
+stop_loss_cooldown_secs: 600
+
+# Risk — values are irrelevant in observe mode but kept sane.
+risk_pct_per_trade: 0.40
+equity_usd_reference: 50
+max_leverage: 1
+max_loss_r_mult: 1.0
+
+# Execution
+cooldown_secs: 60
+slippage_bps: 0
+fee_bps: 0
+entry_post_only_timeout_secs: 30
+
+# Filters (identical to main)
+spread_velocity_max_sigma_per_min: 0.15
+spread_trend_max_slope_sigma: 1.0
+beta_divergence_max: 0.30
+beta_min: 0.30
+hedge_ratio_max_deviation: 0.20
+entry_vol_lookback_hours: 2
+vol_spike_mult: 3.0
+net_funding_min_per_hour: -0.01
+reeval_jump_z_mult: 1.5
+
+# Phase 2 filters (identical to main)
+entry_velocity_block_sigma_per_min: 0.0
+funding_entry_z_scale: 0.0
+beta_gap_entry_z_scale: 3.0
+
+# Std collapse guard (identical to main)
+std_collapse_window_bars: 60
+std_collapse_min_ratio: 0.2
+std_collapse_observe_only: false
+
+# Circuit breaker (identical to main; cannot fire in observe mode)
+circuit_breaker_tier1_losses: 5
+circuit_breaker_tier1_cooldown_secs: 600
+circuit_breaker_tier2_losses: 8
+circuit_breaker_tier2_cooldown_secs: 3600
+
+risk:
+  max_daily_loss_bps: 300
+  max_daily_loss_action: block
+  daily_reset_utc_hour: 0
+  max_session_loss_bps: 200
+  session_dd_lookback_secs: 2592000
+  session_dd_sample_secs: 3600
+  max_notional_headroom: 1.0
+
+# Single instance — observer has no A/B/C split.
+strategies:
+  - id: a
+    agent_name: debot-pair-shadow-macro
+    exit_z_score: 0.2
+    stop_loss_z_score: 4.0
+    max_loss_r_mult: 1.0
+    equity_usd_reference: 50
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 10800
+    entry_z_score_base: 1.5
+    entry_z_score_min: 1.0
+    entry_z_score_max: 2.0
