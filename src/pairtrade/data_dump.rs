@@ -57,6 +57,10 @@ impl RotatingDumpWriter {
         writeln!(self.writer, "{}", line)
     }
 
+    pub(super) fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+
     fn file_path(base: &Path, ext: &str, date: NaiveDate) -> PathBuf {
         let date_str = date.format("%Y%m%d").to_string();
         let filename = format!(
@@ -112,7 +116,7 @@ mod tests {
         let base_path = dir.path().join("dump.jsonl");
         let mut writer = RotatingDumpWriter::new(base_path.to_str().unwrap()).unwrap();
         writer.write_line(r#"{"test": 1}"#).unwrap();
-        writer.writer.flush().unwrap();
+        writer.flush().unwrap();
 
         let today = Utc::now().date_naive().format("%Y%m%d").to_string();
         let expected_file = dir.path().join(format!("dump_{}.jsonl", today));

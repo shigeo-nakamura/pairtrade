@@ -156,6 +156,8 @@ impl ExecutionLedger {
             Ok(line) => {
                 if let Err(err) = self.writer.write_line(&line) {
                     log::warn!("[EXEC_LEDGER] write failed: {}", err);
+                } else if let Err(err) = self.writer.flush() {
+                    log::warn!("[EXEC_LEDGER] flush failed: {}", err);
                 }
             }
             Err(err) => log::warn!("[EXEC_LEDGER] serialize failed: {}", err),
@@ -165,4 +167,59 @@ impl ExecutionLedger {
 
 pub(in crate::pairtrade) fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializes_leg_fill_record_core_fields() {
+        let record = ExecutionLegFillRecord {
+            event: "leg_fill",
+            ts_ms: 1_789_000_000_000,
+            variant: "A".to_string(),
+            pair: "BTC/ETH".to_string(),
+            phase: "exit".to_string(),
+            close_reason: Some("force_close".to_string()),
+            leg_symbol: "BTC".to_string(),
+            side: "Long".to_string(),
+            target_qty: Decimal::new(100, 3),
+            filled_qty: Decimal::new(100, 3),
+            remaining_qty: Decimal::ZERO,
+            order_id: "local-1".to_string(),
+            exchange_order_id: Some("venue-1".to_string()),
+            post_only: false,
+            reduce_only: true,
+            order_type: "taker".to_string(),
+            attempt: 2,
+            placed_ts_ms: 1_789_000_000_100,
+            fill_ts_ms: Some(1_789_000_000_250),
+            latency_submit_fill_ms: Some(150),
+            reference_price: Some(Decimal::new(100_000, 2)),
+            limit_price: None,
+            best_bid: Some(Decimal::new(99_990, 2)),
+            best_ask: Some(Decimal::new(100_010, 2)),
+            fill_value: Some(Decimal::new(10_000, 2)),
+            fill_price: Some(100.0),
+            filled_fee: Some(Decimal::new(5, 2)),
+            fee_bps: Some(5.0),
+            slippage_bps_vs_decision: Some(1.2),
+            slippage_usd_vs_decision: Some(0.12),
+            overfill_detected: false,
+            underfill_detected: false,
+        };
+
+        let value = serde_json::to_value(&record).unwrap();
+
+        assert_eq!(value["event"], "leg_fill");
+        assert_eq!(value["variant"], "A");
+        assert_eq!(value["pair"], "BTC/ETH");
+        assert_eq!(value["phase"], "exit");
+        assert_eq!(value["reduce_only"], true);
+        assert_eq!(value["order_type"], "taker");
+        assert_eq!(value["latency_submit_fill_ms"], 150);
+        assert_eq!(value["overfill_detected"], false);
+        assert_eq!(value["underfill_detected"], false);
+    }
 }

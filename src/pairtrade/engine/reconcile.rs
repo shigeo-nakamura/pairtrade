@@ -1235,19 +1235,22 @@ impl PairTradeEngine {
     }
 
     fn execution_order_type(leg: &PendingLeg) -> &'static str {
-        if leg.post_only {
-            "post_only"
-        } else if leg.limit_price.is_some() {
-            "limit"
-        } else {
-            "taker"
+        match leg.reference_price {
+            Some(_) => {
+                if leg.limit_price.is_some() {
+                    "post_only"
+                } else {
+                    "taker"
+                }
+            }
+            None => "post_only",
         }
     }
 
     /// Per-leg slippage / fee / fill-latency observation (#314 Group 4-B,
     /// 4-C) plus durable execution-ledger JSONL output (bot-strategy#613).
-    /// Reads the same venue fill maps for both Prometheus and JSONL so the
-    /// histogram view and later per-trade attribution report agree.
+    /// Uses the same fill/status snapshot for Prometheus and JSONL, with the
+    /// in-memory filled fallback matching pending-order completion.
     fn record_leg_execution_quality(
         &mut self,
         variant: &str,
@@ -1271,7 +1274,7 @@ impl PairTradeEngine {
         let mut underfill_detected = false;
 
         for leg in legs {
-            let fill_size = Self::leg_fill_from_map(leg, &status.fills);
+            let fill_size = Self::filled_for_leg(leg, &status.fills);
             if fill_size <= Decimal::ZERO {
                 continue;
             }
@@ -1283,7 +1286,8 @@ impl PairTradeEngine {
                 min_fill_ts = Some(min_fill_ts.map_or(ts, |prev| prev.min(ts)));
                 max_fill_ts = Some(max_fill_ts.map_or(ts, |prev| prev.max(ts)));
             }
-            let fill_value_f64 = filled_value.and_then(|v| v.to_f64());
+            let positive_filled_value = filled_value.filter(|value| *value > Decimal::ZERO);
+            let fill_value_f64 = positive_filled_value.and_then(|v| v.to_f64());
             let fill_size_f64 = fill_size.to_f64();
             let fill_price = match (fill_value_f64, fill_size_f64) {
                 (Some(value), Some(size)) if size > 0.0 => Some(value / size),
@@ -1369,6 +1373,8 @@ impl PairTradeEngine {
                 order_id: leg.order_id.clone(),
                 exchange_order_id: leg.exchange_order_id.clone(),
                 post_only: leg.post_only,
+                // PendingLeg does not retain the submitted reduce_only flag;
+                // phase is the closest in-process proxy for ledger attribution.
                 reduce_only: phase != "entry",
                 order_type: order_type.to_string(),
                 attempt,
