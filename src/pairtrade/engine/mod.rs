@@ -35,7 +35,7 @@ use super::config::PairTradeConfig;
 use super::instance::StrategyInstance;
 use super::state::PairSharedState;
 use super::stats::PriceSample;
-use super::{data_dump, funding_history};
+use super::{data_dump, execution_ledger, funding_history};
 
 pub struct PairTradeEngine {
     pub(in crate::pairtrade) cfg: PairTradeConfig,
@@ -65,6 +65,7 @@ pub struct PairTradeEngine {
     /// entries across all instances.
     pub(in crate::pairtrade) kill_switch_active: bool,
     pub(in crate::pairtrade) data_dump_writer: Option<data_dump::RotatingDumpWriter>,
+    pub(in crate::pairtrade) execution_ledger: Option<execution_ledger::ExecutionLedger>,
     /// Per-tick regime-detector series CSV writer (BT calibration aid for
     /// bot-strategy#534/#494). `Some` only when `cfg.bt_regime_series_file`
     /// is set; flushed at backtest end-of-data.

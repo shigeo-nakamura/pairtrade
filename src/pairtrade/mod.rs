@@ -11,6 +11,7 @@ mod data_dump;
 mod defaults;
 mod engine;
 mod entry;
+mod execution_ledger;
 mod exit;
 mod funding_history;
 mod history_io;

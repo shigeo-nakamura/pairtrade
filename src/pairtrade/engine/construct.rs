@@ -18,7 +18,7 @@ use super::super::instance::{StrategyInstance, EQUITY_REFRESH_CACHE_SECS};
 use super::super::pnl_log::PnlLogger;
 use super::super::state::{PairSharedState, PairState};
 use super::super::status::StatusReporter;
-use super::super::{backtest, data_dump, funding_history, kalman, prom, status};
+use super::super::{backtest, data_dump, execution_ledger, funding_history, kalman, prom, status};
 use super::risk::risk_state_path_for;
 use super::PairTradeEngine;
 
@@ -79,6 +79,7 @@ impl PairTradeEngine {
         } else {
             None
         };
+        let execution_ledger = execution_ledger::ExecutionLedger::from_env(&cfg);
         let regime_series_writer = match cfg.bt_regime_series_file.as_deref() {
             Some(path) => {
                 // Backtest-only output: a non-rotating per-tick file must not
@@ -262,6 +263,7 @@ impl PairTradeEngine {
             risk_state_path,
             kill_switch_active: false,
             data_dump_writer,
+            execution_ledger,
             regime_series_writer,
             funding_history: funding_history::FundingHistory::new(),
             shutdown_pending: false,

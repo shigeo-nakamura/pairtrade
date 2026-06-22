@@ -31,6 +31,7 @@ use rust_decimal::Decimal;
 use super::super::apply_post_exit_state;
 use super::super::defaults::MAX_EXIT_RETRIES;
 use super::super::engine;
+use super::super::execution_ledger::{self, ExecutionLegFillRecord, ExecutionPairSummaryRecord};
 use super::super::exit::compute_pnl;
 use super::super::funding_history;
 use super::super::market::SymbolSnapshot;
@@ -446,6 +447,12 @@ impl PairTradeEngine {
         let mut pnl_record: Option<(PnlLogRecord, f64, f64)> = None;
         if status.open_remaining == 0 && Self::all_filled(&pending, &status.fills) {
             let inst_id = self.instances[inst_idx].id.clone();
+            let close_reason = self.instances[inst_idx]
+                .states
+                .get(key)
+                .and_then(|s| s.pending_exit_reason)
+                .unwrap_or("unknown")
+                .to_string();
             let z_exit = self
                 .per_pair_state
                 .get(key)
@@ -472,13 +479,16 @@ impl PairTradeEngine {
                 );
                 state.pending_exit = None;
             }
-            Self::observe_leg_execution_quality(
+            self.record_leg_execution_quality(
                 &inst_id,
                 key,
                 "exit",
+                Some(&close_reason),
                 &pending.legs,
                 &status,
                 pending.placed_ts_ms,
+                pending.hedge_retry_count,
+                price_map,
             );
             log::info!("[ORDER] {} exit orders filled", key);
             if let Some((record, pnl_value, funding_value)) = pnl_record {
@@ -736,13 +746,17 @@ impl PairTradeEngine {
                 state.pending_entry = None;
                 state.recovery_recorded = false;
             }
-            Self::observe_leg_execution_quality(
-                &self.instances[inst_idx].id,
+            let inst_id = self.instances[inst_idx].id.clone();
+            self.record_leg_execution_quality(
+                &inst_id,
                 key,
                 "entry",
+                None,
                 &pending.legs,
                 &status,
                 pending.placed_ts_ms,
+                pending.hedge_retry_count,
+                price_map,
             );
             log::info!("[ORDER] {} entry orders filled", key);
         } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
@@ -1204,113 +1218,217 @@ impl PairTradeEngine {
             .unwrap_or(Decimal::ZERO)
     }
 
+    fn lookup_decimal_for_leg(leg: &PendingLeg, map: &HashMap<String, Decimal>) -> Option<Decimal> {
+        map.get(&leg.order_id).cloned().or_else(|| {
+            leg.exchange_order_id
+                .as_ref()
+                .and_then(|id| map.get(id).cloned())
+        })
+    }
+
+    fn lookup_ts_for_leg(leg: &PendingLeg, map: &HashMap<String, i64>) -> Option<i64> {
+        map.get(&leg.order_id).copied().or_else(|| {
+            leg.exchange_order_id
+                .as_ref()
+                .and_then(|id| map.get(id).copied())
+        })
+    }
+
+    fn execution_order_type(leg: &PendingLeg) -> &'static str {
+        if leg.post_only {
+            "post_only"
+        } else if leg.limit_price.is_some() {
+            "limit"
+        } else {
+            "taker"
+        }
+    }
+
     /// Per-leg slippage / fee / fill-latency observation (#314 Group 4-B,
-    /// 4-C). Reads the volume-weighted fill price out of
-    /// `status.filled_values`, fee out of `status.filled_fees`, and
-    /// completion timestamp out of `status.filled_ts_ms_max`. Each metric
-    /// fires only when its inputs are present.
-    ///
-    /// Slippage requires a non-zero `leg.reference_price` and a positive
-    /// filled value. Reference price is the decision-time best quote on the
-    /// trading side, captured at order placement for both limit/post-only
-    /// and taker orders so taker fallbacks (`limit_price = None`) still
-    /// produce a slippage signal (#314 Group 4-B-2). Falls back to
-    /// `limit_price` for legs that pre-date the field. Sign convention:
-    /// positive = cost (paid more / received less than the reference).
-    ///
-    /// Fee requires a venue-reported `filled_fee` for the leg. Latency
-    /// requires a venue-reported `filled_ts_ms` (Extended populates,
-    /// Lighter omits). The `order_type` label ("post_only" or "taker")
-    /// lets the post-only-vs-taker distributions be inspected separately.
-    fn observe_leg_execution_quality(
+    /// 4-C) plus durable execution-ledger JSONL output (bot-strategy#613).
+    /// Reads the same venue fill maps for both Prometheus and JSONL so the
+    /// histogram view and later per-trade attribution report agree.
+    fn record_leg_execution_quality(
+        &mut self,
         variant: &str,
         pair: &str,
-        leg_type: &str,
+        phase: &str,
+        close_reason: Option<&str>,
         legs: &[PendingLeg],
         status: &PendingStatus,
         placed_ts_ms: i64,
+        attempt: u32,
+        price_map: &HashMap<String, SymbolSnapshot>,
     ) {
+        let mut leg_records = Vec::new();
+        let mut filled_leg_count = 0usize;
+        let mut notional_usd = 0.0f64;
+        let mut slippage_notional_usd = 0.0f64;
+        let mut slippage_usd_total = 0.0f64;
+        let mut min_fill_ts: Option<i64> = None;
+        let mut max_fill_ts: Option<i64> = None;
+        let mut overfill_detected = false;
+        let mut underfill_detected = false;
+
         for leg in legs {
             let fill_size = Self::leg_fill_from_map(leg, &status.fills);
             if fill_size <= Decimal::ZERO {
                 continue;
             }
-            let lookup_decimal = |map: &HashMap<String, Decimal>| {
-                map.get(&leg.order_id).cloned().or_else(|| {
-                    leg.exchange_order_id
-                        .as_ref()
-                        .and_then(|id| map.get(id).cloned())
-                })
-            };
-            let lookup_ts = |map: &HashMap<String, i64>| -> Option<i64> {
-                map.get(&leg.order_id).copied().or_else(|| {
-                    leg.exchange_order_id
-                        .as_ref()
-                        .and_then(|id| map.get(id).copied())
-                })
-            };
-            if let Some(fill_value) = lookup_decimal(&status.filled_values) {
-                if fill_value > Decimal::ZERO {
-                    if let Some(fill_value_f64) = fill_value.to_f64() {
-                        // Prefer the decision-time reference; fall back
-                        // to limit_price for legs that pre-date the
-                        // reference_price field. order_type tags whether
-                        // this was a post-only/limit fill (post-only)
-                        // or a market/taker fill (taker), so the two
-                        // distributions can be split in Grafana — taker
-                        // fallbacks are the adverse-slippage tail that
-                        // #306 cares about.
-                        let (ref_price_opt, order_type) = match leg.reference_price {
-                            Some(rp) => (
-                                Some(rp),
-                                if leg.limit_price.is_some() {
-                                    "post_only"
-                                } else {
-                                    "taker"
-                                },
-                            ),
-                            None => (leg.limit_price, "post_only"),
-                        };
-                        if let Some(ref_price) = ref_price_opt {
-                            if let (Some(ref_f64), Some(size_f64)) =
-                                (ref_price.to_f64(), fill_size.to_f64())
-                            {
-                                if ref_f64 > 0.0 && size_f64 > 0.0 {
-                                    let avg_price = fill_value_f64 / size_f64;
-                                    let sign = match leg.side {
-                                        dex_connector::OrderSide::Long => 1.0,
-                                        dex_connector::OrderSide::Short => -1.0,
-                                    };
-                                    let slippage_bps =
-                                        sign * (avg_price - ref_f64) / ref_f64 * 10_000.0;
-                                    super::super::prom::LEG_SLIPPAGE_BPS
-                                        .with_label_values(&[variant, pair, leg_type, order_type])
-                                        .observe(slippage_bps);
-                                }
-                            }
-                        }
-                        if let Some(fee) = lookup_decimal(&status.filled_fees) {
-                            if let Some(fee_f64) = fee.to_f64() {
-                                let fee_bps = fee_f64 / fill_value_f64 * 10_000.0;
-                                super::super::prom::LEG_FEE_BPS
-                                    .with_label_values(&[variant, pair, leg_type])
-                                    .observe(fee_bps);
-                            }
-                        }
-                    }
-                }
+            filled_leg_count += 1;
+            let filled_value = Self::lookup_decimal_for_leg(leg, &status.filled_values);
+            let filled_fee = Self::lookup_decimal_for_leg(leg, &status.filled_fees);
+            let fill_ts_ms = Self::lookup_ts_for_leg(leg, &status.filled_ts_ms_max);
+            if let Some(ts) = fill_ts_ms {
+                min_fill_ts = Some(min_fill_ts.map_or(ts, |prev| prev.min(ts)));
+                max_fill_ts = Some(max_fill_ts.map_or(ts, |prev| prev.max(ts)));
             }
-            if placed_ts_ms > 0 {
-                if let Some(fill_ts) = lookup_ts(&status.filled_ts_ms_max) {
-                    let latency_ms = (fill_ts - placed_ts_ms) as f64;
-                    if latency_ms >= 0.0 {
+            let fill_value_f64 = filled_value.and_then(|v| v.to_f64());
+            let fill_size_f64 = fill_size.to_f64();
+            let fill_price = match (fill_value_f64, fill_size_f64) {
+                (Some(value), Some(size)) if size > 0.0 => Some(value / size),
+                _ => None,
+            };
+            if let Some(value) = fill_value_f64 {
+                notional_usd += value.abs();
+            }
+
+            let ref_price_opt = leg.reference_price.or(leg.limit_price);
+            let slippage_bps_vs_decision = match (ref_price_opt, fill_price) {
+                (Some(ref_price), Some(avg_price)) => ref_price.to_f64().and_then(|ref_f64| {
+                    if ref_f64 <= 0.0 {
+                        return None;
+                    }
+                    let sign = match leg.side {
+                        dex_connector::OrderSide::Long => 1.0,
+                        dex_connector::OrderSide::Short => -1.0,
+                    };
+                    Some(sign * (avg_price - ref_f64) / ref_f64 * 10_000.0)
+                }),
+                _ => None,
+            };
+            let slippage_usd_vs_decision = match (slippage_bps_vs_decision, fill_value_f64) {
+                (Some(bps), Some(value)) => {
+                    let usd = value.abs() * bps / 10_000.0;
+                    slippage_notional_usd += value.abs();
+                    slippage_usd_total += usd;
+                    Some(usd)
+                }
+                _ => None,
+            };
+
+            let order_type = Self::execution_order_type(leg);
+            if let Some(slippage_bps) = slippage_bps_vs_decision {
+                super::super::prom::LEG_SLIPPAGE_BPS
+                    .with_label_values(&[variant, pair, phase, order_type])
+                    .observe(slippage_bps);
+            }
+            let fee_bps = match (filled_fee, fill_value_f64) {
+                (Some(fee), Some(value)) if value > 0.0 => {
+                    fee.to_f64().map(|fee| fee / value * 10_000.0)
+                }
+                _ => None,
+            };
+            if let Some(fee_bps) = fee_bps {
+                super::super::prom::LEG_FEE_BPS
+                    .with_label_values(&[variant, pair, phase])
+                    .observe(fee_bps);
+            }
+            let latency_submit_fill_ms = match (placed_ts_ms > 0, fill_ts_ms) {
+                (true, Some(fill_ts)) => {
+                    let latency_ms = fill_ts - placed_ts_ms;
+                    if latency_ms >= 0 {
                         super::super::prom::LEG_FILL_LATENCY_MS
-                            .with_label_values(&[variant, pair, leg_type])
-                            .observe(latency_ms);
+                            .with_label_values(&[variant, pair, phase])
+                            .observe(latency_ms as f64);
+                        Some(latency_ms)
+                    } else {
+                        None
                     }
                 }
-            }
+                _ => None,
+            };
+
+            let leg_overfill = fill_size > leg.target;
+            let leg_underfill = fill_size < leg.target;
+            overfill_detected |= leg_overfill;
+            underfill_detected |= leg_underfill;
+            let snap = price_map.get(&leg.symbol);
+            leg_records.push(ExecutionLegFillRecord {
+                event: "leg_fill",
+                ts_ms: execution_ledger::now_ms(),
+                variant: variant.to_string(),
+                pair: pair.to_string(),
+                phase: phase.to_string(),
+                close_reason: close_reason.map(str::to_string),
+                leg_symbol: leg.symbol.clone(),
+                side: format!("{:?}", leg.side),
+                target_qty: leg.target,
+                filled_qty: fill_size,
+                remaining_qty: (leg.target - fill_size).max(Decimal::ZERO),
+                order_id: leg.order_id.clone(),
+                exchange_order_id: leg.exchange_order_id.clone(),
+                post_only: leg.post_only,
+                reduce_only: phase != "entry",
+                order_type: order_type.to_string(),
+                attempt,
+                placed_ts_ms,
+                fill_ts_ms,
+                latency_submit_fill_ms,
+                reference_price: ref_price_opt,
+                limit_price: leg.limit_price,
+                best_bid: snap.and_then(|s| s.bid_price),
+                best_ask: snap.and_then(|s| s.ask_price),
+                fill_value: filled_value,
+                fill_price,
+                filled_fee,
+                fee_bps,
+                slippage_bps_vs_decision,
+                slippage_usd_vs_decision,
+                overfill_detected: leg_overfill,
+                underfill_detected: leg_underfill,
+            });
         }
+
+        let Some(ledger) = self.execution_ledger.as_mut() else {
+            return;
+        };
+        for record in &leg_records {
+            ledger.write_leg_fill(record);
+        }
+        if filled_leg_count == 0 {
+            return;
+        }
+        let gross_execution_slippage_bps = if slippage_notional_usd > 0.0 {
+            Some(slippage_usd_total / slippage_notional_usd * 10_000.0)
+        } else {
+            None
+        };
+        let leg_sync_gap_ms = match (min_fill_ts, max_fill_ts) {
+            (Some(min_ts), Some(max_ts)) => Some(max_ts - min_ts),
+            _ => None,
+        };
+        ledger.write_pair_summary(&ExecutionPairSummaryRecord {
+            event: "pair_fill_summary",
+            ts_ms: execution_ledger::now_ms(),
+            trade_id: format!("{}:{}:{}:{}", variant, pair, phase, placed_ts_ms),
+            variant: variant.to_string(),
+            pair: pair.to_string(),
+            phase: phase.to_string(),
+            close_reason: close_reason.map(str::to_string),
+            leg_count: legs.len(),
+            filled_leg_count,
+            notional_usd,
+            gross_execution_slippage_bps,
+            gross_execution_slippage_usd: if slippage_notional_usd > 0.0 {
+                Some(slippage_usd_total)
+            } else {
+                None
+            },
+            leg_sync_gap_ms,
+            overfill_detected,
+            underfill_detected,
+        });
     }
 
     fn update_pending_fills(pending: &mut PendingOrders, fills: &HashMap<String, Decimal>) {
