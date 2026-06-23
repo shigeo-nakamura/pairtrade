@@ -1274,7 +1274,7 @@ impl PairTradeEngine {
         let mut underfill_detected = false;
 
         for leg in legs {
-            let fill_size = Self::filled_for_leg(leg, &status.fills);
+            let (fill_size, capped_fill_size) = Self::ledger_fill_for_leg(leg, &status.fills);
             if fill_size <= Decimal::ZERO {
                 continue;
             }
@@ -1354,7 +1354,7 @@ impl PairTradeEngine {
             };
 
             let leg_overfill = fill_size > leg.target;
-            let leg_underfill = fill_size < leg.target;
+            let leg_underfill = capped_fill_size < leg.target;
             overfill_detected |= leg_overfill;
             underfill_detected |= leg_underfill;
             let snap = price_map.get(&leg.symbol);
@@ -1369,7 +1369,7 @@ impl PairTradeEngine {
                 side: format!("{:?}", leg.side),
                 target_qty: leg.target,
                 filled_qty: fill_size,
-                remaining_qty: (leg.target - fill_size).max(Decimal::ZERO),
+                remaining_qty: (leg.target - capped_fill_size).max(Decimal::ZERO),
                 order_id: leg.order_id.clone(),
                 exchange_order_id: leg.exchange_order_id.clone(),
                 post_only: leg.post_only,
@@ -1449,6 +1449,14 @@ impl PairTradeEngine {
     fn filled_for_leg(leg: &PendingLeg, fills: &HashMap<String, Decimal>) -> Decimal {
         let filled = Self::leg_fill_from_map(leg, fills);
         filled.max(leg.filled).min(leg.target)
+    }
+
+    fn ledger_fill_for_leg(
+        leg: &PendingLeg,
+        fills: &HashMap<String, Decimal>,
+    ) -> (Decimal, Decimal) {
+        let filled = Self::leg_fill_from_map(leg, fills).max(leg.filled);
+        (filled, filled.min(leg.target))
     }
 
     fn filled_by_leg(
@@ -1593,6 +1601,27 @@ mod tests {
         let mut fills = HashMap::new();
         fills.insert("ord-1".to_string(), dec("0.4"));
         assert_eq!(PairTradeEngine::filled_for_leg(&l, &fills), dec("0.6"));
+    }
+
+    #[test]
+    fn ledger_fill_for_leg_keeps_raw_overreport_and_capped_completion() {
+        let l = leg("BTC", "ord-1", "1.0", "0.0");
+        let mut fills = HashMap::new();
+        fills.insert("ord-1".to_string(), dec("1.5"));
+        assert_eq!(
+            PairTradeEngine::ledger_fill_for_leg(&l, &fills),
+            (dec("1.5"), dec("1.0"))
+        );
+    }
+
+    #[test]
+    fn ledger_fill_for_leg_falls_back_to_in_memory_when_map_silent() {
+        let l = leg("BTC", "ord-1", "1.0", "1.0");
+        let fills: HashMap<String, Decimal> = HashMap::new();
+        assert_eq!(
+            PairTradeEngine::ledger_fill_for_leg(&l, &fills),
+            (dec("1.0"), dec("1.0"))
+        );
     }
 
     #[test]
