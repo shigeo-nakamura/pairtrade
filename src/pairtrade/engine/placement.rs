@@ -104,6 +104,18 @@ impl PairTradeEngine {
         kept
     }
 
+    /// Preserve the execution metadata for an already-filled slice while
+    /// shrinking its target to the settled size. Used when cancel+reissue
+    /// splits one original leg into a completed slice plus a fresh
+    /// remainder; ledger attribution still needs the original order mode and
+    /// reference price for the completed slice.
+    fn settled_leg(leg: &PendingLeg, filled: Decimal) -> PendingLeg {
+        let mut settled = leg.clone();
+        settled.target = filled;
+        settled.filled = filled;
+        settled
+    }
+
     /// Derive the effective `(filled, remaining)` for one reissue leg.
     /// On the entry-side path this cross-checks the exchange position
     /// against the local fill state (bot-strategy#470): the
@@ -433,20 +445,10 @@ impl PairTradeEngine {
                         );
                         if filled > Decimal::ZERO {
                             // Preserved record of the already-filled portion
-                            // of the original leg. No new fill expected on
-                            // this entry, so both decision-time fields stay
-                            // None.
-                            new_legs.push(PendingLeg {
-                                symbol: leg.symbol.clone(),
-                                order_id: leg.order_id.clone(),
-                                exchange_order_id: leg.exchange_order_id.clone(),
-                                target: filled,
-                                filled,
-                                side: leg.side,
-                                limit_price: None,
-                                reference_price: None,
-                                post_only: false,
-                            });
+                            // of the original leg. No new fill is expected
+                            // on this entry, but the ledger still needs the
+                            // original placement metadata for attribution.
+                            new_legs.push(Self::settled_leg(leg, filled));
                         }
                         new_legs.push(PendingLeg {
                             symbol: leg.symbol.clone(),
@@ -1323,9 +1325,41 @@ mod tests {
     //! invariant is therefore worth pinning at the unit level
     //! independent of the engine. bot-strategy#396.
     use dex_connector::OrderSide;
+    use rust_decimal::Decimal;
 
-    use super::super::super::state::PositionDirection;
+    use super::super::super::state::{PendingLeg, PositionDirection};
     use super::PairTradeEngine;
+
+    fn dec(v: &str) -> Decimal {
+        v.parse().unwrap()
+    }
+
+    #[test]
+    fn settled_leg_preserves_original_execution_metadata() {
+        let original = PendingLeg {
+            symbol: "BTC".to_string(),
+            order_id: "ord-1".to_string(),
+            exchange_order_id: Some("ex-1".to_string()),
+            target: dec("1.0"),
+            filled: dec("0.25"),
+            side: OrderSide::Short,
+            limit_price: Some(dec("101.25")),
+            reference_price: Some(dec("100.80")),
+            post_only: true,
+        };
+
+        let settled = PairTradeEngine::settled_leg(&original, dec("0.25"));
+
+        assert_eq!(settled.symbol, original.symbol);
+        assert_eq!(settled.order_id, original.order_id);
+        assert_eq!(settled.exchange_order_id, original.exchange_order_id);
+        assert_eq!(settled.target, dec("0.25"));
+        assert_eq!(settled.filled, dec("0.25"));
+        assert_eq!(settled.side, original.side);
+        assert_eq!(settled.limit_price, original.limit_price);
+        assert_eq!(settled.reference_price, original.reference_price);
+        assert_eq!(settled.post_only, original.post_only);
+    }
 
     #[test]
     fn entry_sides_long_spread() {
