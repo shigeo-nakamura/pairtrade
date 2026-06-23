@@ -1235,15 +1235,10 @@ impl PairTradeEngine {
     }
 
     fn execution_order_type(leg: &PendingLeg) -> &'static str {
-        match leg.reference_price {
-            Some(_) => {
-                if leg.limit_price.is_some() {
-                    "post_only"
-                } else {
-                    "taker"
-                }
-            }
-            None => "post_only",
+        if leg.post_only {
+            "post_only"
+        } else {
+            "taker"
         }
     }
 

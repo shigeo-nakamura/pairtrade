@@ -57,6 +57,7 @@ struct DummyConnector {
     modify_calls: Mutex<Vec<ModifyCall>>,
     cancel_order_calls: AtomicUsize,
     modify_should_fail: AtomicBool,
+    reject_priced_orders: AtomicBool,
 }
 
 #[async_trait]
@@ -167,6 +168,9 @@ impl DexConnector for DummyConnector {
             .lock()
             .unwrap()
             .push((symbol.to_string(), size, side, price, reduce_only));
+        if self.reject_priced_orders.load(Ordering::SeqCst) && price.is_some() {
+            return Err(DexError::Transient("priced order rejected".to_string()));
+        }
         Ok(CreateOrderResponse {
             order_id,
             exchange_order_id: None,
@@ -1158,6 +1162,83 @@ async fn reconcile_pending_orders_noop_when_no_pendings() {
     assert!(state.pending_entry.is_none());
     assert!(state.pending_exit.is_none());
     assert!(state.position.is_none());
+}
+
+#[tokio::test]
+async fn close_pair_orders_records_taker_mode_after_post_only_fallback() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.reject_priced_orders.store(true, Ordering::SeqCst);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+    engine.cfg.default_pair_params.exit_post_only_timeout_secs = 30;
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        (
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("100.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: Some(dec("99.0")),
+                ask_price: Some(dec("101.0")),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        ),
+        (
+            "BBB".to_string(),
+            SymbolSnapshot {
+                price: dec("50.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: Some(dec("49.0")),
+                ask_price: Some(dec("51.0")),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        ),
+    ]);
+
+    let (legs, takeover_at) = engine
+        .close_pair_orders(
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+            false,
+        )
+        .await
+        .expect("fallback taker close should succeed");
+
+    assert_eq!(legs.len(), 2);
+    assert!(legs.iter().all(|leg| !leg.post_only));
+    assert!(legs.iter().all(|leg| leg.limit_price.is_none()));
+    assert!(takeover_at.is_none());
+
+    let calls = connector.calls.lock().unwrap();
+    assert!(calls
+        .iter()
+        .any(|(symbol, _, _, price, _)| symbol == "AAA" && price.is_some()));
+    assert!(calls
+        .iter()
+        .any(|(symbol, _, _, price, _)| symbol == "AAA" && price.is_none()));
+    assert!(calls
+        .iter()
+        .any(|(symbol, _, _, price, _)| symbol == "BBB" && price.is_some()));
+    assert!(calls
+        .iter()
+        .any(|(symbol, _, _, price, _)| symbol == "BBB" && price.is_none()));
 }
 
 /// `register_partial_leg_failure` is the bridge from the engine's
