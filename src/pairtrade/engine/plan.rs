@@ -392,16 +392,30 @@ impl PairTradeEngine {
             // Maintenance pre-flatten: the entry-blocker only suppresses Open
             // actions, so a position whose remaining hold (force_close_secs −
             // age) extends past the next maintenance window would otherwise
-            // ride through the venue outage. Variant B's fc=10800s (3h) vs
-            // the 1h entry block leaves a ~2h overlap. We reuse the existing
-            // bool window API; granularity is 1h, so we may close up to ~1h
-            // earlier than strictly required.
+            // ride through the venue outage. We reuse the existing bool window
+            // API; granularity is 1h, so we may close up to ~1h earlier than
+            // strictly required.
+            //
+            // The lookahead is capped at the entry-block horizon (1h, see
+            // gating.rs `maintenance_status(1)`). Without the cap, a fresh
+            // position with a large force_close_secs (variant B is now 21600s
+            // = 6h) queries `is_upcoming_maintenance(6)` and preempt-closes up
+            // to 6h early; since maintenance_preempt is not a stop, only the
+            // generic ~60s cooldown gates re-entry, so the position re-enters
+            // and re-preempts, paying market-taker slippage repeatedly for
+            // hours before a possibly-short window. Capping at 1h aligns the
+            // preempt with the entry block: once inside 1h new entries are
+            // blocked too (no re-entry thrash), and 1h is ample to market-close
+            // before the outage.
             if !force_close_due {
                 if let Some(pos) = &position_state {
                     let position_age = now_ts.saturating_sub(pos.entered_ts).max(0);
                     let remaining_hold = (pp.force_close_secs as i64).saturating_sub(position_age);
                     if remaining_hold > 0 {
-                        let hours_to_check = ((remaining_hold + 3599) / 3600).max(1);
+                        const MAINT_PREEMPT_MAX_LOOKAHEAD_HOURS: i64 = 1;
+                        let hours_to_check = ((remaining_hold + 3599) / 3600)
+                            .max(1)
+                            .min(MAINT_PREEMPT_MAX_LOOKAHEAD_HOURS);
                         if self.connector.is_upcoming_maintenance(hours_to_check).await {
                             log::info!(
                                 "[EXIT_CHECK] {} reason=maintenance_preempt remaining_hold_s={} window_h={}",
