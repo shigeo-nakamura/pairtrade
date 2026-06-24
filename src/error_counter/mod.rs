@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use classification::{
-    is_step_overrun_event, is_step_overrun_recovery_event, is_ws_recovery_event, is_ws_reset_event,
-    is_ws_transient_event,
+    is_non_actionable_warn_event, is_step_overrun_event, is_step_overrun_recovery_event,
+    is_ws_recovery_event, is_ws_reset_event, is_ws_transient_event,
 };
 use deferral::{
     flush_all_expired_pending, PendingEntry, STEP_OVERRUN_DEFER_WINDOW_SECS, WS_DEFER_WINDOW_SECS,
@@ -430,6 +430,9 @@ impl Log for ErrorCountingLogger {
                 } else {
                     msg
                 };
+                if level == Level::Warn && is_non_actionable_warn_event(&truncated) {
+                    return;
+                }
                 let instance = current_instance();
                 if is_ws_transient_event(&truncated) {
                     self.counters
@@ -517,6 +520,9 @@ mod tests {
             return;
         }
         let truncated = msg.to_string();
+        if level == Level::Warn && is_non_actionable_warn_event(&truncated) {
+            return;
+        }
         let instance_owned = instance.map(|s| s.to_string());
         if is_ws_transient_event(&truncated) {
             counters.pending_ws.lock().unwrap().push_back(PendingEntry {
@@ -855,6 +861,36 @@ mod tests {
         assert_eq!(w, 1, "expired Extended transient must commit");
     }
 
+    #[test]
+    fn rate_limit_retry_warn_is_not_counted() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_250_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "fetch_account: HTTP 429 from Lighter (attempt 2/3), retrying after 5000ms",
+        );
+        let (e, w) = snap_counts(&c, t0 + 1);
+        assert_eq!((e, w), (0, 0), "retrying 429 must not page auto-error");
+    }
+
+    #[test]
+    fn ws_bars_lagged_ticks_warn_is_not_counted() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_260_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[WS_BARS] dropped 113 ticks (slow consumer); bucket close may briefly fall back to a polled snapshot",
+        );
+        let (e, w) = snap_counts(&c, t0 + 1);
+        assert_eq!((e, w), (0, 0), "lagged WS ticks must not page auto-error");
+    }
+
     // bot-strategy#267: STEP_OVERRUN warn during normal partial-fill
     // chain must NOT inflate the rolling counter once the matching
     // `[ORDER] ... orders filled` recovery log lands within
@@ -913,6 +949,31 @@ mod tests {
             w, 0,
             "STEP_OVERRUN paired with exit completion must not commit"
         );
+    }
+
+    #[test]
+    fn step_overrun_with_next_metrics_cycle_is_suppressed() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 8_100_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 7.76s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        fake_log(
+            &c,
+            t0 + 60,
+            Level::Info,
+            "[METRICS] BTC/ETH elig=true z=0.09 beta=0.65 hl=0.06h p=0.025",
+        );
+        assert!(
+            c.pending_step_overrun.lock().unwrap().is_empty(),
+            "next healthy metrics cycle must drain pending STEP_OVERRUN"
+        );
+        let (_, w) = snap_counts(&c, t0 + 90);
+        assert_eq!(w, 0, "recovered STEP_OVERRUN must not commit");
     }
 
     #[test]
