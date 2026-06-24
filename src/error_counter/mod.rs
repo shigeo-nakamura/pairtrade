@@ -238,15 +238,6 @@ fn has_recent_non_actionable_warn(counters: &Counters, ts: i64) -> bool {
     recent.iter().any(|&valid_until| valid_until >= ts)
 }
 
-fn drain_step_overrun_near_non_actionable_warn(counters: &Counters, ts: i64) {
-    let cutoff = ts - NON_ACTIONABLE_STEP_ASSOC_GRACE_SECS;
-    counters
-        .pending_step_overrun
-        .lock()
-        .unwrap()
-        .retain(|entry| entry.ts < cutoff);
-}
-
 #[derive(Clone)]
 pub struct ErrorCounterHandle {
     counters: Arc<Counters>,
@@ -478,7 +469,6 @@ impl Log for ErrorCountingLogger {
                     if is_step_overrun_assoc_warn_event(&truncated) {
                         let valid_until = step_assoc_valid_until(&truncated, ts);
                         remember_non_actionable_warn(&self.counters, ts, valid_until);
-                        drain_step_overrun_near_non_actionable_warn(&self.counters, ts);
                     }
                 } else {
                     let instance = current_instance();
@@ -595,7 +585,6 @@ mod tests {
             if is_step_overrun_assoc_warn_event(&truncated) {
                 let valid_until = step_assoc_valid_until(&truncated, ts);
                 remember_non_actionable_warn(counters, ts, valid_until);
-                drain_step_overrun_near_non_actionable_warn(counters, ts);
             }
             return;
         }
@@ -1027,6 +1016,32 @@ mod tests {
         );
         let (_, w) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 30);
         assert_eq!(w, 0, "429-linked STEP_OVERRUN must not page auto-error");
+    }
+
+    #[test]
+    fn step_overrun_before_rate_limit_retry_still_commits_after_deadline() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_325_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 8.01s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Warn,
+            "fetch_account: HTTP 429 from Lighter (attempt 2/3), retrying after 5000ms",
+        );
+        assert_eq!(
+            c.pending_step_overrun.lock().unwrap().len(),
+            1,
+            "later account-retry WARN must not drain a prior STEP_OVERRUN"
+        );
+        let (_, w) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 30);
+        assert_eq!(w, 1, "later 429 retry must not hide a prior slow step");
     }
 
     #[test]
