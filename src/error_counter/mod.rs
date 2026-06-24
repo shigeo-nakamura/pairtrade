@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use classification::{
-    is_step_overrun_event, is_step_overrun_recovery_event, is_ws_recovery_event, is_ws_reset_event,
-    is_ws_transient_event,
+    is_non_actionable_warn_event, is_step_overrun_assoc_warn_event, is_step_overrun_event,
+    is_step_overrun_recovery_event, is_ws_recovery_event, is_ws_reset_event, is_ws_transient_event,
 };
 use deferral::{
     flush_all_expired_pending, PendingEntry, STEP_OVERRUN_DEFER_WINDOW_SECS, WS_DEFER_WINDOW_SECS,
@@ -121,6 +121,8 @@ const WS_RESET_24H_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// dashboard can display it without blowing up the JSON payload.
 const LAST_ERROR_MAX_CHARS: usize = 200;
 
+const NON_ACTIONABLE_STEP_ASSOC_GRACE_SECS: i64 = 60;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorSummary {
     pub error_count_30m: u64,
@@ -176,6 +178,11 @@ struct Counters {
     /// `[ORDER] ... entry/exit orders filled` recovery markers within
     /// `STEP_OVERRUN_DEFER_WINDOW_SECS`. See bot-strategy#267.
     pending_step_overrun: Mutex<VecDeque<PendingEntry>>,
+    // Recent non-actionable WARN valid-until timestamps that can explain a nearby
+    // STEP_OVERRUN, such as Lighter account 429 retry. Downstream WS_BARS
+    // lag warnings are intentionally excluded because a slow step can cause them
+    // on the next receiver poll.
+    recent_non_actionable_warns: Mutex<VecDeque<i64>>,
     /// Timestamps (epoch seconds) of WS reset events in the last 24h —
     /// any log line matching `classification::is_ws_reset_event`
     /// (Extended SDK's `Connection reset without closing handshake` plus
@@ -194,6 +201,7 @@ impl Counters {
             buckets: Mutex::new(HashMap::new()),
             pending_ws: Mutex::new(VecDeque::new()),
             pending_step_overrun: Mutex::new(VecDeque::new()),
+            recent_non_actionable_warns: Mutex::new(VecDeque::new()),
             ws_resets_24h: Mutex::new(VecDeque::new()),
         }
     }
@@ -203,6 +211,31 @@ impl Counters {
         let mut map = self.buckets.lock().unwrap();
         Arc::clone(map.entry(key).or_insert_with(|| Arc::new(Bucket::new())))
     }
+}
+
+fn step_assoc_valid_until(msg: &str, ts: i64) -> i64 {
+    ts + retry_after_secs(msg).unwrap_or(0) + NON_ACTIONABLE_STEP_ASSOC_GRACE_SECS
+}
+
+fn retry_after_secs(msg: &str) -> Option<i64> {
+    let marker = "retrying after ";
+    let start = msg.find(marker)? + marker.len();
+    let rest = &msg[start..];
+    let end = rest.find("ms")?;
+    let ms: i64 = rest[..end].trim().parse().ok()?;
+    Some((ms + 999) / 1000)
+}
+
+fn remember_non_actionable_warn(counters: &Counters, ts: i64, valid_until_ts: i64) {
+    let mut recent = counters.recent_non_actionable_warns.lock().unwrap();
+    recent.retain(|&until| until >= ts);
+    recent.push_back(valid_until_ts);
+}
+
+fn has_recent_non_actionable_warn(counters: &Counters, ts: i64) -> bool {
+    let mut recent = counters.recent_non_actionable_warns.lock().unwrap();
+    recent.retain(|&until| until >= ts);
+    recent.iter().any(|&valid_until| valid_until >= ts)
 }
 
 #[derive(Clone)]
@@ -430,31 +463,42 @@ impl Log for ErrorCountingLogger {
                 } else {
                     msg
                 };
-                let instance = current_instance();
-                if is_ws_transient_event(&truncated) {
-                    self.counters
-                        .pending_ws
-                        .lock()
-                        .unwrap()
-                        .push_back(PendingEntry {
-                            ts,
-                            level,
-                            message: truncated,
-                            instance,
-                        });
-                } else if is_step_overrun_event(&truncated) {
-                    self.counters
-                        .pending_step_overrun
-                        .lock()
-                        .unwrap()
-                        .push_back(PendingEntry {
-                            ts,
-                            level,
-                            message: truncated,
-                            instance,
-                        });
+                let non_actionable_warn =
+                    level == Level::Warn && is_non_actionable_warn_event(&truncated);
+                if non_actionable_warn {
+                    if is_step_overrun_assoc_warn_event(&truncated) {
+                        let valid_until = step_assoc_valid_until(&truncated, ts);
+                        remember_non_actionable_warn(&self.counters, ts, valid_until);
+                    }
                 } else {
-                    commit_to_bucket(&self.counters, instance.as_deref(), ts, level, truncated);
+                    let instance = current_instance();
+                    if is_ws_transient_event(&truncated) {
+                        self.counters
+                            .pending_ws
+                            .lock()
+                            .unwrap()
+                            .push_back(PendingEntry {
+                                ts,
+                                level,
+                                message: truncated,
+                                instance,
+                            });
+                    } else if is_step_overrun_event(&truncated) {
+                        if !has_recent_non_actionable_warn(&self.counters, ts) {
+                            self.counters
+                                .pending_step_overrun
+                                .lock()
+                                .unwrap()
+                                .push_back(PendingEntry {
+                                    ts,
+                                    level,
+                                    message: truncated,
+                                    instance,
+                                });
+                        }
+                    } else {
+                        commit_to_bucket(&self.counters, instance.as_deref(), ts, level, truncated);
+                    }
                 }
             }
         }
@@ -470,6 +514,25 @@ impl Log for ErrorCountingLogger {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    struct CapturingLogger {
+        records: Arc<StdMutex<Vec<(Level, String)>>>,
+    }
+
+    impl Log for CapturingLogger {
+        fn enabled(&self, _metadata: &Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &Record) {
+            self.records
+                .lock()
+                .unwrap()
+                .push((record.level(), record.args().to_string()));
+        }
+
+        fn flush(&self) {}
+    }
 
     fn make_counters() -> Arc<Counters> {
         Arc::new(Counters::new())
@@ -517,6 +580,14 @@ mod tests {
             return;
         }
         let truncated = msg.to_string();
+        let non_actionable_warn = level == Level::Warn && is_non_actionable_warn_event(&truncated);
+        if non_actionable_warn {
+            if is_step_overrun_assoc_warn_event(&truncated) {
+                let valid_until = step_assoc_valid_until(&truncated, ts);
+                remember_non_actionable_warn(counters, ts, valid_until);
+            }
+            return;
+        }
         let instance_owned = instance.map(|s| s.to_string());
         if is_ws_transient_event(&truncated) {
             counters.pending_ws.lock().unwrap().push_back(PendingEntry {
@@ -526,16 +597,18 @@ mod tests {
                 instance: instance_owned,
             });
         } else if is_step_overrun_event(&truncated) {
-            counters
-                .pending_step_overrun
-                .lock()
-                .unwrap()
-                .push_back(PendingEntry {
-                    ts,
-                    level,
-                    message: truncated,
-                    instance: instance_owned,
-                });
+            if !has_recent_non_actionable_warn(counters, ts) {
+                counters
+                    .pending_step_overrun
+                    .lock()
+                    .unwrap()
+                    .push_back(PendingEntry {
+                        ts,
+                        level,
+                        message: truncated,
+                        instance: instance_owned,
+                    });
+            }
         } else {
             commit_to_bucket(counters, instance, ts, level, truncated);
         }
@@ -855,6 +928,176 @@ mod tests {
         assert_eq!(w, 1, "expired Extended transient must commit");
     }
 
+    #[test]
+    fn rate_limit_retry_warn_is_not_counted() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_250_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "fetch_account: HTTP 429 from Lighter (attempt 2/3), retrying after 5000ms",
+        );
+        let (e, w) = snap_counts(&c, t0 + 1);
+        assert_eq!((e, w), (0, 0), "retrying 429 must not page auto-error");
+    }
+
+    #[test]
+    fn ws_bars_lagged_ticks_warn_is_not_counted() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_260_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[WS_BARS] dropped 113 ticks (slow consumer); bucket close may briefly fall back to a polled snapshot",
+        );
+        let (e, w) = snap_counts(&c, t0 + 1);
+        assert_eq!((e, w), (0, 0), "lagged WS ticks must not page auto-error");
+    }
+
+    #[test]
+    fn non_actionable_warn_is_forwarded_to_inner_logger() {
+        let _g = _serialize();
+        set_counting_suppressed(false);
+        let records = Arc::new(StdMutex::new(Vec::new()));
+        let inner = CapturingLogger {
+            records: Arc::clone(&records),
+        };
+        let (logger, handle) = ErrorCountingLogger::wrap(Box::new(inner));
+        let args = format_args!(
+            "fetch_account: HTTP 429 from Lighter (attempt 2/3), retrying after 5000ms"
+        );
+        let record = Record::builder()
+            .args(args)
+            .level(Level::Warn)
+            .target("pairtrade::error_counter::test")
+            .build();
+
+        logger.log(&record);
+
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            (snapshot.error_count_30m, snapshot.warn_count_30m),
+            (0, 0),
+            "retrying 429 must not page auto-error"
+        );
+        let captured = records.lock().unwrap();
+        assert_eq!(captured.len(), 1, "warn must still reach the inner logger");
+        assert_eq!(captured[0].0, Level::Warn);
+        assert!(captured[0].1.contains("HTTP 429 from Lighter"));
+    }
+
+    // bot-strategy#619/#620: account 429 retry and WS_BARS slow-consumer
+    // notices are visible in journalctl but do not page error_summary.
+
+    #[test]
+    fn step_overrun_after_rate_limit_retry_is_not_counted() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_300_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "fetch_account: HTTP 429 from Lighter (attempt 2/3), retrying after 5000ms",
+        );
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 7.76s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        assert!(
+            c.pending_step_overrun.lock().unwrap().is_empty(),
+            "STEP_OVERRUN near account-retry WARN should not enter pending queue"
+        );
+        let (_, w) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 30);
+        assert_eq!(w, 0, "429-linked STEP_OVERRUN must not page auto-error");
+    }
+
+    #[test]
+    fn step_overrun_before_rate_limit_retry_still_commits_after_deadline() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_325_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 8.01s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Warn,
+            "fetch_account: HTTP 429 from Lighter (attempt 2/3), retrying after 5000ms",
+        );
+        assert_eq!(
+            c.pending_step_overrun.lock().unwrap().len(),
+            1,
+            "later account-retry WARN must not drain a prior STEP_OVERRUN"
+        );
+        let (_, w) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 30);
+        assert_eq!(w, 1, "later 429 retry must not hide a prior slow step");
+    }
+
+    #[test]
+    fn step_overrun_after_long_rate_limit_retry_is_not_counted() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_350_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "fetch_account: HTTP 429 from Lighter (attempt 2/3), retrying after 75000ms",
+        );
+        fake_log(
+            &c,
+            t0 + 75,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 75.10s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        assert!(
+            c.pending_step_overrun.lock().unwrap().is_empty(),
+            "STEP_OVERRUN after long account-retry sleep should not enter pending queue"
+        );
+        let (_, w) = snap_counts(&c, t0 + 75 + STEP_OVERRUN_DEFER_WINDOW_SECS + 30);
+        assert_eq!(
+            w, 0,
+            "long 429-linked STEP_OVERRUN must not page auto-error"
+        );
+    }
+
+    #[test]
+    fn step_overrun_before_ws_bars_lagged_ticks_still_commits_after_deadline() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_400_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 8.01s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        fake_log(
+            &c,
+            t0 + 5,
+            Level::Warn,
+            "[WS_BARS] dropped 113 ticks (slow consumer); bucket close may briefly fall back to a polled snapshot",
+        );
+        assert_eq!(
+            c.pending_step_overrun.lock().unwrap().len(),
+            1,
+            "WS_BARS slow-consumer WARN must not drain pending STEP_OVERRUN"
+        );
+        let (_, w) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 30);
+        assert_eq!(w, 1, "WS_BARS must not hide a slow step overrun");
+    }
+
     // bot-strategy#267: STEP_OVERRUN warn during normal partial-fill
     // chain must NOT inflate the rolling counter once the matching
     // `[ORDER] ... orders filled` recovery log lands within
@@ -913,6 +1156,32 @@ mod tests {
             w, 0,
             "STEP_OVERRUN paired with exit completion must not commit"
         );
+    }
+
+    #[test]
+    fn step_overrun_with_next_metrics_cycle_still_commits_after_deadline() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 8_100_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 7.76s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        fake_log(
+            &c,
+            t0 + 60,
+            Level::Info,
+            "[METRICS] BTC/ETH elig=true z=0.09 beta=0.65 hl=0.06h p=0.025",
+        );
+        assert_eq!(
+            c.pending_step_overrun.lock().unwrap().len(),
+            1,
+            "routine metrics must not drain pending STEP_OVERRUN"
+        );
+        let (_, w) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 10);
+        assert_eq!(w, 1, "routine metrics must not hide recurring slow steps");
     }
 
     #[test]
