@@ -67,7 +67,12 @@ class TradeRow:
 
     @property
     def bot_pnl_missing(self) -> bool:
-        return self.pnl_available is False or "bot pnl unavailable" in self.gaps.lower()
+        gaps = self.gaps.lower()
+        return (
+            self.pnl_available is False
+            or "bot pnl unavailable" in gaps
+            or "bot pnl jsonl unmatched" in gaps
+        )
 
 
 def parse_decimal(raw: object) -> Decimal | None:
@@ -275,7 +280,7 @@ def feature_matrix(rows: list[TradeRow]) -> list[dict[str, object]]:
         by("partial markers present", lambda row: row.partial_marker_count > 0),
         by("reissue markers present", lambda row: row.reissue_marker_count > 0),
         by("amend markers present", lambda row: row.amend_marker_count > 0),
-        by("bot pnl unavailable", lambda row: row.bot_pnl_missing),
+        by("bot pnl missing/unmatched", lambda row: row.bot_pnl_missing),
         by("abs(entry_z) >= 3.0", lambda row: row.entry_z is not None and abs(row.entry_z) >= Decimal("3.0")),
         by("abs(entry_z) >= 3.5", lambda row: row.entry_z is not None and abs(row.entry_z) >= Decimal("3.5")),
         by("abs(entry_z) >= 4.0", lambda row: row.entry_z is not None and abs(row.entry_z) >= Decimal("4.0")),
