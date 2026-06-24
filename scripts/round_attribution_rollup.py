@@ -277,7 +277,11 @@ def feature_matrix(rows: list[TradeRow]) -> list[dict[str, object]]:
         by("close_reason=ineligible", lambda row: row.close_reason == "ineligible"),
         by("close_reason=stop_loss_z", lambda row: row.close_reason == "stop_loss_z"),
         by("close_reason=exit_z", lambda row: row.close_reason == "exit_z"),
-        by("partial markers present", lambda row: row.partial_marker_count > 0),
+        by("close_reason=partial_fill", lambda row: row.close_reason == "partial_fill"),
+        by(
+            "partial fill (marker or reason)",
+            lambda row: row.partial_marker_count > 0 or row.close_reason == "partial_fill",
+        ),
         by("reissue markers present", lambda row: row.reissue_marker_count > 0),
         by("amend markers present", lambda row: row.amend_marker_count > 0),
         by("bot pnl missing/unmatched", lambda row: row.bot_pnl_missing),
