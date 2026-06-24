@@ -61,11 +61,8 @@ pub(super) fn is_step_overrun_event(msg: &str) -> bool {
 }
 
 /// Match log lines that drain pending STEP_OVERRUN entries. A successful
-/// trade completion or next healthy strategy-loop marker within the defer
-/// window is taken as proof the slow step() was transient, not a stuck loop.
+/// trade completion within the defer window is taken as proof the slow
+/// step() was waiting on order management, not a stuck loop.
 pub(super) fn is_step_overrun_recovery_event(msg: &str) -> bool {
-    msg.contains("entry orders filled")
-        || msg.contains("exit orders filled")
-        || msg.contains("[ZCHECK]")
-        || msg.contains("[METRICS]")
+    msg.contains("entry orders filled") || msg.contains("exit orders filled")
 }
