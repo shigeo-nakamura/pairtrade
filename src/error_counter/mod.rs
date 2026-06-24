@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use classification::{
-    is_non_actionable_warn_event, is_step_overrun_event, is_step_overrun_recovery_event,
-    is_ws_recovery_event, is_ws_reset_event, is_ws_transient_event,
+    is_non_actionable_warn_event, is_step_overrun_assoc_warn_event, is_step_overrun_event,
+    is_step_overrun_recovery_event, is_ws_recovery_event, is_ws_reset_event, is_ws_transient_event,
 };
 use deferral::{
     flush_all_expired_pending, PendingEntry, STEP_OVERRUN_DEFER_WINDOW_SECS, WS_DEFER_WINDOW_SECS,
@@ -178,9 +178,10 @@ struct Counters {
     /// `[ORDER] ... entry/exit orders filled` recovery markers within
     /// `STEP_OVERRUN_DEFER_WINDOW_SECS`. See bot-strategy#267.
     pending_step_overrun: Mutex<VecDeque<PendingEntry>>,
-    // Recent non-actionable WARN timestamps (for example Lighter account
-    // 429 retry or WS_BARS slow-consumer notices) used to suppress only
-    // nearby STEP_OVERRUN warns from the same transient cycle.
+    // Recent non-actionable WARN timestamps that can explain a nearby
+    // STEP_OVERRUN, such as Lighter account 429 retry. Downstream WS_BARS
+    // lag warnings are intentionally excluded because a slow step can cause them
+    // on the next receiver poll.
     recent_non_actionable_warns: Mutex<VecDeque<i64>>,
     /// Timestamps (epoch seconds) of WS reset events in the last 24h —
     /// any log line matching `classification::is_ws_reset_event`
@@ -475,8 +476,10 @@ impl Log for ErrorCountingLogger {
                 let non_actionable_warn =
                     level == Level::Warn && is_non_actionable_warn_event(&truncated);
                 if non_actionable_warn {
-                    remember_non_actionable_warn(&self.counters, ts);
-                    drain_step_overrun_near_non_actionable_warn(&self.counters, ts);
+                    if is_step_overrun_assoc_warn_event(&truncated) {
+                        remember_non_actionable_warn(&self.counters, ts);
+                        drain_step_overrun_near_non_actionable_warn(&self.counters, ts);
+                    }
                 } else {
                     let instance = current_instance();
                     if is_ws_transient_event(&truncated) {
@@ -589,8 +592,10 @@ mod tests {
         let truncated = msg.to_string();
         let non_actionable_warn = level == Level::Warn && is_non_actionable_warn_event(&truncated);
         if non_actionable_warn {
-            remember_non_actionable_warn(counters, ts);
-            drain_step_overrun_near_non_actionable_warn(counters, ts);
+            if is_step_overrun_assoc_warn_event(&truncated) {
+                remember_non_actionable_warn(counters, ts);
+                drain_step_overrun_near_non_actionable_warn(counters, ts);
+            }
             return;
         }
         let instance_owned = instance.map(|s| s.to_string());
@@ -1024,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn step_overrun_before_ws_bars_lagged_ticks_is_not_counted() {
+    fn step_overrun_before_ws_bars_lagged_ticks_still_commits_after_deadline() {
         let _g = _serialize();
         let c = make_counters();
         let t0 = 6_400_000;
@@ -1040,12 +1045,13 @@ mod tests {
             Level::Warn,
             "[WS_BARS] dropped 113 ticks (slow consumer); bucket close may briefly fall back to a polled snapshot",
         );
-        assert!(
-            c.pending_step_overrun.lock().unwrap().is_empty(),
-            "nearby WS_BARS slow-consumer WARN should drain pending STEP_OVERRUN"
+        assert_eq!(
+            c.pending_step_overrun.lock().unwrap().len(),
+            1,
+            "WS_BARS slow-consumer WARN must not drain pending STEP_OVERRUN"
         );
         let (_, w) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 30);
-        assert_eq!(w, 0, "WS_BARS-linked STEP_OVERRUN must not page auto-error");
+        assert_eq!(w, 1, "WS_BARS must not hide a slow step overrun");
     }
 
     // bot-strategy#267: STEP_OVERRUN warn during normal partial-fill

@@ -39,8 +39,15 @@ pub(super) fn is_ws_transient_event(msg: &str) -> bool {
 /// retry or a temporary fallback whose final failure path logs a separate,
 /// actionable WARN/ERROR if recovery does not happen.
 pub(super) fn is_non_actionable_warn_event(msg: &str) -> bool {
-    (msg.starts_with("fetch_account: HTTP 429 from Lighter") && msg.contains("retrying after"))
+    is_step_overrun_assoc_warn_event(msg)
         || (msg.starts_with("[WS_BARS] dropped ") && msg.contains("slow consumer"))
+}
+
+/// Match non-actionable WARNs that can explain a nearby STEP_OVERRUN.
+/// Do not include downstream slow-consumer notices: a slow step can
+/// itself cause a WS_BARS dropped-ticks warning on the next receiver poll.
+pub(super) fn is_step_overrun_assoc_warn_event(msg: &str) -> bool {
+    msg.starts_with("fetch_account: HTTP 429 from Lighter") && msg.contains("retrying after")
 }
 
 /// Match log lines that signal a successful WS reconnect. Drains pending
