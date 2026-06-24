@@ -121,7 +121,7 @@ const WS_RESET_24H_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// dashboard can display it without blowing up the JSON payload.
 const LAST_ERROR_MAX_CHARS: usize = 200;
 
-const NON_ACTIONABLE_STEP_ASSOC_WINDOW_SECS: i64 = 60;
+const NON_ACTIONABLE_STEP_ASSOC_GRACE_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorSummary {
@@ -178,7 +178,7 @@ struct Counters {
     /// `[ORDER] ... entry/exit orders filled` recovery markers within
     /// `STEP_OVERRUN_DEFER_WINDOW_SECS`. See bot-strategy#267.
     pending_step_overrun: Mutex<VecDeque<PendingEntry>>,
-    // Recent non-actionable WARN timestamps that can explain a nearby
+    // Recent non-actionable WARN valid-until timestamps that can explain a nearby
     // STEP_OVERRUN, such as Lighter account 429 retry. Downstream WS_BARS
     // lag warnings are intentionally excluded because a slow step can cause them
     // on the next receiver poll.
@@ -213,34 +213,33 @@ impl Counters {
     }
 }
 
-fn remember_non_actionable_warn(counters: &Counters, ts: i64) {
-    let cutoff = ts - NON_ACTIONABLE_STEP_ASSOC_WINDOW_SECS;
+fn step_assoc_valid_until(msg: &str, ts: i64) -> i64 {
+    ts + retry_after_secs(msg).unwrap_or(0) + NON_ACTIONABLE_STEP_ASSOC_GRACE_SECS
+}
+
+fn retry_after_secs(msg: &str) -> Option<i64> {
+    let marker = "retrying after ";
+    let start = msg.find(marker)? + marker.len();
+    let rest = &msg[start..];
+    let end = rest.find("ms")?;
+    let ms: i64 = rest[..end].trim().parse().ok()?;
+    Some((ms + 999) / 1000)
+}
+
+fn remember_non_actionable_warn(counters: &Counters, ts: i64, valid_until_ts: i64) {
     let mut recent = counters.recent_non_actionable_warns.lock().unwrap();
-    while let Some(&front) = recent.front() {
-        if front < cutoff {
-            recent.pop_front();
-        } else {
-            break;
-        }
-    }
-    recent.push_back(ts);
+    recent.retain(|&until| until >= ts);
+    recent.push_back(valid_until_ts);
 }
 
 fn has_recent_non_actionable_warn(counters: &Counters, ts: i64) -> bool {
-    let cutoff = ts - NON_ACTIONABLE_STEP_ASSOC_WINDOW_SECS;
     let mut recent = counters.recent_non_actionable_warns.lock().unwrap();
-    while let Some(&front) = recent.front() {
-        if front < cutoff {
-            recent.pop_front();
-        } else {
-            break;
-        }
-    }
-    recent.iter().any(|&marker_ts| marker_ts <= ts)
+    recent.retain(|&until| until >= ts);
+    recent.iter().any(|&valid_until| valid_until >= ts)
 }
 
 fn drain_step_overrun_near_non_actionable_warn(counters: &Counters, ts: i64) {
-    let cutoff = ts - NON_ACTIONABLE_STEP_ASSOC_WINDOW_SECS;
+    let cutoff = ts - NON_ACTIONABLE_STEP_ASSOC_GRACE_SECS;
     counters
         .pending_step_overrun
         .lock()
@@ -477,7 +476,8 @@ impl Log for ErrorCountingLogger {
                     level == Level::Warn && is_non_actionable_warn_event(&truncated);
                 if non_actionable_warn {
                     if is_step_overrun_assoc_warn_event(&truncated) {
-                        remember_non_actionable_warn(&self.counters, ts);
+                        let valid_until = step_assoc_valid_until(&truncated, ts);
+                        remember_non_actionable_warn(&self.counters, ts, valid_until);
                         drain_step_overrun_near_non_actionable_warn(&self.counters, ts);
                     }
                 } else {
@@ -593,7 +593,8 @@ mod tests {
         let non_actionable_warn = level == Level::Warn && is_non_actionable_warn_event(&truncated);
         if non_actionable_warn {
             if is_step_overrun_assoc_warn_event(&truncated) {
-                remember_non_actionable_warn(counters, ts);
+                let valid_until = step_assoc_valid_until(&truncated, ts);
+                remember_non_actionable_warn(counters, ts, valid_until);
                 drain_step_overrun_near_non_actionable_warn(counters, ts);
             }
             return;
@@ -1026,6 +1027,34 @@ mod tests {
         );
         let (_, w) = snap_counts(&c, t0 + STEP_OVERRUN_DEFER_WINDOW_SECS + 30);
         assert_eq!(w, 0, "429-linked STEP_OVERRUN must not page auto-error");
+    }
+
+    #[test]
+    fn step_overrun_after_long_rate_limit_retry_is_not_counted() {
+        let _g = _serialize();
+        let c = make_counters();
+        let t0 = 6_350_000;
+        fake_log(
+            &c,
+            t0,
+            Level::Warn,
+            "fetch_account: HTTP 429 from Lighter (attempt 2/3), retrying after 75000ms",
+        );
+        fake_log(
+            &c,
+            t0 + 75,
+            Level::Warn,
+            "[STEP_OVERRUN] step() took 75.10s >= 7.50s (1.5x interval_secs=5); wall-clock tick skipped",
+        );
+        assert!(
+            c.pending_step_overrun.lock().unwrap().is_empty(),
+            "STEP_OVERRUN after long account-retry sleep should not enter pending queue"
+        );
+        let (_, w) = snap_counts(&c, t0 + 75 + STEP_OVERRUN_DEFER_WINDOW_SECS + 30);
+        assert_eq!(
+            w, 0,
+            "long 429-linked STEP_OVERRUN must not page auto-error"
+        );
     }
 
     #[test]
