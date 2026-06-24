@@ -2,6 +2,18 @@
 
 This runbook turns a pairtrade round readout into a repeatable attribution packet. It is diagnostic only: no YAML change, restart, or live config mutation belongs in this workflow.
 
+## Readout Checklist
+
+Work top to bottom; the preflight is a hard gate before any A/B/C scoring.
+
+- [ ] **Config-drift preflight passes** — `scripts/check_config_drift.sh --round-json configs/pairtrade/round.json` exits 0 (running effective config == round expectation). Stop the readout on drift.
+- [ ] **DEX realised PnL by variant** — per-variant `live_trade_attribution.py --csv-out` from DEX accounting exports, rolled up by `round_attribution_rollup.py`. The score is realised DEX PnL, not modeled JSONL/bot PnL.
+- [ ] **Concentration + feature buckets** — rollup includes worst UTC day, weekly PnL concentration, and the cross-variant feature-bucket matrix (loss recall / win-kill).
+- [ ] **Execution-artifact separation** — any A/B/C decision explicitly separates strategy signal from execution artifacts; attach the #613 execution-ledger report when it covers the window, otherwise record the missing-ledger caveat.
+- [ ] **#510 blocker statement** — update bot-strategy#510 with the current top 1-2 blockers and follow-up issue mapping, supported by the packet or an explicit caveat.
+
+The sections below detail each step.
+
 ## Inputs
 
 - Per-variant DEX accounting exports for the readout window.
