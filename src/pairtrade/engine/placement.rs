@@ -59,6 +59,12 @@ struct PostOnlyOrderRequest<'a> {
     fallback_to_taker: bool,
 }
 
+struct PostOnlyOrderResult {
+    response: dex_connector::CreateOrderResponse,
+    post_only: bool,
+    limit_price: Option<Decimal>,
+}
+
 /// Per-leg inputs for `place_or_amend_reissue_leg`, grouped so the amend /
 /// cancel+reissue decision can live in one named helper without widening
 /// its argument list past the clippy boundary (bot-strategy#502).
@@ -96,6 +102,18 @@ impl PairTradeEngine {
         let mut kept = leg.clone();
         kept.filled = filled;
         kept
+    }
+
+    /// Preserve the execution metadata for an already-filled slice while
+    /// shrinking its target to the settled size. Used when cancel+reissue
+    /// splits one original leg into a completed slice plus a fresh
+    /// remainder; ledger attribution still needs the original order mode and
+    /// reference price for the completed slice.
+    fn settled_leg(leg: &PendingLeg, filled: Decimal) -> PendingLeg {
+        let mut settled = leg.clone();
+        settled.target = filled;
+        settled.filled = filled;
+        settled
     }
 
     /// Derive the effective `(filled, remaining)` for one reissue leg.
@@ -427,20 +445,10 @@ impl PairTradeEngine {
                         );
                         if filled > Decimal::ZERO {
                             // Preserved record of the already-filled portion
-                            // of the original leg. No new fill expected on
-                            // this entry, so both decision-time fields stay
-                            // None.
-                            new_legs.push(PendingLeg {
-                                symbol: leg.symbol.clone(),
-                                order_id: leg.order_id.clone(),
-                                exchange_order_id: leg.exchange_order_id.clone(),
-                                target: filled,
-                                filled,
-                                side: leg.side,
-                                limit_price: None,
-                                reference_price: None,
-                                post_only: false,
-                            });
+                            // of the original leg. No new fill is expected
+                            // on this entry, but the ledger still needs the
+                            // original placement metadata for attribution.
+                            new_legs.push(Self::settled_leg(leg, filled));
                         }
                         new_legs.push(PendingLeg {
                             symbol: leg.symbol.clone(),
@@ -585,7 +593,7 @@ impl PairTradeEngine {
     async fn create_order_with_post_only_retry(
         &mut self,
         request: PostOnlyOrderRequest<'_>,
-    ) -> Result<dex_connector::CreateOrderResponse, DexError> {
+    ) -> Result<PostOnlyOrderResult, DexError> {
         let PostOnlyOrderRequest {
             symbol,
             size,
@@ -624,7 +632,13 @@ impl PairTradeEngine {
                 .create_order(symbol, size, side, limit, spread, reduce_only, None)
                 .await
             {
-                Ok(resp) => return Ok(resp),
+                Ok(response) => {
+                    return Ok(PostOnlyOrderResult {
+                        response,
+                        post_only: use_post_only,
+                        limit_price: limit,
+                    });
+                }
                 Err(err) => {
                     if !use_post_only {
                         return Err(err);
@@ -678,7 +692,12 @@ impl PairTradeEngine {
             return self
                 .connector
                 .create_order(symbol, size, side, None, None, reduce_only, None)
-                .await;
+                .await
+                .map(|response| PostOnlyOrderResult {
+                    response,
+                    post_only: false,
+                    limit_price: None,
+                });
         }
 
         Err(last_err)
@@ -825,32 +844,29 @@ impl PairTradeEngine {
             })
             .await
             .context("place leg A")?;
-        let target_a = if res_a.ordered_size > Decimal::ZERO {
-            if res_a.ordered_size != qtys.0 {
+        let target_a = if res_a.response.ordered_size > Decimal::ZERO {
+            if res_a.response.ordered_size != qtys.0 {
                 log::debug!(
                     "[ORDER_PARAMS][ENTRY] size adjusted by exchange for {}: requested={} ordered={}",
                     pair.base,
                     qtys.0,
-                    res_a.ordered_size
+                    res_a.response.ordered_size
                 );
             }
-            res_a.ordered_size
+            res_a.response.ordered_size
         } else {
             qtys.0
         };
         legs.push(PendingLeg {
             symbol: pair.base.clone(),
-            order_id: res_a.order_id.clone(),
-            exchange_order_id: res_a.exchange_order_id.clone(),
+            order_id: res_a.response.order_id.clone(),
+            exchange_order_id: res_a.response.exchange_order_id.clone(),
             target: target_a,
             filled: Decimal::ZERO,
             side: side_a,
-            limit_price: limit_a,
+            limit_price: res_a.limit_price,
             reference_price: ref_price_a,
-            // Entry legs place with fallback_to_taker=false, so the helper's
-            // use_post_only (= allow_post_only && should_post_only()) is the
-            // flag the order actually rests with.
-            post_only,
+            post_only: res_a.post_only,
         });
 
         let res_b = match self
@@ -868,34 +884,34 @@ impl PairTradeEngine {
         {
             Ok(res) => res,
             Err(e) => {
-                self.recover_from_leg_b_failure(pair, &res_a, side_a, &e)
+                self.recover_from_leg_b_failure(pair, &res_a.response, side_a, &e)
                     .await;
                 return Err(PartialOrderPlacementError::new(legs.clone(), e).into());
             }
         };
-        let target_b = if res_b.ordered_size > Decimal::ZERO {
-            if res_b.ordered_size != qtys.1 {
+        let target_b = if res_b.response.ordered_size > Decimal::ZERO {
+            if res_b.response.ordered_size != qtys.1 {
                 log::debug!(
                     "[ORDER_PARAMS][ENTRY] size adjusted by exchange for {}: requested={} ordered={}",
                     pair.quote,
                     qtys.1,
-                    res_b.ordered_size
+                    res_b.response.ordered_size
                 );
             }
-            res_b.ordered_size
+            res_b.response.ordered_size
         } else {
             qtys.1
         };
         legs.push(PendingLeg {
             symbol: pair.quote.clone(),
-            order_id: res_b.order_id.clone(),
-            exchange_order_id: res_b.exchange_order_id.clone(),
+            order_id: res_b.response.order_id.clone(),
+            exchange_order_id: res_b.response.exchange_order_id.clone(),
             target: target_b,
             filled: Decimal::ZERO,
             side: side_b,
-            limit_price: limit_b,
+            limit_price: res_b.limit_price,
             reference_price: ref_price_b,
-            post_only,
+            post_only: res_b.post_only,
         });
         Ok(legs)
     }
@@ -1077,6 +1093,11 @@ impl PairTradeEngine {
                 self.connector
                     .create_order(&pair.base, qty_a, side_a, None, None, true, None)
                     .await
+                    .map(|response| PostOnlyOrderResult {
+                        response,
+                        post_only: false,
+                        limit_price: None,
+                    })
             } else {
                 self.create_order_with_post_only_retry(PostOnlyOrderRequest {
                     symbol: &pair.base,
@@ -1092,36 +1113,28 @@ impl PairTradeEngine {
             };
             match res {
                 Ok(res) => {
-                    if res.ordered_size > Decimal::ZERO && res.ordered_size != qty_a {
+                    if res.response.ordered_size > Decimal::ZERO
+                        && res.response.ordered_size != qty_a
+                    {
                         log::debug!(
                             "[ORDER_PARAMS][EXIT] size adjusted by exchange for {}: requested={} ordered={}",
                             pair.base,
                             qty_a,
-                            res.ordered_size
+                            res.response.ordered_size
                         );
                     }
                     legs.push(PendingLeg {
                         symbol: pair.base.clone(),
-                        order_id: res.order_id.clone(),
-                        exchange_order_id: res.exchange_order_id.clone(),
+                        order_id: res.response.order_id.clone(),
+                        exchange_order_id: res.response.exchange_order_id.clone(),
                         target: qty_a,
                         filled: Decimal::ZERO,
                         side: side_a,
-                        // limit_price was previously hardcoded to None
-                        // for exit legs even on the post-only path,
-                        // which silently disabled exit-side slippage
-                        // observation in Group 4-B. Carry through the
-                        // actual posted limit so the order_type tag
-                        // resolves correctly (#314 Group 4-B-2).
-                        limit_price: limit_a,
+                        limit_price: res.limit_price,
                         reference_price: ref_price_a,
-                        // Placement intent. Exit legs use fallback_to_taker=
-                        // true, so a leg whose post-only attempts exhausted
-                        // actually rests as taker — exits never amend today,
-                        // so the imprecision is unobservable.
-                        post_only,
+                        post_only: res.post_only,
                     });
-                    res_a = Some(res);
+                    res_a = Some(res.response);
                 }
                 Err(err) => {
                     if engine::error_class::is_reduce_only_rejection(&err) {
@@ -1159,6 +1172,11 @@ impl PairTradeEngine {
                 self.connector
                     .create_order(&pair.quote, qty_b, side_b, None, None, true, None)
                     .await
+                    .map(|response| PostOnlyOrderResult {
+                        response,
+                        post_only: false,
+                        limit_price: None,
+                    })
             } else {
                 self.create_order_with_post_only_retry(PostOnlyOrderRequest {
                     symbol: &pair.quote,
@@ -1207,27 +1225,26 @@ impl PairTradeEngine {
                 }
             };
             if let Some(res_b) = res_b {
-                if res_b.ordered_size > Decimal::ZERO && res_b.ordered_size != qty_b {
+                if res_b.response.ordered_size > Decimal::ZERO
+                    && res_b.response.ordered_size != qty_b
+                {
                     log::debug!(
                         "[ORDER_PARAMS][EXIT] size adjusted by exchange for {}: requested={} ordered={}",
                         pair.quote,
                         qty_b,
-                        res_b.ordered_size
+                        res_b.response.ordered_size
                     );
                 }
                 legs.push(PendingLeg {
                     symbol: pair.quote.clone(),
-                    order_id: res_b.order_id.clone(),
-                    exchange_order_id: res_b.exchange_order_id.clone(),
+                    order_id: res_b.response.order_id.clone(),
+                    exchange_order_id: res_b.response.exchange_order_id.clone(),
                     target: qty_b,
                     filled: Decimal::ZERO,
                     side: side_b,
-                    // Same fix as the leg-A site above — exit legs
-                    // need limit_price carried through for post-only
-                    // slippage tagging (#314 Group 4-B-2).
-                    limit_price: limit_b,
+                    limit_price: res_b.limit_price,
                     reference_price: ref_price_b,
-                    post_only,
+                    post_only: res_b.post_only,
                 });
             }
         }
@@ -1253,13 +1270,14 @@ impl PairTradeEngine {
         // bot-strategy#306 / #408: on fee-bearing venues (Extended) where the
         // exit went out post-only, schedule a deadline at which the reconcile
         // loop will cancel the resting legs and reissue as taker. Frankfurt
-        // (fee_bps=0) takes the use_market / non-post-only path above, so
-        // post_only=false here and `takeover_at` stays None — Frankfurt
-        // behavior is unchanged regardless of the configured timeout. Prior
-        // to #408 this was a synchronous in-step monitor that blocked
-        // `step()` for the full timeout and caused STEP_OVERRUN warns.
+        // (fee_bps=0) takes the use_market / non-post-only path above, so no
+        // leg is post-only and `takeover_at` stays None — Frankfurt behavior
+        // is unchanged regardless of the configured timeout. Prior to #408
+        // this was a synchronous in-step monitor that blocked `step()` for
+        // the full timeout and caused STEP_OVERRUN warns.
         let exit_timeout = self.cfg.default_pair_params.exit_post_only_timeout_secs;
-        let takeover_at = if post_only && exit_timeout > 0 && !legs.is_empty() {
+        let exit_post_only = legs.iter().any(|leg| leg.post_only);
+        let takeover_at = if exit_post_only && exit_timeout > 0 {
             Some(Instant::now() + Duration::from_secs(exit_timeout))
         } else {
             None
@@ -1307,9 +1325,41 @@ mod tests {
     //! invariant is therefore worth pinning at the unit level
     //! independent of the engine. bot-strategy#396.
     use dex_connector::OrderSide;
+    use rust_decimal::Decimal;
 
-    use super::super::super::state::PositionDirection;
+    use super::super::super::state::{PendingLeg, PositionDirection};
     use super::PairTradeEngine;
+
+    fn dec(v: &str) -> Decimal {
+        v.parse().unwrap()
+    }
+
+    #[test]
+    fn settled_leg_preserves_original_execution_metadata() {
+        let original = PendingLeg {
+            symbol: "BTC".to_string(),
+            order_id: "ord-1".to_string(),
+            exchange_order_id: Some("ex-1".to_string()),
+            target: dec("1.0"),
+            filled: dec("0.25"),
+            side: OrderSide::Short,
+            limit_price: Some(dec("101.25")),
+            reference_price: Some(dec("100.80")),
+            post_only: true,
+        };
+
+        let settled = PairTradeEngine::settled_leg(&original, dec("0.25"));
+
+        assert_eq!(settled.symbol, original.symbol);
+        assert_eq!(settled.order_id, original.order_id);
+        assert_eq!(settled.exchange_order_id, original.exchange_order_id);
+        assert_eq!(settled.target, dec("0.25"));
+        assert_eq!(settled.filled, dec("0.25"));
+        assert_eq!(settled.side, original.side);
+        assert_eq!(settled.limit_price, original.limit_price);
+        assert_eq!(settled.reference_price, original.reference_price);
+        assert_eq!(settled.post_only, original.post_only);
+    }
 
     #[test]
     fn entry_sides_long_spread() {

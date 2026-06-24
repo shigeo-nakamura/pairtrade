@@ -149,6 +149,7 @@ impl PairTradeEngine {
             risk_state_path,
             kill_switch_active: false,
             data_dump_writer: None,
+            execution_ledger: None,
             regime_series_writer: None,
             replay_connector: None,
             funding_history: funding_history::FundingHistory::new(),
