@@ -522,6 +522,25 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    struct CapturingLogger {
+        records: Arc<StdMutex<Vec<(Level, String)>>>,
+    }
+
+    impl Log for CapturingLogger {
+        fn enabled(&self, _metadata: &Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &Record) {
+            self.records
+                .lock()
+                .unwrap()
+                .push((record.level(), record.args().to_string()));
+        }
+
+        fn flush(&self) {}
+    }
+
     fn make_counters() -> Arc<Counters> {
         Arc::new(Counters::new())
     }
@@ -942,6 +961,38 @@ mod tests {
         );
         let (e, w) = snap_counts(&c, t0 + 1);
         assert_eq!((e, w), (0, 0), "lagged WS ticks must not page auto-error");
+    }
+
+    #[test]
+    fn non_actionable_warn_is_forwarded_to_inner_logger() {
+        let _g = _serialize();
+        set_counting_suppressed(false);
+        let records = Arc::new(StdMutex::new(Vec::new()));
+        let inner = CapturingLogger {
+            records: Arc::clone(&records),
+        };
+        let (logger, handle) = ErrorCountingLogger::wrap(Box::new(inner));
+        let args = format_args!(
+            "fetch_account: HTTP 429 from Lighter (attempt 2/3), retrying after 5000ms"
+        );
+        let record = Record::builder()
+            .args(args)
+            .level(Level::Warn)
+            .target("pairtrade::error_counter::test")
+            .build();
+
+        logger.log(&record);
+
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            (snapshot.error_count_30m, snapshot.warn_count_30m),
+            (0, 0),
+            "retrying 429 must not page auto-error"
+        );
+        let captured = records.lock().unwrap();
+        assert_eq!(captured.len(), 1, "warn must still reach the inner logger");
+        assert_eq!(captured[0].0, Level::Warn);
+        assert!(captured[0].1.contains("HTTP 429 from Lighter"));
     }
 
     // bot-strategy#619/#620: account 429 retry and WS_BARS slow-consumer
