@@ -18,14 +18,21 @@ pub(in crate::pairtrade) struct ExecutionLegFillRecord {
     pub phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close_reason: Option<String>,
+    pub ts_decision_ms: i64,
+    pub ts_submit_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts_ack_ms: Option<i64>,
     pub leg_symbol: String,
     pub side: String,
     pub target_qty: Decimal,
+    pub submitted_qty: Decimal,
     pub filled_qty: Decimal,
     pub remaining_qty: Decimal,
     pub order_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exchange_order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
     pub post_only: bool,
     pub reduce_only: bool,
     pub order_type: String,
@@ -38,7 +45,15 @@ pub(in crate::pairtrade) struct ExecutionLegFillRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference_price: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit_reference_price: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit_mid: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_price: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit_bid: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit_ask: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_bid: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +70,10 @@ pub(in crate::pairtrade) struct ExecutionLegFillRecord {
     pub slippage_bps_vs_decision: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slippage_usd_vs_decision: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slippage_bps_vs_submit: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slippage_usd_vs_submit: Option<f64>,
     pub overfill_detected: bool,
     pub underfill_detected: bool,
 }
@@ -182,13 +201,18 @@ mod tests {
             pair: "BTC/ETH".to_string(),
             phase: "exit".to_string(),
             close_reason: Some("force_close".to_string()),
+            ts_decision_ms: 1_789_000_000_050,
+            ts_submit_ms: 1_789_000_000_100,
+            ts_ack_ms: Some(1_789_000_000_130),
             leg_symbol: "BTC".to_string(),
             side: "Long".to_string(),
             target_qty: Decimal::new(100, 3),
+            submitted_qty: Decimal::new(100, 3),
             filled_qty: Decimal::new(100, 3),
             remaining_qty: Decimal::ZERO,
             order_id: "local-1".to_string(),
             exchange_order_id: Some("venue-1".to_string()),
+            client_order_id: Some("client-1".to_string()),
             post_only: false,
             reduce_only: true,
             order_type: "taker".to_string(),
@@ -197,7 +221,11 @@ mod tests {
             fill_ts_ms: Some(1_789_000_000_250),
             latency_submit_fill_ms: Some(150),
             reference_price: Some(Decimal::new(100_000, 2)),
+            submit_reference_price: Some(Decimal::new(100_010, 2)),
+            submit_mid: Some(Decimal::new(100_000, 2)),
             limit_price: None,
+            submit_bid: Some(Decimal::new(99_995, 2)),
+            submit_ask: Some(Decimal::new(100_025, 2)),
             best_bid: Some(Decimal::new(99_990, 2)),
             best_ask: Some(Decimal::new(100_010, 2)),
             fill_value: Some(Decimal::new(10_000, 2)),
@@ -206,6 +234,8 @@ mod tests {
             fee_bps: Some(5.0),
             slippage_bps_vs_decision: Some(1.2),
             slippage_usd_vs_decision: Some(0.12),
+            slippage_bps_vs_submit: Some(1.1),
+            slippage_usd_vs_submit: Some(0.11),
             overfill_detected: false,
             underfill_detected: false,
         };

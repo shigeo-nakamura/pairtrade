@@ -59,10 +59,26 @@ struct PostOnlyOrderRequest<'a> {
     fallback_to_taker: bool,
 }
 
-struct PostOnlyOrderResult {
+pub(in crate::pairtrade) struct OrderSubmitMetadata {
+    submitted_qty: Decimal,
+    submit_ts_ms: i64,
+    submit_reference_price: Option<Decimal>,
+    submit_mid: Option<Decimal>,
+    submit_bid: Option<Decimal>,
+    submit_ask: Option<Decimal>,
+}
+
+pub(in crate::pairtrade) struct PostOnlyOrderResult {
     response: dex_connector::CreateOrderResponse,
     post_only: bool,
     limit_price: Option<Decimal>,
+    submitted_qty: Decimal,
+    submit_ts_ms: i64,
+    ack_ts_ms: Option<i64>,
+    submit_reference_price: Option<Decimal>,
+    submit_mid: Option<Decimal>,
+    submit_bid: Option<Decimal>,
+    submit_ask: Option<Decimal>,
 }
 
 /// Per-leg inputs for `place_or_amend_reissue_leg`, grouped so the amend /
@@ -114,6 +130,83 @@ impl PairTradeEngine {
         settled.target = filled;
         settled.filled = filled;
         settled
+    }
+
+    pub(in crate::pairtrade) fn order_submit_metadata(
+        &self,
+        symbol: &str,
+        size: Decimal,
+        side: dex_connector::OrderSide,
+        prices: &HashMap<String, SymbolSnapshot>,
+    ) -> OrderSubmitMetadata {
+        let snap = prices.get(symbol);
+        OrderSubmitMetadata {
+            submitted_qty: size,
+            submit_ts_ms: chrono::Utc::now().timestamp_millis(),
+            submit_reference_price: snap
+                .map(|s| self.order_reference_price_from_snapshot(symbol, side, s)),
+            submit_mid: snap.map(|s| s.price),
+            submit_bid: snap.and_then(|s| s.bid_price),
+            submit_ask: snap.and_then(|s| s.ask_price),
+        }
+    }
+
+    pub(in crate::pairtrade) fn order_result_from_response(
+        response: dex_connector::CreateOrderResponse,
+        post_only: bool,
+        limit_price: Option<Decimal>,
+        meta: OrderSubmitMetadata,
+    ) -> PostOnlyOrderResult {
+        PostOnlyOrderResult {
+            response,
+            post_only,
+            limit_price,
+            submitted_qty: meta.submitted_qty,
+            submit_ts_ms: meta.submit_ts_ms,
+            ack_ts_ms: Some(chrono::Utc::now().timestamp_millis()),
+            submit_reference_price: meta.submit_reference_price,
+            submit_mid: meta.submit_mid,
+            submit_bid: meta.submit_bid,
+            submit_ask: meta.submit_ask,
+        }
+    }
+
+    pub(in crate::pairtrade) fn pending_leg_from_order(
+        symbol: String,
+        side: dex_connector::OrderSide,
+        target: Decimal,
+        filled: Decimal,
+        reference_price: Option<Decimal>,
+        reduce_only: bool,
+        result: PostOnlyOrderResult,
+    ) -> PendingLeg {
+        let dex_connector::CreateOrderResponse {
+            order_id,
+            exchange_order_id,
+            ordered_price: _,
+            ordered_size: _,
+            client_order_id,
+        } = result.response;
+        PendingLeg {
+            symbol,
+            order_id,
+            exchange_order_id,
+            target,
+            filled,
+            side,
+            submitted_qty: result.submitted_qty,
+            limit_price: result.limit_price,
+            reference_price,
+            submit_ts_ms: result.submit_ts_ms,
+            ack_ts_ms: result.ack_ts_ms,
+            submit_reference_price: result.submit_reference_price,
+            submit_mid: result.submit_mid,
+            submit_bid: result.submit_bid,
+            submit_ask: result.submit_ask,
+            client_order_id,
+            reduce_only,
+            post_only: result.post_only,
+        }
     }
 
     /// Derive the effective `(filled, remaining)` for one reissue leg.
@@ -171,7 +264,7 @@ impl PairTradeEngine {
     async fn place_or_amend_reissue_leg(
         &mut self,
         req: ReissueLegPlacement<'_>,
-    ) -> Result<(dex_connector::CreateOrderResponse, bool, Option<Decimal>), DexError> {
+    ) -> Result<PostOnlyOrderResult, DexError> {
         let ReissueLegPlacement {
             stage,
             leg,
@@ -211,6 +304,8 @@ impl PairTradeEngine {
         };
         match amend_pricing {
             Some((amend_limit, amend_spread)) => {
+                let meta =
+                    self.order_submit_metadata(&leg.symbol, quantized_size, leg.side, price_map);
                 match self
                     .connector
                     .modify_order(
@@ -225,7 +320,12 @@ impl PairTradeEngine {
                     )
                     .await
                 {
-                    Ok(resp) => Ok((resp, leg.post_only, amend_limit)),
+                    Ok(resp) => Ok(Self::order_result_from_response(
+                        resp,
+                        leg.post_only,
+                        amend_limit,
+                        meta,
+                    )),
                     Err(e) => {
                         log::warn!(
                             "[ORDER] amend failed for {} leg {} ({:?}); falling back to cancel+reissue",
@@ -237,6 +337,12 @@ impl PairTradeEngine {
                             .connector
                             .cancel_order(&leg.symbol, &leg.order_id)
                             .await;
+                        let fallback_meta = self.order_submit_metadata(
+                            &leg.symbol,
+                            quantized_size,
+                            leg.side,
+                            price_map,
+                        );
                         self.connector
                             .create_order(
                                 &leg.symbol,
@@ -248,7 +354,9 @@ impl PairTradeEngine {
                                 None,
                             )
                             .await
-                            .map(|resp| (resp, false, limit))
+                            .map(|resp| {
+                                Self::order_result_from_response(resp, false, limit, fallback_meta)
+                            })
                     }
                 }
             }
@@ -264,6 +372,8 @@ impl PairTradeEngine {
                         .cancel_order(&leg.symbol, &leg.order_id)
                         .await;
                 }
+                let meta =
+                    self.order_submit_metadata(&leg.symbol, quantized_size, leg.side, price_map);
                 self.connector
                     .create_order(
                         &leg.symbol,
@@ -275,7 +385,7 @@ impl PairTradeEngine {
                         None,
                     )
                     .await
-                    .map(|resp| (resp, false, limit))
+                    .map(|resp| Self::order_result_from_response(resp, false, limit, meta))
             }
         }
     }
@@ -407,16 +517,8 @@ impl PairTradeEngine {
                 })
                 .await;
             match placement {
-                Ok((resp, placed_post_only, placed_limit)) => {
-                    // Native in-place amend keeps the order's identity: the
-                    // same order_id continues to fill toward the original
-                    // target with its already-filled portion intact. Record
-                    // it as ONE continuing leg so fill aggregation (keyed by
-                    // order_id) doesn't double-count. A cancel-replace amend
-                    // (Extended) or a plain reissue/create returns a NEW id —
-                    // those keep the original two-leg shape (a settled
-                    // already-filled leg + a fresh remainder leg).
-                    let amended_in_place = use_amend && resp.order_id == leg.order_id;
+                Ok(result) => {
+                    let amended_in_place = use_amend && result.response.order_id == leg.order_id;
                     if amended_in_place {
                         log::info!(
                             "[ORDER] Amended {} leg {} remaining={} in place (order {})",
@@ -425,17 +527,17 @@ impl PairTradeEngine {
                             quantized_size,
                             leg.order_id
                         );
-                        new_legs.push(PendingLeg {
-                            symbol: leg.symbol.clone(),
-                            order_id: resp.order_id,
-                            exchange_order_id: leg.exchange_order_id.clone(),
-                            target: leg.target,
+                        let mut amended = Self::pending_leg_from_order(
+                            leg.symbol.clone(),
+                            leg.side,
+                            leg.target,
                             filled,
-                            side: leg.side,
-                            limit_price: placed_limit,
-                            reference_price: ref_price_reissue,
-                            post_only: placed_post_only,
-                        });
+                            ref_price_reissue,
+                            reduce_only,
+                            result,
+                        );
+                        amended.exchange_order_id = leg.exchange_order_id.clone();
+                        new_legs.push(amended);
                     } else {
                         log::info!(
                             "[ORDER] Reissued {} leg {} size={}",
@@ -444,23 +546,17 @@ impl PairTradeEngine {
                             quantized_size
                         );
                         if filled > Decimal::ZERO {
-                            // Preserved record of the already-filled portion
-                            // of the original leg. No new fill is expected
-                            // on this entry, but the ledger still needs the
-                            // original placement metadata for attribution.
                             new_legs.push(Self::settled_leg(leg, filled));
                         }
-                        new_legs.push(PendingLeg {
-                            symbol: leg.symbol.clone(),
-                            order_id: resp.order_id,
-                            exchange_order_id: resp.exchange_order_id,
-                            target: quantized_size,
-                            filled: Decimal::ZERO,
-                            side: leg.side,
-                            limit_price: placed_limit,
-                            reference_price: ref_price_reissue,
-                            post_only: placed_post_only,
-                        });
+                        new_legs.push(Self::pending_leg_from_order(
+                            leg.symbol.clone(),
+                            leg.side,
+                            quantized_size,
+                            Decimal::ZERO,
+                            ref_price_reissue,
+                            reduce_only,
+                            result,
+                        ));
                     }
                 }
                 Err(e) => {
@@ -533,6 +629,7 @@ impl PairTradeEngine {
             // the principal post-only-fallback path the BT/live gap
             // analysis cares about.
             let ref_price_taker = self.order_reference_price(&leg.symbol, leg.side, price_map);
+            let meta = self.order_submit_metadata(&leg.symbol, size, leg.side, price_map);
             match self
                 .connector
                 .create_order(
@@ -545,6 +642,7 @@ impl PairTradeEngine {
                     None,
                 )
                 .await
+                .map(|resp| Self::order_result_from_response(resp, false, None, meta))
             {
                 Ok(resp) => {
                     log::info!(
@@ -553,17 +651,15 @@ impl PairTradeEngine {
                         leg.symbol,
                         size
                     );
-                    new_legs.push(PendingLeg {
-                        symbol: leg.symbol.clone(),
-                        order_id: resp.order_id,
-                        exchange_order_id: resp.exchange_order_id,
-                        target: size,
-                        filled: Decimal::ZERO,
-                        side: leg.side,
-                        limit_price: None,
-                        reference_price: ref_price_taker,
-                        post_only: false,
-                    });
+                    new_legs.push(Self::pending_leg_from_order(
+                        leg.symbol.clone(),
+                        leg.side,
+                        size,
+                        Decimal::ZERO,
+                        ref_price_taker,
+                        false,
+                        resp,
+                    ));
                 }
                 Err(e) => {
                     log::error!(
@@ -627,17 +723,19 @@ impl PairTradeEngine {
             }
             last_limit = limit;
             let spread = self.order_spread_param(limit, use_post_only);
+            let meta = self.order_submit_metadata(symbol, size, side, prices);
             match self
                 .connector
                 .create_order(symbol, size, side, limit, spread, reduce_only, None)
                 .await
             {
                 Ok(response) => {
-                    return Ok(PostOnlyOrderResult {
+                    return Ok(Self::order_result_from_response(
                         response,
-                        post_only: use_post_only,
-                        limit_price: limit,
-                    });
+                        use_post_only,
+                        limit,
+                        meta,
+                    ));
                 }
                 Err(err) => {
                     if !use_post_only {
@@ -689,15 +787,12 @@ impl PairTradeEngine {
                     .unwrap_or_else(|| "?".into()),
                 format!("{:?}", last_err).chars().take(160).collect::<String>(),
             );
+            let meta = self.order_submit_metadata(symbol, size, side, prices);
             return self
                 .connector
                 .create_order(symbol, size, side, None, None, reduce_only, None)
                 .await
-                .map(|response| PostOnlyOrderResult {
-                    response,
-                    post_only: false,
-                    limit_price: None,
-                });
+                .map(|response| Self::order_result_from_response(response, false, None, meta));
         }
 
         Err(last_err)
@@ -857,17 +952,22 @@ impl PairTradeEngine {
         } else {
             qtys.0
         };
-        legs.push(PendingLeg {
-            symbol: pair.base.clone(),
+        let res_a_response = dex_connector::CreateOrderResponse {
             order_id: res_a.response.order_id.clone(),
             exchange_order_id: res_a.response.exchange_order_id.clone(),
-            target: target_a,
-            filled: Decimal::ZERO,
-            side: side_a,
-            limit_price: res_a.limit_price,
-            reference_price: ref_price_a,
-            post_only: res_a.post_only,
-        });
+            ordered_price: res_a.response.ordered_price,
+            ordered_size: res_a.response.ordered_size,
+            client_order_id: res_a.response.client_order_id.clone(),
+        };
+        legs.push(Self::pending_leg_from_order(
+            pair.base.clone(),
+            side_a,
+            target_a,
+            Decimal::ZERO,
+            ref_price_a,
+            false,
+            res_a,
+        ));
 
         let res_b = match self
             .create_order_with_post_only_retry(PostOnlyOrderRequest {
@@ -884,7 +984,7 @@ impl PairTradeEngine {
         {
             Ok(res) => res,
             Err(e) => {
-                self.recover_from_leg_b_failure(pair, &res_a.response, side_a, &e)
+                self.recover_from_leg_b_failure(pair, &res_a_response, side_a, &e)
                     .await;
                 return Err(PartialOrderPlacementError::new(legs.clone(), e).into());
             }
@@ -902,17 +1002,15 @@ impl PairTradeEngine {
         } else {
             qtys.1
         };
-        legs.push(PendingLeg {
-            symbol: pair.quote.clone(),
-            order_id: res_b.response.order_id.clone(),
-            exchange_order_id: res_b.response.exchange_order_id.clone(),
-            target: target_b,
-            filled: Decimal::ZERO,
-            side: side_b,
-            limit_price: res_b.limit_price,
-            reference_price: ref_price_b,
-            post_only: res_b.post_only,
-        });
+        legs.push(Self::pending_leg_from_order(
+            pair.quote.clone(),
+            side_b,
+            target_b,
+            Decimal::ZERO,
+            ref_price_b,
+            false,
+            res_b,
+        ));
         Ok(legs)
     }
 
@@ -1090,14 +1188,11 @@ impl PairTradeEngine {
         }
         if qty_a > Decimal::ZERO && !skipped_already_closed {
             let res = if use_market {
+                let meta = self.order_submit_metadata(&pair.base, qty_a, side_a, prices);
                 self.connector
                     .create_order(&pair.base, qty_a, side_a, None, None, true, None)
                     .await
-                    .map(|response| PostOnlyOrderResult {
-                        response,
-                        post_only: false,
-                        limit_price: None,
-                    })
+                    .map(|response| Self::order_result_from_response(response, false, None, meta))
             } else {
                 self.create_order_with_post_only_retry(PostOnlyOrderRequest {
                     symbol: &pair.base,
@@ -1123,18 +1218,23 @@ impl PairTradeEngine {
                             res.response.ordered_size
                         );
                     }
-                    legs.push(PendingLeg {
-                        symbol: pair.base.clone(),
+                    let res_a_response = dex_connector::CreateOrderResponse {
                         order_id: res.response.order_id.clone(),
                         exchange_order_id: res.response.exchange_order_id.clone(),
-                        target: qty_a,
-                        filled: Decimal::ZERO,
-                        side: side_a,
-                        limit_price: res.limit_price,
-                        reference_price: ref_price_a,
-                        post_only: res.post_only,
-                    });
-                    res_a = Some(res.response);
+                        ordered_price: res.response.ordered_price,
+                        ordered_size: res.response.ordered_size,
+                        client_order_id: res.response.client_order_id.clone(),
+                    };
+                    legs.push(Self::pending_leg_from_order(
+                        pair.base.clone(),
+                        side_a,
+                        qty_a,
+                        Decimal::ZERO,
+                        ref_price_a,
+                        true,
+                        res,
+                    ));
+                    res_a = Some(res_a_response);
                 }
                 Err(err) => {
                     if engine::error_class::is_reduce_only_rejection(&err) {
@@ -1169,14 +1269,11 @@ impl PairTradeEngine {
         }
         if qty_b > Decimal::ZERO && !quote_already_flat {
             let res_b = if use_market {
+                let meta = self.order_submit_metadata(&pair.quote, qty_b, side_b, prices);
                 self.connector
                     .create_order(&pair.quote, qty_b, side_b, None, None, true, None)
                     .await
-                    .map(|response| PostOnlyOrderResult {
-                        response,
-                        post_only: false,
-                        limit_price: None,
-                    })
+                    .map(|response| Self::order_result_from_response(response, false, None, meta))
             } else {
                 self.create_order_with_post_only_retry(PostOnlyOrderRequest {
                     symbol: &pair.quote,
@@ -1235,17 +1332,15 @@ impl PairTradeEngine {
                         res_b.response.ordered_size
                     );
                 }
-                legs.push(PendingLeg {
-                    symbol: pair.quote.clone(),
-                    order_id: res_b.response.order_id.clone(),
-                    exchange_order_id: res_b.response.exchange_order_id.clone(),
-                    target: qty_b,
-                    filled: Decimal::ZERO,
-                    side: side_b,
-                    limit_price: res_b.limit_price,
-                    reference_price: ref_price_b,
-                    post_only: res_b.post_only,
-                });
+                legs.push(Self::pending_leg_from_order(
+                    pair.quote.clone(),
+                    side_b,
+                    qty_b,
+                    Decimal::ZERO,
+                    ref_price_b,
+                    true,
+                    res_b,
+                ));
             }
         }
 
@@ -1343,8 +1438,17 @@ mod tests {
             target: dec("1.0"),
             filled: dec("0.25"),
             side: OrderSide::Short,
+            submitted_qty: Decimal::ZERO,
             limit_price: Some(dec("101.25")),
             reference_price: Some(dec("100.80")),
+            submit_ts_ms: 0,
+            ack_ts_ms: None,
+            submit_reference_price: None,
+            submit_mid: None,
+            submit_bid: None,
+            submit_ask: None,
+            client_order_id: None,
+            reduce_only: false,
             post_only: true,
         };
 

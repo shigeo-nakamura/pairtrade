@@ -321,23 +321,23 @@ impl PairTradeEngine {
                 // 4-B-2). The downsized retry below uses the
                 // same captured value.
                 let ref_price_retry = self.order_reference_price(&leg.symbol, leg.side, price_map);
+                let meta = self.order_submit_metadata(&leg.symbol, quantized, leg.side, price_map);
                 match self
                     .connector
                     .create_order(&leg.symbol, quantized, leg.side, limit, None, true, None)
                     .await
+                    .map(|resp| Self::order_result_from_response(resp, false, None, meta))
                 {
                     Ok(resp) => {
-                        new_legs.push(PendingLeg {
-                            symbol: leg.symbol.clone(),
-                            order_id: resp.order_id,
-                            exchange_order_id: resp.exchange_order_id,
-                            target: quantized,
-                            filled: Decimal::ZERO,
-                            side: leg.side,
-                            limit_price: None,
-                            reference_price: ref_price_retry,
-                            post_only: false,
-                        });
+                        new_legs.push(Self::pending_leg_from_order(
+                            leg.symbol.clone(),
+                            leg.side,
+                            quantized,
+                            Decimal::ZERO,
+                            ref_price_retry,
+                            true,
+                            resp,
+                        ));
                         log::warn!(
                             "[ORDER] Retrying exit leg {} size={} mode=MARKET",
                             leg.symbol,
@@ -367,6 +367,12 @@ impl PairTradeEngine {
                                     );
                                     continue;
                                 }
+                                let meta = self.order_submit_metadata(
+                                    &leg.symbol,
+                                    downsized,
+                                    leg.side,
+                                    price_map,
+                                );
                                 match self
                                     .connector
                                     .create_order(
@@ -379,19 +385,19 @@ impl PairTradeEngine {
                                         None,
                                     )
                                     .await
-                                {
+                                    .map(|resp| {
+                                        Self::order_result_from_response(resp, false, None, meta)
+                                    }) {
                                     Ok(resp) => {
-                                        new_legs.push(PendingLeg {
-                                            symbol: leg.symbol.clone(),
-                                            order_id: resp.order_id,
-                                            exchange_order_id: resp.exchange_order_id,
-                                            target: downsized,
-                                            filled: Decimal::ZERO,
-                                            side: leg.side,
-                                            limit_price: None,
-                                            reference_price: ref_price_retry,
-                                            post_only: false,
-                                        });
+                                        new_legs.push(Self::pending_leg_from_order(
+                                            leg.symbol.clone(),
+                                            leg.side,
+                                            downsized,
+                                            Decimal::ZERO,
+                                            ref_price_retry,
+                                            true,
+                                            resp,
+                                        ));
                                         log::warn!(
                                                 "[ORDER] Retrying exit leg {} size={} mode=MARKET (sized down from {})",
                                                 leg.symbol,
@@ -1306,6 +1312,20 @@ impl PairTradeEngine {
                 }),
                 _ => None,
             };
+            let submit_ref_price_opt = leg.submit_reference_price.or(ref_price_opt);
+            let slippage_bps_vs_submit = match (submit_ref_price_opt, fill_price) {
+                (Some(ref_price), Some(avg_price)) => ref_price.to_f64().and_then(|ref_f64| {
+                    if ref_f64 <= 0.0 {
+                        return None;
+                    }
+                    let sign = match leg.side {
+                        dex_connector::OrderSide::Long => 1.0,
+                        dex_connector::OrderSide::Short => -1.0,
+                    };
+                    Some(sign * (avg_price - ref_f64) / ref_f64 * 10_000.0)
+                }),
+                _ => None,
+            };
             let slippage_usd_vs_decision = match (slippage_bps_vs_decision, fill_value_f64) {
                 (Some(bps), Some(value)) => {
                     let usd = value.abs() * bps / 10_000.0;
@@ -1313,6 +1333,10 @@ impl PairTradeEngine {
                     slippage_usd_total += usd;
                     Some(usd)
                 }
+                _ => None,
+            };
+            let slippage_usd_vs_submit = match (slippage_bps_vs_submit, fill_value_f64) {
+                (Some(bps), Some(value)) => Some(value.abs() * bps / 10_000.0),
                 _ => None,
             };
 
@@ -1333,9 +1357,14 @@ impl PairTradeEngine {
                     .with_label_values(&[variant, pair, phase])
                     .observe(fee_bps);
             }
-            let latency_submit_fill_ms = match (placed_ts_ms > 0, fill_ts_ms) {
+            let submit_ts_for_latency = if leg.submit_ts_ms > 0 {
+                leg.submit_ts_ms
+            } else {
+                placed_ts_ms
+            };
+            let latency_submit_fill_ms = match (submit_ts_for_latency > 0, fill_ts_ms) {
                 (true, Some(fill_ts)) => {
-                    let latency_ms = fill_ts - placed_ts_ms;
+                    let latency_ms = fill_ts - submit_ts_for_latency;
                     if latency_ms >= 0 {
                         super::super::prom::LEG_FILL_LATENCY_MS
                             .with_label_values(&[variant, pair, phase])
@@ -1360,24 +1389,31 @@ impl PairTradeEngine {
                 pair: pair.to_string(),
                 phase: phase.to_string(),
                 close_reason: close_reason.map(str::to_string),
+                ts_decision_ms: placed_ts_ms,
+                ts_submit_ms: leg.submit_ts_ms,
+                ts_ack_ms: leg.ack_ts_ms,
                 leg_symbol: leg.symbol.clone(),
                 side: format!("{:?}", leg.side),
                 target_qty: leg.target,
+                submitted_qty: leg.submitted_qty,
                 filled_qty: fill_size,
                 remaining_qty: (leg.target - capped_fill_size).max(Decimal::ZERO),
                 order_id: leg.order_id.clone(),
                 exchange_order_id: leg.exchange_order_id.clone(),
+                client_order_id: leg.client_order_id.clone(),
                 post_only: leg.post_only,
-                // PendingLeg does not retain the submitted reduce_only flag;
-                // phase is the closest in-process proxy for ledger attribution.
-                reduce_only: phase != "entry",
+                reduce_only: leg.reduce_only,
                 order_type: order_type.to_string(),
                 attempt,
                 placed_ts_ms,
                 fill_ts_ms,
                 latency_submit_fill_ms,
                 reference_price: ref_price_opt,
+                submit_reference_price: submit_ref_price_opt,
+                submit_mid: leg.submit_mid,
                 limit_price: leg.limit_price,
+                submit_bid: leg.submit_bid,
+                submit_ask: leg.submit_ask,
                 best_bid: snap.and_then(|s| s.bid_price),
                 best_ask: snap.and_then(|s| s.ask_price),
                 fill_value: filled_value,
@@ -1386,6 +1422,8 @@ impl PairTradeEngine {
                 fee_bps,
                 slippage_bps_vs_decision,
                 slippage_usd_vs_decision,
+                slippage_bps_vs_submit,
+                slippage_usd_vs_submit,
                 overfill_detected: leg_overfill,
                 underfill_detected: leg_underfill,
             });
@@ -1504,8 +1542,17 @@ mod tests {
             target: dec(target),
             filled: dec(filled),
             side: OrderSide::Long,
+            submitted_qty: Decimal::ZERO,
             limit_price: None,
             reference_price: None,
+            submit_ts_ms: 0,
+            ack_ts_ms: None,
+            submit_reference_price: None,
+            submit_mid: None,
+            submit_bid: None,
+            submit_ask: None,
+            client_order_id: None,
+            reduce_only: false,
             post_only: false,
         }
     }
@@ -1523,8 +1570,17 @@ mod tests {
             target: dec(target),
             filled: Decimal::ZERO,
             side: OrderSide::Long,
+            submitted_qty: Decimal::ZERO,
             limit_price: None,
             reference_price: None,
+            submit_ts_ms: 0,
+            ack_ts_ms: None,
+            submit_reference_price: None,
+            submit_mid: None,
+            submit_bid: None,
+            submit_ask: None,
+            client_order_id: None,
+            reduce_only: false,
             post_only: false,
         }
     }

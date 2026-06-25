@@ -75,6 +75,10 @@ pub(super) struct PendingLeg {
     pub(super) target: Decimal,
     pub(super) filled: Decimal,
     pub(super) side: dex_connector::OrderSide,
+    /// Quantity submitted to the connector for this live order. This can
+    /// differ from `target` when the exchange adjusts size or when an amend
+    /// keeps the original target while replacing only the open remainder.
+    pub(super) submitted_qty: Decimal,
     /// Limit price posted for this leg, when placed as a limit/post-only
     /// order. `None` for market orders and for reissue paths that do not
     /// carry a limit forward. Used by the post-only fallback instrumentation
@@ -90,6 +94,17 @@ pub(super) struct PendingLeg {
     /// 4-B-2) so taker fallbacks — where `limit_price = None` — still
     /// produce a measurable adverse-slippage signal.
     pub(super) reference_price: Option<Decimal>,
+    /// Per-order submission metadata captured around the connector call. Kept
+    /// on the leg so the execution ledger can reconstruct submit/ack timing
+    /// and the book snapshot visible at submission after fills arrive later.
+    pub(super) submit_ts_ms: i64,
+    pub(super) ack_ts_ms: Option<i64>,
+    pub(super) submit_reference_price: Option<Decimal>,
+    pub(super) submit_mid: Option<Decimal>,
+    pub(super) submit_bid: Option<Decimal>,
+    pub(super) submit_ask: Option<Decimal>,
+    pub(super) client_order_id: Option<String>,
+    pub(super) reduce_only: bool,
     /// Whether the resting order was placed post-only (maker). The amend
     /// path (bot-strategy#471) must re-assert this flag verbatim:
     /// Extended's cancel-replace edit only permits price/size changes, and

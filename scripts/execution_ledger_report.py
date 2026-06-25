@@ -41,6 +41,7 @@ class Record:
     order_type: str
     attempt: int
     slippage_bps: float | None
+    slippage_submit_bps: float | None
     slippage_usd: float | None
     latency_ms: float | None
     fee_bps: float | None
@@ -127,6 +128,7 @@ def load_records(paths: list[Path], since: datetime | None, until: datetime | No
                         slippage_bps=as_float(
                             raw.get("gross_execution_slippage_bps", raw.get("slippage_bps_vs_decision"))
                         ),
+                        slippage_submit_bps=as_float(raw.get("slippage_bps_vs_submit")),
                         slippage_usd=as_float(
                             raw.get("gross_execution_slippage_usd", raw.get("slippage_usd_vs_decision"))
                         ),
@@ -216,6 +218,7 @@ def render_report(records: list[Record], inputs: list[Path], since: datetime | N
     lines.append("")
 
     pair_slip = stats(r.slippage_bps for r in pair_records)
+    leg_submit_slip = stats(r.slippage_submit_bps for r in leg_records)
     pair_drag = stats(r.slippage_usd for r in pair_records)
     sync = stats(r.leg_sync_gap_ms for r in pair_records)
     latency = stats(r.latency_ms for r in leg_records)
@@ -229,6 +232,7 @@ def render_report(records: list[Record], inputs: list[Path], since: datetime | N
             ["Leg fills", str(len(leg_records))],
             ["Pair summaries", str(len(pair_records))],
             ["Pair slippage bps mean / median / p95", f"{fmt(pair_slip['mean'])} / {fmt(pair_slip['median'])} / {fmt(pair_slip['p95'])}"],
+            ["Leg submit slippage bps median / p95", f"{fmt(leg_submit_slip['median'])} / {fmt(leg_submit_slip['p95'])}"],
             ["Execution PnL drag USD sum", fmt(pair_drag["sum"])],
             ["Leg-sync gap ms median / p95", f"{fmt_int(sync['median'])} / {fmt_int(sync['p95'])}"],
             ["Submit-fill latency ms median / p95", f"{fmt_int(latency['median'])} / {fmt_int(latency['p95'])}"],

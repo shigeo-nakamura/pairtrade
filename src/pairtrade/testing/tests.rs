@@ -300,8 +300,17 @@ fn make_leg(symbol: &str, target: Decimal) -> PendingLeg {
         target,
         filled: target,
         side: dex_connector::OrderSide::Long,
+        submitted_qty: Decimal::ZERO,
         limit_price: None,
         reference_price: None,
+        submit_ts_ms: 0,
+        ack_ts_ms: None,
+        submit_reference_price: None,
+        submit_mid: None,
+        submit_bid: None,
+        submit_ask: None,
+        client_order_id: None,
+        reduce_only: false,
         post_only: false,
     }
 }
