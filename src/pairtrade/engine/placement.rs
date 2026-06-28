@@ -139,15 +139,37 @@ impl PairTradeEngine {
         side: dex_connector::OrderSide,
         prices: &HashMap<String, SymbolSnapshot>,
     ) -> OrderSubmitMetadata {
-        let snap = prices.get(symbol);
+        match prices.get(symbol) {
+            Some(snapshot) => {
+                self.order_submit_metadata_from_snapshot(symbol, size, side, snapshot)
+            }
+            None => OrderSubmitMetadata {
+                submitted_qty: size,
+                submit_ts_ms: chrono::Utc::now().timestamp_millis(),
+                submit_reference_price: None,
+                submit_mid: None,
+                submit_bid: None,
+                submit_ask: None,
+            },
+        }
+    }
+
+    pub(in crate::pairtrade) fn order_submit_metadata_from_snapshot(
+        &self,
+        symbol: &str,
+        size: Decimal,
+        side: dex_connector::OrderSide,
+        snapshot: &SymbolSnapshot,
+    ) -> OrderSubmitMetadata {
         OrderSubmitMetadata {
             submitted_qty: size,
             submit_ts_ms: chrono::Utc::now().timestamp_millis(),
-            submit_reference_price: snap
-                .map(|s| self.order_reference_price_from_snapshot(symbol, side, s)),
-            submit_mid: snap.map(|s| s.price),
-            submit_bid: snap.and_then(|s| s.bid_price),
-            submit_ask: snap.and_then(|s| s.ask_price),
+            submit_reference_price: Some(
+                self.order_reference_price_from_snapshot(symbol, side, snapshot),
+            ),
+            submit_mid: Some(snapshot.price),
+            submit_bid: snapshot.bid_price,
+            submit_ask: snapshot.ask_price,
         }
     }
 
@@ -258,8 +280,8 @@ impl PairTradeEngine {
     /// Place one reissue leg: native amend when opted in (bot-strategy#471),
     /// falling back to cancel+reissue on any amend error or when no
     /// maker-safe price exists for a post-only leg. Resolves to
-    /// `(response, post_only, posted limit)` so the rebuilt `PendingLeg`
-    /// records how the live order actually rests on the venue. Pure
+    /// `PostOnlyOrderResult` so the rebuilt `PendingLeg` records how the
+    /// live order actually rests on the venue. Pure
     /// relocation from `reissue_partial_legs` (bot-strategy#502).
     async fn place_or_amend_reissue_leg(
         &mut self,
@@ -296,16 +318,25 @@ impl PairTradeEngine {
         } else if leg.post_only {
             self.refreshed_limit_price(&leg.symbol, leg.side, price_map)
                 .await
-                .filter(|px| *px > Decimal::ZERO)
-                .or(limit)
-                .map(|px| (Some(px), Some(-2)))
+                .filter(|pricing| pricing.limit > Decimal::ZERO)
+                .map(|pricing| (Some(pricing.limit), Some(-2), pricing.submit_snapshot))
+                .or_else(|| limit.map(|px| (Some(px), Some(-2), None)))
         } else {
-            Some((limit, spread))
+            Some((limit, spread, None))
         };
         match amend_pricing {
-            Some((amend_limit, amend_spread)) => {
-                let meta =
-                    self.order_submit_metadata(&leg.symbol, quantized_size, leg.side, price_map);
+            Some((amend_limit, amend_spread, submit_snapshot)) => {
+                let meta = match submit_snapshot.as_ref() {
+                    Some(snapshot) => self.order_submit_metadata_from_snapshot(
+                        &leg.symbol,
+                        quantized_size,
+                        leg.side,
+                        snapshot,
+                    ),
+                    None => {
+                        self.order_submit_metadata(&leg.symbol, quantized_size, leg.side, price_map)
+                    }
+                };
                 match self
                     .connector
                     .modify_order(
@@ -500,7 +531,7 @@ impl PairTradeEngine {
                 new_legs.push(Self::kept_leg(leg, leg.target));
                 continue;
             }
-            // Each placement resolves to (response, post_only, posted limit)
+            // Each placement resolves to the live order mode and submit metadata
             // so the rebuilt PendingLeg records how the live order actually
             // rests on the venue (see place_or_amend_reissue_leg for the
             // amend-vs-cancel+reissue policy, bot-strategy#471).
@@ -710,10 +741,13 @@ impl PairTradeEngine {
 
         let last_err = loop {
             attempt += 1;
-            let limit = if use_post_only {
-                self.refreshed_limit_price(symbol, side, prices).await
+            let (limit, submit_snapshot) = if use_post_only {
+                match self.refreshed_limit_price(symbol, side, prices).await {
+                    Some(pricing) => (Some(pricing.limit), pricing.submit_snapshot),
+                    None => (None, None),
+                }
             } else {
-                self.limit_price_for(symbol, side, prices)
+                (self.limit_price_for(symbol, side, prices), None)
             };
             if use_post_only && limit.is_none() {
                 return Err(DexError::Transient(format!(
@@ -723,7 +757,12 @@ impl PairTradeEngine {
             }
             last_limit = limit;
             let spread = self.order_spread_param(limit, use_post_only);
-            let meta = self.order_submit_metadata(symbol, size, side, prices);
+            let meta = match submit_snapshot.as_ref() {
+                Some(snapshot) => {
+                    self.order_submit_metadata_from_snapshot(symbol, size, side, snapshot)
+                }
+                None => self.order_submit_metadata(symbol, size, side, prices),
+            };
             match self
                 .connector
                 .create_order(symbol, size, side, limit, spread, reduce_only, None)
