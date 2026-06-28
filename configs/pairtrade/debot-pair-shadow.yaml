@@ -24,7 +24,8 @@
 #   still covers us; ~20-25 MB/day for 6 symbols).
 # - Credentials are shared with the canary sub-account (sourced by the
 #   wrapper). In observe mode the process signs no transactions, so there is
-#   no nonce contention; it only adds WS/REST read load.
+#   no nonce contention. The wrapper disables Lighter REST fallback so it only
+#   consumes WS market data.
 
 dex_name: lighter
 rest_endpoint: https://mainnet.zklighter.elliot.ai/

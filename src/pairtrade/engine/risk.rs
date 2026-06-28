@@ -150,6 +150,10 @@ impl PairTradeEngine {
     }
 
     pub(in crate::pairtrade) async fn fetch_equity_rest(&mut self, inst_idx: usize) {
+        if self.cfg.observe_only {
+            self.instances[inst_idx].last_equity_fetch = Some(Instant::now());
+            return;
+        }
         // No pairtrade-side throttle: dex-connector v4.2.83 (#239) populates
         // `balance_cache` from WS-derived equity (assets[USDC].margin_balance
         // + sum(positions.unrealized_pnl)), so `get_balance(None)` is a cache
@@ -555,7 +559,7 @@ impl PairTradeEngine {
     /// after a successful equity refresh. No-op when the threshold is
     /// disabled (0 bps) so disabled instances don't grow disk state.
     pub(in crate::pairtrade) fn update_equity_sample(&mut self, inst_idx: usize) {
-        if self.cfg.backtest_mode {
+        if self.cfg.backtest_mode || self.cfg.observe_only {
             return;
         }
         let threshold_bps = self.cfg.risk.max_session_loss_bps;
@@ -776,7 +780,7 @@ impl PairTradeEngine {
     /// already flat). Returns true if the halt is currently active for
     /// the instance after the check.
     pub(in crate::pairtrade) async fn evaluate_session_dd(&mut self, inst_idx: usize) -> bool {
-        if self.cfg.backtest_mode {
+        if self.cfg.backtest_mode || self.cfg.observe_only {
             return false;
         }
         let threshold_bps = self.cfg.risk.max_session_loss_bps;

@@ -5,8 +5,8 @@ use super::*;
 use async_trait::async_trait;
 use dex_connector::{
     BalanceResponse, CanceledOrdersResponse, CreateOrderResponse, DexConnector, DexError,
-    FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse, OrderBookSnapshot, OrderSide,
-    PositionSnapshot, TickerResponse, TpSl, TriggerOrderStyle,
+    FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse, OrderBookLevel,
+    OrderBookSnapshot, OrderSide, PositionSnapshot, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -50,6 +50,8 @@ struct DummyConnector {
     /// matching entries to simulate a successful flatten.
     positions_to_return: Mutex<Vec<PositionSnapshot>>,
     min_order_to_return: Mutex<Option<Decimal>>,
+    ticker_price_to_return: Mutex<Option<Decimal>>,
+    order_book_to_return: Mutex<Option<OrderBookSnapshot>>,
     /// bot-strategy#471: per-call record of `modify_order`
     /// `(symbol, order_id, target_total, open_remaining, price, spread)`,
     /// the count of `cancel_order` calls, and a switch to force amend
@@ -85,6 +87,11 @@ impl DexConnector for DummyConnector {
     ) -> Result<TickerResponse, DexError> {
         Ok(TickerResponse {
             symbol: symbol.to_string(),
+            price: self
+                .ticker_price_to_return
+                .lock()
+                .unwrap()
+                .unwrap_or_default(),
             min_order: *self.min_order_to_return.lock().unwrap(),
             ..Default::default()
         })
@@ -133,7 +140,12 @@ impl DexConnector for DummyConnector {
         _symbol: &str,
         _depth: usize,
     ) -> Result<OrderBookSnapshot, DexError> {
-        Ok(OrderBookSnapshot::default())
+        Ok(self
+            .order_book_to_return
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default())
     }
 
     async fn clear_filled_order(&self, _symbol: &str, _trade_id: &str) -> Result<(), DexError> {
@@ -751,6 +763,23 @@ async fn fetch_equity_rest_bypasses_cache() {
     assert!((engine.instances[0].equity_cache - 777.0).abs() < 1e-6);
 }
 
+#[tokio::test]
+async fn fetch_equity_rest_observe_only_skips_connector() {
+    let connector = Arc::new(DummyConnector::default());
+    *connector.balance_equity.lock().unwrap() = Some(dec("777.0"));
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.observe_only = true;
+    engine.instances[0].last_equity_fetch = None;
+    let seed_cache = engine.instances[0].equity_cache;
+
+    engine.fetch_equity_rest(0).await;
+
+    assert_eq!(connector.balance_calls.load(Ordering::SeqCst), 0);
+    assert!((engine.instances[0].equity_cache - seed_cache).abs() < 1e-9);
+    assert!(!engine.instances[0].equity_initialized);
+    assert!(engine.instances[0].last_equity_fetch.is_some());
+}
+
 // bot-strategy#366: reproduce the restart race that synthesised a 50%
 // DD on Frankfurt Round 4 Step 4 partial. Persisted `equity_samples`
 // hold yesterday's intraday peak (~$1003) but `equity_cache` is the
@@ -1284,6 +1313,90 @@ async fn close_pair_orders_records_taker_mode_after_post_only_fallback() {
     assert!(calls
         .iter()
         .any(|(symbol, _, _, price, _)| symbol == "BBB" && price.is_none()));
+}
+
+#[tokio::test]
+async fn close_pair_orders_records_refreshed_post_only_submit_metadata() {
+    let connector = Arc::new(DummyConnector::default());
+    *connector.ticker_price_to_return.lock().unwrap() = Some(dec("200.0"));
+    *connector.order_book_to_return.lock().unwrap() = Some(OrderBookSnapshot {
+        bids: vec![OrderBookLevel {
+            price: dec("199.0"),
+            size: Decimal::ONE,
+        }],
+        asks: vec![OrderBookLevel {
+            price: dec("201.0"),
+            size: Decimal::ONE,
+        }],
+        book_ts_ms: Some(123),
+    });
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        (
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("100.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: Some(dec("99.0")),
+                ask_price: Some(dec("101.0")),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+                min_order: Some(dec("0.001")),
+                min_tick: None,
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        ),
+        (
+            "BBB".to_string(),
+            SymbolSnapshot {
+                price: dec("50.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: Some(dec("49.0")),
+                ask_price: Some(dec("51.0")),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+                min_order: Some(dec("0.001")),
+                min_tick: None,
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        ),
+    ]);
+
+    let (legs, _) = engine
+        .close_pair_orders(
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+            false,
+        )
+        .await
+        .expect("post-only close should succeed");
+
+    let base_leg = legs.iter().find(|leg| leg.symbol == "AAA").unwrap();
+    assert!(base_leg.post_only);
+    assert_eq!(base_leg.reference_price, Some(dec("99.0")));
+    assert_eq!(base_leg.submit_reference_price, Some(dec("199.0")));
+    assert_eq!(base_leg.submit_mid, Some(dec("200.0")));
+    assert_eq!(base_leg.submit_bid, Some(dec("199.0")));
+    assert_eq!(base_leg.submit_ask, Some(dec("201.0")));
+
+    let quote_leg = legs.iter().find(|leg| leg.symbol == "BBB").unwrap();
+    assert!(quote_leg.post_only);
+    assert_eq!(quote_leg.reference_price, Some(dec("51.0")));
+    assert_eq!(quote_leg.submit_reference_price, Some(dec("201.0")));
+    assert_eq!(quote_leg.submit_mid, Some(dec("200.0")));
+    assert_eq!(quote_leg.submit_bid, Some(dec("199.0")));
+    assert_eq!(quote_leg.submit_ask, Some(dec("201.0")));
 }
 
 /// `register_partial_leg_failure` is the bridge from the engine's
