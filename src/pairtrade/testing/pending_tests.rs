@@ -1438,6 +1438,7 @@ fn register_partial_leg_failure_writes_pending_entry() {
         0,
         "AAA/BBB",
         PositionDirection::LongSpread,
+        0,
         &partial_err,
         false, // is_exit
     );
@@ -1493,6 +1494,7 @@ fn register_partial_leg_failure_writes_pending_exit() {
         0,
         "AAA/BBB",
         PositionDirection::ShortSpread,
+        0,
         &partial_err,
         true, // is_exit
     );
@@ -1525,6 +1527,7 @@ fn register_partial_leg_failure_ignores_non_partial_errors() {
         0,
         "AAA/BBB",
         PositionDirection::LongSpread,
+        0,
         &plain_err,
         false,
     );
@@ -1553,6 +1556,7 @@ fn register_partial_leg_failure_silently_skips_unknown_pair() {
         0,
         "CCC/DDD",
         PositionDirection::LongSpread,
+        0,
         &partial_err,
         false,
     );

@@ -307,6 +307,7 @@ impl PairTradeEngine {
                         plan.pair.quote
                     );
                 } else {
+                    let placed_ts_ms = Utc::now().timestamp_millis();
                     let (legs, exit_taker_takeover_at) = match self
                         .close_pair_orders(&plan.pair, direction, qtys, price_map, force)
                         .await
@@ -314,7 +315,12 @@ impl PairTradeEngine {
                         Ok(out) => out,
                         Err(err) => {
                             self.register_partial_leg_failure(
-                                inst_idx, &plan.key, direction, &err, true,
+                                inst_idx,
+                                &plan.key,
+                                direction,
+                                placed_ts_ms,
+                                &err,
+                                true,
                             );
                             return Err(err);
                         }
@@ -324,7 +330,7 @@ impl PairTradeEngine {
                             legs,
                             direction,
                             placed_at: Instant::now(),
-                            placed_ts_ms: Utc::now().timestamp_millis(),
+                            placed_ts_ms,
                             hedge_retry_count: 0,
                             post_only_hybrid: false,
                             exit_taker_takeover_at,
@@ -559,6 +565,7 @@ impl PairTradeEngine {
                         plan.net_funding_per_hour,
                         now_ts
                     );
+                    let placed_ts_ms = Utc::now().timestamp_millis();
                     let legs = match self
                         .place_pair_orders(inst_idx, &plan.pair, direction, qtys, price_map)
                         .await
@@ -566,7 +573,12 @@ impl PairTradeEngine {
                         Ok(legs) => legs,
                         Err(err) => {
                             self.register_partial_leg_failure(
-                                inst_idx, &plan.key, direction, &err, false,
+                                inst_idx,
+                                &plan.key,
+                                direction,
+                                placed_ts_ms,
+                                &err,
+                                false,
                             );
                             return Err(err);
                         }
@@ -586,7 +598,7 @@ impl PairTradeEngine {
                                 legs,
                                 direction,
                                 placed_at: Instant::now(),
-                                placed_ts_ms: Utc::now().timestamp_millis(),
+                                placed_ts_ms,
                                 hedge_retry_count: 0,
                                 post_only_hybrid: hybrid,
                                 // Entry path — exit_taker_takeover_at only

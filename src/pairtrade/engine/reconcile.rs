@@ -622,6 +622,7 @@ impl PairTradeEngine {
             }
             // Re-attempt closing missing legs based on filled qty,
             // reusing filled_qtys defined earlier.
+            let placed_ts_ms = chrono::Utc::now().timestamp_millis();
             let new_legs = self
                 .retry_exit_remaining_legs(&pending, &filled_qtys, price_map)
                 .await;
@@ -634,7 +635,7 @@ impl PairTradeEngine {
                         legs: new_legs,
                         direction: pending.direction,
                         placed_at: Instant::now(),
-                        placed_ts_ms: chrono::Utc::now().timestamp_millis(),
+                        placed_ts_ms,
                         hedge_retry_count: next_retry,
                         post_only_hybrid: false,
                         // This branch reissues remaining exit legs (post-

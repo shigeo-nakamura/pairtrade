@@ -425,6 +425,7 @@ impl PairTradeEngine {
         &mut self,
         request: ReissuePartialLegsRequest<'_>,
     ) -> Result<Option<PendingOrders>> {
+        let placed_ts_ms = chrono::Utc::now().timestamp_millis();
         let ReissuePartialLegsRequest {
             pending,
             filled_qtys,
@@ -628,7 +629,7 @@ impl PairTradeEngine {
             legs: new_legs,
             direction: pending.direction,
             placed_at: Instant::now(),
-            placed_ts_ms: chrono::Utc::now().timestamp_millis(),
+            placed_ts_ms,
             hedge_retry_count: retry_count,
             post_only_hybrid: false,
             // The reissue is itself the taker-takeover step (either market or
@@ -644,6 +645,7 @@ impl PairTradeEngine {
         pending: &PendingOrders,
         price_map: &HashMap<String, SymbolSnapshot>,
     ) -> Result<Option<PendingOrders>> {
+        let placed_ts_ms = chrono::Utc::now().timestamp_millis();
         let mut new_legs = Vec::new();
         for leg in &pending.legs {
             let size = self.quantize_order_size(&leg.symbol, leg.target, price_map);
@@ -709,7 +711,7 @@ impl PairTradeEngine {
             legs: new_legs,
             direction: pending.direction,
             placed_at: Instant::now(),
-            placed_ts_ms: chrono::Utc::now().timestamp_millis(),
+            placed_ts_ms,
             hedge_retry_count: 0,
             post_only_hybrid: false,
             // Entry path — no exit takeover deadline.
@@ -1425,6 +1427,7 @@ impl PairTradeEngine {
         inst_idx: usize,
         key: &str,
         direction: PositionDirection,
+        placed_ts_ms: i64,
         err: &anyhow::Error,
         is_exit: bool,
     ) {
@@ -1434,7 +1437,7 @@ impl PairTradeEngine {
                     legs: partial.legs().to_vec(),
                     direction,
                     placed_at: Instant::now(),
-                    placed_ts_ms: chrono::Utc::now().timestamp_millis(),
+                    placed_ts_ms,
                     hedge_retry_count: 0,
                     post_only_hybrid: false,
                     // Partial-failure recovery — let the next reconcile tick

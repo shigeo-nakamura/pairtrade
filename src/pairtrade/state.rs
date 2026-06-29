@@ -119,10 +119,10 @@ pub(super) struct PendingOrders {
     pub(super) legs: Vec<PendingLeg>,
     pub(super) direction: PositionDirection,
     pub(super) placed_at: Instant,
-    /// Wall-clock placement time in Unix epoch milliseconds. Captured at
-    /// every PendingOrders construction (including reissue paths) so the
-    /// per-leg fill-latency histogram (#314 Group 4-C) can compare against
-    /// the venue-reported `FilledOrder.filled_ts_ms`. `placed_at` is a
+    /// Wall-clock decision / placement-request time in Unix epoch
+    /// milliseconds. Captured before order submission (including reissue
+    /// paths) so ledger rows can compare decision -> submit -> fill timing
+    /// against venue-reported `FilledOrder.filled_ts_ms`. `placed_at` is a
     /// monotonic `Instant` and not directly comparable to wall-clock fill
     /// timestamps, hence this parallel field.
     pub(super) placed_ts_ms: i64,
