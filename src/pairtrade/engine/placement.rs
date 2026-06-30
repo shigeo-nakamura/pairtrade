@@ -740,6 +740,10 @@ impl PairTradeEngine {
         let mut attempt = 0usize;
         #[allow(unused_assignments)]
         let mut last_limit: Option<Decimal> = None;
+        // Carry the most recent refreshed book snapshot so a taker fallback
+        // (below) can price submit metadata against the book the last post-only
+        // attempt actually saw, instead of the stale decision-time `prices` map.
+        let mut last_submit_snapshot: Option<SymbolSnapshot> = None;
 
         let last_err = loop {
             attempt += 1;
@@ -758,6 +762,9 @@ impl PairTradeEngine {
                 )));
             }
             last_limit = limit;
+            if submit_snapshot.is_some() {
+                last_submit_snapshot = submit_snapshot.clone();
+            }
             let spread = self.order_spread_param(limit, use_post_only);
             let meta = match submit_snapshot.as_ref() {
                 Some(snapshot) => {
@@ -828,7 +835,12 @@ impl PairTradeEngine {
                     .unwrap_or_else(|| "?".into()),
                 format!("{:?}", last_err).chars().take(160).collect::<String>(),
             );
-            let meta = self.order_submit_metadata(symbol, size, side, prices);
+            let meta = match last_submit_snapshot.as_ref() {
+                Some(snapshot) => {
+                    self.order_submit_metadata_from_snapshot(symbol, size, side, snapshot)
+                }
+                None => self.order_submit_metadata(symbol, size, side, prices),
+            };
             return self
                 .connector
                 .create_order(symbol, size, side, None, None, reduce_only, None)

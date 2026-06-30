@@ -1399,6 +1399,100 @@ async fn close_pair_orders_records_refreshed_post_only_submit_metadata() {
     assert_eq!(quote_leg.submit_ask, Some(dec("201.0")));
 }
 
+/// When post-only attempts exhaust and the order falls back to taker, the
+/// submit metadata must come from the *last refreshed* book snapshot the retry
+/// loop saw, not the stale decision-time `price_map`. Codex review PR #159:
+/// otherwise `slippage_bps_vs_submit` folds in pre-submit market movement.
+#[tokio::test]
+async fn taker_fallback_records_refreshed_submit_metadata() {
+    let connector = Arc::new(DummyConnector::default());
+    // Force every priced (post-only) order to fail → exhaust retries → taker.
+    connector.reject_priced_orders.store(true, Ordering::SeqCst);
+    // Refreshed book/ticker differs from the decision-time price_map below.
+    *connector.ticker_price_to_return.lock().unwrap() = Some(dec("200.0"));
+    *connector.order_book_to_return.lock().unwrap() = Some(OrderBookSnapshot {
+        bids: vec![OrderBookLevel {
+            price: dec("199.0"),
+            size: Decimal::ONE,
+        }],
+        asks: vec![OrderBookLevel {
+            price: dec("201.0"),
+            size: Decimal::ONE,
+        }],
+        book_ts_ms: Some(123),
+    });
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+    engine.cfg.default_pair_params.exit_post_only_timeout_secs = 30;
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        (
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("100.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: Some(dec("99.0")),
+                ask_price: Some(dec("101.0")),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+                min_order: Some(dec("0.001")),
+                min_tick: None,
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        ),
+        (
+            "BBB".to_string(),
+            SymbolSnapshot {
+                price: dec("50.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: Some(dec("49.0")),
+                ask_price: Some(dec("51.0")),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+                min_order: Some(dec("0.001")),
+                min_tick: None,
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        ),
+    ]);
+
+    let (legs, _) = engine
+        .close_pair_orders(
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+            false,
+        )
+        .await
+        .expect("fallback taker close should succeed");
+
+    // Legs actually fell back to taker (unpriced).
+    assert!(legs.iter().all(|leg| !leg.post_only));
+    assert!(legs.iter().all(|leg| leg.limit_price.is_none()));
+
+    // submit_* reflect the refreshed book (199/200/201), NOT the stale
+    // price_map (which would give bid 99 / ask 101 for the base leg).
+    let base_leg = legs.iter().find(|leg| leg.symbol == "AAA").unwrap();
+    assert_eq!(base_leg.submit_reference_price, Some(dec("199.0")));
+    assert_eq!(base_leg.submit_mid, Some(dec("200.0")));
+    assert_eq!(base_leg.submit_bid, Some(dec("199.0")));
+    assert_eq!(base_leg.submit_ask, Some(dec("201.0")));
+
+    let quote_leg = legs.iter().find(|leg| leg.symbol == "BBB").unwrap();
+    assert_eq!(quote_leg.submit_reference_price, Some(dec("201.0")));
+    assert_eq!(quote_leg.submit_mid, Some(dec("200.0")));
+    assert_eq!(quote_leg.submit_bid, Some(dec("199.0")));
+    assert_eq!(quote_leg.submit_ask, Some(dec("201.0")));
+}
+
 /// `register_partial_leg_failure` is the bridge from the engine's
 /// place-leg error path back into per-pair pending state. An entry
 /// failure must land in `pending_entry` so the next reconcile tick
