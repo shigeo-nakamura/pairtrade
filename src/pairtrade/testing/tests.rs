@@ -305,6 +305,7 @@ fn make_leg(symbol: &str, target: Decimal) -> PendingLeg {
         reference_price: None,
         submit_ts_ms: 0,
         ack_ts_ms: None,
+        decision_ts_ms: 0,
         submit_reference_price: None,
         submit_mid: None,
         submit_bid: None,

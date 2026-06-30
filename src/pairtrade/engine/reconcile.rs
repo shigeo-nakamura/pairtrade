@@ -631,19 +631,22 @@ impl PairTradeEngine {
                     state.pending_exit = None;
                     // Keep position state unchanged; will retry next loop
                 } else {
-                    state.pending_exit = Some(PendingOrders {
-                        legs: new_legs,
-                        direction: pending.direction,
-                        placed_at: Instant::now(),
-                        placed_ts_ms,
-                        hedge_retry_count: next_retry,
-                        post_only_hybrid: false,
-                        // This branch reissues remaining exit legs (post-
-                        // only retry, not taker); the dedicated post-only
-                        // takeover deadline does not apply here — the
-                        // generic `order_timeout_secs` will govern.
-                        exit_taker_takeover_at: None,
-                    });
+                    state.pending_exit = Some(
+                        PendingOrders {
+                            legs: new_legs,
+                            direction: pending.direction,
+                            placed_at: Instant::now(),
+                            placed_ts_ms,
+                            hedge_retry_count: next_retry,
+                            post_only_hybrid: false,
+                            // This branch reissues remaining exit legs (post-
+                            // only retry, not taker); the dedicated post-only
+                            // takeover deadline does not apply here — the
+                            // generic `order_timeout_secs` will govern.
+                            exit_taker_takeover_at: None,
+                        }
+                        .with_leg_decision_ts(),
+                    );
                 }
             }
         } else if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
@@ -1390,7 +1393,15 @@ impl PairTradeEngine {
                 pair: pair.to_string(),
                 phase: phase.to_string(),
                 close_reason: close_reason.map(str::to_string),
-                ts_decision_ms: placed_ts_ms,
+                // Per-leg decision time: a leg carried forward by a reissue
+                // (kept/settled) keeps its original decision time, so its row
+                // doesn't report a decision after its own submit/fill (Codex
+                // review PR #159). Unstamped legs fall back to the group time.
+                ts_decision_ms: if leg.decision_ts_ms > 0 {
+                    leg.decision_ts_ms
+                } else {
+                    placed_ts_ms
+                },
                 ts_submit_ms: leg.submit_ts_ms,
                 ts_ack_ms: leg.ack_ts_ms,
                 leg_symbol: leg.symbol.clone(),
@@ -1548,6 +1559,7 @@ mod tests {
             reference_price: None,
             submit_ts_ms: 0,
             ack_ts_ms: None,
+            decision_ts_ms: 0,
             submit_reference_price: None,
             submit_mid: None,
             submit_bid: None,
@@ -1576,6 +1588,7 @@ mod tests {
             reference_price: None,
             submit_ts_ms: 0,
             ack_ts_ms: None,
+            decision_ts_ms: 0,
             submit_reference_price: None,
             submit_mid: None,
             submit_bid: None,
@@ -1596,6 +1609,43 @@ mod tests {
             post_only_hybrid: false,
             exit_taker_takeover_at: None,
         }
+    }
+
+    fn pending_at(legs: Vec<PendingLeg>, placed_ts_ms: i64) -> PendingOrders {
+        let mut p = pending(legs);
+        p.placed_ts_ms = placed_ts_ms;
+        p
+    }
+
+    /// Codex review PR #159: a leg carried forward by a reissue (cloned via
+    /// `kept_leg`/`settled_leg`, which preserves `decision_ts_ms`) must keep
+    /// its original decision time, while a freshly placed leg inherits the new
+    /// group's `placed_ts_ms`. Otherwise the carried filled leg's ledger
+    /// `ts_decision_ms` would jump to the reissue time — after its own
+    /// submit/fill.
+    #[test]
+    fn with_leg_decision_ts_stamps_fresh_legs_and_preserves_carried() {
+        // First placement at T=1000: both legs are fresh (decision_ts_ms == 0)
+        // and must inherit the group time.
+        let original = pending_at(
+            vec![leg("AAA", "a", "1", "1"), leg("BBB", "b", "1", "0")],
+            1000,
+        )
+        .with_leg_decision_ts();
+        assert_eq!(original.legs[0].decision_ts_ms, 1000);
+        assert_eq!(original.legs[1].decision_ts_ms, 1000);
+
+        // Reissue at T=2000: carry leg AAA forward (clone preserves its 1000),
+        // add a freshly placed remainder leg (decision_ts_ms == 0).
+        let carried = original.legs[0].clone();
+        assert_eq!(carried.decision_ts_ms, 1000);
+        let reissued =
+            pending_at(vec![carried, leg("AAA", "a2", "1", "0")], 2000).with_leg_decision_ts();
+
+        // Carried leg keeps its original decision time; the fresh leg takes
+        // the reissue time.
+        assert_eq!(reissued.legs[0].decision_ts_ms, 1000);
+        assert_eq!(reissued.legs[1].decision_ts_ms, 2000);
     }
 
     #[test]

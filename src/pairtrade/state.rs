@@ -99,6 +99,16 @@ pub(super) struct PendingLeg {
     /// and the book snapshot visible at submission after fills arrive later.
     pub(super) submit_ts_ms: i64,
     pub(super) ack_ts_ms: Option<i64>,
+    /// Wall-clock decision time (Unix epoch ms) for *this* leg. Stamped from
+    /// the owning `PendingOrders.placed_ts_ms` when the leg is first placed
+    /// (`PendingOrders::with_leg_decision_ts`), then carried verbatim when a
+    /// reissue keeps/settles an already-filled leg forward. Without this, a
+    /// carried filled leg would inherit the *reissue* group's `placed_ts_ms`,
+    /// making its ledger `ts_decision_ms` land after its own submit/fill and
+    /// corrupting the decision -> submit timing (Codex review PR #159). `0`
+    /// means "not yet stamped" — the ledger then falls back to the group
+    /// `placed_ts_ms`.
+    pub(super) decision_ts_ms: i64,
     pub(super) submit_reference_price: Option<Decimal>,
     pub(super) submit_mid: Option<Decimal>,
     pub(super) submit_bid: Option<Decimal>,
@@ -135,6 +145,25 @@ pub(super) struct PendingOrders {
     /// the synchronous `monitor_exit_legs_with_timeout` flow that blocked
     /// `step()` for the full timeout (bot-strategy#408).
     pub(super) exit_taker_takeover_at: Option<Instant>,
+}
+
+impl PendingOrders {
+    /// Stamp this group's `placed_ts_ms` onto every leg that does not already
+    /// carry a decision timestamp. Freshly placed/reissued legs arrive with
+    /// `decision_ts_ms == 0` and inherit this group's placement time; legs
+    /// carried forward from a prior cycle (kept/settled in a reissue) already
+    /// hold their original decision time and are left untouched, so their
+    /// ledger rows don't report a decision *after* their own submit/fill
+    /// (Codex review PR #159). Call once at every `PendingOrders`
+    /// construction that becomes the live pending state.
+    pub(super) fn with_leg_decision_ts(mut self) -> Self {
+        for leg in &mut self.legs {
+            if leg.decision_ts_ms == 0 {
+                leg.decision_ts_ms = self.placed_ts_ms;
+            }
+        }
+        self
+    }
 }
 
 #[derive(Debug)]

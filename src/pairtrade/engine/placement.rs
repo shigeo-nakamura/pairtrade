@@ -221,6 +221,10 @@ impl PairTradeEngine {
             reference_price,
             submit_ts_ms: result.submit_ts_ms,
             ack_ts_ms: result.ack_ts_ms,
+            // Stamped from the owning PendingOrders.placed_ts_ms via
+            // `with_leg_decision_ts` after the group is built; a fresh leg
+            // starts at 0 so it inherits this placement's decision time.
+            decision_ts_ms: 0,
             submit_reference_price: result.submit_reference_price,
             submit_mid: result.submit_mid,
             submit_bid: result.submit_bid,
@@ -625,18 +629,23 @@ impl PairTradeEngine {
         if new_legs.is_empty() {
             return Ok(None);
         }
-        Ok(Some(PendingOrders {
-            legs: new_legs,
-            direction: pending.direction,
-            placed_at: Instant::now(),
-            placed_ts_ms,
-            hedge_retry_count: retry_count,
-            post_only_hybrid: false,
-            // The reissue is itself the taker-takeover step (either market or
-            // a fresh post-only attempt budgeted by `order_timeout_secs`);
-            // no further dedicated post-only takeover deadline applies.
-            exit_taker_takeover_at: None,
-        }))
+        Ok(Some(
+            PendingOrders {
+                legs: new_legs,
+                direction: pending.direction,
+                placed_at: Instant::now(),
+                placed_ts_ms,
+                hedge_retry_count: retry_count,
+                post_only_hybrid: false,
+                // The reissue is itself the taker-takeover step (either market
+                // or a fresh post-only attempt budgeted by `order_timeout_secs`);
+                // no further dedicated post-only takeover deadline applies.
+                exit_taker_takeover_at: None,
+            }
+            // Fresh reissue legs inherit this reissue's decision time; legs
+            // kept/settled forward keep their original decision time.
+            .with_leg_decision_ts(),
+        ))
     }
 
     pub(in crate::pairtrade) async fn reissue_entry_as_taker(
@@ -707,16 +716,19 @@ impl PairTradeEngine {
         if new_legs.is_empty() {
             return Ok(None);
         }
-        Ok(Some(PendingOrders {
-            legs: new_legs,
-            direction: pending.direction,
-            placed_at: Instant::now(),
-            placed_ts_ms,
-            hedge_retry_count: 0,
-            post_only_hybrid: false,
-            // Entry path — no exit takeover deadline.
-            exit_taker_takeover_at: None,
-        }))
+        Ok(Some(
+            PendingOrders {
+                legs: new_legs,
+                direction: pending.direction,
+                placed_at: Instant::now(),
+                placed_ts_ms,
+                hedge_retry_count: 0,
+                post_only_hybrid: false,
+                // Entry path — no exit takeover deadline.
+                exit_taker_takeover_at: None,
+            }
+            .with_leg_decision_ts(),
+        ))
     }
 
     async fn create_order_with_post_only_retry(
@@ -1460,7 +1472,8 @@ impl PairTradeEngine {
                     // Partial-failure recovery — let the next reconcile tick
                     // decide normal-timeout behavior; no fast takeover.
                     exit_taker_takeover_at: None,
-                };
+                }
+                .with_leg_decision_ts();
                 if is_exit {
                     state.pending_exit = Some(pending);
                 } else {
@@ -1502,6 +1515,7 @@ mod tests {
             reference_price: Some(dec("100.80")),
             submit_ts_ms: 0,
             ack_ts_ms: None,
+            decision_ts_ms: 0,
             submit_reference_price: None,
             submit_mid: None,
             submit_bid: None,
