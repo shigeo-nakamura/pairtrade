@@ -60,6 +60,13 @@ struct DummyConnector {
     cancel_order_calls: AtomicUsize,
     modify_should_fail: AtomicBool,
     reject_priced_orders: AtomicBool,
+    /// Codex review PR #159: count of `get_ticker` calls and an optional
+    /// threshold after which `get_ticker` starts failing. With one ticker
+    /// call per post-only retry attempt, this lets a test make the *first*
+    /// refresh succeed and later/last attempts fail, exercising the
+    /// "clear the cached submit snapshot when refresh fails" path.
+    ticker_calls: AtomicUsize,
+    ticker_fail_after_calls: Mutex<Option<usize>>,
 }
 
 #[async_trait]
@@ -85,6 +92,15 @@ impl DexConnector for DummyConnector {
         symbol: &str,
         _test_price: Option<Decimal>,
     ) -> Result<TickerResponse, DexError> {
+        let calls = self.ticker_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(threshold) = *self.ticker_fail_after_calls.lock().unwrap() {
+            if calls > threshold {
+                return Err(DexError::Transient(format!(
+                    "ticker refresh forced failure for {} (call {})",
+                    symbol, calls
+                )));
+            }
+        }
         Ok(TickerResponse {
             symbol: symbol.to_string(),
             price: self
@@ -1491,6 +1507,104 @@ async fn taker_fallback_records_refreshed_submit_metadata() {
     assert_eq!(quote_leg.submit_mid, Some(dec("200.0")));
     assert_eq!(quote_leg.submit_bid, Some(dec("199.0")));
     assert_eq!(quote_leg.submit_ask, Some(dec("201.0")));
+}
+
+/// Codex review PR #159 (placement.rs:767): when a post-only leg refreshes its
+/// book on an early retry but the *final* attempt's refresh fails, the taker
+/// fallback must price submit metadata against the snapshot the last attempt
+/// actually saw — i.e. drop to the decision-time `price_map` — not reuse the
+/// earlier refresh across the retry gap. Otherwise `slippage_bps_vs_submit`
+/// folds in market movement from before the final submit.
+#[tokio::test]
+async fn taker_fallback_drops_stale_refresh_when_final_attempt_refresh_fails() {
+    let connector = Arc::new(DummyConnector::default());
+    // Every priced (post-only) order fails → all 3 exit attempts exhaust → taker.
+    connector.reject_priced_orders.store(true, Ordering::SeqCst);
+    // Only the very first ticker refresh succeeds (base leg, attempt 1). Every
+    // later attempt's refresh fails, so the base leg's *last* attempt sees no
+    // fresh snapshot and the quote leg never refreshes at all.
+    *connector.ticker_fail_after_calls.lock().unwrap() = Some(1);
+    // The (single) successful refresh would report a book far from the
+    // decision-time price_map, so a stale-reuse bug is visible.
+    *connector.ticker_price_to_return.lock().unwrap() = Some(dec("200.0"));
+    *connector.order_book_to_return.lock().unwrap() = Some(OrderBookSnapshot {
+        bids: vec![OrderBookLevel {
+            price: dec("199.0"),
+            size: Decimal::ONE,
+        }],
+        asks: vec![OrderBookLevel {
+            price: dec("201.0"),
+            size: Decimal::ONE,
+        }],
+        book_ts_ms: Some(123),
+    });
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+    engine.cfg.default_pair_params.exit_post_only_timeout_secs = 30;
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        (
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("100.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: Some(dec("99.0")),
+                ask_price: Some(dec("101.0")),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+                min_order: Some(dec("0.001")),
+                min_tick: None,
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        ),
+        (
+            "BBB".to_string(),
+            SymbolSnapshot {
+                price: dec("50.0"),
+                funding_rate: Decimal::ZERO,
+                bid_price: Some(dec("49.0")),
+                ask_price: Some(dec("51.0")),
+                bid_size: Decimal::ONE,
+                ask_size: Decimal::ONE,
+                min_order: Some(dec("0.001")),
+                min_tick: None,
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        ),
+    ]);
+
+    let (legs, _) = engine
+        .close_pair_orders(
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+            false,
+        )
+        .await
+        .expect("fallback taker close should succeed");
+
+    assert!(legs.iter().all(|leg| !leg.post_only));
+    assert!(legs.iter().all(|leg| leg.limit_price.is_none()));
+
+    // Base leg refreshed on attempt 1 but its final attempt's refresh failed,
+    // so submit_* must come from the decision-time price_map (bid 99 / ask 101),
+    // NOT the earlier refresh (which would give 199/201).
+    let base_leg = legs.iter().find(|leg| leg.symbol == "AAA").unwrap();
+    assert_eq!(base_leg.submit_bid, Some(dec("99.0")));
+    assert_eq!(base_leg.submit_ask, Some(dec("101.0")));
+
+    // Quote leg never refreshed → also the decision-time price_map.
+    let quote_leg = legs.iter().find(|leg| leg.symbol == "BBB").unwrap();
+    assert_eq!(quote_leg.submit_bid, Some(dec("49.0")));
+    assert_eq!(quote_leg.submit_ask, Some(dec("51.0")));
 }
 
 /// `register_partial_leg_failure` is the bridge from the engine's

@@ -743,6 +743,7 @@ impl PairTradeEngine {
         // Carry the most recent refreshed book snapshot so a taker fallback
         // (below) can price submit metadata against the book the last post-only
         // attempt actually saw, instead of the stale decision-time `prices` map.
+        #[allow(unused_assignments)]
         let mut last_submit_snapshot: Option<SymbolSnapshot> = None;
 
         let last_err = loop {
@@ -762,9 +763,13 @@ impl PairTradeEngine {
                 )));
             }
             last_limit = limit;
-            if submit_snapshot.is_some() {
-                last_submit_snapshot = submit_snapshot.clone();
-            }
+            // Track the submit source of *this* attempt unconditionally so a
+            // later taker fallback prices its metadata against the book the
+            // final failed post-only attempt actually saw. If this attempt got
+            // no fresh snapshot (refresh returned None), clear the cache so the
+            // fallback drops to the decision-time `prices` map rather than
+            // reusing an earlier attempt's stale refresh across the retry gap.
+            last_submit_snapshot = submit_snapshot.clone();
             let spread = self.order_spread_param(limit, use_post_only);
             let meta = match submit_snapshot.as_ref() {
                 Some(snapshot) => {
