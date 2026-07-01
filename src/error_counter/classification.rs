@@ -34,6 +34,22 @@ pub(super) fn is_ws_transient_event(msg: &str) -> bool {
         || msg.starts_with("account stream error:")
 }
 
+/// Match WARN lines that should remain in journalctl but should not page
+/// `error_summary` / auto-error by themselves. These messages describe a
+/// retry or a temporary fallback whose final failure path logs a separate,
+/// actionable WARN/ERROR if recovery does not happen.
+pub(super) fn is_non_actionable_warn_event(msg: &str) -> bool {
+    is_step_overrun_assoc_warn_event(msg)
+        || (msg.starts_with("[WS_BARS] dropped ") && msg.contains("slow consumer"))
+}
+
+/// Match non-actionable WARNs that can explain a nearby STEP_OVERRUN.
+/// Do not include downstream slow-consumer notices: a slow step can
+/// itself cause a WS_BARS dropped-ticks warning on the next receiver poll.
+pub(super) fn is_step_overrun_assoc_warn_event(msg: &str) -> bool {
+    msg.starts_with("fetch_account: HTTP 429 from Lighter") && msg.contains("retrying after")
+}
+
 /// Match log lines that signal a successful WS reconnect. Drains pending
 /// transient entries logged within the past `WS_DEFER_WINDOW_SECS`.
 pub(super) fn is_ws_recovery_event(msg: &str) -> bool {
@@ -51,10 +67,9 @@ pub(super) fn is_step_overrun_event(msg: &str) -> bool {
     msg.contains("[STEP_OVERRUN]")
 }
 
-/// Match the `[ORDER] X entry orders filled` / `[ORDER] X exit orders filled`
-/// log lines that drain pending STEP_OVERRUN entries. A successful trade
-/// completion within the defer window is taken as proof the slow step()
-/// was waiting on order management (not a real stall).
+/// Match log lines that drain pending STEP_OVERRUN entries. A successful
+/// trade completion within the defer window is taken as proof the slow
+/// step() was waiting on order management, not a stuck loop.
 pub(super) fn is_step_overrun_recovery_event(msg: &str) -> bool {
     msg.contains("entry orders filled") || msg.contains("exit orders filled")
 }
