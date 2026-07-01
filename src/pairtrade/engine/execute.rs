@@ -307,6 +307,7 @@ impl PairTradeEngine {
                         plan.pair.quote
                     );
                 } else {
+                    let placed_ts_ms = Utc::now().timestamp_millis();
                     let (legs, exit_taker_takeover_at) = match self
                         .close_pair_orders(&plan.pair, direction, qtys, price_map, force)
                         .await
@@ -314,21 +315,29 @@ impl PairTradeEngine {
                         Ok(out) => out,
                         Err(err) => {
                             self.register_partial_leg_failure(
-                                inst_idx, &plan.key, direction, &err, true,
+                                inst_idx,
+                                &plan.key,
+                                direction,
+                                placed_ts_ms,
+                                &err,
+                                true,
                             );
                             return Err(err);
                         }
                     };
                     if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
-                        state.pending_exit = Some(PendingOrders {
-                            legs,
-                            direction,
-                            placed_at: Instant::now(),
-                            placed_ts_ms: Utc::now().timestamp_millis(),
-                            hedge_retry_count: 0,
-                            post_only_hybrid: false,
-                            exit_taker_takeover_at,
-                        });
+                        state.pending_exit = Some(
+                            PendingOrders {
+                                legs,
+                                direction,
+                                placed_at: Instant::now(),
+                                placed_ts_ms,
+                                hedge_retry_count: 0,
+                                post_only_hybrid: false,
+                                exit_taker_takeover_at,
+                            }
+                            .with_leg_decision_ts(),
+                        );
                     }
                 }
             }
@@ -559,6 +568,7 @@ impl PairTradeEngine {
                         plan.net_funding_per_hour,
                         now_ts
                     );
+                    let placed_ts_ms = Utc::now().timestamp_millis();
                     let legs = match self
                         .place_pair_orders(inst_idx, &plan.pair, direction, qtys, price_map)
                         .await
@@ -566,7 +576,12 @@ impl PairTradeEngine {
                         Ok(legs) => legs,
                         Err(err) => {
                             self.register_partial_leg_failure(
-                                inst_idx, &plan.key, direction, &err, false,
+                                inst_idx,
+                                &plan.key,
+                                direction,
+                                placed_ts_ms,
+                                &err,
+                                false,
                             );
                             return Err(err);
                         }
@@ -582,17 +597,20 @@ impl PairTradeEngine {
                         let hybrid =
                             entry_pp.entry_post_only_timeout_secs > 0 && self.post_only_supported();
                         if let Some(state) = self.instances[inst_idx].states.get_mut(&plan.key) {
-                            state.pending_entry = Some(PendingOrders {
-                                legs,
-                                direction,
-                                placed_at: Instant::now(),
-                                placed_ts_ms: Utc::now().timestamp_millis(),
-                                hedge_retry_count: 0,
-                                post_only_hybrid: hybrid,
-                                // Entry path — exit_taker_takeover_at only
-                                // applies to exit pending orders (#408).
-                                exit_taker_takeover_at: None,
-                            });
+                            state.pending_entry = Some(
+                                PendingOrders {
+                                    legs,
+                                    direction,
+                                    placed_at: Instant::now(),
+                                    placed_ts_ms,
+                                    hedge_retry_count: 0,
+                                    post_only_hybrid: hybrid,
+                                    // Entry path — exit_taker_takeover_at only
+                                    // applies to exit pending orders (#408).
+                                    exit_taker_takeover_at: None,
+                                }
+                                .with_leg_decision_ts(),
+                            );
                         }
                     }
                 }

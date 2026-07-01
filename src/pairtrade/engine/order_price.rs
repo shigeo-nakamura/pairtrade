@@ -13,6 +13,11 @@ use super::super::order_pricing;
 use super::super::util::{enforce_post_only_passive, round_price_by_tick};
 use super::super::PairTradeEngine;
 
+pub(in crate::pairtrade) struct RefreshedLimitPrice {
+    pub(in crate::pairtrade) limit: Decimal,
+    pub(in crate::pairtrade) submit_snapshot: Option<SymbolSnapshot>,
+}
+
 impl PairTradeEngine {
     pub(in crate::pairtrade) fn post_only_supported(&self) -> bool {
         let dex = self.cfg.dex_name.to_ascii_lowercase();
@@ -84,9 +89,14 @@ impl PairTradeEngine {
         symbol: &str,
         side: dex_connector::OrderSide,
         prices: &HashMap<String, SymbolSnapshot>,
-    ) -> Option<Decimal> {
+    ) -> Option<RefreshedLimitPrice> {
         match self.refresh_symbol_snapshot(symbol).await {
-            Ok(snapshot) => self.limit_price_for_snapshot(symbol, side, &snapshot),
+            Ok(snapshot) => self
+                .limit_price_for_snapshot(symbol, side, &snapshot)
+                .map(|limit| RefreshedLimitPrice {
+                    limit,
+                    submit_snapshot: Some(snapshot),
+                }),
             Err(err) => {
                 log::debug!(
                     "[ORDER] Failed to refresh price snapshot for {}: {:?}",
@@ -94,6 +104,10 @@ impl PairTradeEngine {
                     err
                 );
                 self.limit_price_for(symbol, side, prices)
+                    .map(|limit| RefreshedLimitPrice {
+                        limit,
+                        submit_snapshot: None,
+                    })
             }
         }
     }

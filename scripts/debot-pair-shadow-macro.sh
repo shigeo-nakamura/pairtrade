@@ -9,8 +9,8 @@
 #   EURUSD/GBPUSD, equity NVDA/AMD — real ~5s cadence + real L1 quotes).
 # - Reuses the canary's Lighter sub-account credentials
 #   (debot-pair-canary.env). Safe because observe mode signs no transactions
-#   (no nonce contention); it only adds WS/REST read load, which the
-#   lighter-ratelimit sidecar already arbitrates.
+#   (no nonce contention). REST fallback is disabled, so it only consumes
+#   Lighter WS market data.
 # - Always uses the latest /opt/debot/bin/debot deployed by CI, but is NOT in
 #   the ci.yml auto-restart allowlist — restart manually after deploys if a
 #   dump-format change matters (none expected).
@@ -34,12 +34,17 @@ export DEBOT_STATUS_DIR="${DEBOT_STATUS_DIR:-/home/ec2-user/debot_status}"
 export DEBOT_STATUS_ID=debot-pair-shadow-macro
 export PAIRTRADE_CONFIG_PATH=/opt/debot/configs/pairtrade/debot-pair-shadow-macro.yaml
 
-# Perps-only, same as main (bot-strategy#128)
+# Perps-only, same as main (bot-strategy#128). Disable Lighter REST
+# market-data fallback so this observe-only collector cannot consume the live
+# bot's REST budget when WS is stale.
 export LIGHTER_SKIP_SPOT_MARKETS=1
+export LIGHTER_DISABLE_REST_FALLBACK=1
 
-# Fail before the observer starts if any configured leg is not a canonical
-# Lighter perp symbol; otherwise one bad leg makes every tick fail before dump.
-python3 "$ENV_DIR/check_lighter_config_markets.py" "$PAIRTRADE_CONFIG_PATH"
+# Optional REST preflight for manual config changes. Disabled by default because
+# this observer must not spend Lighter REST budget during normal startup.
+if [ "${LIGHTER_ALLOW_SHADOW_STARTUP_REST:-0}" = "1" ]; then
+    python3 "$ENV_DIR/check_lighter_config_markets.py" "$PAIRTRADE_CONFIG_PATH"
+fi
 
 # Own ack sentinel (bot-strategy#488 pattern); unused in observe mode but
 # keeps the path disjoint from main/canary/sol/shadow.

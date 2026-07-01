@@ -75,6 +75,10 @@ pub(super) struct PendingLeg {
     pub(super) target: Decimal,
     pub(super) filled: Decimal,
     pub(super) side: dex_connector::OrderSide,
+    /// Quantity submitted to the connector for this live order. This can
+    /// differ from `target` when the exchange adjusts size or when an amend
+    /// keeps the original target while replacing only the open remainder.
+    pub(super) submitted_qty: Decimal,
     /// Limit price posted for this leg, when placed as a limit/post-only
     /// order. `None` for market orders and for reissue paths that do not
     /// carry a limit forward. Used by the post-only fallback instrumentation
@@ -90,6 +94,27 @@ pub(super) struct PendingLeg {
     /// 4-B-2) so taker fallbacks — where `limit_price = None` — still
     /// produce a measurable adverse-slippage signal.
     pub(super) reference_price: Option<Decimal>,
+    /// Per-order submission metadata captured around the connector call. Kept
+    /// on the leg so the execution ledger can reconstruct submit/ack timing
+    /// and the book snapshot visible at submission after fills arrive later.
+    pub(super) submit_ts_ms: i64,
+    pub(super) ack_ts_ms: Option<i64>,
+    /// Wall-clock decision time (Unix epoch ms) for *this* leg. Stamped from
+    /// the owning `PendingOrders.placed_ts_ms` when the leg is first placed
+    /// (`PendingOrders::with_leg_decision_ts`), then carried verbatim when a
+    /// reissue keeps/settles an already-filled leg forward. Without this, a
+    /// carried filled leg would inherit the *reissue* group's `placed_ts_ms`,
+    /// making its ledger `ts_decision_ms` land after its own submit/fill and
+    /// corrupting the decision -> submit timing (Codex review PR #159). `0`
+    /// means "not yet stamped" — the ledger then falls back to the group
+    /// `placed_ts_ms`.
+    pub(super) decision_ts_ms: i64,
+    pub(super) submit_reference_price: Option<Decimal>,
+    pub(super) submit_mid: Option<Decimal>,
+    pub(super) submit_bid: Option<Decimal>,
+    pub(super) submit_ask: Option<Decimal>,
+    pub(super) client_order_id: Option<String>,
+    pub(super) reduce_only: bool,
     /// Whether the resting order was placed post-only (maker). The amend
     /// path (bot-strategy#471) must re-assert this flag verbatim:
     /// Extended's cancel-replace edit only permits price/size changes, and
@@ -104,10 +129,10 @@ pub(super) struct PendingOrders {
     pub(super) legs: Vec<PendingLeg>,
     pub(super) direction: PositionDirection,
     pub(super) placed_at: Instant,
-    /// Wall-clock placement time in Unix epoch milliseconds. Captured at
-    /// every PendingOrders construction (including reissue paths) so the
-    /// per-leg fill-latency histogram (#314 Group 4-C) can compare against
-    /// the venue-reported `FilledOrder.filled_ts_ms`. `placed_at` is a
+    /// Wall-clock decision / placement-request time in Unix epoch
+    /// milliseconds. Captured before order submission (including reissue
+    /// paths) so ledger rows can compare decision -> submit -> fill timing
+    /// against venue-reported `FilledOrder.filled_ts_ms`. `placed_at` is a
     /// monotonic `Instant` and not directly comparable to wall-clock fill
     /// timestamps, hence this parallel field.
     pub(super) placed_ts_ms: i64,
@@ -120,6 +145,25 @@ pub(super) struct PendingOrders {
     /// the synchronous `monitor_exit_legs_with_timeout` flow that blocked
     /// `step()` for the full timeout (bot-strategy#408).
     pub(super) exit_taker_takeover_at: Option<Instant>,
+}
+
+impl PendingOrders {
+    /// Stamp this group's `placed_ts_ms` onto every leg that does not already
+    /// carry a decision timestamp. Freshly placed/reissued legs arrive with
+    /// `decision_ts_ms == 0` and inherit this group's placement time; legs
+    /// carried forward from a prior cycle (kept/settled in a reissue) already
+    /// hold their original decision time and are left untouched, so their
+    /// ledger rows don't report a decision *after* their own submit/fill
+    /// (Codex review PR #159). Call once at every `PendingOrders`
+    /// construction that becomes the live pending state.
+    pub(super) fn with_leg_decision_ts(mut self) -> Self {
+        for leg in &mut self.legs {
+            if leg.decision_ts_ms == 0 {
+                leg.decision_ts_ms = self.placed_ts_ms;
+            }
+        }
+        self
+    }
 }
 
 #[derive(Debug)]
