@@ -1,0 +1,30 @@
+{
+  "round": "round8",
+  "issue": "bot-strategy#530",
+  "service": "debot-pair-btceth",
+  "notes": "Round-8 SCENARIO 1 (promote-sl8): expected EFFECTIVE per-variant config if the 07-05 #581 readout promotes Round-7 C (sl-widen) to incumbent. Copy this file over configs/pairtrade/round.json in the SAME commit that copies round8-promote-sl8.yaml over debot-pair-btceth.yaml. The drift monitor / round-eval preflight (scripts/check_config_drift.sh --round-json) asserts the RUNNING process matches this.",
+  "max_leverage": 10,
+  "variants": {
+    "a": {
+      "force_close_secs": 10800,
+      "exit_z": 0.2,
+      "stop_loss_z": 8.0,
+      "use_frozen_beta_exit_z": false,
+      "equity_reference_usd": 2000
+    },
+    "b": {
+      "force_close_secs": 10800,
+      "exit_z": 0.1,
+      "stop_loss_z": 8.0,
+      "use_frozen_beta_exit_z": false,
+      "equity_reference_usd": 1000
+    },
+    "c": {
+      "force_close_secs": 10800,
+      "exit_z": 0.2,
+      "stop_loss_z": 4.0,
+      "use_frozen_beta_exit_z": false,
+      "equity_reference_usd": 1000
+    }
+  }
+}
