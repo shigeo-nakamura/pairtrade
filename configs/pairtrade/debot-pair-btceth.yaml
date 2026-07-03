@@ -1,3 +1,33 @@
+# =============================================================================
+# Round 8 SCENARIO 1 — promote-sl8 (leading branch as of 2026-07-03 prep)
+# =============================================================================
+# Decision criterion (#581 readout 2026-07-05): Round-7 C (stop-loss-widen
+# isolate) confirms >= A on normalized metrics (bps of ref, per-trade Sharpe,
+# Calmar) on BOTH full window and last-7d holdout. Status at prep time
+# (data through 07-03): C >= A on both — this is the leading branch.
+#
+# Arms (total $4000 = 2000/1000/1000 per the #530 owner decision 2026-07-02):
+#   A = new incumbent: Round-7 C config promoted (ez0.2 / fc10800 / sl_z 8).
+#       The whole +$1000 raise rides on the live-proven config.
+#   B = Round-8 challenger: exit_z 0.2 -> 0.1 single knob on top of the new
+#       incumbent (#664: +15-18% aggregate on two BT methodologies; NOTE the
+#       06-27..07-03 forward-OOS window is -$6.78 — edge is regime-dependent,
+#       wins in reverting tape, drags in persistent drift).
+#   C = reverse control: old Round-7 A exit (sl_z 4) kept at $1000 so the
+#       sl-widen effect keeps a live counterfactual (A - C = sl effect).
+# Attribution: B - A = exit_z deepening; A - C = stop-loss-widen (continued).
+#
+# DEFER OPTION (#664 note 2): if the persistent-drift regime is still active
+# at the readout, ship only the capital/incumbent change (B keeps ez0.2 =
+# clone of A at $1000) and revisit exit_z next round. As of 07-03 the regime
+# detector is inactive (cusum 0.0) and live tape is reverting — not met.
+#
+# Prerequisites before restart (see scenarios/round8/README.md):
+#   collateral top-up to $4000 total; fresh binary (execution ledger #155/#613);
+#   USE_AMEND_ON_PARTIAL_FILL drop-in survives; round.json swapped in the SAME
+#   commit; Frankfurt restart needs explicit owner approval.
+# =============================================================================
+
 dex_name: lighter
 rest_endpoint: https://mainnet.zklighter.elliot.ai/
 web_socket_endpoint: wss://mainnet.zklighter.elliot.ai/stream
@@ -145,42 +175,39 @@ risk:
 strategies:
   - id: a
     agent_name: debot-pair-btceth-a
-    # Round 7 (2026-06-15, bot-strategy#581): A = incumbent control. Keeps the
-    # Round-5/6 champion exit (exit_z=0.2, fc=10800, sl_z=4.0) — the proven
-    # baseline B/C are measured against. equity raised to 1500 (largest arm).
+    # Round 8 (#530/#664): A = NEW incumbent — Round-7 C (stop-loss-widen)
+    # promoted after confirming >= old A on normalized metrics live (full
+    # window + holdout). Carries the entire capital raise (2000 = largest arm).
     exit_z_score: 0.2
-    stop_loss_z_score: 4.0
+    stop_loss_z_score: 8.0
     max_loss_r_mult: 1.0
-    equity_usd_reference: 1500
+    equity_usd_reference: 2000
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 10800
   - id: b
     agent_name: debot-pair-btceth-b
-    # Round 7 (2026-06-15, #581): B = combined exit-extension challenger
-    # (BT full-span winner across 5 windows incl. 2 regime weeks). exit_z 0.2→0.15
-    # + force_close 10800→21600 (hold the drift longer; §4.3/§8.1) and stop_loss
-    # 4→8 (~off; sl=4 is non-binding, §8.2). BT worst-case positive in ALL 5
-    # windows. Requires top-level shutdown_grace_secs >= 21660. Promote to
-    # incumbent next round if it confirms live.
-    exit_z_score: 0.15
+    # Round 8 (#530/#664): B = exit_z deepening challenger, single knob vs A
+    # (exit_z 0.2 -> 0.1, all else = incumbent). BT: 5/8 windows win, +15-18%
+    # aggregate; regime-dependent (drags in persistent drift, bounded by
+    # fc=10800). Expect higher force-close share (BT 4/14 -> 7/14) — the
+    # execution ledger (#613) must be live to price that fc slippage.
+    exit_z_score: 0.1
     stop_loss_z_score: 8.0
     max_loss_r_mult: 1.0
     equity_usd_reference: 1000
     mtf_windows: [15]
     mtf_z_min: 0.5
-    force_close_time_secs: 21600
+    force_close_time_secs: 10800
   - id: c
     agent_name: debot-pair-btceth-c
-    # Round 7 (2026-06-15, #581): C = stop-loss-widen isolate (1-knob vs A):
-    # stop_loss_z 4→8 only, so we can attribute B's combined gain
-    # (C-A = sl effect, B-C = exit-extension effect). frozen-β (#473) is DROPPED
-    # — BT-rejected: middling on the full-span aggregate but a -$30 regime-week
-    # blow-up (W1). equity 500 (smallest single-lever probe).
+    # Round 8 (#530/#664): C = reverse control — old Round-7 A exit config
+    # (sl_z=4) retained so the promoted sl-widen keeps a live counterfactual
+    # (A - C isolates the sl effect through one more round).
     exit_z_score: 0.2
-    stop_loss_z_score: 8.0
+    stop_loss_z_score: 4.0
     max_loss_r_mult: 1.0
-    equity_usd_reference: 500
+    equity_usd_reference: 1000
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 10800

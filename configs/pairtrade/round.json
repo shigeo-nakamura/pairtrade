@@ -1,20 +1,20 @@
 {
-  "round": "round7",
-  "issue": "bot-strategy#581",
+  "round": "round8",
+  "issue": "bot-strategy#530",
   "service": "debot-pair-btceth",
-  "notes": "Expected EFFECTIVE per-variant config for the live Frankfurt debot-pair-btceth A/B/C. The drift monitor / round-eval preflight (scripts/check_config_drift.sh --round-json) asserts the RUNNING process matches this. A mismatch means a config was deployed but never loaded (deploy != restart, #269), which went undetected for ~8 days in #491 — `force_close_secs` is the field that drifted. Update this file whenever the round config changes, in the SAME commit as the YAML, so the assertion tracks the intended round.",
+  "notes": "Round-8 SCENARIO 1 (promote-sl8): expected EFFECTIVE per-variant config if the 07-05 #581 readout promotes Round-7 C (sl-widen) to incumbent. Copy this file over configs/pairtrade/round.json in the SAME commit that copies round8-promote-sl8.yaml over debot-pair-btceth.yaml. The drift monitor / round-eval preflight (scripts/check_config_drift.sh --round-json) asserts the RUNNING process matches this.",
   "max_leverage": 10,
   "variants": {
     "a": {
       "force_close_secs": 10800,
       "exit_z": 0.2,
-      "stop_loss_z": 4.0,
+      "stop_loss_z": 8.0,
       "use_frozen_beta_exit_z": false,
-      "equity_reference_usd": 1500
+      "equity_reference_usd": 2000
     },
     "b": {
-      "force_close_secs": 21600,
-      "exit_z": 0.15,
+      "force_close_secs": 10800,
+      "exit_z": 0.1,
       "stop_loss_z": 8.0,
       "use_frozen_beta_exit_z": false,
       "equity_reference_usd": 1000
@@ -22,9 +22,9 @@
     "c": {
       "force_close_secs": 10800,
       "exit_z": 0.2,
-      "stop_loss_z": 8.0,
+      "stop_loss_z": 4.0,
       "use_frozen_beta_exit_z": false,
-      "equity_reference_usd": 500
+      "equity_reference_usd": 1000
     }
   }
 }
