@@ -1,0 +1,213 @@
+# =============================================================================
+# Round 8 SCENARIO 1 — promote-sl8 (leading branch as of 2026-07-03 prep)
+# =============================================================================
+# Decision criterion (#581 readout 2026-07-05): Round-7 C (stop-loss-widen
+# isolate) confirms >= A on normalized metrics (bps of ref, per-trade Sharpe,
+# Calmar) on BOTH full window and last-7d holdout. Status at prep time
+# (data through 07-03): C >= A on both — this is the leading branch.
+#
+# Arms (total $4000 = 2000/1000/1000 per the #530 owner decision 2026-07-02):
+#   A = new incumbent: Round-7 C config promoted (ez0.2 / fc10800 / sl_z 8).
+#       The whole +$1000 raise rides on the live-proven config.
+#   B = Round-8 challenger: exit_z 0.2 -> 0.1 single knob on top of the new
+#       incumbent (#664: +15-18% aggregate on two BT methodologies; NOTE the
+#       06-27..07-03 forward-OOS window is -$6.78 — edge is regime-dependent,
+#       wins in reverting tape, drags in persistent drift).
+#   C = reverse control: old Round-7 A exit (sl_z 4) kept at $1000 so the
+#       sl-widen effect keeps a live counterfactual (A - C = sl effect).
+# Attribution: B - A = exit_z deepening; A - C = stop-loss-widen (continued).
+#
+# DEFER OPTION (#664 note 2): if the persistent-drift regime is still active
+# at the readout, ship only the capital/incumbent change (B keeps ez0.2 =
+# clone of A at $1000) and revisit exit_z next round. As of 07-03 the regime
+# detector is inactive (cusum 0.0) and live tape is reverting — not met.
+#
+# Prerequisites before restart (see scenarios/round8/README.md):
+#   collateral top-up to $4000 total; fresh binary (execution ledger #155/#613);
+#   USE_AMEND_ON_PARTIAL_FILL drop-in survives; round.json swapped in the SAME
+#   commit; Frankfurt restart needs explicit owner approval.
+# =============================================================================
+
+dex_name: lighter
+rest_endpoint: https://mainnet.zklighter.elliot.ai/
+web_socket_endpoint: wss://mainnet.zklighter.elliot.ai/stream
+dry_run: false
+agent_name: debot-pair-btceth
+
+# Data dump for BT (independent of trading; observe_only must be set explicitly)
+enable_data_dump: true
+data_dump_file: /opt/debot/market_data_btceth.jsonl
+observe_only: false
+
+# Hourly snapshot archive for BT replay warm-start (#69)
+# 360 days retention ≈ 168 MB / 8640 files — covers year-long replays and
+# ad-hoc historical analysis at trivial disk cost.
+history_archive_dir: /opt/debot/history_archive
+history_archive_retention_days: 360
+
+# Fixed pair: BTC/ETH only
+universe_pairs:
+- BTC/ETH
+max_active_pairs: 1
+
+# Timing
+interval_secs: 5
+trading_period_secs: 60
+
+# Pair diagnostics (simplified: relaxed thresholds)
+pair_selection_lookback_hours_short: 1
+pair_selection_lookback_hours_long: 2
+adf_p_threshold: 0.15
+half_life_max_hours: 2.0
+metrics_window_length: 240
+warm_start_mode: relaxed
+warm_start_min_bars: 60
+
+# Core MR params (Bot C champion params, swapped in 2026-04-07: was exit_z=0.3, sl_z=6.0)
+entry_z_score_base: 1.5
+entry_z_score_min: 1.0
+entry_z_score_max: 2.0
+exit_z_score: 0.2
+stop_loss_z_score: 4.0
+force_close_time_secs: 3600
+shutdown_grace_secs: 22200  # >= max force_close (B=21600, Round 7 #581) + 60s buffer. See bot-strategy#50.
+
+# Post-stop cool-down (#316). 600 s blocks immediate re-entry after a
+# stop_loss_z exit on the same direction — Round 4 BT sweep on 5/3-5/8
+# byte-exact (#278): Calmar 1.330 vs 0/1800/3600/7200 baselines
+# (1.109/1.104/1.055/0.760), MaxDD -25%, PnL -9.4%. Catches the 6-min
+# re-entry pathology observed on 2026-05-04 regime shift.
+stop_loss_cooldown_secs: 600
+
+# Risk
+risk_pct_per_trade: 0.40
+# Fixed equity reference for thresholds and sizing (bot-strategy#222). Revised
+# at the same monthly cadence as A/B/C parameter updates; live equity drift is
+# no longer mixed into the calculation, so daily-DD denominator and risk_budget
+# stay constant within the month. Top-level value is only the fallback for any
+# strategy that omits the per-instance field — each Frankfurt instance overrides
+# it below.
+equity_usd_reference: 1000
+max_leverage: 10  # Round 4 (#278) bumped from 5. bps-based risk gates are leverage-invariant.
+max_loss_r_mult: 1.0    # Bot C champion value (was 3.0). Swapped 2026-04-07.
+
+# Execution
+cooldown_secs: 60
+slippage_bps: 0
+fee_bps: 0
+entry_post_only_timeout_secs: 30
+
+# Filters (relaxed: let z-score do the work)
+spread_velocity_max_sigma_per_min: 0.15
+spread_trend_max_slope_sigma: 1.0
+beta_divergence_max: 0.30
+beta_min: 0.30
+hedge_ratio_max_deviation: 0.20
+entry_vol_lookback_hours: 2
+vol_spike_mult: 3.0
+net_funding_min_per_hour: -0.01
+reeval_jump_z_mult: 1.5
+
+# Phase 2 filters (BT 2026-04-05: beta_gap=3.0 best, +$0.84 vs baseline +$0.20)
+entry_velocity_block_sigma_per_min: 0.0
+funding_entry_z_scale: 0.0
+beta_gap_entry_z_scale: 3.0
+
+# Std collapse guard (bot-strategy#62). Root cause (warm_start single-OLS-beta
+# artifact) was fixed via snapshot v2 spread_history persistence. Guard remains
+# as a hard gate against real-market std collapse: blocks entries when
+# std < 20% of the rolling median of the last 60 bar stds. 11-day observe-only
+# data (2026-04-16 → 2026-04-27) showed only one ~4h episode with |z| ≤ 1.25
+# (no entries blocked), confirming flip-to-block is risk-free.
+std_collapse_window_bars: 60
+std_collapse_min_ratio: 0.2
+std_collapse_observe_only: false
+
+# Circuit breaker
+circuit_breaker_tier1_losses: 5
+circuit_breaker_tier1_cooldown_secs: 600
+circuit_breaker_tier2_losses: 8
+circuit_breaker_tier2_cooldown_secs: 3600
+
+# Risk gates (bot-strategy#185). All bps fields are now leverage-invariant:
+# the bot multiplies them by max_leverage internally so a single value covers
+# any leverage and changing max_leverage does not require rewriting the bps.
+# Typical 100–500 bps. See #185 leverage-neutralization amendment.
+risk:
+  # Phase 2: daily DD cap. 300 bps = halt at 3% equivalent 1x market move
+  # (= 15% realized loss against session_start_equity at max_leverage=5,
+  # behaviourally equivalent to the pre-amendment 1500 bps). Action `block`
+  # refuses new entries while existing positions exit normally, auto-resume
+  # at next UTC midnight.
+  max_daily_loss_bps: 300
+  max_daily_loss_action: block
+  daily_reset_utc_hour: 0
+  # Phase 3-1: rolling-peak session DD. Sticky halt + auto-flatten of the
+  # breaching instance, cleared only by `sudo touch /opt/debot/RISK_ACK`.
+  # Round 4 (#278): activated at 50 bps. Effective threshold = 50 × max_leverage(10)
+  # = 500 bps DD = 5% equity. Catches the 5/4 cluster (B 448 bps obs at 5x → 896 bps
+  # proj at 10x; C 271 → 542 bps proj) while leaving A's normal vol (49 → 98 bps) at 5x
+  # headroom. Strawman 100 (= 1000 bps gate) was too loose — would miss B's 5/4.
+  max_session_loss_bps: 50
+  session_dd_lookback_secs: 2592000  # 30 d
+  session_dd_sample_secs: 3600       # 1 h
+  # Phase 3-4: per-leg notional cap, expressed as a multiplier of
+  # equity_reference_usd × max_leverage. 0 disables, 1.0 = exactly the
+  # intended leverage, 1.1 = 10% slack for slippage/rounding while still
+  # rejecting bug-driven oversizing. The multiplicative form lets the same
+  # value work across A/B/C with different equity and across hosts
+  # (Frankfurt $1k×10x → $10k cap, Tokyo Lighter $150×5x → $750 cap at
+  # headroom=1.0). Round 4 (#278) flipped from 0 → 1.0.
+  max_notional_headroom: 1.0
+
+# Multi-strategy A/B/C variants for the single-process architecture
+# (shigeo-nakamura/bot-strategy#25, completed in bot-strategy#413). The
+# single `debot-pair-btceth` process spawns one StrategyInstance per
+# entry. All instances now share the WS feed, BarBuilder, spread_history,
+# β / Kalman state and evaluate_pair cadence at engine level (#413's
+# `PairTradeEngine.per_pair_state`), so A/B/C produce byte-identical
+# β / std / z for the same tick. Variants only branch on the per-strategy
+# overrides below: entry_z / exit_z / stop_loss_z / force_close /
+# mtf_windows / equity_usd_reference. Each instance loads its sub-account
+# credentials via LIGHTER_*_{A,B,C} env vars set up by
+# /opt/debot/scripts/debot-pair-btceth.sh from the legacy per-bot env
+# files.
+strategies:
+  - id: a
+    agent_name: debot-pair-btceth-a
+    # Round 8 (#530/#664): A = NEW incumbent — Round-7 C (stop-loss-widen)
+    # promoted after confirming >= old A on normalized metrics live (full
+    # window + holdout). Carries the entire capital raise (2000 = largest arm).
+    exit_z_score: 0.2
+    stop_loss_z_score: 8.0
+    max_loss_r_mult: 1.0
+    equity_usd_reference: 2000
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 10800
+  - id: b
+    agent_name: debot-pair-btceth-b
+    # Round 8 (#530/#664): B = exit_z deepening challenger, single knob vs A
+    # (exit_z 0.2 -> 0.1, all else = incumbent). BT: 5/8 windows win, +15-18%
+    # aggregate; regime-dependent (drags in persistent drift, bounded by
+    # fc=10800). Expect higher force-close share (BT 4/14 -> 7/14) — the
+    # execution ledger (#613) must be live to price that fc slippage.
+    exit_z_score: 0.1
+    stop_loss_z_score: 8.0
+    max_loss_r_mult: 1.0
+    equity_usd_reference: 1000
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 10800
+  - id: c
+    agent_name: debot-pair-btceth-c
+    # Round 8 (#530/#664): C = reverse control — old Round-7 A exit config
+    # (sl_z=4) retained so the promoted sl-widen keeps a live counterfactual
+    # (A - C isolates the sl effect through one more round).
+    exit_z_score: 0.2
+    stop_loss_z_score: 4.0
+    max_loss_r_mult: 1.0
+    equity_usd_reference: 1000
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 10800
