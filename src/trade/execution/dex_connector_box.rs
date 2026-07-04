@@ -28,6 +28,31 @@ lazy_static! {
     };
 }
 
+/// True only when the error text refers to HTTP 429: either the canonical
+/// reason phrase, or "429" as a standalone number. Digits embedded in a
+/// larger number must NOT match — dex-connector's stale-price transient
+/// error ("websocket price for GBPUSD is stale (429785ms old) and REST
+/// fallback is disabled") kept tripping the old `contains("429")` check
+/// whenever the millisecond age happened to contain the digits 429, spamming
+/// false "HTTP 429" alert emails.
+fn mentions_http_429(text: &str) -> bool {
+    if text.contains("Too Many Requests") {
+        return true;
+    }
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = text[start..].find("429") {
+        let i = start + pos;
+        let digit_before = i > 0 && bytes[i - 1].is_ascii_digit();
+        let digit_after = bytes.get(i + 3).is_some_and(|b| b.is_ascii_digit());
+        if !digit_before && !digit_after {
+            return true;
+        }
+        start = i + 3;
+    }
+    false
+}
+
 pub struct DexConnectorBox {
     pub inner: Box<dyn DexConnector>,
 }
@@ -44,7 +69,7 @@ impl DexConnectorBox {
             return;
         }
         let err_text = err.to_string();
-        if err_text.contains("429") || err_text.contains("Too Many Requests") {
+        if mentions_http_429(&err_text) {
             let context = format!("{} ({})", operation, detail);
             notify_rate_limit(&context, &err_text);
         }
@@ -542,5 +567,38 @@ impl DexConnector for DexConnectorBox {
         &self,
     ) -> Result<tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>, DexError> {
         self.inner.subscribe_price_updates()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mentions_http_429;
+
+    // Regression: the stale-WS-price transient error must never be reported
+    // as a rate limit, no matter what the millisecond age happens to be.
+    #[test]
+    fn stale_price_ages_containing_429_digits_do_not_match() {
+        for age in ["429785", "42992", "34294", "44295", "54294", "14298023"] {
+            let msg = format!(
+                "websocket price for GBPUSD is stale ({age}ms old) and REST fallback is disabled"
+            );
+            assert!(!mentions_http_429(&msg), "false positive for {msg}");
+        }
+    }
+
+    #[test]
+    fn genuine_http_429_shapes_match() {
+        assert!(mentions_http_429("HTTP 429: rate limited"));
+        assert!(mentions_http_429("HTTP error: 429 Too Many Requests"));
+        assert!(mentions_http_429("Too Many Requests"));
+        assert!(mentions_http_429("server returned status 429"));
+        assert!(mentions_http_429("(429)"));
+    }
+
+    #[test]
+    fn unrelated_text_does_not_match() {
+        assert!(!mentions_http_429("filled 1429 lots"));
+        assert!(!mentions_http_429("order id 42900 accepted"));
+        assert!(!mentions_http_429("everything is fine"));
     }
 }
