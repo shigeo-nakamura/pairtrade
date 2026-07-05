@@ -1127,6 +1127,7 @@ impl PairTradeEngine {
         let mut open_remaining = 0;
         let mut fills: HashMap<String, Decimal> = HashMap::new();
         let mut filled_values: HashMap<String, Decimal> = HashMap::new();
+        let mut filled_value_qty: HashMap<String, Decimal> = HashMap::new();
         let mut filled_fees: HashMap<String, Decimal> = HashMap::new();
         let mut filled_ts_ms_max: HashMap<String, i64> = HashMap::new();
         let mut open_ids: HashSet<String> = HashSet::new();
@@ -1172,6 +1173,7 @@ impl PairTradeEngine {
                     *fills.entry(order.order_id.clone()).or_default() += sz;
                     if let Some(value) = order.filled_value {
                         *filled_values.entry(order.order_id.clone()).or_default() += value;
+                        *filled_value_qty.entry(order.order_id.clone()).or_default() += sz;
                     }
                     if let Some(fee) = order.filled_fee {
                         *filled_fees.entry(order.order_id.clone()).or_default() += fee;
@@ -1206,6 +1208,7 @@ impl PairTradeEngine {
             open_remaining,
             fills,
             filled_values,
+            filled_value_qty,
             filled_fees,
             filled_ts_ms_max,
             open_ids,
@@ -1293,11 +1296,8 @@ impl PairTradeEngine {
             }
             let positive_filled_value = filled_value.filter(|value| *value > Decimal::ZERO);
             let fill_value_f64 = positive_filled_value.and_then(|v| v.to_f64());
-            let fill_size_f64 = fill_size.to_f64();
-            let fill_price = match (fill_value_f64, fill_size_f64) {
-                (Some(value), Some(size)) if size > 0.0 => Some(value / size),
-                _ => None,
-            };
+            let fill_price =
+                Self::ledger_fill_price(leg, &status.filled_values, &status.filled_value_qty);
             if let Some(value) = fill_value_f64 {
                 notional_usd += value.abs();
             }
@@ -1502,6 +1502,29 @@ impl PairTradeEngine {
     ) -> (Decimal, Decimal) {
         let filled = Self::leg_fill_from_map(leg, fills).max(leg.filled);
         (filled, filled.min(leg.target))
+    }
+
+    /// Volume-weighted average fill price over the (value, qty) slice the
+    /// fill map actually covers for this leg — both sides of the division
+    /// come from the same set of reported fills. The denominator must NOT
+    /// be the leg's total fill (`ledger_fill_for_leg`): that total can
+    /// include qty recovered by the bot-strategy#470 exchange-position
+    /// cross-check whose USD value never landed in `filled_values`, and
+    /// dividing a partial value sum by the full size books the missing
+    /// fraction as ~1000 bps of phantom slippage (bot-strategy#705).
+    fn ledger_fill_price(
+        leg: &PendingLeg,
+        filled_values: &HashMap<String, Decimal>,
+        filled_value_qty: &HashMap<String, Decimal>,
+    ) -> Option<f64> {
+        let value = Self::lookup_decimal_for_leg(leg, filled_values)
+            .filter(|value| *value > Decimal::ZERO)?;
+        let qty = Self::lookup_decimal_for_leg(leg, filled_value_qty)
+            .filter(|qty| *qty > Decimal::ZERO)?;
+        match (value.to_f64(), qty.to_f64()) {
+            (Some(value), Some(qty)) if qty > 0.0 => Some(value / qty),
+            _ => None,
+        }
     }
 
     fn filled_by_leg(
@@ -1723,6 +1746,64 @@ mod tests {
         assert_eq!(
             PairTradeEngine::ledger_fill_for_leg(&l, &fills),
             (dec("1.0"), dec("1.0"))
+        );
+    }
+
+    #[test]
+    fn ledger_fill_price_divides_by_value_covered_qty_not_total_fill() {
+        // bot-strategy#705 regression: leg.filled carries 1.0 (0.1 of it
+        // recovered via the #470 exchange-position cross-check, so its
+        // value never reached the map), while the map covers only the 0.9
+        // that reported a value. Dividing the 0.9-slice value by the full
+        // 1.0 booked a ~1000 bps phantom price drop; the price must come
+        // out of the covered slice alone.
+        let l = leg("BTC", "ord-1", "1.0", "1.0");
+        let mut values = HashMap::new();
+        values.insert("ord-1".to_string(), dec("56700.0")); // 0.9 × 63000
+        let mut value_qty = HashMap::new();
+        value_qty.insert("ord-1".to_string(), dec("0.9"));
+        assert_eq!(
+            PairTradeEngine::ledger_fill_price(&l, &values, &value_qty),
+            Some(63000.0)
+        );
+    }
+
+    #[test]
+    fn ledger_fill_price_full_coverage_is_value_over_size() {
+        let l = leg("BTC", "ord-1", "1.0", "1.0");
+        let mut values = HashMap::new();
+        values.insert("ord-1".to_string(), dec("63000.0"));
+        let mut value_qty = HashMap::new();
+        value_qty.insert("ord-1".to_string(), dec("1.0"));
+        assert_eq!(
+            PairTradeEngine::ledger_fill_price(&l, &values, &value_qty),
+            Some(63000.0)
+        );
+    }
+
+    #[test]
+    fn ledger_fill_price_none_when_no_value_reported() {
+        // In-memory fill state alone carries no USD value; better no
+        // fill_price than a fabricated one.
+        let l = leg("BTC", "ord-1", "1.0", "1.0");
+        let values: HashMap<String, Decimal> = HashMap::new();
+        let value_qty: HashMap<String, Decimal> = HashMap::new();
+        assert_eq!(
+            PairTradeEngine::ledger_fill_price(&l, &values, &value_qty),
+            None
+        );
+    }
+
+    #[test]
+    fn ledger_fill_price_resolves_via_exchange_order_id() {
+        let l = leg_with_exchange("BTC", "ord-1", "ex-9", "1.0");
+        let mut values = HashMap::new();
+        values.insert("ex-9".to_string(), dec("31500.0"));
+        let mut value_qty = HashMap::new();
+        value_qty.insert("ex-9".to_string(), dec("0.5"));
+        assert_eq!(
+            PairTradeEngine::ledger_fill_price(&l, &values, &value_qty),
+            Some(63000.0)
         );
     }
 

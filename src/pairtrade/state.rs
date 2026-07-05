@@ -176,6 +176,16 @@ pub(super) struct PendingStatus {
     /// average fill price without re-querying the venue. Absent entries
     /// mean the venue did not report a value for that fill.
     pub(super) filled_values: HashMap<String, Decimal>,
+    /// Per-order-id sum of `FilledOrder.filled_size` restricted to the
+    /// fills that also reported a `filled_value` — i.e. the qty actually
+    /// covered by `filled_values`. The average fill price must divide by
+    /// this, not the total fill, because the total can include qty whose
+    /// value never reached the local map (fills dropped at the cancel/
+    /// reissue boundary and recovered via the exchange-position
+    /// cross-check, bot-strategy#470). Dividing a partial value sum by
+    /// the full size books the missing fraction as phantom slippage
+    /// (bot-strategy#705: ~1000 bps ghosts on amend-path fills).
+    pub(super) filled_value_qty: HashMap<String, Decimal>,
     /// Per-order-id sum of `FilledOrder.filled_fee`. Same semantics as
     /// `filled_values`. Lighter (fee-free) leaves entries unpopulated;
     /// Extended populates them.
