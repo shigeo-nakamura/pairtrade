@@ -418,6 +418,9 @@ impl PairTradeEngine {
 #[path = "testing/halt_gate_tests.rs"]
 mod halt_gate_tests;
 #[cfg(test)]
+#[path = "testing/hyperliquid_maker_tests.rs"]
+mod hyperliquid_maker_tests;
+#[cfg(test)]
 #[path = "testing/pending_tests.rs"]
 mod pending_tests;
 #[cfg(test)]
