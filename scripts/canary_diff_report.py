@@ -205,22 +205,9 @@ def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot,
         )
         return "WATCH", " | ".join(notes)
 
-    if main.trade_count == 0:
-        return "WATCH", "main has zero activity events; activity ratio is undefined"
-
-    rate_ratio = canary.trade_count / main.trade_count
-    return_gap_bps = canary.return_bps - main.return_bps
-    notes.append(
-        f"activity_event_ratio={rate_ratio:.2f} "
-        f"(heuristic at >= {TRADE_EVENT_BPS_OF_EQUITY:.0f} bps delta)"
-    )
-    notes.append(
-        f"return_gap={return_gap_bps:+.1f}bps "
-        f"(main={main.return_bps:+.1f}bps, canary={canary.return_bps:+.1f}bps)"
-    )
-
     # bot-strategy#412 signal #5: absolute-USD divergence, calibrated for the
-    # 7-day window only.
+    # 7-day window only. Independent of the activity ratio, so it is evaluated
+    # before the zero-activity early return below.
     pnl_divergence = (
         window_days == CANARY_PNL_ALERT_WINDOW_DAYS
         and canary.cumulative_pnl < CANARY_PNL_ALERT_USD_7D
@@ -232,6 +219,21 @@ def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot,
             f"main=${main.cumulative_pnl:+.2f} "
             f"(alert if canary < ${CANARY_PNL_ALERT_USD_7D} and main > 0)"
         )
+
+    if main.trade_count == 0:
+        notes.append("main has zero activity events; activity ratio is undefined")
+        return ("ALERT" if pnl_divergence else "WATCH"), " | ".join(notes)
+
+    rate_ratio = canary.trade_count / main.trade_count
+    return_gap_bps = canary.return_bps - main.return_bps
+    notes.append(
+        f"activity_event_ratio={rate_ratio:.2f} "
+        f"(heuristic at >= {TRADE_EVENT_BPS_OF_EQUITY:.0f} bps delta)"
+    )
+    notes.append(
+        f"return_gap={return_gap_bps:+.1f}bps "
+        f"(main={main.return_bps:+.1f}bps, canary={canary.return_bps:+.1f}bps)"
+    )
 
     if (
         rate_ratio < ACTIVITY_RATIO_ALERT_MIN
