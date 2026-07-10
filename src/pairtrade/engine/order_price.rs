@@ -21,7 +21,7 @@ pub(in crate::pairtrade) struct RefreshedLimitPrice {
 impl PairTradeEngine {
     pub(in crate::pairtrade) fn post_only_supported(&self) -> bool {
         let dex = self.cfg.dex_name.to_ascii_lowercase();
-        dex.contains("lighter") || dex.contains("extended")
+        dex.contains("lighter") || dex.contains("extended") || dex.contains("hyperliquid")
     }
 
     pub(in crate::pairtrade) fn should_post_only(&self) -> bool {

@@ -1,0 +1,107 @@
+# Hyperliquid read-only pairtrade observer (bot-strategy#709 first slice).
+# This config is intentionally observe-only: the current connector exposes
+# public market data only and every trading/account method returns Permanent.
+
+# The connector factory reads REST_ENDPOINT from the environment today; keep
+# rest_endpoint here for resolved-config visibility and export REST_ENDPOINT in
+# the runbook before launching.
+dex_name: hyperliquid
+rest_endpoint: https://api.hyperliquid.xyz
+web_socket_endpoint: wss://api.hyperliquid.xyz/ws
+dry_run: true
+observe_only: true
+force_close_on_startup: false
+agent_name: debot-pair-hyperliquid-observe
+
+enable_data_dump: true
+data_dump_file: /tmp/debot-hyperliquid-observe/market_data_hyperliquid_pairs.jsonl
+history_archive_dir: /tmp/debot-hyperliquid-observe/history_archive
+history_archive_retention_days: 30
+
+universe_pairs:
+- BTC/ETH
+- SOL/ETH
+max_active_pairs: 2
+
+interval_secs: 5
+trading_period_secs: 60
+
+pair_selection_lookback_hours_short: 1
+pair_selection_lookback_hours_long: 2
+adf_p_threshold: 0.15
+half_life_max_hours: 2.0
+metrics_window_length: 240
+warm_start_mode: relaxed
+warm_start_min_bars: 60
+
+# Signal preview only. These mirror the Lighter observer baseline enough to
+# compare z/eligibility streams, not to claim live edge.
+entry_z_score_base: 1.5
+entry_z_score_min: 1.0
+entry_z_score_max: 2.0
+exit_z_score: 0.2
+stop_loss_z_score: 4.0
+force_close_time_secs: 10800
+shutdown_grace_secs: 10860
+stop_loss_cooldown_secs: 600
+
+risk_pct_per_trade: 0.40
+equity_usd_reference: 50
+max_leverage: 1
+max_loss_r_mult: 1.0
+
+cooldown_secs: 60
+slippage_bps: 0
+# Hyperliquid base-tier perp taker fee is currently non-zero; keep this >0 so
+# pricing/logs stay in post-only mode for the prototype even though no orders
+# are submitted in observe_only.
+fee_bps: 4.5
+entry_post_only_timeout_secs: 5
+exit_post_only_timeout_secs: 5
+order_timeout_secs: 30
+
+spread_velocity_max_sigma_per_min: 0.15
+spread_trend_max_slope_sigma: 1.0
+beta_divergence_max: 0.30
+beta_min: 0.30
+hedge_ratio_max_deviation: 0.20
+entry_vol_lookback_hours: 2
+vol_spike_mult: 3.0
+net_funding_min_per_hour: -0.01
+reeval_jump_z_mult: 1.5
+
+entry_velocity_block_sigma_per_min: 0.0
+funding_entry_z_scale: 0.0
+beta_gap_entry_z_scale: 3.0
+
+std_collapse_window_bars: 60
+std_collapse_min_ratio: 0.2
+std_collapse_observe_only: false
+
+circuit_breaker_tier1_losses: 5
+circuit_breaker_tier1_cooldown_secs: 600
+circuit_breaker_tier2_losses: 8
+circuit_breaker_tier2_cooldown_secs: 3600
+
+risk:
+  max_daily_loss_bps: 300
+  max_daily_loss_action: block
+  daily_reset_utc_hour: 0
+  max_session_loss_bps: 200
+  session_dd_lookback_secs: 2592000
+  session_dd_sample_secs: 3600
+  max_notional_headroom: 1.0
+
+strategies:
+  - id: a
+    agent_name: debot-pair-hyperliquid-observe
+    exit_z_score: 0.2
+    stop_loss_z_score: 4.0
+    max_loss_r_mult: 1.0
+    equity_usd_reference: 50
+    mtf_windows: [15]
+    mtf_z_min: 0.5
+    force_close_time_secs: 10800
+    entry_z_score_base: 1.5
+    entry_z_score_min: 1.0
+    entry_z_score_max: 2.0
