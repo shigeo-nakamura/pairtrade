@@ -188,6 +188,54 @@ pub(super) fn quote_sanity_check(
     Ok(())
 }
 
+/// Book-quality check for the ineligible-close deferral guard
+/// (bot-strategy#531). Returns `Some(reason)` when either leg's snapshot
+/// looks too degraded to price a forced exit against:
+///
+/// - `spread`: bid/ask spread above `max_spread_bps` (default 20 bps — the
+///   BT degraded-book artifact threshold, an order of magnitude below the
+///   200 bps tick-filter reject so it catches "wide but not corrupt" books).
+/// - `stale`: last accepted tick older than `max_stale_secs`. The tick
+///   filter rejects corrupt snapshots before they reach the engine, so in a
+///   venue-data incident (06-10: ~5 min of `[TICK_FILTER]` rejections) the
+///   engine's view is a stale copy whose spread still looks normal —
+///   staleness is the only signal the engine can see.
+///
+/// Missing bid/ask or a missing `exchange_ts` contribute nothing (accepted
+/// snapshots always carry bid/ask; a venue without exchange timestamps just
+/// forgoes the staleness signal). `now_ts` is Unix seconds; `exchange_ts`
+/// is milliseconds, with legacy seconds-scale values auto-detected the same
+/// way the snapshot loader migrates them (bot-strategy#274/#276).
+pub(super) fn ineligible_close_book_degraded(
+    p1: &SymbolSnapshot,
+    p2: &SymbolSnapshot,
+    now_ts: i64,
+    max_spread_bps: f64,
+    max_stale_secs: i64,
+) -> Option<&'static str> {
+    for snap in [p1, p2] {
+        if let (Some(bid), Some(ask)) = (snap.bid_price, snap.ask_price) {
+            let bid_f = bid.to_f64().unwrap_or(0.0);
+            let ask_f = ask.to_f64().unwrap_or(0.0);
+            let mid = (bid_f + ask_f) * 0.5;
+            if mid > 0.0 && (ask_f - bid_f) / mid * 10_000.0 > max_spread_bps {
+                return Some("spread");
+            }
+        }
+        if let Some(ts) = snap.exchange_ts {
+            let ts_ms = if ts < 1_000_000_000_000 {
+                ts * 1000
+            } else {
+                ts
+            };
+            if now_ts * 1000 - ts_ms > max_stale_secs * 1000 {
+                return Some("stale");
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +519,93 @@ mod tests {
         let z_neg = net_funding_for_direction(-1.0, &p1, &p2);
         assert!((z_pos - 0.000016).abs() < 1e-15, "z_pos was {}", z_pos);
         assert!((z_neg - (-0.000016)).abs() < 1e-15, "z_neg was {}", z_neg);
+    }
+
+    /// bot-strategy#531 book-quality guard for the ineligible flatten.
+    /// `now_ts` in seconds, `exchange_ts` in ms (10 bps spread reference
+    /// book: bid 63800.0 / ask 63863.9 on a ~63832 mid).
+    fn guard_snap(bid: Decimal, ask: Decimal, exchange_ts: Option<i64>) -> SymbolSnapshot {
+        let mut s = snap(
+            (bid + ask) / dec!(2),
+            Some(bid),
+            Some(ask),
+            dec!(1),
+            dec!(1),
+        );
+        s.exchange_ts = exchange_ts;
+        s
+    }
+
+    #[test]
+    fn ineligible_guard_passes_fresh_tight_book() {
+        let now = 1_783_651_400_i64;
+        let p1 = guard_snap(dec!(63837.9), dec!(63838.0), Some(now * 1000 - 5_000));
+        let p2 = guard_snap(dec!(1768.11), dec!(1768.14), Some(now * 1000 - 5_000));
+        assert_eq!(
+            ineligible_close_book_degraded(&p1, &p2, now, 20.0, 30),
+            None
+        );
+    }
+
+    #[test]
+    fn ineligible_guard_flags_wide_spread_on_either_leg() {
+        let now = 1_783_651_400_i64;
+        let tight = guard_snap(dec!(63837.9), dec!(63838.0), Some(now * 1000));
+        // ~25 bps spread on the ETH leg (1768.0 vs 1772.4).
+        let wide = guard_snap(dec!(1768.0), dec!(1772.4), Some(now * 1000));
+        assert_eq!(
+            ineligible_close_book_degraded(&tight, &wide, now, 20.0, 30),
+            Some("spread")
+        );
+        assert_eq!(
+            ineligible_close_book_degraded(&wide, &tight, now, 20.0, 30),
+            Some("spread")
+        );
+        // The same book passes with the guard threshold above the spread.
+        assert_eq!(
+            ineligible_close_book_degraded(&tight, &wide, now, 30.0, 30),
+            None
+        );
+    }
+
+    #[test]
+    fn ineligible_guard_flags_stale_tick() {
+        let now = 1_783_651_400_i64;
+        let fresh = guard_snap(dec!(63837.9), dec!(63838.0), Some(now * 1000 - 5_000));
+        // Last accepted tick 5 minutes old — the 06-10 incident shape
+        // (tick filter rejecting everything, engine view frozen).
+        let stale = guard_snap(dec!(1768.11), dec!(1768.14), Some(now * 1000 - 300_000));
+        assert_eq!(
+            ineligible_close_book_degraded(&fresh, &stale, now, 20.0, 30),
+            Some("stale")
+        );
+    }
+
+    #[test]
+    fn ineligible_guard_migrates_legacy_seconds_exchange_ts() {
+        let now = 1_783_651_400_i64;
+        // Legacy pre-#276 seconds-scale exchange_ts, 5s old: sane.
+        let fresh = guard_snap(dec!(63837.9), dec!(63838.0), Some(now - 5));
+        // Same scale, 5 minutes old: stale.
+        let stale = guard_snap(dec!(1768.11), dec!(1768.14), Some(now - 300));
+        assert_eq!(
+            ineligible_close_book_degraded(&fresh, &fresh, now, 20.0, 30),
+            None
+        );
+        assert_eq!(
+            ineligible_close_book_degraded(&fresh, &stale, now, 20.0, 30),
+            Some("stale")
+        );
+    }
+
+    #[test]
+    fn ineligible_guard_ignores_missing_signals() {
+        let now = 1_783_651_400_i64;
+        // No exchange_ts and no bid/ask: nothing to assess, not degraded.
+        let bare = snap(dec!(63838.0), None, None, dec!(1), dec!(1));
+        assert_eq!(
+            ineligible_close_book_degraded(&bare, &bare, now, 20.0, 30),
+            None
+        );
     }
 }

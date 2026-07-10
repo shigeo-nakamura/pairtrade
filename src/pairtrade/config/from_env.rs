@@ -200,6 +200,19 @@ impl PairTradeConfig {
             bt_regime_series_file: env::var("BT_REGIME_SERIES_FILE")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            // bot-strategy#531 ineligible-close book-quality guard
+            ineligible_close_defer_cap_secs: env::var("INELIGIBLE_CLOSE_DEFER_CAP_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            ineligible_close_defer_spread_bps: env::var("INELIGIBLE_CLOSE_DEFER_SPREAD_BPS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20.0),
+            ineligible_close_defer_stale_secs: env::var("INELIGIBLE_CLOSE_DEFER_STALE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
             shutdown_grace_secs: env::var("SHUTDOWN_GRACE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

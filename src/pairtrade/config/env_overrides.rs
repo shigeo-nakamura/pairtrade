@@ -258,6 +258,19 @@ impl PairTradeConfig {
             self.bt_restart_timestamps = load_bt_restart_timestamps();
         }
         env_override("BT_FILL_DELAY_SECS", &mut self.bt_fill_delay_secs);
+        // bot-strategy#531 ineligible-close book-quality guard.
+        env_override(
+            "INELIGIBLE_CLOSE_DEFER_CAP_SECS",
+            &mut self.ineligible_close_defer_cap_secs,
+        );
+        env_override(
+            "INELIGIBLE_CLOSE_DEFER_SPREAD_BPS",
+            &mut self.ineligible_close_defer_spread_bps,
+        );
+        env_override(
+            "INELIGIBLE_CLOSE_DEFER_STALE_SECS",
+            &mut self.ineligible_close_defer_stale_secs,
+        );
         // Per-tick regime series dump — see struct field doc.
         if let Ok(value) = env::var("BT_REGIME_SERIES_FILE") {
             if !value.trim().is_empty() {

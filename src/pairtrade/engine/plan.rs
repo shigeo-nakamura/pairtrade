@@ -17,7 +17,9 @@ use super::super::apply_post_exit_state;
 use super::super::config::PairSpec;
 use super::super::entry::{entry_z_for_pair, should_enter, EntryCheck};
 use super::super::exit::{exit_reason, ExitCheck};
-use super::super::market::{liquidity_score, net_funding_for_direction, SymbolSnapshot};
+use super::super::market::{
+    ineligible_close_book_degraded, liquidity_score, net_funding_for_direction, SymbolSnapshot,
+};
 use super::super::state::PositionDirection;
 use super::super::stats::spread_slope_sigma;
 use super::super::PairTradeEngine;
@@ -368,6 +370,15 @@ impl PairTradeEngine {
                 .states
                 .get(&key)
                 .and_then(|s| s.position.clone());
+
+            // bot-strategy#531: any eligible tick resets the ineligible-close
+            // deferral timer, so a later ineligibility spell starts a fresh
+            // deferral window instead of inheriting a stale start timestamp.
+            if eligible_shared {
+                if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                    state.ineligible_defer_since_ts = None;
+                }
+            }
 
             let pp = self.pair_params_for(inst_idx, &key).clone();
             let pp = &pp;
@@ -750,18 +761,78 @@ impl PairTradeEngine {
                         min_points
                     );
                 } else if position_state.is_some() && !eligible_shared {
-                    // If pair falls out of eligibility, flatten
+                    // If pair falls out of eligibility, flatten. When the
+                    // book-quality guard is enabled (bot-strategy#531), a
+                    // degraded book defers the flatten — re-checked every
+                    // tick — until the book recovers or the deferral cap
+                    // runs out. The eligibility break is often caused by
+                    // degraded venue data, so the immediate close would
+                    // execute into exactly the book conditions that
+                    // triggered it (the 2026-06-10 -$30.85 pooled event).
                     if let Some(pos) = &position_state {
-                        log::info!("[EXIT_CHECK] {} reason=ineligible", key);
-                        if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
-                            state.pending_exit_reason = Some("ineligible");
-                        }
-                        action = TradeAction::Close {
-                            direction: pos.direction,
-                            z: 0.0,
-                            beta: beta_eff,
-                            force: false,
+                        let defer_cap = self.cfg.ineligible_close_defer_cap_secs;
+                        let degraded = if defer_cap > 0 {
+                            ineligible_close_book_degraded(
+                                p1,
+                                p2,
+                                now_ts,
+                                self.cfg.ineligible_close_defer_spread_bps,
+                                self.cfg.ineligible_close_defer_stale_secs,
+                            )
+                        } else {
+                            None
                         };
+                        let mut fire_close = true;
+                        if let Some(reason) = degraded {
+                            let since = self.instances[inst_idx]
+                                .states
+                                .get_mut(&key)
+                                .map(|s| *s.ineligible_defer_since_ts.get_or_insert(now_ts))
+                                .unwrap_or(now_ts);
+                            let elapsed = now_ts.saturating_sub(since);
+                            let variant = self.instances[inst_idx].id.clone();
+                            if elapsed < defer_cap {
+                                log::warn!(
+                                    "[EXIT_DEFER] {} reason=ineligible book_degraded={} elapsed={}s cap={}s",
+                                    key,
+                                    reason,
+                                    elapsed,
+                                    defer_cap
+                                );
+                                crate::pairtrade::prom::INELIGIBLE_CLOSE_DEFER_TOTAL
+                                    .with_label_values(&[variant.as_str(), key.as_str(), reason])
+                                    .inc();
+                                fire_close = false;
+                            } else {
+                                log::warn!(
+                                    "[EXIT_DEFER] {} cap exceeded ({}s >= {}s); closing into degraded book (reason={})",
+                                    key,
+                                    elapsed,
+                                    defer_cap,
+                                    reason
+                                );
+                                crate::pairtrade::prom::INELIGIBLE_CLOSE_DEFER_TOTAL
+                                    .with_label_values(&[
+                                        variant.as_str(),
+                                        key.as_str(),
+                                        "cap_exceeded",
+                                    ])
+                                    .inc();
+                            }
+                        }
+                        if fire_close {
+                            log::info!("[EXIT_CHECK] {} reason=ineligible", key);
+                            if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                                state.pending_exit_reason = Some("ineligible");
+                                state.ineligible_defer_since_ts = None;
+                            }
+                            action = TradeAction::Close {
+                                direction: pos.direction,
+                                z: 0.0,
+                                beta: beta_eff,
+                                force: false,
+                            };
+                        }
                     }
                 }
             }

@@ -391,6 +391,22 @@ pub static ENTRY_REJECT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// Ineligible-close deferral guard (bot-strategy#531): counts ticks on
+/// which an ineligible flatten was deferred because the book looked
+/// degraded (`reason` = `spread` | `stale`), plus `cap_exceeded` when the
+/// deferral window ran out and the close fired into the still-degraded
+/// book. Zero under normal operation — any movement here is a venue-data
+/// incident worth a look.
+pub static INELIGIBLE_CLOSE_DEFER_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_ineligible_close_defer_total",
+        "Cumulative count of ineligible-close deferral guard events \
+         (bot-strategy#531), broken down by reason (spread, stale, \
+         cap_exceeded).",
+        &["variant", "pair", "reason"],
+    )
+});
+
 /// Every entry-reject reason string `pairtrade_entry_reject_total` may receive.
 /// Kept in sync with the literals in `engine/step.rs` (pre-`should_enter`) and
 /// `entry.rs::should_enter` (in-filter). The unit test below asserts that.

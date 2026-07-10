@@ -314,6 +314,12 @@ pub(super) struct PairState {
     /// position is cleared or a new position is created. Not persisted.
     /// bot-strategy#514.
     pub(super) recovery_recorded: bool,
+    /// Replay timestamp at which the ineligible-close deferral guard
+    /// (bot-strategy#531) started deferring the flatten because the book
+    /// looked degraded. Cleared on any eligible tick and when the close
+    /// fires, so each ineligibility spell gets a fresh deferral window.
+    /// Not persisted: a restart force-closes positions anyway.
+    pub(super) ineligible_defer_since_ts: Option<i64>,
 }
 
 /// Deferred exit info for BT fill-delay simulation.
@@ -480,6 +486,7 @@ impl PairState {
             pending_exit_reason: None,
             last_stop_loss_at: None,
             recovery_recorded: false,
+            ineligible_defer_since_ts: None,
         }
     }
 }
@@ -621,6 +628,7 @@ mod tests {
         let _ = &s.pending_exit;
         let _ = &s.bt_deferred_exit;
         let _ = &s.pending_exit_reason;
+        let _ = &s.ineligible_defer_since_ts;
         let _ = &s.last_stop_loss_at;
         let _ = &s.last_exit_at;
         let _ = &s.last_exit_ts;
