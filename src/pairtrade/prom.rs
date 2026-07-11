@@ -407,6 +407,26 @@ pub static INELIGIBLE_CLOSE_DEFER_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// Every reason string `pairtrade_ineligible_close_defer_total` may receive.
+/// Kept in sync with the literals `ineligible_close_book_degraded`
+/// (market.rs) returns plus the `"cap_exceeded"` literal in
+/// `step_plan_pair_actions` (engine/plan.rs).
+pub const KNOWN_INELIGIBLE_CLOSE_DEFER_REASONS: &[&str] = &["spread", "stale", "cap_exceeded"];
+
+/// Materialize every `(variant, pair, reason)` series for
+/// `pairtrade_ineligible_close_defer_total` at value 0, for the same reason
+/// as `init_close_reason_series` (bot-strategy#416): the counter is only
+/// touched during a venue-data incident, so without a zero baseline the
+/// first scrape after a one-tick deferral already sees value=1 and
+/// `increase([range])` misses exactly the first/only incident.
+pub fn init_ineligible_close_defer_series(variant: &str, pair: &str) {
+    for reason in KNOWN_INELIGIBLE_CLOSE_DEFER_REASONS {
+        INELIGIBLE_CLOSE_DEFER_TOTAL
+            .with_label_values(&[variant, pair, reason])
+            .inc_by(0);
+    }
+}
+
 /// Every entry-reject reason string `pairtrade_entry_reject_total` may receive.
 /// Kept in sync with the literals in `engine/step.rs` (pre-`should_enter`) and
 /// `entry.rs::should_enter` (in-filter). The unit test below asserts that.
@@ -848,6 +868,19 @@ mod tests {
         init_close_reason_series(variant, pair);
         for reason in KNOWN_CLOSE_REASONS {
             let value = CLOSE_REASON_TOTAL
+                .with_label_values(&[variant, pair, reason])
+                .get();
+            assert_eq!(value, 0, "reason {} should be pre-registered at 0", reason);
+        }
+    }
+
+    #[test]
+    fn init_ineligible_close_defer_series_registers_every_known_reason_at_zero() {
+        let variant = "test-init-defer-zero";
+        let pair = "BTC/ETH";
+        init_ineligible_close_defer_series(variant, pair);
+        for reason in KNOWN_INELIGIBLE_CLOSE_DEFER_REASONS {
+            let value = INELIGIBLE_CLOSE_DEFER_TOTAL
                 .with_label_values(&[variant, pair, reason])
                 .get();
             assert_eq!(value, 0, "reason {} should be pre-registered at 0", reason);

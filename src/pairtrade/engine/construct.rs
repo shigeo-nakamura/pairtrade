@@ -135,6 +135,7 @@ impl PairTradeEngine {
                 let ps = PairState::new(pp.entry_z_base);
                 prom::init_close_reason_series(&strategy.id, &pair_key);
                 prom::init_entry_reject_series(&strategy.id, &pair_key);
+                prom::init_ineligible_close_defer_series(&strategy.id, &pair_key);
                 states.insert(pair_key, ps);
             }
 
