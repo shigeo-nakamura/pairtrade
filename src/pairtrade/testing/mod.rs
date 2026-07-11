@@ -141,6 +141,7 @@ impl PairTradeEngine {
             }],
             history: HashMap::new(),
             bar_builders: HashMap::new(),
+            tick_feed_health: HashMap::new(),
             last_metrics_log: None,
             last_ob_warn: HashMap::new(),
             last_ticker_warn: HashMap::new(),

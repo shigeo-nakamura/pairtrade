@@ -142,6 +142,27 @@ impl PairTradeEngine {
                 );
                 continue;
             }
+            // bot-strategy#531: track accepted-tick freshness for the
+            // ineligible-close guard's `stale` signal. During a rejection
+            // storm the raw `exchange_ts` stays fresh (corrupt frames keep
+            // arriving), so the guard needs this accepted-tick clock; an
+            // accepted tick that ends a longer-than-threshold gap marks
+            // `gap_recovered_ts` so the guard holds the close through a
+            // recovery holddown instead of firing into the first
+            // post-storm book (PR #166 Codex review).
+            {
+                let stale_secs = self.cfg.ineligible_close_defer_stale_secs.max(1);
+                let health = self.tick_feed_health.entry(symbol.clone()).or_insert(
+                    super::super::market::FeedHealth {
+                        last_accepted_ts: now_ts,
+                        gap_recovered_ts: None,
+                    },
+                );
+                if now_ts.saturating_sub(health.last_accepted_ts) > stale_secs {
+                    health.gap_recovered_ts = Some(now_ts);
+                }
+                health.last_accepted_ts = now_ts;
+            }
             // bot-strategy#364: record realized funding rate into the
             // rolling history so exit_fill can attribute per-cycle carry
             // without an external REST fetch. Lighter settles funding

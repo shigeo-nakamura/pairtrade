@@ -1204,6 +1204,67 @@ async fn ineligible_close_fires_unconditionally_once_cap_exceeded() {
     );
 }
 
+/// The 06-10 rejection-storm shape (Codex review on PR #166): while the
+/// tick filter rejects everything, no bar updates and the planner never
+/// reaches the pair; when the first valid tick lands, the snapshot is
+/// fresh and sane — the guard must still defer via the accepted-feed gap
+/// recovery holddown instead of firing into the just-recovered book.
+#[tokio::test]
+async fn ineligible_close_deferred_through_gap_recovery_holddown() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = ineligible_guard_harness("hg-inelig-gap");
+    // Tight book: the spread signal must NOT be the one deferring.
+    h._connector.set_half_spread_frac(dec("0.0005"));
+    // Simulate "no accepted tick for 100s" (the storm): the next step's
+    // accepted tick then ends the gap and must arm the recovery holddown.
+    let now_ts = chrono::Utc::now().timestamp();
+    for symbol in [BASE, QUOTE] {
+        h.engine.tick_feed_health.insert(
+            symbol.to_string(),
+            market::FeedHealth {
+                last_accepted_ts: now_ts - 100,
+                gap_recovered_ts: None,
+            },
+        );
+    }
+    let stale_before = defer_count("hg-inelig-gap", "stale");
+
+    h.step().await;
+    assert!(
+        h.position(0).is_some(),
+        "first valid tick after a rejection storm must defer, not close"
+    );
+    assert_eq!(
+        defer_count("hg-inelig-gap", "stale"),
+        stale_before + 1,
+        "the deferral must be attributed to the stale check"
+    );
+    assert!(
+        h.engine
+            .tick_feed_health
+            .get(BASE)
+            .and_then(|f| f.gap_recovered_ts)
+            .is_some(),
+        "the accepted tick that ended the gap must arm the recovery holddown"
+    );
+
+    // Holddown elapsed (backdate the recovery past the 30s threshold; the
+    // accepted feed itself stays fresh): the close must now go through.
+    let now_ts = chrono::Utc::now().timestamp();
+    for symbol in [BASE, QUOTE] {
+        if let Some(f) = h.engine.tick_feed_health.get_mut(symbol) {
+            f.gap_recovered_ts = Some(now_ts - 31);
+        }
+    }
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "close must fire once the recovery holddown has elapsed"
+    );
+}
+
 #[tokio::test]
 async fn ineligible_close_immediate_when_guard_disabled() {
     let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());

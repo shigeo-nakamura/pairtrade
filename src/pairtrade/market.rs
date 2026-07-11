@@ -188,6 +188,25 @@ pub(super) fn quote_sanity_check(
     Ok(())
 }
 
+/// Per-symbol accepted-tick freshness, maintained by the shared tick
+/// (`engine/shared_tick.rs`) for the #531 guard's `stale` signal. The raw
+/// snapshot's `exchange_ts` is refreshed by *every* connector frame —
+/// including corrupt ones the tick filter rejects — so during a rejection
+/// storm it stays fresh while the engine's accepted view is frozen. This
+/// tracks the clock the guard actually needs: ticks that passed
+/// `tick_sanity_check`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FeedHealth {
+    /// Wall/replay-clock seconds of the last snapshot that passed
+    /// `tick_sanity_check`.
+    pub(super) last_accepted_ts: i64,
+    /// Wall/replay-clock seconds of the accepted tick that ended a gap
+    /// longer than the guard's stale threshold. The guard keeps deferring
+    /// through a holddown after this, so the first close decision after a
+    /// rejection storm is not fired into the just-recovered book.
+    pub(super) gap_recovered_ts: Option<i64>,
+}
+
 /// Book-quality check for the ineligible-close deferral guard
 /// (bot-strategy#531). Returns `Some(reason)` when either leg's snapshot
 /// looks too degraded to price a forced exit against:
@@ -195,25 +214,32 @@ pub(super) fn quote_sanity_check(
 /// - `spread`: bid/ask spread above `max_spread_bps` (default 20 bps — the
 ///   BT degraded-book artifact threshold, an order of magnitude below the
 ///   200 bps tick-filter reject so it catches "wide but not corrupt" books).
-/// - `stale`: last accepted tick older than `max_stale_secs`. The tick
-///   filter rejects corrupt snapshots before they reach the engine, so in a
-///   venue-data incident (06-10: ~5 min of `[TICK_FILTER]` rejections) the
-///   engine's view is a stale copy whose spread still looks normal —
-///   staleness is the only signal the engine can see.
+/// - `stale`: the engine's view of the leg is not trustworthy-fresh. Three
+///   sub-signals, any of which counts (all against `max_stale_secs`):
+///   the raw `exchange_ts` is old (quiet venue serving cached frames); the
+///   last tick that passed `tick_sanity_check` is old (rejection storm in
+///   progress — the raw `exchange_ts` stays fresh in that shape because
+///   corrupt frames keep arriving, see `FeedHealth`); or an accepted tick
+///   ended a longer-than-threshold gap less than `max_stale_secs` ago
+///   (post-storm recovery holddown — the 06-10 incident closed on the
+///   first bar after ~5 min of `[TICK_FILTER]` rejections, exactly when
+///   both other signals look fresh again).
 ///
-/// Missing bid/ask or a missing `exchange_ts` contribute nothing (accepted
-/// snapshots always carry bid/ask; a venue without exchange timestamps just
-/// forgoes the staleness signal). `now_ts` is Unix seconds; `exchange_ts`
-/// is milliseconds, with legacy seconds-scale values auto-detected the same
-/// way the snapshot loader migrates them (bot-strategy#274/#276).
+/// Missing bid/ask, a missing `exchange_ts`, or missing feed-health info
+/// contribute nothing (accepted snapshots always carry bid/ask; a venue
+/// without exchange timestamps just forgoes that sub-signal). `now_ts` is
+/// Unix seconds; `exchange_ts` is milliseconds, with legacy seconds-scale
+/// values auto-detected the same way the snapshot loader migrates them
+/// (bot-strategy#274/#276).
 pub(super) fn ineligible_close_book_degraded(
     p1: &SymbolSnapshot,
     p2: &SymbolSnapshot,
+    feed: [Option<&FeedHealth>; 2],
     now_ts: i64,
     max_spread_bps: f64,
     max_stale_secs: i64,
 ) -> Option<&'static str> {
-    for snap in [p1, p2] {
+    for (snap, health) in [(p1, feed[0]), (p2, feed[1])] {
         if let (Some(bid), Some(ask)) = (snap.bid_price, snap.ask_price) {
             let bid_f = bid.to_f64().unwrap_or(0.0);
             let ask_f = ask.to_f64().unwrap_or(0.0);
@@ -230,6 +256,16 @@ pub(super) fn ineligible_close_book_degraded(
             };
             if now_ts * 1000 - ts_ms > max_stale_secs * 1000 {
                 return Some("stale");
+            }
+        }
+        if let Some(h) = health {
+            if now_ts.saturating_sub(h.last_accepted_ts) > max_stale_secs {
+                return Some("stale");
+            }
+            if let Some(recovered) = h.gap_recovered_ts {
+                if now_ts.saturating_sub(recovered) < max_stale_secs {
+                    return Some("stale");
+                }
             }
         }
     }
@@ -536,13 +572,27 @@ mod tests {
         s
     }
 
+    /// Feed health for a symbol whose accepted feed is healthy: last
+    /// accepted tick `age_secs` ago, no recent gap recovery.
+    fn feed(
+        last_accepted_age_secs: i64,
+        gap_recovered_age_secs: Option<i64>,
+        now: i64,
+    ) -> FeedHealth {
+        FeedHealth {
+            last_accepted_ts: now - last_accepted_age_secs,
+            gap_recovered_ts: gap_recovered_age_secs.map(|a| now - a),
+        }
+    }
+
     #[test]
     fn ineligible_guard_passes_fresh_tight_book() {
         let now = 1_783_651_400_i64;
         let p1 = guard_snap(dec!(63837.9), dec!(63838.0), Some(now * 1000 - 5_000));
         let p2 = guard_snap(dec!(1768.11), dec!(1768.14), Some(now * 1000 - 5_000));
+        let h = feed(5, None, now);
         assert_eq!(
-            ineligible_close_book_degraded(&p1, &p2, now, 20.0, 30),
+            ineligible_close_book_degraded(&p1, &p2, [Some(&h), Some(&h)], now, 20.0, 30),
             None
         );
     }
@@ -554,16 +604,16 @@ mod tests {
         // ~25 bps spread on the ETH leg (1768.0 vs 1772.4).
         let wide = guard_snap(dec!(1768.0), dec!(1772.4), Some(now * 1000));
         assert_eq!(
-            ineligible_close_book_degraded(&tight, &wide, now, 20.0, 30),
+            ineligible_close_book_degraded(&tight, &wide, [None, None], now, 20.0, 30),
             Some("spread")
         );
         assert_eq!(
-            ineligible_close_book_degraded(&wide, &tight, now, 20.0, 30),
+            ineligible_close_book_degraded(&wide, &tight, [None, None], now, 20.0, 30),
             Some("spread")
         );
         // The same book passes with the guard threshold above the spread.
         assert_eq!(
-            ineligible_close_book_degraded(&tight, &wide, now, 30.0, 30),
+            ineligible_close_book_degraded(&tight, &wide, [None, None], now, 30.0, 30),
             None
         );
     }
@@ -572,12 +622,71 @@ mod tests {
     fn ineligible_guard_flags_stale_tick() {
         let now = 1_783_651_400_i64;
         let fresh = guard_snap(dec!(63837.9), dec!(63838.0), Some(now * 1000 - 5_000));
-        // Last accepted tick 5 minutes old — the 06-10 incident shape
-        // (tick filter rejecting everything, engine view frozen).
+        // Raw snapshot 5 minutes old — quiet venue serving cached frames.
         let stale = guard_snap(dec!(1768.11), dec!(1768.14), Some(now * 1000 - 300_000));
         assert_eq!(
-            ineligible_close_book_degraded(&fresh, &stale, now, 20.0, 30),
+            ineligible_close_book_degraded(&fresh, &stale, [None, None], now, 20.0, 30),
             Some("stale")
+        );
+    }
+
+    #[test]
+    fn ineligible_guard_flags_frozen_accepted_feed_despite_fresh_exchange_ts() {
+        let now = 1_783_651_400_i64;
+        // The 06-10 rejection-storm shape (Codex PR #166 review): corrupt
+        // frames keep arriving so the raw exchange_ts stays fresh, but no
+        // tick has passed the sanity filter for 5 minutes.
+        let p1 = guard_snap(dec!(63837.9), dec!(63838.0), Some(now * 1000 - 2_000));
+        let p2 = guard_snap(dec!(1768.11), dec!(1768.14), Some(now * 1000 - 2_000));
+        let healthy = feed(5, None, now);
+        let frozen = feed(300, None, now);
+        assert_eq!(
+            ineligible_close_book_degraded(
+                &p1,
+                &p2,
+                [Some(&healthy), Some(&frozen)],
+                now,
+                20.0,
+                30
+            ),
+            Some("stale")
+        );
+    }
+
+    #[test]
+    fn ineligible_guard_holds_through_gap_recovery_then_clears() {
+        let now = 1_783_651_400_i64;
+        // First valid bar after a rejection storm: the snapshot is fresh
+        // and sane, the accepted feed just resumed — without the holddown
+        // the close would fire into the just-recovered book (the exact
+        // 06-10 / Codex scenario). Inside the holddown: still stale.
+        let p1 = guard_snap(dec!(63837.9), dec!(63838.0), Some(now * 1000 - 2_000));
+        let p2 = guard_snap(dec!(1768.11), dec!(1768.14), Some(now * 1000 - 2_000));
+        let healthy = feed(5, None, now);
+        let just_recovered = feed(2, Some(10), now);
+        assert_eq!(
+            ineligible_close_book_degraded(
+                &p1,
+                &p2,
+                [Some(&healthy), Some(&just_recovered)],
+                now,
+                20.0,
+                30
+            ),
+            Some("stale")
+        );
+        // Holddown elapsed (recovery 30s ago == threshold): trustworthy again.
+        let recovered = feed(2, Some(30), now);
+        assert_eq!(
+            ineligible_close_book_degraded(
+                &p1,
+                &p2,
+                [Some(&healthy), Some(&recovered)],
+                now,
+                20.0,
+                30
+            ),
+            None
         );
     }
 
@@ -589,11 +698,11 @@ mod tests {
         // Same scale, 5 minutes old: stale.
         let stale = guard_snap(dec!(1768.11), dec!(1768.14), Some(now - 300));
         assert_eq!(
-            ineligible_close_book_degraded(&fresh, &fresh, now, 20.0, 30),
+            ineligible_close_book_degraded(&fresh, &fresh, [None, None], now, 20.0, 30),
             None
         );
         assert_eq!(
-            ineligible_close_book_degraded(&fresh, &stale, now, 20.0, 30),
+            ineligible_close_book_degraded(&fresh, &stale, [None, None], now, 20.0, 30),
             Some("stale")
         );
     }
@@ -601,10 +710,11 @@ mod tests {
     #[test]
     fn ineligible_guard_ignores_missing_signals() {
         let now = 1_783_651_400_i64;
-        // No exchange_ts and no bid/ask: nothing to assess, not degraded.
+        // No exchange_ts, no bid/ask, no feed health: nothing to assess,
+        // not degraded.
         let bare = snap(dec!(63838.0), None, None, dec!(1), dec!(1));
         assert_eq!(
-            ineligible_close_book_degraded(&bare, &bare, now, 20.0, 30),
+            ineligible_close_book_degraded(&bare, &bare, [None, None], now, 20.0, 30),
             None
         );
     }

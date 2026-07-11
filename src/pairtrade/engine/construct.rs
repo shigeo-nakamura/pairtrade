@@ -251,6 +251,7 @@ impl PairTradeEngine {
             history,
             per_pair_state,
             bar_builders,
+            tick_feed_health: HashMap::new(),
             last_metrics_log: None,
             last_ob_warn: HashMap::new(),
             last_ticker_warn: HashMap::new(),

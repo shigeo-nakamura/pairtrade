@@ -33,6 +33,7 @@ use crate::ports::replay_dex::ReplayConnector;
 use super::bar::BarBuilder;
 use super::config::PairTradeConfig;
 use super::instance::StrategyInstance;
+use super::market::FeedHealth;
 use super::state::PairSharedState;
 use super::stats::PriceSample;
 use super::{data_dump, execution_ledger, funding_history};
@@ -48,6 +49,13 @@ pub struct PairTradeEngine {
     /// byte-identical β / std / z. See bot-strategy#413.
     pub(in crate::pairtrade) per_pair_state: HashMap<String, PairSharedState>,
     pub(in crate::pairtrade) bar_builders: HashMap<String, BarBuilder>,
+    /// Per-symbol accepted-tick freshness for the #531 ineligible-close
+    /// guard's `stale` signal: the raw snapshot's `exchange_ts` stays
+    /// fresh through a tick-filter rejection storm (corrupt frames keep
+    /// arriving), so the guard needs the accepted-tick clock plus a
+    /// post-gap recovery marker. Maintained in `step_shared_tick`; not
+    /// persisted (a restart force-closes positions anyway).
+    pub(in crate::pairtrade) tick_feed_health: HashMap<String, FeedHealth>,
     pub(in crate::pairtrade) last_metrics_log: Option<Instant>,
     pub(in crate::pairtrade) last_ob_warn: HashMap<String, Instant>,
     pub(in crate::pairtrade) last_ticker_warn: HashMap<String, Instant>,

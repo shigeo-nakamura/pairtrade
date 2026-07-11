@@ -772,9 +772,21 @@ impl PairTradeEngine {
                     if let Some(pos) = &position_state {
                         let defer_cap = self.cfg.ineligible_close_defer_cap_secs;
                         let degraded = if defer_cap > 0 {
+                            // This branch only runs on ticks where both
+                            // legs emitted a bar, i.e. both just had an
+                            // *accepted* tick — so the raw exchange_ts is
+                            // fresh here by construction. The feed-health
+                            // view is what lets the guard see a rejection
+                            // storm that ended on this very tick (recovery
+                            // holddown) instead of firing into the first
+                            // post-storm book (PR #166 Codex review).
                             ineligible_close_book_degraded(
                                 p1,
                                 p2,
+                                [
+                                    self.tick_feed_health.get(&pair.base),
+                                    self.tick_feed_health.get(&pair.quote),
+                                ],
                                 now_ts,
                                 self.cfg.ineligible_close_defer_spread_bps,
                                 self.cfg.ineligible_close_defer_stale_secs,

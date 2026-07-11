@@ -110,13 +110,17 @@ pub struct PairTradeConfig {
     /// sit at 0.3-15 bps, degraded windows print fake multi-1000 bps books.
     /// Env: INELIGIBLE_CLOSE_DEFER_SPREAD_BPS.
     pub ineligible_close_defer_spread_bps: f64,
-    /// Age (seconds) of the last accepted tick above which the book counts
-    /// as degraded for the #531 guard. The tick filter rejects corrupt
-    /// snapshots *before* they reach the engine, so during a venue-data
-    /// incident the engine's book view is a stale-but-sane copy — spread
-    /// alone cannot see the degradation (the 06-10 event had ~5 min of
-    /// rejected ticks). Normal cadence is ~5s; 30s is clearly abnormal.
-    /// Env: INELIGIBLE_CLOSE_DEFER_STALE_SECS.
+    /// Staleness threshold (seconds) for the #531 guard. A leg counts as
+    /// degraded when the engine's view of it is not trustworthy-fresh:
+    /// the raw snapshot's `exchange_ts` is older than this (quiet venue
+    /// serving cached frames), the last tick that passed the sanity
+    /// filter is older than this (rejection storm — the raw `exchange_ts`
+    /// stays fresh in that shape because corrupt frames keep arriving),
+    /// or a rejection gap ended less than this many seconds ago
+    /// (post-storm recovery holddown — the 06-10 event closed on the
+    /// first bar after ~5 min of rejected ticks, exactly when everything
+    /// else looks fresh again). Normal accepted cadence is ~5s; 30s is
+    /// clearly abnormal. Env: INELIGIBLE_CLOSE_DEFER_STALE_SECS.
     pub ineligible_close_defer_stale_secs: i64,
     /// All per-pair tunables — z-score thresholds, hedge gates, lookback
     /// windows, circuit-breaker tiers, Phase 2 filters — live here. Engine
