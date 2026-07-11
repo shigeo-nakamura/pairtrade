@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 #[cfg(feature = "extended-sdk")]
 use dex_connector::create_extended_connector;
+#[cfg(feature = "hyperliquid-sdk")]
+use dex_connector::{create_hyperliquid_connector, HyperliquidConnectorConfig};
 #[cfg(feature = "lighter-sdk")]
 use dex_connector::{create_lighter_connector, LighterConnector, LighterConnectorConfig};
 use dex_connector::{
@@ -171,7 +173,19 @@ impl DexConnectorBox {
 
                 Ok(DexConnectorBox { inner: connector })
             }
-            _ => Err(DexError::Permanent("Unsupported dex".to_owned())),
+            #[cfg(feature = "hyperliquid-sdk")]
+            "hyperliquid" => {
+                let base_url = env::var("REST_ENDPOINT")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "https://api.hyperliquid.xyz".to_string());
+                let connector = create_hyperliquid_connector(HyperliquidConnectorConfig {
+                    base_url,
+                    tracked_symbols: token_list.to_vec(),
+                })?;
+                Ok(DexConnectorBox { inner: connector })
+            }
+            _ => Err(DexError::Permanent(format!("Unsupported dex: {dex_name}"))),
         }
     }
 }

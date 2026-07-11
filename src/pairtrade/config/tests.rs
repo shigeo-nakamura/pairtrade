@@ -16,6 +16,51 @@ fn risk_config_defaults_when_block_absent() {
 }
 
 #[test]
+fn hyperliquid_observer_config_parses() {
+    let vars = [
+        "DEX_NAME",
+        "DRY_RUN",
+        "FEE_BPS",
+        "REST_ENDPOINT",
+        "UNIVERSE_PAIRS",
+        "UNIVERSE_SYMBOLS",
+    ];
+    let saved: Vec<_> = vars
+        .iter()
+        .map(|name| ((*name).to_string(), std::env::var(name).ok()))
+        .collect();
+    for name in vars {
+        std::env::remove_var(name);
+    }
+
+    let cfg =
+        PairTradeConfig::from_yaml_path("configs/pairtrade/debot-pair-hyperliquid-observe.yaml")
+            .expect("hyperliquid observer yaml load");
+
+    assert_eq!(cfg.dex_name, "hyperliquid");
+    assert!(cfg.dry_run);
+    assert!(cfg.observe_only);
+    assert!(!cfg.force_close_on_startup);
+    assert_eq!(cfg.max_active_pairs, 2);
+    assert!(
+        cfg.fee_bps > 0.0,
+        "observer must keep post-only pricing enabled"
+    );
+    assert_eq!(cfg.universe.len(), 2);
+    assert_eq!(cfg.universe[0].base, "BTC");
+    assert_eq!(cfg.universe[0].quote, "ETH");
+    assert_eq!(cfg.universe[1].base, "SOL");
+    assert_eq!(cfg.universe[1].quote, "ETH");
+
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
+#[test]
 fn risk_config_resolves_capital_event_fields() {
     let yaml = RiskYaml {
         session_dd_capital_event_min_usd: Some(25.0),

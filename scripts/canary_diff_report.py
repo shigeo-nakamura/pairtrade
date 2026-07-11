@@ -43,6 +43,12 @@ ACTIVITY_RATIO_ALERT_MIN = 0.25
 ACTIVITY_RATIO_ALERT_MAX = 8.00
 RETURN_GAP_WATCH_BPS = -500.0
 RETURN_GAP_ALERT_BPS = -1_000.0
+# bot-strategy#412 signal #5: alert when the canary loses more than ~2 sigma
+# over 7d while main-A is profitable. -1.4 USD is 2 x sigma_7d ~= 0.116 USD/trade
+# x sqrt(36 trades/7d) at the 2026-07 baseline (canary ref $50, entry_z=1.0);
+# recompute when the canary config changes. Only applied to 7-day windows.
+CANARY_PNL_ALERT_USD_7D = -1.4
+CANARY_PNL_ALERT_WINDOW_DAYS = 7
 
 
 @dataclass
@@ -184,7 +190,8 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
     )
 
 
-def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot) -> tuple[str, str]:
+def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot,
+                    window_days: int = CANARY_PNL_ALERT_WINDOW_DAYS) -> tuple[str, str]:
     notes: list[str] = []
     if (
         main.window_coverage < MIN_WINDOW_COVERAGE
@@ -198,8 +205,24 @@ def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot) -> tuple[str, 
         )
         return "WATCH", " | ".join(notes)
 
+    # bot-strategy#412 signal #5: absolute-USD divergence, calibrated for the
+    # 7-day window only. Independent of the activity ratio, so it is evaluated
+    # before the zero-activity early return below.
+    pnl_divergence = (
+        window_days == CANARY_PNL_ALERT_WINDOW_DAYS
+        and canary.cumulative_pnl < CANARY_PNL_ALERT_USD_7D
+        and main.cumulative_pnl > 0
+    )
+    if window_days == CANARY_PNL_ALERT_WINDOW_DAYS:
+        notes.append(
+            f"pnl_7d canary=${canary.cumulative_pnl:+.2f} vs "
+            f"main=${main.cumulative_pnl:+.2f} "
+            f"(alert if canary < ${CANARY_PNL_ALERT_USD_7D} and main > 0)"
+        )
+
     if main.trade_count == 0:
-        return "WATCH", "main has zero activity events; activity ratio is undefined"
+        notes.append("main has zero activity events; activity ratio is undefined")
+        return ("ALERT" if pnl_divergence else "WATCH"), " | ".join(notes)
 
     rate_ratio = canary.trade_count / main.trade_count
     return_gap_bps = canary.return_bps - main.return_bps
@@ -216,6 +239,7 @@ def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot) -> tuple[str, 
         rate_ratio < ACTIVITY_RATIO_ALERT_MIN
         or rate_ratio > ACTIVITY_RATIO_ALERT_MAX
         or return_gap_bps < RETURN_GAP_ALERT_BPS
+        or pnl_divergence
     ):
         return "ALERT", " | ".join(notes)
     if (
@@ -272,7 +296,7 @@ def main() -> int:
     main_snap = build_snapshot(client, MAIN_PREFIX, MAIN_AGENT, cutoff_ms, now_ms)
     canary_snap = build_snapshot(client, CANARY_PREFIX, CANARY_AGENT, cutoff_ms, now_ms)
 
-    verdict, notes = compute_verdict(canary_snap, main_snap)
+    verdict, notes = compute_verdict(canary_snap, main_snap, args.days)
     print(render_markdown(canary_snap, main_snap, args.days, verdict, notes))
     return 0
 
