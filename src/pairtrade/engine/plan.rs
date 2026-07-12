@@ -889,9 +889,15 @@ impl PairTradeEngine {
                         }
                         if fire_close {
                             log::info!("[EXIT_CHECK] {} reason=ineligible", key);
+                            // Deliberately NOT clearing ineligible_defer_since_ts
+                            // here: planning only proposes the close, and a
+                            // failed placement with a reset timer would grant
+                            // the pair a fresh full deferral cap (PR #166
+                            // Codex review). The window is released in
+                            // apply_post_exit_state once the position is
+                            // actually gone.
                             if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
                                 state.pending_exit_reason = Some("ineligible");
-                                state.ineligible_defer_since_ts = None;
                             }
                             action = TradeAction::Close {
                                 direction: pos.direction,

@@ -70,6 +70,12 @@ pub(in crate::pairtrade) fn apply_post_exit_state(
 ) {
     state.position = None;
     state.recovery_recorded = false;
+    // The ineligible-close deferral window (bot-strategy#531) is anchored to
+    // the position it is obligated to flatten: it must survive planning-time
+    // fire attempts (a failed placement would otherwise restart the cap from
+    // scratch, PR #166 Codex review) and is released only here, when the
+    // position is actually gone.
+    state.ineligible_defer_since_ts = None;
     state.last_exit_at = Some(Instant::now());
     state.last_exit_ts = Some(now_ts);
     // Capture the z observed at exit before the post-take pending_exit_reason
