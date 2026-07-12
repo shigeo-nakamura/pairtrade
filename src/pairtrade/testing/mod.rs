@@ -90,6 +90,10 @@ impl PairTradeEngine {
             regime_reference_symbol: DEFAULT_REGIME_REFERENCE_SYMBOL.to_string(),
             bt_fill_delay_secs: 0,
             bt_regime_series_file: None,
+            // bot-strategy#531 — guard disabled in the default test config
+            ineligible_close_defer_cap_secs: 0,
+            ineligible_close_defer_spread_bps: 20.0,
+            ineligible_close_defer_stale_secs: 30,
             risk: config::RiskConfig::default(),
             round_id: None,
             config_source_path: None,
@@ -137,6 +141,7 @@ impl PairTradeEngine {
             }],
             history: HashMap::new(),
             bar_builders: HashMap::new(),
+            tick_feed_health: HashMap::new(),
             last_metrics_log: None,
             last_ob_warn: HashMap::new(),
             last_ticker_warn: HashMap::new(),

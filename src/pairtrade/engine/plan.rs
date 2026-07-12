@@ -16,8 +16,10 @@ use rust_decimal::Decimal;
 use super::super::apply_post_exit_state;
 use super::super::config::PairSpec;
 use super::super::entry::{entry_z_for_pair, should_enter, EntryCheck};
-use super::super::exit::{exit_reason, ExitCheck};
-use super::super::market::{liquidity_score, net_funding_for_direction, SymbolSnapshot};
+use super::super::exit::{exit_reason, risk_exit_reason, ExitCheck};
+use super::super::market::{
+    ineligible_close_book_degraded, liquidity_score, net_funding_for_direction, SymbolSnapshot,
+};
 use super::super::state::PositionDirection;
 use super::super::stats::spread_slope_sigma;
 use super::super::PairTradeEngine;
@@ -369,6 +371,27 @@ impl PairTradeEngine {
                 .get(&key)
                 .and_then(|s| s.position.clone());
 
+            // bot-strategy#531: a started deferral is a close obligation, not
+            // a hint — once an ineligible tick has triggered the flatten, the
+            // guard may only re-time it, never drop it (PR #166 Codex
+            // review). So the timer survives an eligibility recovery while a
+            // position is held (`defer_pending` routes the pair back into the
+            // close path below until it fires), and is reset only when there
+            // is no position left to close — then a later ineligibility spell
+            // starts a fresh deferral window instead of inheriting a stale
+            // start timestamp.
+            if position_state.is_none() {
+                if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                    state.ineligible_defer_since_ts = None;
+                }
+            }
+            let defer_pending = position_state.is_some()
+                && self.instances[inst_idx]
+                    .states
+                    .get(&key)
+                    .and_then(|s| s.ineligible_defer_since_ts)
+                    .is_some();
+
             let pp = self.pair_params_for(inst_idx, &key).clone();
             let pp = &pp;
             let force_close_due = position_state
@@ -485,7 +508,7 @@ impl PairTradeEngine {
 
             let min_points = (self.cfg.metrics_window / 2).max(10);
             if matches!(action, TradeAction::None) {
-                if eligible_shared && spread_len >= min_points {
+                if eligible_shared && !defer_pending && spread_len >= min_points {
                     if let Some((z, std, mean, latest_spread)) = z_snapshot {
                         let net_funding = net_funding_for_direction(z, p1, p2);
                         let position_open = self.instances[inst_idx]
@@ -742,26 +765,147 @@ impl PairTradeEngine {
                             consecutive_losses_snapshot
                         );
                     }
-                } else if eligible_shared && spread_len < min_points {
+                } else if eligible_shared && !defer_pending && spread_len < min_points {
                     log::debug!(
                         "[ZCHECK] {} skipped (spread history too short: {} < {})",
                         key,
                         spread_len,
                         min_points
                     );
-                } else if position_state.is_some() && !eligible_shared {
-                    // If pair falls out of eligibility, flatten
+                } else if position_state.is_some() && (!eligible_shared || defer_pending) {
+                    // If pair falls out of eligibility, flatten. When the
+                    // book-quality guard is enabled (bot-strategy#531), a
+                    // degraded book defers the flatten — re-checked every
+                    // tick — until the book recovers or the deferral cap
+                    // runs out. The eligibility break is often caused by
+                    // degraded venue data, so the immediate close would
+                    // execute into exactly the book conditions that
+                    // triggered it (the 2026-06-10 -$30.85 pooled event).
                     if let Some(pos) = &position_state {
-                        log::info!("[EXIT_CHECK] {} reason=ineligible", key);
-                        if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
-                            state.pending_exit_reason = Some("ineligible");
-                        }
-                        action = TradeAction::Close {
-                            direction: pos.direction,
-                            z: 0.0,
-                            beta: beta_eff,
-                            force: false,
+                        let defer_cap = self.cfg.ineligible_close_defer_cap_secs;
+                        // A risk-triggered exit (stop_loss_z / max_loss_r /
+                        // risk_budget) is never deferred: those gates live in
+                        // the eligible branch, so once the pair turns
+                        // ineligible this flatten is the only path that
+                        // realizes them — holding it for up to `defer_cap`
+                        // would keep an already-stopped-out position open
+                        // into exactly the conditions the stop exists for
+                        // (PR #166 Codex review). The close still fires with
+                        // reason=ineligible, matching pre-guard behavior.
+                        let risk_exit = if defer_cap > 0 {
+                            let (z_now, std_now) = z_snapshot
+                                .map(|(z, std, _, _)| (z, std))
+                                .unwrap_or((0.0, 0.0));
+                            let state = self.instances[inst_idx]
+                                .states
+                                .get(&key)
+                                .ok_or_else(|| anyhow!("missing state for {}", key))?;
+                            let shared = self
+                                .per_pair_state
+                                .get(&key)
+                                .ok_or_else(|| anyhow!("missing shared state for {}", key))?;
+                            risk_exit_reason(ExitCheck {
+                                cfg: &self.cfg,
+                                pp,
+                                state,
+                                shared,
+                                z: z_now,
+                                std: std_now,
+                                p1,
+                                p2,
+                                equity_base: equity_reference_snapshot,
+                                now_ts,
+                            })
+                        } else {
+                            None
                         };
+                        let degraded = if defer_cap > 0 && risk_exit.is_none() {
+                            // This branch only runs on ticks where both
+                            // legs emitted a bar, i.e. both just had an
+                            // *accepted* tick — so the raw exchange_ts is
+                            // fresh here by construction. The feed-health
+                            // view is what lets the guard see a rejection
+                            // storm that ended on this very tick (recovery
+                            // holddown) instead of firing into the first
+                            // post-storm book (PR #166 Codex review).
+                            ineligible_close_book_degraded(
+                                p1,
+                                p2,
+                                [
+                                    self.tick_feed_health.get(&pair.base),
+                                    self.tick_feed_health.get(&pair.quote),
+                                ],
+                                now_ts,
+                                self.cfg.ineligible_close_defer_spread_bps,
+                                self.cfg.ineligible_close_defer_stale_secs,
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = risk_exit {
+                            log::warn!(
+                                "[EXIT_DEFER] {} bypass: risk exit ({}) pending; closing immediately regardless of book quality",
+                                key,
+                                reason
+                            );
+                        }
+                        let mut fire_close = true;
+                        if let Some(reason) = degraded {
+                            let since = self.instances[inst_idx]
+                                .states
+                                .get_mut(&key)
+                                .map(|s| *s.ineligible_defer_since_ts.get_or_insert(now_ts))
+                                .unwrap_or(now_ts);
+                            let elapsed = now_ts.saturating_sub(since);
+                            let variant = self.instances[inst_idx].id.clone();
+                            if elapsed < defer_cap {
+                                log::warn!(
+                                    "[EXIT_DEFER] {} reason=ineligible book_degraded={} elapsed={}s cap={}s",
+                                    key,
+                                    reason,
+                                    elapsed,
+                                    defer_cap
+                                );
+                                crate::pairtrade::prom::INELIGIBLE_CLOSE_DEFER_TOTAL
+                                    .with_label_values(&[variant.as_str(), key.as_str(), reason])
+                                    .inc();
+                                fire_close = false;
+                            } else {
+                                log::warn!(
+                                    "[EXIT_DEFER] {} cap exceeded ({}s >= {}s); closing into degraded book (reason={})",
+                                    key,
+                                    elapsed,
+                                    defer_cap,
+                                    reason
+                                );
+                                crate::pairtrade::prom::INELIGIBLE_CLOSE_DEFER_TOTAL
+                                    .with_label_values(&[
+                                        variant.as_str(),
+                                        key.as_str(),
+                                        "cap_exceeded",
+                                    ])
+                                    .inc();
+                            }
+                        }
+                        if fire_close {
+                            log::info!("[EXIT_CHECK] {} reason=ineligible", key);
+                            // Deliberately NOT clearing ineligible_defer_since_ts
+                            // here: planning only proposes the close, and a
+                            // failed placement with a reset timer would grant
+                            // the pair a fresh full deferral cap (PR #166
+                            // Codex review). The window is released in
+                            // apply_post_exit_state once the position is
+                            // actually gone.
+                            if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                                state.pending_exit_reason = Some("ineligible");
+                            }
+                            action = TradeAction::Close {
+                                direction: pos.direction,
+                                z: 0.0,
+                                beta: beta_eff,
+                                force: false,
+                            };
+                        }
                     }
                 }
             }

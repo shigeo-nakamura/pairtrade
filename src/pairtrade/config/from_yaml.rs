@@ -116,6 +116,10 @@ impl PairTradeConfig {
             bt_restart_timestamps: None,  // env-only, not in YAML
             bt_fill_delay_secs: 0,        // env-only, not in YAML
             bt_regime_series_file: None,  // env-only, not in YAML
+            // bot-strategy#531 — env-only, not in YAML; cap 0 = guard disabled
+            ineligible_close_defer_cap_secs: 0,
+            ineligible_close_defer_spread_bps: 20.0,
+            ineligible_close_defer_stale_secs: 30,
             shutdown_grace_secs: yaml
                 .shutdown_grace_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),

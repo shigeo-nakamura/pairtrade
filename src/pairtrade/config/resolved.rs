@@ -90,6 +90,38 @@ pub struct PairTradeConfig {
     /// offline, which needs the raw innovation at every tick.
     /// Env: BT_REGIME_SERIES_FILE.
     pub bt_regime_series_file: Option<String>,
+    /// Ineligible-close book-quality guard (bot-strategy#531). When a held
+    /// pair loses eligibility, the flatten fires on the same tick — and the
+    /// eligibility break is often *caused by* degraded venue data, so the
+    /// close executes into exactly the book conditions that triggered it
+    /// (the 2026-06-10 -$30.85 pooled event). When this cap is > 0, the
+    /// ineligible close is deferred while the book looks degraded (spread or
+    /// staleness, see the two thresholds below) and re-checked each tick; it
+    /// fires unconditionally once the deferral has lasted this many seconds.
+    /// Strictly a close-*timing* guard: the position still closes, entries
+    /// stay blocked while ineligible, and it is distinct from the rejected
+    /// #599 ineligible-hold (which held through the whole ineligible spell).
+    /// 0 disables the guard entirely (default — legacy immediate close).
+    /// Recommended live value: 300. Env: INELIGIBLE_CLOSE_DEFER_CAP_SECS.
+    pub ineligible_close_defer_cap_secs: i64,
+    /// Leg bid/ask spread (bps of mid) above which the book counts as
+    /// degraded for the #531 guard. 20 bps matches the BT degraded-book
+    /// artifact filter (cascade-fade screen): normal Lighter BTC/ETH spreads
+    /// sit at 0.3-15 bps, degraded windows print fake multi-1000 bps books.
+    /// Env: INELIGIBLE_CLOSE_DEFER_SPREAD_BPS.
+    pub ineligible_close_defer_spread_bps: f64,
+    /// Staleness threshold (seconds) for the #531 guard. A leg counts as
+    /// degraded when the engine's view of it is not trustworthy-fresh:
+    /// the raw snapshot's `exchange_ts` is older than this (quiet venue
+    /// serving cached frames), the last tick that passed the sanity
+    /// filter is older than this (rejection storm — the raw `exchange_ts`
+    /// stays fresh in that shape because corrupt frames keep arriving),
+    /// or a rejection gap ended less than this many seconds ago
+    /// (post-storm recovery holddown — the 06-10 event closed on the
+    /// first bar after ~5 min of rejected ticks, exactly when everything
+    /// else looks fresh again). Normal accepted cadence is ~5s; 30s is
+    /// clearly abnormal. Env: INELIGIBLE_CLOSE_DEFER_STALE_SECS.
+    pub ineligible_close_defer_stale_secs: i64,
     /// All per-pair tunables — z-score thresholds, hedge gates, lookback
     /// windows, circuit-breaker tiers, Phase 2 filters — live here. Engine
     /// reads them via `params_for(key)` so per-pair YAML overrides win.

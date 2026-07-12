@@ -135,6 +135,7 @@ impl PairTradeEngine {
                 let ps = PairState::new(pp.entry_z_base);
                 prom::init_close_reason_series(&strategy.id, &pair_key);
                 prom::init_entry_reject_series(&strategy.id, &pair_key);
+                prom::init_ineligible_close_defer_series(&strategy.id, &pair_key);
                 states.insert(pair_key, ps);
             }
 
@@ -225,6 +226,9 @@ impl PairTradeEngine {
                     &inst.default_pair_params,
                     cfg.max_leverage,
                     cfg.dry_run,
+                    cfg.ineligible_close_defer_cap_secs,
+                    cfg.ineligible_close_defer_spread_bps,
+                    cfg.ineligible_close_defer_stale_secs,
                 );
                 log::info!("{}", effective.log_line());
                 prom::record_config_info(
@@ -236,6 +240,9 @@ impl PairTradeEngine {
                     effective.use_frozen_beta_exit_z,
                     effective.equity_reference_usd,
                     effective.max_leverage,
+                    effective.ineligible_close_defer_cap_secs,
+                    effective.ineligible_close_defer_spread_bps,
+                    effective.ineligible_close_defer_stale_secs,
                     &file_path,
                     &file_sha,
                     file_mtime,
@@ -251,6 +258,7 @@ impl PairTradeEngine {
             history,
             per_pair_state,
             bar_builders,
+            tick_feed_health: HashMap::new(),
             last_metrics_log: None,
             last_ob_warn: HashMap::new(),
             last_ticker_warn: HashMap::new(),

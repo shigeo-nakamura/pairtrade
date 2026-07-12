@@ -391,6 +391,42 @@ pub static ENTRY_REJECT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// Ineligible-close deferral guard (bot-strategy#531): counts ticks on
+/// which an ineligible flatten was deferred because the book looked
+/// degraded (`reason` = `spread` | `stale`), plus `cap_exceeded` when the
+/// deferral window ran out and the close fired into the still-degraded
+/// book. Zero under normal operation — any movement here is a venue-data
+/// incident worth a look.
+pub static INELIGIBLE_CLOSE_DEFER_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_ineligible_close_defer_total",
+        "Cumulative count of ineligible-close deferral guard events \
+         (bot-strategy#531), broken down by reason (spread, stale, \
+         cap_exceeded).",
+        &["variant", "pair", "reason"],
+    )
+});
+
+/// Every reason string `pairtrade_ineligible_close_defer_total` may receive.
+/// Kept in sync with the literals `ineligible_close_book_degraded`
+/// (market.rs) returns plus the `"cap_exceeded"` literal in
+/// `step_plan_pair_actions` (engine/plan.rs).
+pub const KNOWN_INELIGIBLE_CLOSE_DEFER_REASONS: &[&str] = &["spread", "stale", "cap_exceeded"];
+
+/// Materialize every `(variant, pair, reason)` series for
+/// `pairtrade_ineligible_close_defer_total` at value 0, for the same reason
+/// as `init_close_reason_series` (bot-strategy#416): the counter is only
+/// touched during a venue-data incident, so without a zero baseline the
+/// first scrape after a one-tick deferral already sees value=1 and
+/// `increase([range])` misses exactly the first/only incident.
+pub fn init_ineligible_close_defer_series(variant: &str, pair: &str) {
+    for reason in KNOWN_INELIGIBLE_CLOSE_DEFER_REASONS {
+        INELIGIBLE_CLOSE_DEFER_TOTAL
+            .with_label_values(&[variant, pair, reason])
+            .inc_by(0);
+    }
+}
+
 /// Every entry-reject reason string `pairtrade_entry_reject_total` may receive.
 /// Kept in sync with the literals in `engine/step.rs` (pre-`should_enter`) and
 /// `entry.rs::should_enter` (in-filter). The unit test below asserts that.
@@ -671,6 +707,34 @@ pub static EFFECTIVE_FROZEN_BETA_EXIT_Z: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static EFFECTIVE_INELIGIBLE_CLOSE_DEFER_CAP_SECS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_ineligible_close_defer_cap_secs",
+        "Effective ineligible-close book-quality deferral cap (seconds) the running process \
+         is using; 0 means the guard is disabled (bot-strategy#531). Process-wide, repeated \
+         per variant so the drift preflight can assert it alongside the other effective params.",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_INELIGIBLE_CLOSE_DEFER_SPREAD_BPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_ineligible_close_defer_spread_bps",
+        "Effective per-leg spread threshold (bps) above which the ineligible-close guard \
+         treats the book as degraded (bot-strategy#531). Process-wide, repeated per variant.",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_INELIGIBLE_CLOSE_DEFER_STALE_SECS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_ineligible_close_defer_stale_secs",
+        "Effective feed-staleness threshold (seconds) above which the ineligible-close guard \
+         treats a leg's feed as degraded (bot-strategy#531). Process-wide, repeated per variant.",
+        &["variant"],
+    )
+});
+
 /// Spawn the metrics HTTP server if `PROM_LISTEN` is set in the
 /// environment. The address must parse as `host:port`. Failures during
 /// bind are logged at WARN and do not abort the bot — the gauges keep
@@ -787,6 +851,9 @@ pub fn record_config_info(
     frozen_beta_exit_z: bool,
     equity_reference_usd: f64,
     max_leverage: f64,
+    ineligible_close_defer_cap_secs: i64,
+    ineligible_close_defer_spread_bps: f64,
+    ineligible_close_defer_stale_secs: i64,
     file_path: &str,
     file_sha: &str,
     file_mtime: i64,
@@ -819,6 +886,15 @@ pub fn record_config_info(
     MAX_LEVERAGE_CONFIG
         .with_label_values(&[variant])
         .set(max_leverage);
+    EFFECTIVE_INELIGIBLE_CLOSE_DEFER_CAP_SECS
+        .with_label_values(&[variant])
+        .set(ineligible_close_defer_cap_secs as f64);
+    EFFECTIVE_INELIGIBLE_CLOSE_DEFER_SPREAD_BPS
+        .with_label_values(&[variant])
+        .set(ineligible_close_defer_spread_bps);
+    EFFECTIVE_INELIGIBLE_CLOSE_DEFER_STALE_SECS
+        .with_label_values(&[variant])
+        .set(ineligible_close_defer_stale_secs as f64);
 }
 
 #[cfg(test)]
@@ -832,6 +908,19 @@ mod tests {
         init_close_reason_series(variant, pair);
         for reason in KNOWN_CLOSE_REASONS {
             let value = CLOSE_REASON_TOTAL
+                .with_label_values(&[variant, pair, reason])
+                .get();
+            assert_eq!(value, 0, "reason {} should be pre-registered at 0", reason);
+        }
+    }
+
+    #[test]
+    fn init_ineligible_close_defer_series_registers_every_known_reason_at_zero() {
+        let variant = "test-init-defer-zero";
+        let pair = "BTC/ETH";
+        init_ineligible_close_defer_series(variant, pair);
+        for reason in KNOWN_INELIGIBLE_CLOSE_DEFER_REASONS {
+            let value = INELIGIBLE_CLOSE_DEFER_TOTAL
                 .with_label_values(&[variant, pair, reason])
                 .get();
             assert_eq!(value, 0, "reason {} should be pre-registered at 0", reason);

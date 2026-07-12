@@ -77,6 +77,11 @@ const PRICE_B: &str = "100.0";
 struct GateConnector {
     prices: Mutex<HashMap<String, Decimal>>,
     equity: Mutex<Decimal>,
+    /// Per-side book half-spread as a fraction of price. `None` keeps the
+    /// historical ±10 bps book; the #531 guard tests widen it to a
+    /// degraded-but-not-corrupt level (above the 20 bps guard threshold,
+    /// below the 200 bps tick-filter reject).
+    half_spread_frac: Mutex<Option<Decimal>>,
 }
 
 impl GateConnector {
@@ -94,6 +99,19 @@ impl GateConnector {
             .get(symbol)
             .copied()
             .unwrap_or_default()
+    }
+
+    fn set_half_spread_frac(&self, frac: Decimal) {
+        *self.half_spread_frac.lock().unwrap() = Some(frac);
+    }
+
+    fn half_spread_of(&self, price: Decimal) -> Decimal {
+        let frac = self
+            .half_spread_frac
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| dec("0.001"));
+        price * frac
     }
 }
 
@@ -172,11 +190,12 @@ impl DexConnector for GateConnector {
         symbol: &str,
         _depth: usize,
     ) -> Result<OrderBookSnapshot, DexError> {
-        // ±10 bps book around the ticker price: comfortably inside
-        // MAX_TICK_SPREAD_BPS / MAX_TICK_PRICE_ENVELOPE_BPS so the polled
-        // snapshot survives tick_sanity_check and reaches the BarBuilder.
+        // ±10 bps book around the ticker price by default: comfortably
+        // inside MAX_TICK_SPREAD_BPS / MAX_TICK_PRICE_ENVELOPE_BPS so the
+        // polled snapshot survives tick_sanity_check and reaches the
+        // BarBuilder. Tests may widen it via `set_half_spread_frac`.
         let price = self.price_of(symbol);
-        let spread = price * dec("0.001");
+        let spread = self.half_spread_of(price);
         Ok(OrderBookSnapshot {
             bids: vec![OrderBookLevel {
                 price: price - spread,
@@ -510,6 +529,14 @@ impl Harness {
     /// `force_close_secs` (60s), so the next planning pass must schedule a
     /// forced exit regardless of any active entry halt.
     fn seed_aged_position(&mut self, inst_idx: usize) {
+        self.seed_position(inst_idx, 3600);
+    }
+
+    /// Seed an open position `age_secs` into its hold. The #531 guard
+    /// tests use a fresh position (age well below `force_close_secs`) so
+    /// the ineligible-flatten branch — not the force-close branch — is
+    /// the one that decides the exit.
+    fn seed_position(&mut self, inst_idx: usize, age_secs: i64) {
         let now_ts = chrono::Utc::now().timestamp();
         let state = self.engine.instances[inst_idx]
             .states
@@ -518,7 +545,7 @@ impl Harness {
         state.position = Some(Position {
             direction: PositionDirection::LongSpread,
             entered_at: Instant::now(),
-            entered_ts: now_ts - 3600,
+            entered_ts: now_ts - age_secs,
             entry_price_a: Some(dec(PRICE_A)),
             entry_price_b: Some(dec(PRICE_B)),
             entry_size_a: Some(dec("0.476")),
@@ -1067,5 +1094,277 @@ fn risk_ack_without_reanchor_leaves_peak_intact() {
     assert!(
         (inst.equity_samples[0].equity - 1_003.0).abs() < 1e-9,
         "the inflated peak survives a plain ack (today's behaviour preserved)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Scenario 5 (bot-strategy#531): ineligible-close book-quality guard.
+// When a held pair loses eligibility, the flatten normally fires on the
+// same tick. With INELIGIBLE_CLOSE_DEFER_CAP_SECS > 0, a degraded book
+// (leg spread above the guard threshold, or a stale engine view) defers
+// the close — re-checked every tick — until the book recovers or the
+// deferral cap runs out. The guard must never *prevent* the close, only
+// re-time it; disabled (cap 0, the default) must preserve today's
+// immediate-close behaviour bit for bit.
+// ---------------------------------------------------------------------
+
+fn defer_count(instance_id: &str, reason: &str) -> u64 {
+    prom::INELIGIBLE_CLOSE_DEFER_TOTAL
+        .with_label_values(&[instance_id, PAIR_KEY, reason])
+        .get()
+}
+
+/// Shared setup: engine with the guard enabled, a fresh held position
+/// (age 5s, far below force_close_secs=60), the pair forced ineligible,
+/// and a 40 bps book (above the 20 bps guard threshold, below the 200 bps
+/// tick-filter reject so the polled snapshot still reaches the planner).
+fn ineligible_guard_harness(instance_id: &str) -> Harness {
+    let mut h = Harness::new(instance_id);
+    h.engine.cfg.ineligible_close_defer_cap_secs = 300;
+    h.seed_position(0, 5);
+    h._connector.set_half_spread_frac(dec("0.002"));
+    h.engine.per_pair_state.get_mut(PAIR_KEY).unwrap().eligible = false;
+    h
+}
+
+#[tokio::test]
+async fn ineligible_close_deferred_on_degraded_book_then_fires_on_recovery() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = ineligible_guard_harness("hg-inelig-defer");
+    let deferred_before = defer_count("hg-inelig-defer", "spread");
+
+    h.step().await;
+    assert!(
+        h.position(0).is_some(),
+        "ineligible close must be deferred while the book is degraded"
+    );
+    assert_eq!(
+        defer_count("hg-inelig-defer", "spread"),
+        deferred_before + 1,
+        "the deferral must be attributed to the spread check"
+    );
+    assert!(
+        h.engine.instances[0].states[PAIR_KEY]
+            .ineligible_defer_since_ts
+            .is_some(),
+        "the deferral window must have started"
+    );
+
+    // Book recovers to a ±5 bps shape (clearly below the 20 bps guard
+    // threshold — the historical ±10 bps default lands exactly ON the
+    // threshold, where f64 rounding makes the comparison unstable) → the
+    // very next tick must flatten (pair is still ineligible).
+    h._connector.set_half_spread_frac(dec("0.0005"));
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "close must fire as soon as the book recovers"
+    );
+    assert!(
+        h.engine.instances[0].states[PAIR_KEY]
+            .ineligible_defer_since_ts
+            .is_none(),
+        "firing the close must clear the deferral window"
+    );
+}
+
+#[tokio::test]
+async fn ineligible_close_fires_unconditionally_once_cap_exceeded() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = ineligible_guard_harness("hg-inelig-cap");
+
+    h.step().await;
+    assert!(
+        h.position(0).is_some(),
+        "first tick defers while the book is degraded"
+    );
+
+    // Age the deferral start past the 300s cap; the book stays degraded.
+    let now_ts = chrono::Utc::now().timestamp();
+    h.engine.instances[0]
+        .states
+        .get_mut(PAIR_KEY)
+        .unwrap()
+        .ineligible_defer_since_ts = Some(now_ts - 301);
+    let cap_before = defer_count("hg-inelig-cap", "cap_exceeded");
+
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "cap exceeded must close even into the still-degraded book"
+    );
+    assert_eq!(
+        defer_count("hg-inelig-cap", "cap_exceeded"),
+        cap_before + 1,
+        "the forced fire must be attributed to cap_exceeded"
+    );
+}
+
+/// The 06-10 rejection-storm shape (Codex review on PR #166): while the
+/// tick filter rejects everything, no bar updates and the planner never
+/// reaches the pair; when the first valid tick lands, the snapshot is
+/// fresh and sane — the guard must still defer via the accepted-feed gap
+/// recovery holddown instead of firing into the just-recovered book.
+#[tokio::test]
+async fn ineligible_close_deferred_through_gap_recovery_holddown() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = ineligible_guard_harness("hg-inelig-gap");
+    // Tight book: the spread signal must NOT be the one deferring.
+    h._connector.set_half_spread_frac(dec("0.0005"));
+    // Simulate "no accepted tick for 100s" (the storm): the next step's
+    // accepted tick then ends the gap and must arm the recovery holddown.
+    let now_ts = chrono::Utc::now().timestamp();
+    for symbol in [BASE, QUOTE] {
+        h.engine.tick_feed_health.insert(
+            symbol.to_string(),
+            market::FeedHealth {
+                last_accepted_ts: now_ts - 100,
+                gap_recovered_ts: None,
+            },
+        );
+    }
+    let stale_before = defer_count("hg-inelig-gap", "stale");
+
+    h.step().await;
+    assert!(
+        h.position(0).is_some(),
+        "first valid tick after a rejection storm must defer, not close"
+    );
+    assert_eq!(
+        defer_count("hg-inelig-gap", "stale"),
+        stale_before + 1,
+        "the deferral must be attributed to the stale check"
+    );
+    assert!(
+        h.engine
+            .tick_feed_health
+            .get(BASE)
+            .and_then(|f| f.gap_recovered_ts)
+            .is_some(),
+        "the accepted tick that ended the gap must arm the recovery holddown"
+    );
+
+    // Holddown elapsed (backdate the recovery past the 30s threshold; the
+    // accepted feed itself stays fresh): the close must now go through.
+    let now_ts = chrono::Utc::now().timestamp();
+    for symbol in [BASE, QUOTE] {
+        if let Some(f) = h.engine.tick_feed_health.get_mut(symbol) {
+            f.gap_recovered_ts = Some(now_ts - 31);
+        }
+    }
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "close must fire once the recovery holddown has elapsed"
+    );
+}
+
+#[tokio::test]
+async fn ineligible_close_immediate_when_guard_disabled() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    // Same degraded book, guard left at the cap=0 default: today's
+    // immediate flatten must be unchanged.
+    let mut h = ineligible_guard_harness("hg-inelig-off");
+    h.engine.cfg.ineligible_close_defer_cap_secs = 0;
+
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "with the guard disabled the ineligible close fires on the same tick"
+    );
+}
+
+/// A started deferral is a close obligation (PR #166 Codex review): if
+/// eligibility flips back to true while the close is still deferred, the
+/// guard must not drop the already-triggered flatten — it re-times it,
+/// firing as soon as the book recovers (or the cap expires), exactly as
+/// if the pair had stayed ineligible.
+#[tokio::test]
+async fn ineligible_close_survives_eligibility_recovery() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = ineligible_guard_harness("hg-inelig-flip");
+    // Park every eligible-branch exit gate out of reach so a close after
+    // the flip can only come from the deferred ineligible flatten — not
+    // from stop_loss_z / exit_z happening to fire on the same tick.
+    {
+        let pp = &mut h.engine.instances[0].default_pair_params;
+        pp.stop_loss_z = 50.0;
+        pp.exit_z = 0.0;
+    }
+
+    h.step().await;
+    assert!(
+        h.position(0).is_some(),
+        "first tick defers while the book is degraded"
+    );
+    assert!(
+        h.engine.instances[0].states[PAIR_KEY]
+            .ineligible_defer_since_ts
+            .is_some(),
+        "the deferral window must have started"
+    );
+
+    // Eligibility recovers AND the book heals before the cap expires.
+    h.engine.per_pair_state.get_mut(PAIR_KEY).unwrap().eligible = true;
+    h._connector.set_half_spread_frac(dec("0.0005"));
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "the deferred close must still fire after eligibility recovers"
+    );
+    assert!(
+        h.engine.instances[0].states[PAIR_KEY]
+            .ineligible_defer_since_ts
+            .is_none(),
+        "firing the close must clear the deferral window"
+    );
+}
+
+/// A risk-triggered exit must never be deferred (PR #166 Codex review):
+/// once a held pair turns ineligible, this flatten is the only path that
+/// realizes `stop_loss_z` / `max_loss_r` / `risk_budget`, so a degraded
+/// book must not hold an already-breached loss budget open for up to the
+/// deferral cap.
+#[tokio::test]
+async fn ineligible_close_bypasses_deferral_when_risk_exit_pending() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    // Guard enabled + degraded 40 bps book, exactly like the defer test —
+    // but the position is deep underwater: leg-A entry far above the
+    // current book puts the PnL (≈ -$140) past the max_loss_r budget
+    // (equity $10k × risk 1% × mult 1.0 = -$100).
+    let mut h = ineligible_guard_harness("hg-inelig-risk");
+    {
+        let state = h.engine.instances[0].states.get_mut(PAIR_KEY).unwrap();
+        state.position.as_mut().unwrap().entry_price_a = Some(dec("400"));
+    }
+    let deferred_before = defer_count("hg-inelig-risk", "spread");
+
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "a pending risk exit must close immediately even into the degraded book"
+    );
+    assert_eq!(
+        defer_count("hg-inelig-risk", "spread"),
+        deferred_before,
+        "the bypass must not count as a deferral"
+    );
+    assert!(
+        h.engine.instances[0].states[PAIR_KEY]
+            .ineligible_defer_since_ts
+            .is_none(),
+        "no deferral window may be opened for a risk-exit bypass"
     );
 }
