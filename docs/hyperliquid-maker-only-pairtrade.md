@@ -79,6 +79,24 @@ Prepare local output directories:
 mkdir -p /tmp/debot-hyperliquid-observe/history_archive
 ```
 
+The `/tmp` paths in the YAML are local smoke-test defaults. For a long-running
+shadow collector, point the existing output overrides at a persistent
+`STATE_DIR`, for example in the dedicated observer service environment:
+
+```bash
+STATE_DIR=/path/to/persistent/debot-pair-hyperliquid-observe
+mkdir -p "$STATE_DIR/history_archive"
+export DATA_DUMP_FILE="$STATE_DIR/market_data_hyperliquid_pairs.jsonl"
+export HISTORY_ARCHIVE_DIR="$STATE_DIR/history_archive"
+export PAIRTRADE_HISTORY_FILE="$STATE_DIR/pairtrade_history_BTC_ETH_SOL.json"
+```
+
+`risk_state.json` is written next to `PAIRTRADE_HISTORY_FILE`. In a systemd
+`EnvironmentFile`, do not rely on shell variable interpolation; set the three
+output variables above to their resolved absolute paths. Configure these values
+only for the dedicated Hyperliquid observer service; do not modify an existing
+trading service environment.
+
 Run the observer:
 
 ```bash
