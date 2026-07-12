@@ -1282,6 +1282,54 @@ async fn ineligible_close_immediate_when_guard_disabled() {
     );
 }
 
+/// A started deferral is a close obligation (PR #166 Codex review): if
+/// eligibility flips back to true while the close is still deferred, the
+/// guard must not drop the already-triggered flatten — it re-times it,
+/// firing as soon as the book recovers (or the cap expires), exactly as
+/// if the pair had stayed ineligible.
+#[tokio::test]
+async fn ineligible_close_survives_eligibility_recovery() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = ineligible_guard_harness("hg-inelig-flip");
+    // Park every eligible-branch exit gate out of reach so a close after
+    // the flip can only come from the deferred ineligible flatten — not
+    // from stop_loss_z / exit_z happening to fire on the same tick.
+    {
+        let pp = &mut h.engine.instances[0].default_pair_params;
+        pp.stop_loss_z = 50.0;
+        pp.exit_z = 0.0;
+    }
+
+    h.step().await;
+    assert!(
+        h.position(0).is_some(),
+        "first tick defers while the book is degraded"
+    );
+    assert!(
+        h.engine.instances[0].states[PAIR_KEY]
+            .ineligible_defer_since_ts
+            .is_some(),
+        "the deferral window must have started"
+    );
+
+    // Eligibility recovers AND the book heals before the cap expires.
+    h.engine.per_pair_state.get_mut(PAIR_KEY).unwrap().eligible = true;
+    h._connector.set_half_spread_frac(dec("0.0005"));
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "the deferred close must still fire after eligibility recovers"
+    );
+    assert!(
+        h.engine.instances[0].states[PAIR_KEY]
+            .ineligible_defer_since_ts
+            .is_none(),
+        "firing the close must clear the deferral window"
+    );
+}
+
 /// A risk-triggered exit must never be deferred (PR #166 Codex review):
 /// once a held pair turns ineligible, this flatten is the only path that
 /// realizes `stop_loss_z` / `max_loss_r` / `risk_budget`, so a degraded

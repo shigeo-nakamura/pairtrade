@@ -371,14 +371,26 @@ impl PairTradeEngine {
                 .get(&key)
                 .and_then(|s| s.position.clone());
 
-            // bot-strategy#531: any eligible tick resets the ineligible-close
-            // deferral timer, so a later ineligibility spell starts a fresh
-            // deferral window instead of inheriting a stale start timestamp.
-            if eligible_shared {
+            // bot-strategy#531: a started deferral is a close obligation, not
+            // a hint — once an ineligible tick has triggered the flatten, the
+            // guard may only re-time it, never drop it (PR #166 Codex
+            // review). So the timer survives an eligibility recovery while a
+            // position is held (`defer_pending` routes the pair back into the
+            // close path below until it fires), and is reset only when there
+            // is no position left to close — then a later ineligibility spell
+            // starts a fresh deferral window instead of inheriting a stale
+            // start timestamp.
+            if position_state.is_none() {
                 if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
                     state.ineligible_defer_since_ts = None;
                 }
             }
+            let defer_pending = position_state.is_some()
+                && self.instances[inst_idx]
+                    .states
+                    .get(&key)
+                    .and_then(|s| s.ineligible_defer_since_ts)
+                    .is_some();
 
             let pp = self.pair_params_for(inst_idx, &key).clone();
             let pp = &pp;
@@ -496,7 +508,7 @@ impl PairTradeEngine {
 
             let min_points = (self.cfg.metrics_window / 2).max(10);
             if matches!(action, TradeAction::None) {
-                if eligible_shared && spread_len >= min_points {
+                if eligible_shared && !defer_pending && spread_len >= min_points {
                     if let Some((z, std, mean, latest_spread)) = z_snapshot {
                         let net_funding = net_funding_for_direction(z, p1, p2);
                         let position_open = self.instances[inst_idx]
@@ -753,14 +765,14 @@ impl PairTradeEngine {
                             consecutive_losses_snapshot
                         );
                     }
-                } else if eligible_shared && spread_len < min_points {
+                } else if eligible_shared && !defer_pending && spread_len < min_points {
                     log::debug!(
                         "[ZCHECK] {} skipped (spread history too short: {} < {})",
                         key,
                         spread_len,
                         min_points
                     );
-                } else if position_state.is_some() && !eligible_shared {
+                } else if position_state.is_some() && (!eligible_shared || defer_pending) {
                     // If pair falls out of eligibility, flatten. When the
                     // book-quality guard is enabled (bot-strategy#531), a
                     // degraded book defers the flatten — re-checked every
