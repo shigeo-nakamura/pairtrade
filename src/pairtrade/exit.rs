@@ -36,17 +36,7 @@ pub(super) fn exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
 
     let pos = state.position.as_ref()?;
 
-    // bot-strategy#473: when the YAML opts into frozen-β exit and the
-    // position has an entry_beta on file, recompute z under entry_beta
-    // and use it for the exit-side gates (`stop_loss_z`, `exit_z`,
-    // `expected_value`). Entry / regime / dashboards keep using the
-    // rolling-β z that came in via the `z` arg, so the rest of the bot
-    // is unaffected.
-    let (z_for_exit, std_for_exit) = if pp.use_frozen_beta_exit_z {
-        position_z_for_exit(shared, pos, p1, p2).unwrap_or((z, std))
-    } else {
-        (z, std)
-    };
+    let (z_for_exit, std_for_exit) = exit_z_view(pp, shared, pos, p1, p2, z, std);
 
     if z_for_exit.abs() >= pp.stop_loss_z {
         return Some("stop_loss_z");
@@ -58,22 +48,8 @@ pub(super) fn exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
         return Some("exit_z");
     }
     let pnl = compute_pnl(pos, p1.price, p2.price);
-    if let Some(pnl) = pnl {
-        let risk_budget = equity_base * cfg.risk_pct_per_trade;
-        if let Some(target) = Decimal::from_f64(risk_budget) {
-            if target > Decimal::ZERO {
-                if pp.max_loss_r_mult > 0.0 {
-                    let loss_mult = Decimal::from_f64(pp.max_loss_r_mult).unwrap_or(Decimal::ONE);
-                    let max_loss = -target * loss_mult;
-                    if pnl <= max_loss {
-                        return Some("max_loss_r");
-                    }
-                }
-                if pnl >= target {
-                    return Some("risk_budget");
-                }
-            }
-        }
+    if let Some(reason) = pnl_risk_exit(cfg, pp, pnl, equity_base) {
+        return Some(reason);
     }
     if std_for_exit > 1e-9 {
         if let Some(pnl) = pnl {
@@ -96,6 +72,83 @@ pub(super) fn exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
                     }
                 }
             }
+        }
+    }
+    None
+}
+
+/// The risk-triggered subset of `exit_reason`: `stop_loss_z`, `max_loss_r`
+/// and `risk_budget`, under the same frozen-β view and precedence those gates
+/// have in `exit_reason`. Used by the ineligible-close book-quality guard
+/// (bot-strategy#531, PR #166 review): a position that is already stopped
+/// out, past its loss budget or at its risk-budget target must close
+/// immediately even into a degraded book — only the timing-only exits may be
+/// deferred.
+pub(super) fn risk_exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
+    let ExitCheck {
+        cfg,
+        pp,
+        state,
+        shared,
+        z,
+        std,
+        p1,
+        p2,
+        equity_base,
+        now_ts: _,
+    } = check;
+
+    let pos = state.position.as_ref()?;
+    let (z_for_exit, _) = exit_z_view(pp, shared, pos, p1, p2, z, std);
+    if z_for_exit.abs() >= pp.stop_loss_z {
+        return Some("stop_loss_z");
+    }
+    pnl_risk_exit(cfg, pp, compute_pnl(pos, p1.price, p2.price), equity_base)
+}
+
+/// bot-strategy#473: when the YAML opts into frozen-β exit and the position
+/// has an entry_beta on file, recompute z under entry_beta and use it for the
+/// exit-side gates (`stop_loss_z`, `exit_z`, `expected_value`). Entry /
+/// regime / dashboards keep using the rolling-β z that came in via the `z`
+/// arg, so the rest of the bot is unaffected.
+fn exit_z_view(
+    pp: &PairParams,
+    shared: &PairSharedState,
+    pos: &Position,
+    p1: &SymbolSnapshot,
+    p2: &SymbolSnapshot,
+    z: f64,
+    std: f64,
+) -> (f64, f64) {
+    if pp.use_frozen_beta_exit_z {
+        position_z_for_exit(shared, pos, p1, p2).unwrap_or((z, std))
+    } else {
+        (z, std)
+    }
+}
+
+/// The PnL-based risk gates shared by `exit_reason` and `risk_exit_reason`:
+/// `max_loss_r` (loss past the R-multiple of the per-trade risk budget) and
+/// `risk_budget` (profit target reached).
+fn pnl_risk_exit(
+    cfg: &PairTradeConfig,
+    pp: &PairParams,
+    pnl: Option<Decimal>,
+    equity_base: f64,
+) -> Option<&'static str> {
+    let pnl = pnl?;
+    let risk_budget = equity_base * cfg.risk_pct_per_trade;
+    let target = Decimal::from_f64(risk_budget)?;
+    if target > Decimal::ZERO {
+        if pp.max_loss_r_mult > 0.0 {
+            let loss_mult = Decimal::from_f64(pp.max_loss_r_mult).unwrap_or(Decimal::ONE);
+            let max_loss = -target * loss_mult;
+            if pnl <= max_loss {
+                return Some("max_loss_r");
+            }
+        }
+        if pnl >= target {
+            return Some("risk_budget");
         }
     }
     None

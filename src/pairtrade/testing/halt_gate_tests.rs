@@ -1281,3 +1281,42 @@ async fn ineligible_close_immediate_when_guard_disabled() {
         "with the guard disabled the ineligible close fires on the same tick"
     );
 }
+
+/// A risk-triggered exit must never be deferred (PR #166 Codex review):
+/// once a held pair turns ineligible, this flatten is the only path that
+/// realizes `stop_loss_z` / `max_loss_r` / `risk_budget`, so a degraded
+/// book must not hold an already-breached loss budget open for up to the
+/// deferral cap.
+#[tokio::test]
+async fn ineligible_close_bypasses_deferral_when_risk_exit_pending() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    // Guard enabled + degraded 40 bps book, exactly like the defer test —
+    // but the position is deep underwater: leg-A entry far above the
+    // current book puts the PnL (≈ -$140) past the max_loss_r budget
+    // (equity $10k × risk 1% × mult 1.0 = -$100).
+    let mut h = ineligible_guard_harness("hg-inelig-risk");
+    {
+        let state = h.engine.instances[0].states.get_mut(PAIR_KEY).unwrap();
+        state.position.as_mut().unwrap().entry_price_a = Some(dec("400"));
+    }
+    let deferred_before = defer_count("hg-inelig-risk", "spread");
+
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "a pending risk exit must close immediately even into the degraded book"
+    );
+    assert_eq!(
+        defer_count("hg-inelig-risk", "spread"),
+        deferred_before,
+        "the bypass must not count as a deferral"
+    );
+    assert!(
+        h.engine.instances[0].states[PAIR_KEY]
+            .ineligible_defer_since_ts
+            .is_none(),
+        "no deferral window may be opened for a risk-exit bypass"
+    );
+}

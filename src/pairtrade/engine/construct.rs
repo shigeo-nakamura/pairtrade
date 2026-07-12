@@ -226,6 +226,9 @@ impl PairTradeEngine {
                     &inst.default_pair_params,
                     cfg.max_leverage,
                     cfg.dry_run,
+                    cfg.ineligible_close_defer_cap_secs,
+                    cfg.ineligible_close_defer_spread_bps,
+                    cfg.ineligible_close_defer_stale_secs,
                 );
                 log::info!("{}", effective.log_line());
                 prom::record_config_info(
@@ -237,6 +240,9 @@ impl PairTradeEngine {
                     effective.use_frozen_beta_exit_z,
                     effective.equity_reference_usd,
                     effective.max_leverage,
+                    effective.ineligible_close_defer_cap_secs,
+                    effective.ineligible_close_defer_spread_bps,
+                    effective.ineligible_close_defer_stale_secs,
                     &file_path,
                     &file_sha,
                     file_mtime,

@@ -46,6 +46,9 @@ pub struct EffectiveConfig {
     pub beta_gap_entry_z_scale: f64,
     pub beta_gap_notional_scale: f64,
     pub beta_gap_notional_floor: f64,
+    pub ineligible_close_defer_cap_secs: i64,
+    pub ineligible_close_defer_spread_bps: f64,
+    pub ineligible_close_defer_stale_secs: i64,
 }
 
 impl EffectiveConfig {
@@ -56,6 +59,9 @@ impl EffectiveConfig {
         effective: &PairParams,
         max_leverage: f64,
         dry_run: bool,
+        ineligible_close_defer_cap_secs: i64,
+        ineligible_close_defer_spread_bps: f64,
+        ineligible_close_defer_stale_secs: i64,
     ) -> Self {
         Self {
             variant: strategy.id.clone(),
@@ -78,6 +84,9 @@ impl EffectiveConfig {
             beta_gap_entry_z_scale: effective.beta_gap_entry_z_scale,
             beta_gap_notional_scale: effective.beta_gap_notional_scale,
             beta_gap_notional_floor: effective.beta_gap_notional_floor,
+            ineligible_close_defer_cap_secs,
+            ineligible_close_defer_spread_bps,
+            ineligible_close_defer_stale_secs,
         }
     }
 
@@ -102,7 +111,10 @@ impl EffectiveConfig {
              mtf_windows={};mtf_z_min={:.6};max_loss_r_mult={:.6};\
              regime_block_entries={};std_collapse_hold_down_secs={};\
              use_amend_on_partial_fill={};beta_gap_entry_z_scale={:.6};\
-             beta_gap_notional_scale={:.6};beta_gap_notional_floor={:.6}",
+             beta_gap_notional_scale={:.6};beta_gap_notional_floor={:.6};\
+             ineligible_close_defer_cap_secs={};\
+             ineligible_close_defer_spread_bps={:.6};\
+             ineligible_close_defer_stale_secs={}",
             self.force_close_secs,
             self.exit_z,
             self.stop_loss_z,
@@ -122,6 +134,9 @@ impl EffectiveConfig {
             self.beta_gap_entry_z_scale,
             self.beta_gap_notional_scale,
             self.beta_gap_notional_floor,
+            self.ineligible_close_defer_cap_secs,
+            self.ineligible_close_defer_spread_bps,
+            self.ineligible_close_defer_stale_secs,
         )
     }
 
@@ -137,7 +152,7 @@ impl EffectiveConfig {
     pub fn log_line(&self) -> String {
         format!(
             "[CONFIG] variant={} force_close={} exit_z={} stop_loss_z={} frozen_beta={} \
-             equity_ref={} max_leverage={} dry_run={} fp={}",
+             equity_ref={} max_leverage={} dry_run={} inelig_defer_cap={} fp={}",
             self.variant,
             self.force_close_secs,
             self.exit_z,
@@ -146,6 +161,7 @@ impl EffectiveConfig {
             self.equity_reference_usd,
             self.max_leverage,
             self.dry_run,
+            self.ineligible_close_defer_cap_secs,
             self.fingerprint(),
         )
     }
@@ -221,8 +237,8 @@ mod tests {
     #[test]
     fn fingerprint_is_stable_and_variant_independent() {
         let p = sample_params();
-        let a = EffectiveConfig::from_resolved(&sample_strategy("a"), &p, 5.0, true);
-        let b = EffectiveConfig::from_resolved(&sample_strategy("b"), &p, 5.0, true);
+        let a = EffectiveConfig::from_resolved(&sample_strategy("a"), &p, 5.0, true, 0, 20.0, 30);
+        let b = EffectiveConfig::from_resolved(&sample_strategy("b"), &p, 5.0, true, 0, 20.0, 30);
         // Same parameter set under different variant ids -> identical fp.
         assert_eq!(a.fingerprint(), b.fingerprint());
         assert_eq!(a.fingerprint().len(), 12);
@@ -236,9 +252,11 @@ mod tests {
         p7200.force_close_secs = 7200;
         let p10800 = sample_params();
         let fp_7200 =
-            EffectiveConfig::from_resolved(&sample_strategy("a"), &p7200, 5.0, true).fingerprint();
+            EffectiveConfig::from_resolved(&sample_strategy("a"), &p7200, 5.0, true, 0, 20.0, 30)
+                .fingerprint();
         let fp_10800 =
-            EffectiveConfig::from_resolved(&sample_strategy("a"), &p10800, 5.0, true).fingerprint();
+            EffectiveConfig::from_resolved(&sample_strategy("a"), &p10800, 5.0, true, 0, 20.0, 30)
+                .fingerprint();
         assert_ne!(fp_7200, fp_10800);
     }
 
@@ -248,20 +266,48 @@ mod tests {
         let mut p_on = sample_params();
         p_on.use_frozen_beta_exit_z = true;
         let fp_off =
-            EffectiveConfig::from_resolved(&sample_strategy("c"), &p_off, 5.0, true).fingerprint();
+            EffectiveConfig::from_resolved(&sample_strategy("c"), &p_off, 5.0, true, 0, 20.0, 30)
+                .fingerprint();
         let fp_on =
-            EffectiveConfig::from_resolved(&sample_strategy("c"), &p_on, 5.0, true).fingerprint();
+            EffectiveConfig::from_resolved(&sample_strategy("c"), &p_on, 5.0, true, 0, 20.0, 30)
+                .fingerprint();
         assert_ne!(fp_off, fp_on);
+    }
+
+    #[test]
+    fn ineligible_defer_change_moves_the_fingerprint() {
+        // The guard's knobs change live close timing (0 disables it, 300 can
+        // hold closes), so guard-off vs guard-on must never share a
+        // fingerprint (PR #166 Codex review).
+        let p = sample_params();
+        let fp_off =
+            EffectiveConfig::from_resolved(&sample_strategy("a"), &p, 5.0, true, 0, 20.0, 30)
+                .fingerprint();
+        let fp_on =
+            EffectiveConfig::from_resolved(&sample_strategy("a"), &p, 5.0, true, 300, 20.0, 30)
+                .fingerprint();
+        let fp_spread =
+            EffectiveConfig::from_resolved(&sample_strategy("a"), &p, 5.0, true, 300, 40.0, 30)
+                .fingerprint();
+        let fp_stale =
+            EffectiveConfig::from_resolved(&sample_strategy("a"), &p, 5.0, true, 300, 20.0, 60)
+                .fingerprint();
+        assert_ne!(fp_off, fp_on);
+        assert_ne!(fp_on, fp_spread);
+        assert_ne!(fp_on, fp_stale);
     }
 
     #[test]
     fn log_line_carries_the_documented_fields() {
         let p = sample_params();
-        let line = EffectiveConfig::from_resolved(&sample_strategy("a"), &p, 5.0, true).log_line();
+        let line =
+            EffectiveConfig::from_resolved(&sample_strategy("a"), &p, 5.0, true, 0, 20.0, 30)
+                .log_line();
         assert!(line.starts_with("[CONFIG] variant=a "));
         assert!(line.contains("force_close=10800"));
         assert!(line.contains("frozen_beta=false"));
         assert!(line.contains("equity_ref=1000"));
+        assert!(line.contains("inelig_defer_cap=0"));
         assert!(line.contains("fp="));
     }
 }

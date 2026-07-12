@@ -707,6 +707,34 @@ pub static EFFECTIVE_FROZEN_BETA_EXIT_Z: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static EFFECTIVE_INELIGIBLE_CLOSE_DEFER_CAP_SECS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_ineligible_close_defer_cap_secs",
+        "Effective ineligible-close book-quality deferral cap (seconds) the running process \
+         is using; 0 means the guard is disabled (bot-strategy#531). Process-wide, repeated \
+         per variant so the drift preflight can assert it alongside the other effective params.",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_INELIGIBLE_CLOSE_DEFER_SPREAD_BPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_ineligible_close_defer_spread_bps",
+        "Effective per-leg spread threshold (bps) above which the ineligible-close guard \
+         treats the book as degraded (bot-strategy#531). Process-wide, repeated per variant.",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_INELIGIBLE_CLOSE_DEFER_STALE_SECS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_ineligible_close_defer_stale_secs",
+        "Effective feed-staleness threshold (seconds) above which the ineligible-close guard \
+         treats a leg's feed as degraded (bot-strategy#531). Process-wide, repeated per variant.",
+        &["variant"],
+    )
+});
+
 /// Spawn the metrics HTTP server if `PROM_LISTEN` is set in the
 /// environment. The address must parse as `host:port`. Failures during
 /// bind are logged at WARN and do not abort the bot — the gauges keep
@@ -823,6 +851,9 @@ pub fn record_config_info(
     frozen_beta_exit_z: bool,
     equity_reference_usd: f64,
     max_leverage: f64,
+    ineligible_close_defer_cap_secs: i64,
+    ineligible_close_defer_spread_bps: f64,
+    ineligible_close_defer_stale_secs: i64,
     file_path: &str,
     file_sha: &str,
     file_mtime: i64,
@@ -855,6 +886,15 @@ pub fn record_config_info(
     MAX_LEVERAGE_CONFIG
         .with_label_values(&[variant])
         .set(max_leverage);
+    EFFECTIVE_INELIGIBLE_CLOSE_DEFER_CAP_SECS
+        .with_label_values(&[variant])
+        .set(ineligible_close_defer_cap_secs as f64);
+    EFFECTIVE_INELIGIBLE_CLOSE_DEFER_SPREAD_BPS
+        .with_label_values(&[variant])
+        .set(ineligible_close_defer_spread_bps);
+    EFFECTIVE_INELIGIBLE_CLOSE_DEFER_STALE_SECS
+        .with_label_values(&[variant])
+        .set(ineligible_close_defer_stale_secs as f64);
 }
 
 #[cfg(test)]

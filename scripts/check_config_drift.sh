@@ -60,6 +60,7 @@ declare -A EXPECT_SLZ=()
 declare -A EXPECT_FROZEN=()
 declare -A EXPECT_EQUITY=()
 EXPECT_MAXLEV=""
+EXPECT_INELIG_CAP=""
 
 # Seed EXPECT_FC from EXPECT_FC_<VARIANT> env vars (e.g. EXPECT_FC_A=10800).
 for kv in $(env | grep -E '^EXPECT_FC_[A-Za-z0-9]+=' || true); do
@@ -94,6 +95,7 @@ if [ -n "$ROUND_JSON" ]; then
   # cell ('') means "not declared for this variant" → that field is skipped.
   while IFS=$'\t' read -r kind v fc ez slz fz eq; do
     if [ "$kind" = "maxlev" ]; then EXPECT_MAXLEV="$v"; continue; fi
+    if [ "$kind" = "ineligcap" ]; then EXPECT_INELIG_CAP="$v"; continue; fi
     EXPECT_FC["$v"]="$fc"; EXPECT_EXITZ["$v"]="$ez"; EXPECT_SLZ["$v"]="$slz"
     EXPECT_FROZEN["$v"]="$fz"; EXPECT_EQUITY["$v"]="$eq"
   done < <(python3 - "$ROUND_JSON" <<'PY'
@@ -104,6 +106,8 @@ def cell(p, k):
     return "" if v is None else v
 if d.get("max_leverage") is not None:
     print(f'maxlev\t{d["max_leverage"]}\t\t\t\t\t')
+if d.get("ineligible_close_defer_cap_secs") is not None:
+    print(f'ineligcap\t{d["ineligible_close_defer_cap_secs"]}\t\t\t\t\t')
 for v, p in d.get("variants", {}).items():
     fz = "" if p.get("use_frozen_beta_exit_z") is None else (1 if p["use_frozen_beta_exit_z"] else 0)
     print(f'var\t{v.lower()}\t{cell(p,"force_close_secs")}\t{cell(p,"exit_z")}\t'
@@ -206,12 +210,15 @@ else
     fz=$(gauge_for pairtrade_effective_frozen_beta_exit_z "$variant"); fz=${fz%.*}
     eq=$(gauge_for pairtrade_equity_reference_usd "$variant")
     mlev=$(gauge_for pairtrade_max_leverage_config "$variant")
-    say "variant $variant   : force_close=${fc_int}s exit_z=${ez:-?} stop_loss_z=${slz:-?} frozen_beta=${fz:-?} equity=${eq:-?} max_leverage=${mlev:-?}"
+    inelig_cap=$(gauge_for pairtrade_effective_ineligible_close_defer_cap_secs "$variant")
+    inelig_cap=${inelig_cap%.*}
+    say "variant $variant   : force_close=${fc_int}s exit_z=${ez:-?} stop_loss_z=${slz:-?} frozen_beta=${fz:-?} equity=${eq:-?} max_leverage=${mlev:-?} inelig_defer_cap=${inelig_cap:-?}"
     assert_num "$variant" force_close "${EXPECT_FC[$variant]:-}" "$fc_int"
     assert_num "$variant" exit_z "${EXPECT_EXITZ[$variant]:-}" "$ez"
     assert_num "$variant" stop_loss_z "${EXPECT_SLZ[$variant]:-}" "$slz"
     assert_num "$variant" equity_reference_usd "${EXPECT_EQUITY[$variant]:-}" "$eq"
     assert_num "$variant" max_leverage "$EXPECT_MAXLEV" "$mlev"
+    assert_num "$variant" ineligible_close_defer_cap_secs "$EXPECT_INELIG_CAP" "$inelig_cap"
     want_fz="${EXPECT_FROZEN[$variant]:-}"
     if [ -n "$want_fz" ] && [ -n "$fz" ] && [ "$fz" != "$want_fz" ]; then
       note_drift "variant $variant frozen_beta_exit_z=${fz} ≠ expected ${want_fz} (round config)."

@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 use super::super::apply_post_exit_state;
 use super::super::config::PairSpec;
 use super::super::entry::{entry_z_for_pair, should_enter, EntryCheck};
-use super::super::exit::{exit_reason, ExitCheck};
+use super::super::exit::{exit_reason, risk_exit_reason, ExitCheck};
 use super::super::market::{
     ineligible_close_book_degraded, liquidity_score, net_funding_for_direction, SymbolSnapshot,
 };
@@ -771,7 +771,43 @@ impl PairTradeEngine {
                     // triggered it (the 2026-06-10 -$30.85 pooled event).
                     if let Some(pos) = &position_state {
                         let defer_cap = self.cfg.ineligible_close_defer_cap_secs;
-                        let degraded = if defer_cap > 0 {
+                        // A risk-triggered exit (stop_loss_z / max_loss_r /
+                        // risk_budget) is never deferred: those gates live in
+                        // the eligible branch, so once the pair turns
+                        // ineligible this flatten is the only path that
+                        // realizes them — holding it for up to `defer_cap`
+                        // would keep an already-stopped-out position open
+                        // into exactly the conditions the stop exists for
+                        // (PR #166 Codex review). The close still fires with
+                        // reason=ineligible, matching pre-guard behavior.
+                        let risk_exit = if defer_cap > 0 {
+                            let (z_now, std_now) = z_snapshot
+                                .map(|(z, std, _, _)| (z, std))
+                                .unwrap_or((0.0, 0.0));
+                            let state = self.instances[inst_idx]
+                                .states
+                                .get(&key)
+                                .ok_or_else(|| anyhow!("missing state for {}", key))?;
+                            let shared = self
+                                .per_pair_state
+                                .get(&key)
+                                .ok_or_else(|| anyhow!("missing shared state for {}", key))?;
+                            risk_exit_reason(ExitCheck {
+                                cfg: &self.cfg,
+                                pp,
+                                state,
+                                shared,
+                                z: z_now,
+                                std: std_now,
+                                p1,
+                                p2,
+                                equity_base: equity_reference_snapshot,
+                                now_ts,
+                            })
+                        } else {
+                            None
+                        };
+                        let degraded = if defer_cap > 0 && risk_exit.is_none() {
                             // This branch only runs on ticks where both
                             // legs emitted a bar, i.e. both just had an
                             // *accepted* tick — so the raw exchange_ts is
@@ -794,6 +830,13 @@ impl PairTradeEngine {
                         } else {
                             None
                         };
+                        if let Some(reason) = risk_exit {
+                            log::warn!(
+                                "[EXIT_DEFER] {} bypass: risk exit ({}) pending; closing immediately regardless of book quality",
+                                key,
+                                reason
+                            );
+                        }
                         let mut fire_close = true;
                         if let Some(reason) = degraded {
                             let since = self.instances[inst_idx]
