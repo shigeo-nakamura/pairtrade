@@ -299,9 +299,13 @@ impl PairTradeEngine {
             price_map,
         } = req;
         let trim_qty = self.quantize_order_size(symbol, excess.min(actual.abs()), price_map);
-        if trim_qty <= Decimal::ZERO {
-            // Excess above tolerance but below the venue min lot — cannot
-            // be traded away. Leave it (dust-level exposure), keep entries
+        if trim_qty <= Decimal::ZERO || trim_qty > excess {
+            // Excess above tolerance but not tradable as-is: either it
+            // quantized to zero, or it sits below the venue min lot and
+            // `quantize_order_size` rounded it UP to the minimum (Codex
+            // review PR #168) — submitting that would trim more than the
+            // confirmed excess and leave the leg under the intended
+            // hedge. Leave the dust-level exposure in place, keep entries
             // open, but surface the residual for the operator.
             return SymbolReconcileOutcome {
                 action: "excess_below_min_lot",

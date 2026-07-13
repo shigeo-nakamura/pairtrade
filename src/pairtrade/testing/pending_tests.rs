@@ -2805,3 +2805,56 @@ async fn entry_reconcile_skipped_in_dry_run() {
     assert_eq!(connector.calls.lock().unwrap().len(), 0);
     assert!(engine.instances[0].entry_blocked_pairs.is_empty());
 }
+
+/// Codex review PR #168 (P1): an excess between one size tick and the
+/// venue min lot must NOT be trimmed — `quantize_order_size` rounds such
+/// sizes UP to `min_order`, so the trim would exceed the confirmed excess
+/// and leave the leg under the intended hedge. The dust is surfaced but
+/// left in place, and entries stay open.
+#[tokio::test]
+async fn entry_overfill_below_min_lot_is_not_trimmed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from(vec![vec![("legA".to_string(), dec("1.0"))]]),
+    );
+    // Excess 0.005: above the 0.0001 size tick, below the 0.01 min lot.
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![vec![position_721("AAA", "1.005", 1)]]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("AAA", "legA", "1.0", OrderSide::Long)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut snapshot = snapshot_721("100000.0");
+    snapshot.min_order = Some(dec("0.01"));
+    let mut price_map = HashMap::new();
+    price_map.insert("AAA".to_string(), snapshot);
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        0,
+        "a sub-min-lot excess must not be rounded up into an oversized trim"
+    );
+    assert!(
+        engine.instances[0].entry_blocked_pairs.is_empty(),
+        "dust-level excess is surfaced but does not fail-close entries"
+    );
+}
