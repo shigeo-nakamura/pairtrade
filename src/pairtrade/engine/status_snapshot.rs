@@ -10,10 +10,12 @@ impl PairTradeEngine {
             let circuit_breaker = self.circuit_breaker_snapshot(inst_idx);
             let kill_switch_active = self.kill_switch_active;
             let funding_today = self.instances[inst_idx].funding_carry_today;
+            let entry_blocked = self.instances[inst_idx].entry_blocked_pairs.clone();
             if let Some(reporter) = &mut self.instances[inst_idx].status_reporter {
                 reporter.set_daily_risk(risk);
                 reporter.set_session_risk(session_risk);
                 reporter.set_circuit_breaker(circuit_breaker);
+                reporter.set_entry_blocked_pairs(entry_blocked);
                 reporter.set_kill_switch(kill_switch_active);
                 reporter.set_funding_today(funding_today);
                 if let Err(err) =

@@ -493,6 +493,7 @@ impl Harness {
             pair_params: HashMap::new(),
             default_pair_params: pp,
             external_flatten_reason: None,
+            entry_blocked_pairs: HashMap::new(),
         });
     }
 

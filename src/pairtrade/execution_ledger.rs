@@ -101,6 +101,33 @@ pub(in crate::pairtrade) struct ExecutionPairSummaryRecord {
     pub underfill_detected: bool,
 }
 
+/// bot-strategy#721: one row per (entry, symbol) written by the post-entry
+/// venue-position reconciliation. Quantity fields are authoritative:
+/// `intended_qty` / `actual_qty` are signed (Long positive, Short negative),
+/// `excess_qty` is `|actual| - |intended|` (positive = overfill).
+#[derive(Debug, Serialize)]
+pub(in crate::pairtrade) struct ExecutionEntryReconcileRecord {
+    pub event: &'static str,
+    pub ts_ms: i64,
+    pub variant: String,
+    pub pair: String,
+    pub symbol: String,
+    pub intended_qty: Decimal,
+    pub actual_qty: Decimal,
+    pub excess_qty: Decimal,
+    pub tolerance: Decimal,
+    /// ok | trimmed | trim_failed | excess_below_min_lot | underfill |
+    /// sign_flip | fetch_failed
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trim_order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trim_qty: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_excess: Option<Decimal>,
+    pub entries_blocked: bool,
+}
+
 pub(in crate::pairtrade) struct ExecutionLedger {
     writer: RotatingDumpWriter,
 }
@@ -170,6 +197,13 @@ impl ExecutionLedger {
         self.write_record(record);
     }
 
+    pub(in crate::pairtrade) fn write_entry_reconcile(
+        &mut self,
+        record: &ExecutionEntryReconcileRecord,
+    ) {
+        self.write_record(record);
+    }
+
     fn write_record<T: Serialize>(&mut self, record: &T) {
         match serde_json::to_string(record) {
             Ok(line) => {
@@ -191,6 +225,38 @@ pub(in crate::pairtrade) fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serializes_entry_reconcile_record_core_fields() {
+        // bot-strategy#721: the reconciliation audit row must carry the
+        // signed intended/actual quantities and the action verbatim so the
+        // ledger join can separate execution artifacts from strategy PnL.
+        let record = ExecutionEntryReconcileRecord {
+            event: "entry_reconcile",
+            ts_ms: 1_789_000_000_000,
+            variant: "A".to_string(),
+            pair: "BTC/ETH".to_string(),
+            symbol: "ETH".to_string(),
+            intended_qty: Decimal::new(-24291, 4),
+            actual_qty: Decimal::new(-26016, 4),
+            excess_qty: Decimal::new(1725, 4),
+            tolerance: Decimal::new(1, 4),
+            action: "trimmed".to_string(),
+            trim_order_id: Some("trim-1".to_string()),
+            trim_qty: Some(Decimal::new(1725, 4)),
+            residual_excess: Some(Decimal::ZERO),
+            entries_blocked: false,
+        };
+
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["event"], "entry_reconcile");
+        assert_eq!(value["symbol"], "ETH");
+        assert_eq!(value["intended_qty"], "-2.4291");
+        assert_eq!(value["actual_qty"], "-2.6016");
+        assert_eq!(value["excess_qty"], "0.1725");
+        assert_eq!(value["action"], "trimmed");
+        assert_eq!(value["entries_blocked"], false);
+    }
 
     #[test]
     fn serializes_leg_fill_record_core_fields() {

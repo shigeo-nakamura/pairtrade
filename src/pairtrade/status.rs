@@ -83,6 +83,11 @@ pub(super) struct StatusReporter {
     /// present once the engine has run at least one tick on the
     /// instance; the field is None only briefly at startup.
     pub(super) circuit_breaker: Option<CircuitBreakerSnapshot>,
+    /// bot-strategy#721: pairs whose new entries are fail-closed behind
+    /// an unresolved entry-exposure mismatch (pair key → reason tag).
+    /// Pushed each tick by the engine; rendered on the dashboard so the
+    /// operator sees the unresolved exposure without reading journalctl.
+    pub(super) entry_blocked_pairs: HashMap<String, String>,
     /// Bounded ring buffer (capacity 200) of recent halt transitions
     /// across all gates. Filled on startup from `risk_history_path`,
     /// pushed on each `record_risk_event` call, and serialised inline
@@ -267,6 +272,10 @@ pub(super) struct StatusSnapshot {
     pub(super) session_risk: Option<SessionRiskSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) circuit_breaker: Option<CircuitBreakerSnapshot>,
+    /// bot-strategy#721: unresolved entry-exposure fail-closed blocks
+    /// (pair key → reason). Empty (omitted) in the healthy state.
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub(super) entry_blocked_pairs: HashMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(super) risk_history: Vec<RiskHistoryEvent>,
 }
@@ -506,6 +515,7 @@ impl StatusReporter {
             daily_risk: None,
             session_risk: None,
             circuit_breaker: None,
+            entry_blocked_pairs: HashMap::new(),
             risk_history: std::collections::VecDeque::with_capacity(RISK_HISTORY_BUFFER_CAP),
             risk_history_path,
         };
@@ -699,6 +709,12 @@ impl StatusReporter {
         self.circuit_breaker = cb;
     }
 
+    /// bot-strategy#721: mirror the engine's fail-closed entry-block map
+    /// into the next status snapshot.
+    pub(super) fn set_entry_blocked_pairs(&mut self, blocked: HashMap<String, String>) {
+        self.entry_blocked_pairs = blocked;
+    }
+
     /// Mirror the engine's KILL_SWITCH sentinel-file state into the
     /// next status snapshot. Called once per tick alongside the other
     /// risk setters. See bot-strategy#343.
@@ -762,6 +778,7 @@ impl StatusReporter {
             daily_risk: None,
             session_risk: None,
             circuit_breaker: None,
+            entry_blocked_pairs: HashMap::new(),
             risk_history: std::collections::VecDeque::with_capacity(RISK_HISTORY_BUFFER_CAP),
             risk_history_path,
         }
@@ -844,6 +861,7 @@ impl StatusReporter {
             daily_risk: self.daily_risk.clone(),
             session_risk: self.session_risk.clone(),
             circuit_breaker: self.circuit_breaker.clone(),
+            entry_blocked_pairs: self.entry_blocked_pairs.clone(),
             risk_history: self.risk_history.iter().cloned().collect(),
         };
         let payload = serde_json::to_string(&snapshot).map_err(std::io::Error::other)?;

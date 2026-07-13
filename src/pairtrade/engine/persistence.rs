@@ -175,6 +175,7 @@ impl PairTradeEngine {
             inst.session_halted = state.session_halted;
             inst.session_halt_reason = state.session_halt_reason.clone();
             inst.session_halt_ts = state.session_halt_ts;
+            inst.entry_blocked_pairs = state.entry_blocked_pairs.clone();
             inst.total_trades = state.total_trades;
             inst.total_wins = state.total_wins;
             inst.total_pnl = state.total_pnl;
@@ -220,6 +221,18 @@ impl PairTradeEngine {
                     inst.session_halt_ts.unwrap_or(0),
                     risk_ack_path()
                 );
+            }
+            for (pair_key, reason) in &inst.entry_blocked_pairs {
+                log::warn!(
+                    "[ENTRY_RECONCILE] {} {} restored entry block: reason={} (waiting for {} ack)",
+                    inst.id,
+                    pair_key,
+                    reason,
+                    risk_ack_path()
+                );
+                super::super::prom::ENTRY_EXPOSURE_BLOCKED
+                    .with_label_values(&[inst.id.as_str(), pair_key.as_str()])
+                    .set(1);
             }
             match state.circuit_breaker_until_ts {
                 Some(until_ts) if until_ts > now_ts => {
@@ -289,6 +302,7 @@ impl PairTradeEngine {
                         peak_pnl: inst.peak_pnl,
                         max_dd: inst.max_dd,
                         last_stop_loss_per_pair,
+                        entry_blocked_pairs: inst.entry_blocked_pairs.clone(),
                     },
                 )
             })

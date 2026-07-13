@@ -194,6 +194,7 @@ impl PairTradeEngine {
                 pair_params: inst_pair_params,
                 default_pair_params: inst_default,
                 external_flatten_reason: None,
+                entry_blocked_pairs: HashMap::new(),
             });
         }
 

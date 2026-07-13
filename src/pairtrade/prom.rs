@@ -337,6 +337,58 @@ pub static ENTRY_REISSUE_GIVEUP_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
 });
 
+/// bot-strategy#721: post-entry venue-position reconciliation found the
+/// actual per-leg exposure outside the size-tick tolerance of the intended
+/// target. `kind` = overfill | underfill | sign_flip | fetch_failed.
+/// Normally 0; every overfill increment is a live late-fill TOCTOU event
+/// of the 2026-07-08 09:42 UTC shape.
+pub static ENTRY_RECONCILE_MISMATCH_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_entry_reconcile_mismatch_total",
+        "Post-entry venue-position reconciliations (bot-strategy#721) that \
+         found actual exposure outside tolerance of the intended target, \
+         by kind (overfill/underfill/sign_flip/fetch_failed).",
+        &["variant", "pair", "symbol", "kind"],
+    )
+});
+
+/// bot-strategy#721: reduce-only trims of confirmed entry overfill.
+/// `outcome` = attempted | succeeded | failed.
+pub static ENTRY_RECONCILE_TRIM_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_entry_reconcile_trim_total",
+        "Reduce-only excess trims issued by the post-entry reconciliation \
+         (bot-strategy#721), by outcome (attempted/succeeded/failed).",
+        &["variant", "pair", "symbol", "outcome"],
+    )
+});
+
+/// bot-strategy#721: residual excess quantity (base units) still on the
+/// venue after the post-entry reconciliation finished. 0 when the entry
+/// reconciled clean or the trim restored the intended exposure.
+pub static ENTRY_RECONCILE_RESIDUAL_EXCESS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_entry_reconcile_residual_excess",
+        "Residual excess quantity (base units) left after the post-entry \
+         reconciliation (bot-strategy#721). Non-zero means an unresolved \
+         exposure mismatch.",
+        &["variant", "pair", "symbol"],
+    )
+});
+
+/// bot-strategy#721: 1 while new entries for the pair are fail-closed
+/// behind an unresolved entry-exposure mismatch (trim failed / fetch
+/// failed / sign flip). Cleared by the RISK_ACK sentinel.
+pub static ENTRY_EXPOSURE_BLOCKED: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_entry_exposure_blocked",
+        "1 while new entries are fail-closed for the pair after an \
+         unrepaired entry-exposure mismatch (bot-strategy#721); cleared \
+         only by RISK_ACK.",
+        &["variant", "pair"],
+    )
+});
+
 pub static CLOSE_REASON_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter(
         "pairtrade_close_reason_total",
@@ -436,6 +488,7 @@ pub const KNOWN_ENTRY_REJECT_REASONS: &[&str] = &[
     "session_halted",
     "daily_loss",
     "circuit_breaker",
+    "entry_exposure_mismatch",
     "waiting_first_eval",
     "regime",
     // in-should_enter (entry.rs)

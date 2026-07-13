@@ -89,6 +89,13 @@ pub(super) struct InstanceRiskState {
     /// here so `total_trades` / `total_wins` survive restart and stay in
     /// scope with `consecutive_losses` (otherwise the dashboard can show
     /// `consecutive_losses > total_trades` after a restart). bot-strategy#320.
+    /// Pairs whose new entries are fail-closed after a post-entry
+    /// venue-position reconciliation failure (bot-strategy#721). Key =
+    /// pair key, value = reason tag. Persisted so a restart cannot
+    /// silently re-arm entries over an unresolved exposure mismatch;
+    /// cleared only by the RISK_ACK sentinel.
+    #[serde(default)]
+    pub entry_blocked_pairs: HashMap<String, String>,
     #[serde(default)]
     pub total_trades: u64,
     #[serde(default)]
@@ -115,6 +122,10 @@ impl InstanceRiskState {
         self.session_halted = false;
         self.session_halt_reason = None;
         self.session_halt_ts = None;
+        // A round transition is an operator-managed restart boundary where
+        // positions are force-closed on the way down, so an unresolved
+        // entry-exposure mismatch (bot-strategy#721) cannot outlive it.
+        self.entry_blocked_pairs.clear();
         self.total_trades = 0;
         self.total_wins = 0;
         self.total_pnl = 0.0;
@@ -279,10 +290,16 @@ mod tests {
                 ts: 1_234_567_000,
             },
         );
+        let mut entry_blocked_pairs = std::collections::HashMap::new();
+        entry_blocked_pairs.insert(
+            "BTC/ETH".to_string(),
+            "entry_reconcile_trim_failed_ETH".to_string(),
+        );
         InstanceRiskState {
             consecutive_losses: 3,
             circuit_breaker_until_ts: Some(1_234_567_890),
             last_stop_loss_per_pair,
+            entry_blocked_pairs,
             session_start_equity: 500.0,
             session_start_ts: 1_700_000_000,
             realized_pnl_today: -4.20,
@@ -321,6 +338,7 @@ mod tests {
         assert!(!s.session_halted);
         assert_eq!(s.session_halt_reason, None);
         assert_eq!(s.session_halt_ts, None);
+        assert!(s.entry_blocked_pairs.is_empty());
         assert_eq!(s.total_trades, 0);
         assert_eq!(s.total_wins, 0);
         assert_eq!(s.total_pnl, 0.0);
@@ -427,6 +445,31 @@ mod tests {
                 "instance {id}: equity samples not cleared"
             );
         }
+    }
+
+    #[test]
+    fn entry_blocked_pairs_round_trips_and_defaults_empty() {
+        // bot-strategy#721: the fail-closed entry block must survive a
+        // restart (otherwise a bounce silently re-arms entries over an
+        // unresolved exposure mismatch), and older risk_state.json files
+        // without the field must parse with an empty map.
+        let snap = make_snapshot(Some("round-8"));
+        let json = serde_json::to_string(&snap).unwrap();
+        let loaded: RiskStateSnapshot = serde_json::from_str(&json).unwrap();
+        let inst = loaded.instances.get("a").expect("instance present");
+        assert_eq!(
+            inst.entry_blocked_pairs.get("BTC/ETH").map(String::as_str),
+            Some("entry_reconcile_trim_failed_ETH")
+        );
+
+        let legacy = r#"{"_v":2,"round_id":"r","instances":{"a":{"consecutive_losses":1}}}"#;
+        let snap: RiskStateSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(snap
+            .instances
+            .get("a")
+            .unwrap()
+            .entry_blocked_pairs
+            .is_empty());
     }
 
     #[test]
