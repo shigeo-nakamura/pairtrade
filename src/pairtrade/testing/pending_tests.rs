@@ -2915,3 +2915,61 @@ async fn post_trim_sign_flip_fails_closed() {
         .is_some_and(|r| r.contains("post_trim_sign_flip")));
     let _ = std::fs::remove_file(&engine.risk_state_path);
 }
+
+/// Codex review PR #168 (P2, follow-up): an Underfill readout from the
+/// POST-trim verification is anomalous — `trim_qty <= excess` means our
+/// own reduce-only trim can only settle at-or-above the intended target.
+/// Dropping below it (external close mid-trim, or the venue filling more
+/// than requested) leaves the model position overstating the venue, so
+/// it must fail closed like the post-trim sign flip, not count as a
+/// successful trim.
+#[tokio::test]
+async fn post_trim_underfill_fails_closed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    let overfilled = vec![position_721("BBB", "2.6016", -1)];
+    // After the 0.1725 reduce-only trim the venue reports 2.3 short —
+    // 0.1291 UNDER the intended 2.4291 target.
+    let under = vec![position_721("BBB", "2.3", -1)];
+    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![overfilled, under]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = std::env::temp_dir().join(format!(
+        "pairtrade-721-post-trim-under-risk-{}.json",
+        std::process::id()
+    ));
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "the trim itself was placed");
+    assert!(calls[0].4, "trim must be reduce-only");
+    assert!(engine.instances[0]
+        .entry_blocked_pairs
+        .get("AAA/BBB")
+        .is_some_and(|r| r.contains("post_trim_underfill")));
+    let _ = std::fs::remove_file(&engine.risk_state_path);
+}

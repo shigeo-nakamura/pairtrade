@@ -117,7 +117,7 @@ pub(in crate::pairtrade) struct ExecutionEntryReconcileRecord {
     pub excess_qty: Decimal,
     pub tolerance: Decimal,
     /// ok | trimmed | trim_failed | excess_below_min_lot | underfill |
-    /// sign_flip | fetch_failed
+    /// post_trim_underfill | sign_flip | fetch_failed
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trim_order_id: Option<String>,

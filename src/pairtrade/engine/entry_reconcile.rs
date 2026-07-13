@@ -397,11 +397,33 @@ impl PairTradeEngine {
                             )),
                         };
                     }
+                    // Underfill after the trim is anomalous, not success:
+                    // `trim_qty <= excess` by construction, so a reduce-
+                    // only trim of our own can only land at-or-above the
+                    // intended target. Dropping below it means something
+                    // else moved the position mid-trim (external close,
+                    // or the venue filled more than requested) — the
+                    // model position now overstates the venue. Fail
+                    // closed like the sign-flip path (Codex review
+                    // PR #168).
+                    ExposureVerdict::Underfill(deficit) => {
+                        prom::ENTRY_RECONCILE_TRIM_TOTAL
+                            .with_label_values(&[variant, key, symbol, "failed"])
+                            .inc();
+                        return SymbolReconcileOutcome {
+                            action: "post_trim_underfill",
+                            mismatch_kind: Some("underfill"),
+                            trim_order_id: Some(trim_order_id),
+                            trim_qty: Some(trim_qty),
+                            residual_excess: Some(-deficit),
+                            block_reason: Some(format!(
+                                "entry_reconcile_post_trim_underfill_{}",
+                                symbol
+                            )),
+                        };
+                    }
                     // WithinTolerance is the expected convergence.
-                    // Underfill/flat after a size-capped reduce-only trim
-                    // means the venue settled at-or-under the intended
-                    // target — the excess is gone either way.
-                    ExposureVerdict::WithinTolerance | ExposureVerdict::Underfill(_) => {
+                    ExposureVerdict::WithinTolerance => {
                         prom::ENTRY_RECONCILE_TRIM_TOTAL
                             .with_label_values(&[variant, key, symbol, "succeeded"])
                             .inc();
