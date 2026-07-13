@@ -2858,3 +2858,60 @@ async fn entry_overfill_below_min_lot_is_not_trimmed() {
         "dust-level excess is surfaced but does not fail-close entries"
     );
 }
+
+/// Codex review PR #168 (P2): a sign flip observed by the POST-trim
+/// verification must fail closed exactly like a pre-trim sign flip — a
+/// reduce-only trim can never invert the position, so an opposite-sided
+/// verify readout means the venue/state cannot be trusted, not that the
+/// excess was successfully trimmed.
+#[tokio::test]
+async fn post_trim_sign_flip_fails_closed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    let overfilled = vec![position_721("BBB", "2.6016", -1)];
+    let flipped = vec![position_721("BBB", "0.5", 1)];
+    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![overfilled, flipped]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = std::env::temp_dir().join(format!(
+        "pairtrade-721-post-trim-flip-risk-{}.json",
+        std::process::id()
+    ));
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    // The trim itself was placed (reduce-only buy of the excess)...
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].4, "trim must be reduce-only");
+    // ...but the flipped verify readout must fail closed, not record a
+    // successful trim.
+    assert!(engine.instances[0]
+        .entry_blocked_pairs
+        .get("AAA/BBB")
+        .is_some_and(|r| r.contains("post_trim_sign_flip")));
+    let _ = std::fs::remove_file(&engine.risk_state_path);
+}

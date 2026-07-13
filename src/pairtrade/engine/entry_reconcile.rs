@@ -375,11 +375,33 @@ impl PairTradeEngine {
                     // Still over target — keep polling (position endpoint
                     // may lag the trim fill), fail after the last attempt.
                     ExposureVerdict::TrimExcess(remaining) => residual = remaining,
+                    // The venue now points the opposite way from the
+                    // intended entry — a reduce-only trim can never do
+                    // that, so either the venue did not honor reduce-only
+                    // semantics or something else moved the position mid-
+                    // trim. Same fail-closed treatment as a pre-trim sign
+                    // flip (Codex review PR #168).
+                    ExposureVerdict::SignFlip => {
+                        prom::ENTRY_RECONCILE_TRIM_TOTAL
+                            .with_label_values(&[variant, key, symbol, "failed"])
+                            .inc();
+                        return SymbolReconcileOutcome {
+                            action: "sign_flip",
+                            mismatch_kind: Some("sign_flip"),
+                            trim_order_id: Some(trim_order_id),
+                            trim_qty: Some(trim_qty),
+                            residual_excess: None,
+                            block_reason: Some(format!(
+                                "entry_reconcile_post_trim_sign_flip_{}",
+                                symbol
+                            )),
+                        };
+                    }
                     // WithinTolerance is the expected convergence.
                     // Underfill/flat after a size-capped reduce-only trim
                     // means the venue settled at-or-under the intended
                     // target — the excess is gone either way.
-                    _ => {
+                    ExposureVerdict::WithinTolerance | ExposureVerdict::Underfill(_) => {
                         prom::ENTRY_RECONCILE_TRIM_TOTAL
                             .with_label_values(&[variant, key, symbol, "succeeded"])
                             .inc();
