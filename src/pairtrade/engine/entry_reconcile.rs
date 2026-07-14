@@ -35,12 +35,13 @@ use super::super::prom;
 use super::super::state::PendingLeg;
 use super::super::PairTradeEngine;
 
-/// Bounded stability polling for the initial per-symbol position read:
-/// two consecutive identical readings settle early (steady state = 2
-/// reads ~250ms apart, served from the connector's WS-derived cache),
-/// otherwise the last successful reading is used. Guards against the
-/// position endpoint lagging the fill endpoints that made `all_filled`
-/// true (Codex review PR #168).
+/// Bounded stability polling for the initial per-symbol position read
+/// (reads are served from the connector's WS-derived cache). Early settle
+/// is allowed only for excess / sign-flip readings — a stale cache can
+/// only under-report a just-filled entry, so clean readings (which lag
+/// can fake, even repeatedly) always consume the full window. Guards
+/// against the position endpoint lagging the fill endpoints that made
+/// `all_filled` true (Codex review PR #168).
 const POSITION_SETTLE_READ_ATTEMPTS: usize = 3;
 const POSITION_SETTLE_READ_DELAY_MS: u64 = 250;
 
@@ -181,15 +182,27 @@ impl PairTradeEngine {
         }
     }
 
-    /// Signed venue position, read until stable: the position endpoint can
+    /// Signed venue position, read until settled: the position endpoint can
     /// lag the fill/order endpoints that made `all_filled` true, so a
     /// single read could still show the pre-late-fill size and record a
     /// spurious `ok`/`underfill` — permanently missing the exact overfill
-    /// this reconciliation exists to catch (Codex review PR #168). Two
-    /// consecutive identical readings settle the value early; otherwise
-    /// the last successful reading wins. `None` only when every read
-    /// failed (treated as reconciliation failure upstream).
-    async fn fetch_settled_signed_position(&mut self, symbol: &str) -> Option<Decimal> {
+    /// this reconciliation exists to catch (Codex review PR #168).
+    ///
+    /// Settling is verdict-aware: during an entry the only recent venue
+    /// events are fills that GROW the position, so a stale cache can only
+    /// under-report — an excess or sign-flip reading is never a lag
+    /// artifact and two consecutive identical bad readings settle early.
+    /// Clean readings (ok/underfill) are exactly the ones lag can fake,
+    /// even repeatedly from the same stale snapshot, so they must survive
+    /// the full polling window; the last successful reading wins. `None`
+    /// only when every read failed (treated as reconciliation failure
+    /// upstream).
+    async fn fetch_settled_signed_position(
+        &mut self,
+        symbol: &str,
+        intended: Decimal,
+        tolerance: Decimal,
+    ) -> Option<Decimal> {
         let mut last_ok: Option<Decimal> = None;
         for attempt in 0..POSITION_SETTLE_READ_ATTEMPTS {
             if attempt > 0 {
@@ -197,7 +210,12 @@ impl PairTradeEngine {
             }
             if let Some(reading) = self.fetch_signed_position(symbol).await {
                 if last_ok == Some(reading) {
-                    return Some(reading);
+                    match exposure_verdict(intended, reading, tolerance) {
+                        ExposureVerdict::TrimExcess(_) | ExposureVerdict::SignFlip => {
+                            return Some(reading)
+                        }
+                        ExposureVerdict::WithinTolerance | ExposureVerdict::Underfill(_) => {}
+                    }
                 }
                 last_ok = Some(reading);
             }
@@ -221,7 +239,10 @@ impl PairTradeEngine {
         let variant = self.instances[inst_idx].id.clone();
         for (symbol, intended) in intended_by_symbol(legs) {
             let tolerance = venue_size_tick(&symbol, price_map);
-            let (actual, outcome) = match self.fetch_settled_signed_position(&symbol).await {
+            let (actual, outcome) = match self
+                .fetch_settled_signed_position(&symbol, intended, tolerance)
+                .await
+            {
                 None => (
                     Decimal::ZERO,
                     SymbolReconcileOutcome {

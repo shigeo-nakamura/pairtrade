@@ -2496,10 +2496,11 @@ async fn entry_overfill_short_leg_trimmed_reduce_only() {
         position_721("BBB", "2.4291", -1),
     ];
     *connector.positions_script.lock().unwrap() = VecDeque::from(vec![
-        overfilled.clone(), // reconcile AAA settle read 1
-        overfilled.clone(), // reconcile AAA settle read 2 (stable)
-        overfilled.clone(), // reconcile BBB settle read 1
-        overfilled,         // reconcile BBB settle read 2 → excess 0.1725
+        overfilled.clone(), // AAA read 1 (clean leg → full window)
+        overfilled.clone(), // AAA read 2
+        overfilled.clone(), // AAA read 3 → settles clean
+        overfilled.clone(), // BBB read 1
+        overfilled,         // BBB read 2 → stable excess settles early
         trimmed,            // post-trim verification → within tolerance
     ]);
 
@@ -3031,6 +3032,68 @@ async fn entry_reconcile_polls_lagging_position_endpoint() {
         calls.len(),
         1,
         "the lagged overfill must still be detected and trimmed"
+    );
+    let (symbol, size, side, price, reduce_only) = calls[0].clone();
+    assert_eq!(symbol, "BBB");
+    assert_eq!(size, dec("0.1725"));
+    assert_eq!(side, OrderSide::Long);
+    assert_eq!(price, None);
+    assert!(reduce_only);
+    assert!(engine.instances[0].entry_blocked_pairs.is_empty());
+}
+
+/// Codex review PR #168 (P1, follow-up ②): two identical CLEAN readings
+/// must not settle early — a stale position cache returns the same
+/// pre-late-fill snapshot repeatedly, and accepting it after one delay
+/// would record the entry as ok and permanently skip the trim. Clean
+/// reads consume the full polling window, so the excess that only
+/// becomes visible on the final read is still caught and trimmed.
+#[tokio::test]
+async fn entry_reconcile_does_not_settle_on_repeated_stale_clean_reads() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    let stale = vec![position_721("BBB", "2.4291", -1)]; // pre-late-fill snapshot
+    let overfilled = vec![position_721("BBB", "2.6016", -1)];
+    let trimmed = vec![position_721("BBB", "2.4291", -1)];
+    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![
+        stale.clone(), // read 1: stale cache — looks ok
+        stale,         // read 2: SAME stale snapshot — must not settle as ok
+        overfilled,    // read 3: cache caught up — excess visible
+        trimmed,       // post-trim verification
+    ]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the excess revealed on the final read must still be trimmed"
     );
     let (symbol, size, side, price, reduce_only) = calls[0].clone();
     assert_eq!(symbol, "BBB");
