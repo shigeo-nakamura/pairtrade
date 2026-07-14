@@ -9,7 +9,7 @@ use dex_connector::{
     OrderBookSnapshot, OrderSide, PositionSnapshot, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,6 +67,38 @@ struct DummyConnector {
     /// "clear the cached submit snapshot when refresh fails" path.
     ticker_calls: AtomicUsize,
     ticker_fail_after_calls: Mutex<Option<usize>>,
+    /// bot-strategy#721: scripted per-symbol responses so the cancel-ack
+    /// wait + post-cancel fill refresh and the post-entry venue-position
+    /// reconciliation can be driven deterministically. Each `get_*` call
+    /// pops the front entry of its queue, holding on the last entry once
+    /// the queue is down to one (steady state). Empty queue = the legacy
+    /// default response.
+    ///
+    /// `open_ids_by_symbol`: sequences of still-open order-id sets.
+    /// `filled_by_symbol`: sequences of `(order_id, filled_size)` rows.
+    /// `positions_script`: sequences of full `get_positions` snapshots
+    /// (falls back to `positions_to_return` when empty).
+    open_ids_by_symbol: Mutex<HashMap<String, VecDeque<Vec<String>>>>,
+    filled_by_symbol: Mutex<HashMap<String, VecDeque<FilledRows>>>,
+    positions_script: Mutex<VecDeque<Vec<PositionSnapshot>>>,
+    reject_reduce_only_orders: AtomicBool,
+    positions_should_fail: AtomicBool,
+    /// bot-strategy#721: threshold after which `get_positions` starts
+    /// failing (mirrors `ticker_fail_after_calls`), so a test can serve
+    /// one successful stale read and then fail the settle re-reads.
+    positions_fail_after_calls: Mutex<Option<usize>>,
+}
+
+/// Scripted `(order_id, filled_size)` rows for one `get_filled_orders` call.
+type FilledRows = Vec<(String, Decimal)>;
+
+/// Pop the next scripted entry, holding on the last one (steady state).
+fn pop_scripted<T: Clone>(queue: &mut VecDeque<T>) -> Option<T> {
+    if queue.len() > 1 {
+        queue.pop_front()
+    } else {
+        queue.front().cloned()
+    }
 }
 
 #[async_trait]
@@ -113,7 +145,26 @@ impl DexConnector for DummyConnector {
         })
     }
 
-    async fn get_filled_orders(&self, _symbol: &str) -> Result<FilledOrdersResponse, DexError> {
+    async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
+        if let Some(queue) = self.filled_by_symbol.lock().unwrap().get_mut(symbol) {
+            if let Some(rows) = pop_scripted(queue) {
+                return Ok(FilledOrdersResponse {
+                    orders: rows
+                        .into_iter()
+                        .map(|(order_id, size)| dex_connector::FilledOrder {
+                            order_id,
+                            is_rejected: false,
+                            trade_id: "trade".to_string(),
+                            filled_side: None,
+                            filled_size: Some(size),
+                            filled_value: None,
+                            filled_fee: None,
+                            filled_ts_ms: None,
+                        })
+                        .collect(),
+                });
+            }
+        }
         Ok(FilledOrdersResponse::default())
     }
 
@@ -121,7 +172,24 @@ impl DexConnector for DummyConnector {
         Ok(CanceledOrdersResponse::default())
     }
 
-    async fn get_open_orders(&self, _symbol: &str) -> Result<OpenOrdersResponse, DexError> {
+    async fn get_open_orders(&self, symbol: &str) -> Result<OpenOrdersResponse, DexError> {
+        if let Some(queue) = self.open_ids_by_symbol.lock().unwrap().get_mut(symbol) {
+            if let Some(ids) = pop_scripted(queue) {
+                return Ok(OpenOrdersResponse {
+                    orders: ids
+                        .into_iter()
+                        .map(|order_id| dex_connector::OpenOrder {
+                            order_id,
+                            symbol: symbol.to_string(),
+                            side: OrderSide::Long,
+                            size: Decimal::ZERO,
+                            price: Decimal::ZERO,
+                            status: "open".to_string(),
+                        })
+                        .collect(),
+                });
+            }
+        }
         Ok(OpenOrdersResponse::default())
     }
 
@@ -143,7 +211,23 @@ impl DexConnector for DummyConnector {
     }
 
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
-        self.positions_calls.fetch_add(1, Ordering::SeqCst);
+        let calls = self.positions_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.positions_should_fail.load(Ordering::SeqCst) {
+            return Err(DexError::Transient(
+                "positions fetch forced failure (test)".to_string(),
+            ));
+        }
+        if let Some(threshold) = *self.positions_fail_after_calls.lock().unwrap() {
+            if calls > threshold {
+                return Err(DexError::Transient(format!(
+                    "positions fetch forced failure (test, call {})",
+                    calls
+                )));
+            }
+        }
+        if let Some(positions) = pop_scripted(&mut self.positions_script.lock().unwrap()) {
+            return Ok(positions);
+        }
         Ok(self.positions_to_return.lock().unwrap().clone())
     }
 
@@ -198,6 +282,11 @@ impl DexConnector for DummyConnector {
             .push((symbol.to_string(), size, side, price, reduce_only));
         if self.reject_priced_orders.load(Ordering::SeqCst) && price.is_some() {
             return Err(DexError::Transient("priced order rejected".to_string()));
+        }
+        if self.reject_reduce_only_orders.load(Ordering::SeqCst) && reduce_only {
+            return Err(DexError::Transient(
+                "reduce-only order rejected (test)".to_string(),
+            ));
         }
         Ok(CreateOrderResponse {
             order_id,
@@ -2267,4 +2356,822 @@ fn stale_pending_clear_writes_recovery_record() {
     let state = engine.instances[0].states.get("AAA/BBB").unwrap();
     assert!(state.position.is_none());
     assert!(state.pending_exit.is_none());
+}
+
+// === bot-strategy#721: late-fill overfill during amend → MARKET fallback ===
+
+/// Entry-leg builder for the #721 reconciliation tests.
+fn entry_leg_721(symbol: &str, order_id: &str, target: &str, side: OrderSide) -> PendingLeg {
+    PendingLeg {
+        symbol: symbol.to_string(),
+        order_id: order_id.to_string(),
+        exchange_order_id: None,
+        target: dec(target),
+        filled: Decimal::ZERO,
+        side,
+        submitted_qty: Decimal::ZERO,
+        limit_price: None,
+        reference_price: None,
+        submit_ts_ms: 0,
+        ack_ts_ms: None,
+        decision_ts_ms: 0,
+        submit_reference_price: None,
+        submit_mid: None,
+        submit_bid: None,
+        submit_ask: None,
+        client_order_id: None,
+        reduce_only: false,
+        post_only: false,
+    }
+}
+
+fn snapshot_721(price: &str) -> SymbolSnapshot {
+    SymbolSnapshot {
+        price: dec(price),
+        funding_rate: Decimal::ZERO,
+        bid_price: None,
+        ask_price: None,
+        bid_size: Decimal::ZERO,
+        ask_size: Decimal::ZERO,
+        min_order: Some(dec("0.0001")),
+        min_tick: Some(dec("0.001")),
+        size_decimals: Some(4),
+        exchange_ts: None,
+    }
+}
+
+fn position_721(symbol: &str, size: &str, sign: i32) -> PositionSnapshot {
+    PositionSnapshot {
+        symbol: symbol.to_string(),
+        size: dec(size),
+        sign,
+        entry_price: None,
+    }
+}
+
+/// Deterministic regression for the 2026-07-08 09:42:30 UTC entry overfill
+/// (bot-strategy#721), prevention layer: a late maker fill lands after the
+/// initial fill snapshot but is visible once the cancel is acknowledged.
+/// The MARKET remainder must be recomputed from the post-cancel refresh —
+/// 2.4291 − 1.1158 = 1.3133 — not from the stale snapshot (1.4858, which
+/// produced the live +0.1725 overfill). The venue position endpoint is
+/// kept stale so the #470 cross-check alone cannot save the day.
+#[tokio::test]
+async fn market_takeover_recomputes_remaining_after_cancel_ack() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![
+            // initial pending_status snapshot: pre-late-fill
+            vec![("leg1".to_string(), dec("0.9433"))],
+            // post-cancel-ack refresh: the late 0.1725 fill is now visible
+            vec![("leg1".to_string(), dec("1.1158"))],
+        ]),
+    );
+    connector.open_ids_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![
+            vec!["leg1".to_string()], // initial pending_status open scan
+            vec!["leg1".to_string()], // cancel-ack poll 1: still open
+            vec![],                   // cancel-ack poll 2 → acknowledged
+        ]),
+    );
+    // /positions is stale: it has not seen the late fill.
+    connector
+        .positions_to_return
+        .lock()
+        .unwrap()
+        .push(position_721("BBB", "0.9433", -1));
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.entry_partial_fill_max_retries = 1;
+    engine.cfg.entry_partial_fill_giveup_retries = 0;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "leg1", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        // retry index 2 > max_retries 1 → MARKET takeover branch
+        hedge_retry_count: 1,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "exactly one MARKET reissue expected");
+    let (symbol, size, side, price, reduce_only) = calls[0].clone();
+    assert_eq!(symbol, "BBB");
+    assert_eq!(
+        size,
+        dec("1.3133"),
+        "MARKET remainder must come from the post-cancel refresh, not the stale snapshot (1.4858)"
+    );
+    assert_eq!(side, OrderSide::Short);
+    assert_eq!(price, None, "takeover order must be MARKET");
+    assert!(!reduce_only);
+}
+
+/// Defense layer, short-leg direction (the live 2026-07-08 shape): the
+/// entry completes but the venue holds 2.6016 ETH short against an
+/// intended 2.4291. The reconciliation must trim exactly the 0.1725
+/// excess with a reduce-only buy and end with the venue back at
+/// target ± one size tick, without blocking future entries.
+#[tokio::test]
+async fn entry_overfill_short_leg_trimmed_reduce_only() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from(vec![vec![("legA".to_string(), dec("0.04"))]]),
+    );
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    let overfilled = vec![
+        position_721("AAA", "0.04", 1),
+        position_721("BBB", "2.6016", -1),
+    ];
+    let trimmed = vec![
+        position_721("AAA", "0.04", 1),
+        position_721("BBB", "2.4291", -1),
+    ];
+    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![
+        overfilled.clone(), // AAA read 1 (clean leg → full window)
+        overfilled.clone(), // AAA read 2
+        overfilled.clone(), // AAA read 3 → settles clean
+        overfilled.clone(), // BBB read 1
+        overfilled,         // BBB read 2 → stable excess settles early
+        trimmed,            // post-trim verification → within tolerance
+    ]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![
+            entry_leg_721("AAA", "legA", "0.04", OrderSide::Long),
+            entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short),
+        ],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("AAA".to_string(), snapshot_721("100000.0"));
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "exactly one trim order expected");
+    let (symbol, size, side, price, reduce_only) = calls[0].clone();
+    assert_eq!(symbol, "BBB");
+    assert_eq!(size, dec("0.1725"), "trim must be exactly the excess");
+    assert_eq!(side, OrderSide::Long, "short excess is bought back");
+    assert_eq!(price, None, "trim is a MARKET order");
+    assert!(reduce_only, "trim must be reduce-only");
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.position.is_some(), "intended pair position retained");
+    assert_eq!(
+        state.position.as_ref().unwrap().entry_size_b,
+        Some(dec("2.4291")),
+        "model position keeps the intended target, not the overfilled qty"
+    );
+    assert!(
+        engine.instances[0].entry_blocked_pairs.is_empty(),
+        "successful trim must not fail-close entries"
+    );
+}
+
+/// Defense layer, long-leg direction: excess on a long leg is trimmed
+/// with a reduce-only sell.
+#[tokio::test]
+async fn entry_overfill_long_leg_trimmed_reduce_only() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from(vec![vec![("legA".to_string(), dec("1.0"))]]),
+    );
+    let overfilled = vec![position_721("AAA", "1.2", 1)];
+    let trimmed = vec![position_721("AAA", "1.0", 1)];
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![overfilled.clone(), overfilled, trimmed]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("AAA", "legA", "1.0", OrderSide::Long)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("AAA".to_string(), snapshot_721("100000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let (symbol, size, side, price, reduce_only) = calls[0].clone();
+    assert_eq!(symbol, "AAA");
+    assert_eq!(size, dec("0.2"));
+    assert_eq!(side, OrderSide::Short, "long excess is sold back");
+    assert_eq!(price, None);
+    assert!(reduce_only);
+    assert!(engine.instances[0].entry_blocked_pairs.is_empty());
+}
+
+/// Underfill is never trimmed: the venue holding LESS than the intended
+/// target must produce no order (a reduce-only "trim" of a deficit would
+/// make the position smaller still) and must not fail-close entries.
+#[tokio::test]
+async fn entry_underfill_is_never_trimmed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![vec![position_721("BBB", "2.3", -1)]]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        0,
+        "underfill must never be trimmed"
+    );
+    assert!(
+        engine.instances[0].entry_blocked_pairs.is_empty(),
+        "underfill reports but does not fail-close entries"
+    );
+}
+
+/// A failed excess trim fails closed: new entries for the pair are
+/// blocked (persisted via entry_blocked_pairs), while the position and
+/// normal exit management stay intact.
+#[tokio::test]
+async fn entry_trim_failure_blocks_new_entries() {
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .reject_reduce_only_orders
+        .store(true, Ordering::SeqCst);
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![vec![position_721("BBB", "2.6016", -1)]]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = std::env::temp_dir().join(format!(
+        "pairtrade-721-trim-fail-risk-{}.json",
+        std::process::id()
+    ));
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let blocked = &engine.instances[0].entry_blocked_pairs;
+    let reason = blocked
+        .get("AAA/BBB")
+        .expect("trim failure must fail-close entries for the pair");
+    assert!(
+        reason.contains("trim_failed"),
+        "block reason must name the trim failure: {reason}"
+    );
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(
+        state.position.is_some(),
+        "position (and thus exit management) must survive the block"
+    );
+    // The block persisted to the risk-state file so a restart cannot
+    // silently re-arm entries.
+    let persisted = risk_io::load_risk_state(&engine.risk_state_path);
+    let inst = persisted
+        .instances
+        .get("default")
+        .expect("risk state persisted");
+    assert!(inst.entry_blocked_pairs.contains_key("AAA/BBB"));
+    let _ = std::fs::remove_file(&engine.risk_state_path);
+}
+
+/// A position fetch failure during reconciliation also fails closed —
+/// "could not verify" must never be treated as "verified clean".
+#[tokio::test]
+async fn entry_reconcile_fetch_failure_blocks_new_entries() {
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .positions_should_fail
+        .store(true, Ordering::SeqCst);
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = std::env::temp_dir().join(format!(
+        "pairtrade-721-fetch-fail-risk-{}.json",
+        std::process::id()
+    ));
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(engine.instances[0]
+        .entry_blocked_pairs
+        .get("AAA/BBB")
+        .is_some_and(|r| r.contains("fetch_failed")));
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        0,
+        "no trim can be attempted when the position is unknown"
+    );
+    let _ = std::fs::remove_file(&engine.risk_state_path);
+}
+
+/// dry_run keeps the legacy behaviour: entry completion never touches
+/// get_positions, places no trim, and blocks nothing. Pins the
+/// "existing paths unchanged" acceptance for BT / dry-run deployments.
+#[tokio::test]
+async fn entry_reconcile_skipped_in_dry_run() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert_eq!(connector.positions_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.calls.lock().unwrap().len(), 0);
+    assert!(engine.instances[0].entry_blocked_pairs.is_empty());
+}
+
+/// Codex review PR #168 (P1): an excess between one size tick and the
+/// venue min lot must NOT be trimmed — `quantize_order_size` rounds such
+/// sizes UP to `min_order`, so the trim would exceed the confirmed excess
+/// and leave the leg under the intended hedge. The dust is surfaced but
+/// left in place, and entries stay open.
+#[tokio::test]
+async fn entry_overfill_below_min_lot_is_not_trimmed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from(vec![vec![("legA".to_string(), dec("1.0"))]]),
+    );
+    // Excess 0.005: above the 0.0001 size tick, below the 0.01 min lot.
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![vec![position_721("AAA", "1.005", 1)]]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("AAA", "legA", "1.0", OrderSide::Long)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut snapshot = snapshot_721("100000.0");
+    snapshot.min_order = Some(dec("0.01"));
+    let mut price_map = HashMap::new();
+    price_map.insert("AAA".to_string(), snapshot);
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        0,
+        "a sub-min-lot excess must not be rounded up into an oversized trim"
+    );
+    assert!(
+        engine.instances[0].entry_blocked_pairs.is_empty(),
+        "dust-level excess is surfaced but does not fail-close entries"
+    );
+}
+
+/// Codex review PR #168 (P2): a sign flip observed by the POST-trim
+/// verification must fail closed exactly like a pre-trim sign flip — a
+/// reduce-only trim can never invert the position, so an opposite-sided
+/// verify readout means the venue/state cannot be trusted, not that the
+/// excess was successfully trimmed.
+#[tokio::test]
+async fn post_trim_sign_flip_fails_closed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    let overfilled = vec![position_721("BBB", "2.6016", -1)];
+    let flipped = vec![position_721("BBB", "0.5", 1)];
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![overfilled.clone(), overfilled, flipped]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = std::env::temp_dir().join(format!(
+        "pairtrade-721-post-trim-flip-risk-{}.json",
+        std::process::id()
+    ));
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    // The trim itself was placed (reduce-only buy of the excess)...
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].4, "trim must be reduce-only");
+    // ...but the flipped verify readout must fail closed, not record a
+    // successful trim.
+    assert!(engine.instances[0]
+        .entry_blocked_pairs
+        .get("AAA/BBB")
+        .is_some_and(|r| r.contains("post_trim_sign_flip")));
+    let _ = std::fs::remove_file(&engine.risk_state_path);
+}
+
+/// Codex review PR #168 (P2, follow-up): an Underfill readout from the
+/// POST-trim verification is anomalous — `trim_qty <= excess` means our
+/// own reduce-only trim can only settle at-or-above the intended target.
+/// Dropping below it (external close mid-trim, or the venue filling more
+/// than requested) leaves the model position overstating the venue, so
+/// it must fail closed like the post-trim sign flip, not count as a
+/// successful trim.
+#[tokio::test]
+async fn post_trim_underfill_fails_closed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    let overfilled = vec![position_721("BBB", "2.6016", -1)];
+    // After the 0.1725 reduce-only trim the venue reports 2.3 short —
+    // 0.1291 UNDER the intended 2.4291 target.
+    let under = vec![position_721("BBB", "2.3", -1)];
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![overfilled.clone(), overfilled, under]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = std::env::temp_dir().join(format!(
+        "pairtrade-721-post-trim-under-risk-{}.json",
+        std::process::id()
+    ));
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "the trim itself was placed");
+    assert!(calls[0].4, "trim must be reduce-only");
+    assert!(engine.instances[0]
+        .entry_blocked_pairs
+        .get("AAA/BBB")
+        .is_some_and(|r| r.contains("post_trim_underfill")));
+    let _ = std::fs::remove_file(&engine.risk_state_path);
+}
+
+/// Codex review PR #168 (P1, follow-up): the initial reconciliation read
+/// must not trust a single position readout. Here the position endpoint
+/// lags the fill endpoints — the first read still shows the intended size
+/// (looks `ok`), and only the second read reveals the late-fill excess.
+/// The stability polling (two consecutive identical reads required) must
+/// catch the overfill and trim it instead of recording a clean entry.
+#[tokio::test]
+async fn entry_reconcile_polls_lagging_position_endpoint() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    let lagging = vec![position_721("BBB", "2.4291", -1)]; // pre-late-fill
+    let overfilled = vec![position_721("BBB", "2.6016", -1)];
+    let trimmed = vec![position_721("BBB", "2.4291", -1)];
+    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![
+        lagging,            // read 1: endpoint not caught up — looks ok
+        overfilled.clone(), // read 2: late fill visible — disagrees with read 1
+        overfilled,         // read 3: stable → settled on the overfill
+        trimmed,            // post-trim verification
+    ]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the lagged overfill must still be detected and trimmed"
+    );
+    let (symbol, size, side, price, reduce_only) = calls[0].clone();
+    assert_eq!(symbol, "BBB");
+    assert_eq!(size, dec("0.1725"));
+    assert_eq!(side, OrderSide::Long);
+    assert_eq!(price, None);
+    assert!(reduce_only);
+    assert!(engine.instances[0].entry_blocked_pairs.is_empty());
+}
+
+/// Codex review PR #168 (P1, follow-up ②): two identical CLEAN readings
+/// must not settle early — a stale position cache returns the same
+/// pre-late-fill snapshot repeatedly, and accepting it after one delay
+/// would record the entry as ok and permanently skip the trim. Clean
+/// reads consume the full polling window, so the excess that only
+/// becomes visible on the final read is still caught and trimmed.
+#[tokio::test]
+async fn entry_reconcile_does_not_settle_on_repeated_stale_clean_reads() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    let stale = vec![position_721("BBB", "2.4291", -1)]; // pre-late-fill snapshot
+    let overfilled = vec![position_721("BBB", "2.6016", -1)];
+    let trimmed = vec![position_721("BBB", "2.4291", -1)];
+    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![
+        stale.clone(), // read 1: stale cache — looks ok
+        stale,         // read 2: SAME stale snapshot — must not settle as ok
+        overfilled,    // read 3: cache caught up — excess visible
+        trimmed,       // post-trim verification
+    ]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the excess revealed on the final read must still be trimmed"
+    );
+    let (symbol, size, side, price, reduce_only) = calls[0].clone();
+    assert_eq!(symbol, "BBB");
+    assert_eq!(size, dec("0.1725"));
+    assert_eq!(side, OrderSide::Long);
+    assert_eq!(price, None);
+    assert!(reduce_only);
+    assert!(engine.instances[0].entry_blocked_pairs.is_empty());
+}
+
+/// Codex review PR #168 (P2, follow-up ③): a clean first read followed by
+/// FAILED settle re-reads must not be accepted — the failed reads are
+/// exactly where the late-fill overfill could have become visible, so the
+/// stale clean value is unverified and the reconciliation fails closed.
+#[tokio::test]
+async fn entry_reconcile_clean_read_with_failed_rereads_fails_closed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    // Read 1 succeeds with a clean (pre-late-fill) snapshot; every later
+    // get_positions call fails.
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![vec![position_721("BBB", "2.4291", -1)]]);
+    *connector.positions_fail_after_calls.lock().unwrap() = Some(1);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = std::env::temp_dir().join(format!(
+        "pairtrade-721-settle-fail-risk-{}.json",
+        std::process::id()
+    ));
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        0,
+        "no trim can be placed from an unverified stale reading"
+    );
+    assert!(
+        engine.instances[0]
+            .entry_blocked_pairs
+            .get("AAA/BBB")
+            .is_some_and(|r| r.contains("fetch_failed")),
+        "clean-then-failed settle reads must fail closed, not record ok"
+    );
+    let _ = std::fs::remove_file(&engine.risk_state_path);
 }

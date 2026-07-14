@@ -677,6 +677,15 @@ impl PairTradeEngine {
                                     .is_some_and(|until| now_ts < until)
                                 {
                                     Some("circuit_breaker")
+                                } else if self.instances[inst_idx]
+                                    .entry_blocked_pairs
+                                    .contains_key(key.as_str())
+                                {
+                                    // bot-strategy#721: unresolved entry-
+                                    // exposure mismatch — new entries fail
+                                    // closed until the operator acks via
+                                    // RISK_ACK. Exits are unaffected.
+                                    Some("entry_exposure_mismatch")
                                 } else if last_eval_ts.is_none() {
                                     Some("waiting_first_eval")
                                 } else if !regime_ok {

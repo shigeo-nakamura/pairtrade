@@ -125,4 +125,12 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// of the generic `exchange_snapshot_clear`. Not persisted.
     /// bot-strategy#514.
     pub(in crate::pairtrade) external_flatten_reason: Option<String>,
+    /// Pairs whose NEW entries are fail-closed because the post-entry
+    /// venue-position reconciliation (bot-strategy#721) found an exposure
+    /// mismatch it could not repair (trim failed, position fetch failed,
+    /// or the venue position sign contradicts the intended entry). Key =
+    /// pair key (e.g. "BTC/ETH"), value = reason tag. Exit management is
+    /// unaffected. Persisted via `InstanceRiskState`; cleared only by the
+    /// RISK_ACK sentinel — there is no auto-resume.
+    pub(in crate::pairtrade) entry_blocked_pairs: HashMap<String, String>,
 }

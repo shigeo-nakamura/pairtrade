@@ -89,6 +89,13 @@ pub(super) struct InstanceRiskState {
     /// here so `total_trades` / `total_wins` survive restart and stay in
     /// scope with `consecutive_losses` (otherwise the dashboard can show
     /// `consecutive_losses > total_trades` after a restart). bot-strategy#320.
+    /// Pairs whose new entries are fail-closed after a post-entry
+    /// venue-position reconciliation failure (bot-strategy#721). Key =
+    /// pair key, value = reason tag. Persisted so a restart cannot
+    /// silently re-arm entries over an unresolved exposure mismatch;
+    /// cleared only by the RISK_ACK sentinel.
+    #[serde(default)]
+    pub entry_blocked_pairs: HashMap<String, String>,
     #[serde(default)]
     pub total_trades: u64,
     #[serde(default)]
@@ -115,6 +122,14 @@ impl InstanceRiskState {
         self.session_halted = false;
         self.session_halt_reason = None;
         self.session_halt_ts = None;
+        // `entry_blocked_pairs` (bot-strategy#721) deliberately survives the
+        // round reset: the block means the venue may still carry excess a
+        // failed trim could not remove, and the startup force-close that
+        // would clear it is a separate, fallible step (config-gated,
+        // retry-bounded). The only clear is the explicit RISK_ACK — a stale
+        // block after a clean round flip costs one ack; an auto-cleared
+        // real block silently re-arms entries over live excess (PR #168
+        // review).
         self.total_trades = 0;
         self.total_wins = 0;
         self.total_pnl = 0.0;
@@ -279,10 +294,16 @@ mod tests {
                 ts: 1_234_567_000,
             },
         );
+        let mut entry_blocked_pairs = std::collections::HashMap::new();
+        entry_blocked_pairs.insert(
+            "BTC/ETH".to_string(),
+            "entry_reconcile_trim_failed_ETH".to_string(),
+        );
         InstanceRiskState {
             consecutive_losses: 3,
             circuit_breaker_until_ts: Some(1_234_567_890),
             last_stop_loss_per_pair,
+            entry_blocked_pairs,
             session_start_equity: 500.0,
             session_start_ts: 1_700_000_000,
             realized_pnl_today: -4.20,
@@ -332,6 +353,15 @@ mod tests {
         assert_eq!(s.session_start_ts, 1_700_000_000);
         assert!((s.realized_pnl_today - (-4.20)).abs() < 1e-9);
         assert!((s.funding_carry_today - (-0.85)).abs() < 1e-9);
+
+        // bot-strategy#721 / PR #168 review: the entry-exposure fail-closed
+        // block survives the round reset — the venue may still carry the
+        // excess a failed trim could not remove, and only the explicit
+        // RISK_ACK may clear it.
+        assert_eq!(
+            s.entry_blocked_pairs.get("BTC/ETH").map(String::as_str),
+            Some("entry_reconcile_trim_failed_ETH")
+        );
     }
 
     fn make_snapshot(round_id: Option<&str>) -> RiskStateSnapshot {
@@ -427,6 +457,31 @@ mod tests {
                 "instance {id}: equity samples not cleared"
             );
         }
+    }
+
+    #[test]
+    fn entry_blocked_pairs_round_trips_and_defaults_empty() {
+        // bot-strategy#721: the fail-closed entry block must survive a
+        // restart (otherwise a bounce silently re-arms entries over an
+        // unresolved exposure mismatch), and older risk_state.json files
+        // without the field must parse with an empty map.
+        let snap = make_snapshot(Some("round-8"));
+        let json = serde_json::to_string(&snap).unwrap();
+        let loaded: RiskStateSnapshot = serde_json::from_str(&json).unwrap();
+        let inst = loaded.instances.get("a").expect("instance present");
+        assert_eq!(
+            inst.entry_blocked_pairs.get("BTC/ETH").map(String::as_str),
+            Some("entry_reconcile_trim_failed_ETH")
+        );
+
+        let legacy = r#"{"_v":2,"round_id":"r","instances":{"a":{"consecutive_losses":1}}}"#;
+        let snap: RiskStateSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(snap
+            .instances
+            .get("a")
+            .unwrap()
+            .entry_blocked_pairs
+            .is_empty());
     }
 
     #[test]

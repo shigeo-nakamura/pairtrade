@@ -4,6 +4,7 @@
 //! bot-strategy#444.
 
 pub(super) mod construct;
+pub(super) mod entry_reconcile;
 pub(super) mod error_class;
 pub(super) mod eval_helpers;
 pub(super) mod execute;

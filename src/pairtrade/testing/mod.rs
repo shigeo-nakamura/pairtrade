@@ -138,6 +138,7 @@ impl PairTradeEngine {
                 pair_params: HashMap::new(),
                 default_pair_params: PairParams::default(),
                 external_flatten_reason: None,
+                entry_blocked_pairs: HashMap::new(),
             }],
             history: HashMap::new(),
             bar_builders: HashMap::new(),

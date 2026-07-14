@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use tokio::time::sleep;
 
 use super::super::apply_post_exit_state;
 use super::super::defaults::MAX_EXIT_RETRIES;
@@ -726,7 +727,7 @@ impl PairTradeEngine {
     ) -> Result<bool> {
         let status = self.pending_status(&pending).await?;
         Self::update_pending_fills(&mut pending, &status.fills);
-        let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
+        let mut filled_qtys = Self::filled_by_leg(&pending, &status.fills);
         if Self::all_filled(&pending, &status.fills) {
             let z_at_entry = self
                 .per_pair_state
@@ -769,6 +770,13 @@ impl PairTradeEngine {
                 price_map,
             );
             log::info!("[ORDER] {} entry orders filled", key);
+            // bot-strategy#721: entry completion is not considered safe
+            // until the actual venue position per leg reconciles against
+            // the intended signed target. Catches the late-fill overfill
+            // the pre-submit checks (#470 cap, cancel-ack refresh) cannot:
+            // a fill that lands after their snapshot.
+            self.reconcile_entry_exposure(inst_idx, key, &pending.legs, price_map)
+                .await;
         } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
             let max_retries = self.cfg.entry_partial_fill_max_retries;
             let giveup_retries = self.cfg.entry_partial_fill_giveup_retries;
@@ -881,6 +889,33 @@ impl PairTradeEngine {
             }
             if !use_amend {
                 self.cancel_pending_orders(&pending).await?;
+            }
+            // bot-strategy#721: the MARKET takeover is the TOCTOU-prone
+            // step — a late fill on the old maker order between the fill
+            // snapshot above and the replacement placement overfills the
+            // leg (Frankfurt 2026-07-08 09:42:30 UTC, variant A ETH
+            // +7.10%). Wait for the cancels to be acknowledged (no order
+            // left open → no further fills possible), then refresh the
+            // fill state so the remaining MARKET quantity is recomputed
+            // immediately before placement.
+            if use_market {
+                self.await_pending_cancellation(&pending).await;
+                match self.pending_status(&pending).await {
+                    Ok(refreshed) => {
+                        Self::update_pending_fills(&mut pending, &refreshed.fills);
+                        filled_qtys = Self::filled_by_leg(&pending, &refreshed.fills);
+                    }
+                    Err(err) => {
+                        // Keep the pre-cancel snapshot: the #470 venue-
+                        // position cap inside reissue_partial_legs and the
+                        // post-fill reconciliation still cover the gap.
+                        log::warn!(
+                            "[ORDER] {} post-cancel fill refresh failed; using pre-cancel snapshot: {:?}",
+                            key,
+                            err
+                        );
+                    }
+                }
             }
             if let Some(new_pending) = self
                 .reissue_partial_legs(ReissuePartialLegsRequest {
@@ -1096,6 +1131,57 @@ impl PairTradeEngine {
             }
         }
         (flattened_any, hedge_failed)
+    }
+
+    /// Poll the venue until none of `pending`'s orders remain open — i.e.
+    /// the blanket cancel has been acknowledged and no further fills can
+    /// land on the old orders. Bounded (~1.5 s worst case) and best-effort:
+    /// on exhaustion it logs and returns, leaving the #470 venue-position
+    /// cap and the post-fill reconciliation (bot-strategy#721) as the
+    /// remaining safety nets. Skipped in backtest replay, where the cancel
+    /// is synchronous by construction.
+    async fn await_pending_cancellation(&self, pending: &PendingOrders) {
+        const CANCEL_ACK_ATTEMPTS: usize = 10;
+        const CANCEL_ACK_DELAY_MS: u64 = 150;
+        if self.cfg.backtest_mode {
+            return;
+        }
+        let mut by_symbol: HashMap<String, HashSet<String>> = HashMap::new();
+        for leg in &pending.legs {
+            by_symbol
+                .entry(leg.symbol.clone())
+                .or_default()
+                .insert(leg.order_id.clone());
+        }
+        for attempt in 0..CANCEL_ACK_ATTEMPTS {
+            if attempt > 0 {
+                sleep(Duration::from_millis(CANCEL_ACK_DELAY_MS)).await;
+            }
+            let mut any_open = false;
+            for (symbol, order_ids) in &by_symbol {
+                match self.connector.get_open_orders(symbol).await {
+                    Ok(open) => {
+                        if open
+                            .orders
+                            .iter()
+                            .any(|order| order_ids.contains(&order.order_id))
+                        {
+                            any_open = true;
+                        }
+                    }
+                    // Can't confirm — assume still open and keep polling.
+                    Err(_) => any_open = true,
+                }
+            }
+            if !any_open {
+                return;
+            }
+        }
+        log::warn!(
+            "[ORDER] cancel not confirmed for {} legs after {}ms; proceeding with post-cancel fill refresh",
+            pending.legs.len(),
+            CANCEL_ACK_ATTEMPTS as u64 * CANCEL_ACK_DELAY_MS,
+        );
     }
 
     async fn cancel_pending_orders(&self, pending: &PendingOrders) -> Result<()> {

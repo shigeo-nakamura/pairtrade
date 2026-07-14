@@ -525,6 +525,25 @@ impl PairTradeEngine {
                 cleared_any = true;
                 cleared_indices.push((inst_idx, prior_reason));
             }
+            // bot-strategy#721: the same ack sentinel clears the fail-closed
+            // entry block left by an unrepaired entry-exposure mismatch.
+            // The operator is expected to have verified/flattened the venue
+            // position before acking (see runbook_risk_ack).
+            if !inst.entry_blocked_pairs.is_empty() {
+                for (pair_key, reason) in inst.entry_blocked_pairs.drain() {
+                    log::warn!(
+                        "[ENTRY_RECONCILE] {} {} entry block cleared by ack at {} (reason was: {})",
+                        inst.id,
+                        pair_key,
+                        ack_path,
+                        reason
+                    );
+                    crate::pairtrade::prom::ENTRY_EXPOSURE_BLOCKED
+                        .with_label_values(&[inst.id.as_str(), pair_key.as_str()])
+                        .set(0);
+                }
+                cleared_any = true;
+            }
         }
         let ack_payload = if trimmed.is_empty() && !reanchor {
             None
