@@ -203,24 +203,40 @@ impl PairTradeEngine {
         intended: Decimal,
         tolerance: Decimal,
     ) -> Option<Decimal> {
+        let is_bad = |reading: Decimal| {
+            matches!(
+                exposure_verdict(intended, reading, tolerance),
+                ExposureVerdict::TrimExcess(_) | ExposureVerdict::SignFlip
+            )
+        };
         let mut last_ok: Option<Decimal> = None;
+        let mut final_read_ok = false;
         for attempt in 0..POSITION_SETTLE_READ_ATTEMPTS {
             if attempt > 0 {
                 sleep(Duration::from_millis(POSITION_SETTLE_READ_DELAY_MS)).await;
             }
-            if let Some(reading) = self.fetch_signed_position(symbol).await {
-                if last_ok == Some(reading) {
-                    match exposure_verdict(intended, reading, tolerance) {
-                        ExposureVerdict::TrimExcess(_) | ExposureVerdict::SignFlip => {
-                            return Some(reading)
-                        }
-                        ExposureVerdict::WithinTolerance | ExposureVerdict::Underfill(_) => {}
+            match self.fetch_signed_position(symbol).await {
+                Some(reading) => {
+                    if last_ok == Some(reading) && is_bad(reading) {
+                        return Some(reading);
                     }
+                    last_ok = Some(reading);
+                    final_read_ok = true;
                 }
-                last_ok = Some(reading);
+                None => final_read_ok = false,
             }
         }
-        last_ok
+        match last_ok {
+            // The full window ended on a successful read — trust it.
+            Some(reading) if final_read_ok => Some(reading),
+            // Newer reads failed, but a bad reading is trustworthy anyway
+            // (lag only under-reports) and the trim path re-verifies.
+            Some(reading) if is_bad(reading) => Some(reading),
+            // A clean reading followed by failed reads is unverified: the
+            // failed reads are exactly where the late fill could have
+            // become visible (Codex review PR #168). Fail closed upstream.
+            _ => None,
+        }
     }
 
     /// Reconcile the just-completed entry's per-leg venue exposure against

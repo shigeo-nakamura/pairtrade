@@ -83,6 +83,10 @@ struct DummyConnector {
     positions_script: Mutex<VecDeque<Vec<PositionSnapshot>>>,
     reject_reduce_only_orders: AtomicBool,
     positions_should_fail: AtomicBool,
+    /// bot-strategy#721: threshold after which `get_positions` starts
+    /// failing (mirrors `ticker_fail_after_calls`), so a test can serve
+    /// one successful stale read and then fail the settle re-reads.
+    positions_fail_after_calls: Mutex<Option<usize>>,
 }
 
 /// Scripted `(order_id, filled_size)` rows for one `get_filled_orders` call.
@@ -207,11 +211,19 @@ impl DexConnector for DummyConnector {
     }
 
     async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
-        self.positions_calls.fetch_add(1, Ordering::SeqCst);
+        let calls = self.positions_calls.fetch_add(1, Ordering::SeqCst) + 1;
         if self.positions_should_fail.load(Ordering::SeqCst) {
             return Err(DexError::Transient(
                 "positions fetch forced failure (test)".to_string(),
             ));
+        }
+        if let Some(threshold) = *self.positions_fail_after_calls.lock().unwrap() {
+            if calls > threshold {
+                return Err(DexError::Transient(format!(
+                    "positions fetch forced failure (test, call {})",
+                    calls
+                )));
+            }
         }
         if let Some(positions) = pop_scripted(&mut self.positions_script.lock().unwrap()) {
             return Ok(positions);
@@ -3102,4 +3114,64 @@ async fn entry_reconcile_does_not_settle_on_repeated_stale_clean_reads() {
     assert_eq!(price, None);
     assert!(reduce_only);
     assert!(engine.instances[0].entry_blocked_pairs.is_empty());
+}
+
+/// Codex review PR #168 (P2, follow-up ③): a clean first read followed by
+/// FAILED settle re-reads must not be accepted — the failed reads are
+/// exactly where the late-fill overfill could have become visible, so the
+/// stale clean value is unverified and the reconciliation fails closed.
+#[tokio::test]
+async fn entry_reconcile_clean_read_with_failed_rereads_fails_closed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    // Read 1 succeeds with a clean (pre-late-fill) snapshot; every later
+    // get_positions call fails.
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![vec![position_721("BBB", "2.4291", -1)]]);
+    *connector.positions_fail_after_calls.lock().unwrap() = Some(1);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = std::env::temp_dir().join(format!(
+        "pairtrade-721-settle-fail-risk-{}.json",
+        std::process::id()
+    ));
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        0,
+        "no trim can be placed from an unverified stale reading"
+    );
+    assert!(
+        engine.instances[0]
+            .entry_blocked_pairs
+            .get("AAA/BBB")
+            .is_some_and(|r| r.contains("fetch_failed")),
+        "clean-then-failed settle reads must fail closed, not record ok"
+    );
+    let _ = std::fs::remove_file(&engine.risk_state_path);
 }
