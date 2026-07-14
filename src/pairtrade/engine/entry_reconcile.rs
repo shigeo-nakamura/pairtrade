@@ -37,7 +37,11 @@ use super::super::PairTradeEngine;
 
 /// Bounded post-trim verification: the venue position endpoint can lag the
 /// trim fill by a beat, so re-check a few times before declaring failure.
-const TRIM_VERIFY_ATTEMPTS: usize = 3;
+/// Every attempt (including the first) waits `TRIM_VERIFY_DELAY_MS` —
+/// checking immediately after `create_order` returns would almost always
+/// read the pre-fill position and burn an attempt (PR #168 review). Worst
+/// case ~1s before the trim is declared unverified and entries fail closed.
+const TRIM_VERIFY_ATTEMPTS: usize = 5;
 const TRIM_VERIFY_DELAY_MS: u64 = 200;
 
 /// Pure verdict of one per-symbol exposure comparison. All quantities are
@@ -366,10 +370,8 @@ impl PairTradeEngine {
         // reduce-only MARKET order, so convergence is normally immediate;
         // the bounded re-check absorbs position-endpoint lag.
         let mut residual = excess;
-        for attempt in 0..TRIM_VERIFY_ATTEMPTS {
-            if attempt > 0 {
-                sleep(Duration::from_millis(TRIM_VERIFY_DELAY_MS)).await;
-            }
+        for _ in 0..TRIM_VERIFY_ATTEMPTS {
+            sleep(Duration::from_millis(TRIM_VERIFY_DELAY_MS)).await;
             if let Some(after) = self.fetch_signed_position(symbol).await {
                 match exposure_verdict(intended, after, tolerance) {
                     // Still over target — keep polling (position endpoint
