@@ -35,6 +35,15 @@ use super::super::prom;
 use super::super::state::PendingLeg;
 use super::super::PairTradeEngine;
 
+/// Bounded stability polling for the initial per-symbol position read:
+/// two consecutive identical readings settle early (steady state = 2
+/// reads ~250ms apart, served from the connector's WS-derived cache),
+/// otherwise the last successful reading is used. Guards against the
+/// position endpoint lagging the fill endpoints that made `all_filled`
+/// true (Codex review PR #168).
+const POSITION_SETTLE_READ_ATTEMPTS: usize = 3;
+const POSITION_SETTLE_READ_DELAY_MS: u64 = 250;
+
 /// Bounded post-trim verification: the venue position endpoint can lag the
 /// trim fill by a beat, so re-check a few times before declaring failure.
 /// Every attempt (including the first) waits `TRIM_VERIFY_DELAY_MS` —
@@ -172,6 +181,30 @@ impl PairTradeEngine {
         }
     }
 
+    /// Signed venue position, read until stable: the position endpoint can
+    /// lag the fill/order endpoints that made `all_filled` true, so a
+    /// single read could still show the pre-late-fill size and record a
+    /// spurious `ok`/`underfill` — permanently missing the exact overfill
+    /// this reconciliation exists to catch (Codex review PR #168). Two
+    /// consecutive identical readings settle the value early; otherwise
+    /// the last successful reading wins. `None` only when every read
+    /// failed (treated as reconciliation failure upstream).
+    async fn fetch_settled_signed_position(&mut self, symbol: &str) -> Option<Decimal> {
+        let mut last_ok: Option<Decimal> = None;
+        for attempt in 0..POSITION_SETTLE_READ_ATTEMPTS {
+            if attempt > 0 {
+                sleep(Duration::from_millis(POSITION_SETTLE_READ_DELAY_MS)).await;
+            }
+            if let Some(reading) = self.fetch_signed_position(symbol).await {
+                if last_ok == Some(reading) {
+                    return Some(reading);
+                }
+                last_ok = Some(reading);
+            }
+        }
+        last_ok
+    }
+
     /// Reconcile the just-completed entry's per-leg venue exposure against
     /// the intended signed targets (bot-strategy#721). Called from the
     /// `all_filled` branch of `reconcile_entry`; live-trading only.
@@ -188,7 +221,7 @@ impl PairTradeEngine {
         let variant = self.instances[inst_idx].id.clone();
         for (symbol, intended) in intended_by_symbol(legs) {
             let tolerance = venue_size_tick(&symbol, price_map);
-            let (actual, outcome) = match self.fetch_signed_position(&symbol).await {
+            let (actual, outcome) = match self.fetch_settled_signed_position(&symbol).await {
                 None => (
                     Decimal::ZERO,
                     SymbolReconcileOutcome {

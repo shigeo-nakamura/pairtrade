@@ -2496,8 +2496,10 @@ async fn entry_overfill_short_leg_trimmed_reduce_only() {
         position_721("BBB", "2.4291", -1),
     ];
     *connector.positions_script.lock().unwrap() = VecDeque::from(vec![
-        overfilled.clone(), // reconcile AAA
-        overfilled,         // reconcile BBB → excess 0.1725
+        overfilled.clone(), // reconcile AAA settle read 1
+        overfilled.clone(), // reconcile AAA settle read 2 (stable)
+        overfilled.clone(), // reconcile BBB settle read 1
+        overfilled,         // reconcile BBB settle read 2 → excess 0.1725
         trimmed,            // post-trim verification → within tolerance
     ]);
 
@@ -2561,7 +2563,8 @@ async fn entry_overfill_long_leg_trimmed_reduce_only() {
     );
     let overfilled = vec![position_721("AAA", "1.2", 1)];
     let trimmed = vec![position_721("AAA", "1.0", 1)];
-    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![overfilled, trimmed]);
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![overfilled.clone(), overfilled, trimmed]);
 
     let mut engine = PairTradeEngine::test_instance(connector.clone());
     engine.cfg.dry_run = false;
@@ -2873,7 +2876,8 @@ async fn post_trim_sign_flip_fails_closed() {
     );
     let overfilled = vec![position_721("BBB", "2.6016", -1)];
     let flipped = vec![position_721("BBB", "0.5", 1)];
-    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![overfilled, flipped]);
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![overfilled.clone(), overfilled, flipped]);
 
     let mut engine = PairTradeEngine::test_instance(connector.clone());
     engine.cfg.dry_run = false;
@@ -2934,7 +2938,8 @@ async fn post_trim_underfill_fails_closed() {
     // After the 0.1725 reduce-only trim the venue reports 2.3 short —
     // 0.1291 UNDER the intended 2.4291 target.
     let under = vec![position_721("BBB", "2.3", -1)];
-    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![overfilled, under]);
+    *connector.positions_script.lock().unwrap() =
+        VecDeque::from(vec![overfilled.clone(), overfilled, under]);
 
     let mut engine = PairTradeEngine::test_instance(connector.clone());
     engine.cfg.dry_run = false;
@@ -2972,4 +2977,66 @@ async fn post_trim_underfill_fails_closed() {
         .get("AAA/BBB")
         .is_some_and(|r| r.contains("post_trim_underfill")));
     let _ = std::fs::remove_file(&engine.risk_state_path);
+}
+
+/// Codex review PR #168 (P1, follow-up): the initial reconciliation read
+/// must not trust a single position readout. Here the position endpoint
+/// lags the fill endpoints — the first read still shows the intended size
+/// (looks `ok`), and only the second read reveals the late-fill excess.
+/// The stability polling (two consecutive identical reads required) must
+/// catch the overfill and trim it instead of recording a clean entry.
+#[tokio::test]
+async fn entry_reconcile_polls_lagging_position_endpoint() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![("legB".to_string(), dec("2.4291"))]]),
+    );
+    let lagging = vec![position_721("BBB", "2.4291", -1)]; // pre-late-fill
+    let overfilled = vec![position_721("BBB", "2.6016", -1)];
+    let trimmed = vec![position_721("BBB", "2.4291", -1)];
+    *connector.positions_script.lock().unwrap() = VecDeque::from(vec![
+        lagging,            // read 1: endpoint not caught up — looks ok
+        overfilled.clone(), // read 2: late fill visible — disagrees with read 1
+        overfilled,         // read 3: stable → settled on the overfill
+        trimmed,            // post-trim verification
+    ]);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    seed_state(&mut engine, "AAA/BBB");
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_entry = Some(PendingOrders {
+        legs: vec![entry_leg_721("BBB", "legB", "2.4291", OrderSide::Short)],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the lagged overfill must still be detected and trimmed"
+    );
+    let (symbol, size, side, price, reduce_only) = calls[0].clone();
+    assert_eq!(symbol, "BBB");
+    assert_eq!(size, dec("0.1725"));
+    assert_eq!(side, OrderSide::Long);
+    assert_eq!(price, None);
+    assert!(reduce_only);
+    assert!(engine.instances[0].entry_blocked_pairs.is_empty());
 }
