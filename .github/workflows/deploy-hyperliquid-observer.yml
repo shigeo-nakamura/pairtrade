@@ -33,6 +33,10 @@ env:
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
+    # Protected-ref guard (same as ci.yml's deploy job): this ships a binary
+    # to the production host, so a workflow_dispatch against a feature branch
+    # or tag must not deploy.
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     # Same QEMU-emulated arm64 budget rationale as ci.yml's deploy job.
     timeout-minutes: 180
     environment: debot
