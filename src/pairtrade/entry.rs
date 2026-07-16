@@ -347,6 +347,14 @@ pub(super) fn should_enter(check: EntryCheck<'_>) -> Result<(), &'static str> {
             return Err("spread_trend");
         }
     }
+    // bot-strategy#474/#732 — halt when the composite or either estimator
+    // component has saturated at an OLS/Kalman clamp. Checked before the
+    // tunable β gates: a floor-pinned component also inflates beta_gap, so
+    // `beta_divergence` would otherwise absorb the reject and the structural
+    // guard (and its Prometheus label) would depend on per-variant knobs.
+    if beta_state_at_clamp(shared) {
+        return Err("beta_clamp");
+    }
     // Beta stability filter: block entry if beta_s and beta_l diverge
     if shared.beta_gap > pp.beta_divergence_max {
         return Err("beta_divergence");
@@ -354,11 +362,6 @@ pub(super) fn should_enter(check: EntryCheck<'_>) -> Result<(), &'static str> {
     // Beta minimum filter: block entry if beta is too low (hedge leg too small)
     if pp.beta_min > 0.0 && shared.beta < pp.beta_min {
         return Err("beta_min");
-    }
-    // bot-strategy#474/#732 — halt when the composite or either estimator
-    // component has saturated at an OLS/Kalman clamp.
-    if beta_state_at_clamp(shared) {
-        return Err("beta_clamp");
     }
     // bot-strategy#462 Phase 2 — Kalman β-uncertainty gate. Rigorous
     // alternative to the beta_gap proxy: the filter's posterior σ_β

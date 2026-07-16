@@ -1369,3 +1369,66 @@ async fn ineligible_close_bypasses_deferral_when_risk_exit_pending() {
         "no deferral window may be opened for a risk-exit bypass"
     );
 }
+
+// ---------------------------------------------------------------------
+// bot-strategy#732: the β-clamp structural guard must run BEFORE the
+// tunable β gates. In the observed 2026-07-15 single-component collapse
+// (β_s floor-pinned at 0.10, β_l ≈ 0.25) the composite stays interior
+// (~0.145) but beta_gap ≈ 1.03 — if `beta_divergence` ran first it would
+// absorb the reject and the `beta_clamp` Prometheus label would never
+// surface the collapse (PR #169 Codex review).
+// ---------------------------------------------------------------------
+#[tokio::test]
+async fn beta_component_clamp_fires_before_divergence_gate() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-beta-clamp");
+    {
+        let shared = h.engine.per_pair_state.get_mut(PAIR_KEY).unwrap();
+        shared.beta_short = 0.10; // BETA_CLAMP_MIN floor
+        shared.beta_long = 0.25;
+        shared.beta = 0.7 * shared.beta_short + 0.3 * shared.beta_long;
+        shared.beta_gap = (shared.beta_short - shared.beta_long).abs() / shared.beta;
+    }
+
+    h.step().await;
+
+    assert!(
+        h.position(0).is_none(),
+        "entry must be suppressed while a β component sits at the clamp floor"
+    );
+    assert_eq!(
+        reject_count("hg-beta-clamp", "beta_clamp"),
+        1,
+        "the structural clamp guard must attribute the reject, not a tunable gate"
+    );
+    assert_eq!(
+        reject_count("hg-beta-clamp", "beta_divergence"),
+        0,
+        "beta_divergence must not absorb the collapse-shape reject"
+    );
+
+    // Healthy interior components on the next tick → the guard releases
+    // and the queued entry signal goes through without a restart. Restore
+    // the exact harness preconditions (β=1.0 all around, zero history) so
+    // the clamped step's polluted spread push does not distort the signal.
+    {
+        let shared = h.engine.per_pair_state.get_mut(PAIR_KEY).unwrap();
+        shared.beta_short = 1.0;
+        shared.beta_long = 1.0;
+        shared.beta = 1.0;
+        shared.beta_gap = 0.0;
+        shared.spread_history = std::iter::repeat(0.0).take(29).collect();
+    }
+    h.step().await;
+    assert!(
+        h.position(0).is_some(),
+        "entry must resume once every β estimate is interior again"
+    );
+    assert_eq!(
+        reject_count("hg-beta-clamp", "beta_clamp"),
+        1,
+        "no further beta_clamp reject once the components recover"
+    );
+}
