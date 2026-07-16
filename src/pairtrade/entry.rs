@@ -188,6 +188,15 @@ pub(super) fn beta_at_clamp(beta: f64) -> bool {
     beta <= BETA_CLAMP_MIN + BETA_CLAMP_EPSILON || beta >= BETA_CLAMP_MAX - BETA_CLAMP_EPSILON
 }
 
+/// A clamped short- or long-window estimate is unsafe even when the weighted
+/// composite remains inside the clamp. Checking only `shared.beta` masks the
+/// common single-component collapse shape (bot-strategy#732).
+fn beta_state_at_clamp(shared: &PairSharedState) -> bool {
+    [shared.beta, shared.beta_short, shared.beta_long]
+        .into_iter()
+        .any(beta_at_clamp)
+}
+
 pub(super) struct EntryCheck<'a> {
     pub(super) cfg: &'a PairTradeConfig,
     pub(super) pp: &'a PairParams,
@@ -338,6 +347,14 @@ pub(super) fn should_enter(check: EntryCheck<'_>) -> Result<(), &'static str> {
             return Err("spread_trend");
         }
     }
+    // bot-strategy#474/#732 — halt when the composite or either estimator
+    // component has saturated at an OLS/Kalman clamp. Checked before the
+    // tunable β gates: a floor-pinned component also inflates beta_gap, so
+    // `beta_divergence` would otherwise absorb the reject and the structural
+    // guard (and its Prometheus label) would depend on per-variant knobs.
+    if beta_state_at_clamp(shared) {
+        return Err("beta_clamp");
+    }
     // Beta stability filter: block entry if beta_s and beta_l diverge
     if shared.beta_gap > pp.beta_divergence_max {
         return Err("beta_divergence");
@@ -345,10 +362,6 @@ pub(super) fn should_enter(check: EntryCheck<'_>) -> Result<(), &'static str> {
     // Beta minimum filter: block entry if beta is too low (hedge leg too small)
     if pp.beta_min > 0.0 && shared.beta < pp.beta_min {
         return Err("beta_min");
-    }
-    // bot-strategy#474 Phase 1 — β-clamp halt (see `beta_at_clamp`).
-    if beta_at_clamp(shared.beta) {
-        return Err("beta_clamp");
     }
     // bot-strategy#462 Phase 2 — Kalman β-uncertainty gate. Rigorous
     // alternative to the beta_gap proxy: the filter's posterior σ_β
@@ -719,6 +732,28 @@ mod tests {
     #[test]
     fn beta_at_clamp_allows_interior_high() {
         assert!(!beta_at_clamp(3.0));
+    }
+
+    #[test]
+    fn beta_state_at_clamp_blocks_single_short_component_at_floor() {
+        let mut shared = PairSharedState::new(120);
+        shared.beta_short = 0.1;
+        shared.beta_long = 0.25;
+        shared.beta = 0.7 * shared.beta_short + 0.3 * shared.beta_long;
+
+        assert!((shared.beta - 0.145).abs() < 1e-12);
+        assert!(!beta_at_clamp(shared.beta));
+        assert!(beta_state_at_clamp(&shared));
+    }
+
+    #[test]
+    fn beta_state_at_clamp_allows_healthy_components() {
+        let mut shared = PairSharedState::new(120);
+        shared.beta_short = 0.72;
+        shared.beta_long = 0.81;
+        shared.beta = 0.7 * shared.beta_short + 0.3 * shared.beta_long;
+
+        assert!(!beta_state_at_clamp(&shared));
     }
 
     // Regression guard: `prom::KNOWN_ENTRY_REJECT_REASONS` MUST list
