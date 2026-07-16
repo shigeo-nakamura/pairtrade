@@ -1,0 +1,31 @@
+[Unit]
+Description="debot-pair-hyperliquid-observe (bot-strategy#724 Hyperliquid read-only shadow collector)"
+After=network-online.target debot-pair-btceth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root like the other observer units (no User=) so journal/state
+# handling stays uniform; unlike them it sources no secrets file (read-only
+# public-data connector).
+# Leading '-' (see debot-pair-shadow-macro.service): systemd applies
+# WorkingDirectory BEFORE ExecStartPre/ExecStart, so on a fresh host an
+# un-prefixed path would CHDIR-fail the unit before the wrapper's own
+# `mkdir -p` + `cd` could create /opt/debot-hl.
+WorkingDirectory=-/opt/debot-hl
+# Small boot destagger only: this observer talks to Hyperliquid, not Lighter,
+# so the bot-strategy#163 Lighter WS/REST spacing ladder (30/45/60s) does not
+# apply; 15s just avoids piling CPU on the 2-vCPU host at boot.
+ExecStartPre=/bin/sleep 15
+ExecStart=/bin/bash /opt/debot/scripts/debot-pair-hyperliquid-observe.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+TimeoutStartSec=300
+# Observe-only: no positions to force-close, short stop is fine.
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
