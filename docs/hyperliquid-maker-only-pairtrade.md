@@ -124,6 +124,34 @@ Stop criteria:
 - Any sustained REST rate-limit or timeout burst means polling cadence must be
   reduced or WebSocket market data must be implemented before extending scope.
 
+## Frankfurt Persistent Shadow Deployment (bot-strategy#724)
+
+The long-running shadow collector runs on Frankfurt as a dedicated unit,
+fully isolated from the trading services:
+
+- Unit: `debot-pair-hyperliquid-observe.service` — installed (but never
+  started/restarted) by the `Deploy Hyperliquid Observer` workflow
+  (`workflow_dispatch` only). The operator starts it manually.
+- Binary: `/opt/debot-hl/bin/debot`, built arm64 with
+  `--no-default-features --features hyperliquid-sdk`. It cannot share
+  `/opt/debot/bin/debot` because lighter-sdk and hyperliquid-sdk are
+  mutually exclusive feature builds.
+- Wrapper: `/opt/debot/scripts/debot-pair-hyperliquid-observe.sh` — sources
+  no secrets env files (the connector is read-only, public `/info` only).
+- State: `/opt/debot-hl/` — `market_data_hyperliquid_pairs.jsonl`,
+  `history_archive/`, `pairtrade_history_hyperliquid.json`, and the derived
+  sibling `risk_state.json`.
+- Stop / rollback:
+
+  ```bash
+  sudo systemctl stop debot-pair-hyperliquid-observe
+  sudo systemctl disable debot-pair-hyperliquid-observe
+  ```
+
+  Neither command touches any other unit; removing
+  `/etc/systemd/system/debot-pair-hyperliquid-observe.service` +
+  `daemon-reload` and deleting `/opt/debot-hl/` fully reverts the host.
+
 ## Next Live-Capable Slice
 
 Do not enable live orders until these are done:
