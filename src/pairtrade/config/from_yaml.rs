@@ -120,6 +120,12 @@ impl PairTradeConfig {
             ineligible_close_defer_cap_secs: 0,
             ineligible_close_defer_spread_bps: 20.0,
             ineligible_close_defer_stale_secs: 30,
+            eligibility_margin_grace_secs: yaml
+                .eligibility_margin_grace_secs
+                .unwrap_or(DEFAULT_ELIGIBILITY_MARGIN_GRACE_SECS),
+            eligibility_beta_gap_exit: yaml
+                .eligibility_beta_gap_exit
+                .unwrap_or(DEFAULT_ELIGIBILITY_BETA_GAP_EXIT),
             shutdown_grace_secs: yaml
                 .shutdown_grace_secs
                 .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),

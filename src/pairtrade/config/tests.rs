@@ -61,6 +61,59 @@ fn hyperliquid_observer_config_parses() {
 }
 
 #[test]
+fn eligibility_margin_grace_yaml_resolves_defaults_and_validates_bounds() {
+    let env_names = ["ELIGIBILITY_MARGIN_GRACE_SECS", "ELIGIBILITY_BETA_GAP_EXIT"];
+    let saved: Vec<_> = env_names
+        .iter()
+        .map(|name| ((*name).to_string(), std::env::var(name).ok()))
+        .collect();
+    for name in env_names {
+        std::env::remove_var(name);
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "pairtrade_eligibility_margin_grace_{}.yaml",
+        std::process::id()
+    ));
+    let base = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+"#;
+    std::fs::write(&path, base).unwrap();
+    let defaults = PairTradeConfig::from_yaml_path(&path).expect("default yaml load");
+    assert_eq!(defaults.eligibility_margin_grace_secs, 0);
+    assert!((defaults.eligibility_beta_gap_exit - 0.25).abs() < 1e-12);
+
+    std::fs::write(
+        &path,
+        format!("{base}eligibility_margin_grace_secs: 60\neligibility_beta_gap_exit: 0.25\n"),
+    )
+    .unwrap();
+    let enabled = PairTradeConfig::from_yaml_path(&path).expect("enabled yaml load");
+    assert_eq!(enabled.eligibility_margin_grace_secs, 60);
+    assert!((enabled.eligibility_beta_gap_exit - 0.25).abs() < 1e-12);
+
+    std::fs::write(
+        &path,
+        format!("{base}eligibility_margin_grace_secs: 60\neligibility_beta_gap_exit: 0.19\n"),
+    )
+    .unwrap();
+    assert!(PairTradeConfig::from_yaml_path(&path).is_err());
+
+    let _ = std::fs::remove_file(&path);
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
+#[test]
 fn risk_config_resolves_capital_event_fields() {
     let yaml = RiskYaml {
         session_dd_capital_event_min_usd: Some(25.0),

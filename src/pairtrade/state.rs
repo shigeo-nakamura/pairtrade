@@ -12,6 +12,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::config::PairTradeConfig;
+use super::defaults::ELIGIBILITY_BETA_GAP_MAX;
 use super::kalman::KalmanBeta;
 use super::regime::RegimeDetector;
 use super::util::mean_std;
@@ -227,6 +228,16 @@ impl Error for PartialOrderPlacementError {
     }
 }
 
+/// Observable transition produced by the held-position-only eligibility
+/// margin grace (bot-strategy#742).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EligibilityMarginGraceEvent {
+    Started { until_ts: i64 },
+    Recovered,
+    Expired { deadline_ts: i64 },
+    SevereBypass,
+}
+
 /// Per-pair quantities that are deterministic functions of the shared
 /// log-price history and therefore must produce identical values for every
 /// strategy variant operating on the same pair. Owned at engine level
@@ -244,6 +255,13 @@ pub(super) struct PairSharedState {
     pub(super) adf_p_value: f64,
     pub(super) eligible: bool,
     pub(super) last_evaluated: Option<Instant>,
+    /// Event-time deadline for #742's held-position-only grace. While set,
+    /// raw `eligible` remains false (so flat variants cannot enter), but
+    /// already-held variants may continue through their ordinary exit gates.
+    /// Cleared on recovery, severe failure, expiry, or when every variant is
+    /// flat. Not persisted: startup force-close owns restart recovery.
+    pub(super) eligibility_margin_grace_until_ts: Option<i64>,
+
     /// Replay-aware companion to `last_evaluated`. Drives the periodic
     /// pair re-evaluation interval (PAIR_SELECTION_INTERVAL_SECS).
     pub(super) last_evaluated_ts: Option<i64>,
@@ -343,6 +361,7 @@ impl PairSharedState {
             eligible: false,
             last_evaluated: None,
             last_evaluated_ts: None,
+            eligibility_margin_grace_until_ts: None,
             p_value_weighted_score: 0.0,
             beta_gap: 0.0,
             kalman: None,
@@ -350,6 +369,89 @@ impl PairSharedState {
             regime: RegimeDetector::default(),
             last_regime_shadow_ts: None,
         }
+    }
+
+    /// Eligibility used only for an already-held position. Flat entry logic
+    /// must continue to read raw `eligible` directly.
+    pub(super) fn exit_eligible(&self) -> bool {
+        self.eligible || self.eligibility_margin_grace_until_ts.is_some()
+    }
+
+    /// Commit a raw pair-evaluation result and update the narrow #742 grace.
+    ///
+    /// Grace is available only while at least one variant already holds the
+    /// pair and the exact failed composition is:
+    /// `half_ok && !adf_ok && 0.20 < beta_gap <= configured_exit`.
+    /// Every other failure remains an immediate held-position ineligibility.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn update_eligibility(
+        &mut self,
+        raw_eligible: bool,
+        half_ok: bool,
+        adf_ok: bool,
+        beta_gap: f64,
+        has_open_position: bool,
+        now_ts: i64,
+        grace_secs: i64,
+        beta_gap_exit: f64,
+    ) -> Option<EligibilityMarginGraceEvent> {
+        let was_raw_eligible = self.eligible;
+        let had_active_grace = self.eligibility_margin_grace_until_ts.is_some();
+        self.eligible = raw_eligible;
+
+        if grace_secs <= 0 {
+            self.eligibility_margin_grace_until_ts = None;
+            return None;
+        }
+        if !has_open_position {
+            self.eligibility_margin_grace_until_ts = None;
+            return None;
+        }
+        if raw_eligible {
+            return self
+                .eligibility_margin_grace_until_ts
+                .take()
+                .map(|_| EligibilityMarginGraceEvent::Recovered);
+        }
+
+        let marginal_adf_beta_failure =
+            half_ok && !adf_ok && beta_gap > ELIGIBILITY_BETA_GAP_MAX && beta_gap <= beta_gap_exit;
+        if marginal_adf_beta_failure {
+            if self.eligibility_margin_grace_until_ts.is_none() && was_raw_eligible {
+                let until_ts = now_ts.saturating_add(grace_secs);
+                self.eligibility_margin_grace_until_ts = Some(until_ts);
+                return Some(EligibilityMarginGraceEvent::Started { until_ts });
+            }
+            return None;
+        }
+
+        self.eligibility_margin_grace_until_ts = None;
+        if was_raw_eligible || had_active_grace {
+            Some(EligibilityMarginGraceEvent::SevereBypass)
+        } else {
+            None
+        }
+    }
+
+    /// Expire the grace from replay/event time on every shared tick, so a
+    /// second statistical evaluation is not required to release the close.
+    pub(super) fn expire_eligibility_margin_grace(
+        &mut self,
+        has_open_position: bool,
+        now_ts: i64,
+    ) -> Option<EligibilityMarginGraceEvent> {
+        if !has_open_position {
+            self.eligibility_margin_grace_until_ts = None;
+            return None;
+        }
+        let until_ts = self.eligibility_margin_grace_until_ts?;
+        if now_ts < until_ts {
+            return None;
+        }
+        self.eligibility_margin_grace_until_ts = None;
+        Some(EligibilityMarginGraceEvent::Expired {
+            deadline_ts: until_ts,
+        })
     }
 
     pub(super) fn push_spread(&mut self, spread: f64, window: usize, config: &PairTradeConfig) {
@@ -633,6 +735,73 @@ mod tests {
         let _ = &s.last_exit_at;
         let _ = &s.last_exit_ts;
         let _ = s.position_guard;
+    }
+
+    #[test]
+    fn eligibility_margin_grace_is_held_only_and_expires_on_event_time() {
+        let mut shared = PairSharedState::new(60);
+        shared.eligible = true;
+        let event = shared.update_eligibility(false, true, false, 0.236, true, 100, 60, 0.25);
+        assert_eq!(
+            event,
+            Some(EligibilityMarginGraceEvent::Started { until_ts: 160 })
+        );
+        assert!(!shared.eligible, "raw entry eligibility must stay false");
+        assert!(shared.exit_eligible(), "held position consumes the grace");
+        assert_eq!(shared.expire_eligibility_margin_grace(true, 159), None);
+        assert_eq!(
+            shared.expire_eligibility_margin_grace(true, 160),
+            Some(EligibilityMarginGraceEvent::Expired { deadline_ts: 160 })
+        );
+        assert!(!shared.exit_eligible());
+        assert_eq!(
+            shared.update_eligibility(false, true, false, 0.21, true, 170, 60, 0.25),
+            None,
+            "an expired grace must not restart in the same raw-ineligible spell"
+        );
+    }
+
+    #[test]
+    fn eligibility_margin_grace_recovers_or_bypasses_by_failure_reason() {
+        let mut shared = PairSharedState::new(60);
+        shared.eligible = true;
+        shared.update_eligibility(false, true, false, 0.21, true, 100, 60, 0.25);
+        assert_eq!(
+            shared.update_eligibility(true, true, true, 0.19, true, 110, 60, 0.25),
+            Some(EligibilityMarginGraceEvent::Recovered)
+        );
+        assert!(shared.exit_eligible());
+
+        shared.update_eligibility(false, true, false, 0.21, true, 120, 60, 0.25);
+        assert_eq!(
+            shared.update_eligibility(false, true, false, 0.26, true, 130, 60, 0.25),
+            Some(EligibilityMarginGraceEvent::SevereBypass)
+        );
+        assert!(!shared.exit_eligible());
+        assert_eq!(
+            shared.update_eligibility(false, true, false, 0.26, true, 140, 60, 0.25),
+            None
+        );
+    }
+
+    #[test]
+    fn eligibility_margin_grace_never_opens_for_flat_or_disabled_pair() {
+        let mut shared = PairSharedState::new(60);
+        assert_eq!(
+            shared.update_eligibility(false, true, false, 0.21, false, 100, 60, 0.25),
+            None
+        );
+        assert!(!shared.exit_eligible());
+
+        shared.eligible = true;
+        assert_eq!(
+            shared.update_eligibility(false, true, false, 0.21, true, 100, 0, 0.25),
+            None
+        );
+        assert!(
+            !shared.exit_eligible(),
+            "default-off path closes immediately"
+        );
     }
 
     #[test]

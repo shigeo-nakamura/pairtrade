@@ -136,6 +136,7 @@ impl PairTradeEngine {
                 prom::init_close_reason_series(&strategy.id, &pair_key);
                 prom::init_entry_reject_series(&strategy.id, &pair_key);
                 prom::init_ineligible_close_defer_series(&strategy.id, &pair_key);
+                prom::init_eligibility_margin_grace_series(&pair_key);
                 states.insert(pair_key, ps);
             }
 
@@ -230,6 +231,10 @@ impl PairTradeEngine {
                     cfg.ineligible_close_defer_cap_secs,
                     cfg.ineligible_close_defer_spread_bps,
                     cfg.ineligible_close_defer_stale_secs,
+                )
+                .with_eligibility_margin_grace(
+                    cfg.eligibility_margin_grace_secs,
+                    cfg.eligibility_beta_gap_exit,
                 );
                 log::info!("{}", effective.log_line());
                 prom::record_config_info(
@@ -244,6 +249,8 @@ impl PairTradeEngine {
                     effective.ineligible_close_defer_cap_secs,
                     effective.ineligible_close_defer_spread_bps,
                     effective.ineligible_close_defer_stale_secs,
+                    effective.eligibility_margin_grace_secs,
+                    effective.eligibility_beta_gap_exit,
                     &file_path,
                     &file_sha,
                     file_mtime,

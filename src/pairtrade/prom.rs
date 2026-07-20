@@ -188,6 +188,22 @@ pub static ELIGIBLE: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static EXIT_ELIGIBLE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_exit_eligible",
+        "1 when a held position may remain open after raw eligibility plus the bounded #742 grace.",
+        &["variant", "pair"],
+    )
+});
+
+pub static ELIGIBILITY_MARGIN_GRACE_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_eligibility_margin_grace_active",
+        "1 while the pair-level held-position eligibility margin grace is active (bot-strategy#742).",
+        &["variant", "pair"],
+    )
+});
+
 pub static ENTRY_Z_THRESHOLD_EFFECTIVE: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_entry_z_threshold_effective",
@@ -442,6 +458,28 @@ pub static ENTRY_REJECT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
         &["variant", "pair", "reason"],
     )
 });
+
+/// Pair-level outcomes of the held-position-only eligibility margin grace
+/// (bot-strategy#742). It is intentionally not variant-labelled because one
+/// shared evaluation and deadline governs every A/B/C variant on the pair.
+pub static ELIGIBILITY_MARGIN_GRACE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_eligibility_margin_grace_total",
+        "Cumulative held-position eligibility grace transitions by outcome.",
+        &["pair", "outcome"],
+    )
+});
+
+pub const KNOWN_ELIGIBILITY_MARGIN_GRACE_OUTCOMES: &[&str] =
+    &["started", "recovered", "expired", "severe_bypass"];
+
+pub fn init_eligibility_margin_grace_series(pair: &str) {
+    for outcome in KNOWN_ELIGIBILITY_MARGIN_GRACE_OUTCOMES {
+        ELIGIBILITY_MARGIN_GRACE_TOTAL
+            .with_label_values(&[pair, outcome])
+            .inc_by(0);
+    }
+}
 
 /// Ineligible-close deferral guard (bot-strategy#531): counts ticks on
 /// which an ineligible flatten was deferred because the book looked
@@ -788,6 +826,22 @@ pub static EFFECTIVE_INELIGIBLE_CLOSE_DEFER_STALE_SECS: Lazy<GaugeVec> = Lazy::n
     )
 });
 
+pub static EFFECTIVE_ELIGIBILITY_MARGIN_GRACE_SECS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_eligibility_margin_grace_secs",
+        "Effective held-position eligibility margin grace in seconds; 0 disables (bot-strategy#742).",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_ELIGIBILITY_BETA_GAP_EXIT: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_eligibility_beta_gap_exit",
+        "Effective upper relative beta-gap bound for the held-position grace (bot-strategy#742).",
+        &["variant"],
+    )
+});
+
 /// Spawn the metrics HTTP server if `PROM_LISTEN` is set in the
 /// environment. The address must parse as `host:port`. Failures during
 /// bind are logged at WARN and do not abort the bot — the gauges keep
@@ -907,6 +961,8 @@ pub fn record_config_info(
     ineligible_close_defer_cap_secs: i64,
     ineligible_close_defer_spread_bps: f64,
     ineligible_close_defer_stale_secs: i64,
+    eligibility_margin_grace_secs: i64,
+    eligibility_beta_gap_exit: f64,
     file_path: &str,
     file_sha: &str,
     file_mtime: i64,
@@ -948,6 +1004,12 @@ pub fn record_config_info(
     EFFECTIVE_INELIGIBLE_CLOSE_DEFER_STALE_SECS
         .with_label_values(&[variant])
         .set(ineligible_close_defer_stale_secs as f64);
+    EFFECTIVE_ELIGIBILITY_MARGIN_GRACE_SECS
+        .with_label_values(&[variant])
+        .set(eligibility_margin_grace_secs as f64);
+    EFFECTIVE_ELIGIBILITY_BETA_GAP_EXIT
+        .with_label_values(&[variant])
+        .set(eligibility_beta_gap_exit);
 }
 
 #[cfg(test)]

@@ -1283,6 +1283,65 @@ async fn ineligible_close_immediate_when_guard_disabled() {
     );
 }
 
+#[tokio::test]
+async fn eligibility_margin_grace_holds_until_event_time_deadline() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = ineligible_guard_harness("hg-elig-margin");
+    h.engine.cfg.ineligible_close_defer_cap_secs = 0;
+    h.engine.cfg.eligibility_margin_grace_secs = 60;
+    h._connector.set_half_spread_frac(dec("0.0005"));
+    let now_ts = chrono::Utc::now().timestamp();
+    h.engine
+        .per_pair_state
+        .get_mut(PAIR_KEY)
+        .unwrap()
+        .eligibility_margin_grace_until_ts = Some(now_ts + 60);
+
+    h.step().await;
+    assert!(
+        h.position(0).is_some(),
+        "held position must use exit eligibility while raw entry eligibility is false"
+    );
+    assert!(
+        !h.engine.per_pair_state[PAIR_KEY].eligible,
+        "raw entry eligibility must remain false during the grace"
+    );
+
+    h.engine
+        .per_pair_state
+        .get_mut(PAIR_KEY)
+        .unwrap()
+        .eligibility_margin_grace_until_ts = Some(chrono::Utc::now().timestamp() - 1);
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "deadline expiry must release the ineligible close without another evaluation"
+    );
+}
+
+#[tokio::test]
+async fn eligibility_margin_grace_does_not_block_force_close() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = ineligible_guard_harness("hg-elig-margin-force");
+    h.engine.cfg.ineligible_close_defer_cap_secs = 0;
+    h.seed_position(0, 61);
+    h.engine
+        .per_pair_state
+        .get_mut(PAIR_KEY)
+        .unwrap()
+        .eligibility_margin_grace_until_ts = Some(chrono::Utc::now().timestamp() + 60);
+
+    h.step().await;
+    assert!(
+        h.position(0).is_none(),
+        "force-close must bypass the eligibility margin grace"
+    );
+}
+
 /// A started deferral is a close obligation (PR #166 Codex review): if
 /// eligibility flips back to true while the close is still deferred, the
 /// guard must not drop the already-triggered flatten — it re-times it,

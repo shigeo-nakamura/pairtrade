@@ -122,6 +122,16 @@ pub struct PairTradeConfig {
     /// else looks fresh again). Normal accepted cadence is ~5s; 30s is
     /// clearly abnormal. Env: INELIGIBLE_CLOSE_DEFER_STALE_SECS.
     pub ineligible_close_defer_stale_secs: i64,
+    /// Maximum event-time grace for an already-held position when the raw
+    /// eligibility failure is narrowly attributable to ADF plus a marginal
+    /// relative beta gap. Zero disables and preserves immediate close.
+    /// Env: ELIGIBILITY_MARGIN_GRACE_SECS. bot-strategy#742.
+    pub eligibility_margin_grace_secs: i64,
+    /// Upper relative beta-gap bound for #742's held-position grace. Raw
+    /// entries always retain the fixed 0.20 threshold.
+    /// Env: ELIGIBILITY_BETA_GAP_EXIT.
+    pub eligibility_beta_gap_exit: f64,
+
     /// All per-pair tunables — z-score thresholds, hedge gates, lookback
     /// windows, circuit-breaker tiers, Phase 2 filters — live here. Engine
     /// reads them via `params_for(key)` so per-pair YAML overrides win.

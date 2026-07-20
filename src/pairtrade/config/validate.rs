@@ -7,6 +7,7 @@
 
 use anyhow::{anyhow, Result};
 
+use super::super::defaults::ELIGIBILITY_BETA_GAP_MAX as RAW_BETA_GAP_MAX;
 use super::PairTradeConfig;
 
 impl PairTradeConfig {
@@ -88,6 +89,21 @@ impl PairTradeConfig {
     pub(super) fn validate(&self) -> Result<()> {
         const BUFFER_SECS: u64 = 60;
         self.warn_std_collapse_hold_down_cap();
+        if self.eligibility_margin_grace_secs < 0 {
+            return Err(anyhow!(
+                "eligibility_margin_grace_secs ({}) must be >= 0",
+                self.eligibility_margin_grace_secs
+            ));
+        }
+        if !self.eligibility_beta_gap_exit.is_finite()
+            || self.eligibility_beta_gap_exit < RAW_BETA_GAP_MAX
+        {
+            return Err(anyhow!(
+                "eligibility_beta_gap_exit ({}) must be finite and >= {:.2}",
+                self.eligibility_beta_gap_exit,
+                RAW_BETA_GAP_MAX
+            ));
+        }
         // 0 = legacy immediate force-close on SIGTERM; no grace window to
         // validate.
         if self.shutdown_grace_secs == 0 {

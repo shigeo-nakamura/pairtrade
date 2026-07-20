@@ -271,6 +271,14 @@ impl PairTradeConfig {
             "INELIGIBLE_CLOSE_DEFER_STALE_SECS",
             &mut self.ineligible_close_defer_stale_secs,
         );
+        env_override(
+            "ELIGIBILITY_MARGIN_GRACE_SECS",
+            &mut self.eligibility_margin_grace_secs,
+        );
+        env_override(
+            "ELIGIBILITY_BETA_GAP_EXIT",
+            &mut self.eligibility_beta_gap_exit,
+        );
         // Per-tick regime series dump — see struct field doc.
         if let Ok(value) = env::var("BT_REGIME_SERIES_FILE") {
             if !value.trim().is_empty() {

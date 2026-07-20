@@ -213,6 +213,14 @@ impl PairTradeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+            eligibility_margin_grace_secs: env::var("ELIGIBILITY_MARGIN_GRACE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_ELIGIBILITY_MARGIN_GRACE_SECS),
+            eligibility_beta_gap_exit: env::var("ELIGIBILITY_BETA_GAP_EXIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_ELIGIBILITY_BETA_GAP_EXIT),
             shutdown_grace_secs: env::var("SHUTDOWN_GRACE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
