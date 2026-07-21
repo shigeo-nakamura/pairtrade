@@ -1442,6 +1442,190 @@
         "showHeader": true,
         "cellHeight": "sm"
       }
+    },
+    {
+      "id": 116,
+      "type": "timeseries",
+      "title": "Frankfurt Canary eligibility / held-exit grace (#742)",
+      "description": "Canary LIVE verification view for bot-strategy#742. Raw eligibility always gates new entries. Held-exit eligibility may remain 1 only during the narrow ADF + marginal beta-gap grace, while grace_active identifies that bounded exposure extension explicitly. All three series must return to their ordinary state on recovery, expiry, or severe bypass.",
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 188
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_eligible{instance=\"debot-frankfurt-canary\",variant!=\"\"}",
+          "legendFormat": "raw {{variant}} {{pair}}",
+          "refId": "A"
+        },
+        {
+          "expr": "pairtrade_exit_eligible{instance=\"debot-frankfurt-canary\",variant!=\"\"}",
+          "legendFormat": "held exit {{variant}} {{pair}}",
+          "refId": "B"
+        },
+        {
+          "expr": "pairtrade_eligibility_margin_grace_active{instance=\"debot-frankfurt-canary\",variant!=\"\"}",
+          "legendFormat": "grace active {{variant}} {{pair}}",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^raw.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^held exit.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^grace active.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 35
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 117,
+      "type": "stat",
+      "title": "Canary grace outcomes — selected range",
+      "description": "Pair-level #742 state-machine transitions on the Frankfurt Canary LIVE probe. severe_bypass and expired are the primary safety/rollback signals; started without recovered/expired indicates the selected time range ends during an active grace.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 188
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (increase(pairtrade_eligibility_margin_grace_total{instance=\"debot-frankfurt-canary\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 118,
+      "type": "stat",
+      "title": "Canary eligibility-grace effective config",
+      "description": "Resolved Frankfurt Canary config. The #742 LIVE probe expects grace seconds = 60 and beta-gap exit = 0.25; unexpected values indicate YAML/env drift or a stale binary.",
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 196
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_effective_eligibility_margin_grace_secs{instance=\"debot-frankfurt-canary\",variant!=\"\"}",
+          "instant": true,
+          "legendFormat": "{{variant}} grace seconds",
+          "refId": "A"
+        },
+        {
+          "expr": "pairtrade_effective_eligibility_beta_gap_exit{instance=\"debot-frankfurt-canary\",variant!=\"\"}",
+          "instant": true,
+          "legendFormat": "{{variant}} beta-gap exit",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "horizontal",
+        "textMode": "value_and_name",
+        "colorMode": "value"
+      }
     }
   ]
 }

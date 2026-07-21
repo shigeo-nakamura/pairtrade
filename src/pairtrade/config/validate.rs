@@ -96,10 +96,10 @@ impl PairTradeConfig {
             ));
         }
         if !self.eligibility_beta_gap_exit.is_finite()
-            || self.eligibility_beta_gap_exit < RAW_BETA_GAP_MAX
+            || self.eligibility_beta_gap_exit <= RAW_BETA_GAP_MAX
         {
             return Err(anyhow!(
-                "eligibility_beta_gap_exit ({}) must be finite and >= {:.2}",
+                "eligibility_beta_gap_exit ({}) must be finite and > {:.2}",
                 self.eligibility_beta_gap_exit,
                 RAW_BETA_GAP_MAX
             ));

@@ -99,6 +99,16 @@ universe_pairs:
 
     std::fs::write(
         &path,
+        format!("{base}eligibility_margin_grace_secs: 60\neligibility_beta_gap_exit: 0.20\n"),
+    )
+    .unwrap();
+    assert!(
+        PairTradeConfig::from_yaml_path(&path).is_err(),
+        "the raw 0.20 boundary would make the grace interval empty"
+    );
+
+    std::fs::write(
+        &path,
         format!("{base}eligibility_margin_grace_secs: 60\neligibility_beta_gap_exit: 0.19\n"),
     )
     .unwrap();
