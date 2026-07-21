@@ -49,6 +49,8 @@ pub struct EffectiveConfig {
     pub ineligible_close_defer_cap_secs: i64,
     pub ineligible_close_defer_spread_bps: f64,
     pub ineligible_close_defer_stale_secs: i64,
+    pub eligibility_margin_grace_secs: i64,
+    pub eligibility_beta_gap_exit: f64,
 }
 
 impl EffectiveConfig {
@@ -87,7 +89,17 @@ impl EffectiveConfig {
             ineligible_close_defer_cap_secs,
             ineligible_close_defer_spread_bps,
             ineligible_close_defer_stale_secs,
+            // Defaults preserve legacy behavior; the engine constructor
+            // overwrites these from the fully resolved process config.
+            eligibility_margin_grace_secs: 0,
+            eligibility_beta_gap_exit: 0.25,
         }
+    }
+
+    pub fn with_eligibility_margin_grace(mut self, grace_secs: i64, beta_gap_exit: f64) -> Self {
+        self.eligibility_margin_grace_secs = grace_secs;
+        self.eligibility_beta_gap_exit = beta_gap_exit;
+        self
     }
 
     /// Canonical, deterministic key=value serialization over the fingerprinted
@@ -114,7 +126,9 @@ impl EffectiveConfig {
              beta_gap_notional_scale={:.6};beta_gap_notional_floor={:.6};\
              ineligible_close_defer_cap_secs={};\
              ineligible_close_defer_spread_bps={:.6};\
-             ineligible_close_defer_stale_secs={}",
+             ineligible_close_defer_stale_secs={};\
+             eligibility_margin_grace_secs={};\
+             eligibility_beta_gap_exit={:.6}",
             self.force_close_secs,
             self.exit_z,
             self.stop_loss_z,
@@ -137,6 +151,8 @@ impl EffectiveConfig {
             self.ineligible_close_defer_cap_secs,
             self.ineligible_close_defer_spread_bps,
             self.ineligible_close_defer_stale_secs,
+            self.eligibility_margin_grace_secs,
+            self.eligibility_beta_gap_exit,
         )
     }
 
@@ -152,7 +168,7 @@ impl EffectiveConfig {
     pub fn log_line(&self) -> String {
         format!(
             "[CONFIG] variant={} force_close={} exit_z={} stop_loss_z={} frozen_beta={} \
-             equity_ref={} max_leverage={} dry_run={} inelig_defer_cap={} fp={}",
+             equity_ref={} max_leverage={} dry_run={} inelig_defer_cap={} elig_margin_grace={} elig_beta_exit={} fp={}",
             self.variant,
             self.force_close_secs,
             self.exit_z,
@@ -162,6 +178,8 @@ impl EffectiveConfig {
             self.max_leverage,
             self.dry_run,
             self.ineligible_close_defer_cap_secs,
+            self.eligibility_margin_grace_secs,
+            self.eligibility_beta_gap_exit,
             self.fingerprint(),
         )
     }
@@ -295,6 +313,24 @@ mod tests {
         assert_ne!(fp_off, fp_on);
         assert_ne!(fp_on, fp_spread);
         assert_ne!(fp_on, fp_stale);
+    }
+
+    #[test]
+    fn eligibility_margin_change_moves_the_fingerprint() {
+        let p = sample_params();
+        let base =
+            EffectiveConfig::from_resolved(&sample_strategy("a"), &p, 5.0, true, 0, 20.0, 30);
+        let fp_off = base
+            .clone()
+            .with_eligibility_margin_grace(0, 0.25)
+            .fingerprint();
+        let fp_grace = base
+            .clone()
+            .with_eligibility_margin_grace(60, 0.25)
+            .fingerprint();
+        let fp_exit = base.with_eligibility_margin_grace(60, 0.30).fingerprint();
+        assert_ne!(fp_off, fp_grace);
+        assert_ne!(fp_grace, fp_exit);
     }
 
     #[test]

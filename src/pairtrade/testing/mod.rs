@@ -94,6 +94,8 @@ impl PairTradeEngine {
             ineligible_close_defer_cap_secs: 0,
             ineligible_close_defer_spread_bps: 20.0,
             ineligible_close_defer_stale_secs: 30,
+            eligibility_margin_grace_secs: DEFAULT_ELIGIBILITY_MARGIN_GRACE_SECS,
+            eligibility_beta_gap_exit: DEFAULT_ELIGIBILITY_BETA_GAP_EXIT,
             risk: config::RiskConfig::default(),
             round_id: None,
             config_source_path: None,

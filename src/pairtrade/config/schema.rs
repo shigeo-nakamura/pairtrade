@@ -146,6 +146,11 @@ pub(in crate::pairtrade) struct PairTradeYaml {
     /// Graceful shutdown: max seconds to wait for natural exit on SIGTERM before
     /// force-closing both legs. 0 = immediate force close (legacy behavior).
     pub(super) shutdown_grace_secs: Option<u64>,
+    /// Held-position-only grace for the exact marginal eligibility failure
+    /// `half_ok && !adf_ok && 0.20 < beta_gap <= exit`. Zero disables.
+    pub(super) eligibility_margin_grace_secs: Option<i64>,
+    /// Upper relative beta-gap bound for the held-position grace.
+    pub(super) eligibility_beta_gap_exit: Option<f64>,
     /// Optional list of strategy variants for the single-process A/B/C
     /// architecture (shigeo-nakamura/bot-strategy#25). When absent, the
     /// loader synthesizes a single strategy from the top-level scalars

@@ -352,6 +352,7 @@ impl PairTradeEngine {
                     s.beta_short,
                     s.beta_long,
                     s.eligible,
+                    s.exit_eligible(),
                 )
             }) else {
                 continue;
@@ -364,12 +365,21 @@ impl PairTradeEngine {
                 beta_eff,
                 beta_short,
                 beta_long,
-                eligible_shared,
+                raw_eligible_shared,
+                exit_eligible_shared,
             ) = shared_snap;
             let position_state = self.instances[inst_idx]
                 .states
                 .get(&key)
                 .and_then(|s| s.position.clone());
+
+            // Raw eligibility always gates flat entries; only an already-held
+            // position may consume #742's bounded margin grace.
+            let eligible_shared = if position_state.is_some() {
+                exit_eligible_shared
+            } else {
+                raw_eligible_shared
+            };
 
             // bot-strategy#531: a started deferral is a close obligation, not
             // a hint — once an ineligible tick has triggered the flatten, the

@@ -81,6 +81,25 @@ impl PairTradeEngine {
                     0
                 },
             );
+            prom::EXIT_ELIGIBLE.with_label_values(&labels).set(
+                if shared.map(|s| s.exit_eligible()).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+            );
+            prom::ELIGIBILITY_MARGIN_GRACE_ACTIVE
+                .with_label_values(&labels)
+                .set(
+                    if shared
+                        .and_then(|s| s.eligibility_margin_grace_until_ts)
+                        .is_some()
+                    {
+                        1
+                    } else {
+                        0
+                    },
+                );
             let mut effective = state.z_entry;
             if pp.beta_gap_entry_z_scale > 0.0 {
                 effective *=

@@ -19,6 +19,7 @@ use super::super::market::{
 };
 use super::super::pair_eval;
 use super::super::regime;
+use super::super::state::EligibilityMarginGraceEvent;
 use super::super::stats::PriceSample;
 use super::super::util::tail_std;
 use super::super::PairTradeEngine;
@@ -487,6 +488,14 @@ impl PairTradeEngine {
 
         let use_kalman_beta = self.cfg.use_kalman_beta;
         let kalman_min_updates = self.cfg.kalman_min_updates;
+        let has_open_position = self.instances.iter().any(|inst| {
+            inst.states
+                .get(key)
+                .and_then(|state| state.position.as_ref())
+                .is_some()
+        });
+        let grace_secs = self.cfg.eligibility_margin_grace_secs;
+        let beta_gap_exit = self.cfg.eligibility_beta_gap_exit;
         if let Some(eval) = eval {
             if let Some(shared) = self.per_pair_state.get_mut(key) {
                 let kf_beta_warm = if use_kalman_beta {
@@ -532,21 +541,82 @@ impl PairTradeEngine {
                 shared.beta_long = eval.beta_long;
                 shared.half_life_hours = eval.half_life_hours;
                 shared.adf_p_value = eval.adf_p_value;
-                shared.eligible = eval.eligible;
                 shared.p_value_weighted_score = eval.score;
                 shared.beta_gap = eval.beta_gap;
                 shared.last_evaluated = Some(Instant::now());
                 shared.last_evaluated_ts = Some(now_ts);
+                let grace_event = shared.update_eligibility(
+                    eval.eligible,
+                    eval.half_ok,
+                    eval.adf_ok,
+                    eval.beta_gap,
+                    has_open_position,
+                    now_ts,
+                    grace_secs,
+                    beta_gap_exit,
+                );
                 if prev_eligible != shared.eligible {
                     log::info!(
-                        "[ELIGIBILITY] {} -> {} (p={:.3} hl={:.2}h beta_gap={:.3})",
+                        "[ELIGIBILITY] {} -> {} half_ok={} adf_ok={} beta_ok={} p={:.3} hl={:.2}h beta_gap_rel={:.3}",
                         key,
                         shared.eligible,
+                        eval.half_ok,
+                        eval.adf_ok,
+                        eval.beta_ok,
                         shared.adf_p_value,
                         shared.half_life_hours,
-                        (shared.beta_short - shared.beta_long).abs()
+                        shared.beta_gap,
                     );
                 }
+                if let Some(event) = grace_event {
+                    let (outcome, deadline_ts) = match event {
+                        EligibilityMarginGraceEvent::Started { until_ts } => ("started", until_ts),
+                        EligibilityMarginGraceEvent::Recovered => ("recovered", 0),
+                        EligibilityMarginGraceEvent::Expired { deadline_ts } => {
+                            ("expired", deadline_ts)
+                        }
+                        EligibilityMarginGraceEvent::SevereBypass => ("severe_bypass", 0),
+                    };
+                    log::info!(
+                        "[ELIGIBILITY_MARGIN_GRACE] {} outcome={} raw_eligible={} half_ok={} adf_ok={} beta_ok={} beta_gap_rel={:.3} deadline_ts={}",
+                        key,
+                        outcome,
+                        shared.eligible,
+                        eval.half_ok,
+                        eval.adf_ok,
+                        eval.beta_ok,
+                        shared.beta_gap,
+                        deadline_ts,
+                    );
+                    crate::pairtrade::prom::ELIGIBILITY_MARGIN_GRACE_TOTAL
+                        .with_label_values(&[key, outcome])
+                        .inc();
+                }
+            }
+        }
+        let expiry_event = self
+            .per_pair_state
+            .get_mut(key)
+            .and_then(|shared| shared.expire_eligibility_margin_grace(has_open_position, now_ts));
+        if let Some(EligibilityMarginGraceEvent::Expired { deadline_ts }) = expiry_event {
+            if let Some(shared) = self.per_pair_state.get(key) {
+                let pp = self.cfg.params_for(key);
+                let half_ok = shared.half_life_hours <= pp.half_life_max_hours;
+                let adf_ok = shared.adf_p_value <= pp.adf_p_threshold;
+                let beta_ok = shared.beta_gap <= super::super::defaults::ELIGIBILITY_BETA_GAP_MAX;
+                log::info!(
+                    "[ELIGIBILITY_MARGIN_GRACE] {} outcome=expired raw_eligible={} half_ok={} adf_ok={} beta_ok={} beta_gap_rel={:.3} deadline_ts={}",
+                    key,
+                    shared.eligible,
+                    half_ok,
+                    adf_ok,
+                    beta_ok,
+                    shared.beta_gap,
+                    deadline_ts,
+                );
+                crate::pairtrade::prom::ELIGIBILITY_MARGIN_GRACE_TOTAL
+                    .with_label_values(&[key, "expired"])
+                    .inc();
             }
         }
 

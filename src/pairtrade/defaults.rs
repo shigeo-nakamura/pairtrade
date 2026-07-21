@@ -11,6 +11,12 @@ pub(super) const DEFAULT_EXIT_Z: f64 = 0.5;
 pub(super) const DEFAULT_STOP_LOSS_Z: f64 = 3.3;
 pub(super) const DEFAULT_FORCE_CLOSE_SECS: u64 = 3600;
 pub(super) const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 3660; // DEFAULT_FORCE_CLOSE_SECS + 60s buffer
+/// Held-position-only eligibility grace (bot-strategy#742). Zero preserves
+/// legacy immediate ineligible closes; the replay-backed candidate is 60s.
+pub(super) const DEFAULT_ELIGIBILITY_MARGIN_GRACE_SECS: i64 = 0;
+/// Upper relative beta-gap bound for the narrow #742 grace. The raw entry
+/// eligibility threshold remains 0.20; only (0.20, exit] may be held.
+pub(super) const DEFAULT_ELIGIBILITY_BETA_GAP_EXIT: f64 = 0.25;
 pub(super) const DEFAULT_COOLDOWN_SECS: u64 = 30;
 /// Per-direction post-stop_loss_z cool-down (seconds). 0 = disabled (legacy
 /// behavior). Independent of `DEFAULT_COOLDOWN_SECS` and the global circuit
@@ -26,6 +32,8 @@ pub(super) const DEFAULT_LOOKBACK_HOURS_SHORT: u64 = 4;
 pub(super) const DEFAULT_LOOKBACK_HOURS_LONG: u64 = 24;
 pub(super) const DEFAULT_HALF_LIFE_MAX_HOURS: f64 = 1.5;
 pub(super) const DEFAULT_ADF_P_THRESHOLD: f64 = 0.05;
+/// Fixed raw-entry eligibility threshold on relative beta divergence.
+pub(super) const ELIGIBILITY_BETA_GAP_MAX: f64 = 0.20;
 pub(super) const PAIR_SELECTION_INTERVAL_SECS: u64 = 3600;
 pub(super) const DEFAULT_ENTRY_VOL_LOOKBACK_HOURS: u64 = 24;
 pub(super) const DEFAULT_SLIPPAGE_BPS: i32 = 0;

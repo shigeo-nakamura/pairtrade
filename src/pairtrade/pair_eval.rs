@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use super::config::{PairSpec, PairTradeConfig, WarmStartMode};
+use super::defaults::ELIGIBILITY_BETA_GAP_MAX;
 use super::stats::{regression_beta, tail_samples, PriceSample};
 use super::util::half_life_and_p;
 
@@ -17,8 +18,6 @@ const BETA_EFF_LONG_WEIGHT: f64 = 0.3;
 /// weights above.
 const SCORE_PVALUE_WEIGHT: f64 = 0.6;
 const SCORE_HALF_LIFE_WEIGHT: f64 = 0.4;
-/// Eligibility threshold on `beta_gap` (relative beta divergence).
-const ELIGIBILITY_BETA_GAP_MAX: f64 = 0.2;
 
 #[derive(Debug)]
 pub(super) struct PairEvaluation {
@@ -27,6 +26,9 @@ pub(super) struct PairEvaluation {
     pub(super) beta_eff: f64,
     pub(super) half_life_hours: f64,
     pub(super) adf_p_value: f64,
+    pub(super) half_ok: bool,
+    pub(super) adf_ok: bool,
+    pub(super) beta_ok: bool,
     pub(super) eligible: bool,
     pub(super) score: f64,
     pub(super) beta_gap: f64,
@@ -97,6 +99,9 @@ pub(super) fn evaluate_pair(
         half_life_hours,
         adf_p_value,
         eligible,
+        half_ok,
+        adf_ok,
+        beta_ok,
         score: continuous_score,
         beta_gap,
     })
