@@ -37,8 +37,12 @@ jobs:
     # to the production host, so a workflow_dispatch against a feature branch
     # or tag must not deploy.
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
-    # Same QEMU-emulated arm64 budget rationale as ci.yml's deploy job.
-    timeout-minutes: 180
+    # QEMU-emulated arm64 like ci.yml's deploy job, but the first hl-feature
+    # build has no cache to warm-start from and was observed to exceed 180
+    # minutes (run 29632538074 hit the timeout with the build still going,
+    # which also skipped the cache save). 300 covers a cold build; warm
+    # builds stay well under it.
+    timeout-minutes: 300
     environment: debot
     steps:
       - name: Checkout debot
@@ -77,6 +81,7 @@ jobs:
           key: ${{ runner.os }}-cargo-arm64-hl-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-arm64-hl-
+            ${{ runner.os }}-cargo-arm64-
 
       - name: Build debot (linux/arm64, --features hyperliquid-sdk)
         id: build_debot
