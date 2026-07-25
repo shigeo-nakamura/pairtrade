@@ -1089,6 +1089,108 @@ fn reference_change_and_redeposit_at_restart_reconcile_once() {
     assert!((inst.equity_samples[0].equity - 6_000.01).abs() < 1e-9);
 }
 
+// PR #175 review / bot-strategy#752: the first binary carrying #752 may load
+// a legacy snapshot that has no `session_equity_reference_usd`. It must keep
+// that absence as migration-pending until a safe live observation instead of
+// stamping the current config and preserving a stale $8,000 denominator.
+#[test]
+fn legacy_snapshot_stale_denominator_reconciles_when_flat_settled() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    h.engine.instances[0].equity_reference_usd = 6_000.0;
+    let now = chrono::Utc::now().timestamp();
+    let legacy = serde_json::json!({
+        "_v": 2,
+        "instances": {
+            "hg-cap-legacy": {
+                "session_start_equity": 8_000.0,
+                "session_start_ts": now,
+                "realized_pnl_today": -12.5,
+                "capital_baseline_equity": 6_000.01,
+                "equity_samples": [{ "ts": now - 100, "equity": 6_000.01 }]
+            }
+        }
+    });
+    std::fs::write(
+        &h.engine.risk_state_path,
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    h.engine.load_risk_state();
+    assert_eq!(h.engine.instances[0].session_start_equity, 8_000.0);
+    assert_eq!(
+        h.engine.instances[0].session_equity_reference_usd, 0.0,
+        "missing legacy field stays pending after load"
+    );
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 6_000.01;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert_eq!(inst.session_start_equity, 6_000.0);
+    assert_eq!(inst.session_equity_reference_usd, 6_000.0);
+    assert_eq!(inst.realized_pnl_today, -12.5);
+    let persisted = risk_io::load_risk_state(&h.engine.risk_state_path);
+    let persisted_inst = persisted
+        .instances
+        .get("hg-cap-legacy")
+        .expect("legacy instance persisted after reconciliation");
+    assert_eq!(persisted_inst.session_start_equity, 6_000.0);
+    assert_eq!(persisted_inst.session_equity_reference_usd, 6_000.0);
+}
+
+// Reference migration is needed for daily DD even when rolling session DD is
+// disabled. A simultaneous deposit still establishes the current reference,
+// but the otherwise-inert rolling-peak samples must not be rewritten.
+#[test]
+fn legacy_reference_reconciles_without_reanchoring_disabled_session_dd() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-disabled");
+    h.engine.cfg.risk.max_session_loss_bps = 0;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 6_000.0;
+        inst.equity_cache = 6_000.01;
+        inst.capital_baseline_equity = 0.01;
+        inst.session_start_equity = 2_000.0;
+        inst.session_equity_reference_usd = 0.0;
+        inst.realized_pnl_today = -3.0;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 9_000.0,
+        }];
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(inst.session_start_equity, 6_000.0);
+    assert_eq!(inst.session_equity_reference_usd, 6_000.0);
+    assert_eq!(inst.realized_pnl_today, -3.0);
+    assert_eq!(inst.equity_samples.len(), 1);
+    assert_eq!(
+        inst.equity_samples[0].equity, 9_000.0,
+        "disabled rolling session DD keeps its inert sample history untouched"
+    );
+}
+
 // If only the config reference changes and collateral is stable, the next
 // flat/settled observation adopts the new configured denominator. This makes
 // the no-transfer side of restart reconciliation explicit.

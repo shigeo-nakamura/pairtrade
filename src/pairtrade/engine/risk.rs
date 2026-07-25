@@ -680,16 +680,20 @@ impl PairTradeEngine {
         }
         let threshold_bps = self.cfg.risk.max_session_loss_bps;
         let min_usd = self.cfg.risk.session_dd_capital_event_min_usd;
-        let reference_changed = {
+        let (legacy_reference, reference_reconciliation_pending) = {
             let inst = &self.instances[inst_idx];
-            inst.session_equity_reference_usd > 0.0
-                && (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9
+            let legacy = inst.session_equity_reference_usd <= 0.0;
+            (
+                legacy,
+                legacy
+                    || (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9,
+            )
         };
         // No peak to rebaseline when session DD is disabled, and detection
         // is off when the threshold is 0 USD. A pending config-reference
         // change is the exception: it must still be reconciled at the same
         // flat/settled safety boundary.
-        if (threshold_bps == 0 || min_usd <= 0.0) && !reference_changed {
+        if (threshold_bps == 0 || min_usd <= 0.0) && !reference_reconciliation_pending {
             return;
         }
         let settle_secs = self.cfg.risk.session_dd_capital_settle_secs;
@@ -707,6 +711,7 @@ impl PairTradeEngine {
                 prev_start_equity: f64,
                 previous_reference: f64,
                 new_reference: f64,
+                observed_delta: Option<f64>,
             },
         }
 
@@ -746,7 +751,7 @@ impl PairTradeEngine {
             if baseline <= 0.0 {
                 // First settled reading establishes the reference; no event.
                 inst.capital_baseline_equity = equity;
-                if reference_changed {
+                if reference_reconciliation_pending {
                     let prev_start_equity = inst.session_start_equity;
                     let previous_reference = inst.session_equity_reference_usd;
                     inst.session_start_equity = inst.equity_reference_usd;
@@ -756,55 +761,88 @@ impl PairTradeEngine {
                         prev_start_equity,
                         previous_reference,
                         new_reference: inst.equity_reference_usd,
+                        observed_delta: None,
                     })
                 } else {
                     None
                 }
             } else {
-                match classify_capital_event(baseline, equity, min_usd) {
-                    None => {
-                        // Stable collateral — keep the baseline tracking current
-                        // so a future discrete jump is measured against the
-                        // latest value. A pending config-only reference change
-                        // becomes authoritative here because no simultaneous
-                        // capital flow exists to apply instead.
-                        inst.capital_baseline_equity = equity;
-                        if reference_changed {
+                let capital_delta = classify_capital_event(baseline, equity, min_usd);
+                if legacy_reference {
+                    // A pre-#752 snapshot cannot tell us which configured
+                    // reference its denominator was based on. At the first
+                    // safe live observation, make the current config
+                    // authoritative instead of adding an observed transfer
+                    // to a possibly stale denominator. The live collateral
+                    // still becomes the future capital-event baseline.
+                    if capital_delta.is_some() && threshold_bps > 0 {
+                        reanchor_peak_samples(&mut inst.equity_samples, equity, now_ts);
+                    }
+                    inst.capital_baseline_equity = equity;
+                    let prev_start_equity = inst.session_start_equity;
+                    let previous_reference = inst.session_equity_reference_usd;
+                    inst.session_start_equity = inst.equity_reference_usd;
+                    inst.session_equity_reference_usd = inst.equity_reference_usd;
+                    Some(Rebaseline::Reference {
+                        equity,
+                        prev_start_equity,
+                        previous_reference,
+                        new_reference: inst.equity_reference_usd,
+                        observed_delta: capital_delta,
+                    })
+                } else {
+                    match capital_delta {
+                        None => {
+                            // Stable collateral — keep the baseline tracking current
+                            // so a future discrete jump is measured against the
+                            // latest value. A pending config-only reference change
+                            // becomes authoritative here because no simultaneous
+                            // capital flow exists to apply instead.
+                            inst.capital_baseline_equity = equity;
+                            if reference_reconciliation_pending {
+                                let prev_start_equity = inst.session_start_equity;
+                                let previous_reference = inst.session_equity_reference_usd;
+                                inst.session_start_equity = inst.equity_reference_usd;
+                                inst.session_equity_reference_usd = inst.equity_reference_usd;
+                                Some(Rebaseline::Reference {
+                                    equity,
+                                    prev_start_equity,
+                                    previous_reference,
+                                    new_reference: inst.equity_reference_usd,
+                                    observed_delta: None,
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        Some(delta) => {
+                            // Capital event. Collapse the rolling peak to current
+                            // equity (DD → 0) and shift the daily-DD denominator by
+                            // the same delta. realized_pnl_today is left untouched —
+                            // a deposit does not erase the day's trading PnL.
+                            // Reference reconciliation also serves daily DD when
+                            // rolling session DD is disabled. In that combination
+                            // the samples are inert and must not be mutated.
+                            if threshold_bps > 0 {
+                                reanchor_peak_samples(&mut inst.equity_samples, equity, now_ts);
+                            }
                             let prev_start_equity = inst.session_start_equity;
-                            let previous_reference = inst.session_equity_reference_usd;
-                            inst.session_start_equity = inst.equity_reference_usd;
-                            inst.session_equity_reference_usd = inst.equity_reference_usd;
-                            Some(Rebaseline::Reference {
+                            inst.session_start_equity =
+                                (inst.session_start_equity + delta).max(0.0);
+                            inst.capital_baseline_equity = equity;
+                            let reference_change = reference_reconciliation_pending.then_some({
+                                (inst.session_equity_reference_usd, inst.equity_reference_usd)
+                            });
+                            if reference_reconciliation_pending {
+                                inst.session_equity_reference_usd = inst.equity_reference_usd;
+                            }
+                            Some(Rebaseline::Capital {
+                                delta,
                                 equity,
                                 prev_start_equity,
-                                previous_reference,
-                                new_reference: inst.equity_reference_usd,
+                                reference_change,
                             })
-                        } else {
-                            None
                         }
-                    }
-                    Some(delta) => {
-                        // Capital event. Collapse the rolling peak to current
-                        // equity (DD → 0) and shift the daily-DD denominator by
-                        // the same delta. realized_pnl_today is left untouched —
-                        // a deposit does not erase the day's trading PnL.
-                        reanchor_peak_samples(&mut inst.equity_samples, equity, now_ts);
-                        let prev_start_equity = inst.session_start_equity;
-                        inst.session_start_equity = (inst.session_start_equity + delta).max(0.0);
-                        inst.capital_baseline_equity = equity;
-                        let reference_change = reference_changed.then_some({
-                            (inst.session_equity_reference_usd, inst.equity_reference_usd)
-                        });
-                        if reference_changed {
-                            inst.session_equity_reference_usd = inst.equity_reference_usd;
-                        }
-                        Some(Rebaseline::Capital {
-                            delta,
-                            equity,
-                            prev_start_equity,
-                            reference_change,
-                        })
                     }
                 }
             }
@@ -851,13 +889,21 @@ impl PairTradeEngine {
                 prev_start_equity,
                 previous_reference,
                 new_reference,
+                observed_delta,
             }) => {
+                let source = if previous_reference <= 0.0 {
+                    "legacy_snapshot"
+                } else {
+                    "config_reference_change"
+                };
                 log::warn!(
-                    "[DAILY_DD] {} equity reference reconciled {:.2} -> {:.2} while flat/settled at equity={:.2}; session_start_equity {:.2} -> {:.2}",
+                    "[DAILY_DD] {} equity reference reconciled source={} {:.2} -> {:.2} while flat/settled at equity={:.2} observed_delta={:?}; session_start_equity {:.2} -> {:.2}",
                     self.instances[inst_idx].id,
+                    source,
                     previous_reference,
                     new_reference,
                     equity,
+                    observed_delta,
                     prev_start_equity,
                     self.instances[inst_idx].session_start_equity,
                 );
@@ -865,11 +911,12 @@ impl PairTradeEngine {
                     inst_idx,
                     "daily_dd",
                     "reference_rebaseline",
-                    Some("config_reference_change".to_string()),
+                    Some(source.to_string()),
                     Some(serde_json::json!({
                         "equity": equity,
                         "previous_reference": previous_reference,
                         "new_reference": new_reference,
+                        "observed_delta_usd": observed_delta,
                         "prev_session_start_equity": prev_start_equity,
                         "new_session_start_equity": self.instances[inst_idx].session_start_equity,
                     })),

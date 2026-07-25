@@ -168,14 +168,12 @@ impl PairTradeEngine {
             inst.consecutive_losses = state.consecutive_losses;
             inst.session_start_equity = state.session_start_equity;
             // Zero is the serde default for snapshots written before #752.
-            // Adopt the current reference without changing their already-
-            // adjusted denominator; future snapshots can then detect a real
-            // config-reference change explicitly.
-            inst.session_equity_reference_usd = if state.session_equity_reference_usd > 0.0 {
-                state.session_equity_reference_usd
-            } else {
-                inst.equity_reference_usd
-            };
+            // Preserve it as an explicit migration-pending sentinel: the old
+            // reference is unknowable, so stamping the current config here
+            // would falsely mark a stale denominator as reconciled forever.
+            // `detect_capital_event_and_rebaseline` resolves it only after a
+            // flat/settled live-equity observation.
+            inst.session_equity_reference_usd = state.session_equity_reference_usd;
             inst.session_start_ts = state.session_start_ts;
             inst.realized_pnl_today = state.realized_pnl_today;
             inst.funding_carry_today = state.funding_carry_today;
@@ -190,7 +188,14 @@ impl PairTradeEngine {
             inst.total_pnl = state.total_pnl;
             inst.peak_pnl = state.peak_pnl;
             inst.max_dd = state.max_dd;
-            if (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9 {
+            if inst.session_equity_reference_usd <= 0.0 {
+                log::warn!(
+                    "[DAILY_DD] {} legacy snapshot has no equity reference; pending flat/settled reconciliation to {:.2}, preserving session_start_equity={:.2}",
+                    inst.id,
+                    inst.equity_reference_usd,
+                    inst.session_start_equity,
+                );
+            } else if (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9 {
                 log::warn!(
                     "[DAILY_DD] {} equity reference change {:.2} -> {:.2} pending flat/settled reconciliation; preserving session_start_equity={:.2}",
                     inst.id,
