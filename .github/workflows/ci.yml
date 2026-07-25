@@ -32,7 +32,9 @@ permissions:
 env:
   AWS_REGION: eu-central-1
   INSTALL_DIR: /opt/debot
-  DEX_CONNECTOR_REF: v4.7.5
+  # Temporary draft integration pin for pairtrade#173. Replace with the
+  # Arcus release tag before marking the PR ready for review.
+  DEX_CONNECTOR_REF: feat/749-arcus-readonly
   LIGHTER_GO_REF: v1.0.2
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
 
@@ -82,7 +84,10 @@ jobs:
           token = os.environ.get("GH_TOKEN", "")
 
           ref = input_ref or default_ref
-          if not input_ref:
+          # Release pins continue to float to the latest published tag. A
+          # non-release ref is an intentional draft integration pin and must
+          # not be overwritten by tag discovery.
+          if not input_ref and default_ref.startswith("v"):
               try:
                   req = urllib.request.Request(
                       "https://api.github.com/repos/shigeo-nakamura/dex-connector/tags?per_page=1",
