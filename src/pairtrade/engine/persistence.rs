@@ -167,6 +167,15 @@ impl PairTradeEngine {
             };
             inst.consecutive_losses = state.consecutive_losses;
             inst.session_start_equity = state.session_start_equity;
+            // Zero is the serde default for snapshots written before #752.
+            // Adopt the current reference without changing their already-
+            // adjusted denominator; future snapshots can then detect a real
+            // config-reference change explicitly.
+            inst.session_equity_reference_usd = if state.session_equity_reference_usd > 0.0 {
+                state.session_equity_reference_usd
+            } else {
+                inst.equity_reference_usd
+            };
             inst.session_start_ts = state.session_start_ts;
             inst.realized_pnl_today = state.realized_pnl_today;
             inst.funding_carry_today = state.funding_carry_today;
@@ -181,6 +190,15 @@ impl PairTradeEngine {
             inst.total_pnl = state.total_pnl;
             inst.peak_pnl = state.peak_pnl;
             inst.max_dd = state.max_dd;
+            if (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9 {
+                log::warn!(
+                    "[DAILY_DD] {} equity reference change {:.2} -> {:.2} pending flat/settled reconciliation; preserving session_start_equity={:.2}",
+                    inst.id,
+                    inst.session_equity_reference_usd,
+                    inst.equity_reference_usd,
+                    inst.session_start_equity,
+                );
+            }
             // bot-strategy#469: surface the persisted lifetime totals on the
             // dashboard immediately. Without this seed the status reporter's
             // `trade_stats` stays at its `Some(zeros)` initial value until
@@ -288,6 +306,7 @@ impl PairTradeEngine {
                         consecutive_losses: inst.consecutive_losses,
                         circuit_breaker_until_ts: inst.circuit_breaker_until_ts,
                         session_start_equity: inst.session_start_equity,
+                        session_equity_reference_usd: inst.session_equity_reference_usd,
                         session_start_ts: inst.session_start_ts,
                         realized_pnl_today: inst.realized_pnl_today,
                         funding_carry_today: inst.funding_carry_today,

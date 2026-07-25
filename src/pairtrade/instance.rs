@@ -67,6 +67,12 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// Daily-DD tracking (bot-strategy#185 Phase 2). Zero/None until the
     /// first `refresh_daily_session` reset populates them.
     pub(in crate::pairtrade) session_start_equity: f64,
+    /// Configured equity reference associated with the current daily-DD
+    /// denominator. A changed reference is reconciled only after the
+    /// instance is flat and settled, alongside capital-event detection, so
+    /// a matching deposit is not counted twice. Persisted via
+    /// `InstanceRiskState`. bot-strategy#752.
+    pub(in crate::pairtrade) session_equity_reference_usd: f64,
     pub(in crate::pairtrade) session_start_ts: i64,
     pub(in crate::pairtrade) realized_pnl_today: f64,
     /// Running sum of `funding_carry_usd` from cycles closed during the
