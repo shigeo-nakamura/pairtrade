@@ -2,7 +2,7 @@
   "round": "round9",
   "issue": "bot-strategy#751",
   "service": "debot-pair-btceth",
-  "notes": "Round 9 (#751): low-confidence promote exit_z=0.1 after the #698 DEX-ground-truth readout. A and C run the promoted config at 2:1 reference for execution-size attribution; B keeps exit_z=0.2 as an equal-size parameter control against C. Capital stays at 2000/1000/1000 for the #721/#750 main soak.",
+  "notes": "Round 9 (#751): low-confidence promote exit_z=0.1 after the #698 DEX-ground-truth readout. A and C run the promoted config at 6:1 reference for execution-size attribution; B keeps exit_z=0.2 as an equal-size parameter control against C. Selected capital target is 6000/1000/1000 ($8000 total); monitor #721 on main and use DEX fill ground truth until #750 is fixed.",
   "max_leverage": 10,
   "variants": {
     "a": {
@@ -10,7 +10,7 @@
       "exit_z": 0.1,
       "stop_loss_z": 8.0,
       "use_frozen_beta_exit_z": false,
-      "equity_reference_usd": 2000
+      "equity_reference_usd": 6000
     },
     "b": {
       "force_close_secs": 10800,

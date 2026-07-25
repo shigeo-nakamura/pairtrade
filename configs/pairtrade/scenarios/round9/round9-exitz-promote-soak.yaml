@@ -6,16 +6,17 @@
 #   B-A (exit_z .1 vs .2) = +14.2 / +0.2 bps -> live-flat but consistent
 #   with #664 byte-exact evidence, so .1 is promoted at low confidence.
 #
-# Arms (total reference unchanged at $4000 = 2000/1000/1000):
-#   A = promoted production config: exit_z .1 / sl8 / fc10800 at $2k.
+# Arms (selected next scaling target $8000 = 6000/1000/1000):
+#   A = promoted production config: exit_z .1 / sl8 / fc10800 at $6k.
 #   B = old-A parameter control: exit_z .2 / sl8 / fc10800 at $1k.
 #   C = promoted-config size control: exit_z .1 / sl8 / fc10800 at $1k.
-# Attribution: C-B = exit_z at equal size; A-C = execution quality at 2x size.
+# Attribution: C-B = exit_z at equal size; A-C = execution quality at 6x size.
 #
-# Capital target $6k/$1k/$1k is DEFERRED: keep current references until #721
-# entry reconciliation is clean on main and #750 fill-ground-truth PnL/risk
-# bookkeeping is fixed/verified. Before restart, redeposit exactly $2k/$1k/$1k,
-# confirm A/B/C flat, and obtain explicit Frankfurt restart approval.
+# Capital target $6k/$1k/$1k selected in #476 and confirmed for Round 9 on
+# 2026-07-25. Monitor #721 entry reconciliation on main and use DEX fill ground
+# truth for readouts until #750 PnL/risk bookkeeping is fixed. Before restart,
+# redeposit exactly $6k/$1k/$1k, confirm A/B/C flat, and obtain explicit
+# Frankfurt restart approval.
 # =============================================================================
 
 dex_name: lighter
@@ -165,12 +166,12 @@ risk:
 strategies:
   - id: a
     agent_name: debot-pair-btceth-a
-    # Round 9 (#751): promoted production config. Same strategy as C, at 2x
+    # Round 9 (#751): promoted production config. Same strategy as C, at 6x
     # reference, so A-C measures execution quality rather than strategy.
     exit_z_score: 0.1
     stop_loss_z_score: 8.0
     max_loss_r_mult: 1.0
-    equity_usd_reference: 2000
+    equity_usd_reference: 6000
     mtf_windows: [15]
     mtf_z_min: 0.5
     force_close_time_secs: 10800
