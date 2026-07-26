@@ -1260,6 +1260,81 @@ fn legacy_snapshot_untrustworthy_denominator_discards_delta() {
     assert_eq!(inst.session_equity_reference_usd, 1_000.0);
 }
 
+// Codex review on PR #175 / bot-strategy#752: `capital_baseline_equity` keeps
+// accruing realized trading PnL between capital events (each closed trade
+// reseeds it to the post-trade settled equity), while `session_start_equity`
+// deliberately excludes that PnL. A legitimate deposit followed by ordinary
+// profit must not look like #752 rollover drift and get discarded: $1,000
+// config + $500 deposit = $1,500 denominator, then $100 of realized profit
+// (tracked in `total_pnl`) pushes the settled baseline to $1,600. Comparing
+// the denominator to the raw baseline would see a $100 gap (over the $5
+// threshold) and wrongly reset to $1,000; backing `total_pnl` out of the
+// baseline first must recover the $1,500 comparison and preserve the deposit.
+#[test]
+fn legacy_snapshot_preserved_despite_realized_pnl_baseline_drift() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-pnl-drift");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
+        inst.total_pnl = 100.0; // realized profit since the deposit
+        inst.capital_baseline_equity = 1_600.0; // $1,500 basis + $100 realized profit
+        inst.equity_cache = 1_600.0; // stable — no new capital event this tick
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 1_500.0,
+        "realized PnL drift in the baseline must not be mistaken for #752 rollover drift"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+}
+
+// Companion to the above for the same-tick delta path: the persisted
+// denominator ($1,500 = $1,000 config + $500 deposit) still matches the
+// baseline once $100 of realized profit is backed out, so a genuinely
+// detected $500 withdrawal (equity now $1,100 against a $1,600 baseline)
+// must be applied on top of it rather than discarded.
+#[test]
+fn legacy_snapshot_trustworthy_denominator_applies_delta_despite_realized_pnl() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-delta-pnl-drift");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
+        inst.total_pnl = 100.0; // realized profit since the deposit
+        inst.capital_baseline_equity = 1_600.0; // $1,500 basis + $100 realized profit
+        inst.equity_cache = 1_100.0; // $500 withdrawn while stopped
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 1_000.0,
+        "a real withdrawal must apply on top of a denominator that only looks stale due to realized PnL"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+}
+
 // Reference migration is needed for daily DD even when rolling session DD is
 // disabled. A simultaneous deposit still establishes the current reference,
 // but the otherwise-inert rolling-peak samples must not be rewritten.

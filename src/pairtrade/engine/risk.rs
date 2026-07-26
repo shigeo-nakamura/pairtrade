@@ -802,10 +802,19 @@ impl PairTradeEngine {
                             // legacy denominator diverges from the baseline
                             // by more than `min_usd`, which has no known
                             // capital-event explanation and is more likely
-                            // #752 rollover drift.
+                            // #752 rollover drift. `baseline` is raw settled
+                            // equity, which (unlike this denominator) keeps
+                            // accruing realized trading PnL between capital
+                            // events; back `total_pnl` (round-scoped,
+                            // resets alongside `baseline` on a round
+                            // transition) out of it first, or ordinary
+                            // trading profit since the last real capital
+                            // event would itself look like #752 drift and
+                            // discard a legitimate adjustment (Codex review).
+                            let baseline_capital_basis = baseline - inst.total_pnl;
                             let legacy_denominator_trustworthy = legacy_reference
                                 && min_usd > 0.0
-                                && (prev_start_equity - baseline).abs() < min_usd;
+                                && (prev_start_equity - baseline_capital_basis).abs() < min_usd;
                             if !legacy_denominator_trustworthy {
                                 inst.session_start_equity = inst.equity_reference_usd;
                             }
@@ -848,9 +857,13 @@ impl PairTradeEngine {
                             // was stopped) must be applied on top of it —
                             // discarding it here would leave the daily-DD
                             // denominator blind to a real capital move
-                            // (bot-strategy#752 review).
-                            let legacy_denominator_trustworthy =
-                                min_usd > 0.0 && (prev_start_equity - baseline).abs() < min_usd;
+                            // (bot-strategy#752 review). Same `total_pnl`
+                            // correction as the no-delta branch above: raw
+                            // `baseline` carries realized trading PnL that
+                            // this denominator deliberately excludes.
+                            let baseline_capital_basis = baseline - inst.total_pnl;
+                            let legacy_denominator_trustworthy = min_usd > 0.0
+                                && (prev_start_equity - baseline_capital_basis).abs() < min_usd;
                             inst.session_start_equity = if legacy_denominator_trustworthy {
                                 (prev_start_equity + delta).max(0.0)
                             } else {
