@@ -82,7 +82,10 @@ jobs:
           token = os.environ.get("GH_TOKEN", "")
 
           ref = input_ref or default_ref
-          if not input_ref:
+          # Release pins continue to float to the latest published tag. A
+          # non-release ref is an intentional draft integration pin and must
+          # not be overwritten by tag discovery.
+          if not input_ref and default_ref.startswith("v"):
               try:
                   req = urllib.request.Request(
                       "https://api.github.com/repos/shigeo-nakamura/dex-connector/tags?per_page=1",

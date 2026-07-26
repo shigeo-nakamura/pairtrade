@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 #[cfg(feature = "extended-sdk")]
 use dex_connector::create_extended_connector;
+#[cfg(feature = "arcus-sdk")]
+use dex_connector::{create_arcus_connector, ArcusConnectorConfig};
 #[cfg(feature = "hyperliquid-sdk")]
 use dex_connector::{create_hyperliquid_connector, HyperliquidConnectorConfig};
 #[cfg(feature = "lighter-sdk")]
@@ -171,6 +173,37 @@ impl DexConnectorBox {
                 )
                 .await?;
 
+                Ok(DexConnectorBox { inner: connector })
+            }
+            #[cfg(feature = "arcus-sdk")]
+            "arcus" => {
+                if !dry_run {
+                    return Err(DexError::Permanent(
+                        "Arcus support is read-only; set DRY_RUN=true".to_string(),
+                    ));
+                }
+                let base_url = env::var("ARCUS_REST_ENDPOINT")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "https://api.arcus.xyz".to_string());
+                let websocket_url = env::var("ARCUS_WEBSOCKET_ENDPOINT")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "wss://api.arcus.xyz/v1/ws".to_string());
+                let connector = create_arcus_connector(ArcusConnectorConfig {
+                    base_url,
+                    websocket_url,
+                    tracked_symbols: token_list.to_vec(),
+                    ob_stale_secs: None,
+                    // This wiring stays read-only (enforced by the dry_run
+                    // check above); authenticated mutations were added by
+                    // dex-connector's Arcus auth/execution slice
+                    // (bot-strategy#749) but are out of scope here.
+                    address: None,
+                    account_index: 0,
+                    api_key: None,
+                    api_private_key_hex: None,
+                })?;
                 Ok(DexConnectorBox { inner: connector })
             }
             #[cfg(feature = "hyperliquid-sdk")]
@@ -587,6 +620,8 @@ impl DexConnector for DexConnectorBox {
 #[cfg(test)]
 mod tests {
     use super::mentions_http_429;
+    #[cfg(feature = "arcus-sdk")]
+    use super::DexConnectorBox;
 
     // Regression: the stale-WS-price transient error must never be reported
     // as a rate limit, no matter what the millisecond age happens to be.
@@ -614,5 +649,30 @@ mod tests {
         assert!(!mentions_http_429("filled 1429 lots"));
         assert!(!mentions_http_429("order id 42900 accepted"));
         assert!(!mentions_http_429("everything is fine"));
+    }
+
+    #[cfg(feature = "arcus-sdk")]
+    #[tokio::test]
+    async fn arcus_factory_accepts_read_only_dry_run() {
+        let connector = DexConnectorBox::create(
+            "arcus",
+            true,
+            &["BTC-USD".to_string(), "ETH".to_string()],
+            None,
+        )
+        .await;
+
+        assert!(connector.is_ok());
+    }
+
+    #[cfg(feature = "arcus-sdk")]
+    #[tokio::test]
+    async fn arcus_factory_rejects_live_mode() {
+        let error = DexConnectorBox::create("arcus", false, &["BTC-USD".to_string()], None)
+            .await
+            .err()
+            .expect("live Arcus factory must fail");
+
+        assert!(error.to_string().contains("read-only"));
     }
 }
