@@ -1335,6 +1335,46 @@ fn legacy_snapshot_trustworthy_denominator_applies_delta_despite_realized_pnl() 
     assert_eq!(inst.session_equity_reference_usd, 1_000.0);
 }
 
+// Codex review on PR #175 / bot-strategy#752: InstanceRiskState::reset_round_bound
+// zeroes capital_baseline_equity on a round transition while deliberately
+// preserving session_start_equity (bot-strategy#354 — session-rolling fields
+// have their own lifecycle, separate from round-bound ones). A legacy
+// snapshot carrying a real deposit adjustment can therefore land on the
+// baseline<=0 "first settled reading" branch with no baseline to validate
+// against; it must not be treated differently from the baseline-available
+// branches above and overwritten with the fresh configured reference.
+#[test]
+fn legacy_snapshot_with_cleared_baseline_preserves_denominator_on_round_transition() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-cleared-baseline");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
+                                             // reset_round_bound() already zeroed this on the round transition;
+                                             // session_start_equity survived it untouched.
+        inst.capital_baseline_equity = 0.0;
+        inst.equity_cache = 1_500.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 1_500.0,
+        "a cleared baseline gives no signal to distrust a legacy denominator by"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+    assert_eq!(inst.capital_baseline_equity, 1_500.0);
+}
+
 // Reference migration is needed for daily DD even when rolling session DD is
 // disabled. A simultaneous deposit still establishes the current reference,
 // but the otherwise-inert rolling-peak samples must not be rewritten.

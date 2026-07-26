@@ -762,7 +762,20 @@ impl PairTradeEngine {
                 if reference_reconciliation_pending {
                     let prev_start_equity = inst.session_start_equity;
                     let previous_reference = inst.session_equity_reference_usd;
-                    inst.session_start_equity = inst.equity_reference_usd;
+                    // A cleared baseline gives no signal to compare
+                    // session_start_equity against (InstanceRiskState::
+                    // reset_round_bound zeroes capital_baseline_equity on a
+                    // round transition while deliberately preserving
+                    // session_start_equity, so a legacy snapshot can land
+                    // here carrying a real, already-applied deposit or
+                    // withdrawal adjustment). Without a baseline to validate
+                    // against, only adopt the fresh reference for a
+                    // non-legacy operator-driven config change; a legacy
+                    // denominator is preserved verbatim, same policy as the
+                    // baseline-available branches below (Codex review).
+                    if !legacy_reference {
+                        inst.session_start_equity = inst.equity_reference_usd;
+                    }
                     inst.session_equity_reference_usd = inst.equity_reference_usd;
                     Some(Rebaseline::Reference {
                         equity,
@@ -804,14 +817,20 @@ impl PairTradeEngine {
                             // capital-event explanation and is more likely
                             // #752 rollover drift. `baseline` is raw settled
                             // equity, which (unlike this denominator) keeps
-                            // accruing realized trading PnL between capital
-                            // events; back `total_pnl` (round-scoped,
-                            // resets alongside `baseline` on a round
-                            // transition) out of it first, or ordinary
-                            // trading profit since the last real capital
-                            // event would itself look like #752 drift and
-                            // discard a legitimate adjustment (Codex review).
-                            let baseline_capital_basis = baseline - inst.total_pnl;
+                            // accruing realized trading PnL and funding
+                            // between capital events; back `total_pnl`
+                            // (round-scoped, resets alongside `baseline` on a
+                            // round transition) and today's `funding_carry_today`
+                            // out of it first, or ordinary trading profit /
+                            // funding since the last real capital event would
+                            // itself look like #752 drift and discard a
+                            // legitimate adjustment (Codex review). No
+                            // lifetime funding accumulator exists, so this
+                            // still under-corrects for funding predating
+                            // today's rollover — a known residual, bounded by
+                            // this being a one-time migration check.
+                            let baseline_capital_basis =
+                                baseline - inst.total_pnl - inst.funding_carry_today;
                             let legacy_denominator_trustworthy = legacy_reference
                                 && min_usd > 0.0
                                 && (prev_start_equity - baseline_capital_basis).abs() < min_usd;
@@ -857,11 +876,13 @@ impl PairTradeEngine {
                             // was stopped) must be applied on top of it —
                             // discarding it here would leave the daily-DD
                             // denominator blind to a real capital move
-                            // (bot-strategy#752 review). Same `total_pnl`
-                            // correction as the no-delta branch above: raw
-                            // `baseline` carries realized trading PnL that
-                            // this denominator deliberately excludes.
-                            let baseline_capital_basis = baseline - inst.total_pnl;
+                            // (bot-strategy#752 review). Same `total_pnl` /
+                            // `funding_carry_today` correction as the
+                            // no-delta branch above: raw `baseline` carries
+                            // realized trading PnL and funding that this
+                            // denominator deliberately excludes.
+                            let baseline_capital_basis =
+                                baseline - inst.total_pnl - inst.funding_carry_today;
                             let legacy_denominator_trustworthy = min_usd > 0.0
                                 && (prev_start_equity - baseline_capital_basis).abs() < min_usd;
                             inst.session_start_equity = if legacy_denominator_trustworthy {
