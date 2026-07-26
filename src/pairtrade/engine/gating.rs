@@ -55,19 +55,36 @@ impl PairTradeEngine {
         crate::error_counter::set_counting_suppressed(maintenance_block_entries);
 
         self.refresh_equity_if_needed(inst_idx).await?;
+        // bot-strategy#752 review: sync real exchange positions before the
+        // capital-event "flat" check below. On the first tick after a
+        // restart, per-pair `states` is empty until this sync populates it,
+        // so an account that retained an open position across restart would
+        // otherwise vacuously pass the flat check and have its
+        // unrealized-PnL-driven equity move misclassified as a deposit or
+        // withdrawal, corrupting session_start_equity.
+        self.sync_positions_from_exchange(inst_idx, price_map)
+            .await?;
         // bot-strategy#575 ①: detect a deposit / withdrawal (flat + settled
         // equity jump) and rebaseline the rolling peak to current equity
         // before sampling, so a top-up into a halted variant restores its DD
         // headroom instead of leaving it pinned under a sticky 30-day peak.
-        self.detect_capital_event_and_rebaseline(inst_idx);
+        // bot-strategy#752 review: `sync_positions_from_exchange` above can
+        // return `Ok(())` with `positions_ready` still false (initial WS
+        // snapshot not pushed yet). Until then every local pair state reads
+        // as positionless regardless of what the account actually holds, so
+        // an account that retained an open position across restart would
+        // have its unrealized-PnL move misclassified as a deposit or
+        // withdrawal. Skip reconciliation for this tick rather than trust a
+        // flatness reading that isn't authoritative yet.
+        if self.positions_ready {
+            self.detect_capital_event_and_rebaseline(inst_idx);
+        }
         // Phase 3-1: sample current equity into the rolling-peak window
         // and check the session-DD threshold. On breach, this flattens
         // the instance's positions and sets `session_halted=true`; the
         // entry gate below picks up the halt.
         self.update_equity_sample(inst_idx);
         self.evaluate_session_dd(inst_idx).await;
-        self.sync_positions_from_exchange(inst_idx, price_map)
-            .await?;
 
         let vol_median = self.compute_vol_median();
 

@@ -475,6 +475,7 @@ impl Harness {
             circuit_breaker_until: None,
             circuit_breaker_until_ts: None,
             session_start_equity: DEFAULT_EQUITY_USD,
+            session_equity_reference_usd: DEFAULT_EQUITY_USD,
             session_start_ts: now_ts,
             realized_pnl_today: 0.0,
             funding_carry_today: 0.0,
@@ -961,6 +962,527 @@ fn deposit_while_flat_rebaselines_peak_without_clearing_halt() {
     let (peak, dd) = PairTradeEngine::rolling_peak(&inst.equity_samples, 1_003.0).unwrap();
     assert!((peak - 1_003.0).abs() < 1e-9);
     assert_eq!(dd, 0.0, "DD is reset to 0 at the new base");
+}
+
+// bot-strategy#752: a full withdrawal can include accumulated PnL, so its
+// delta need not equal the configured reference. The zero-clamped daily
+// denominator must survive UTC rollover; otherwise the old reference is
+// resurrected and the later redeposit is added on top of it.
+#[test]
+fn withdrawal_rollover_redeposit_counts_new_capital_once() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-rollover");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        // $53.27 of accumulated PnL makes the withdrawal deliberately
+        // non-round relative to the $1,000 configured denominator.
+        inst.equity_cache = 1_053.27;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 1_053.27,
+        }];
+        inst.capital_baseline_equity = 1_053.27;
+        inst.session_start_equity = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        inst.realized_pnl_today = 53.27;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    // Withdraw everything except exchange dust. The accumulated PnL makes
+    // delta=-$1,053.26, so the denominator clamps at zero.
+    h.engine.instances[0].equity_cache = 0.01;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert_eq!(h.engine.instances[0].session_start_equity, 0.0);
+    assert!((h.engine.instances[0].realized_pnl_today - 53.27).abs() < 1e-9);
+
+    // Cross a real UTC session bucket. Rollover clears daily PnL but must
+    // preserve the capital-adjusted zero denominator.
+    h.engine.instances[0].session_start_ts = now - 86_400;
+    h.engine.refresh_daily_session();
+    assert_eq!(h.engine.instances[0].session_start_equity, 0.0);
+    assert_eq!(h.engine.instances[0].realized_pnl_today, 0.0);
+
+    // A loss booked after rollover remains intact across the capital event.
+    h.engine.instances[0].realized_pnl_today = -7.25;
+    h.engine.instances[0].equity_cache = 6_000.01;
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        (inst.session_start_equity - 6_000.0).abs() < 1e-9,
+        "the $6,000 redeposit is counted exactly once after rollover"
+    );
+    assert!(
+        (inst.realized_pnl_today - (-7.25)).abs() < 1e-9,
+        "a capital event never erases current-session realized PnL"
+    );
+    assert!((inst.capital_baseline_equity - 6_000.01).abs() < 1e-9);
+}
+
+// A reference change at the restart boundary stays pending until the same
+// flat/settled observation used for capital detection. When a matching
+// transfer is present, the observed delta wins and the new reference is only
+// recorded — it is not independently added to the denominator.
+#[test]
+fn reference_change_and_redeposit_at_restart_reconcile_once() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut before = Harness::new("hg-cap-ref-restart");
+    before.engine.cfg.risk.max_session_loss_bps = 500;
+    before.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    before.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    let path = before.engine.risk_state_path.clone();
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut before.engine.instances[0];
+        inst.equity_reference_usd = 2_000.0;
+        inst.session_equity_reference_usd = 2_000.0;
+        inst.session_start_equity = 0.0;
+        inst.session_start_ts = now;
+        inst.realized_pnl_today = -12.5;
+        inst.capital_baseline_equity = 0.01;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 0.01,
+        }];
+    }
+    before.engine.persist_risk_state();
+
+    let mut restarted = Harness::new("hg-cap-ref-restart");
+    restarted.engine.risk_state_path = path;
+    restarted.engine.cfg.risk.max_session_loss_bps = 500;
+    restarted.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    restarted.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    restarted.engine.instances[0].equity_reference_usd = 6_000.0;
+    restarted.engine.load_risk_state();
+
+    // Loading a new config does not inject $6,000 before the actual capital
+    // observation, and the old reference remains as a persisted pending mark.
+    assert_eq!(restarted.engine.instances[0].session_start_equity, 0.0);
+    assert_eq!(
+        restarted.engine.instances[0].session_equity_reference_usd,
+        2_000.0
+    );
+
+    {
+        let inst = &mut restarted.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 6_000.01;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+    restarted.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &restarted.engine.instances[0];
+    assert!((inst.session_start_equity - 6_000.0).abs() < 1e-9);
+    assert_eq!(inst.session_equity_reference_usd, 6_000.0);
+    assert!((inst.realized_pnl_today - (-12.5)).abs() < 1e-9);
+    assert_eq!(inst.equity_samples.len(), 1);
+    assert!((inst.equity_samples[0].equity - 6_000.01).abs() < 1e-9);
+}
+
+// PR #175 review / bot-strategy#752: the first binary carrying #752 may load
+// a legacy snapshot that has no `session_equity_reference_usd`. It must keep
+// that absence as migration-pending until a safe live observation instead of
+// stamping the current config and preserving a stale $8,000 denominator.
+#[test]
+fn legacy_snapshot_stale_denominator_reconciles_when_flat_settled() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    h.engine.instances[0].equity_reference_usd = 6_000.0;
+    let now = chrono::Utc::now().timestamp();
+    let legacy = serde_json::json!({
+        "_v": 2,
+        "instances": {
+            "hg-cap-legacy": {
+                "session_start_equity": 8_000.0,
+                "session_start_ts": now,
+                "realized_pnl_today": -12.5,
+                "capital_baseline_equity": 6_000.01,
+                "equity_samples": [{ "ts": now - 100, "equity": 6_000.01 }]
+            }
+        }
+    });
+    std::fs::write(
+        &h.engine.risk_state_path,
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    h.engine.load_risk_state();
+    assert_eq!(h.engine.instances[0].session_start_equity, 8_000.0);
+    assert_eq!(
+        h.engine.instances[0].session_equity_reference_usd, 0.0,
+        "missing legacy field stays pending after load"
+    );
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 6_000.01;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert_eq!(inst.session_start_equity, 6_000.0);
+    assert_eq!(inst.session_equity_reference_usd, 6_000.0);
+    assert_eq!(inst.realized_pnl_today, -12.5);
+    let persisted = risk_io::load_risk_state(&h.engine.risk_state_path);
+    let persisted_inst = persisted
+        .instances
+        .get("hg-cap-legacy")
+        .expect("legacy instance persisted after reconciliation");
+    assert_eq!(persisted_inst.session_start_equity, 6_000.0);
+    assert_eq!(persisted_inst.session_equity_reference_usd, 6_000.0);
+}
+
+// Codex review on PR #175 / bot-strategy#752: a legacy snapshot whose
+// persisted session_start_equity already lines up with the tracked capital
+// baseline (e.g. both near-zero after a same-session withdrawal, with no new
+// transfer since) must NOT be reset to the fresh configured reference. Doing
+// so would resurrect the withdrawn capital, and a later redeposit would then
+// double-count on top of it.
+#[test]
+fn legacy_snapshot_consistent_denominator_preserved_when_flat_settled() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-withdrawn");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 6_000.0;
+        // Old code already zeroed the denominator when the withdrawal
+        // happened; capital_baseline_equity (tracked since #575, unaffected
+        // by the #752 rollover bug) confirms it — both sit near zero.
+        inst.equity_cache = 0.01;
+        inst.capital_baseline_equity = 0.01;
+        inst.session_start_equity = 0.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 0.0,
+        "consistent legacy denominator must be preserved, not resurrected to the full reference"
+    );
+    assert_eq!(
+        inst.session_equity_reference_usd, 6_000.0,
+        "migration still stamps the reference so future ticks are treated as reconciled"
+    );
+}
+
+// Codex review on PR #175 / bot-strategy#752: a legacy snapshot whose
+// persisted session_start_equity already tracked the capital baseline before
+// this tick (the ordinary pre-#752 case) must still have a genuinely
+// detected delta applied on top of it, not discarded. Scenario: both were
+// $1,000 before restart, $500 was withdrawn while the bot was stopped, so
+// the first flat/settled tick observes equity=$500 against baseline=$1,000.
+#[test]
+fn legacy_snapshot_trustworthy_denominator_applies_detected_delta() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-delta-trustworthy");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.capital_baseline_equity = 1_000.0;
+        inst.session_start_equity = 1_000.0; // consistent with baseline
+        inst.equity_cache = 500.0; // $500 withdrawn while stopped
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 500.0,
+        "a real detected withdrawal must be applied, not discarded, on a trustworthy legacy denominator"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+}
+
+// Companion case: the persisted denominator is untrustworthy (diverges from
+// the tracked capital baseline by more than min_usd — the #752 rollover-drift
+// shape), so the old discard-and-replace behavior is kept: there is no way to
+// tell a real capital delta apart from more #752 drift noise, so the delta is
+// not applied and the fresh configured reference is adopted directly.
+#[test]
+fn legacy_snapshot_untrustworthy_denominator_discards_delta() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-delta-untrustworthy");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.capital_baseline_equity = 5_000.0;
+        inst.session_start_equity = 8_000.0; // diverges from baseline: #752 drift
+        inst.equity_cache = 4_500.0; // $500 withdrawn since the tracked baseline
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 1_000.0,
+        "an untrustworthy legacy denominator keeps the discard-and-replace fallback"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+}
+
+// Codex review on PR #175 / bot-strategy#752: `capital_baseline_equity` keeps
+// accruing realized trading PnL between capital events (each closed trade
+// reseeds it to the post-trade settled equity), while `session_start_equity`
+// deliberately excludes that PnL. A legitimate deposit followed by ordinary
+// profit must not look like #752 rollover drift and get discarded: $1,000
+// config + $500 deposit = $1,500 denominator, then $100 of realized profit
+// (tracked in `total_pnl`) pushes the settled baseline to $1,600. Comparing
+// the denominator to the raw baseline would see a $100 gap (over the $5
+// threshold) and wrongly reset to $1,000; backing `total_pnl` out of the
+// baseline first must recover the $1,500 comparison and preserve the deposit.
+#[test]
+fn legacy_snapshot_preserved_despite_realized_pnl_baseline_drift() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-pnl-drift");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
+        inst.total_pnl = 100.0; // realized profit since the deposit
+        inst.capital_baseline_equity = 1_600.0; // $1,500 basis + $100 realized profit
+        inst.equity_cache = 1_600.0; // stable — no new capital event this tick
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 1_500.0,
+        "realized PnL drift in the baseline must not be mistaken for #752 rollover drift"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+}
+
+// Companion to the above for the same-tick delta path: the persisted
+// denominator ($1,500 = $1,000 config + $500 deposit) still matches the
+// baseline once $100 of realized profit is backed out, so a genuinely
+// detected $500 withdrawal (equity now $1,100 against a $1,600 baseline)
+// must be applied on top of it rather than discarded.
+#[test]
+fn legacy_snapshot_trustworthy_denominator_applies_delta_despite_realized_pnl() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-delta-pnl-drift");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
+        inst.total_pnl = 100.0; // realized profit since the deposit
+        inst.capital_baseline_equity = 1_600.0; // $1,500 basis + $100 realized profit
+        inst.equity_cache = 1_100.0; // $500 withdrawn while stopped
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 1_000.0,
+        "a real withdrawal must apply on top of a denominator that only looks stale due to realized PnL"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+}
+
+// Codex review on PR #175 / bot-strategy#752: InstanceRiskState::reset_round_bound
+// zeroes capital_baseline_equity on a round transition while deliberately
+// preserving session_start_equity (bot-strategy#354 — session-rolling fields
+// have their own lifecycle, separate from round-bound ones). A legacy
+// snapshot carrying a real deposit adjustment can therefore land on the
+// baseline<=0 "first settled reading" branch with no baseline to validate
+// against; it must not be treated differently from the baseline-available
+// branches above and overwritten with the fresh configured reference.
+#[test]
+fn legacy_snapshot_with_cleared_baseline_preserves_denominator_on_round_transition() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-cleared-baseline");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
+                                             // reset_round_bound() already zeroed this on the round transition;
+                                             // session_start_equity survived it untouched.
+        inst.capital_baseline_equity = 0.0;
+        inst.equity_cache = 1_500.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 1_500.0,
+        "a cleared baseline gives no signal to distrust a legacy denominator by"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+    assert_eq!(inst.capital_baseline_equity, 1_500.0);
+}
+
+// Reference migration is needed for daily DD even when rolling session DD is
+// disabled. A simultaneous deposit still establishes the current reference,
+// but the otherwise-inert rolling-peak samples must not be rewritten.
+#[test]
+fn legacy_reference_reconciles_without_reanchoring_disabled_session_dd() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-disabled");
+    h.engine.cfg.risk.max_session_loss_bps = 0;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 6_000.0;
+        inst.equity_cache = 6_000.01;
+        inst.capital_baseline_equity = 0.01;
+        inst.session_start_equity = 2_000.0;
+        inst.session_equity_reference_usd = 0.0;
+        inst.realized_pnl_today = -3.0;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 9_000.0,
+        }];
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(inst.session_start_equity, 6_000.0);
+    assert_eq!(inst.session_equity_reference_usd, 6_000.0);
+    assert_eq!(inst.realized_pnl_today, -3.0);
+    assert_eq!(inst.equity_samples.len(), 1);
+    assert_eq!(
+        inst.equity_samples[0].equity, 9_000.0,
+        "disabled rolling session DD keeps its inert sample history untouched"
+    );
+}
+
+// PR #175 review: `max_session_loss_bps` and `max_daily_loss_bps` are
+// independent knobs, but detect_capital_event_and_rebaseline used to gate
+// all capital tracking on max_session_loss_bps alone. With rolling session
+// DD disabled but daily DD still enabled, a genuine deposit must still
+// update session_start_equity — otherwise the daily-DD denominator sticks
+// at whatever it was when session DD was turned off.
+#[test]
+fn capital_delta_updates_daily_dd_denominator_when_session_dd_disabled() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-daily-only");
+    h.engine.cfg.risk.max_session_loss_bps = 0;
+    h.engine.cfg.risk.max_daily_loss_bps = 300;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0; // already reconciled, not legacy
+        inst.equity_cache = 2_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.session_start_equity = 1_000.0;
+        inst.realized_pnl_today = -5.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 2_000.0,
+        "daily-DD denominator must track a deposit even with rolling session DD disabled"
+    );
+    assert_eq!(inst.capital_baseline_equity, 2_000.0);
+    assert_eq!(inst.realized_pnl_today, -5.0);
+}
+
+// If only the config reference changes and collateral is stable, the next
+// flat/settled observation adopts the new configured denominator. This makes
+// the no-transfer side of restart reconciliation explicit.
+#[test]
+fn reference_change_without_capital_event_adopts_new_reference_when_settled() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-ref-only");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_003.0;
+        inst.capital_baseline_equity = 1_003.0;
+        inst.session_start_equity = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        inst.equity_reference_usd = 2_000.0;
+        inst.realized_pnl_today = -4.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(inst.session_start_equity, 2_000.0);
+    assert_eq!(inst.session_equity_reference_usd, 2_000.0);
+    assert_eq!(inst.realized_pnl_today, -4.0);
 }
 
 // A trading loss (equity moving while a position is OPEN) must never be

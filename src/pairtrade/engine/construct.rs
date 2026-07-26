@@ -177,6 +177,7 @@ impl PairTradeEngine {
                 circuit_breaker_until: None,
                 circuit_breaker_until_ts: None,
                 session_start_equity: 0.0,
+                session_equity_reference_usd: strategy.equity_reference_usd,
                 session_start_ts: 0,
                 realized_pnl_today: 0.0,
                 funding_carry_today: 0.0,

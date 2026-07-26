@@ -34,6 +34,12 @@ pub(super) struct InstanceRiskState {
     /// bot-strategy#185 Phase 2.
     #[serde(default)]
     pub session_start_equity: f64,
+    /// Configured `equity_reference_usd` last reconciled with the daily-DD
+    /// denominator. A mismatch after restart is resolved on the next
+    /// flat-and-settled capital observation so a simultaneous transfer is
+    /// applied exactly once. Zero means a legacy snapshot. bot-strategy#752.
+    #[serde(default)]
+    pub session_equity_reference_usd: f64,
     /// UNIX-seconds timestamp of the current session's rollover. Used to
     /// detect day-boundary crossings; compared against `now_ts` via
     /// `session_day()` which buckets by `daily_reset_utc_hour`.
@@ -305,6 +311,7 @@ mod tests {
             last_stop_loss_per_pair,
             entry_blocked_pairs,
             session_start_equity: 500.0,
+            session_equity_reference_usd: 500.0,
             session_start_ts: 1_700_000_000,
             realized_pnl_today: -4.20,
             funding_carry_today: -0.85,
@@ -350,6 +357,7 @@ mod tests {
 
         // session-rolling fields preserved (have their own daily lifecycle)
         assert_eq!(s.session_start_equity, 500.0);
+        assert_eq!(s.session_equity_reference_usd, 500.0);
         assert_eq!(s.session_start_ts, 1_700_000_000);
         assert!((s.realized_pnl_today - (-4.20)).abs() < 1e-9);
         assert!((s.funding_carry_today - (-0.85)).abs() < 1e-9);

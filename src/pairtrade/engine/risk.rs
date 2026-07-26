@@ -219,13 +219,15 @@ impl PairTradeEngine {
     /// Cross the UTC session boundary when `now_ts` lands in a different
     /// day bucket from the persisted `session_start_ts`. Called once per
     /// `step_shared` tick. On rollover, realized_pnl_today is zeroed and
-    /// `session_start_equity` is reset to the fixed `equity_reference_usd`
-    /// so the daily-DD denominator stays constant within (and across)
-    /// sessions, regardless of intra-session live equity drift. Also
-    /// initialises state on the very first tick (when
-    /// `session_start_ts == 0`). See bot-strategy#185 Phase 2 and
-    /// bot-strategy#222 (semantic switch from live floor to fixed
-    /// reference).
+    /// `session_start_equity` is preserved across subsequent rollovers: it
+    /// already represents the fixed reference plus any flat-and-settled
+    /// capital events observed since startup. Resetting it to the configured
+    /// reference would resurrect withdrawn capital, then count a later
+    /// redeposit again (bot-strategy#752). The configured reference is used
+    /// only to initialise brand-new state; a reference change on restart is
+    /// reconciled by `detect_capital_event_and_rebaseline` once the instance
+    /// is flat and settled. Realized PnL still resets every session. See
+    /// bot-strategy#185 Phase 2 and bot-strategy#222.
     pub(in crate::pairtrade) fn refresh_daily_session(&mut self) {
         if self.cfg.backtest_mode {
             return;
@@ -261,10 +263,14 @@ impl PairTradeEngine {
                 Some(prev) => prev != current_day,
             };
             if needs_rollover {
-                let equity_base = inst.equity_reference_usd;
+                let first_session = prior_day.is_none();
+                if first_session {
+                    inst.session_start_equity = inst.equity_reference_usd;
+                    inst.session_equity_reference_usd = inst.equity_reference_usd;
+                }
+                let equity_base = inst.session_start_equity;
                 let prev_pnl = inst.realized_pnl_today;
                 inst.session_start_ts = now_ts;
-                inst.session_start_equity = equity_base;
                 inst.realized_pnl_today = 0.0;
                 inst.funding_carry_today = 0.0;
                 if inst.daily_loss_halted {
@@ -280,7 +286,7 @@ impl PairTradeEngine {
                 dirty = true;
                 if prior_day.is_some() {
                     log::info!(
-                        "[DAILY_DD] {} session rolled: prev_pnl={:.4} -> reset; new session_start_equity={:.2}",
+                        "[DAILY_DD] {} session rolled: prev_pnl={:.4} -> reset; preserved session_start_equity={:.2}",
                         inst.id, prev_pnl, equity_base
                     );
                 } else {
@@ -660,25 +666,64 @@ impl PairTradeEngine {
     ///
     /// On a detected event the rolling peak is collapsed to current equity
     /// and `session_start_equity` (the daily-DD denominator) is shifted by
-    /// the same delta so both gates reflect the new deployable capital. The
-    /// sticky `session_halted` flag is deliberately **not** cleared here —
-    /// resuming trading stays an explicit operator action (RISK_ACK), this
-    /// only restores the headroom so that ack does not immediately re-breach.
+    /// the same delta so both gates reflect the new deployable capital. If
+    /// the configured equity reference changed across a restart, that change
+    /// is committed on this same flat/settled observation: a real collateral
+    /// delta wins (and is applied once); without a delta the new configured
+    /// reference becomes the denominator. The sticky `session_halted` flag is
+    /// deliberately **not** cleared here — resuming trading stays an explicit
+    /// operator action (RISK_ACK), this only restores the headroom so that ack
+    /// does not immediately re-breach.
     pub(in crate::pairtrade) fn detect_capital_event_and_rebaseline(&mut self, inst_idx: usize) {
         if self.cfg.backtest_mode {
             return;
         }
         let threshold_bps = self.cfg.risk.max_session_loss_bps;
+        let daily_threshold_bps = self.cfg.risk.max_daily_loss_bps;
         let min_usd = self.cfg.risk.session_dd_capital_event_min_usd;
-        // No peak to rebaseline when session DD is disabled, and detection
-        // off when the threshold is 0 USD.
-        if threshold_bps == 0 || min_usd <= 0.0 {
+        let (legacy_reference, reference_reconciliation_pending) = {
+            let inst = &self.instances[inst_idx];
+            let legacy = inst.session_equity_reference_usd <= 0.0;
+            (
+                legacy,
+                legacy
+                    || (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9,
+            )
+        };
+        // No peak to rebaseline when both session DD and daily DD are
+        // disabled, and detection is off when the threshold is 0 USD. A
+        // pending config-reference change is the exception: it must still be
+        // reconciled at the same flat/settled safety boundary. Daily DD
+        // shares this denominator (session_start_equity) with session DD, so
+        // disabling only max_session_loss_bps must not also stop capital
+        // deltas from updating it — otherwise a withdrawal followed by a
+        // redeposit leaves the daily-DD denominator stuck (bot-strategy#752
+        // review).
+        if (threshold_bps == 0 && daily_threshold_bps == 0 || min_usd <= 0.0)
+            && !reference_reconciliation_pending
+        {
             return;
         }
         let settle_secs = self.cfg.risk.session_dd_capital_settle_secs;
         let now_ts = self.current_now_ts();
 
-        let detected: Option<(f64, f64, f64)> = {
+        enum Rebaseline {
+            Capital {
+                delta: f64,
+                equity: f64,
+                prev_start_equity: f64,
+                reference_change: Option<(f64, f64)>,
+            },
+            Reference {
+                equity: f64,
+                prev_start_equity: f64,
+                previous_reference: f64,
+                new_reference: f64,
+                observed_delta: Option<f64>,
+            },
+        }
+
+        let detected: Option<Rebaseline> = {
             let inst = &mut self.instances[inst_idx];
             if !inst.equity_initialized {
                 return;
@@ -714,57 +759,235 @@ impl PairTradeEngine {
             if baseline <= 0.0 {
                 // First settled reading establishes the reference; no event.
                 inst.capital_baseline_equity = equity;
-                return;
-            }
-            match classify_capital_event(baseline, equity, min_usd) {
-                None => {
-                    // Stable collateral — keep the baseline tracking current
-                    // so a future discrete jump is measured against the
-                    // latest value.
-                    inst.capital_baseline_equity = equity;
+                if reference_reconciliation_pending {
+                    let prev_start_equity = inst.session_start_equity;
+                    let previous_reference = inst.session_equity_reference_usd;
+                    // A cleared baseline gives no signal to compare
+                    // session_start_equity against (InstanceRiskState::
+                    // reset_round_bound zeroes capital_baseline_equity on a
+                    // round transition while deliberately preserving
+                    // session_start_equity, so a legacy snapshot can land
+                    // here carrying a real, already-applied deposit or
+                    // withdrawal adjustment). Without a baseline to validate
+                    // against, only adopt the fresh reference for a
+                    // non-legacy operator-driven config change; a legacy
+                    // denominator is preserved verbatim, same policy as the
+                    // baseline-available branches below (Codex review).
+                    if !legacy_reference {
+                        inst.session_start_equity = inst.equity_reference_usd;
+                    }
+                    inst.session_equity_reference_usd = inst.equity_reference_usd;
+                    Some(Rebaseline::Reference {
+                        equity,
+                        prev_start_equity,
+                        previous_reference,
+                        new_reference: inst.equity_reference_usd,
+                        observed_delta: None,
+                    })
+                } else {
                     None
                 }
-                Some(delta) => {
-                    // Capital event. Collapse the rolling peak to current
-                    // equity (DD → 0) and shift the daily-DD denominator by
-                    // the same delta. realized_pnl_today is left untouched —
-                    // a deposit does not erase the day's trading PnL.
-                    reanchor_peak_samples(&mut inst.equity_samples, equity, now_ts);
-                    let prev_start_equity = inst.session_start_equity;
-                    if inst.session_start_equity > 0.0 {
-                        inst.session_start_equity = (inst.session_start_equity + delta).max(0.0);
+            } else {
+                let capital_delta = classify_capital_event(baseline, equity, min_usd);
+                match capital_delta {
+                    None => {
+                        // Stable collateral — keep the baseline tracking current
+                        // so a future discrete jump is measured against the
+                        // latest value.
+                        inst.capital_baseline_equity = equity;
+                        if reference_reconciliation_pending {
+                            let prev_start_equity = inst.session_start_equity;
+                            let previous_reference = inst.session_equity_reference_usd;
+                            // An operator-driven config reference change
+                            // (previous_reference already valid) always
+                            // becomes authoritative here, since no
+                            // simultaneous capital flow exists to apply
+                            // instead. A pre-#752 legacy snapshot
+                            // (previous_reference <= 0, `legacy_reference`)
+                            // needs more care: if its persisted denominator
+                            // is within `min_usd` of the tracked capital
+                            // baseline, that denominator already reflects a
+                            // real adjustment the old code applied — e.g. a
+                            // withdrawal down to near-zero — and resetting
+                            // it here would resurrect that capital, then
+                            // double-count it against a later redeposit
+                            // (bot-strategy#752 review). Only reset when the
+                            // legacy denominator diverges from the baseline
+                            // by more than `min_usd`, which has no known
+                            // capital-event explanation and is more likely
+                            // #752 rollover drift. `baseline` is raw settled
+                            // equity, which (unlike this denominator) keeps
+                            // accruing realized trading PnL and funding
+                            // between capital events; back `total_pnl`
+                            // (round-scoped, resets alongside `baseline` on a
+                            // round transition) and today's `funding_carry_today`
+                            // out of it first, or ordinary trading profit /
+                            // funding since the last real capital event would
+                            // itself look like #752 drift and discard a
+                            // legitimate adjustment (Codex review). No
+                            // lifetime funding accumulator exists, so this
+                            // still under-corrects for funding predating
+                            // today's rollover — a known residual, bounded by
+                            // this being a one-time migration check.
+                            let baseline_capital_basis =
+                                baseline - inst.total_pnl - inst.funding_carry_today;
+                            let legacy_denominator_trustworthy = legacy_reference
+                                && min_usd > 0.0
+                                && (prev_start_equity - baseline_capital_basis).abs() < min_usd;
+                            if !legacy_denominator_trustworthy {
+                                inst.session_start_equity = inst.equity_reference_usd;
+                            }
+                            inst.session_equity_reference_usd = inst.equity_reference_usd;
+                            Some(Rebaseline::Reference {
+                                equity,
+                                prev_start_equity,
+                                previous_reference,
+                                new_reference: inst.equity_reference_usd,
+                                observed_delta: None,
+                            })
+                        } else {
+                            None
+                        }
                     }
-                    inst.capital_baseline_equity = equity;
-                    Some((delta, equity, prev_start_equity))
+                    Some(delta) => {
+                        // Capital event. Collapse the rolling peak to current
+                        // equity (DD → 0) and shift the daily-DD denominator by
+                        // the same delta. realized_pnl_today is left untouched —
+                        // a deposit does not erase the day's trading PnL.
+                        // Reference reconciliation also serves daily DD when
+                        // rolling session DD is disabled. In that combination
+                        // the samples are inert and must not be mutated.
+                        if threshold_bps > 0 {
+                            reanchor_peak_samples(&mut inst.equity_samples, equity, now_ts);
+                        }
+                        let prev_start_equity = inst.session_start_equity;
+                        if legacy_reference {
+                            // A pre-#752 snapshot's persisted
+                            // session_start_equity has no known relationship
+                            // to this delta in general — it was never tracked
+                            // against equity_reference_usd — so the safe
+                            // default is still to adopt the configured
+                            // reference directly, discarding the delta.
+                            // Exception: if `prev_start_equity` already
+                            // tracked `baseline` coming into this tick (the
+                            // ordinary pre-#752 case, not #752 rollover
+                            // drift), it IS trustworthy, and a genuine
+                            // detected delta (e.g. a withdrawal while the bot
+                            // was stopped) must be applied on top of it —
+                            // discarding it here would leave the daily-DD
+                            // denominator blind to a real capital move
+                            // (bot-strategy#752 review). Same `total_pnl` /
+                            // `funding_carry_today` correction as the
+                            // no-delta branch above: raw `baseline` carries
+                            // realized trading PnL and funding that this
+                            // denominator deliberately excludes.
+                            let baseline_capital_basis =
+                                baseline - inst.total_pnl - inst.funding_carry_today;
+                            let legacy_denominator_trustworthy = min_usd > 0.0
+                                && (prev_start_equity - baseline_capital_basis).abs() < min_usd;
+                            inst.session_start_equity = if legacy_denominator_trustworthy {
+                                (prev_start_equity + delta).max(0.0)
+                            } else {
+                                inst.equity_reference_usd
+                            };
+                        } else {
+                            inst.session_start_equity =
+                                (inst.session_start_equity + delta).max(0.0);
+                        }
+                        inst.capital_baseline_equity = equity;
+                        let reference_change = reference_reconciliation_pending.then_some({
+                            (inst.session_equity_reference_usd, inst.equity_reference_usd)
+                        });
+                        if reference_reconciliation_pending {
+                            inst.session_equity_reference_usd = inst.equity_reference_usd;
+                        }
+                        Some(Rebaseline::Capital {
+                            delta,
+                            equity,
+                            prev_start_equity,
+                            reference_change,
+                        })
+                    }
                 }
             }
         };
 
-        if let Some((delta, equity, prev_start_equity)) = detected {
-            let kind = if delta > 0.0 { "deposit" } else { "withdrawal" };
-            let new_start_equity = self.instances[inst_idx].session_start_equity;
-            log::warn!(
-                "[SESSION_DD] {} capital {} detected: Δ={:.2} equity={:.2}; rolling peak rebaselined to current (DD→0), session_start_equity {:.2} -> {:.2}",
-                self.instances[inst_idx].id,
-                kind,
+        match detected {
+            Some(Rebaseline::Capital {
                 delta,
                 equity,
                 prev_start_equity,
-                new_start_equity,
-            );
-            self.record_risk_event_for_instance(
-                inst_idx,
-                "session_dd",
-                "capital_rebaseline",
-                Some(kind.to_string()),
-                Some(serde_json::json!({
-                    "delta_usd": delta,
-                    "equity": equity,
-                    "prev_session_start_equity": prev_start_equity,
-                    "new_session_start_equity": new_start_equity,
-                })),
-            );
-            self.persist_risk_state();
+                reference_change,
+            }) => {
+                let kind = if delta > 0.0 { "deposit" } else { "withdrawal" };
+                let new_start_equity = self.instances[inst_idx].session_start_equity;
+                log::warn!(
+                    "[SESSION_DD] {} capital {} detected: Δ={:.2} equity={:.2}; rolling peak rebaselined to current (DD→0), session_start_equity {:.2} -> {:.2}",
+                    self.instances[inst_idx].id,
+                    kind,
+                    delta,
+                    equity,
+                    prev_start_equity,
+                    new_start_equity,
+                );
+                self.record_risk_event_for_instance(
+                    inst_idx,
+                    "session_dd",
+                    "capital_rebaseline",
+                    Some(kind.to_string()),
+                    Some(serde_json::json!({
+                        "delta_usd": delta,
+                        "equity": equity,
+                        "prev_session_start_equity": prev_start_equity,
+                        "new_session_start_equity": new_start_equity,
+                        "reference_change": reference_change.map(|(previous, new)| serde_json::json!({
+                            "previous": previous,
+                            "new": new,
+                        })),
+                    })),
+                );
+                self.persist_risk_state();
+            }
+            Some(Rebaseline::Reference {
+                equity,
+                prev_start_equity,
+                previous_reference,
+                new_reference,
+                observed_delta,
+            }) => {
+                let source = if previous_reference <= 0.0 {
+                    "legacy_snapshot"
+                } else {
+                    "config_reference_change"
+                };
+                log::warn!(
+                    "[DAILY_DD] {} equity reference reconciled source={} {:.2} -> {:.2} while flat/settled at equity={:.2} observed_delta={:?}; session_start_equity {:.2} -> {:.2}",
+                    self.instances[inst_idx].id,
+                    source,
+                    previous_reference,
+                    new_reference,
+                    equity,
+                    observed_delta,
+                    prev_start_equity,
+                    self.instances[inst_idx].session_start_equity,
+                );
+                self.record_risk_event_for_instance(
+                    inst_idx,
+                    "daily_dd",
+                    "reference_rebaseline",
+                    Some(source.to_string()),
+                    Some(serde_json::json!({
+                        "equity": equity,
+                        "previous_reference": previous_reference,
+                        "new_reference": new_reference,
+                        "observed_delta_usd": observed_delta,
+                        "prev_session_start_equity": prev_start_equity,
+                        "new_session_start_equity": self.instances[inst_idx].session_start_equity,
+                    })),
+                );
+                self.persist_risk_state();
+            }
+            None => {}
         }
     }
 
