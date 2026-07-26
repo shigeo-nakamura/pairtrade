@@ -68,7 +68,17 @@ impl PairTradeEngine {
         // equity jump) and rebaseline the rolling peak to current equity
         // before sampling, so a top-up into a halted variant restores its DD
         // headroom instead of leaving it pinned under a sticky 30-day peak.
-        self.detect_capital_event_and_rebaseline(inst_idx);
+        // bot-strategy#752 review: `sync_positions_from_exchange` above can
+        // return `Ok(())` with `positions_ready` still false (initial WS
+        // snapshot not pushed yet). Until then every local pair state reads
+        // as positionless regardless of what the account actually holds, so
+        // an account that retained an open position across restart would
+        // have its unrealized-PnL move misclassified as a deposit or
+        // withdrawal. Skip reconciliation for this tick rather than trust a
+        // flatness reading that isn't authoritative yet.
+        if self.positions_ready {
+            self.detect_capital_event_and_rebaseline(inst_idx);
+        }
         // Phase 3-1: sample current equity into the rolling-peak window
         // and check the session-DD threshold. On breach, this flattens
         // the instance's positions and sets `session_halted=true`; the

@@ -835,14 +835,27 @@ impl PairTradeEngine {
                         let prev_start_equity = inst.session_start_equity;
                         if legacy_reference {
                             // A pre-#752 snapshot's persisted
-                            // session_start_equity has no known
-                            // relationship to this delta — it was never
-                            // tracked against equity_reference_usd — so
-                            // adding the delta onto it would be arbitrary.
-                            // Adopt the configured reference directly, as
-                            // with the no-delta legacy path above
+                            // session_start_equity has no known relationship
+                            // to this delta in general — it was never tracked
+                            // against equity_reference_usd — so the safe
+                            // default is still to adopt the configured
+                            // reference directly, discarding the delta.
+                            // Exception: if `prev_start_equity` already
+                            // tracked `baseline` coming into this tick (the
+                            // ordinary pre-#752 case, not #752 rollover
+                            // drift), it IS trustworthy, and a genuine
+                            // detected delta (e.g. a withdrawal while the bot
+                            // was stopped) must be applied on top of it —
+                            // discarding it here would leave the daily-DD
+                            // denominator blind to a real capital move
                             // (bot-strategy#752 review).
-                            inst.session_start_equity = inst.equity_reference_usd;
+                            let legacy_denominator_trustworthy =
+                                min_usd > 0.0 && (prev_start_equity - baseline).abs() < min_usd;
+                            inst.session_start_equity = if legacy_denominator_trustworthy {
+                                (prev_start_equity + delta).max(0.0)
+                            } else {
+                                inst.equity_reference_usd
+                            };
                         } else {
                             inst.session_start_equity =
                                 (inst.session_start_equity + delta).max(0.0);

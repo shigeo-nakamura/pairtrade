@@ -1191,6 +1191,75 @@ fn legacy_snapshot_consistent_denominator_preserved_when_flat_settled() {
     );
 }
 
+// Codex review on PR #175 / bot-strategy#752: a legacy snapshot whose
+// persisted session_start_equity already tracked the capital baseline before
+// this tick (the ordinary pre-#752 case) must still have a genuinely
+// detected delta applied on top of it, not discarded. Scenario: both were
+// $1,000 before restart, $500 was withdrawn while the bot was stopped, so
+// the first flat/settled tick observes equity=$500 against baseline=$1,000.
+#[test]
+fn legacy_snapshot_trustworthy_denominator_applies_detected_delta() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-delta-trustworthy");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.capital_baseline_equity = 1_000.0;
+        inst.session_start_equity = 1_000.0; // consistent with baseline
+        inst.equity_cache = 500.0; // $500 withdrawn while stopped
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 500.0,
+        "a real detected withdrawal must be applied, not discarded, on a trustworthy legacy denominator"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+}
+
+// Companion case: the persisted denominator is untrustworthy (diverges from
+// the tracked capital baseline by more than min_usd — the #752 rollover-drift
+// shape), so the old discard-and-replace behavior is kept: there is no way to
+// tell a real capital delta apart from more #752 drift noise, so the delta is
+// not applied and the fresh configured reference is adopted directly.
+#[test]
+fn legacy_snapshot_untrustworthy_denominator_discards_delta() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-delta-untrustworthy");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.capital_baseline_equity = 5_000.0;
+        inst.session_start_equity = 8_000.0; // diverges from baseline: #752 drift
+        inst.equity_cache = 4_500.0; // $500 withdrawn since the tracked baseline
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 1_000.0,
+        "an untrustworthy legacy denominator keeps the discard-and-replace fallback"
+    );
+    assert_eq!(inst.session_equity_reference_usd, 1_000.0);
+}
+
 // Reference migration is needed for daily DD even when rolling session DD is
 // disabled. A simultaneous deposit still establishes the current reference,
 // but the otherwise-inert rolling-peak samples must not be rewritten.
