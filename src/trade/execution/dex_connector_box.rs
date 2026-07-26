@@ -195,6 +195,14 @@ impl DexConnectorBox {
                     websocket_url,
                     tracked_symbols: token_list.to_vec(),
                     ob_stale_secs: None,
+                    // This wiring stays read-only (enforced by the dry_run
+                    // check above); authenticated mutations were added by
+                    // dex-connector's Arcus auth/execution slice
+                    // (bot-strategy#749) but are out of scope here.
+                    address: None,
+                    account_index: 0,
+                    api_key: None,
+                    api_private_key_hex: None,
                 })?;
                 Ok(DexConnectorBox { inner: connector })
             }

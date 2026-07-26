@@ -32,9 +32,7 @@ permissions:
 env:
   AWS_REGION: eu-central-1
   INSTALL_DIR: /opt/debot
-  # Temporary draft integration pin for pairtrade#173. Replace with the
-  # Arcus release tag before marking the PR ready for review.
-  DEX_CONNECTOR_REF: feat/749-arcus-readonly
+  DEX_CONNECTOR_REF: v4.7.6
   LIGHTER_GO_REF: v1.0.2
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
 
