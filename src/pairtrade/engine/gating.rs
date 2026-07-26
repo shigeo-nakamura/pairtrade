@@ -55,6 +55,15 @@ impl PairTradeEngine {
         crate::error_counter::set_counting_suppressed(maintenance_block_entries);
 
         self.refresh_equity_if_needed(inst_idx).await?;
+        // bot-strategy#752 review: sync real exchange positions before the
+        // capital-event "flat" check below. On the first tick after a
+        // restart, per-pair `states` is empty until this sync populates it,
+        // so an account that retained an open position across restart would
+        // otherwise vacuously pass the flat check and have its
+        // unrealized-PnL-driven equity move misclassified as a deposit or
+        // withdrawal, corrupting session_start_equity.
+        self.sync_positions_from_exchange(inst_idx, price_map)
+            .await?;
         // bot-strategy#575 ①: detect a deposit / withdrawal (flat + settled
         // equity jump) and rebaseline the rolling peak to current equity
         // before sampling, so a top-up into a halted variant restores its DD
@@ -66,8 +75,6 @@ impl PairTradeEngine {
         // entry gate below picks up the halt.
         self.update_equity_sample(inst_idx);
         self.evaluate_session_dd(inst_idx).await;
-        self.sync_positions_from_exchange(inst_idx, price_map)
-            .await?;
 
         let vol_median = self.compute_vol_median();
 
