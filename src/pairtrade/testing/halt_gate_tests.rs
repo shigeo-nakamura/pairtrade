@@ -1191,6 +1191,44 @@ fn legacy_reference_reconciles_without_reanchoring_disabled_session_dd() {
     );
 }
 
+// PR #175 review: `max_session_loss_bps` and `max_daily_loss_bps` are
+// independent knobs, but detect_capital_event_and_rebaseline used to gate
+// all capital tracking on max_session_loss_bps alone. With rolling session
+// DD disabled but daily DD still enabled, a genuine deposit must still
+// update session_start_equity — otherwise the daily-DD denominator sticks
+// at whatever it was when session DD was turned off.
+#[test]
+fn capital_delta_updates_daily_dd_denominator_when_session_dd_disabled() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-daily-only");
+    h.engine.cfg.risk.max_session_loss_bps = 0;
+    h.engine.cfg.risk.max_daily_loss_bps = 300;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0; // already reconciled, not legacy
+        inst.equity_cache = 2_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.session_start_equity = 1_000.0;
+        inst.realized_pnl_today = -5.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 2_000.0,
+        "daily-DD denominator must track a deposit even with rolling session DD disabled"
+    );
+    assert_eq!(inst.capital_baseline_equity, 2_000.0);
+    assert_eq!(inst.realized_pnl_today, -5.0);
+}
+
 // If only the config reference changes and collateral is stable, the next
 // flat/settled observation adopts the new configured denominator. This makes
 // the no-transfer side of restart reconciliation explicit.

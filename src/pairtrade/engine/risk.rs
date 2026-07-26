@@ -679,6 +679,7 @@ impl PairTradeEngine {
             return;
         }
         let threshold_bps = self.cfg.risk.max_session_loss_bps;
+        let daily_threshold_bps = self.cfg.risk.max_daily_loss_bps;
         let min_usd = self.cfg.risk.session_dd_capital_event_min_usd;
         let (legacy_reference, reference_reconciliation_pending) = {
             let inst = &self.instances[inst_idx];
@@ -689,11 +690,18 @@ impl PairTradeEngine {
                     || (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9,
             )
         };
-        // No peak to rebaseline when session DD is disabled, and detection
-        // is off when the threshold is 0 USD. A pending config-reference
-        // change is the exception: it must still be reconciled at the same
-        // flat/settled safety boundary.
-        if (threshold_bps == 0 || min_usd <= 0.0) && !reference_reconciliation_pending {
+        // No peak to rebaseline when both session DD and daily DD are
+        // disabled, and detection is off when the threshold is 0 USD. A
+        // pending config-reference change is the exception: it must still be
+        // reconciled at the same flat/settled safety boundary. Daily DD
+        // shares this denominator (session_start_equity) with session DD, so
+        // disabling only max_session_loss_bps must not also stop capital
+        // deltas from updating it — otherwise a withdrawal followed by a
+        // redeposit leaves the daily-DD denominator stuck (bot-strategy#752
+        // review).
+        if (threshold_bps == 0 && daily_threshold_bps == 0 || min_usd <= 0.0)
+            && !reference_reconciliation_pending
+        {
             return;
         }
         let settle_secs = self.cfg.risk.session_dd_capital_settle_secs;
