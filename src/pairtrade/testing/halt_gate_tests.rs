@@ -1150,6 +1150,47 @@ fn legacy_snapshot_stale_denominator_reconciles_when_flat_settled() {
     assert_eq!(persisted_inst.session_equity_reference_usd, 6_000.0);
 }
 
+// Codex review on PR #175 / bot-strategy#752: a legacy snapshot whose
+// persisted session_start_equity already lines up with the tracked capital
+// baseline (e.g. both near-zero after a same-session withdrawal, with no new
+// transfer since) must NOT be reset to the fresh configured reference. Doing
+// so would resurrect the withdrawn capital, and a later redeposit would then
+// double-count on top of it.
+#[test]
+fn legacy_snapshot_consistent_denominator_preserved_when_flat_settled() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-legacy-withdrawn");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 6_000.0;
+        // Old code already zeroed the denominator when the withdrawal
+        // happened; capital_baseline_equity (tracked since #575, unaffected
+        // by the #752 rollover bug) confirms it — both sit near zero.
+        inst.equity_cache = 0.01;
+        inst.capital_baseline_equity = 0.01;
+        inst.session_start_equity = 0.0;
+        inst.session_equity_reference_usd = 0.0; // pre-#752 snapshot: legacy
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_start_equity, 0.0,
+        "consistent legacy denominator must be preserved, not resurrected to the full reference"
+    );
+    assert_eq!(
+        inst.session_equity_reference_usd, 6_000.0,
+        "migration still stamps the reference so future ticks are treated as reconciled"
+    );
+}
+
 // Reference migration is needed for daily DD even when rolling session DD is
 // disabled. A simultaneous deposit still establishes the current reference,
 // but the otherwise-inert rolling-peak samples must not be rewritten.
