@@ -1,0 +1,27 @@
+# Safe example only. This artifact is not referenced by any production service.
+# Values are illustrative and must be replaced with approved inventory and cost limits.
+mode: read_only
+chain_id: 4663
+pair:
+  sell_symbol: NVDA
+  buy_symbol: AMD
+notional_usd: "5"
+initial_inventory:
+  token_a: "0.25"
+  token_b: "0.10"
+inventory_floors:
+  token_a: "0.05"
+  token_b: "0.02"
+max_rotation_fraction: "0.25"
+signal_window_samples: 96
+min_signal_samples: 32
+entry_z_score: 2.5
+exit_z_score: 0.25
+max_quote_age_secs: 30
+max_hold_secs: 86400
+max_all_in_round_trip_cost_bps: "75"
+gas_buffer_bps: "10"
+settlement_buffer_bps: "10"
+max_inventory_imbalance_fraction: "0.75"
+daily_loss_limit_usd: "2"
+cumulative_loss_limit_usd: "10"

@@ -164,6 +164,12 @@ jobs:
       - name: Cargo test
         run: cargo test --all-targets --locked
 
+      - name: Arcus Spot feature check
+        run: cargo check --all-targets --no-default-features --features arcus-spot-sdk --locked
+
+      - name: Arcus Spot runtime tests
+        run: cargo test --lib --no-default-features --features arcus-spot-sdk arcus_spot --locked
+
   deploy:
     runs-on: ubuntu-latest
     # CI ships new binary + configs but no longer restarts the service

@@ -1419,6 +1419,7 @@ dependencies = [
  "ed25519-dalek",
  "env_logger",
  "ethers",
+ "fs2",
  "futures",
  "generic-array",
  "hex",
