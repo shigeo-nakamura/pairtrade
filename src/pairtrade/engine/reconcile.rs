@@ -49,6 +49,11 @@ struct ExitFillPnlContext<'a> {
     key: &'a str,
     state: &'a PairState,
     price_map: &'a HashMap<String, SymbolSnapshot>,
+    /// Exit legs (settled slices + final remainder) and their fill status,
+    /// used to derive actual exit fill VWAP instead of a mark snapshot
+    /// (bot-strategy#750).
+    legs: &'a [PendingLeg],
+    status: &'a PendingStatus,
     funding_history: &'a funding_history::FundingHistory,
     z_exit: Option<f64>,
     beta_val: Option<f64>,
@@ -90,18 +95,20 @@ impl PairTradeEngine {
         }
     }
 
-    /// Pure derivation of the entry-fill snapshot's per-leg prices and
-    /// sizes: split the `base/quote` pair key, look up each side's mark
-    /// price in `price_map`, and sum the filled-leg sizes by symbol.
-    /// Returns `(price_a, price_b, size_a, size_b)`; all `None` when `key`
-    /// is not a `base/quote` pair. Extracted from `reconcile_pending_orders`
-    /// so the entry-snapshot field derivation is auditable/testable
-    /// (bot-strategy#502).
+    /// Pure derivation of the entry-fill record's per-leg prices and sizes:
+    /// split the `base/quote` pair key, derive each side's actual fill VWAP
+    /// from `status` (falling back to the `price_map` mark snapshot only on
+    /// total value-coverage blackout, bot-strategy#750), and sum the
+    /// filled-leg sizes by symbol. Returns `(price_a, price_b, size_a,
+    /// size_b)`; all `None` when `key` is not a `base/quote` pair. Extracted
+    /// from `reconcile_pending_orders` so the entry-price field derivation
+    /// is auditable/testable (bot-strategy#502).
     #[allow(clippy::type_complexity)]
     fn entry_prices_and_sizes(
         key: &str,
         price_map: &HashMap<String, SymbolSnapshot>,
         legs: &[PendingLeg],
+        status: &PendingStatus,
     ) -> (
         Option<Decimal>,
         Option<Decimal>,
@@ -112,8 +119,8 @@ impl PairTradeEngine {
             Some((base, quote)) => {
                 let (es_a, es_b) = Self::sum_entry_sizes_by_symbol(legs, base, quote);
                 (
-                    price_map.get(base).map(|s| s.price),
-                    price_map.get(quote).map(|s| s.price),
+                    Self::fill_price_or_snapshot(legs, status, price_map, key, "entry", base),
+                    Self::fill_price_or_snapshot(legs, status, price_map, key, "entry", quote),
                     es_a,
                     es_b,
                 )
@@ -133,9 +140,29 @@ impl PairTradeEngine {
     fn build_exit_fill_pnl(ctx: ExitFillPnlContext<'_>) -> Option<(PnlLogRecord, f64, f64)> {
         let pos = ctx.state.position.as_ref()?;
         let (base, quote) = ctx.key.split_once('/')?;
-        let p1 = ctx.price_map.get(base)?;
-        let p2 = ctx.price_map.get(quote)?;
-        let pnl = compute_pnl(pos, p1.price, p2.price).and_then(|p| p.to_f64())?;
+        // bot-strategy#750: PnL, trade stats, and the consecutive-loss
+        // circuit breaker must be driven by actual exit fill VWAP, not the
+        // reconciliation-time mark snapshot `build_exit_fill_pnl` used to
+        // read here — the two can differ materially after a partial-fill
+        // amend/reissue. Falls back to the snapshot only on total
+        // value-coverage blackout (logged in `fill_price_or_snapshot`).
+        let exit_price_a = Self::fill_price_or_snapshot(
+            ctx.legs,
+            ctx.status,
+            ctx.price_map,
+            ctx.key,
+            "exit",
+            base,
+        )?;
+        let exit_price_b = Self::fill_price_or_snapshot(
+            ctx.legs,
+            ctx.status,
+            ctx.price_map,
+            ctx.key,
+            "exit",
+            quote,
+        )?;
+        let pnl = compute_pnl(pos, exit_price_a, exit_price_b).and_then(|p| p.to_f64())?;
         let hold_secs = Some(ctx.now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
         let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
         let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
@@ -166,8 +193,8 @@ impl PairTradeEngine {
                 .with_trade_details(PnlTradeDetails {
                     entry_a,
                     entry_b,
-                    exit_a: p1.price.to_f64(),
-                    exit_b: p2.price.to_f64(),
+                    exit_a: exit_price_a.to_f64(),
+                    exit_b: exit_price_b.to_f64(),
                     beta: ctx.beta_val,
                     z_entry: pos.entry_z,
                     z_exit: ctx.z_exit,
@@ -471,6 +498,8 @@ impl PairTradeEngine {
                     key,
                     state,
                     price_map,
+                    legs: &pending.legs,
+                    status: &status,
                     funding_history: &self.funding_history,
                     z_exit,
                     beta_val,
@@ -739,7 +768,7 @@ impl PairTradeEngine {
             let beta_at_entry = self.per_pair_state.get(key).map(|s| s.beta);
             if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                 let (ep_a, ep_b, es_a, es_b) =
-                    Self::entry_prices_and_sizes(key, price_map, &pending.legs);
+                    Self::entry_prices_and_sizes(key, price_map, &pending.legs, &status);
                 state.position = Some(Position {
                     direction: pending.direction,
                     entered_at: Instant::now(),
@@ -1325,6 +1354,66 @@ impl PairTradeEngine {
         })
     }
 
+    /// Volume-weighted average fill price across every leg for `symbol`,
+    /// from the actual venue fills the reconcile loop already collected
+    /// (`status.filled_values` / `filled_value_qty`) — not a reconciliation-
+    /// time mark snapshot. A partial-fill reissue leaves one settled leg
+    /// (the filled slice, original order_id) plus a fresh leg for the
+    /// remainder (bot-strategy#502's `sum_entry_sizes_by_symbol`), so this
+    /// sums value/qty across every leg matching `symbol`, not just the last
+    /// one — the same coverage-matched invariant `ledger_fill_price` uses
+    /// per-leg, extended to the per-symbol total a position needs.
+    /// `None` when no leg for this symbol has any reported fill value
+    /// (bot-strategy#750): callers must treat that as an explicit missing-
+    /// coverage case, not silently substitute a snapshot in its place.
+    fn fill_vwap_by_symbol(
+        legs: &[PendingLeg],
+        status: &PendingStatus,
+        symbol: &str,
+    ) -> Option<Decimal> {
+        let mut total_value = Decimal::ZERO;
+        let mut total_qty = Decimal::ZERO;
+        let mut covered = false;
+        for leg in legs.iter().filter(|leg| leg.symbol == symbol) {
+            let value = Self::lookup_decimal_for_leg(leg, &status.filled_values);
+            let qty = Self::lookup_decimal_for_leg(leg, &status.filled_value_qty);
+            if let (Some(value), Some(qty)) = (value, qty) {
+                if qty > Decimal::ZERO {
+                    total_value += value;
+                    total_qty += qty;
+                    covered = true;
+                }
+            }
+        }
+        (covered && total_qty > Decimal::ZERO).then(|| total_value / total_qty)
+    }
+
+    /// `fill_vwap_by_symbol`, falling back to the reconciliation-time mark
+    /// snapshot only when no leg reported any fill value at all — the rare
+    /// zero-coverage case (bot-strategy#750 acceptance: never fabricate a
+    /// VWAP by blending in a snapshot price for a partially-covered fill,
+    /// but a total value blackout still needs *some* price rather than
+    /// dropping the record entirely). The fallback is logged so it stays
+    /// auditable instead of silently masquerading as fill-grade truth.
+    fn fill_price_or_snapshot(
+        legs: &[PendingLeg],
+        status: &PendingStatus,
+        price_map: &HashMap<String, SymbolSnapshot>,
+        key: &str,
+        phase: &str,
+        symbol: &str,
+    ) -> Option<Decimal> {
+        Self::fill_vwap_by_symbol(legs, status, symbol).or_else(|| {
+            log::warn!(
+                "[PNL] {} {} {} fill-value coverage missing; falling back to mark snapshot",
+                key,
+                phase,
+                symbol
+            );
+            price_map.get(symbol).map(|s| s.price)
+        })
+    }
+
     fn lookup_ts_for_leg(leg: &PendingLeg, map: &HashMap<String, i64>) -> Option<i64> {
         map.get(&leg.order_id).copied().or_else(|| {
             leg.exchange_order_id
@@ -1641,14 +1730,14 @@ mod tests {
     //! without standing up an engine. Reaches the leg-fill aggregation
     //! that drives partial / full / fallback branching in the reconcile
     //! loop. bot-strategy#396.
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::Instant;
 
     use dex_connector::OrderSide;
     use rust_decimal::Decimal;
 
     use super::super::super::market::SymbolSnapshot;
-    use super::super::super::state::{PendingLeg, PendingOrders, PositionDirection};
+    use super::super::super::state::{PendingLeg, PendingOrders, PendingStatus, PositionDirection};
     use super::PairTradeEngine;
 
     fn dec(v: &str) -> Decimal {
@@ -2039,27 +2128,169 @@ mod tests {
         assert_eq!(d.next_retry, u32::MAX);
     }
 
+    fn empty_status() -> PendingStatus {
+        PendingStatus {
+            open_remaining: 0,
+            fills: HashMap::new(),
+            filled_values: HashMap::new(),
+            filled_value_qty: HashMap::new(),
+            filled_fees: HashMap::new(),
+            filled_ts_ms_max: HashMap::new(),
+            open_ids: HashSet::new(),
+        }
+    }
+
+    /// Builds a `PendingStatus` reporting `value`/`qty` fill coverage for
+    /// `order_id`, as `pending_status()` would after querying the venue.
+    fn status_with_fill(order_id: &str, value: &str, qty: &str) -> PendingStatus {
+        let mut status = empty_status();
+        status
+            .filled_values
+            .insert(order_id.to_string(), dec(value));
+        status
+            .filled_value_qty
+            .insert(order_id.to_string(), dec(qty));
+        status
+    }
+
     #[test]
     fn entry_prices_and_sizes_non_pair_key_is_all_none() {
         let legs = vec![leg("BTC", "ord-1", "0.5", "0.5")];
         let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
-        let got = PairTradeEngine::entry_prices_and_sizes("NOTAPAIR", &prices, &legs);
+        let status = empty_status();
+        let got = PairTradeEngine::entry_prices_and_sizes("NOTAPAIR", &prices, &legs, &status);
         assert_eq!(got, (None, None, None, None));
     }
 
     #[test]
     fn entry_prices_and_sizes_sums_legs_when_prices_absent() {
-        // Empty price_map: prices stay None, but the split + per-symbol size
-        // summing still runs (BTC long leg, ETH short leg).
+        // Empty price_map and no fill-value coverage: prices stay None, but
+        // the split + per-symbol size summing still runs (BTC long leg, ETH
+        // short leg).
         let legs = vec![
             leg("BTC", "ord-1", "0.5", "0.5"),
             leg("ETH", "ord-2", "2.0", "2.0"),
         ];
         let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
-        let (pa, pb, sa, sb) = PairTradeEngine::entry_prices_and_sizes("BTC/ETH", &prices, &legs);
+        let status = empty_status();
+        let (pa, pb, sa, sb) =
+            PairTradeEngine::entry_prices_and_sizes("BTC/ETH", &prices, &legs, &status);
         assert_eq!((pa, pb), (None, None));
         // sum_entry_sizes_by_symbol aggregates filled size per side.
         assert_eq!(sa, Some(dec("0.5")));
         assert_eq!(sb, Some(dec("2.0")));
+    }
+
+    // bot-strategy#750: entry/exit PnL must be driven by actual fill VWAP,
+    // not a reconciliation-time mark snapshot.
+
+    #[test]
+    fn entry_prices_prefer_fill_vwap_over_snapshot() {
+        // Fill VWAP (100.10) differs materially from the mark snapshot
+        // (105.00) sampled at reconcile time — must use the fill, not the
+        // snapshot, even though a snapshot is available.
+        let legs = vec![leg("BTC", "ord-1", "1.0", "1.0")];
+        let status = status_with_fill("ord-1", "100.10", "1.0");
+        let mut prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+        prices.insert(
+            "BTC".to_string(),
+            SymbolSnapshot {
+                price: dec("105.00"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
+        );
+        let (pa, _, _, _) =
+            PairTradeEngine::entry_prices_and_sizes("BTC/ETH", &prices, &legs, &status);
+        assert_eq!(pa, Some(dec("100.10")));
+    }
+
+    #[test]
+    fn entry_prices_blend_vwap_across_settled_and_reissued_legs() {
+        // Partial-fill reissue: 0.4 filled at 100 on the original order,
+        // remaining 0.6 filled at 102 on the reissued order (settled leg +
+        // fresh leg for the same symbol, per sum_entry_sizes_by_symbol's
+        // documented shape). Blended VWAP = (0.4*100 + 0.6*102) / 1.0 =
+        // 101.2, not the mark snapshot and not either fill in isolation.
+        let legs = vec![
+            leg("BTC", "ord-1", "0.4", "0.4"),
+            leg("BTC", "ord-2", "0.6", "0.6"),
+        ];
+        let mut status = empty_status();
+        status
+            .filled_values
+            .insert("ord-1".to_string(), dec("40.00"));
+        status
+            .filled_value_qty
+            .insert("ord-1".to_string(), dec("0.4"));
+        status
+            .filled_values
+            .insert("ord-2".to_string(), dec("61.20"));
+        status
+            .filled_value_qty
+            .insert("ord-2".to_string(), dec("0.6"));
+        let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+        let (pa, _, sa, _) =
+            PairTradeEngine::entry_prices_and_sizes("BTC/ETH", &prices, &legs, &status);
+        assert_eq!(pa, Some(dec("101.2")));
+        assert_eq!(sa, Some(dec("1.0")));
+    }
+
+    #[test]
+    fn entry_prices_fall_back_to_snapshot_on_zero_coverage() {
+        // No leg reports any fill value at all (total coverage blackout) —
+        // the only case allowed to fall back to the mark snapshot.
+        let legs = vec![leg("BTC", "ord-1", "1.0", "1.0")];
+        let status = empty_status();
+        let mut prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+        prices.insert(
+            "BTC".to_string(),
+            SymbolSnapshot {
+                price: dec("105.00"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
+        );
+        let (pa, _, _, _) =
+            PairTradeEngine::entry_prices_and_sizes("BTC/ETH", &prices, &legs, &status);
+        assert_eq!(pa, Some(dec("105.00")));
+    }
+
+    #[test]
+    fn fill_vwap_by_symbol_ignores_legs_with_qty_but_no_value() {
+        // A leg whose fill map has qty but zero/no reported value must not
+        // be divided in — that is exactly the #705 phantom-slippage shape
+        // (qty recovered by the exchange-position cross-check with no
+        // matching value). It must be excluded from the VWAP, not treated
+        // as a zero-price fill.
+        let legs = vec![
+            leg("BTC", "ord-1", "0.5", "0.5"),
+            leg("BTC", "ord-2", "0.5", "0.5"),
+        ];
+        let mut status = empty_status();
+        status
+            .filled_values
+            .insert("ord-1".to_string(), dec("50.00"));
+        status
+            .filled_value_qty
+            .insert("ord-1".to_string(), dec("0.5"));
+        // ord-2 has a qty-only fill entry (no value/value_qty reported).
+        status.fills.insert("ord-2".to_string(), dec("0.5"));
+        let got = PairTradeEngine::fill_vwap_by_symbol(&legs, &status, "BTC");
+        assert_eq!(got, Some(dec("100.00")));
     }
 }
