@@ -325,36 +325,30 @@ impl ArcusSpotRuntime {
             });
         }
 
-        let Some(z_score) = z_score else {
-            return self.event(RuntimeEventInput {
-                sequence,
-                observed_at: evaluation_time,
-                inventory_before,
-                regime_before,
-                token_a_reference_price_usd: Some(context.token_a_price_usd),
-                token_b_reference_price_usd: Some(context.token_b_price_usd),
-                relative_log_price: Some(relative_log_price),
-                z_score: None,
-                risk_before: Some(risk_before),
-                decision: ArcusSpotDecision::Observe {
-                    hold: ArcusSpotHold::new(
-                        ArcusSpotHoldCode::Warmup,
-                        format!(
-                            "need {} prior samples; have {}",
-                            self.config.min_signal_samples,
-                            self.state
-                                .relative_log_price_history
-                                .len()
-                                .saturating_sub(1)
-                        ),
-                    ),
-                },
-            });
-        };
-
+        // A max-hold exit must fire even when the signal window is flat
+        // (z_score() returns None once its standard deviation collapses to
+        // zero), so rotation_signal is consulted with the raw Option instead
+        // of bailing out to Warmup before it ever sees a rotated regime.
         let Some((direction, trigger)) =
             self.rotation_signal(z_score, evaluation_time, regime_before)
         else {
+            let hold = match z_score {
+                Some(z) => ArcusSpotHold::new(
+                    ArcusSpotHoldCode::NoSignal,
+                    format!("z={z:.6}, regime={regime_before:?}"),
+                ),
+                None => ArcusSpotHold::new(
+                    ArcusSpotHoldCode::Warmup,
+                    format!(
+                        "need {} prior samples; have {}",
+                        self.config.min_signal_samples,
+                        self.state
+                            .relative_log_price_history
+                            .len()
+                            .saturating_sub(1)
+                    ),
+                ),
+            };
             return self.event(RuntimeEventInput {
                 sequence,
                 observed_at: evaluation_time,
@@ -363,14 +357,9 @@ impl ArcusSpotRuntime {
                 token_a_reference_price_usd: Some(context.token_a_price_usd),
                 token_b_reference_price_usd: Some(context.token_b_price_usd),
                 relative_log_price: Some(relative_log_price),
-                z_score: Some(z_score),
+                z_score,
                 risk_before: Some(risk_before),
-                decision: ArcusSpotDecision::Observe {
-                    hold: ArcusSpotHold::new(
-                        ArcusSpotHoldCode::NoSignal,
-                        format!("z={z_score:.6}, regime={regime_before:?}"),
-                    ),
-                },
+                decision: ArcusSpotDecision::Observe { hold },
             });
         };
 
@@ -391,7 +380,7 @@ impl ArcusSpotRuntime {
                     token_a_reference_price_usd: Some(context.token_a_price_usd),
                     token_b_reference_price_usd: Some(context.token_b_price_usd),
                     relative_log_price: Some(relative_log_price),
-                    z_score: Some(z_score),
+                    z_score,
                     risk_before: Some(risk_before),
                     decision: ArcusSpotDecision::Observe { hold },
                 })
@@ -435,7 +424,7 @@ impl ArcusSpotRuntime {
             token_a_reference_price_usd: Some(context.token_a_price_usd),
             token_b_reference_price_usd: Some(context.token_b_price_usd),
             relative_log_price: Some(relative_log_price),
-            z_score: Some(z_score),
+            z_score,
             risk_before: Some(risk_before),
             decision,
         })
@@ -581,14 +570,20 @@ impl ArcusSpotRuntime {
         })
     }
 
+    /// `z_score` is `None` once the signal window is flat enough that its
+    /// standard deviation collapses to zero. A rotated position must still
+    /// be able to time out on `max_hold_secs` in that case, so the max-hold
+    /// branches are checked before the z-score is required; only the
+    /// entry and mean-reversion-exit paths need an actual score.
     fn rotation_signal(
         &self,
-        z_score: f64,
+        z_score: Option<f64>,
         evaluation_time: DateTime<Utc>,
         regime: ArcusSpotRegime,
     ) -> Option<(ArcusSpotDirection, ArcusSpotRotationTrigger)> {
         match regime {
             ArcusSpotRegime::Neutral => {
+                let z_score = z_score?;
                 if z_score >= self.config.entry_z_score {
                     Some((
                         ArcusSpotDirection::TokenAToTokenB,
@@ -605,11 +600,13 @@ impl ArcusSpotRuntime {
             }
             ArcusSpotRegime::RotatedAToB => {
                 if self.max_hold_elapsed(evaluation_time) {
-                    Some((
+                    return Some((
                         ArcusSpotDirection::TokenBToTokenA,
                         ArcusSpotRotationTrigger::MaxHoldExit,
-                    ))
-                } else if z_score <= self.config.exit_z_score {
+                    ));
+                }
+                let z_score = z_score?;
+                if z_score <= self.config.exit_z_score {
                     Some((
                         ArcusSpotDirection::TokenBToTokenA,
                         ArcusSpotRotationTrigger::MeanReversionExit,
@@ -620,11 +617,13 @@ impl ArcusSpotRuntime {
             }
             ArcusSpotRegime::RotatedBToA => {
                 if self.max_hold_elapsed(evaluation_time) {
-                    Some((
+                    return Some((
                         ArcusSpotDirection::TokenAToTokenB,
                         ArcusSpotRotationTrigger::MaxHoldExit,
-                    ))
-                } else if z_score >= -self.config.exit_z_score {
+                    ));
+                }
+                let z_score = z_score?;
+                if z_score >= -self.config.exit_z_score {
                     Some((
                         ArcusSpotDirection::TokenAToTokenB,
                         ArcusSpotRotationTrigger::MeanReversionExit,
@@ -1359,6 +1358,51 @@ mod tests {
             },
         );
         assert_eq!(runtime.state.risk_halt.unwrap(), halt);
+    }
+
+    #[test]
+    fn max_hold_exit_fires_even_without_a_z_score() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.state.last_rotation_at = Some(event_time());
+        let signal = runtime.rotation_signal(
+            None,
+            event_time() + Duration::seconds(runtime.config.max_hold_secs),
+            ArcusSpotRegime::RotatedAToB,
+        );
+        assert_eq!(
+            signal,
+            Some((
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::MaxHoldExit
+            ))
+        );
+
+        let signal = runtime.rotation_signal(
+            None,
+            event_time() + Duration::seconds(runtime.config.max_hold_secs),
+            ArcusSpotRegime::RotatedBToA,
+        );
+        assert_eq!(
+            signal,
+            Some((
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::MaxHoldExit
+            ))
+        );
+    }
+
+    #[test]
+    fn rotated_regime_without_a_z_score_stays_in_warmup_before_max_hold() {
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let signal = runtime.rotation_signal(None, event_time(), ArcusSpotRegime::RotatedAToB);
+        assert_eq!(signal, None);
+    }
+
+    #[test]
+    fn neutral_regime_without_a_z_score_never_enters() {
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let signal = runtime.rotation_signal(None, event_time(), ArcusSpotRegime::Neutral);
+        assert_eq!(signal, None);
     }
 
     #[test]
