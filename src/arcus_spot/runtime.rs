@@ -169,6 +169,19 @@ pub struct ArcusSpotRuntime {
     state: ArcusSpotRuntimeState,
 }
 
+/// The subset of `SnapshotContext` that depends only on token metadata and
+/// reference prices, never on the recorder row's route data. Mark-to-market
+/// equity valuation and risk-halt engagement only need this, and must run
+/// even when the round-trip row itself is unavailable, errored, or stale:
+/// a loss-limit breach during a route outage would otherwise never engage
+/// the (sticky) halt if the route recovers before the next valid snapshot.
+struct PriceContext {
+    token_a: ArcusSpotToken,
+    token_b: ArcusSpotToken,
+    token_a_price_usd: Decimal,
+    token_b_price_usd: Decimal,
+}
+
 struct SnapshotContext {
     token_a: ArcusSpotToken,
     token_b: ArcusSpotToken,
@@ -230,8 +243,13 @@ impl ArcusSpotRuntime {
         let inventory_before = self.state.inventory;
         let regime_before = self.state.regime;
 
-        let context = match self.snapshot_context(snapshot, evaluation_time) {
-            Ok(context) => context,
+        // Resolved independently of the round-trip row: mark-to-market
+        // equity valuation and risk-halt engagement must run even when the
+        // row itself is missing, errored, or stale, so a loss-limit breach
+        // during a route outage still engages the (sticky) halt instead of
+        // silently recovering before the next valid route.
+        let price = match self.price_context(snapshot) {
+            Ok(price) => price,
             Err(hold) => {
                 return self.event(RuntimeEventInput {
                     sequence,
@@ -249,7 +267,7 @@ impl ArcusSpotRuntime {
         };
 
         let equity_before = match inventory_before
-            .checked_value_usd(context.token_a_price_usd, context.token_b_price_usd)
+            .checked_value_usd(price.token_a_price_usd, price.token_b_price_usd)
         {
             Some(value) => value,
             None => {
@@ -258,8 +276,8 @@ impl ArcusSpotRuntime {
                     observed_at: evaluation_time,
                     inventory_before,
                     regime_before,
-                    token_a_reference_price_usd: Some(context.token_a_price_usd),
-                    token_b_reference_price_usd: Some(context.token_b_price_usd),
+                    token_a_reference_price_usd: Some(price.token_a_price_usd),
+                    token_b_reference_price_usd: Some(price.token_b_price_usd),
                     relative_log_price: None,
                     z_score: None,
                     risk_before: None,
@@ -275,6 +293,24 @@ impl ArcusSpotRuntime {
         self.update_risk_baselines(evaluation_time, equity_before);
         let risk_before = self.risk_mark(equity_before);
         self.engage_risk_halt(evaluation_time, risk_before);
+
+        let context = match self.snapshot_context(snapshot, evaluation_time, &price) {
+            Ok(context) => context,
+            Err(hold) => {
+                return self.event(RuntimeEventInput {
+                    sequence,
+                    observed_at: evaluation_time,
+                    inventory_before,
+                    regime_before,
+                    token_a_reference_price_usd: Some(price.token_a_price_usd),
+                    token_b_reference_price_usd: Some(price.token_b_price_usd),
+                    relative_log_price: None,
+                    z_score: None,
+                    risk_before: Some(risk_before),
+                    decision: ArcusSpotDecision::Observe { hold },
+                })
+            }
+        };
 
         let relative_log_price =
             match relative_log_price(context.token_a_price_usd, context.token_b_price_usd) {
@@ -310,27 +346,36 @@ impl ArcusSpotRuntime {
             self.state.relative_log_price_history.drain(0..excess);
         }
 
+        // A halt blocks new entries, but an existing rotated position must
+        // still be able to exit via mean-reversion or max-hold: rotation_signal
+        // is keyed on `regime_before` and can only ever produce an EntrySignal
+        // from Neutral, never from a rotated regime, so falling through to it
+        // here cannot open a new position while halted. Blocking
+        // unconditionally instead made a halt engaged mid-rotation permanent,
+        // defeating the configured maximum hold indefinitely.
         if let Some(halt) = &self.state.risk_halt {
-            return self.event(RuntimeEventInput {
-                sequence,
-                observed_at: evaluation_time,
-                inventory_before,
-                regime_before,
-                token_a_reference_price_usd: Some(context.token_a_price_usd),
-                token_b_reference_price_usd: Some(context.token_b_price_usd),
-                relative_log_price: Some(relative_log_price),
-                z_score,
-                risk_before: Some(risk_before),
-                decision: ArcusSpotDecision::Observe {
-                    hold: ArcusSpotHold::new(
-                        ArcusSpotHoldCode::RiskHalt,
-                        format!(
-                            "{:?} halt engaged at {}: loss {} >= limit {}",
-                            halt.kind, halt.engaged_at, halt.loss_usd, halt.limit_usd
+            if regime_before == ArcusSpotRegime::Neutral {
+                return self.event(RuntimeEventInput {
+                    sequence,
+                    observed_at: evaluation_time,
+                    inventory_before,
+                    regime_before,
+                    token_a_reference_price_usd: Some(context.token_a_price_usd),
+                    token_b_reference_price_usd: Some(context.token_b_price_usd),
+                    relative_log_price: Some(relative_log_price),
+                    z_score,
+                    risk_before: Some(risk_before),
+                    decision: ArcusSpotDecision::Observe {
+                        hold: ArcusSpotHold::new(
+                            ArcusSpotHoldCode::RiskHalt,
+                            format!(
+                                "{:?} halt engaged at {}: loss {} >= limit {}",
+                                halt.kind, halt.engaged_at, halt.loss_usd, halt.limit_usd
+                            ),
                         ),
-                    ),
-                },
-            });
+                    },
+                });
+            }
         }
 
         // A max-hold exit must fire even when the signal window is flat
@@ -470,11 +515,10 @@ impl ArcusSpotRuntime {
         }
     }
 
-    fn snapshot_context(
+    fn price_context(
         &self,
         snapshot: &ArcusSpotRecorderSnapshot,
-        evaluation_time: DateTime<Utc>,
-    ) -> Result<SnapshotContext, ArcusSpotHold> {
+    ) -> Result<PriceContext, ArcusSpotHold> {
         if snapshot.schema_version != SUPPORTED_RECORDER_SCHEMA_VERSION {
             return Err(ArcusSpotHold::new(
                 ArcusSpotHoldCode::InvalidSnapshot,
@@ -512,6 +556,25 @@ impl ArcusSpotRuntime {
         let overview = capture_payload(&snapshot.reference_overview, "reference_overview")?;
         let token_a_price_usd = find_reference_price(overview, &token_a)?;
         let token_b_price_usd = find_reference_price(overview, &token_b)?;
+
+        Ok(PriceContext {
+            token_a,
+            token_b,
+            token_a_price_usd,
+            token_b_price_usd,
+        })
+    }
+
+    fn snapshot_context(
+        &self,
+        snapshot: &ArcusSpotRecorderSnapshot,
+        evaluation_time: DateTime<Utc>,
+        price: &PriceContext,
+    ) -> Result<SnapshotContext, ArcusSpotHold> {
+        let token_a = &price.token_a;
+        let token_b = &price.token_b;
+        let token_a_price_usd = price.token_a_price_usd;
+        let token_b_price_usd = price.token_b_price_usd;
 
         let matching_rows = snapshot
             .round_trips
@@ -578,15 +641,15 @@ impl ArcusSpotRuntime {
         // shape the cost gate and the row's eventual selection.
         validate_route_leg(
             forward_route,
-            &token_a,
-            &token_b,
+            token_a,
+            token_b,
             evaluation_time,
             self.config.max_quote_age_secs,
         )?;
         validate_route_leg(
             reverse_route,
-            &token_b,
-            &token_a,
+            token_b,
+            token_a,
             evaluation_time,
             self.config.max_quote_age_secs,
         )?;
@@ -595,7 +658,7 @@ impl ArcusSpotRuntime {
             forward_route,
             self.config.notional_usd,
             token_a_price_usd,
-            &token_a,
+            token_a,
         )?;
         // The reverse leg has no analogous requested_sell_amount to
         // cross-check: its sell amount is whatever the forward leg's quote
@@ -607,13 +670,13 @@ impl ArcusSpotRuntime {
             reverse_route,
             self.config.notional_usd,
             token_b_price_usd,
-            &token_b,
+            token_b,
         )?;
         let verified_round_trip_loss_bps = verify_round_trip_linkage_and_loss(row)?;
 
         Ok(SnapshotContext {
-            token_a,
-            token_b,
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
             token_a_price_usd,
             token_b_price_usd,
             row: row.clone(),
@@ -2012,5 +2075,226 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
         assert!(error.detail.contains("reverse leg notional"));
+    }
+
+    fn snapshot_with_route_unavailable(
+        collected_at: DateTime<Utc>,
+        nvda_price: &str,
+        amd_price: &str,
+    ) -> ArcusSpotRecorderSnapshot {
+        serde_json::from_value(json!({
+            "schema_version": 3,
+            "mode": "public_indicative_read_only",
+            "chain_id": 4663,
+            "collection_started_at": collected_at,
+            "collection_finished_at": collected_at,
+            "indexer_stats": {
+                "status": "error",
+                "error": {"stage": "indexer_stats", "classification": "http", "retryable": false, "message": "x"}
+            },
+            "token_metadata": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {
+                            "chainId": 4663,
+                            "symbol": "NVDA",
+                            "name": "NVIDIA",
+                            "address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                            "decimals": 18,
+                            "verified": true
+                        },
+                        {
+                            "chainId": 4663,
+                            "symbol": "AMD",
+                            "name": "AMD",
+                            "address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                            "decimals": 18,
+                            "verified": true
+                        }
+                    ],
+                    "requested_at": collected_at,
+                    "received_at": collected_at,
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "reference_overview": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {
+                            "ticker": "NVDA",
+                            "contractAddress": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                            "name": "NVIDIA",
+                            "category": "stock",
+                            "quote": {"price": nvda_price}
+                        },
+                        {
+                            "ticker": "AMD",
+                            "contractAddress": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                            "name": "AMD",
+                            "category": "stock",
+                            "quote": {"price": amd_price}
+                        }
+                    ],
+                    "requested_at": collected_at,
+                    "received_at": collected_at,
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "round_trips": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn risk_halt_engages_even_when_the_route_is_unavailable() {
+        // The recorder row is entirely absent (round_trips is empty), so
+        // snapshot_context() fails with RouteUnavailable. Token metadata and
+        // reference prices are otherwise valid, so equity can still be
+        // marked; the halt must still engage here rather than only on a
+        // later snapshot where a route happens to be available again.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.update_risk_baselines(event_time(), Decimal::from(300));
+        let snapshot = snapshot_with_route_unavailable(event_time(), "150", "50");
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::RouteUnavailable);
+            }
+            other => panic!("expected Observe/RouteUnavailable, got {other:?}"),
+        }
+        assert!(
+            runtime.state().risk_halt.is_some(),
+            "loss during a route outage must still engage the halt"
+        );
+    }
+
+    fn snapshot_with_valid_row(collected_at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
+        let row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        serde_json::from_value(json!({
+            "schema_version": 3,
+            "mode": "public_indicative_read_only",
+            "chain_id": 4663,
+            "collection_started_at": collected_at,
+            "collection_finished_at": collected_at,
+            "indexer_stats": {
+                "status": "error",
+                "error": {"stage": "indexer_stats", "classification": "http", "retryable": false, "message": "x"}
+            },
+            "token_metadata": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {
+                            "chainId": 4663,
+                            "symbol": "NVDA",
+                            "name": "NVIDIA",
+                            "address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                            "decimals": 18,
+                            "verified": true
+                        },
+                        {
+                            "chainId": 4663,
+                            "symbol": "AMD",
+                            "name": "AMD",
+                            "address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                            "decimals": 18,
+                            "verified": true
+                        }
+                    ],
+                    "requested_at": collected_at,
+                    "received_at": collected_at,
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "reference_overview": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {
+                            "ticker": "NVDA",
+                            "contractAddress": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                            "name": "NVIDIA",
+                            "category": "stock",
+                            "quote": {"price": "200"}
+                        },
+                        {
+                            "ticker": "AMD",
+                            "contractAddress": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                            "name": "AMD",
+                            "category": "stock",
+                            "quote": {"price": "100"}
+                        }
+                    ],
+                    "requested_at": collected_at,
+                    "received_at": collected_at,
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "round_trips": [row]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn risk_halted_rotated_regime_can_still_exit_on_max_hold() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.last_rotation_at =
+            Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
+        runtime.update_risk_baselines(event_time(), Decimal::from(300));
+        runtime.engage_risk_halt(
+            event_time(),
+            ArcusSpotRiskMark {
+                equity_usd: Decimal::from(100),
+                daily_loss_usd: Decimal::from(200),
+                cumulative_loss_usd: Decimal::from(200),
+            },
+        );
+        assert!(runtime.state.risk_halt.is_some());
+        let snapshot = snapshot_with_valid_row(event_time());
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
+            }
+            other => panic!("expected a max-hold exit despite the halt, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn risk_halted_neutral_regime_still_blocks_new_entries() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.update_risk_baselines(event_time(), Decimal::from(300));
+        runtime.engage_risk_halt(
+            event_time(),
+            ArcusSpotRiskMark {
+                equity_usd: Decimal::from(100),
+                daily_loss_usd: Decimal::from(200),
+                cumulative_loss_usd: Decimal::from(200),
+            },
+        );
+        assert!(runtime.state.risk_halt.is_some());
+        let snapshot = snapshot_with_valid_row(event_time());
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::RiskHalt);
+            }
+            other => panic!("expected Observe/RiskHalt, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
     }
 }
