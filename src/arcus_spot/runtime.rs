@@ -175,6 +175,14 @@ struct SnapshotContext {
     token_a_price_usd: Decimal,
     token_b_price_usd: Decimal,
     row: ArcusSpotRoundTripRecord,
+    /// Round-trip cost in bps, independently recomputed from the forward and
+    /// reverse recommended quote amounts and cross-checked against the
+    /// recorded `optimistic_round_trip_loss_bps`/`optimistic_return_amount`
+    /// fields. `build_plan`'s cost gate must use this instead of the row's
+    /// self-reported string: a row whose two legs do not actually chain
+    /// (reverse sellAmount != forward buyAmount) can report an arbitrarily
+    /// cheap loss while the real recommended amounts imply a much larger one.
+    verified_round_trip_loss_bps: Decimal,
 }
 
 struct RuntimeEventInput {
@@ -560,6 +568,7 @@ impl ArcusSpotRuntime {
                 "round-trip cost is absent",
             ));
         }
+        let verified_round_trip_loss_bps = verify_round_trip_linkage_and_loss(row)?;
 
         Ok(SnapshotContext {
             token_a,
@@ -567,6 +576,7 @@ impl ArcusSpotRuntime {
             token_a_price_usd,
             token_b_price_usd,
             row: row.clone(),
+            verified_round_trip_loss_bps,
         })
     }
 
@@ -652,10 +662,7 @@ impl ArcusSpotRuntime {
         evaluation_time: DateTime<Utc>,
         inventory: ArcusSpotInventory,
     ) -> Result<ArcusSpotRotationPlan, ArcusSpotHold> {
-        let route_loss = parse_positive_or_zero(
-            "optimistic_round_trip_loss_bps",
-            context.row.optimistic_round_trip_loss_bps.as_deref(),
-        )?;
+        let route_loss = context.verified_round_trip_loss_bps;
         let all_in_cost = route_loss
             .checked_add(self.config.gas_buffer_bps)
             .and_then(|cost| cost.checked_add(self.config.settlement_buffer_bps))
@@ -998,6 +1005,102 @@ fn validate_route(
     Ok(())
 }
 
+/// Independently derives the round-trip cost from the forward and reverse
+/// recommended quote amounts, and rejects the row unless that recomputation
+/// agrees with what the recorder self-reported. `row.forward`/`row.reverse`
+/// are assumed present (callers already gate on that).
+///
+/// A row's `optimistic_round_trip_loss_bps` is only a valid cost signal if
+/// its two legs actually chain: the reverse route must have been sized off
+/// the forward leg's recommended output, and the reported return amount must
+/// match what the reverse leg's recommended quote actually returns. Without
+/// checking this, a row with a mismatched (e.g. stale or mis-joined) reverse
+/// leg can report an arbitrarily cheap loss while the real recommended
+/// amounts imply a much larger one, letting both read-only plans and replay
+/// fills pass the cost gate on incorrect risk numbers.
+fn verify_round_trip_linkage_and_loss(
+    row: &ArcusSpotRoundTripRecord,
+) -> Result<Decimal, ArcusSpotHold> {
+    let forward = row
+        .forward
+        .as_ref()
+        .expect("caller has already verified forward is present");
+    let reverse = row
+        .reverse
+        .as_ref()
+        .expect("caller has already verified reverse is present");
+    let forward_quote = forward
+        .response
+        .payload
+        .recommended_quote()
+        .map_err(|error| {
+            ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
+        })?;
+    let reverse_quote = reverse
+        .response
+        .payload
+        .recommended_quote()
+        .map_err(|error| {
+            ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
+        })?;
+    if forward_quote.buy_amount != reverse.sell_amount {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            "reverse route sellAmount does not match the forward recommended buyAmount",
+        ));
+    }
+    if let Some(recorded_return) = row.optimistic_return_amount.as_deref() {
+        if recorded_return != reverse_quote.buy_amount {
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                "recorded optimistic return amount does not match the reverse recommended buyAmount",
+            ));
+        }
+    }
+    let start = Decimal::from_str(&forward.sell_amount).map_err(|error| {
+        ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!("forward sellAmount is invalid: {error}"),
+        )
+    })?;
+    if start <= Decimal::ZERO {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            "forward sellAmount must be positive",
+        ));
+    }
+    let returned = Decimal::from_str(&reverse_quote.buy_amount).map_err(|error| {
+        ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!("reverse recommended buyAmount is invalid: {error}"),
+        )
+    })?;
+    let recomputed = start
+        .checked_sub(returned)
+        .and_then(|loss| loss.checked_div(start))
+        .and_then(|ratio| ratio.checked_mul(Decimal::from(10_000)))
+        .ok_or_else(|| {
+            ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                "round-trip loss exceeds Decimal range",
+            )
+        })?;
+    let recorded = parse_positive_or_zero(
+        "optimistic_round_trip_loss_bps",
+        row.optimistic_round_trip_loss_bps.as_deref(),
+    )?;
+    if recomputed != recorded {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!(
+                "recorded round-trip loss {recorded} bps does not match {recomputed} bps \
+                 recomputed from the forward/reverse route amounts"
+            ),
+        ));
+    }
+    Ok(recomputed)
+}
+
 fn parse_positive_or_zero(field: &str, value: Option<&str>) -> Result<Decimal, ArcusSpotHold> {
     let value = value.ok_or_else(|| {
         ArcusSpotHold::new(
@@ -1269,6 +1372,7 @@ mod tests {
             token_a_price_usd: Decimal::from(200),
             token_b_price_usd: Decimal::from(100),
             row,
+            verified_round_trip_loss_bps: loss_bps,
         }
     }
 
@@ -1420,5 +1524,136 @@ mod tests {
             Decimal::from_str("0.023969319271332694").unwrap()
         );
         assert!(raw_amount_to_quantity("0", 18).is_err());
+    }
+
+    fn round_trip_row(
+        forward_buy_amount: &str,
+        reverse_sell_amount: &str,
+        reverse_buy_amount: &str,
+        optimistic_return_amount: &str,
+        optimistic_round_trip_loss_bps: &str,
+    ) -> ArcusSpotRoundTripRecord {
+        serde_json::from_value(json!({
+            "pair": {"sell_symbol": "NVDA", "buy_symbol": "AMD"},
+            "notional_usd": "5",
+            "sell_reference_price_usd": "200",
+            "buy_reference_price_usd": "100",
+            "requested_sell_amount": "25000000000000000",
+            "forward": {
+                "chain_id": 4663,
+                "sell_symbol": "NVDA",
+                "buy_symbol": "AMD",
+                "sell_token": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                "buy_token": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                "sell_amount": "25000000000000000",
+                "response": {
+                    "payload": {
+                        "recommended": "arcus",
+                        "all": [{
+                            "venue": "arcus",
+                            "buyAmount": forward_buy_amount,
+                            "sellAmount": "25000000000000000",
+                            "fees": []
+                        }],
+                        "errors": []
+                    },
+                    "requested_at": event_time(),
+                    "received_at": event_time(),
+                    "latency_ms": 1000,
+                    "attempts": 1
+                }
+            },
+            "reverse": {
+                "chain_id": 4663,
+                "sell_symbol": "AMD",
+                "buy_symbol": "NVDA",
+                "sell_token": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                "buy_token": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                "sell_amount": reverse_sell_amount,
+                "response": {
+                    "payload": {
+                        "recommended": "arcus",
+                        "all": [{
+                            "venue": "arcus",
+                            "buyAmount": reverse_buy_amount,
+                            "sellAmount": reverse_sell_amount,
+                            "fees": []
+                        }],
+                        "errors": []
+                    },
+                    "requested_at": event_time(),
+                    "received_at": event_time(),
+                    "latency_ms": 1000,
+                    "attempts": 1
+                }
+            },
+            "optimistic_return_amount": optimistic_return_amount,
+            "optimistic_round_trip_loss_bps": optimistic_round_trip_loss_bps,
+            "errors": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn round_trip_linkage_accepts_a_consistent_row() {
+        let row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        assert_eq!(
+            verify_round_trip_linkage_and_loss(&row).unwrap(),
+            Decimal::from(80)
+        );
+    }
+
+    #[test]
+    fn round_trip_linkage_rejects_a_reverse_leg_not_sized_off_the_forward_output() {
+        // The reverse route was requested with a sellAmount that does not
+        // match what the forward leg's recommended quote actually produces,
+        // so the two legs do not chain into one real round trip.
+        let row = round_trip_row(
+            "49000000000000000",
+            "48000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        let error = verify_round_trip_linkage_and_loss(&row).unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(error.detail.contains("reverse route sellAmount"));
+    }
+
+    #[test]
+    fn round_trip_linkage_rejects_a_stale_recorded_return_amount() {
+        let row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24900000000000000",
+            "80",
+        );
+        let error = verify_round_trip_linkage_and_loss(&row).unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(error.detail.contains("optimistic return amount"));
+    }
+
+    #[test]
+    fn round_trip_linkage_rejects_a_loss_bps_that_understates_the_real_cost() {
+        // The forward/reverse amounts imply an 80 bps loss, but the row
+        // self-reports 20 bps; a cost gate trusting the reported number
+        // alone would pass a round trip that is really 4x costlier.
+        let row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "20",
+        );
+        let error = verify_round_trip_linkage_and_loss(&row).unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(error.detail.contains("does not match"));
     }
 }
