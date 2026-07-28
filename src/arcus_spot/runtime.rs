@@ -597,6 +597,18 @@ impl ArcusSpotRuntime {
             token_a_price_usd,
             &token_a,
         )?;
+        // The reverse leg has no analogous requested_sell_amount to
+        // cross-check: its sell amount is whatever the forward leg's quote
+        // reported as its buy amount, not independently requested from the
+        // notional. A malformed or severely off-market forward quote could
+        // therefore size a B-to-A rotation far outside the configured
+        // notional while still linking correctly to the forward leg.
+        verify_reverse_notional_bound(
+            reverse_route,
+            self.config.notional_usd,
+            token_b_price_usd,
+            &token_b,
+        )?;
         let verified_round_trip_loss_bps = verify_round_trip_linkage_and_loss(row)?;
 
         Ok(SnapshotContext {
@@ -1145,6 +1157,45 @@ fn verify_requested_notional_amount(
             format!(
                 "requested_sell_amount {requested_decimal} does not match {expected} raw units \
                  expected for notional {notional_usd} at price {sell_reference_price_usd}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A gross data-sanity bound on the reverse leg's USD value, not a slippage
+/// tolerance: normal round-trip costs are already capped in bps by
+/// `max_all_in_round_trip_cost_bps`. This only needs to be loose enough to
+/// tolerate ordinary price movement between the forward and reverse legs
+/// while catching amounts wrong by an order of magnitude (wrong token,
+/// decimal error, unit mismatch) that would otherwise size a rotation far
+/// outside the configured notional while still linking correctly to the
+/// forward leg.
+fn verify_reverse_notional_bound(
+    reverse: &ArcusSpotRouteObservation,
+    notional_usd: Decimal,
+    reference_price_usd: Decimal,
+    sell_token: &ArcusSpotToken,
+) -> Result<(), ArcusSpotHold> {
+    let reverse_quantity = raw_amount_to_quantity(&reverse.sell_amount, sell_token.decimals)
+        .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
+    let reverse_notional_usd = reverse_quantity
+        .checked_mul(reference_price_usd)
+        .ok_or_else(|| {
+            ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                "reverse leg notional exceeds Decimal range",
+            )
+        })?;
+    let deviation = Decimal::new(5, 1); // 50%
+    let floor = notional_usd * (Decimal::ONE - deviation);
+    let ceiling = notional_usd * (Decimal::ONE + deviation);
+    if reverse_notional_usd < floor || reverse_notional_usd > ceiling {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!(
+                "reverse leg notional {reverse_notional_usd} USD is outside [{floor}, {ceiling}] \
+                 for configured notional {notional_usd}"
             ),
         ));
     }
@@ -1909,5 +1960,57 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
         assert!(error.detail.contains("absent"));
+    }
+
+    fn amd_token() -> ArcusSpotToken {
+        ArcusSpotToken {
+            chain_id: 4663,
+            symbol: "AMD".to_string(),
+            name: "AMD".to_string(),
+            address: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string(),
+            decimals: 18,
+            source: Some("server".to_string()),
+            category: Some("stock".to_string()),
+            verified: true,
+            wrapped_token_address: None,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn reverse_notional_bound_accepts_an_ordinary_round_trip() {
+        let row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        let reverse = row.reverse.as_ref().unwrap();
+        // 0.049 units at $100 = $4.90, within 50% of the $5 notional.
+        verify_reverse_notional_bound(reverse, Decimal::from(5), Decimal::from(100), &amd_token())
+            .unwrap();
+    }
+
+    #[test]
+    fn reverse_notional_bound_rejects_an_order_of_magnitude_mismatch() {
+        // 0.49 units at $100 = $49, far outside 50% of the $5 notional.
+        let row = round_trip_row(
+            "490000000000000000",
+            "490000000000000000",
+            "248000000000000000",
+            "248000000000000000",
+            "80",
+        );
+        let reverse = row.reverse.as_ref().unwrap();
+        let error = verify_reverse_notional_bound(
+            reverse,
+            Decimal::from(5),
+            Decimal::from(100),
+            &amd_token(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(error.detail.contains("reverse leg notional"));
     }
 }
