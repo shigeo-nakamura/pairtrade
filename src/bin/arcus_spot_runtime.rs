@@ -57,6 +57,15 @@ fn main() -> Result<()> {
                 input_path.display()
             );
         }
+        if same_file(config_path, output_path) {
+            bail!(
+                "EVENTS_JSONL {} must not alias CONFIG_YAML {}: the config has \
+                 already been read into memory, but creating the output would \
+                 still truncate it on disk",
+                output_path.display(),
+                config_path.display()
+            );
+        }
         let output = File::create(output_path)
             .with_context(|| format!("failed to create output {}", output_path.display()))?;
         replay_jsonl(&mut runtime, BufReader::new(input), BufWriter::new(output))?

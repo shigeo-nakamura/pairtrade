@@ -4,7 +4,7 @@ use dex_connector::{
     ArcusSpotCapture, ArcusSpotOverviewEntry, ArcusSpotRecorderSnapshot, ArcusSpotRoundTripRecord,
     ArcusSpotRouteObservation, ArcusSpotToken,
 };
-use rust_decimal::{prelude::ToPrimitive, Decimal};
+use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -230,7 +230,7 @@ impl ArcusSpotRuntime {
         let inventory_before = self.state.inventory;
         let regime_before = self.state.regime;
 
-        let context = match self.snapshot_context(snapshot) {
+        let context = match self.snapshot_context(snapshot, evaluation_time) {
             Ok(context) => context,
             Err(hold) => {
                 return self.event(RuntimeEventInput {
@@ -473,6 +473,7 @@ impl ArcusSpotRuntime {
     fn snapshot_context(
         &self,
         snapshot: &ArcusSpotRecorderSnapshot,
+        evaluation_time: DateTime<Utc>,
     ) -> Result<SnapshotContext, ArcusSpotHold> {
         if snapshot.schema_version != SUPPORTED_RECORDER_SCHEMA_VERSION {
             return Err(ArcusSpotHold::new(
@@ -568,6 +569,34 @@ impl ArcusSpotRuntime {
                 "round-trip cost is absent",
             ));
         }
+        let forward_route = row.forward.as_ref().expect("checked above");
+        let reverse_route = row.reverse.as_ref().expect("checked above");
+        // Both legs feed verified_round_trip_loss_bps below, and either one
+        // can also be selected as the executing route once a direction is
+        // chosen; validating only the leg picked at build_plan() time would
+        // let an untrusted identity/amount/staleness in the other leg still
+        // shape the cost gate and the row's eventual selection.
+        validate_route_leg(
+            forward_route,
+            &token_a,
+            &token_b,
+            evaluation_time,
+            self.config.max_quote_age_secs,
+        )?;
+        validate_route_leg(
+            reverse_route,
+            &token_b,
+            &token_a,
+            evaluation_time,
+            self.config.max_quote_age_secs,
+        )?;
+        verify_requested_notional_amount(
+            row,
+            forward_route,
+            self.config.notional_usd,
+            token_a_price_usd,
+            &token_a,
+        )?;
         let verified_round_trip_loss_bps = verify_round_trip_linkage_and_loss(row)?;
 
         Ok(SnapshotContext {
@@ -698,7 +727,18 @@ impl ArcusSpotRuntime {
                 self.config.inventory_floors.token_b,
             ),
         };
-        validate_route(route, sell_token, buy_token)?;
+        // snapshot_context() already validated both legs' identity, echoed
+        // sell amount, and freshness before accepting this row; re-running
+        // the same check on the selected leg here keeps build_plan callable
+        // (and independently testable) without relying on that upstream
+        // gate having run first.
+        validate_route_leg(
+            route,
+            sell_token,
+            buy_token,
+            evaluation_time,
+            self.config.max_quote_age_secs,
+        )?;
         let quote = route
             .response
             .payload
@@ -706,31 +746,6 @@ impl ArcusSpotRuntime {
             .map_err(|error| {
                 ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
             })?;
-        if quote.sell_amount != route.sell_amount {
-            return Err(ArcusSpotHold::new(
-                ArcusSpotHoldCode::RouteUnavailable,
-                "recommended quote sell amount does not match route request",
-            ));
-        }
-        let quote_age_ms = evaluation_time
-            .signed_duration_since(route.response.received_at)
-            .num_milliseconds();
-        if quote_age_ms < 0 {
-            return Err(ArcusSpotHold::new(
-                ArcusSpotHoldCode::InvalidSnapshot,
-                "quote receipt is later than evaluation time",
-            ));
-        }
-        let max_quote_age_ms = self.config.max_quote_age_secs.saturating_mul(1_000);
-        if quote_age_ms > max_quote_age_ms {
-            return Err(ArcusSpotHold::new(
-                ArcusSpotHoldCode::StaleQuote,
-                format!(
-                    "quote age {}ms exceeds {}ms",
-                    quote_age_ms, max_quote_age_ms
-                ),
-            ));
-        }
 
         let sell_quantity = raw_amount_to_quantity(&route.sell_amount, sell_token.decimals)
             .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
@@ -1000,6 +1015,137 @@ fn validate_route(
         return Err(ArcusSpotHold::new(
             ArcusSpotHoldCode::RouteUnavailable,
             "route token identity does not match verified metadata",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates one route leg's token identity, that its recommended quote
+/// actually echoes the requested sell amount, and that its quote receipt is
+/// neither in the future nor stale relative to `evaluation_time`. Used both
+/// to pre-validate every leg of a recorder row up front and to re-check the
+/// specific leg a rotation plan ends up selecting.
+fn validate_route_leg(
+    route: &ArcusSpotRouteObservation,
+    sell_token: &ArcusSpotToken,
+    buy_token: &ArcusSpotToken,
+    evaluation_time: DateTime<Utc>,
+    max_quote_age_secs: i64,
+) -> Result<(), ArcusSpotHold> {
+    validate_route(route, sell_token, buy_token)?;
+    let quote = route
+        .response
+        .payload
+        .recommended_quote()
+        .map_err(|error| {
+            ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
+        })?;
+    if quote.sell_amount != route.sell_amount {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::RouteUnavailable,
+            "recommended quote sell amount does not match route request",
+        ));
+    }
+    let quote_age_ms = evaluation_time
+        .signed_duration_since(route.response.received_at)
+        .num_milliseconds();
+    if quote_age_ms < 0 {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            "quote receipt is later than evaluation time",
+        ));
+    }
+    let max_quote_age_ms = max_quote_age_secs.saturating_mul(1_000);
+    if quote_age_ms > max_quote_age_ms {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::StaleQuote,
+            format!("quote age {quote_age_ms}ms exceeds {max_quote_age_ms}ms"),
+        ));
+    }
+    Ok(())
+}
+
+/// The raw token amount the recorder should have requested for `notional_usd`
+/// at `reference_price_usd`, replicating dex-connector's
+/// `notional_to_raw_amount` (USD / price, scaled to `decimals`, truncated
+/// toward zero) exactly. Used to cross-check a row's self-reported
+/// `requested_sell_amount` rather than trusting it outright.
+fn expected_raw_notional_amount(
+    notional_usd: Decimal,
+    reference_price_usd: Decimal,
+    decimals: u32,
+) -> Result<Decimal, ArcusSpotHold> {
+    if notional_usd <= Decimal::ZERO || reference_price_usd <= Decimal::ZERO {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            "notional and reference price must be positive",
+        ));
+    }
+    let raw_scale = 10_i128.checked_pow(decimals).ok_or_else(|| {
+        ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!("token decimals {decimals} exceed the replay Decimal range"),
+        )
+    })?;
+    let scale = Decimal::try_from_i128_with_scale(raw_scale, 0).map_err(|error| {
+        ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!("token decimals {decimals} exceed the replay Decimal range: {error}"),
+        )
+    })?;
+    notional_usd
+        .checked_div(reference_price_usd)
+        .and_then(|quantity| quantity.checked_mul(scale))
+        .map(|value| value.round_dp_with_strategy(0, RoundingStrategy::ToZero))
+        .ok_or_else(|| {
+            ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                "USD notional exceeds the replay Decimal range",
+            )
+        })
+}
+
+/// A row is selected from the snapshot solely by its `notional_usd` label
+/// (see `snapshot_context`), but the quantity actually traded comes from
+/// `forward.sell_amount`. A malformed or mis-joined row can carry a label
+/// that does not match its own embedded route, defeating the configured
+/// notional limit; cross-check the row's self-reported requested amount
+/// against both the forward route's actual sell amount and the amount
+/// independently recomputed from the notional and reference price.
+fn verify_requested_notional_amount(
+    row: &ArcusSpotRoundTripRecord,
+    forward: &ArcusSpotRouteObservation,
+    notional_usd: Decimal,
+    sell_reference_price_usd: Decimal,
+    sell_token: &ArcusSpotToken,
+) -> Result<(), ArcusSpotHold> {
+    let requested = row.requested_sell_amount.as_deref().ok_or_else(|| {
+        ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            "requested_sell_amount is absent",
+        )
+    })?;
+    if requested != forward.sell_amount {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            "requested_sell_amount does not match the forward route sellAmount",
+        ));
+    }
+    let requested_decimal = Decimal::from_str(requested).map_err(|error| {
+        ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!("requested_sell_amount is invalid: {error}"),
+        )
+    })?;
+    let expected =
+        expected_raw_notional_amount(notional_usd, sell_reference_price_usd, sell_token.decimals)?;
+    if requested_decimal != expected {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!(
+                "requested_sell_amount {requested_decimal} does not match {expected} raw units \
+                 expected for notional {notional_usd} at price {sell_reference_price_usd}"
+            ),
         ));
     }
     Ok(())
@@ -1655,5 +1801,113 @@ mod tests {
         let error = verify_round_trip_linkage_and_loss(&row).unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
         assert!(error.detail.contains("does not match"));
+    }
+
+    fn nvda_token() -> ArcusSpotToken {
+        ArcusSpotToken {
+            chain_id: 4663,
+            symbol: "NVDA".to_string(),
+            name: "NVIDIA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+            source: Some("server".to_string()),
+            category: Some("stock".to_string()),
+            verified: true,
+            wrapped_token_address: None,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn requested_notional_amount_accepts_a_row_whose_amount_matches_its_label() {
+        let row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        let forward = row.forward.as_ref().unwrap();
+        verify_requested_notional_amount(
+            &row,
+            forward,
+            Decimal::from(5),
+            Decimal::from(200),
+            &nvda_token(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn requested_notional_amount_rejects_a_row_labeled_smaller_than_its_route() {
+        // The row is labeled (and passed here as) a $5 notional, but its
+        // requested_sell_amount reflects the $50 route a mis-joined or
+        // malformed row could actually carry.
+        let mut row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        row.requested_sell_amount = Some("250000000000000000".to_string());
+        row.forward.as_mut().unwrap().sell_amount = "250000000000000000".to_string();
+        let forward = row.forward.as_ref().unwrap();
+        let error = verify_requested_notional_amount(
+            &row,
+            forward,
+            Decimal::from(5),
+            Decimal::from(200),
+            &nvda_token(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(error.detail.contains("does not match"));
+    }
+
+    #[test]
+    fn requested_notional_amount_rejects_a_requested_amount_disjoint_from_the_route() {
+        let mut row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        row.requested_sell_amount = Some("1".to_string());
+        let forward = row.forward.as_ref().unwrap();
+        let error = verify_requested_notional_amount(
+            &row,
+            forward,
+            Decimal::from(5),
+            Decimal::from(200),
+            &nvda_token(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(error.detail.contains("forward route sellAmount"));
+    }
+
+    #[test]
+    fn requested_notional_amount_rejects_a_missing_requested_amount() {
+        let mut row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        row.requested_sell_amount = None;
+        let forward = row.forward.as_ref().unwrap();
+        let error = verify_requested_notional_amount(
+            &row,
+            forward,
+            Decimal::from(5),
+            Decimal::from(200),
+            &nvda_token(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(error.detail.contains("absent"));
     }
 }
