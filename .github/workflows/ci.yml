@@ -61,6 +61,15 @@ jobs:
             exit 1
           fi
 
+  # bot-strategy#765: regression-tests the capital-event exclusion logic in
+  # canary_diff_report.py (stdlib-only, no boto3/AWS needed for this layer).
+  test-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run canary_diff_report.py unit tests
+        run: python3 scripts/test_canary_diff_report.py -v
+
   resolve-ref:
     runs-on: ubuntu-latest
     outputs:
@@ -175,7 +184,7 @@ jobs:
     # the QEMU emulated arm64 cargo build past the original 60min cap;
     # bumped to 180 to leave headroom for future SDK-sized additions.
     timeout-minutes: 180
-    needs: [resolve-ref, build-test, lint-no-bot-restart]
+    needs: [resolve-ref, build-test, lint-no-bot-restart, test-scripts]
     if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
     env:

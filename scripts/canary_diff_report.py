@@ -105,6 +105,17 @@ def s3_get_jsonl(client, key: str) -> list[dict]:
 # Refined under bot-strategy#376 Phase 5 Stage B baseline review.
 TRADE_EVENT_BPS_OF_EQUITY = 5.0
 
+# bot-strategy#765: a single-step |Δequity| this large relative to the
+# window's starting equity is a deposit/withdrawal capital event, not
+# trading PnL — round rollouts routinely move >50% of a variant's equity
+# in one step (e.g. bot-strategy#751 withdrew Pair-A to ~$0 then
+# redeposited to $6,000, which the naive equity_end - equity_start diff
+# misread as an $3,834.95 trading gain in bot-strategy#762). No observed
+# real trade-close has come close to this fraction of equity_start.
+# Capital-event steps are excluded entirely from cumulative_pnl,
+# trade_count/win_count, and median_per_trade_pnl.
+CAPITAL_EVENT_FRACTION_OF_EQUITY = 0.50
+
 
 def filter_window(samples: list[dict], cutoff_ts_ms: float) -> list[dict]:
     """Filter equity-history samples to those at or after the cutoff.
@@ -118,16 +129,13 @@ def filter_window(samples: list[dict], cutoff_ts_ms: float) -> list[dict]:
     return [s for s in samples if s.get("ts", 0) >= cutoff_ts_ms]
 
 
-def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
-                   now_ts_ms: float) -> WindowSnapshot:
-    """Build a 7-day window summary from S3-mirrored bot state.
+def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
+                             cutoff_ts_ms: float, now_ts_ms: float) -> WindowSnapshot:
+    """Pure computation over already-fetched status/history data.
 
-    Source of truth is `equity_history.jsonl`. It is more durable than
-    status.json trade_stats, but a state reset or manual main-bot restart
-    can truncate it. Window coverage therefore gates the verdict.
+    Split out from `build_snapshot` so the verdict logic can be exercised
+    with fixture data (bot-strategy#765) without mocking S3.
     """
-    status = s3_get_json(client, f"{prefix}/{agent}.json") or {}
-    history = s3_get_jsonl(client, f"{prefix}/{agent}.equity_history.jsonl")
     history_in_window = filter_window(history, cutoff_ts_ms)
 
     funding_carry = float(status.get("funding_carry_today", 0.0) or 0.0)
@@ -154,7 +162,6 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
     covered_span_ms = max(0.0, history_end_ts_ms - history_start_ts_ms)
     equity_start = float(history_in_window[0]["equity"])
     equity_end = float(history_in_window[-1]["equity"])
-    cumulative_pnl = equity_end - equity_start
 
     # Trade count heuristic: count equity-history transitions where
     # |Δ equity| ≥ TRADE_EVENT_BPS_OF_EQUITY bps of starting equity.
@@ -163,11 +170,18 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
     # mirrored to S3. Until then the heuristic gives a directionally
     # correct trade-rate ratio (the metric the verdict cares about).
     threshold = abs(equity_start) * TRADE_EVENT_BPS_OF_EQUITY / 10_000.0
+    capital_event_threshold = abs(equity_start) * CAPITAL_EVENT_FRACTION_OF_EQUITY
     trade_count = 0
     win_count = 0
     deltas: list[float] = []
+    trading_pnl = 0.0
     for i in range(1, len(history_in_window)):
         delta = history_in_window[i]["equity"] - history_in_window[i - 1]["equity"]
+        if capital_event_threshold > 0.0 and abs(delta) >= capital_event_threshold:
+            # Deposit/withdrawal, not a trade — excluded from PnL and
+            # trade-count accounting (bot-strategy#765).
+            continue
+        trading_pnl += delta
         if abs(delta) >= threshold:
             trade_count += 1
             if delta > 0:
@@ -179,7 +193,7 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
         agent=agent,
         trade_count=trade_count,
         win_count=win_count,
-        cumulative_pnl=cumulative_pnl,
+        cumulative_pnl=trading_pnl,
         median_per_trade_pnl=median_per_trade_pnl,
         funding_carry=funding_carry,
         equity_start=equity_start,
@@ -188,6 +202,19 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
         history_end_ts_ms=history_end_ts_ms,
         window_coverage=min(1.0, covered_span_ms / requested_span_ms),
     )
+
+
+def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
+                   now_ts_ms: float) -> WindowSnapshot:
+    """Build a 7-day window summary from S3-mirrored bot state.
+
+    Source of truth is `equity_history.jsonl`. It is more durable than
+    status.json trade_stats, but a state reset or manual main-bot restart
+    can truncate it. Window coverage therefore gates the verdict.
+    """
+    status = s3_get_json(client, f"{prefix}/{agent}.json") or {}
+    history = s3_get_jsonl(client, f"{prefix}/{agent}.equity_history.jsonl")
+    return build_snapshot_from_data(agent, status, history, cutoff_ts_ms, now_ts_ms)
 
 
 def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot,
