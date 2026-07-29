@@ -142,6 +142,14 @@ pub struct ArcusSpotRuntimeState {
     pub regime: ArcusSpotRegime,
     pub relative_log_price_history: Vec<f64>,
     pub last_rotation_at: Option<DateTime<Utc>>,
+    /// Quantity of the currently-held (bought) token still open from the
+    /// entry that produced the current non-Neutral `regime`, denominated in
+    /// that token. `None` while `Neutral`. An exit's route offers whatever
+    /// quantity the recorder's fixed-notional quote happens to propose,
+    /// which is independent of what was actually acquired at entry, so this
+    /// bounds each exit to the still-open amount and lets a partial fill
+    /// keep the regime rotated instead of being declared closed early.
+    pub rotated_quantity: Option<Decimal>,
     pub initial_equity_usd: Option<Decimal>,
     pub daily_baseline_day: Option<String>,
     pub daily_baseline_equity_usd: Option<Decimal>,
@@ -156,6 +164,7 @@ impl ArcusSpotRuntimeState {
             regime: ArcusSpotRegime::Neutral,
             relative_log_price_history: Vec::new(),
             last_rotation_at: None,
+            rotated_quantity: None,
             initial_equity_usd: None,
             daily_baseline_day: None,
             daily_baseline_equity_usd: None,
@@ -294,26 +303,15 @@ impl ArcusSpotRuntime {
         let risk_before = self.risk_mark(equity_before);
         self.engage_risk_halt(evaluation_time, risk_before);
 
-        let context = match self.snapshot_context(snapshot, evaluation_time, &price) {
-            Ok(context) => context,
-            Err(hold) => {
-                return self.event(RuntimeEventInput {
-                    sequence,
-                    observed_at: evaluation_time,
-                    inventory_before,
-                    regime_before,
-                    token_a_reference_price_usd: Some(price.token_a_price_usd),
-                    token_b_reference_price_usd: Some(price.token_b_price_usd),
-                    relative_log_price: None,
-                    z_score: None,
-                    risk_before: Some(risk_before),
-                    decision: ArcusSpotDecision::Observe { hold },
-                })
-            }
-        };
-
+        // Computed and appended to the signal window from `price` (token
+        // metadata + reference prices only) before the route-availability
+        // gate below, so an outage that drops the recorder's route rows
+        // does not also stall the signal history. Otherwise the first
+        // route recovered after an outage would be scored against
+        // pre-outage prices and could produce a spurious entry or fill
+        // even though the ratio was stable throughout.
         let relative_log_price =
-            match relative_log_price(context.token_a_price_usd, context.token_b_price_usd) {
+            match relative_log_price(price.token_a_price_usd, price.token_b_price_usd) {
                 Ok(value) => value,
                 Err(detail) => {
                     return self.event(RuntimeEventInput {
@@ -321,8 +319,8 @@ impl ArcusSpotRuntime {
                         observed_at: evaluation_time,
                         inventory_before,
                         regime_before,
-                        token_a_reference_price_usd: Some(context.token_a_price_usd),
-                        token_b_reference_price_usd: Some(context.token_b_price_usd),
+                        token_a_reference_price_usd: Some(price.token_a_price_usd),
+                        token_b_reference_price_usd: Some(price.token_b_price_usd),
                         relative_log_price: None,
                         z_score: None,
                         risk_before: Some(risk_before),
@@ -345,6 +343,24 @@ impl ArcusSpotRuntime {
                 self.state.relative_log_price_history.len() - self.config.signal_window_samples;
             self.state.relative_log_price_history.drain(0..excess);
         }
+
+        let context = match self.snapshot_context(snapshot, evaluation_time, &price) {
+            Ok(context) => context,
+            Err(hold) => {
+                return self.event(RuntimeEventInput {
+                    sequence,
+                    observed_at: evaluation_time,
+                    inventory_before,
+                    regime_before,
+                    token_a_reference_price_usd: Some(price.token_a_price_usd),
+                    token_b_reference_price_usd: Some(price.token_b_price_usd),
+                    relative_log_price: Some(relative_log_price),
+                    z_score,
+                    risk_before: Some(risk_before),
+                    decision: ArcusSpotDecision::Observe { hold },
+                })
+            }
+        };
 
         // A halt blocks new entries, but an existing rotated position must
         // still be able to exit via mean-reversion or max-hold: rotation_signal
@@ -451,11 +467,29 @@ impl ArcusSpotRuntime {
                             ArcusSpotDirection::TokenBToTokenA => ArcusSpotRegime::RotatedBToA,
                         };
                         self.state.last_rotation_at = Some(evaluation_time);
+                        self.state.rotated_quantity = Some(plan.buy_quantity);
                     }
                     ArcusSpotRotationTrigger::MeanReversionExit
                     | ArcusSpotRotationTrigger::MaxHoldExit => {
-                        self.state.regime = ArcusSpotRegime::Neutral;
-                        self.state.last_rotation_at = None;
+                        // build_plan() bounded plan.sell_quantity to at most
+                        // the tracked open quantity, so this is >= 0; only
+                        // clear the regime once the whole open amount has
+                        // actually been unwound, otherwise stay rotated
+                        // with the remaining open quantity so the next step
+                        // keeps trying to close it out.
+                        let remaining = self
+                            .state
+                            .rotated_quantity
+                            .and_then(|open| open.checked_sub(plan.sell_quantity))
+                            .unwrap_or(Decimal::ZERO)
+                            .max(Decimal::ZERO);
+                        if remaining.is_zero() {
+                            self.state.regime = ArcusSpotRegime::Neutral;
+                            self.state.last_rotation_at = None;
+                            self.state.rotated_quantity = None;
+                        } else {
+                            self.state.rotated_quantity = Some(remaining);
+                        }
                     }
                 }
                 ArcusSpotDecision::SimulatedFill { plan }
@@ -841,22 +875,52 @@ impl ArcusSpotRuntime {
                 ),
             ));
         }
-        let max_rotation = sellable
-            .checked_mul(self.config.max_rotation_fraction)
-            .ok_or_else(|| {
-                ArcusSpotHold::new(
+        // An exit's route offers whatever quantity the recorder's
+        // fixed-notional quote happens to propose at this snapshot, which is
+        // independent of the quantity actually acquired at entry. Bounding
+        // it to the tracked open rotation quantity keeps an exit from
+        // selling into pre-existing (pre-rotation) inventory; the caller
+        // only clears the regime once this tracked amount reaches zero, so
+        // a route that offers less than the open amount is accepted as a
+        // partial unwind rather than mis-declaring the position closed.
+        if trigger != ArcusSpotRotationTrigger::EntrySignal {
+            if let Some(open_quantity) = self.state.rotated_quantity {
+                if sell_quantity > open_quantity {
+                    return Err(ArcusSpotHold::new(
+                        ArcusSpotHoldCode::RotationLimit,
+                        format!(
+                            "exit selling {} {} exceeds the open rotation quantity {}",
+                            sell_quantity, sell_token.symbol, open_quantity
+                        ),
+                    ));
+                }
+            }
+        }
+        // The cap limits how large a single new entry may be relative to
+        // available inventory; it must not also apply to exits. The
+        // fraction is recomputed against whatever balance remains after the
+        // entry, which is smaller than the balance the entry itself was
+        // capped against, so applying the same cap to the reverse leg can
+        // reject the exit outright and leave the position permanently
+        // stuck in a rotated regime with no way to unwind.
+        if trigger == ArcusSpotRotationTrigger::EntrySignal {
+            let max_rotation = sellable
+                .checked_mul(self.config.max_rotation_fraction)
+                .ok_or_else(|| {
+                    ArcusSpotHold::new(
+                        ArcusSpotHoldCode::RotationLimit,
+                        "rotation cap exceeds Decimal range",
+                    )
+                })?;
+            if sell_quantity > max_rotation {
+                return Err(ArcusSpotHold::new(
                     ArcusSpotHoldCode::RotationLimit,
-                    "rotation cap exceeds Decimal range",
-                )
-            })?;
-        if sell_quantity > max_rotation {
-            return Err(ArcusSpotHold::new(
-                ArcusSpotHoldCode::RotationLimit,
-                format!(
-                    "selling {} {} exceeds per-action cap {}",
-                    sell_quantity, sell_token.symbol, max_rotation
-                ),
-            ));
+                    format!(
+                        "selling {} {} exceeds per-action cap {}",
+                        sell_quantity, sell_token.symbol, max_rotation
+                    ),
+                ));
+            }
         }
 
         let predicted_inventory = match direction {
@@ -2172,6 +2236,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn price_sampling_continues_during_a_route_outage() {
+        // A route outage must not stall the signal window: otherwise the
+        // first route recovered after an outage is scored against
+        // pre-outage prices and can produce a spurious entry even if the
+        // ratio was stable throughout.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        assert_eq!(runtime.state().relative_log_price_history.len(), 0);
+        let snapshot = snapshot_with_route_unavailable(event_time(), "150", "50");
+        let event = runtime.step_at(&snapshot, event_time());
+        assert!(matches!(
+            event.decision,
+            ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::RouteUnavailable
+        ));
+        assert_eq!(event.relative_log_price, Some((150.0_f64 / 50.0_f64).ln()));
+        assert_eq!(runtime.state().relative_log_price_history.len(), 1);
+    }
+
     fn snapshot_with_valid_row(collected_at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
         let row = round_trip_row(
             "49000000000000000",
@@ -2272,6 +2354,91 @@ mod tests {
             other => panic!("expected a max-hold exit despite the halt, got {other:?}"),
         }
         assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn exit_exceeding_the_open_rotation_quantity_is_rejected() {
+        // The row's reverse leg wants to sell 0.049 AMD, but only 0.04 AMD
+        // is tracked as open from the entry; accepting it would consume
+        // pre-existing (pre-rotation) AMD inventory.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(40, 3));
+        runtime.state.last_rotation_at =
+            Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
+        let snapshot = snapshot_with_valid_row(event_time());
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::RotationLimit);
+            }
+            other => panic!("expected Observe/RotationLimit, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
+        assert_eq!(runtime.state().rotated_quantity, Some(Decimal::new(40, 3)));
+    }
+
+    #[test]
+    fn partial_exit_keeps_the_regime_rotated_with_the_remaining_open_quantity() {
+        // 0.06 AMD is tracked as open, but this snapshot's reverse leg only
+        // unwinds 0.049 of it; the position must stay rotated with 0.011
+        // AMD still open rather than being declared closed.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(60, 3));
+        runtime.state.last_rotation_at =
+            Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
+        let snapshot = snapshot_with_valid_row(event_time());
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
+                assert_eq!(plan.sell_quantity, Decimal::new(49, 3));
+            }
+            other => panic!("expected a partial max-hold exit, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
+        assert_eq!(runtime.state().rotated_quantity, Some(Decimal::new(11, 3)));
+    }
+
+    #[test]
+    fn exit_matching_the_open_rotation_quantity_clears_the_regime() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(49, 3));
+        runtime.state.last_rotation_at =
+            Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
+        let snapshot = snapshot_with_valid_row(event_time());
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
+            }
+            other => panic!("expected a closing max-hold exit, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+        assert_eq!(runtime.state().rotated_quantity, None);
+    }
+
+    #[test]
+    fn entry_plan_ignores_the_rotation_fraction_cap_is_not_applied_to_exits() {
+        // The per-action rotation-fraction cap is entry-only (see
+        // `max_rotation_fraction` handling in build_plan); the open-quantity
+        // cap tested above is what protects exits instead. A tight fraction
+        // cap must still reject an oversized entry.
+        let mut cfg = config();
+        cfg.max_rotation_fraction = Decimal::new(1, 2); // 1%
+        let runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let error = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::RotationLimit);
     }
 
     #[test]
