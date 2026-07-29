@@ -257,7 +257,7 @@ impl ArcusSpotRuntime {
         // row itself is missing, errored, or stale, so a loss-limit breach
         // during a route outage still engages the (sticky) halt instead of
         // silently recovering before the next valid route.
-        let price = match self.price_context(snapshot) {
+        let price = match self.price_context(snapshot, evaluation_time) {
             Ok(price) => price,
             Err(hold) => {
                 return self.event(RuntimeEventInput {
@@ -552,6 +552,7 @@ impl ArcusSpotRuntime {
     fn price_context(
         &self,
         snapshot: &ArcusSpotRecorderSnapshot,
+        evaluation_time: DateTime<Utc>,
     ) -> Result<PriceContext, ArcusSpotHold> {
         if snapshot.schema_version != SUPPORTED_RECORDER_SCHEMA_VERSION {
             return Err(ArcusSpotHold::new(
@@ -588,6 +589,28 @@ impl ArcusSpotRuntime {
         let token_a = find_token(tokens, &self.config.pair.sell_symbol, self.config.chain_id)?;
         let token_b = find_token(tokens, &self.config.pair.buy_symbol, self.config.chain_id)?;
         let overview = capture_payload(&snapshot.reference_overview, "reference_overview")?;
+        // A fresh route response says nothing about how old the separately
+        // captured reference-price observation is; an old or future-dated
+        // overview can otherwise poison the signal history, engage a sticky
+        // loss halt incorrectly, and drive notional/imbalance validation on
+        // stale prices even though the route itself passes its own
+        // freshness check.
+        let overview_age_ms = evaluation_time
+            .signed_duration_since(overview.received_at)
+            .num_milliseconds();
+        if overview_age_ms < 0 {
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                "reference_overview receipt is later than evaluation time",
+            ));
+        }
+        let max_overview_age_ms = self.config.max_quote_age_secs.saturating_mul(1_000);
+        if overview_age_ms > max_overview_age_ms {
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::StaleQuote,
+                format!("reference_overview age {overview_age_ms}ms exceeds {max_overview_age_ms}ms"),
+            ));
+        }
         let token_a_price_usd = find_reference_price(overview, &token_a)?;
         let token_b_price_usd = find_reference_price(overview, &token_b)?;
 
@@ -951,13 +974,34 @@ impl ArcusSpotRuntime {
             context.token_b_price_usd,
         )?;
         if imbalance > self.config.max_inventory_imbalance_fraction {
-            return Err(ArcusSpotHold::new(
-                ArcusSpotHoldCode::InventoryImbalance,
-                format!(
-                    "predicted USD inventory imbalance {} exceeds {}",
-                    imbalance, self.config.max_inventory_imbalance_fraction
-                ),
-            ));
+            // The hard cap applies unconditionally to entries. A market move
+            // can push an already-rotated portfolio's imbalance above the
+            // cap between snapshots, and a single reverse quote may not
+            // bring it fully back under the cap in one fill; rejecting
+            // every such exit would block both mean-reversion and max-hold
+            // exits and leave the runtime permanently rotated even though
+            // repeated partial exits would reduce exposure. So an exit is
+            // only rejected here if it would not even improve on the
+            // current (pre-trade) imbalance.
+            let blocks = if trigger == ArcusSpotRotationTrigger::EntrySignal {
+                true
+            } else {
+                let current_imbalance = inventory_imbalance_fraction(
+                    inventory,
+                    context.token_a_price_usd,
+                    context.token_b_price_usd,
+                )?;
+                imbalance >= current_imbalance
+            };
+            if blocks {
+                return Err(ArcusSpotHold::new(
+                    ArcusSpotHoldCode::InventoryImbalance,
+                    format!(
+                        "predicted USD inventory imbalance {} exceeds {}",
+                        imbalance, self.config.max_inventory_imbalance_fraction
+                    ),
+                ));
+            }
         }
 
         Ok(ArcusSpotRotationPlan {
@@ -2329,6 +2373,112 @@ mod tests {
         .unwrap()
     }
 
+    fn snapshot_with_overview_received_at(
+        collected_at: DateTime<Utc>,
+        overview_received_at: DateTime<Utc>,
+    ) -> ArcusSpotRecorderSnapshot {
+        let row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        serde_json::from_value(json!({
+            "schema_version": 3,
+            "mode": "public_indicative_read_only",
+            "chain_id": 4663,
+            "collection_started_at": collected_at,
+            "collection_finished_at": collected_at,
+            "indexer_stats": {
+                "status": "error",
+                "error": {"stage": "indexer_stats", "classification": "http", "retryable": false, "message": "x"}
+            },
+            "token_metadata": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {
+                            "chainId": 4663,
+                            "symbol": "NVDA",
+                            "name": "NVIDIA",
+                            "address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                            "decimals": 18,
+                            "verified": true
+                        },
+                        {
+                            "chainId": 4663,
+                            "symbol": "AMD",
+                            "name": "AMD",
+                            "address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                            "decimals": 18,
+                            "verified": true
+                        }
+                    ],
+                    "requested_at": collected_at,
+                    "received_at": collected_at,
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "reference_overview": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {
+                            "ticker": "NVDA",
+                            "contractAddress": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                            "name": "NVIDIA",
+                            "category": "stock",
+                            "quote": {"price": "200"}
+                        },
+                        {
+                            "ticker": "AMD",
+                            "contractAddress": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                            "name": "AMD",
+                            "category": "stock",
+                            "quote": {"price": "100"}
+                        }
+                    ],
+                    "requested_at": overview_received_at,
+                    "received_at": overview_received_at,
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "round_trips": [row]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn stale_reference_overview_is_rejected_even_with_a_fresh_route() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let stale_overview_at = event_time() - Duration::seconds(runtime.config.max_quote_age_secs + 1);
+        let snapshot = snapshot_with_overview_received_at(event_time(), stale_overview_at);
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::StaleQuote);
+            }
+            other => panic!("expected Observe/StaleQuote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn future_dated_reference_overview_is_rejected() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let future_overview_at = event_time() + Duration::seconds(5);
+        let snapshot = snapshot_with_overview_received_at(event_time(), future_overview_at);
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::InvalidSnapshot);
+            }
+            other => panic!("expected Observe/InvalidSnapshot, got {other:?}"),
+        }
+    }
+
     #[test]
     fn risk_halted_rotated_regime_can_still_exit_on_max_hold() {
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
@@ -2439,6 +2589,87 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::RotationLimit);
+    }
+
+    #[test]
+    fn entry_plan_still_rejects_a_predicted_imbalance_above_the_hard_cap() {
+        let mut cfg = config();
+        cfg.max_inventory_imbalance_fraction = Decimal::new(1, 1); // 10%
+        let runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let error = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InventoryImbalance);
+    }
+
+    #[test]
+    fn exit_plan_is_allowed_above_the_imbalance_cap_when_it_improves_the_current_imbalance() {
+        // token_a=200usd/unit, token_b=100usd/unit (see `context()`). Before
+        // this exit: 0.5 NVDA (100usd) / 2.0 AMD (200usd), imbalance 0.333.
+        // The reverse leg sells 0.049 AMD for 0.0248 NVDA, moving toward
+        // balance (0.300) but not under a cap this tight; it must still be
+        // allowed since it's a risk-reducing exit, not an entry.
+        let mut cfg = config();
+        cfg.max_inventory_imbalance_fraction = Decimal::new(5, 2); // 5%
+        cfg.inventory_floors = ArcusSpotInventory {
+            token_a: Decimal::ZERO,
+            token_b: Decimal::ZERO,
+        };
+        let runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let inventory = ArcusSpotInventory {
+            token_a: Decimal::new(5, 1),
+            token_b: Decimal::new(20, 1),
+        };
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::MeanReversionExit,
+                event_time(),
+                inventory,
+            )
+            .unwrap();
+        assert!(
+            plan.predicted_inventory_imbalance_fraction
+                > runtime.config().max_inventory_imbalance_fraction,
+            "test setup should keep the exit above the cap: {}",
+            plan.predicted_inventory_imbalance_fraction
+        );
+    }
+
+    #[test]
+    fn exit_plan_is_still_rejected_above_the_cap_when_it_worsens_the_current_imbalance() {
+        // Same tokens/prices as above, but starting heavily skewed toward
+        // token_a (5.0 NVDA vs 0.06 AMD): selling AMD to buy more NVDA here
+        // pushes further away from balance, so the exit gains no exception
+        // and the hard cap applies.
+        let mut cfg = config();
+        cfg.max_inventory_imbalance_fraction = Decimal::new(5, 2); // 5%
+        cfg.inventory_floors = ArcusSpotInventory {
+            token_a: Decimal::ZERO,
+            token_b: Decimal::ZERO,
+        };
+        let runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let inventory = ArcusSpotInventory {
+            token_a: Decimal::new(5, 0),
+            token_b: Decimal::new(6, 2),
+        };
+        let error = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::MeanReversionExit,
+                event_time(),
+                inventory,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InventoryImbalance);
     }
 
     #[test]
