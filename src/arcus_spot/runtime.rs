@@ -823,6 +823,28 @@ impl ArcusSpotRuntime {
         evaluation_time: DateTime<Utc>,
         inventory: ArcusSpotInventory,
     ) -> Result<ArcusSpotRotationPlan, ArcusSpotHold> {
+        // verified_round_trip_loss_bps is computed once per row from the
+        // forward leg's sell amount through to the reverse leg's return
+        // (see verify_round_trip_linkage_and_loss): it only describes the
+        // quoted A-to-B-to-A cycle. A TokenBToTokenA *entry* starts a fresh
+        // B-to-A-to-B cycle instead, which the row's single forward/reverse
+        // pair does not quote — the forward leg is fixed to the original A
+        // amount, not to whatever amount this entry would actually return
+        // to A via the reverse leg. Reusing the A-to-B-to-A figure here
+        // would cost-gate an unrelated cycle, which under nonlinear fees or
+        // slippage can pass a limit the real B-to-A-to-B cycle would not.
+        // A TokenBToTokenA *exit* (closing a position this same row's
+        // forward leg opened) is unaffected: it completes exactly the
+        // A-to-B-to-A cycle this figure measures.
+        if direction == ArcusSpotDirection::TokenBToTokenA
+            && trigger == ArcusSpotRotationTrigger::EntrySignal
+        {
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::RouteUnavailable,
+                "reverse-direction (B-to-A) entries require their own B-to-A-to-B round-trip \
+                 quote; this row's verified round-trip cost only covers the A-to-B-to-A cycle",
+            ));
+        }
         let route_loss = context.verified_round_trip_loss_bps;
         let all_in_cost = route_loss
             .checked_add(self.config.gas_buffer_bps)
@@ -1765,6 +1787,44 @@ mod tests {
         assert_eq!(plan.buy_quantity, Decimal::new(49, 3));
         assert_eq!(plan.predicted_inventory.token_a, Decimal::new(975, 3));
         assert_eq!(plan.predicted_inventory.token_b, Decimal::new(1049, 3));
+        assert_eq!(plan.all_in_round_trip_cost_bps, Decimal::from(30));
+    }
+
+    #[test]
+    fn reverse_direction_entry_is_refused_without_its_own_round_trip_cost() {
+        // context() only quotes the A-to-B-to-A cycle (forward then
+        // reverse); a TokenBToTokenA *entry* would start a fresh
+        // B-to-A-to-B cycle this row does not quote, so it must be refused
+        // rather than cost-gated on the unrelated A-to-B-to-A figure.
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let error = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::RouteUnavailable);
+    }
+
+    #[test]
+    fn reverse_direction_exit_still_uses_the_row_round_trip_cost() {
+        // Unlike the entry case above, exiting a TokenAToTokenB position via
+        // the reverse leg (regime RotatedAToB -> exit direction
+        // TokenBToTokenA) completes exactly the A-to-B-to-A cycle this row
+        // quotes, so it must not be refused.
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::MeanReversionExit,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
         assert_eq!(plan.all_in_round_trip_cost_bps, Decimal::from(30));
     }
 
