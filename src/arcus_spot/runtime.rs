@@ -299,8 +299,16 @@ impl ArcusSpotRuntime {
                 })
             }
         };
-        self.update_risk_baselines(evaluation_time, equity_before);
+        // Marked against the *prior* daily baseline before it can be reset
+        // below: on the first snapshot of a new UTC day, resetting the
+        // baseline first would compare the day's opening equity against
+        // itself (zero loss) and silently absorb whatever was lost
+        // overnight, since that drop happened continuously and was never
+        // assessed against any baseline. Assessing this mark first lets an
+        // overnight loss that breached the still-active prior baseline
+        // engage the halt before the new day's baseline is established.
         let risk_before = self.risk_mark(equity_before);
+        self.update_risk_baselines(evaluation_time, equity_before);
         self.engage_risk_halt(evaluation_time, risk_before);
 
         // Computed and appended to the signal window from `price` (token
@@ -909,9 +917,9 @@ impl ArcusSpotRuntime {
                 ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
             })?;
 
-        let sell_quantity = raw_amount_to_quantity(&route.sell_amount, sell_token.decimals)
+        let mut sell_quantity = raw_amount_to_quantity(&route.sell_amount, sell_token.decimals)
             .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
-        let buy_quantity = raw_amount_to_quantity(&quote.buy_amount, buy_token.decimals)
+        let mut buy_quantity = raw_amount_to_quantity(&quote.buy_amount, buy_token.decimals)
             .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
         let sellable = sell_balance.checked_sub(sell_floor).ok_or_else(|| {
             ArcusSpotHold::new(
@@ -920,13 +928,43 @@ impl ArcusSpotRuntime {
             )
         })?;
         if sell_quantity > sellable {
-            return Err(ArcusSpotHold::new(
-                ArcusSpotHoldCode::InventoryFloor,
-                format!(
-                    "selling {} {} would cross floor {}; balance={}",
-                    sell_quantity, sell_token.symbol, sell_floor, sell_balance
-                ),
-            ));
+            if trigger == ArcusSpotRotationTrigger::EntrySignal {
+                return Err(ArcusSpotHold::new(
+                    ArcusSpotHoldCode::InventoryFloor,
+                    format!(
+                        "selling {} {} would cross floor {}; balance={}",
+                        sell_quantity, sell_token.symbol, sell_floor, sell_balance
+                    ),
+                ));
+            }
+            // An exit's route offers whatever amount the recorder's
+            // fixed-notional quote happens to propose, which is
+            // independent of how much is actually sellable above the
+            // floor: once a partial unwind has shrunk the sellable
+            // balance to a residual, every later fixed-notional quote is
+            // ordinarily larger than it. Rejecting outright (an earlier
+            // version of this check did) can then never be satisfied,
+            // permanently stranding the rotation even though the
+            // rotation-cap fix above already lets an oversized exit
+            // through. Settle for a residual-sized fill capped at the
+            // floor-preserving amount instead, prorating buy_quantity at
+            // the quote's own rate.
+            if sellable.is_zero() {
+                return Err(ArcusSpotHold::new(
+                    ArcusSpotHoldCode::InventoryFloor,
+                    "sell balance is at its configured floor; no residual to unwind",
+                ));
+            }
+            buy_quantity = buy_quantity
+                .checked_mul(sellable)
+                .and_then(|scaled| scaled.checked_div(sell_quantity))
+                .ok_or_else(|| {
+                    ArcusSpotHold::new(
+                        ArcusSpotHoldCode::InventoryFloor,
+                        "residual exit sizing exceeds Decimal range",
+                    )
+                })?;
+            sell_quantity = sellable;
         }
         // An exit's route offers whatever quantity the recorder's
         // fixed-notional quote happens to propose at this snapshot, which is
@@ -1853,6 +1891,60 @@ mod tests {
     }
 
     #[test]
+    fn exit_settles_a_residual_sized_fill_instead_of_crossing_the_floor() {
+        // A prior partial unwind has shrunk token_b's sellable balance
+        // (0.02 above the 0.1 floor) below what this snapshot's
+        // fixed-notional reverse quote offers to sell (0.049): rejecting
+        // outright (an earlier version of this check did) can never be
+        // satisfied once the sellable balance is a residual smaller than
+        // any typical quote, permanently stranding the rotation. The exit
+        // must instead settle for exactly the floor-preserving amount,
+        // with buy_quantity prorated at the quote's own rate.
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let inventory = ArcusSpotInventory {
+            token_a: Decimal::ONE,
+            token_b: Decimal::new(12, 2), // 0.12: sellable = 0.12 - 0.1 = 0.02
+        };
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::MeanReversionExit,
+                event_time(),
+                inventory,
+            )
+            .unwrap();
+        assert_eq!(plan.sell_quantity, Decimal::new(2, 2)); // clamped to sellable (0.02)
+        // buy_quantity prorated: 0.0248 * 0.02 / 0.049
+        let expected_buy = Decimal::new(248, 4)
+            .checked_mul(Decimal::new(2, 2))
+            .unwrap()
+            .checked_div(Decimal::new(49, 3))
+            .unwrap();
+        assert_eq!(plan.buy_quantity, expected_buy);
+        assert_eq!(plan.predicted_inventory.token_b, Decimal::new(1, 1)); // exactly at floor
+    }
+
+    #[test]
+    fn exit_at_exactly_the_floor_with_no_residual_is_rejected() {
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let inventory = ArcusSpotInventory {
+            token_a: Decimal::ONE,
+            token_b: Decimal::new(1, 1), // exactly at the 0.1 floor: sellable = 0
+        };
+        let error = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::MeanReversionExit,
+                event_time(),
+                inventory,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InventoryFloor);
+    }
+
+    #[test]
     fn stale_quote_and_non_trading_buffers_are_hard_gates() {
         let runtime = ArcusSpotRuntime::new(config()).unwrap();
         let stale = runtime
@@ -2365,6 +2457,35 @@ mod tests {
             runtime.state().risk_halt.is_some(),
             "loss during a route outage must still engage the halt"
         );
+    }
+
+    #[test]
+    fn overnight_loss_is_assessed_against_the_prior_days_baseline() {
+        // Equity starts at 1*200 + 1*100 = 300 (config()'s initial
+        // inventory, snapshot_with_valid_row's reference prices). Resetting
+        // the daily baseline to the day's opening equity *before* marking
+        // this first snapshot of the new day would compare it against
+        // itself (zero loss) and silently absorb whatever was lost
+        // overnight; it must instead be marked against the still-active
+        // prior baseline first.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let day1 = event_time();
+        runtime.step_at(&snapshot_with_valid_row(day1), day1);
+        assert_eq!(runtime.state().risk_halt, None);
+
+        // Simulate an overnight loss: 200*0.985 + 100*1 = 297, a $3 loss
+        // against the $300 baseline, exceeding daily_loss_limit_usd=2 (but
+        // not cumulative_loss_limit_usd=10).
+        runtime.state.inventory.token_a = Decimal::new(985, 3);
+        let day2 = day1 + Duration::days(1);
+        runtime.step_at(&snapshot_with_valid_row(day2), day2);
+
+        let halt = runtime
+            .state()
+            .risk_halt
+            .clone()
+            .expect("overnight loss breaching the prior day's baseline must engage the halt");
+        assert_eq!(halt.kind, ArcusSpotRiskHaltKind::DailyLoss);
     }
 
     #[test]
