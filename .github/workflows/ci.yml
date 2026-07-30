@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "src/**"
+      - "scripts/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
@@ -14,6 +15,10 @@ on:
       # files change. A combined push that touches both src/ and
       # configs/ still fires ci.yml via src/**, and ci.yml's deploy
       # step uploads configs as part of its full pipeline.
+      # scripts/** is included so test-scripts (bot-strategy#765,
+      # canary_diff_report.py) actually runs on a scripts-only push;
+      # without it, a scripts/ regression could merge without the job
+      # that exists specifically to catch it ever executing.
   workflow_dispatch:
     inputs:
       dex_connector_ref:

@@ -65,16 +65,19 @@ class WindowSnapshot:
     history_start_ts_ms: float
     history_end_ts_ms: float
     window_coverage: float
+    # bot-strategy#765 round2: a capital-adjusted return, computed by
+    # rebasing to the post-event equity at each capital-event boundary and
+    # compounding each segment's own return (see build_snapshot_from_data).
+    # Plain cumulative_pnl / equity_start (the previous return_bps formula)
+    # divides post-event trading PnL by the *pre-event* starting balance,
+    # which is wrong whenever a capital event changed the capital actually
+    # at risk. With no capital events in the window there is only one
+    # segment, so this is numerically identical to the old formula.
+    return_bps: float
 
     @property
     def win_rate(self) -> float:
         return self.win_count / self.trade_count if self.trade_count else 0.0
-
-    @property
-    def return_bps(self) -> float:
-        if self.equity_start == 0.0:
-            return 0.0
-        return self.cumulative_pnl / abs(self.equity_start) * 10_000.0
 
 
 def s3_get_json(client, key: str) -> dict | None:
@@ -154,6 +157,7 @@ def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
             history_start_ts_ms=0.0,
             history_end_ts_ms=0.0,
             window_coverage=0.0,
+            return_bps=0.0,
         )
 
     history_start_ts_ms = float(history_in_window[0]["ts"])
@@ -170,24 +174,63 @@ def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
     # mirrored to S3. Until then the heuristic gives a directionally
     # correct trade-rate ratio (the metric the verdict cares about).
     threshold = abs(equity_start) * TRADE_EVENT_BPS_OF_EQUITY / 10_000.0
-    capital_event_threshold = abs(equity_start) * CAPITAL_EVENT_FRACTION_OF_EQUITY
     trade_count = 0
     win_count = 0
     deltas: list[float] = []
     trading_pnl = 0.0
+
+    # bot-strategy#765 round2: a capital event closes the current segment
+    # and starts a new one based at the post-event equity, so a
+    # capital-adjusted return can be computed by compounding each
+    # segment's own (local-base) return instead of dividing all
+    # post-event trading PnL by the window's original (possibly
+    # since-withdrawn) starting balance. A single segment (no capital
+    # events) reduces to plain segment_pnl / segment_start_equity, i.e.
+    # numerically identical to the pre-#765-round2 formula.
+    segment_start_equity = equity_start
+    segment_pnl = 0.0
+    growth_factor = 1.0
+
+    def close_segment() -> None:
+        nonlocal growth_factor
+        if segment_start_equity != 0.0:
+            growth_factor *= 1.0 + segment_pnl / abs(segment_start_equity)
+        # else: nothing was at risk in this segment (it started at zero
+        # capital), so it contributes no return; any large move away
+        # from zero is itself caught as the next capital event below,
+        # not misread as an infinite-percent trading gain.
+
     for i in range(1, len(history_in_window)):
-        delta = history_in_window[i]["equity"] - history_in_window[i - 1]["equity"]
-        if capital_event_threshold > 0.0 and abs(delta) >= capital_event_threshold:
+        prev_equity = history_in_window[i - 1]["equity"]
+        curr_equity = history_in_window[i]["equity"]
+        delta = curr_equity - prev_equity
+        # The capital-event reference is the larger of this step's two
+        # endpoints, not a value fixed once at the window's start: a
+        # withdrawal to (near-)zero followed by a redeposit is exactly
+        # the case a start-anchored reference cannot see, since
+        # `abs(equity_start) * CAPITAL_EVENT_FRACTION_OF_EQUITY` is itself
+        # zero whenever the window starts at zero equity, which disabled
+        # capital-event detection for the rest of that window entirely.
+        step_reference = max(abs(prev_equity), abs(curr_equity))
+        capital_event_threshold = step_reference * CAPITAL_EVENT_FRACTION_OF_EQUITY
+        if step_reference > 0.0 and abs(delta) >= capital_event_threshold:
             # Deposit/withdrawal, not a trade — excluded from PnL and
-            # trade-count accounting (bot-strategy#765).
+            # trade-count accounting (bot-strategy#765), and rebases the
+            # capital-adjusted return's segment boundary.
+            close_segment()
+            segment_start_equity = curr_equity
+            segment_pnl = 0.0
             continue
         trading_pnl += delta
+        segment_pnl += delta
         if abs(delta) >= threshold:
             trade_count += 1
             if delta > 0:
                 win_count += 1
             deltas.append(delta)
+    close_segment()
     median_per_trade_pnl = statistics.median(deltas) if deltas else 0.0
+    return_bps = (growth_factor - 1.0) * 10_000.0
 
     return WindowSnapshot(
         agent=agent,
@@ -201,6 +244,7 @@ def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
         history_start_ts_ms=history_start_ts_ms,
         history_end_ts_ms=history_end_ts_ms,
         window_coverage=min(1.0, covered_span_ms / requested_span_ms),
+        return_bps=return_bps,
     )
 
 

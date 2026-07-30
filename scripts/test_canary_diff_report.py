@@ -106,6 +106,53 @@ class CapitalEventExclusionTests(unittest.TestCase):
         snap = build_snapshot_from_data("x", {}, history, _ts(0.0), _ts(WINDOW_DAYS))
         self.assertAlmostEqual(snap.cumulative_pnl, history[-1]["equity"] - history[0]["equity"])
 
+    def test_return_bps_is_rebased_after_a_capital_event(self):
+        # bot-strategy#765 round2: a window starting at $1,000, deposited
+        # to $6,000, then earning $120 of ordinary trading PnL must report
+        # a return close to 120/6000 = 200bps (against the new capital
+        # base), not 120/1000 = 1,200bps (against the pre-deposit base) —
+        # the latter could cross the ALERT threshold against a canary
+        # comparison that would otherwise pass.
+        history = [
+            {"ts": _ts(0.0), "equity": 1000.0},
+            {"ts": _ts(1.0), "equity": 6000.0},   # deposit: capital event
+            {"ts": _ts(2.0), "equity": 6120.0},   # +120 ordinary trade win
+        ]
+        snap = build_snapshot_from_data("x", {}, history, _ts(0.0), _ts(WINDOW_DAYS))
+        self.assertAlmostEqual(snap.cumulative_pnl, 120.0)
+        self.assertAlmostEqual(snap.return_bps, 120.0 / 6000.0 * 10_000.0, places=2)
+        self.assertLess(
+            snap.return_bps, 1_000.0,
+            "return_bps must not be computed against the pre-deposit equity_start",
+        )
+
+    def test_return_bps_matches_the_old_formula_with_no_capital_event(self):
+        history = [
+            {"ts": _ts(0.0), "equity": 1000.0},
+            {"ts": _ts(1.0), "equity": 1008.0},
+            {"ts": _ts(2.0), "equity": 1003.0},
+            {"ts": _ts(3.0), "equity": 1011.0},
+            {"ts": _ts(7.0), "equity": 1015.0},
+        ]
+        snap = build_snapshot_from_data("x", {}, history, _ts(0.0), _ts(WINDOW_DAYS))
+        expected = (history[-1]["equity"] - history[0]["equity"]) / abs(history[0]["equity"]) * 10_000.0
+        self.assertAlmostEqual(snap.return_bps, expected)
+
+    def test_deposit_from_a_zero_starting_balance_is_detected(self):
+        # bot-strategy#765 round2: when the window's first sample is
+        # exactly zero, abs(equity_start) * 0.50 is itself zero, which
+        # previously disabled capital-event detection for the rest of the
+        # window entirely — a $0 -> $6,000 redeposit was then recorded as
+        # $6,000 of trading PnL and one trade.
+        history = [
+            {"ts": _ts(0.0), "equity": 0.0},
+            {"ts": _ts(1.0), "equity": 6000.0},   # redeposit: capital event
+            {"ts": _ts(2.0), "equity": 6010.0},   # +10 ordinary trade win
+        ]
+        snap = build_snapshot_from_data("x", {}, history, _ts(0.0), _ts(WINDOW_DAYS))
+        self.assertAlmostEqual(snap.cumulative_pnl, 10.0)
+        self.assertEqual(snap.trade_count, 1)
+
     def test_ordinary_trade_sized_delta_still_counted(self):
         # A delta comfortably above the trade-event threshold but well
         # below the capital-event threshold must still be treated as an
