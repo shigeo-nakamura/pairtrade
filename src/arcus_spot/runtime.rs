@@ -922,25 +922,23 @@ impl ArcusSpotRuntime {
         }
         // An exit's route offers whatever quantity the recorder's
         // fixed-notional quote happens to propose at this snapshot, which is
-        // independent of the quantity actually acquired at entry. Bounding
-        // it to the tracked open rotation quantity keeps an exit from
-        // selling into pre-existing (pre-rotation) inventory; the caller
-        // only clears the regime once this tracked amount reaches zero, so
-        // a route that offers less than the open amount is accepted as a
-        // partial unwind rather than mis-declaring the position closed.
-        if trigger != ArcusSpotRotationTrigger::EntrySignal {
-            if let Some(open_quantity) = self.state.rotated_quantity {
-                if sell_quantity > open_quantity {
-                    return Err(ArcusSpotHold::new(
-                        ArcusSpotHoldCode::RotationLimit,
-                        format!(
-                            "exit selling {} {} exceeds the open rotation quantity {}",
-                            sell_quantity, sell_token.symbol, open_quantity
-                        ),
-                    ));
-                }
-            }
-        }
+        // independent of the quantity actually acquired at entry: quote
+        // movement between entry and later snapshots routinely makes it
+        // smaller OR larger than the tracked open rotation quantity.
+        // Rejecting an oversized exit outright (an earlier version of this
+        // check did) is unnecessary and actively harmful: once a smaller
+        // quote has partially unwound the position, every later
+        // fixed-notional quote is ordinarily larger than the shrinking
+        // remainder, so a hard reject here would leave the runtime
+        // permanently rotated with a residual amount no future quote could
+        // ever satisfy. Instead, the state transition below always lets the
+        // exit proceed (subject to the ordinary floor/balance check above)
+        // and saturates the tracked open quantity to zero, so both an
+        // undersized exit (partial unwind, stays rotated with the smaller
+        // remainder) and an oversized one (fully closes the rotation; any
+        // amount beyond what was tracked as open is a bounded, already
+        // floor-checked trade against pre-existing inventory) are handled
+        // correctly without ever getting stuck.
         // The cap limits how large a single new entry may be relative to
         // available inventory; it must not also apply to exits. The
         // fraction is recomputed against whatever balance remains after the
@@ -2567,10 +2565,16 @@ mod tests {
     }
 
     #[test]
-    fn exit_exceeding_the_open_rotation_quantity_is_rejected() {
+    fn exit_exceeding_the_open_rotation_quantity_fully_closes_it() {
         // The row's reverse leg wants to sell 0.049 AMD, but only 0.04 AMD
-        // is tracked as open from the entry; accepting it would consume
-        // pre-existing (pre-rotation) AMD inventory.
+        // is tracked as open from the entry. An earlier version of this
+        // check rejected such an oversized exit outright to avoid consuming
+        // pre-existing (pre-rotation) AMD inventory, but that left the
+        // runtime permanently rotated once a partial unwind shrank the open
+        // quantity below what any later fixed-notional quote would offer.
+        // The exit must instead be allowed to proceed and fully close the
+        // rotation; ordinary floor/balance checks (unchanged here) already
+        // bound how much can be sold in one action.
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
         runtime.state.regime = ArcusSpotRegime::RotatedAToB;
         runtime.state.rotated_quantity = Some(Decimal::new(40, 3));
@@ -2579,13 +2583,14 @@ mod tests {
         let snapshot = snapshot_with_valid_row(event_time());
         let event = runtime.step_at(&snapshot, event_time());
         match event.decision {
-            ArcusSpotDecision::Observe { hold } => {
-                assert_eq!(hold.code, ArcusSpotHoldCode::RotationLimit);
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
+                assert_eq!(plan.sell_quantity, Decimal::new(49, 3));
             }
-            other => panic!("expected Observe/RotationLimit, got {other:?}"),
+            other => panic!("expected a closing max-hold exit, got {other:?}"),
         }
-        assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
-        assert_eq!(runtime.state().rotated_quantity, Some(Decimal::new(40, 3)));
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+        assert_eq!(runtime.state().rotated_quantity, None);
     }
 
     #[test]
