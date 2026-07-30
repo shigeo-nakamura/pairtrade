@@ -119,6 +119,20 @@ TRADE_EVENT_BPS_OF_EQUITY = 5.0
 # trade_count/win_count, and median_per_trade_pnl.
 CAPITAL_EVENT_FRACTION_OF_EQUITY = 0.50
 
+# bot-strategy#765 round4: below this absolute USD balance, a segment has
+# no meaningful capital at risk, so ordinary cent-scale drift against it
+# is not a percentage return or a trade — it is the tail of an in-progress
+# withdrawal/redeposit. Without this floor, a withdrawal leaving a small
+# nonzero residual (e.g. $1,000 -> $0.01) rebases the segment onto that
+# dust: a further $0.01 -> $0.014 drift is only a 40% move relative to the
+# $0.01 base, under CAPITAL_EVENT_FRACTION_OF_EQUITY's 50% cutoff, so it
+# is treated as an ordinary trade and compounds into a +4,000bps segment
+# return once the eventual redeposit closes it out — a false ALERT against
+# an unchanged canary. Canary's own reference notional is ~$50 (see
+# CANARY_PNL_ALERT_USD_7D above); $1 is comfortably below any real
+# position size while covering realistic post-withdrawal residuals.
+DUST_EQUITY_USD_FLOOR = 1.0
+
 
 def filter_window(samples: list[dict], cutoff_ts_ms: float) -> list[dict]:
     """Filter equity-history samples to those at or after the cutoff.
@@ -195,12 +209,12 @@ def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
 
     def close_segment() -> None:
         nonlocal growth_factor
-        if segment_start_equity != 0.0:
+        if abs(segment_start_equity) >= DUST_EQUITY_USD_FLOOR:
             growth_factor *= 1.0 + segment_pnl / abs(segment_start_equity)
-        # else: nothing was at risk in this segment (it started at zero
-        # capital), so it contributes no return; any large move away
-        # from zero is itself caught as the next capital event below,
-        # not misread as an infinite-percent trading gain.
+        # else: no meaningful capital was at risk in this segment (it
+        # started at, or dropped to, dust), so it contributes no return;
+        # a move large enough to matter is itself caught as the next
+        # capital event below, not misread as a huge percentage gain.
 
     for i in range(1, len(history_in_window)):
         prev_equity = history_in_window[i - 1]["equity"]
@@ -226,6 +240,17 @@ def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
             close_segment()
             segment_start_equity = curr_equity
             segment_pnl = 0.0
+            continue
+        if abs(segment_start_equity) < DUST_EQUITY_USD_FLOOR:
+            # Still resolving a withdrawal: this segment has no meaningful
+            # capital at risk, so ordinary cent-scale drift here (below
+            # the capital-event fraction of the tiny dust base, e.g. a
+            # further $0.01 -> $0.014 move) is neither a trade nor a
+            # return-bearing move. Keep tracking the running balance so
+            # the eventual redeposit is still measured from the correct
+            # (low) base, without counting this step as a trade or
+            # compounding it into the return.
+            segment_start_equity = curr_equity
             continue
         trading_pnl += delta
         segment_pnl += delta

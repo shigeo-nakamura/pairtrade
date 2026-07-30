@@ -153,6 +153,25 @@ class CapitalEventExclusionTests(unittest.TestCase):
         self.assertAlmostEqual(snap.cumulative_pnl, 10.0)
         self.assertEqual(snap.trade_count, 1)
 
+    def test_withdrawal_dust_is_not_rebased_onto_as_a_return_or_trade(self):
+        # bot-strategy#765 round4: a withdrawal leaving a small nonzero
+        # residual ($0.01) is not itself a big enough move relative to
+        # that tiny base to be a second capital event, so without a dust
+        # floor a further $0.01 -> $0.014 drift would be read as an
+        # ordinary trade and compound into a huge percentage return once
+        # the eventual redeposit closes the segment out.
+        history = [
+            {"ts": _ts(0.0), "equity": 1000.0},
+            {"ts": _ts(1.0), "equity": 0.01},          # withdraw: capital event
+            {"ts": _ts(2.0), "equity": 0.014},         # dust drift: not a trade
+            {"ts": _ts(3.0), "equity": 6000.014},      # redeposit: capital event
+            {"ts": _ts(4.0), "equity": 6010.014},      # +10 ordinary trade win
+        ]
+        snap = build_snapshot_from_data("x", {}, history, _ts(0.0), _ts(WINDOW_DAYS))
+        self.assertAlmostEqual(snap.cumulative_pnl, 10.0)
+        self.assertEqual(snap.trade_count, 1)
+        self.assertLess(snap.return_bps, 100.0)
+
     def test_moderate_deposit_is_measured_against_the_pre_event_balance(self):
         # bot-strategy#765 round3: a $1,000 -> $1,600 deposit is a 60% move
         # relative to the $1,000 that was already there, so it must be
