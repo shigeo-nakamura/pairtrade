@@ -855,7 +855,15 @@ impl ArcusSpotRuntime {
                     "all-in route cost exceeds Decimal range",
                 )
             })?;
-        if all_in_cost > self.config.max_all_in_round_trip_cost_bps {
+        // Entry-only, like max_rotation_fraction and the inventory-imbalance
+        // cap above/below: if this were also enforced on exits, a round-trip
+        // cost that rises above the limit while already rotated would keep
+        // rejecting both MeanReversionExit and MaxHoldExit on every later
+        // snapshot until costs fell back under it, making max_hold_secs not
+        // actually a maximum.
+        if trigger == ArcusSpotRotationTrigger::EntrySignal
+            && all_in_cost > self.config.max_all_in_round_trip_cost_bps
+        {
             return Err(ArcusSpotHold::new(
                 ArcusSpotHoldCode::CostLimit,
                 format!(
@@ -1868,6 +1876,27 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(costly.code, ArcusSpotHoldCode::CostLimit);
+    }
+
+    #[test]
+    fn cost_limit_is_not_applied_to_exits() {
+        // Unlike the EntrySignal case just above (loss_bps=95 exceeds
+        // max_all_in_round_trip_cost_bps=100 once gas/settlement buffers are
+        // added), the same costly context must not block an exit: otherwise
+        // a round-trip cost that rises above the limit while already
+        // rotated would keep rejecting MaxHoldExit on every later snapshot,
+        // making max_hold_secs not actually a maximum.
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(95)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::MaxHoldExit,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        assert_eq!(plan.all_in_round_trip_cost_bps, Decimal::from(105));
     }
 
     #[test]
