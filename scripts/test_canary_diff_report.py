@@ -153,6 +153,37 @@ class CapitalEventExclusionTests(unittest.TestCase):
         self.assertAlmostEqual(snap.cumulative_pnl, 10.0)
         self.assertEqual(snap.trade_count, 1)
 
+    def test_moderate_deposit_is_measured_against_the_pre_event_balance(self):
+        # bot-strategy#765 round3: a $1,000 -> $1,600 deposit is a 60% move
+        # relative to the $1,000 that was already there, so it must be
+        # detected as a capital event. Comparing it against the *larger*
+        # endpoint instead (max(1000, 1600) = 1600) raises the effective
+        # threshold to $800, which a $600 delta does not clear, and the
+        # deposit would be misread as $600 of trading PnL.
+        history = [
+            {"ts": _ts(0.0), "equity": 1000.0},
+            {"ts": _ts(1.0), "equity": 1600.0},   # deposit: capital event
+            {"ts": _ts(2.0), "equity": 1610.0},   # +10 ordinary trade win
+        ]
+        snap = build_snapshot_from_data("x", {}, history, _ts(0.0), _ts(WINDOW_DAYS))
+        self.assertAlmostEqual(snap.cumulative_pnl, 10.0)
+        self.assertEqual(snap.trade_count, 1)
+
+    def test_trade_event_threshold_is_rebased_after_a_capital_event(self):
+        # bot-strategy#765 round3: after a $1,000 -> $6,000 deposit, an
+        # ordinary trade must be judged against the new $6,000 base (5bps
+        # = $3.00), not the window's original $1,000 (5bps = $0.50) — a
+        # stale threshold would count noise well under a real trade size
+        # as a trade once the capital base has grown this much.
+        history = [
+            {"ts": _ts(0.0), "equity": 1000.0},
+            {"ts": _ts(1.0), "equity": 6000.0},   # deposit: capital event
+            {"ts": _ts(2.0), "equity": 6001.0},   # $1 drift: not a trade at the new base
+        ]
+        snap = build_snapshot_from_data("x", {}, history, _ts(0.0), _ts(WINDOW_DAYS))
+        self.assertEqual(snap.trade_count, 0)
+        self.assertAlmostEqual(snap.cumulative_pnl, 1.0)
+
     def test_ordinary_trade_sized_delta_still_counted(self):
         # A delta comfortably above the trade-event threshold but well
         # below the capital-event threshold must still be treated as an

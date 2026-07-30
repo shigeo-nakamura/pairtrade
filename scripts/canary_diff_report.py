@@ -168,12 +168,14 @@ def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
     equity_end = float(history_in_window[-1]["equity"])
 
     # Trade count heuristic: count equity-history transitions where
-    # |Δ equity| ≥ TRADE_EVENT_BPS_OF_EQUITY bps of starting equity.
-    # This is a coarse proxy — Stage B/C follow-up will replace it with
-    # an authoritative debot_pnl/ jsonl read once that prefix is
-    # mirrored to S3. Until then the heuristic gives a directionally
-    # correct trade-rate ratio (the metric the verdict cares about).
-    threshold = abs(equity_start) * TRADE_EVENT_BPS_OF_EQUITY / 10_000.0
+    # |Δ equity| ≥ TRADE_EVENT_BPS_OF_EQUITY bps of the current segment's
+    # starting equity (rebased at each capital event alongside
+    # segment_start_equity below — bot-strategy#765 round3: a fixed,
+    # window-original threshold over-counts noise as trades after a
+    # deposit raises the capital base, or suppresses real trades after a
+    # withdrawal lowers it). A single segment (no capital events) keeps
+    # this fixed at equity_start, i.e. numerically identical to the
+    # pre-#765-round3 formula.
     trade_count = 0
     win_count = 0
     deltas: list[float] = []
@@ -204,14 +206,18 @@ def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
         prev_equity = history_in_window[i - 1]["equity"]
         curr_equity = history_in_window[i]["equity"]
         delta = curr_equity - prev_equity
-        # The capital-event reference is the larger of this step's two
-        # endpoints, not a value fixed once at the window's start: a
-        # withdrawal to (near-)zero followed by a redeposit is exactly
-        # the case a start-anchored reference cannot see, since
-        # `abs(equity_start) * CAPITAL_EVENT_FRACTION_OF_EQUITY` is itself
-        # zero whenever the window starts at zero equity, which disabled
-        # capital-event detection for the rest of that window entirely.
-        step_reference = max(abs(prev_equity), abs(curr_equity))
+        # The capital-event reference is the pre-step (not the larger of
+        # the two endpoints) balance: the fraction is defined relative to
+        # what was already there before this move, so using the larger
+        # endpoint instead raises the effective threshold above the
+        # configured fraction for any deposit that increases the balance
+        # by less than 100% — e.g. a $1,000 -> $1,600 deposit (a 60% move)
+        # would compare its $600 delta against an $800 threshold
+        # (max(1000, 1600) * 50%) and be missed, misread as $600 of
+        # trading PnL. A step whose pre-event balance is exactly zero has
+        # no such reference, so the post-event balance is used instead
+        # purely to still catch that deposit (bot-strategy#765 round2).
+        step_reference = abs(prev_equity) if prev_equity != 0.0 else abs(curr_equity)
         capital_event_threshold = step_reference * CAPITAL_EVENT_FRACTION_OF_EQUITY
         if step_reference > 0.0 and abs(delta) >= capital_event_threshold:
             # Deposit/withdrawal, not a trade — excluded from PnL and
@@ -223,7 +229,8 @@ def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
             continue
         trading_pnl += delta
         segment_pnl += delta
-        if abs(delta) >= threshold:
+        trade_threshold = abs(segment_start_equity) * TRADE_EVENT_BPS_OF_EQUITY / 10_000.0
+        if abs(delta) >= trade_threshold:
             trade_count += 1
             if delta > 0:
                 win_count += 1
