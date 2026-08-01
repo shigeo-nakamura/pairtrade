@@ -2594,6 +2594,10 @@ mod tests {
         // forwarding this value, forwarded a different one, or the
         // breaker mishandled its sign).
         let mut engine = PairTradeEngine::test_instance(Arc::new(NullConnector));
+        // Redirect risk-state persistence to a temp dir so the test does
+        // not litter the working directory (Codex review on PR #180).
+        let risk_state_dir = tempfile::TempDir::new().unwrap();
+        engine.risk_state_path = risk_state_dir.path().join("risk_state.json");
         assert_eq!(engine.instances[0].consecutive_losses, 0);
 
         engine.record_exit_realized_pnl(0, now_ts, pnl, 0.0);
