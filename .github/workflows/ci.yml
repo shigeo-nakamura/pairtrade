@@ -170,6 +170,15 @@ jobs:
       - name: Arcus Spot runtime tests
         run: cargo test --lib --no-default-features --features arcus-spot-sdk arcus_spot --locked
 
+      # `--lib` above only tests the library target; the arcus-spot-runtime
+      # binary (required-features = ["arcus-spot-sdk"]) is excluded from it
+      # and from the default-feature `cargo test --all-targets` above, so
+      # its own tests -- including the same_file alias-detection guards
+      # against silently truncating the recorder archive or config -- never
+      # actually ran in CI (Codex P2 follow-up, pairtrade#177).
+      - name: Arcus Spot runtime binary tests
+        run: cargo test --bin arcus-spot-runtime --no-default-features --features arcus-spot-sdk --locked
+
   deploy:
     runs-on: ubuntu-latest
     # CI ships new binary + configs but no longer restarts the service
