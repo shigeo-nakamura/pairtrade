@@ -1,0 +1,21 @@
+name: Script Tests
+
+# bot-strategy#765 round4: split out of ci.yml. ci.yml's resolve-ref job
+# makes should_deploy unconditional, so any path that fires ci.yml on
+# master also runs the arm64 build, S3 deploy, and the canary
+# auto-restart. deploy-configs.yml already syncs scripts/** to the host
+# with no restart in ~30s, so a scripts-only push has no business
+# reaching that pipeline — this workflow just runs the regression tests
+# for the scripts under test, decoupled from any deploy trigger.
+on:
+  push:
+    paths:
+      - "scripts/**"
+
+jobs:
+  test-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run canary_diff_report.py unit tests
+        run: python3 scripts/test_canary_diff_report.py -v

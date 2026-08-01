@@ -14,6 +14,14 @@ on:
       # files change. A combined push that touches both src/ and
       # configs/ still fires ci.yml via src/**, and ci.yml's deploy
       # step uploads configs as part of its full pipeline.
+      # scripts/** is deliberately NOT here (bot-strategy#765 round4):
+      # the resolve-ref job's should_deploy is unconditional, so any
+      # path that fires this workflow on master also runs the arm64
+      # build, deploy, and the canary auto-restart. deploy-configs.yml
+      # already syncs scripts/** to the host with no restart in ~30s,
+      # so a scripts-only push has no business reaching that pipeline.
+      # test_canary_diff_report.py runs in its own test-scripts.yml
+      # workflow instead, gated on scripts/** only.
   workflow_dispatch:
     inputs:
       dex_connector_ref:

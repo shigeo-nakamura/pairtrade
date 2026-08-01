@@ -65,16 +65,19 @@ class WindowSnapshot:
     history_start_ts_ms: float
     history_end_ts_ms: float
     window_coverage: float
+    # bot-strategy#765 round2: a capital-adjusted return, computed by
+    # rebasing to the post-event equity at each capital-event boundary and
+    # compounding each segment's own return (see build_snapshot_from_data).
+    # Plain cumulative_pnl / equity_start (the previous return_bps formula)
+    # divides post-event trading PnL by the *pre-event* starting balance,
+    # which is wrong whenever a capital event changed the capital actually
+    # at risk. With no capital events in the window there is only one
+    # segment, so this is numerically identical to the old formula.
+    return_bps: float
 
     @property
     def win_rate(self) -> float:
         return self.win_count / self.trade_count if self.trade_count else 0.0
-
-    @property
-    def return_bps(self) -> float:
-        if self.equity_start == 0.0:
-            return 0.0
-        return self.cumulative_pnl / abs(self.equity_start) * 10_000.0
 
 
 def s3_get_json(client, key: str) -> dict | None:
@@ -105,6 +108,31 @@ def s3_get_jsonl(client, key: str) -> list[dict]:
 # Refined under bot-strategy#376 Phase 5 Stage B baseline review.
 TRADE_EVENT_BPS_OF_EQUITY = 5.0
 
+# bot-strategy#765: a single-step |Δequity| this large relative to the
+# window's starting equity is a deposit/withdrawal capital event, not
+# trading PnL — round rollouts routinely move >50% of a variant's equity
+# in one step (e.g. bot-strategy#751 withdrew Pair-A to ~$0 then
+# redeposited to $6,000, which the naive equity_end - equity_start diff
+# misread as an $3,834.95 trading gain in bot-strategy#762). No observed
+# real trade-close has come close to this fraction of equity_start.
+# Capital-event steps are excluded entirely from cumulative_pnl,
+# trade_count/win_count, and median_per_trade_pnl.
+CAPITAL_EVENT_FRACTION_OF_EQUITY = 0.50
+
+# bot-strategy#765 round4: below this absolute USD balance, a segment has
+# no meaningful capital at risk, so ordinary cent-scale drift against it
+# is not a percentage return or a trade — it is the tail of an in-progress
+# withdrawal/redeposit. Without this floor, a withdrawal leaving a small
+# nonzero residual (e.g. $1,000 -> $0.01) rebases the segment onto that
+# dust: a further $0.01 -> $0.014 drift is only a 40% move relative to the
+# $0.01 base, under CAPITAL_EVENT_FRACTION_OF_EQUITY's 50% cutoff, so it
+# is treated as an ordinary trade and compounds into a +4,000bps segment
+# return once the eventual redeposit closes it out — a false ALERT against
+# an unchanged canary. Canary's own reference notional is ~$50 (see
+# CANARY_PNL_ALERT_USD_7D above); $1 is comfortably below any real
+# position size while covering realistic post-withdrawal residuals.
+DUST_EQUITY_USD_FLOOR = 1.0
+
 
 def filter_window(samples: list[dict], cutoff_ts_ms: float) -> list[dict]:
     """Filter equity-history samples to those at or after the cutoff.
@@ -118,16 +146,13 @@ def filter_window(samples: list[dict], cutoff_ts_ms: float) -> list[dict]:
     return [s for s in samples if s.get("ts", 0) >= cutoff_ts_ms]
 
 
-def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
-                   now_ts_ms: float) -> WindowSnapshot:
-    """Build a 7-day window summary from S3-mirrored bot state.
+def build_snapshot_from_data(agent: str, status: dict, history: list[dict],
+                             cutoff_ts_ms: float, now_ts_ms: float) -> WindowSnapshot:
+    """Pure computation over already-fetched status/history data.
 
-    Source of truth is `equity_history.jsonl`. It is more durable than
-    status.json trade_stats, but a state reset or manual main-bot restart
-    can truncate it. Window coverage therefore gates the verdict.
+    Split out from `build_snapshot` so the verdict logic can be exercised
+    with fixture data (bot-strategy#765) without mocking S3.
     """
-    status = s3_get_json(client, f"{prefix}/{agent}.json") or {}
-    history = s3_get_jsonl(client, f"{prefix}/{agent}.equity_history.jsonl")
     history_in_window = filter_window(history, cutoff_ts_ms)
 
     funding_carry = float(status.get("funding_carry_today", 0.0) or 0.0)
@@ -146,6 +171,7 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
             history_start_ts_ms=0.0,
             history_end_ts_ms=0.0,
             window_coverage=0.0,
+            return_bps=0.0,
         )
 
     history_start_ts_ms = float(history_in_window[0]["ts"])
@@ -154,32 +180,95 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
     covered_span_ms = max(0.0, history_end_ts_ms - history_start_ts_ms)
     equity_start = float(history_in_window[0]["equity"])
     equity_end = float(history_in_window[-1]["equity"])
-    cumulative_pnl = equity_end - equity_start
 
     # Trade count heuristic: count equity-history transitions where
-    # |Δ equity| ≥ TRADE_EVENT_BPS_OF_EQUITY bps of starting equity.
-    # This is a coarse proxy — Stage B/C follow-up will replace it with
-    # an authoritative debot_pnl/ jsonl read once that prefix is
-    # mirrored to S3. Until then the heuristic gives a directionally
-    # correct trade-rate ratio (the metric the verdict cares about).
-    threshold = abs(equity_start) * TRADE_EVENT_BPS_OF_EQUITY / 10_000.0
+    # |Δ equity| ≥ TRADE_EVENT_BPS_OF_EQUITY bps of the current segment's
+    # starting equity (rebased at each capital event alongside
+    # segment_start_equity below — bot-strategy#765 round3: a fixed,
+    # window-original threshold over-counts noise as trades after a
+    # deposit raises the capital base, or suppresses real trades after a
+    # withdrawal lowers it). A single segment (no capital events) keeps
+    # this fixed at equity_start, i.e. numerically identical to the
+    # pre-#765-round3 formula.
     trade_count = 0
     win_count = 0
     deltas: list[float] = []
+    trading_pnl = 0.0
+
+    # bot-strategy#765 round2: a capital event closes the current segment
+    # and starts a new one based at the post-event equity, so a
+    # capital-adjusted return can be computed by compounding each
+    # segment's own (local-base) return instead of dividing all
+    # post-event trading PnL by the window's original (possibly
+    # since-withdrawn) starting balance. A single segment (no capital
+    # events) reduces to plain segment_pnl / segment_start_equity, i.e.
+    # numerically identical to the pre-#765-round2 formula.
+    segment_start_equity = equity_start
+    segment_pnl = 0.0
+    growth_factor = 1.0
+
+    def close_segment() -> None:
+        nonlocal growth_factor
+        if abs(segment_start_equity) >= DUST_EQUITY_USD_FLOOR:
+            growth_factor *= 1.0 + segment_pnl / abs(segment_start_equity)
+        # else: no meaningful capital was at risk in this segment (it
+        # started at, or dropped to, dust), so it contributes no return;
+        # a move large enough to matter is itself caught as the next
+        # capital event below, not misread as a huge percentage gain.
+
     for i in range(1, len(history_in_window)):
-        delta = history_in_window[i]["equity"] - history_in_window[i - 1]["equity"]
-        if abs(delta) >= threshold:
+        prev_equity = history_in_window[i - 1]["equity"]
+        curr_equity = history_in_window[i]["equity"]
+        delta = curr_equity - prev_equity
+        # The capital-event reference is the pre-step (not the larger of
+        # the two endpoints) balance: the fraction is defined relative to
+        # what was already there before this move, so using the larger
+        # endpoint instead raises the effective threshold above the
+        # configured fraction for any deposit that increases the balance
+        # by less than 100% — e.g. a $1,000 -> $1,600 deposit (a 60% move)
+        # would compare its $600 delta against an $800 threshold
+        # (max(1000, 1600) * 50%) and be missed, misread as $600 of
+        # trading PnL. A step whose pre-event balance is exactly zero has
+        # no such reference, so the post-event balance is used instead
+        # purely to still catch that deposit (bot-strategy#765 round2).
+        step_reference = abs(prev_equity) if prev_equity != 0.0 else abs(curr_equity)
+        capital_event_threshold = step_reference * CAPITAL_EVENT_FRACTION_OF_EQUITY
+        if step_reference > 0.0 and abs(delta) >= capital_event_threshold:
+            # Deposit/withdrawal, not a trade — excluded from PnL and
+            # trade-count accounting (bot-strategy#765), and rebases the
+            # capital-adjusted return's segment boundary.
+            close_segment()
+            segment_start_equity = curr_equity
+            segment_pnl = 0.0
+            continue
+        if abs(segment_start_equity) < DUST_EQUITY_USD_FLOOR:
+            # Still resolving a withdrawal: this segment has no meaningful
+            # capital at risk, so ordinary cent-scale drift here (below
+            # the capital-event fraction of the tiny dust base, e.g. a
+            # further $0.01 -> $0.014 move) is neither a trade nor a
+            # return-bearing move. Keep tracking the running balance so
+            # the eventual redeposit is still measured from the correct
+            # (low) base, without counting this step as a trade or
+            # compounding it into the return.
+            segment_start_equity = curr_equity
+            continue
+        trading_pnl += delta
+        segment_pnl += delta
+        trade_threshold = abs(segment_start_equity) * TRADE_EVENT_BPS_OF_EQUITY / 10_000.0
+        if abs(delta) >= trade_threshold:
             trade_count += 1
             if delta > 0:
                 win_count += 1
             deltas.append(delta)
+    close_segment()
     median_per_trade_pnl = statistics.median(deltas) if deltas else 0.0
+    return_bps = (growth_factor - 1.0) * 10_000.0
 
     return WindowSnapshot(
         agent=agent,
         trade_count=trade_count,
         win_count=win_count,
-        cumulative_pnl=cumulative_pnl,
+        cumulative_pnl=trading_pnl,
         median_per_trade_pnl=median_per_trade_pnl,
         funding_carry=funding_carry,
         equity_start=equity_start,
@@ -187,7 +276,21 @@ def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
         history_start_ts_ms=history_start_ts_ms,
         history_end_ts_ms=history_end_ts_ms,
         window_coverage=min(1.0, covered_span_ms / requested_span_ms),
+        return_bps=return_bps,
     )
+
+
+def build_snapshot(client, prefix: str, agent: str, cutoff_ts_ms: float,
+                   now_ts_ms: float) -> WindowSnapshot:
+    """Build a 7-day window summary from S3-mirrored bot state.
+
+    Source of truth is `equity_history.jsonl`. It is more durable than
+    status.json trade_stats, but a state reset or manual main-bot restart
+    can truncate it. Window coverage therefore gates the verdict.
+    """
+    status = s3_get_json(client, f"{prefix}/{agent}.json") or {}
+    history = s3_get_jsonl(client, f"{prefix}/{agent}.equity_history.jsonl")
+    return build_snapshot_from_data(agent, status, history, cutoff_ts_ms, now_ts_ms)
 
 
 def compute_verdict(canary: WindowSnapshot, main: WindowSnapshot,
