@@ -1734,11 +1734,16 @@ mod tests {
     use std::time::Instant;
 
     use dex_connector::OrderSide;
+    use rust_decimal::prelude::ToPrimitive;
     use rust_decimal::Decimal;
 
+    use super::super::super::exit::compute_pnl;
+    use super::super::super::funding_history::FundingHistory;
     use super::super::super::market::SymbolSnapshot;
-    use super::super::super::state::{PendingLeg, PendingOrders, PendingStatus, PositionDirection};
-    use super::PairTradeEngine;
+    use super::super::super::state::{
+        PairState, PendingLeg, PendingOrders, PendingStatus, Position, PositionDirection,
+    };
+    use super::{ExitFillPnlContext, PairTradeEngine};
 
     fn dec(v: &str) -> Decimal {
         v.parse().unwrap()
@@ -2292,5 +2297,126 @@ mod tests {
         status.fills.insert("ord-2".to_string(), dec("0.5"));
         let got = PairTradeEngine::fill_vwap_by_symbol(&legs, &status, "BTC");
         assert_eq!(got, Some(dec("100.00")));
+    }
+
+    #[test]
+    fn build_exit_fill_pnl_follows_fill_vwap_even_when_snapshot_sign_disagrees() {
+        // bot-strategy#750 acceptance ("sign-crossing regression"): the
+        // consecutive-loss circuit breaker in `record_exit_realized_pnl`
+        // is a direct, deterministic function of the pnl sign this helper
+        // returns, so proving the sign here is fill-derived — even in a
+        // scenario engineered so the stale mark snapshot would have called
+        // the same close a WIN — is equivalent to proving the breaker
+        // follows actual fill economics rather than a reconciliation-time
+        // mark.
+        //
+        // Entry: long AAA @ 100 / short BBB @ 50, size 1.0 each side.
+        // Actual exit fills: AAA @ 95 (down), BBB @ 50 (flat) -> fill PnL
+        // = (95-100)*1 + (50-50)*1 = -5 (LOSS).
+        // Mark snapshot sampled at reconcile time: AAA @ 110 -> would have
+        // scored (110-100)*1 + (50-50)*1 = +10 (WIN) had it been used
+        // instead of the fill VWAP. The two signs disagree.
+        let position = Position {
+            direction: PositionDirection::LongSpread,
+            entered_at: Instant::now(),
+            entered_ts: 1_700_000_000,
+            entry_price_a: Some(dec("100")),
+            entry_price_b: Some(dec("50")),
+            entry_size_a: Some(dec("1.0")),
+            entry_size_b: Some(dec("1.0")),
+            entry_z: Some(2.4),
+            entry_beta: Some(1.0),
+            last_rehedge_ts: None,
+            rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
+        };
+        let mut state = PairState::new(2.0);
+        state.position = Some(position);
+
+        let legs = vec![
+            leg("AAA", "exit-a", "1.0", "1.0"),
+            leg("BBB", "exit-b", "1.0", "1.0"),
+        ];
+        let mut status = empty_status();
+        status
+            .filled_values
+            .insert("exit-a".to_string(), dec("95.0"));
+        status
+            .filled_value_qty
+            .insert("exit-a".to_string(), dec("1.0"));
+        status
+            .filled_values
+            .insert("exit-b".to_string(), dec("50.0"));
+        status
+            .filled_value_qty
+            .insert("exit-b".to_string(), dec("1.0"));
+
+        let mut price_map: HashMap<String, SymbolSnapshot> = HashMap::new();
+        price_map.insert(
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("110.0"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
+        );
+        price_map.insert(
+            "BBB".to_string(),
+            SymbolSnapshot {
+                price: dec("50.0"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
+        );
+
+        let funding = FundingHistory::new();
+        let ctx = ExitFillPnlContext {
+            inst_id: "default",
+            key: "AAA/BBB",
+            state: &state,
+            price_map: &price_map,
+            legs: &legs,
+            status: &status,
+            funding_history: &funding,
+            z_exit: Some(0.1),
+            beta_val: Some(1.0),
+            now_ts: 1_700_000_300,
+        };
+        let (_record, pnl, _funding_usd) =
+            PairTradeEngine::build_exit_fill_pnl(ctx).expect("pnl available");
+
+        // Sanity: the mark snapshot alone (never actually used once fill
+        // coverage exists) would have scored the opposite sign — this is
+        // what makes it a sign-crossing case rather than a same-direction
+        // magnitude difference.
+        let snapshot_pnl = compute_pnl(state.position.as_ref().unwrap(), dec("110.0"), dec("50.0"))
+            .and_then(|p| p.to_f64())
+            .unwrap();
+        assert!(
+            snapshot_pnl > 0.0,
+            "test setup sanity: snapshot price must imply a win, got {snapshot_pnl}"
+        );
+
+        // The value that actually reaches `record_exit_realized_pnl` (and
+        // therefore drives `consecutive_losses`) must follow the fill, not
+        // the snapshot: a loss, not a win.
+        assert_eq!(
+            pnl, -5.0,
+            "exit pnl must come from fill VWAP, not the mark snapshot"
+        );
     }
 }
