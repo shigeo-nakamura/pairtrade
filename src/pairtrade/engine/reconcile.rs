@@ -1730,10 +1730,18 @@ mod tests {
     //! without standing up an engine. Reaches the leg-fill aggregation
     //! that drives partial / full / fallback branching in the reconcile
     //! loop. bot-strategy#396.
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::sync::Arc;
     use std::time::Instant;
 
-    use dex_connector::OrderSide;
+    use async_trait::async_trait;
+    use dex_connector::{
+        BalanceResponse, CanceledOrdersResponse, CombinedBalanceResponse, CreateOrderResponse,
+        DexConnector, DexError, FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse,
+        OrderBookSnapshot, OrderSide, PositionSnapshot, PriceUpdate, TickerResponse, TpSl,
+        TriggerOrderStyle,
+    };
     use rust_decimal::prelude::ToPrimitive;
     use rust_decimal::Decimal;
 
@@ -1744,6 +1752,166 @@ mod tests {
         PairState, PendingLeg, PendingOrders, PendingStatus, Position, PositionDirection,
     };
     use super::{ExitFillPnlContext, PairTradeEngine};
+
+    /// No-op `DexConnector`: `record_exit_realized_pnl` never touches the
+    /// connector, so every method is unreachable in the test below. Exists
+    /// only to satisfy `PairTradeEngine::test_instance`'s `Arc<dyn
+    /// DexConnector>` requirement.
+    #[derive(Default)]
+    struct NullConnector;
+
+    #[async_trait]
+    impl DexConnector for NullConnector {
+        async fn start(&self) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn stop(&self) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn restart(&self, _max_retries: i32) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn set_leverage(&self, _symbol: &str, _leverage: u32) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn get_ticker(
+            &self,
+            _symbol: &str,
+            _test_price: Option<Decimal>,
+        ) -> Result<TickerResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_filled_orders(&self, _symbol: &str) -> Result<FilledOrdersResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_canceled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<CanceledOrdersResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_open_orders(&self, _symbol: &str) -> Result<OpenOrdersResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
+            unimplemented!()
+        }
+        async fn get_last_trades(&self, _symbol: &str) -> Result<LastTradesResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_order_book(
+            &self,
+            _symbol: &str,
+            _depth: usize,
+        ) -> Result<OrderBookSnapshot, DexError> {
+            unimplemented!()
+        }
+        async fn clear_filled_order(&self, _symbol: &str, _trade_id: &str) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn clear_all_filled_orders(&self) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn clear_canceled_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+        ) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn clear_all_canceled_orders(&self) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn create_order(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<CreateOrderResponse, DexError> {
+            unimplemented!()
+        }
+        async fn create_advanced_trigger_order(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _trigger_px: Decimal,
+            _limit_px: Option<Decimal>,
+            _order_style: TriggerOrderStyle,
+            _slippage_bps: Option<u32>,
+            _tpsl: TpSl,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<CreateOrderResponse, DexError> {
+            unimplemented!()
+        }
+        async fn create_order_taker_ioc(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _slippage_bps: u32,
+            _reduce_only: bool,
+        ) -> Result<CreateOrderResponse, DexError> {
+            unimplemented!()
+        }
+        async fn modify_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+            _side: OrderSide,
+            _target_total_size: Decimal,
+            _open_remaining_size: Decimal,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+        ) -> Result<CreateOrderResponse, DexError> {
+            unimplemented!()
+        }
+        async fn cancel_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn cancel_orders(
+            &self,
+            _symbol: Option<String>,
+            _order_ids: Vec<String>,
+        ) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn clear_last_trades(&self, _symbol: &str) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn is_upcoming_maintenance(&self, _hours_ahead: i64) -> bool {
+            unimplemented!()
+        }
+        async fn sign_evm_65b(&self, _message: &str) -> Result<String, DexError> {
+            unimplemented!()
+        }
+        async fn sign_evm_65b_with_eip191(&self, _message: &str) -> Result<String, DexError> {
+            unimplemented!()
+        }
+        fn subscribe_price_updates(
+            &self,
+        ) -> Result<tokio::sync::broadcast::Receiver<PriceUpdate>, DexError> {
+            unimplemented!()
+        }
+    }
 
     fn dec(v: &str) -> Decimal {
         v.parse().unwrap()
@@ -2384,6 +2552,7 @@ mod tests {
         );
 
         let funding = FundingHistory::new();
+        let now_ts = 1_700_000_300;
         let ctx = ExitFillPnlContext {
             inst_id: "default",
             key: "AAA/BBB",
@@ -2394,7 +2563,7 @@ mod tests {
             funding_history: &funding,
             z_exit: Some(0.1),
             beta_val: Some(1.0),
-            now_ts: 1_700_000_300,
+            now_ts,
         };
         let (_record, pnl, _funding_usd) =
             PairTradeEngine::build_exit_fill_pnl(ctx).expect("pnl available");
@@ -2417,6 +2586,30 @@ mod tests {
         assert_eq!(
             pnl, -5.0,
             "exit pnl must come from fill VWAP, not the mark snapshot"
+        );
+
+        // Drive the value through the actual circuit-breaker consumer
+        // (Codex review on PR #180: stopping at `build_exit_fill_pnl`
+        // alone would stay green even if the reconciliation path stopped
+        // forwarding this value, forwarded a different one, or the
+        // breaker mishandled its sign).
+        let mut engine = PairTradeEngine::test_instance(Arc::new(NullConnector));
+        assert_eq!(engine.instances[0].consecutive_losses, 0);
+
+        engine.record_exit_realized_pnl(0, now_ts, pnl, 0.0);
+        assert_eq!(
+            engine.instances[0].consecutive_losses, 1,
+            "breaker must count the fill-derived loss"
+        );
+
+        // Counterfactual: feeding the snapshot-implied value into the same
+        // consumer resets the streak instead — proving the two values
+        // really do drive the breaker in opposite directions, not just
+        // differ in magnitude.
+        engine.record_exit_realized_pnl(0, now_ts, snapshot_pnl, 0.0);
+        assert_eq!(
+            engine.instances[0].consecutive_losses, 0,
+            "sanity: the snapshot-derived value would have reset the streak instead"
         );
     }
 }
