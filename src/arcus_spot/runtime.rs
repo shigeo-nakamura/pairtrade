@@ -1511,8 +1511,26 @@ fn verify_reverse_notional_bound(
             )
         })?;
     let deviation = Decimal::new(5, 1); // 50%
-    let floor = notional_usd * (Decimal::ONE - deviation);
-    let ceiling = notional_usd * (Decimal::ONE + deviation);
+                                        // `Mul` panics on overflow rather than returning an error; a
+                                        // pathologically large (but otherwise validly-configured) notional_usd
+                                        // must not be able to crash a replay this way (Codex P2 follow-up,
+                                        // pairtrade#177).
+    let floor = notional_usd
+        .checked_mul(Decimal::ONE - deviation)
+        .ok_or_else(|| {
+            ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                "reverse notional floor exceeds Decimal range",
+            )
+        })?;
+    let ceiling = notional_usd
+        .checked_mul(Decimal::ONE + deviation)
+        .ok_or_else(|| {
+            ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                "reverse notional ceiling exceeds Decimal range",
+            )
+        })?;
     if reverse_notional_usd < floor || reverse_notional_usd > ceiling {
         return Err(ArcusSpotHold::new(
             ArcusSpotHoldCode::InvalidSnapshot,
@@ -2475,6 +2493,31 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
         assert!(error.detail.contains("reverse leg notional"));
+    }
+
+    #[test]
+    fn reverse_notional_bound_rejects_overflowing_ceiling_instead_of_panicking() {
+        // `Decimal::MAX / 1.5` sits right at the edge where `notional_usd *
+        // 1.5` would panic via the `Mul` operator (Codex P2 follow-up,
+        // pairtrade#177); the checked_mul-based ceiling must instead return
+        // an InvalidSnapshot hold.
+        let row = round_trip_row(
+            "490000000000000000",
+            "490000000000000000",
+            "248000000000000000",
+            "248000000000000000",
+            "80",
+        );
+        let reverse = row.reverse.as_ref().unwrap();
+        let error =
+            verify_reverse_notional_bound(reverse, Decimal::MAX, Decimal::from(100), &amd_token())
+                .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(
+            error.detail.contains("exceeds Decimal range"),
+            "{}",
+            error.detail
+        );
     }
 
     fn snapshot_with_route_unavailable(
