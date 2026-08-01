@@ -956,12 +956,12 @@ impl ArcusSpotRuntime {
                 ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
             })?;
 
-        let mut sell_quantity = raw_amount_to_quantity(&route.sell_amount, sell_token.decimals)
+        let sell_quantity = raw_amount_to_quantity(&route.sell_amount, sell_token.decimals)
             .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
-        let mut buy_quantity = raw_amount_to_quantity(&quote.buy_amount, buy_token.decimals)
+        let buy_quantity = raw_amount_to_quantity(&quote.buy_amount, buy_token.decimals)
             .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
-        let mut sell_amount_raw = route.sell_amount.clone();
-        let mut buy_amount_raw = quote.buy_amount.clone();
+        let sell_amount_raw = route.sell_amount.clone();
+        let buy_amount_raw = quote.buy_amount.clone();
         let sellable = sell_balance.checked_sub(sell_floor).ok_or_else(|| {
             ArcusSpotHold::new(
                 ArcusSpotHoldCode::InventoryFloor,
@@ -981,51 +981,25 @@ impl ArcusSpotRuntime {
             // An exit's route offers whatever amount the recorder's
             // fixed-notional quote happens to propose, which is
             // independent of how much is actually sellable above the
-            // floor: once a partial unwind has shrunk the sellable
-            // balance to a residual, every later fixed-notional quote is
-            // ordinarily larger than it. Rejecting outright (an earlier
-            // version of this check did) can then never be satisfied,
-            // permanently stranding the rotation even though the
-            // rotation-cap fix above already lets an oversized exit
-            // through. Settle for a residual-sized fill capped at the
-            // floor-preserving amount instead, prorating buy_quantity at
-            // the quote's own rate.
-            if sellable.is_zero() {
-                return Err(ArcusSpotHold::new(
-                    ArcusSpotHoldCode::InventoryFloor,
-                    "sell balance is at its configured floor; no residual to unwind",
-                ));
-            }
-            buy_quantity = buy_quantity
-                .checked_mul(sellable)
-                .and_then(|scaled| scaled.checked_div(sell_quantity))
-                .ok_or_else(|| {
-                    ArcusSpotHold::new(
-                        ArcusSpotHoldCode::InventoryFloor,
-                        "residual exit sizing exceeds Decimal range",
-                    )
-                })?;
-            sell_quantity = sellable;
-            // sell_amount_raw/buy_amount_raw otherwise still hold the
-            // original full-size quote's raw amounts, which would make the
-            // emitted plan's quantities and raw amounts mutually
-            // inconsistent — and any downstream replay/live consumer that
-            // trusts the raw fields over the quantities would apply the
-            // wrong (unprorated) amounts to inventory. quantity_to_raw_amount
-            // truncates to the token's integer raw-unit grid, so the
-            // quantities are read back from those raw strings afterward
-            // (rather than left at the untruncated prorated Decimal) to
-            // keep sell_quantity/buy_quantity — and predicted_inventory,
-            // computed from them below — exactly consistent with the raw
-            // amounts a real fill would settle for.
-            sell_amount_raw = quantity_to_raw_amount(sell_quantity, sell_token.decimals)
-                .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
-            buy_amount_raw = quantity_to_raw_amount(buy_quantity, buy_token.decimals)
-                .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
-            sell_quantity = raw_amount_to_quantity(&sell_amount_raw, sell_token.decimals)
-                .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
-            buy_quantity = raw_amount_to_quantity(&buy_amount_raw, buy_token.decimals)
-                .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
+            // floor. Scaling buy_quantity linearly down to the sellable
+            // amount was tried here, but that synthesizes a fill price the
+            // venue never actually quoted: under price impact, fixed fees,
+            // minimum amounts, or tiered pricing, the real executable
+            // result for a smaller size can differ materially, corrupting
+            // replay inventory, equity, and PnL (Codex P1 follow-up,
+            // pairtrade#177). Remain unfilled and wait for a snapshot whose
+            // quote actually fits above the floor instead of inventing
+            // one; this accepts that a rotation can stay open longer near
+            // the floor, which is preferred over recording an
+            // unexecutable fill.
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::InventoryFloor,
+                format!(
+                    "selling {} {} would cross floor {}; sellable={}, no quote at that residual \
+                     size is available",
+                    sell_quantity, sell_token.symbol, sell_floor, sellable
+                ),
+            ));
         }
         // An exit's route offers whatever quantity the recorder's
         // fixed-notional quote happens to propose at this snapshot, which is
@@ -1049,36 +1023,22 @@ impl ArcusSpotRuntime {
         if trigger != ArcusSpotRotationTrigger::EntrySignal {
             if let Some(open_quantity) = self.state.rotated_quantity {
                 if sell_quantity > open_quantity {
-                    buy_quantity = buy_quantity
-                        .checked_mul(open_quantity)
-                        .and_then(|scaled| scaled.checked_div(sell_quantity))
-                        .ok_or_else(|| {
-                            ArcusSpotHold::new(
-                                ArcusSpotHoldCode::RotationLimit,
-                                "open-quantity exit sizing exceeds Decimal range",
-                            )
-                        })?;
-                    sell_quantity = open_quantity;
-                    // Read the quantities back from their truncated raw
-                    // amounts (see the floor-crossing case above) so
-                    // predicted_inventory below is computed from exactly
-                    // what the raw fields represent.
-                    sell_amount_raw = quantity_to_raw_amount(sell_quantity, sell_token.decimals)
-                        .map_err(|detail| {
-                            ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail)
-                        })?;
-                    buy_amount_raw = quantity_to_raw_amount(buy_quantity, buy_token.decimals)
-                        .map_err(|detail| {
-                            ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail)
-                        })?;
-                    sell_quantity = raw_amount_to_quantity(&sell_amount_raw, sell_token.decimals)
-                        .map_err(|detail| {
-                        ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail)
-                    })?;
-                    buy_quantity = raw_amount_to_quantity(&buy_amount_raw, buy_token.decimals)
-                        .map_err(|detail| {
-                            ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail)
-                        })?;
+                    // Scaling buy_quantity linearly down to open_quantity
+                    // was tried here, but that synthesizes a fill price the
+                    // venue never actually quoted for that smaller size --
+                    // the same soundness problem as the floor-crossing case
+                    // above (Codex P1 follow-up, pairtrade#177). Remain
+                    // unfilled and wait for a snapshot whose quote fits
+                    // within the tracked open quantity instead of
+                    // inventing one.
+                    return Err(ArcusSpotHold::new(
+                        ArcusSpotHoldCode::RotationLimit,
+                        format!(
+                            "exit selling {} {} exceeds the open rotation quantity {}; no quote \
+                             at that size is available",
+                            sell_quantity, sell_token.symbol, open_quantity
+                        ),
+                    ));
                 }
             }
         }
@@ -1708,11 +1668,11 @@ fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
 }
 
 /// Inverse of `raw_amount_to_quantity`: renders a token quantity back to the
-/// integer raw-unit string a route would carry. Used to keep
-/// `sell_amount_raw`/`buy_amount_raw` consistent with `sell_quantity`/
-/// `buy_quantity` after `build_plan` prorates them for a residual exit —
-/// otherwise the emitted plan would report the pre-proration full-size raw
-/// amounts alongside the reduced quantities.
+/// integer raw-unit string a route would carry. `build_plan` no longer
+/// synthesizes prorated fills (see the floor/rotation-limit rejections
+/// above), so this is currently exercised only by tests; kept as a
+/// production-quality utility rather than folded into the test module.
+#[cfg(test)]
 fn quantity_to_raw_amount(quantity: Decimal, decimals: u32) -> Result<String, String> {
     if quantity < Decimal::ZERO {
         return Err(format!("quantity {quantity} must be non-negative"));
@@ -2040,21 +2000,22 @@ mod tests {
     }
 
     #[test]
-    fn exit_settles_a_residual_sized_fill_instead_of_crossing_the_floor() {
+    fn exit_exceeding_the_sellable_residual_above_the_floor_is_rejected() {
         // A prior partial unwind has shrunk token_b's sellable balance
         // (0.02 above the 0.1 floor) below what this snapshot's
-        // fixed-notional reverse quote offers to sell (0.049): rejecting
-        // outright (an earlier version of this check did) can never be
-        // satisfied once the sellable balance is a residual smaller than
-        // any typical quote, permanently stranding the rotation. The exit
-        // must instead settle for exactly the floor-preserving amount,
-        // with buy_quantity prorated at the quote's own rate.
+        // fixed-notional reverse quote offers to sell (0.049). An earlier
+        // version scaled buy_quantity linearly down to the sellable amount,
+        // but that synthesizes a fill price the venue never actually
+        // quoted for that smaller size -- under price impact, fixed fees,
+        // minimum amounts, or tiered pricing the real executable result
+        // can differ materially (Codex P1 follow-up, pairtrade#177). The
+        // exit must instead remain unfilled rather than invent one.
         let runtime = ArcusSpotRuntime::new(config()).unwrap();
         let inventory = ArcusSpotInventory {
             token_a: Decimal::ONE,
             token_b: Decimal::new(12, 2), // 0.12: sellable = 0.12 - 0.1 = 0.02
         };
-        let plan = runtime
+        let error = runtime
             .build_plan(
                 &context(event_time() - Duration::seconds(2), Decimal::from(20)),
                 ArcusSpotDirection::TokenBToTokenA,
@@ -2062,31 +2023,8 @@ mod tests {
                 event_time(),
                 inventory,
             )
-            .unwrap();
-        assert_eq!(plan.sell_quantity, Decimal::new(2, 2)); // clamped to sellable (0.02)
-                                                            // buy_quantity prorated: 0.0248 * 0.02 / 0.049, then truncated to
-                                                            // the token's 18-decimal raw-unit grid (bot-strategy#755 review
-                                                            // round13) — the exact rational quotient does not terminate at 18
-                                                            // decimals, so plan.buy_quantity must match what the raw amount
-                                                            // actually represents, not the untruncated Decimal quotient.
-        let exact_buy_before_truncation = Decimal::new(248, 4)
-            .checked_mul(Decimal::new(2, 2))
-            .unwrap()
-            .checked_div(Decimal::new(49, 3))
-            .unwrap();
-        let expected_buy_raw = quantity_to_raw_amount(exact_buy_before_truncation, 18).unwrap();
-        let expected_buy = raw_amount_to_quantity(&expected_buy_raw, 18).unwrap();
-        assert_ne!(expected_buy, exact_buy_before_truncation); // truncation actually bites here
-        assert_eq!(plan.buy_quantity, expected_buy);
-        assert_eq!(plan.predicted_inventory.token_b, Decimal::new(1, 1)); // exactly at floor
-                                                                          // sell_amount_raw/buy_amount_raw must be recomputed from the
-                                                                          // prorated quantities, not left at the original full-size quote's
-                                                                          // raw amounts (bot-strategy#755 review round12) — otherwise a
-                                                                          // consumer trusting the raw fields over the Decimal quantities
-                                                                          // would apply the pre-proration (larger) amounts.
-        assert_eq!(plan.sell_amount_raw, "20000000000000000");
-        assert_eq!(plan.buy_amount_raw, expected_buy_raw);
-        assert_ne!(plan.sell_amount_raw, "49000000000000000"); // not the unprorated quote
+            .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InventoryFloor);
     }
 
     #[test]
@@ -2985,17 +2923,16 @@ mod tests {
     }
 
     #[test]
-    fn exit_exceeding_the_open_rotation_quantity_is_prorated_to_it() {
+    fn exit_exceeding_the_open_rotation_quantity_is_rejected() {
         // The row's reverse leg wants to sell 0.049 AMD, but only 0.04 AMD
-        // is tracked as open from the entry. An earlier version of this
-        // check rejected such an oversized exit outright to avoid consuming
-        // pre-existing (pre-rotation) AMD inventory, but that left the
-        // runtime permanently rotated once a partial unwind shrank the open
-        // quantity below what any later fixed-notional quote would offer.
-        // A later revision let it through at full size instead, which sold
-        // 0.009 AMD of pre-existing inventory while declaring the rotation
-        // closed (bot-strategy#755 review round13). The exit must instead
-        // be prorated down to exactly the tracked open quantity.
+        // is tracked as open from the entry. An earlier version scaled
+        // buy_quantity linearly down to the open quantity, but that
+        // synthesizes a fill price the venue never actually quoted for
+        // that smaller size -- the same soundness problem as the
+        // floor-crossing case (Codex P1 follow-up, pairtrade#177). The
+        // exit must instead remain unfilled (staying rotated) rather than
+        // invent one; a future snapshot whose quote fits within the open
+        // quantity can still close it.
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
         runtime.state.regime = ArcusSpotRegime::RotatedAToB;
         runtime.state.rotated_quantity = Some(Decimal::new(40, 3));
@@ -3003,27 +2940,14 @@ mod tests {
             Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
         let snapshot = snapshot_with_valid_row(event_time());
         let event = runtime.step_at(&snapshot, event_time());
-        // buy_quantity prorated: 0.0248 * 0.04 / 0.049, then truncated to
-        // the token's 18-decimal raw-unit grid.
-        let exact_buy_before_truncation = Decimal::new(248, 4)
-            .checked_mul(Decimal::new(40, 3))
-            .unwrap()
-            .checked_div(Decimal::new(49, 3))
-            .unwrap();
-        let expected_buy_raw = quantity_to_raw_amount(exact_buy_before_truncation, 18).unwrap();
-        let expected_buy = raw_amount_to_quantity(&expected_buy_raw, 18).unwrap();
         match event.decision {
-            ArcusSpotDecision::SimulatedFill { plan } => {
-                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
-                assert_eq!(plan.sell_quantity, Decimal::new(40, 3));
-                assert_eq!(plan.buy_quantity, expected_buy);
-                assert_eq!(plan.sell_amount_raw, "40000000000000000");
-                assert_eq!(plan.buy_amount_raw, expected_buy_raw);
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::RotationLimit);
             }
-            other => panic!("expected a closing max-hold exit, got {other:?}"),
+            other => panic!("expected the oversized exit to be rejected, got {other:?}"),
         }
-        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
-        assert_eq!(runtime.state().rotated_quantity, None);
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
+        assert_eq!(runtime.state().rotated_quantity, Some(Decimal::new(40, 3)));
     }
 
     #[test]
