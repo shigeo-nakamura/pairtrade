@@ -153,6 +153,16 @@ pub struct ArcusSpotRuntimeState {
     pub initial_equity_usd: Option<Decimal>,
     pub daily_baseline_day: Option<String>,
     pub daily_baseline_equity_usd: Option<Decimal>,
+    /// Equity as of the most recently evaluated snapshot, updated on every
+    /// tick regardless of day boundary. `daily_baseline_equity_usd` is
+    /// fixed at the day's *opening* mark, so on the first tick of a new
+    /// day it is a full day stale by the time of rollover; assessing the
+    /// overnight gap against it instead of this field can miss a loss that
+    /// occurs after an intraday gain (e.g. day opens $100, rises to $110,
+    /// then drops to $105 by the next day's open — a real $5 overnight
+    /// loss from the $110 peak that a $100-baseline comparison reports as
+    /// a gain). See `risk_mark`'s overnight-gap handling.
+    pub last_equity_usd: Option<Decimal>,
     pub risk_halt: Option<ArcusSpotRiskHalt>,
 }
 
@@ -168,6 +178,7 @@ impl ArcusSpotRuntimeState {
             initial_equity_usd: None,
             daily_baseline_day: None,
             daily_baseline_equity_usd: None,
+            last_equity_usd: None,
             risk_halt: None,
         }
     }
@@ -307,8 +318,12 @@ impl ArcusSpotRuntime {
         // assessed against any baseline. Assessing this mark first lets an
         // overnight loss that breached the still-active prior baseline
         // engage the halt before the new day's baseline is established.
-        let risk_before = self.risk_mark(equity_before);
+        // risk_mark_before_rollover (rather than plain risk_mark) uses the
+        // prior day's actual last mark on that specific tick, not its
+        // opening baseline — see `last_equity_usd`'s doc comment.
+        let risk_before = self.risk_mark_before_rollover(evaluation_time, equity_before);
         self.update_risk_baselines(evaluation_time, equity_before);
+        self.state.last_equity_usd = Some(equity_before);
         self.engage_risk_halt(evaluation_time, risk_before);
 
         // Computed and appended to the signal window from `price` (token
@@ -987,31 +1002,77 @@ impl ArcusSpotRuntime {
             // emitted plan's quantities and raw amounts mutually
             // inconsistent — and any downstream replay/live consumer that
             // trusts the raw fields over the quantities would apply the
-            // wrong (unprorated) amounts to inventory.
+            // wrong (unprorated) amounts to inventory. quantity_to_raw_amount
+            // truncates to the token's integer raw-unit grid, so the
+            // quantities are read back from those raw strings afterward
+            // (rather than left at the untruncated prorated Decimal) to
+            // keep sell_quantity/buy_quantity — and predicted_inventory,
+            // computed from them below — exactly consistent with the raw
+            // amounts a real fill would settle for.
             sell_amount_raw = quantity_to_raw_amount(sell_quantity, sell_token.decimals)
                 .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
             buy_amount_raw = quantity_to_raw_amount(buy_quantity, buy_token.decimals)
+                .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
+            sell_quantity = raw_amount_to_quantity(&sell_amount_raw, sell_token.decimals)
+                .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
+            buy_quantity = raw_amount_to_quantity(&buy_amount_raw, buy_token.decimals)
                 .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
         }
         // An exit's route offers whatever quantity the recorder's
         // fixed-notional quote happens to propose at this snapshot, which is
         // independent of the quantity actually acquired at entry: quote
         // movement between entry and later snapshots routinely makes it
-        // smaller OR larger than the tracked open rotation quantity.
-        // Rejecting an oversized exit outright (an earlier version of this
+        // smaller OR larger than the tracked open rotation quantity. An
+        // undersized quote is an ordinary partial exit — the state
+        // transition below keeps the remainder tracked as still open.
+        // Rejecting an oversized quote outright (an earlier version of this
         // check did) is unnecessary and actively harmful: once a smaller
         // quote has partially unwound the position, every later
         // fixed-notional quote is ordinarily larger than the shrinking
         // remainder, so a hard reject here would leave the runtime
         // permanently rotated with a residual amount no future quote could
-        // ever satisfy. Instead, the state transition below always lets the
-        // exit proceed (subject to the ordinary floor/balance check above)
-        // and saturates the tracked open quantity to zero, so both an
-        // undersized exit (partial unwind, stays rotated with the smaller
-        // remainder) and an oversized one (fully closes the rotation; any
-        // amount beyond what was tracked as open is a bounded, already
-        // floor-checked trade against pre-existing inventory) are handled
-        // correctly without ever getting stuck.
+        // ever satisfy. But letting it through at full size would instead
+        // sell more than was ever acquired for this rotation, consuming
+        // pre-existing (pre-rotation) inventory and misattributing it to
+        // this exit (bot-strategy#755 review round13); prorate it down to
+        // exactly the tracked open quantity instead, the same way the
+        // floor-crossing case above is prorated.
+        if trigger != ArcusSpotRotationTrigger::EntrySignal {
+            if let Some(open_quantity) = self.state.rotated_quantity {
+                if sell_quantity > open_quantity {
+                    buy_quantity = buy_quantity
+                        .checked_mul(open_quantity)
+                        .and_then(|scaled| scaled.checked_div(sell_quantity))
+                        .ok_or_else(|| {
+                            ArcusSpotHold::new(
+                                ArcusSpotHoldCode::RotationLimit,
+                                "open-quantity exit sizing exceeds Decimal range",
+                            )
+                        })?;
+                    sell_quantity = open_quantity;
+                    // Read the quantities back from their truncated raw
+                    // amounts (see the floor-crossing case above) so
+                    // predicted_inventory below is computed from exactly
+                    // what the raw fields represent.
+                    sell_amount_raw = quantity_to_raw_amount(sell_quantity, sell_token.decimals)
+                        .map_err(|detail| {
+                            ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail)
+                        })?;
+                    buy_amount_raw = quantity_to_raw_amount(buy_quantity, buy_token.decimals)
+                        .map_err(|detail| {
+                            ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail)
+                        })?;
+                    sell_quantity = raw_amount_to_quantity(&sell_amount_raw, sell_token.decimals)
+                        .map_err(|detail| {
+                        ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail)
+                    })?;
+                    buy_quantity = raw_amount_to_quantity(&buy_amount_raw, buy_token.decimals)
+                        .map_err(|detail| {
+                            ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail)
+                        })?;
+                }
+            }
+        }
         // The cap limits how large a single new entry may be relative to
         // available inventory; it must not also apply to exits. The
         // fraction is recomputed against whatever balance remains after the
@@ -1132,6 +1193,35 @@ impl ArcusSpotRuntime {
         ArcusSpotRiskMark {
             equity_usd,
             daily_loss_usd: positive_loss(self.state.daily_baseline_equity_usd, equity_usd),
+            cumulative_loss_usd: positive_loss(self.state.initial_equity_usd, equity_usd),
+        }
+    }
+
+    /// Like `risk_mark`, but for the one-time assessment taken *before*
+    /// `update_risk_baselines` resets the daily baseline on the first tick
+    /// of a new UTC day. On that specific tick, `daily_baseline_equity_usd`
+    /// still holds the *outgoing* day's opening mark rather than its
+    /// closing one, which can under-report (or entirely miss) a loss that
+    /// occurred after an intraday gain — see `last_equity_usd`'s doc
+    /// comment. Falls back to `daily_baseline_equity_usd` when no prior
+    /// mark exists yet (e.g. the very first tick ever).
+    fn risk_mark_before_rollover(
+        &self,
+        at: DateTime<Utc>,
+        equity_usd: Decimal,
+    ) -> ArcusSpotRiskMark {
+        let day = at.format("%Y-%m-%d").to_string();
+        let is_new_day = self.state.daily_baseline_day.as_deref() != Some(day.as_str());
+        let daily_reference = if is_new_day {
+            self.state
+                .last_equity_usd
+                .or(self.state.daily_baseline_equity_usd)
+        } else {
+            self.state.daily_baseline_equity_usd
+        };
+        ArcusSpotRiskMark {
+            equity_usd,
+            daily_loss_usd: positive_loss(daily_reference, equity_usd),
             cumulative_loss_usd: positive_loss(self.state.initial_equity_usd, equity_usd),
         }
     }
@@ -1965,12 +2055,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(plan.sell_quantity, Decimal::new(2, 2)); // clamped to sellable (0.02)
-                                                            // buy_quantity prorated: 0.0248 * 0.02 / 0.049
-        let expected_buy = Decimal::new(248, 4)
+                                                            // buy_quantity prorated: 0.0248 * 0.02 / 0.049, then truncated to
+                                                            // the token's 18-decimal raw-unit grid (bot-strategy#755 review
+                                                            // round13) — the exact rational quotient does not terminate at 18
+                                                            // decimals, so plan.buy_quantity must match what the raw amount
+                                                            // actually represents, not the untruncated Decimal quotient.
+        let exact_buy_before_truncation = Decimal::new(248, 4)
             .checked_mul(Decimal::new(2, 2))
             .unwrap()
             .checked_div(Decimal::new(49, 3))
             .unwrap();
+        let expected_buy_raw = quantity_to_raw_amount(exact_buy_before_truncation, 18).unwrap();
+        let expected_buy = raw_amount_to_quantity(&expected_buy_raw, 18).unwrap();
+        assert_ne!(expected_buy, exact_buy_before_truncation); // truncation actually bites here
         assert_eq!(plan.buy_quantity, expected_buy);
         assert_eq!(plan.predicted_inventory.token_b, Decimal::new(1, 1)); // exactly at floor
                                                                           // sell_amount_raw/buy_amount_raw must be recomputed from the
@@ -1978,14 +2075,8 @@ mod tests {
                                                                           // raw amounts (bot-strategy#755 review round12) — otherwise a
                                                                           // consumer trusting the raw fields over the Decimal quantities
                                                                           // would apply the pre-proration (larger) amounts.
-        assert_eq!(
-            plan.sell_amount_raw,
-            quantity_to_raw_amount(plan.sell_quantity, 18).unwrap()
-        );
-        assert_eq!(
-            plan.buy_amount_raw,
-            quantity_to_raw_amount(plan.buy_quantity, 18).unwrap()
-        );
+        assert_eq!(plan.sell_amount_raw, "20000000000000000");
+        assert_eq!(plan.buy_amount_raw, expected_buy_raw);
         assert_ne!(plan.sell_amount_raw, "49000000000000000"); // not the unprorated quote
     }
 
@@ -2564,6 +2655,38 @@ mod tests {
     }
 
     #[test]
+    fn overnight_loss_after_an_intraday_gain_is_caught_against_the_last_mark() {
+        // Day 1 opens at $300 (baseline), rises to $310 intraday, then day
+        // 2 opens at $305 — a real $5 drop from the $310 peak, but still a
+        // $5 *gain* over day 1's own $300 opening baseline. Comparing the
+        // rollover tick against that stale opening baseline (as a plain
+        // risk_mark() would) reports zero loss and silently absorbs the
+        // drop; it must instead be compared against day 1's actual last
+        // mark ($310) (bot-strategy#755 review round13).
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let day1 = event_time();
+        runtime.step_at(&snapshot_with_valid_row(day1), day1);
+        assert_eq!(runtime.state().risk_halt, None);
+
+        // Intraday rise to $310: 200*1.05 + 100*1 = 310.
+        runtime.state.inventory.token_a = Decimal::new(105, 2);
+        let day1_later = day1 + Duration::hours(6);
+        runtime.step_at(&snapshot_with_valid_row(day1_later), day1_later);
+        assert_eq!(runtime.state().risk_halt, None);
+
+        // Day 2 opens at $305: 200*1.025 + 100*1 = 305.
+        runtime.state.inventory.token_a = Decimal::new(1025, 3);
+        let day2 = day1 + Duration::days(1);
+        runtime.step_at(&snapshot_with_valid_row(day2), day2);
+
+        let halt =
+            runtime.state().risk_halt.clone().expect(
+                "a $5 overnight drop from yesterday's peak must engage the daily-loss halt",
+            );
+        assert_eq!(halt.kind, ArcusSpotRiskHaltKind::DailyLoss);
+    }
+
+    #[test]
     fn price_sampling_continues_during_a_route_outage() {
         // A route outage must not stall the signal window: otherwise the
         // first route recovered after an outage is scored against
@@ -2815,16 +2938,17 @@ mod tests {
     }
 
     #[test]
-    fn exit_exceeding_the_open_rotation_quantity_fully_closes_it() {
+    fn exit_exceeding_the_open_rotation_quantity_is_prorated_to_it() {
         // The row's reverse leg wants to sell 0.049 AMD, but only 0.04 AMD
         // is tracked as open from the entry. An earlier version of this
         // check rejected such an oversized exit outright to avoid consuming
         // pre-existing (pre-rotation) AMD inventory, but that left the
         // runtime permanently rotated once a partial unwind shrank the open
         // quantity below what any later fixed-notional quote would offer.
-        // The exit must instead be allowed to proceed and fully close the
-        // rotation; ordinary floor/balance checks (unchanged here) already
-        // bound how much can be sold in one action.
+        // A later revision let it through at full size instead, which sold
+        // 0.009 AMD of pre-existing inventory while declaring the rotation
+        // closed (bot-strategy#755 review round13). The exit must instead
+        // be prorated down to exactly the tracked open quantity.
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
         runtime.state.regime = ArcusSpotRegime::RotatedAToB;
         runtime.state.rotated_quantity = Some(Decimal::new(40, 3));
@@ -2832,10 +2956,22 @@ mod tests {
             Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
         let snapshot = snapshot_with_valid_row(event_time());
         let event = runtime.step_at(&snapshot, event_time());
+        // buy_quantity prorated: 0.0248 * 0.04 / 0.049, then truncated to
+        // the token's 18-decimal raw-unit grid.
+        let exact_buy_before_truncation = Decimal::new(248, 4)
+            .checked_mul(Decimal::new(40, 3))
+            .unwrap()
+            .checked_div(Decimal::new(49, 3))
+            .unwrap();
+        let expected_buy_raw = quantity_to_raw_amount(exact_buy_before_truncation, 18).unwrap();
+        let expected_buy = raw_amount_to_quantity(&expected_buy_raw, 18).unwrap();
         match event.decision {
             ArcusSpotDecision::SimulatedFill { plan } => {
                 assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
-                assert_eq!(plan.sell_quantity, Decimal::new(49, 3));
+                assert_eq!(plan.sell_quantity, Decimal::new(40, 3));
+                assert_eq!(plan.buy_quantity, expected_buy);
+                assert_eq!(plan.sell_amount_raw, "40000000000000000");
+                assert_eq!(plan.buy_amount_raw, expected_buy_raw);
             }
             other => panic!("expected a closing max-hold exit, got {other:?}"),
         }
