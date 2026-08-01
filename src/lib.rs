@@ -1,4 +1,6 @@
 // src/lib.rs
+#[cfg(feature = "arcus-spot-sdk")]
+pub mod arcus_spot;
 pub mod ports {
     pub mod replay_dex;
 }
