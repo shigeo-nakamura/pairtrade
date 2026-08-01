@@ -208,13 +208,19 @@ struct SnapshotContext {
     token_a_price_usd: Decimal,
     token_b_price_usd: Decimal,
     row: ArcusSpotRoundTripRecord,
-    /// Round-trip cost in bps, independently recomputed from the forward and
-    /// reverse recommended quote amounts and cross-checked against the
-    /// recorded `optimistic_round_trip_loss_bps`/`optimistic_return_amount`
-    /// fields. `build_plan`'s cost gate must use this instead of the row's
-    /// self-reported string: a row whose two legs do not actually chain
-    /// (reverse sellAmount != forward buyAmount) can report an arbitrarily
-    /// cheap loss while the real recommended amounts imply a much larger one.
+    /// Round-trip cost in bps. For an entry (or any tick with no exit
+    /// executing), independently recomputed from the forward and reverse
+    /// recommended quote amounts and cross-checked against the recorded
+    /// `optimistic_round_trip_loss_bps`/`optimistic_return_amount` fields --
+    /// `build_plan`'s entry cost gate must use this instead of the row's
+    /// self-reported string, since a row whose two legs do not actually
+    /// chain (reverse sellAmount != forward buyAmount) can report an
+    /// arbitrarily cheap loss while the real recommended amounts imply a
+    /// much larger one. For an exit, the cost gate does not apply (see
+    /// `build_plan`), so this is simply the row's as-reported value: exits
+    /// only validate the leg they actually execute, and cross-checking it
+    /// against the unused leg would reintroduce the staleness-blocks-exits
+    /// problem `snapshot_context` exists to avoid.
     verified_round_trip_loss_bps: Decimal,
 }
 
@@ -367,7 +373,17 @@ impl ArcusSpotRuntime {
             self.state.relative_log_price_history.drain(0..excess);
         }
 
-        let context = match self.snapshot_context(snapshot, evaluation_time, &price) {
+        // A max-hold exit must fire even when the signal window is flat
+        // (z_score() returns None once its standard deviation collapses to
+        // zero), so rotation_signal is consulted with the raw Option instead
+        // of bailing out to Warmup before it ever sees a rotated regime.
+        // Resolved *before* snapshot_context so it can validate only the
+        // leg an exit will actually execute (see snapshot_context's doc
+        // comment): a stale but unused leg must not be able to block a
+        // mean-reversion or max-hold exit, defeating max_hold_secs.
+        let signal = self.rotation_signal(z_score, evaluation_time, regime_before);
+
+        let context = match self.snapshot_context(snapshot, evaluation_time, &price, signal) {
             Ok(context) => context,
             Err(hold) => {
                 return self.event(RuntimeEventInput {
@@ -417,13 +433,7 @@ impl ArcusSpotRuntime {
             }
         }
 
-        // A max-hold exit must fire even when the signal window is flat
-        // (z_score() returns None once its standard deviation collapses to
-        // zero), so rotation_signal is consulted with the raw Option instead
-        // of bailing out to Warmup before it ever sees a rotated regime.
-        let Some((direction, trigger)) =
-            self.rotation_signal(z_score, evaluation_time, regime_before)
-        else {
+        let Some((direction, trigger)) = signal else {
             let hold = match z_score {
                 Some(z) => ArcusSpotHold::new(
                     ArcusSpotHoldCode::NoSignal,
@@ -669,11 +679,24 @@ impl ArcusSpotRuntime {
         })
     }
 
+    /// Validates the recorder row and, depending on `signal`, either both
+    /// route legs (entries, and any tick without a rotation signal) or only
+    /// the leg an exit will actually execute.
+    ///
+    /// An exit only ever consumes one leg (see `build_plan`'s direction
+    /// match), and unlike an entry it does not need a verified round-trip
+    /// cost -- the cost gate is entry-only (see `build_plan`). Requiring the
+    /// *other*, unused leg to also be fresh and internally consistent here
+    /// used to block every exit until that unused leg's freshness happened
+    /// to recover, which can defeat `max_hold_secs`'s hard guarantee
+    /// indefinitely if the row's forward/reverse legs are refreshed out of
+    /// step (Codex P1 follow-up, pairtrade#177).
     fn snapshot_context(
         &self,
         snapshot: &ArcusSpotRecorderSnapshot,
         evaluation_time: DateTime<Utc>,
         price: &PriceContext,
+        signal: Option<(ArcusSpotDirection, ArcusSpotRotationTrigger)>,
     ) -> Result<SnapshotContext, ArcusSpotHold> {
         let token_a = &price.token_a;
         let token_b = &price.token_b;
@@ -738,45 +761,105 @@ impl ArcusSpotRuntime {
         }
         let forward_route = row.forward.as_ref().expect("checked above");
         let reverse_route = row.reverse.as_ref().expect("checked above");
-        // Both legs feed verified_round_trip_loss_bps below, and either one
-        // can also be selected as the executing route once a direction is
-        // chosen; validating only the leg picked at build_plan() time would
-        // let an untrusted identity/amount/staleness in the other leg still
-        // shape the cost gate and the row's eventual selection.
-        validate_route_leg(
-            forward_route,
-            token_a,
-            token_b,
-            evaluation_time,
-            self.config.max_quote_age_secs,
-        )?;
-        validate_route_leg(
-            reverse_route,
-            token_b,
-            token_a,
-            evaluation_time,
-            self.config.max_quote_age_secs,
-        )?;
-        verify_requested_notional_amount(
-            row,
-            forward_route,
-            self.config.notional_usd,
-            token_a_price_usd,
-            token_a,
-        )?;
-        // The reverse leg has no analogous requested_sell_amount to
-        // cross-check: its sell amount is whatever the forward leg's quote
-        // reported as its buy amount, not independently requested from the
-        // notional. A malformed or severely off-market forward quote could
-        // therefore size a B-to-A rotation far outside the configured
-        // notional while still linking correctly to the forward leg.
-        verify_reverse_notional_bound(
-            reverse_route,
-            self.config.notional_usd,
-            token_b_price_usd,
-            token_b,
-        )?;
-        let verified_round_trip_loss_bps = verify_round_trip_linkage_and_loss(row)?;
+
+        let exit_direction = match signal {
+            Some((direction, trigger))
+                if trigger == ArcusSpotRotationTrigger::MeanReversionExit
+                    || trigger == ArcusSpotRotationTrigger::MaxHoldExit =>
+            {
+                Some(direction)
+            }
+            _ => None,
+        };
+
+        let verified_round_trip_loss_bps = match exit_direction {
+            Some(ArcusSpotDirection::TokenAToTokenB) => {
+                validate_route_leg(
+                    forward_route,
+                    token_a,
+                    token_b,
+                    evaluation_time,
+                    self.config.max_quote_age_secs,
+                )?;
+                verify_requested_notional_amount(
+                    row,
+                    forward_route,
+                    self.config.notional_usd,
+                    token_a_price_usd,
+                    token_a,
+                )?;
+                // Not independently verified: the executing (forward) leg
+                // is validated above, and the cost gate this figure feeds
+                // does not apply to exits (see build_plan). Read as-reported
+                // rather than requiring the unused reverse leg to also be
+                // fresh and internally consistent.
+                parse_positive_or_zero(
+                    "optimistic_round_trip_loss_bps",
+                    row.optimistic_round_trip_loss_bps.as_deref(),
+                )?
+            }
+            Some(ArcusSpotDirection::TokenBToTokenA) => {
+                validate_route_leg(
+                    reverse_route,
+                    token_b,
+                    token_a,
+                    evaluation_time,
+                    self.config.max_quote_age_secs,
+                )?;
+                verify_reverse_notional_bound(
+                    reverse_route,
+                    self.config.notional_usd,
+                    token_b_price_usd,
+                    token_b,
+                )?;
+                parse_positive_or_zero(
+                    "optimistic_round_trip_loss_bps",
+                    row.optimistic_round_trip_loss_bps.as_deref(),
+                )?
+            }
+            None => {
+                // No exit is executing this tick (either an entry signal or
+                // none at all): both legs feed verified_round_trip_loss_bps
+                // below, and either one could still be selected as the
+                // executing route once a direction is chosen, so both must
+                // be trusted independently here.
+                validate_route_leg(
+                    forward_route,
+                    token_a,
+                    token_b,
+                    evaluation_time,
+                    self.config.max_quote_age_secs,
+                )?;
+                validate_route_leg(
+                    reverse_route,
+                    token_b,
+                    token_a,
+                    evaluation_time,
+                    self.config.max_quote_age_secs,
+                )?;
+                verify_requested_notional_amount(
+                    row,
+                    forward_route,
+                    self.config.notional_usd,
+                    token_a_price_usd,
+                    token_a,
+                )?;
+                // The reverse leg has no analogous requested_sell_amount to
+                // cross-check: its sell amount is whatever the forward
+                // leg's quote reported as its buy amount, not independently
+                // requested from the notional. A malformed or severely
+                // off-market forward quote could therefore size a B-to-A
+                // rotation far outside the configured notional while still
+                // linking correctly to the forward leg.
+                verify_reverse_notional_bound(
+                    reverse_route,
+                    self.config.notional_usd,
+                    token_b_price_usd,
+                    token_b,
+                )?;
+                verify_round_trip_linkage_and_loss(row)?
+            }
+        };
 
         Ok(SnapshotContext {
             token_a: token_a.clone(),
@@ -2961,6 +3044,132 @@ mod tests {
                 assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
             }
             other => panic!("expected a max-hold exit despite the halt, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn stale_unused_leg_does_not_block_a_max_hold_exit() {
+        // RotatedAToB only ever exits via the reverse (B-to-A) leg (see
+        // build_plan's direction match); the forward leg is not consulted
+        // at all for this exit. An earlier version required *both* legs to
+        // be fresh before any rotation could be evaluated, so a forward
+        // leg the recorder happened not to refresh this cycle could block
+        // an otherwise-ready max-hold exit indefinitely, defeating
+        // max_hold_secs (Codex P1 follow-up, pairtrade#177).
+        let stale_forward_received_at = event_time() - Duration::seconds(1_000);
+        let row: ArcusSpotRoundTripRecord = serde_json::from_value(json!({
+            "pair": {"sell_symbol": "NVDA", "buy_symbol": "AMD"},
+            "notional_usd": "5",
+            "sell_reference_price_usd": "200",
+            "buy_reference_price_usd": "100",
+            "requested_sell_amount": "25000000000000000",
+            "forward": {
+                "chain_id": 4663,
+                "sell_symbol": "NVDA",
+                "buy_symbol": "AMD",
+                "sell_token": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                "buy_token": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                "sell_amount": "25000000000000000",
+                "response": {
+                    "payload": {
+                        "recommended": "arcus",
+                        "all": [{
+                            "venue": "arcus",
+                            "buyAmount": "49000000000000000",
+                            "sellAmount": "25000000000000000",
+                            "fees": []
+                        }],
+                        "errors": []
+                    },
+                    "requested_at": stale_forward_received_at,
+                    "received_at": stale_forward_received_at,
+                    "latency_ms": 1000,
+                    "attempts": 1
+                }
+            },
+            "reverse": {
+                "chain_id": 4663,
+                "sell_symbol": "AMD",
+                "buy_symbol": "NVDA",
+                "sell_token": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                "buy_token": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                "sell_amount": "49000000000000000",
+                "response": {
+                    "payload": {
+                        "recommended": "arcus",
+                        "all": [{
+                            "venue": "arcus",
+                            "buyAmount": "24800000000000000",
+                            "sellAmount": "49000000000000000",
+                            "fees": []
+                        }],
+                        "errors": []
+                    },
+                    "requested_at": event_time(),
+                    "received_at": event_time(),
+                    "latency_ms": 1000,
+                    "attempts": 1
+                }
+            },
+            "optimistic_return_amount": "24800000000000000",
+            "optimistic_round_trip_loss_bps": "80",
+            "errors": []
+        }))
+        .unwrap();
+        let snapshot: ArcusSpotRecorderSnapshot = serde_json::from_value(json!({
+            "schema_version": 3,
+            "mode": "public_indicative_read_only",
+            "chain_id": 4663,
+            "collection_started_at": event_time(),
+            "collection_finished_at": event_time(),
+            "indexer_stats": {
+                "status": "error",
+                "error": {"stage": "indexer_stats", "classification": "http", "retryable": false, "message": "x"}
+            },
+            "token_metadata": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {"chainId": 4663, "symbol": "NVDA", "name": "NVIDIA", "address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC", "decimals": 18, "verified": true},
+                        {"chainId": 4663, "symbol": "AMD", "name": "AMD", "address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC", "decimals": 18, "verified": true}
+                    ],
+                    "requested_at": event_time(),
+                    "received_at": event_time(),
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "reference_overview": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {"ticker": "NVDA", "contractAddress": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC", "name": "NVIDIA", "category": "stock", "quote": {"price": "200"}},
+                        {"ticker": "AMD", "contractAddress": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC", "name": "AMD", "category": "stock", "quote": {"price": "100"}}
+                    ],
+                    "requested_at": event_time(),
+                    "received_at": event_time(),
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "round_trips": [row]
+        }))
+        .unwrap();
+
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(49, 3));
+        runtime.state.last_rotation_at =
+            Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
+            }
+            other => panic!(
+                "expected the max-hold exit to fire despite the stale unused forward leg, got {other:?}"
+            ),
         }
         assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
     }
