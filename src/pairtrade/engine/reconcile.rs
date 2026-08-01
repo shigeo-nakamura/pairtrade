@@ -1732,8 +1732,8 @@ mod tests {
     //! loop. bot-strategy#396.
     use std::collections::HashMap;
     use std::collections::HashSet;
-    use std::sync::Arc;
-    use std::time::Instant;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
     use dex_connector::{
@@ -1753,12 +1753,27 @@ mod tests {
     };
     use super::{ExitFillPnlContext, PairTradeEngine};
 
-    /// No-op `DexConnector`: `record_exit_realized_pnl` never touches the
-    /// connector, so every method is unreachable in the test below. Exists
-    /// only to satisfy `PairTradeEngine::test_instance`'s `Arc<dyn
-    /// DexConnector>` requirement.
+    /// Minimal `DexConnector`: every method is `unimplemented!()` except
+    /// `get_open_orders` (always empty — no open remainder) and
+    /// `get_filled_orders`, which replays whatever `script_fill` recorded
+    /// for that symbol. Unlike `pending_tests.rs`'s `DummyConnector`, this
+    /// scripts `filled_value` (not just `filled_size`), since exercising
+    /// the #750 fill-VWAP-vs-mark-snapshot path requires fill *value*
+    /// coverage.
     #[derive(Default)]
-    struct NullConnector;
+    struct NullConnector {
+        // symbol -> (order_id, filled_size, filled_value)
+        scripted_fills: Mutex<HashMap<String, (String, Decimal, Decimal)>>,
+    }
+
+    impl NullConnector {
+        fn script_fill(&self, symbol: &str, order_id: &str, size: Decimal, value: Decimal) {
+            self.scripted_fills
+                .lock()
+                .unwrap()
+                .insert(symbol.to_string(), (order_id.to_string(), size, value));
+        }
+    }
 
     #[async_trait]
     impl DexConnector for NullConnector {
@@ -1781,8 +1796,23 @@ mod tests {
         ) -> Result<TickerResponse, DexError> {
             unimplemented!()
         }
-        async fn get_filled_orders(&self, _symbol: &str) -> Result<FilledOrdersResponse, DexError> {
-            unimplemented!()
+        async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
+            let scripted = self.scripted_fills.lock().unwrap();
+            Ok(match scripted.get(symbol) {
+                Some((order_id, size, value)) => FilledOrdersResponse {
+                    orders: vec![dex_connector::FilledOrder {
+                        order_id: order_id.clone(),
+                        is_rejected: false,
+                        trade_id: "trade".to_string(),
+                        filled_side: None,
+                        filled_size: Some(*size),
+                        filled_value: Some(*value),
+                        filled_fee: None,
+                        filled_ts_ms: None,
+                    }],
+                },
+                None => FilledOrdersResponse::default(),
+            })
         }
         async fn get_canceled_orders(
             &self,
@@ -1791,7 +1821,7 @@ mod tests {
             unimplemented!()
         }
         async fn get_open_orders(&self, _symbol: &str) -> Result<OpenOrdersResponse, DexError> {
-            unimplemented!()
+            Ok(OpenOrdersResponse::default())
         }
         async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
             unimplemented!()
@@ -2587,33 +2617,114 @@ mod tests {
             pnl, -5.0,
             "exit pnl must come from fill VWAP, not the mark snapshot"
         );
+    }
 
-        // Drive the value through the actual circuit-breaker consumer
-        // (Codex review on PR #180: stopping at `build_exit_fill_pnl`
-        // alone would stay green even if the reconciliation path stopped
-        // forwarding this value, forwarded a different one, or the
-        // breaker mishandled its sign).
-        let mut engine = PairTradeEngine::test_instance(Arc::new(NullConnector));
-        // Redirect risk-state persistence to a temp dir so the test does
-        // not litter the working directory (Codex review on PR #180).
+    /// Codex review on PR #180: a test that only calls `build_exit_fill_pnl`
+    /// and `record_exit_realized_pnl` directly stays green even if the real
+    /// call site in `reconcile_exit` (below) stops forwarding the fill
+    /// derived value, swaps the `(record, pnl, funding)` tuple order, or
+    /// substitutes something else. Drive a real exit through
+    /// `reconcile_exit` — the actual production handoff — with a connector
+    /// that reports fill *value* coverage (not just size) for both legs, so
+    /// the whole #750 pipeline (fill VWAP -> pnl -> circuit breaker) runs
+    /// end to end.
+    #[tokio::test]
+    async fn reconcile_exit_drives_circuit_breaker_from_fill_vwap_not_snapshot() {
+        // Same sign-crossing setup as the pure-fn test above: fill VWAP
+        // implies a loss (-5), the mark snapshot would have implied a win
+        // (+10) had it been used instead.
+        let connector = Arc::new(NullConnector::default());
+        connector.script_fill("AAA", "exit-a", dec("1.0"), dec("95.0"));
+        connector.script_fill("BBB", "exit-b", dec("1.0"), dec("50.0"));
+
+        let mut engine = PairTradeEngine::test_instance(connector);
         let risk_state_dir = tempfile::TempDir::new().unwrap();
         engine.risk_state_path = risk_state_dir.path().join("risk_state.json");
+
+        let position = Position {
+            direction: PositionDirection::LongSpread,
+            entered_at: Instant::now(),
+            entered_ts: 1_700_000_000,
+            entry_price_a: Some(dec("100")),
+            entry_price_b: Some(dec("50")),
+            entry_size_a: Some(dec("1.0")),
+            entry_size_b: Some(dec("1.0")),
+            entry_z: Some(2.4),
+            entry_beta: Some(1.0),
+            last_rehedge_ts: None,
+            rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
+        };
+        let mut state = PairState::new(2.0);
+        state.position = Some(position);
+        engine.instances[0]
+            .states
+            .insert("AAA/BBB".to_string(), state);
         assert_eq!(engine.instances[0].consecutive_losses, 0);
 
-        engine.record_exit_realized_pnl(0, now_ts, pnl, 0.0);
-        assert_eq!(
-            engine.instances[0].consecutive_losses, 1,
-            "breaker must count the fill-derived loss"
+        let pending = PendingOrders {
+            legs: vec![
+                leg("AAA", "exit-a", "1.0", "0.0"),
+                leg("BBB", "exit-b", "1.0", "0.0"),
+            ],
+            direction: PositionDirection::LongSpread,
+            placed_at: Instant::now(),
+            placed_ts_ms: 0,
+            hedge_retry_count: 0,
+            post_only_hybrid: false,
+            exit_taker_takeover_at: None,
+        };
+        // Mark snapshot (never consulted once fill-value coverage exists)
+        // would have scored the opposite sign — see the pure-fn test above
+        // for the arithmetic.
+        let mut price_map: HashMap<String, SymbolSnapshot> = HashMap::new();
+        price_map.insert(
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("110.0"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
+        );
+        price_map.insert(
+            "BBB".to_string(),
+            SymbolSnapshot {
+                price: dec("50.0"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
         );
 
-        // Counterfactual: feeding the snapshot-implied value into the same
-        // consumer resets the streak instead — proving the two values
-        // really do drive the breaker in opposite directions, not just
-        // differ in magnitude.
-        engine.record_exit_realized_pnl(0, now_ts, snapshot_pnl, 0.0);
+        engine
+            .reconcile_exit(
+                0,
+                "AAA/BBB",
+                &price_map,
+                pending,
+                1_700_000_300,
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+
         assert_eq!(
-            engine.instances[0].consecutive_losses, 0,
-            "sanity: the snapshot-derived value would have reset the streak instead"
+            engine.instances[0].consecutive_losses, 1,
+            "the real reconcile_exit handoff must count this as a loss, matching the \
+             fill VWAP (-5), not reset it as the mark snapshot (+10) would have"
         );
     }
 }
