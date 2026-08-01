@@ -524,6 +524,15 @@ impl ArcusSpotRuntime {
             .inventory
             .checked_value_usd(context.token_a_price_usd, context.token_b_price_usd)
             .unwrap_or(equity_before);
+        // Overwrites the pre-fill mark set earlier in this tick: when a
+        // ReplaySimulation fill changes marked equity on the last snapshot
+        // of a UTC day, the next day's rollover check (see
+        // `risk_mark_before_rollover`) must compare against this tick's
+        // actual post-fill close, not its opening value, or a
+        // gain-producing fill followed by a large overnight decline could
+        // hide the decline and reset the daily baseline without engaging
+        // the halt.
+        self.state.last_equity_usd = Some(equity_after);
         let risk_after = self.risk_mark(equity_after);
         self.engage_risk_halt(evaluation_time, risk_after);
         self.event(RuntimeEventInput {
@@ -2684,6 +2693,44 @@ mod tests {
                 "a $5 overnight drop from yesterday's peak must engage the daily-loss halt",
             );
         assert_eq!(halt.kind, ArcusSpotRiskHaltKind::DailyLoss);
+    }
+
+    #[test]
+    fn last_equity_mark_reflects_the_post_fill_close_not_the_pre_fill_open() {
+        // A max-hold exit fires on this tick and changes marked equity
+        // within the same step_at call (inventory_before != inventory_after).
+        // last_equity_usd must record the *closing* (post-fill) value so
+        // the next day's overnight-loss rollover check compares against
+        // what equity actually was at day 1's close, not what it was
+        // before the fill executed.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(49, 3));
+        runtime.state.last_rotation_at =
+            Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
+        let snapshot = snapshot_with_valid_row(event_time());
+        let event = runtime.step_at(&snapshot, event_time());
+        assert!(matches!(
+            event.decision,
+            ArcusSpotDecision::SimulatedFill { .. }
+        ));
+        assert_ne!(
+            event.inventory_before, event.inventory_after,
+            "test setup must actually exercise a fill"
+        );
+
+        let reference_price_a = Decimal::from(200);
+        let reference_price_b = Decimal::from(100);
+        let equity_before = event
+            .inventory_before
+            .checked_value_usd(reference_price_a, reference_price_b)
+            .unwrap();
+        let equity_after = event
+            .inventory_after
+            .checked_value_usd(reference_price_a, reference_price_b)
+            .unwrap();
+        assert_ne!(equity_before, equity_after);
+        assert_eq!(runtime.state().last_equity_usd, Some(equity_after));
     }
 
     #[test]
