@@ -1730,15 +1730,218 @@ mod tests {
     //! without standing up an engine. Reaches the leg-fill aggregation
     //! that drives partial / full / fallback branching in the reconcile
     //! loop. bot-strategy#396.
-    use std::collections::{HashMap, HashSet};
-    use std::time::Instant;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
-    use dex_connector::OrderSide;
+    use async_trait::async_trait;
+    use dex_connector::{
+        BalanceResponse, CanceledOrdersResponse, CombinedBalanceResponse, CreateOrderResponse,
+        DexConnector, DexError, FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse,
+        OrderBookSnapshot, OrderSide, PositionSnapshot, PriceUpdate, TickerResponse, TpSl,
+        TriggerOrderStyle,
+    };
+    use rust_decimal::prelude::ToPrimitive;
     use rust_decimal::Decimal;
 
+    use super::super::super::exit::compute_pnl;
+    use super::super::super::funding_history::FundingHistory;
     use super::super::super::market::SymbolSnapshot;
-    use super::super::super::state::{PendingLeg, PendingOrders, PendingStatus, PositionDirection};
-    use super::PairTradeEngine;
+    use super::super::super::state::{
+        PairState, PendingLeg, PendingOrders, PendingStatus, Position, PositionDirection,
+    };
+    use super::{ExitFillPnlContext, PairTradeEngine};
+
+    /// Minimal `DexConnector`: every method is `unimplemented!()` except
+    /// `get_open_orders` (always empty — no open remainder) and
+    /// `get_filled_orders`, which replays whatever `script_fill` recorded
+    /// for that symbol. Unlike `pending_tests.rs`'s `DummyConnector`, this
+    /// scripts `filled_value` (not just `filled_size`), since exercising
+    /// the #750 fill-VWAP-vs-mark-snapshot path requires fill *value*
+    /// coverage.
+    #[derive(Default)]
+    struct NullConnector {
+        // symbol -> (order_id, filled_size, filled_value)
+        scripted_fills: Mutex<HashMap<String, (String, Decimal, Decimal)>>,
+    }
+
+    impl NullConnector {
+        fn script_fill(&self, symbol: &str, order_id: &str, size: Decimal, value: Decimal) {
+            self.scripted_fills
+                .lock()
+                .unwrap()
+                .insert(symbol.to_string(), (order_id.to_string(), size, value));
+        }
+    }
+
+    #[async_trait]
+    impl DexConnector for NullConnector {
+        async fn start(&self) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn stop(&self) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn restart(&self, _max_retries: i32) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn set_leverage(&self, _symbol: &str, _leverage: u32) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn get_ticker(
+            &self,
+            _symbol: &str,
+            _test_price: Option<Decimal>,
+        ) -> Result<TickerResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
+            let scripted = self.scripted_fills.lock().unwrap();
+            Ok(match scripted.get(symbol) {
+                Some((order_id, size, value)) => FilledOrdersResponse {
+                    orders: vec![dex_connector::FilledOrder {
+                        order_id: order_id.clone(),
+                        is_rejected: false,
+                        trade_id: "trade".to_string(),
+                        filled_side: None,
+                        filled_size: Some(*size),
+                        filled_value: Some(*value),
+                        filled_fee: None,
+                        filled_ts_ms: None,
+                    }],
+                },
+                None => FilledOrdersResponse::default(),
+            })
+        }
+        async fn get_canceled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<CanceledOrdersResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_open_orders(&self, _symbol: &str) -> Result<OpenOrdersResponse, DexError> {
+            Ok(OpenOrdersResponse::default())
+        }
+        async fn get_balance(&self, _symbol: Option<&str>) -> Result<BalanceResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_combined_balance(&self) -> Result<CombinedBalanceResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, DexError> {
+            unimplemented!()
+        }
+        async fn get_last_trades(&self, _symbol: &str) -> Result<LastTradesResponse, DexError> {
+            unimplemented!()
+        }
+        async fn get_order_book(
+            &self,
+            _symbol: &str,
+            _depth: usize,
+        ) -> Result<OrderBookSnapshot, DexError> {
+            unimplemented!()
+        }
+        async fn clear_filled_order(&self, _symbol: &str, _trade_id: &str) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn clear_all_filled_orders(&self) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn clear_canceled_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+        ) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn clear_all_canceled_orders(&self) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn create_order(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<CreateOrderResponse, DexError> {
+            unimplemented!()
+        }
+        async fn create_advanced_trigger_order(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _trigger_px: Decimal,
+            _limit_px: Option<Decimal>,
+            _order_style: TriggerOrderStyle,
+            _slippage_bps: Option<u32>,
+            _tpsl: TpSl,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<CreateOrderResponse, DexError> {
+            unimplemented!()
+        }
+        async fn create_order_taker_ioc(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _slippage_bps: u32,
+            _reduce_only: bool,
+        ) -> Result<CreateOrderResponse, DexError> {
+            unimplemented!()
+        }
+        async fn modify_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+            _side: OrderSide,
+            _target_total_size: Decimal,
+            _open_remaining_size: Decimal,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+        ) -> Result<CreateOrderResponse, DexError> {
+            unimplemented!()
+        }
+        async fn cancel_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn cancel_orders(
+            &self,
+            _symbol: Option<String>,
+            _order_ids: Vec<String>,
+        ) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn clear_last_trades(&self, _symbol: &str) -> Result<(), DexError> {
+            unimplemented!()
+        }
+        async fn is_upcoming_maintenance(&self, _hours_ahead: i64) -> bool {
+            unimplemented!()
+        }
+        async fn sign_evm_65b(&self, _message: &str) -> Result<String, DexError> {
+            unimplemented!()
+        }
+        async fn sign_evm_65b_with_eip191(&self, _message: &str) -> Result<String, DexError> {
+            unimplemented!()
+        }
+        fn subscribe_price_updates(
+            &self,
+        ) -> Result<tokio::sync::broadcast::Receiver<PriceUpdate>, DexError> {
+            unimplemented!()
+        }
+    }
 
     fn dec(v: &str) -> Decimal {
         v.parse().unwrap()
@@ -2292,5 +2495,236 @@ mod tests {
         status.fills.insert("ord-2".to_string(), dec("0.5"));
         let got = PairTradeEngine::fill_vwap_by_symbol(&legs, &status, "BTC");
         assert_eq!(got, Some(dec("100.00")));
+    }
+
+    #[test]
+    fn build_exit_fill_pnl_follows_fill_vwap_even_when_snapshot_sign_disagrees() {
+        // bot-strategy#750 acceptance ("sign-crossing regression"): the
+        // consecutive-loss circuit breaker in `record_exit_realized_pnl`
+        // is a direct, deterministic function of the pnl sign this helper
+        // returns, so proving the sign here is fill-derived — even in a
+        // scenario engineered so the stale mark snapshot would have called
+        // the same close a WIN — is equivalent to proving the breaker
+        // follows actual fill economics rather than a reconciliation-time
+        // mark.
+        //
+        // Entry: long AAA @ 100 / short BBB @ 50, size 1.0 each side.
+        // Actual exit fills: AAA @ 95 (down), BBB @ 50 (flat) -> fill PnL
+        // = (95-100)*1 + (50-50)*1 = -5 (LOSS).
+        // Mark snapshot sampled at reconcile time: AAA @ 110 -> would have
+        // scored (110-100)*1 + (50-50)*1 = +10 (WIN) had it been used
+        // instead of the fill VWAP. The two signs disagree.
+        let position = Position {
+            direction: PositionDirection::LongSpread,
+            entered_at: Instant::now(),
+            entered_ts: 1_700_000_000,
+            entry_price_a: Some(dec("100")),
+            entry_price_b: Some(dec("50")),
+            entry_size_a: Some(dec("1.0")),
+            entry_size_b: Some(dec("1.0")),
+            entry_z: Some(2.4),
+            entry_beta: Some(1.0),
+            last_rehedge_ts: None,
+            rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
+        };
+        let mut state = PairState::new(2.0);
+        state.position = Some(position);
+
+        let legs = vec![
+            leg("AAA", "exit-a", "1.0", "1.0"),
+            leg("BBB", "exit-b", "1.0", "1.0"),
+        ];
+        let mut status = empty_status();
+        status
+            .filled_values
+            .insert("exit-a".to_string(), dec("95.0"));
+        status
+            .filled_value_qty
+            .insert("exit-a".to_string(), dec("1.0"));
+        status
+            .filled_values
+            .insert("exit-b".to_string(), dec("50.0"));
+        status
+            .filled_value_qty
+            .insert("exit-b".to_string(), dec("1.0"));
+
+        let mut price_map: HashMap<String, SymbolSnapshot> = HashMap::new();
+        price_map.insert(
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("110.0"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
+        );
+        price_map.insert(
+            "BBB".to_string(),
+            SymbolSnapshot {
+                price: dec("50.0"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
+        );
+
+        let funding = FundingHistory::new();
+        let now_ts = 1_700_000_300;
+        let ctx = ExitFillPnlContext {
+            inst_id: "default",
+            key: "AAA/BBB",
+            state: &state,
+            price_map: &price_map,
+            legs: &legs,
+            status: &status,
+            funding_history: &funding,
+            z_exit: Some(0.1),
+            beta_val: Some(1.0),
+            now_ts,
+        };
+        let (_record, pnl, _funding_usd) =
+            PairTradeEngine::build_exit_fill_pnl(ctx).expect("pnl available");
+
+        // Sanity: the mark snapshot alone (never actually used once fill
+        // coverage exists) would have scored the opposite sign — this is
+        // what makes it a sign-crossing case rather than a same-direction
+        // magnitude difference.
+        let snapshot_pnl = compute_pnl(state.position.as_ref().unwrap(), dec("110.0"), dec("50.0"))
+            .and_then(|p| p.to_f64())
+            .unwrap();
+        assert!(
+            snapshot_pnl > 0.0,
+            "test setup sanity: snapshot price must imply a win, got {snapshot_pnl}"
+        );
+
+        // The value that actually reaches `record_exit_realized_pnl` (and
+        // therefore drives `consecutive_losses`) must follow the fill, not
+        // the snapshot: a loss, not a win.
+        assert_eq!(
+            pnl, -5.0,
+            "exit pnl must come from fill VWAP, not the mark snapshot"
+        );
+    }
+
+    /// Codex review on PR #180: a test that only calls `build_exit_fill_pnl`
+    /// and `record_exit_realized_pnl` directly stays green even if the real
+    /// call site in `reconcile_exit` (below) stops forwarding the fill
+    /// derived value, swaps the `(record, pnl, funding)` tuple order, or
+    /// substitutes something else. Drive a real exit through
+    /// `reconcile_exit` — the actual production handoff — with a connector
+    /// that reports fill *value* coverage (not just size) for both legs, so
+    /// the whole #750 pipeline (fill VWAP -> pnl -> circuit breaker) runs
+    /// end to end.
+    #[tokio::test]
+    async fn reconcile_exit_drives_circuit_breaker_from_fill_vwap_not_snapshot() {
+        // Same sign-crossing setup as the pure-fn test above: fill VWAP
+        // implies a loss (-5), the mark snapshot would have implied a win
+        // (+10) had it been used instead.
+        let connector = Arc::new(NullConnector::default());
+        connector.script_fill("AAA", "exit-a", dec("1.0"), dec("95.0"));
+        connector.script_fill("BBB", "exit-b", dec("1.0"), dec("50.0"));
+
+        let mut engine = PairTradeEngine::test_instance(connector);
+        let risk_state_dir = tempfile::TempDir::new().unwrap();
+        engine.risk_state_path = risk_state_dir.path().join("risk_state.json");
+
+        let position = Position {
+            direction: PositionDirection::LongSpread,
+            entered_at: Instant::now(),
+            entered_ts: 1_700_000_000,
+            entry_price_a: Some(dec("100")),
+            entry_price_b: Some(dec("50")),
+            entry_size_a: Some(dec("1.0")),
+            entry_size_b: Some(dec("1.0")),
+            entry_z: Some(2.4),
+            entry_beta: Some(1.0),
+            last_rehedge_ts: None,
+            rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
+        };
+        let mut state = PairState::new(2.0);
+        state.position = Some(position);
+        engine.instances[0]
+            .states
+            .insert("AAA/BBB".to_string(), state);
+        assert_eq!(engine.instances[0].consecutive_losses, 0);
+
+        let pending = PendingOrders {
+            legs: vec![
+                leg("AAA", "exit-a", "1.0", "0.0"),
+                leg("BBB", "exit-b", "1.0", "0.0"),
+            ],
+            direction: PositionDirection::LongSpread,
+            placed_at: Instant::now(),
+            placed_ts_ms: 0,
+            hedge_retry_count: 0,
+            post_only_hybrid: false,
+            exit_taker_takeover_at: None,
+        };
+        // Mark snapshot (never consulted once fill-value coverage exists)
+        // would have scored the opposite sign — see the pure-fn test above
+        // for the arithmetic.
+        let mut price_map: HashMap<String, SymbolSnapshot> = HashMap::new();
+        price_map.insert(
+            "AAA".to_string(),
+            SymbolSnapshot {
+                price: dec("110.0"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
+        );
+        price_map.insert(
+            "BBB".to_string(),
+            SymbolSnapshot {
+                price: dec("50.0"),
+                funding_rate: dec("0"),
+                bid_price: None,
+                ask_price: None,
+                bid_size: dec("0"),
+                ask_size: dec("0"),
+                min_order: None,
+                min_tick: None,
+                size_decimals: None,
+                exchange_ts: None,
+            },
+        );
+
+        engine
+            .reconcile_exit(
+                0,
+                "AAA/BBB",
+                &price_map,
+                pending,
+                1_700_000_300,
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.instances[0].consecutive_losses, 1,
+            "the real reconcile_exit handoff must count this as a loss, matching the \
+             fill VWAP (-5), not reset it as the mark snapshot (+10) would have"
+        );
     }
 }
