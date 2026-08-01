@@ -596,6 +596,19 @@ impl ArcusSpotRuntime {
         let tokens = capture_payload(&snapshot.token_metadata, "token_metadata")?;
         let token_a = find_token(tokens, &self.config.pair.sell_symbol, self.config.chain_id)?;
         let token_b = find_token(tokens, &self.config.pair.buy_symbol, self.config.chain_id)?;
+        // Both lookups can independently pass verification yet still resolve
+        // to the same contract (e.g. a mislabeled wrapped-token entry), which
+        // would let the relative-price signal and inventory accounting treat
+        // one asset as two distinct ones.
+        if token_a.address.eq_ignore_ascii_case(&token_b.address) {
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                format!(
+                    "token {} and {} resolve to the same contract {}",
+                    token_a.symbol, token_b.symbol, token_a.address
+                ),
+            ));
+        }
         let overview = capture_payload(&snapshot.reference_overview, "reference_overview")?;
         // A fresh route response says nothing about how old the separately
         // captured reference-price observation is; an old or future-dated
@@ -616,7 +629,9 @@ impl ArcusSpotRuntime {
         if overview_age_ms > max_overview_age_ms {
             return Err(ArcusSpotHold::new(
                 ArcusSpotHoldCode::StaleQuote,
-                format!("reference_overview age {overview_age_ms}ms exceeds {max_overview_age_ms}ms"),
+                format!(
+                    "reference_overview age {overview_age_ms}ms exceeds {max_overview_age_ms}ms"
+                ),
             ));
         }
         let token_a_price_usd = find_reference_price(overview, &token_a)?;
@@ -921,6 +936,8 @@ impl ArcusSpotRuntime {
             .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
         let mut buy_quantity = raw_amount_to_quantity(&quote.buy_amount, buy_token.decimals)
             .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
+        let mut sell_amount_raw = route.sell_amount.clone();
+        let mut buy_amount_raw = quote.buy_amount.clone();
         let sellable = sell_balance.checked_sub(sell_floor).ok_or_else(|| {
             ArcusSpotHold::new(
                 ArcusSpotHoldCode::InventoryFloor,
@@ -965,6 +982,16 @@ impl ArcusSpotRuntime {
                     )
                 })?;
             sell_quantity = sellable;
+            // sell_amount_raw/buy_amount_raw otherwise still hold the
+            // original full-size quote's raw amounts, which would make the
+            // emitted plan's quantities and raw amounts mutually
+            // inconsistent — and any downstream replay/live consumer that
+            // trusts the raw fields over the quantities would apply the
+            // wrong (unprorated) amounts to inventory.
+            sell_amount_raw = quantity_to_raw_amount(sell_quantity, sell_token.decimals)
+                .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
+            buy_amount_raw = quantity_to_raw_amount(buy_quantity, buy_token.decimals)
+                .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
         }
         // An exit's route offers whatever quantity the recorder's
         // fixed-notional quote happens to propose at this snapshot, which is
@@ -1077,8 +1104,8 @@ impl ArcusSpotRuntime {
             buy_symbol: buy_token.symbol.clone(),
             sell_quantity,
             buy_quantity,
-            sell_amount_raw: route.sell_amount.clone(),
-            buy_amount_raw: quote.buy_amount.clone(),
+            sell_amount_raw,
+            buy_amount_raw,
             venue: quote.venue.clone(),
             quote_received_at: route.response.received_at,
             optimistic_round_trip_loss_bps: route_loss,
@@ -1581,6 +1608,29 @@ fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
         .map_err(|error| format!("raw token amount {raw:?} exceeds replay precision: {error}"))
 }
 
+/// Inverse of `raw_amount_to_quantity`: renders a token quantity back to the
+/// integer raw-unit string a route would carry. Used to keep
+/// `sell_amount_raw`/`buy_amount_raw` consistent with `sell_quantity`/
+/// `buy_quantity` after `build_plan` prorates them for a residual exit —
+/// otherwise the emitted plan would report the pre-proration full-size raw
+/// amounts alongside the reduced quantities.
+fn quantity_to_raw_amount(quantity: Decimal, decimals: u32) -> Result<String, String> {
+    if quantity < Decimal::ZERO {
+        return Err(format!("quantity {quantity} must be non-negative"));
+    }
+    let raw_scale = 10_i128
+        .checked_pow(decimals)
+        .ok_or_else(|| format!("token decimals {decimals} exceed the replay Decimal range"))?;
+    let scale = Decimal::try_from_i128_with_scale(raw_scale, 0).map_err(|error| {
+        format!("token decimals {decimals} exceed the replay Decimal range: {error}")
+    })?;
+    let raw = quantity
+        .checked_mul(scale)
+        .map(|value| value.round_dp_with_strategy(0, RoundingStrategy::ToZero))
+        .ok_or_else(|| format!("quantity {quantity} exceeds the replay Decimal range"))?;
+    Ok(raw.trunc().to_string())
+}
+
 fn relative_log_price(price_a: Decimal, price_b: Decimal) -> Result<f64, String> {
     let price_a = price_a
         .to_f64()
@@ -1915,7 +1965,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(plan.sell_quantity, Decimal::new(2, 2)); // clamped to sellable (0.02)
-        // buy_quantity prorated: 0.0248 * 0.02 / 0.049
+                                                            // buy_quantity prorated: 0.0248 * 0.02 / 0.049
         let expected_buy = Decimal::new(248, 4)
             .checked_mul(Decimal::new(2, 2))
             .unwrap()
@@ -1923,6 +1973,20 @@ mod tests {
             .unwrap();
         assert_eq!(plan.buy_quantity, expected_buy);
         assert_eq!(plan.predicted_inventory.token_b, Decimal::new(1, 1)); // exactly at floor
+                                                                          // sell_amount_raw/buy_amount_raw must be recomputed from the
+                                                                          // prorated quantities, not left at the original full-size quote's
+                                                                          // raw amounts (bot-strategy#755 review round12) — otherwise a
+                                                                          // consumer trusting the raw fields over the Decimal quantities
+                                                                          // would apply the pre-proration (larger) amounts.
+        assert_eq!(
+            plan.sell_amount_raw,
+            quantity_to_raw_amount(plan.sell_quantity, 18).unwrap()
+        );
+        assert_eq!(
+            plan.buy_amount_raw,
+            quantity_to_raw_amount(plan.buy_quantity, 18).unwrap()
+        );
+        assert_ne!(plan.sell_amount_raw, "49000000000000000"); // not the unprorated quote
     }
 
     #[test]
@@ -2071,6 +2135,17 @@ mod tests {
             Decimal::from_str("0.023969319271332694").unwrap()
         );
         assert!(raw_amount_to_quantity("0", 18).is_err());
+    }
+
+    #[test]
+    fn quantity_to_raw_amount_round_trips() {
+        let quantity = raw_amount_to_quantity("23969319271332694", 18).unwrap();
+        assert_eq!(
+            quantity_to_raw_amount(quantity, 18).unwrap(),
+            "23969319271332694"
+        );
+        assert_eq!(quantity_to_raw_amount(Decimal::ZERO, 6).unwrap(), "0");
+        assert!(quantity_to_raw_amount(Decimal::from(-1), 6).is_err());
     }
 
     fn round_trip_row(
@@ -2662,7 +2737,8 @@ mod tests {
     #[test]
     fn stale_reference_overview_is_rejected_even_with_a_fresh_route() {
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
-        let stale_overview_at = event_time() - Duration::seconds(runtime.config.max_quote_age_secs + 1);
+        let stale_overview_at =
+            event_time() - Duration::seconds(runtime.config.max_quote_age_secs + 1);
         let snapshot = snapshot_with_overview_received_at(event_time(), stale_overview_at);
         let event = runtime.step_at(&snapshot, event_time());
         match event.decision {
@@ -2682,6 +2758,30 @@ mod tests {
         match event.decision {
             ArcusSpotDecision::Observe { hold } => {
                 assert_eq!(hold.code, ArcusSpotHoldCode::InvalidSnapshot);
+            }
+            other => panic!("expected Observe/InvalidSnapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_contract_token_pair_is_rejected() {
+        // Both symbol lookups can independently pass verification while
+        // resolving to the same contract (bot-strategy#755 review round12,
+        // e.g. a mislabeled wrapped-token entry) — this must not be treated
+        // as two distinct assets.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let mut snapshot = snapshot_with_valid_row(event_time());
+        if let ArcusSpotCapture::Success { observation } = &mut snapshot.token_metadata {
+            let nvda_address = observation.payload[0].address.clone();
+            observation.payload[1].address = nvda_address;
+        } else {
+            panic!("expected successful token_metadata capture");
+        }
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::InvalidSnapshot);
+                assert!(hold.detail.contains("same contract"));
             }
             other => panic!("expected Observe/InvalidSnapshot, got {other:?}"),
         }
