@@ -44,6 +44,10 @@ With `arcus-spot-live`, the library provides:
 - independent chain, wallet balance, gas, inventory-floor, token, spender,
   amount, deadline, and signer recovery checks;
 - an atomic mode-0600 execution ledger with a pre-POST dispatch marker;
+- a disabled library coordinator that connects fresh quote, chain preflight,
+  signing, one-shot submit, status polling, and balance reconciliation;
+- hard coordinator caps of at most 60-second-old plans, 100 bps slippage, ten
+  reconciled swaps per UTC day, and deployer-pinned raw sell maxima;
 - exactly one submit attempt, sticky `UNKNOWN` on ambiguous delivery, safe
   status GETs, and exact pre/post wallet-balance reconciliation;
 - a runtime commit seam that refuses fills inconsistent with the genuine

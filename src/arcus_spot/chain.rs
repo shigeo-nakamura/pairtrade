@@ -130,6 +130,10 @@ impl ArcusSpotChainClient {
         })
     }
 
+    pub fn chain_id(&self) -> u64 {
+        self.config.chain_id
+    }
+
     pub async fn preflight(
         &self,
         request: &ArcusSpotChainPreflightRequest,

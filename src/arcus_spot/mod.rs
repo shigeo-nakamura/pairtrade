@@ -12,6 +12,8 @@ mod config;
 mod execution_ledger;
 #[cfg(feature = "arcus-spot-live")]
 mod kms;
+#[cfg(feature = "arcus-spot-live")]
+mod live_executor;
 mod replay;
 mod runtime;
 
@@ -22,5 +24,7 @@ pub use config::*;
 pub use execution_ledger::*;
 #[cfg(feature = "arcus-spot-live")]
 pub use kms::*;
+#[cfg(feature = "arcus-spot-live")]
+pub use live_executor::*;
 pub use replay::*;
 pub use runtime::*;
