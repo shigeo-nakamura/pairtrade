@@ -131,7 +131,7 @@ where
         );
         let observation = self
             .client
-            .signable_quote_by_symbol(&request)
+            .arcus_signable_quote_by_symbol(&request)
             .await
             .context("Arcus fresh signable quote failed")?;
         let mut matching_quotes = observation
