@@ -10,6 +10,10 @@ pub enum ArcusSpotRuntimeMode {
     ReadOnly,
     /// Apply indicative fills to isolated in-memory inventory for deterministic replay.
     ReplaySimulation,
+    /// Emit plans for an external, durable one-shot executor. Runtime state
+    /// changes only after apply_confirmed_live_fill reconciles wallet balances.
+    #[cfg(feature = "arcus-spot-live")]
+    Live,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

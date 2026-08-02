@@ -252,6 +252,119 @@ impl ArcusSpotRuntime {
     pub fn state(&self) -> &ArcusSpotRuntimeState {
         &self.state
     }
+    /// Commit a wallet-balance-reconciled live fill. Planning never mutates
+    /// live inventory; callers invoke this only after the durable execution
+    /// ledger reaches Confirmed and exact balance reconciliation succeeds.
+    #[cfg(feature = "arcus-spot-live")]
+    pub fn apply_confirmed_live_fill(
+        &mut self,
+        plan: &ArcusSpotRotationPlan,
+        actual_sell_quantity: Decimal,
+        actual_buy_quantity: Decimal,
+        filled_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        if self.config.mode != ArcusSpotRuntimeMode::Live {
+            return Err("confirmed live fills require mode=live".to_string());
+        }
+        if actual_sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
+            return Err("confirmed live fill quantities must be positive".to_string());
+        }
+        if actual_sell_quantity != plan.sell_quantity {
+            return Err(format!(
+                "confirmed sell quantity {} does not equal planned exact quantity {}",
+                actual_sell_quantity, plan.sell_quantity
+            ));
+        }
+        if filled_at < plan.quote_received_at {
+            return Err("confirmed fill predates its quote receipt".to_string());
+        }
+
+        match (self.state.regime, plan.trigger, plan.direction) {
+            (
+                ArcusSpotRegime::Neutral,
+                ArcusSpotRotationTrigger::EntrySignal,
+                ArcusSpotDirection::TokenAToTokenB | ArcusSpotDirection::TokenBToTokenA,
+            )
+            | (
+                ArcusSpotRegime::RotatedAToB,
+                ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit,
+                ArcusSpotDirection::TokenBToTokenA,
+            )
+            | (
+                ArcusSpotRegime::RotatedBToA,
+                ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit,
+                ArcusSpotDirection::TokenAToTokenB,
+            ) => {}
+            other => {
+                return Err(format!(
+                    "confirmed fill is inconsistent with runtime state: {other:?}"
+                ))
+            }
+        }
+
+        let mut next = self.state.clone();
+        let mut after = next.inventory;
+        match plan.direction {
+            ArcusSpotDirection::TokenAToTokenB => {
+                after.token_a = after
+                    .token_a
+                    .checked_sub(actual_sell_quantity)
+                    .ok_or("confirmed fill token A subtraction overflow")?;
+                after.token_b = after
+                    .token_b
+                    .checked_add(actual_buy_quantity)
+                    .ok_or("confirmed fill token B addition overflow")?;
+            }
+            ArcusSpotDirection::TokenBToTokenA => {
+                after.token_b = after
+                    .token_b
+                    .checked_sub(actual_sell_quantity)
+                    .ok_or("confirmed fill token B subtraction overflow")?;
+                after.token_a = after
+                    .token_a
+                    .checked_add(actual_buy_quantity)
+                    .ok_or("confirmed fill token A addition overflow")?;
+            }
+        }
+        if after.token_a < self.config.inventory_floors.token_a
+            || after.token_b < self.config.inventory_floors.token_b
+        {
+            return Err(
+                "confirmed fill would place inventory below a configured floor".to_string(),
+            );
+        }
+        next.inventory = after;
+        match plan.trigger {
+            ArcusSpotRotationTrigger::EntrySignal => {
+                next.regime = match plan.direction {
+                    ArcusSpotDirection::TokenAToTokenB => ArcusSpotRegime::RotatedAToB,
+                    ArcusSpotDirection::TokenBToTokenA => ArcusSpotRegime::RotatedBToA,
+                };
+                next.last_rotation_at = Some(filled_at);
+                next.rotated_quantity = Some(actual_buy_quantity);
+            }
+            ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit => {
+                let open = next
+                    .rotated_quantity
+                    .ok_or("rotated regime has no tracked open quantity")?;
+                if actual_sell_quantity > open {
+                    return Err("confirmed exit sold more than tracked open quantity".to_string());
+                }
+                let remaining = open
+                    .checked_sub(actual_sell_quantity)
+                    .ok_or("confirmed exit quantity subtraction overflow")?;
+                if remaining.is_zero() {
+                    next.regime = ArcusSpotRegime::Neutral;
+                    next.last_rotation_at = None;
+                    next.rotated_quantity = None;
+                } else {
+                    next.rotated_quantity = Some(remaining);
+                }
+            }
+        }
+        self.state = next;
+        Ok(())
+    }
 
     /// Deterministic replay step: freshness is evaluated at the snapshot event time.
     pub fn step(&mut self, snapshot: &ArcusSpotRecorderSnapshot) -> ArcusSpotRuntimeEvent {
@@ -491,6 +604,8 @@ impl ArcusSpotRuntime {
 
         let decision = match self.config.mode {
             ArcusSpotRuntimeMode::ReadOnly => ArcusSpotDecision::WouldRotate { plan },
+            #[cfg(feature = "arcus-spot-live")]
+            ArcusSpotRuntimeMode::Live => ArcusSpotDecision::WouldRotate { plan },
             ArcusSpotRuntimeMode::ReplaySimulation => {
                 self.state.inventory = plan.predicted_inventory;
                 match trigger {
@@ -3368,5 +3483,102 @@ mod tests {
             other => panic!("expected Observe/RiskHalt, got {other:?}"),
         }
         assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+    }
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn confirmed_live_fill_commits_only_after_reconciliation_seam() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        let before = runtime.state().inventory;
+        runtime
+            .apply_confirmed_live_fill(&plan, plan.sell_quantity, plan.buy_quantity, event_time())
+            .unwrap();
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
+        assert_eq!(runtime.state().rotated_quantity, Some(plan.buy_quantity));
+        assert_eq!(
+            runtime.state().inventory.token_a,
+            before.token_a - plan.sell_quantity
+        );
+        assert_eq!(
+            runtime.state().inventory.token_b,
+            before.token_b + plan.buy_quantity
+        );
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn mismatched_confirmed_sell_does_not_mutate_live_inventory() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        let before = runtime.state().clone();
+        assert!(runtime
+            .apply_confirmed_live_fill(
+                &plan,
+                plan.sell_quantity / Decimal::from(2),
+                plan.buy_quantity,
+                event_time(),
+            )
+            .is_err());
+        assert_eq!(runtime.state(), &before);
+    }
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn failed_live_exit_does_not_partially_mutate_inventory() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let entry = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        runtime
+            .apply_confirmed_live_fill(
+                &entry,
+                entry.sell_quantity,
+                entry.buy_quantity,
+                event_time(),
+            )
+            .unwrap();
+
+        let mut invalid_exit = entry;
+        invalid_exit.direction = ArcusSpotDirection::TokenBToTokenA;
+        invalid_exit.trigger = ArcusSpotRotationTrigger::MeanReversionExit;
+        invalid_exit.sell_quantity = runtime.state.rotated_quantity.unwrap() + Decimal::new(1, 6);
+        invalid_exit.buy_quantity = Decimal::new(1, 3);
+        let before = runtime.state.clone();
+        assert!(runtime
+            .apply_confirmed_live_fill(
+                &invalid_exit,
+                invalid_exit.sell_quantity,
+                invalid_exit.buy_quantity,
+                event_time(),
+            )
+            .is_err());
+        assert_eq!(runtime.state(), &before);
     }
 }

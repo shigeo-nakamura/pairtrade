@@ -1318,6 +1318,8 @@ dependencies = [
  "debot-utils",
  "dex-connector",
  "env_logger",
+ "ethers",
+ "k256",
  "lazy_static",
  "lettre",
  "libc",
@@ -1325,14 +1327,19 @@ dependencies = [
  "once_cell",
  "prometheus",
  "rand 0.8.5",
+ "rusoto_core",
+ "rusoto_kms",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "spki 0.7.3",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -39,7 +39,13 @@ prometheus = { version = "0.13", default-features = false }
 # (deploy ≠ restart) is detectable within minutes. Already in the tree
 # transitively; this only promotes it to a direct dep.
 sha2 = "0.10"
-
+ethers = { version = "2.0.14", default-features = false, features = ["abigen", "eip712", "rustls"], optional = true }
+rusoto_core = { version = "0.48", optional = true }
+rusoto_kms = { version = "0.48", optional = true }
+k256 = { version = "0.13.3", optional = true }
+spki = { version = "0.7.2", optional = true }
+thiserror = { version = "1", optional = true }
+url = { version = "2", optional = true }
 debot-utils = "1.0.*"
 
 dex-connector = { path = "../dex-connector", default-features = false }
@@ -55,6 +61,17 @@ lighter-sdk = ["dex-connector/lighter-sdk"]
 extended-sdk = ["dex-connector/extended-sdk"]
 arcus-sdk = ["dex-connector/arcus-sdk"]
 arcus-spot-sdk = ["dex-connector/arcus-spot-sdk"]
+arcus-spot-live = [
+    "arcus-spot-sdk",
+    "dex-connector/arcus-spot-execution",
+    "dep:ethers",
+    "dep:rusoto_core",
+    "dep:rusoto_kms",
+    "dep:k256",
+    "dep:spki",
+    "dep:thiserror",
+    "dep:url",
+]
 hyperliquid-sdk = ["dex-connector/hyperliquid-sdk"]
 
 [[bin]]
