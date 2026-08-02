@@ -86,3 +86,8 @@ path = "src/bin/convert_data.rs"
 name = "arcus-spot-runtime"
 path = "src/bin/arcus_spot_runtime.rs"
 required-features = ["arcus-spot-sdk"]
+
+[[bin]]
+name = "arcus-spot-execute-once"
+path = "src/bin/arcus_spot_execute_once.rs"
+required-features = ["arcus-spot-live"]
