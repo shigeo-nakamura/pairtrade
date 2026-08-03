@@ -1,7 +1,7 @@
 use super::{
     ArcusSpotChainClient, ArcusSpotChainPreflightRequest, ArcusSpotExecutionAttempt,
-    ArcusSpotExecutionIntent, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore,
-    ArcusSpotExecutionPhase, ArcusSpotRotationPlan,
+    ArcusSpotExecutionIntent, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock,
+    ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotRotationPlan,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -75,6 +75,7 @@ pub struct ArcusSpotLiveExecutor<S> {
     signer: S,
     store: ArcusSpotExecutionLedgerStore,
     ledger: ArcusSpotExecutionLedger,
+    _ledger_lock: ArcusSpotExecutionLedgerLock,
 }
 
 impl<S> ArcusSpotLiveExecutor<S>
@@ -101,6 +102,7 @@ where
                 signer.address()
             );
         }
+        let ledger_lock = store.acquire_exclusive_lock()?;
         let ledger = store.load_or_create(Utc::now())?;
         Ok(Self {
             config,
@@ -109,6 +111,7 @@ where
             signer,
             store,
             ledger,
+            _ledger_lock: ledger_lock,
         })
     }
 
@@ -150,6 +153,7 @@ where
             bail!("fresh Arcus quote changed the planned exact sell amount");
         }
         let minimum_buy = quote.minimum_received()?;
+        require_fresh_quote_matches_approved_plan(plan, minimum_buy, self.config.slippage_bps)?;
         let deadline = quote.expires_at()?;
         let sell_floor = symbol_amount(
             "inventory_floor_raw",
@@ -296,6 +300,10 @@ where
         if sell_amount.is_zero() {
             bail!("Arcus strategy plan sell amount must be positive");
         }
+        let buy_amount = parse_amount("plan buy_amount_raw", &plan.buy_amount_raw)?;
+        if buy_amount.is_zero() {
+            bail!("Arcus strategy plan buy amount must be positive");
+        }
         let maximum = symbol_amount(
             "maximum_sell_amount_raw",
             &self.config.maximum_sell_amount_raw,
@@ -369,6 +377,30 @@ where
     }
 }
 
+fn require_fresh_quote_matches_approved_plan(
+    plan: &ArcusSpotRotationPlan,
+    fresh_minimum_buy: U256,
+    slippage_bps: u32,
+) -> Result<()> {
+    let approved_buy = parse_amount("plan buy_amount_raw", &plan.buy_amount_raw)?;
+    let retained_bps = 10_000_u32
+        .checked_sub(slippage_bps)
+        .context("Arcus slippage exceeds 10000 bps")?;
+    let numerator = approved_buy
+        .checked_mul(U256::from(retained_bps))
+        .context("Arcus approved minimum buy calculation overflow")?;
+    let approved_minimum = numerator
+        .checked_add(U256::from(9_999_u32))
+        .context("Arcus approved minimum buy rounding overflow")?
+        / U256::from(10_000_u32);
+    if fresh_minimum_buy < approved_minimum {
+        bail!(
+            "fresh Arcus minimum buy {fresh_minimum_buy} undercuts approved plan floor {approved_minimum}"
+        );
+    }
+    Ok(())
+}
+
 fn validate_symbol_amount_map(
     label: &str,
     values: &BTreeMap<String, String>,
@@ -434,6 +466,37 @@ mod tests {
             max_swaps_per_utc_day: 10,
             max_plan_age_secs: 30,
         }
+    }
+
+    fn plan_with_buy_amount(buy_amount_raw: &str) -> ArcusSpotRotationPlan {
+        ArcusSpotRotationPlan {
+            direction: crate::arcus_spot::ArcusSpotDirection::TokenAToTokenB,
+            trigger: crate::arcus_spot::ArcusSpotRotationTrigger::EntrySignal,
+            sell_symbol: "NVDA".to_string(),
+            buy_symbol: "AMD".to_string(),
+            sell_quantity: rust_decimal::Decimal::ONE,
+            buy_quantity: rust_decimal::Decimal::ONE,
+            sell_amount_raw: "1000".to_string(),
+            buy_amount_raw: buy_amount_raw.to_string(),
+            venue: ARCUS_VENUE.to_string(),
+            quote_received_at: Utc::now(),
+            optimistic_round_trip_loss_bps: rust_decimal::Decimal::ZERO,
+            gas_buffer_bps: rust_decimal::Decimal::ZERO,
+            settlement_buffer_bps: rust_decimal::Decimal::ZERO,
+            all_in_round_trip_cost_bps: rust_decimal::Decimal::ZERO,
+            predicted_inventory: crate::arcus_spot::ArcusSpotInventory {
+                token_a: rust_decimal::Decimal::ONE,
+                token_b: rust_decimal::Decimal::ONE,
+            },
+            predicted_inventory_imbalance_fraction: rust_decimal::Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn fresh_quote_cannot_undercut_approved_plan_floor() {
+        let plan = plan_with_buy_amount("1000");
+        require_fresh_quote_matches_approved_plan(&plan, U256::from(995_u64), 50).unwrap();
+        assert!(require_fresh_quote_matches_approved_plan(&plan, U256::from(994_u64), 50).is_err());
     }
 
     #[test]

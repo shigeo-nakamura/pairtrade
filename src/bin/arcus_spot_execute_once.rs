@@ -7,8 +7,8 @@
 use anyhow::{bail, Context, Result};
 use debot::arcus_spot::{
     build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig,
-    ArcusSpotExecutionLedgerStore, ArcusSpotKmsConfig, ArcusSpotLiveExecutor,
-    ArcusSpotLiveExecutorConfig, ArcusSpotRotationPlan,
+    ArcusSpotExecutionAttempt, ArcusSpotExecutionLedgerStore, ArcusSpotKmsConfig,
+    ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotRotationPlan,
 };
 use dex_connector::{ArcusSpotClient, ArcusSpotConfig};
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,37 @@ fn read_private_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
 fn usage() -> &'static str {
     "usage:
   arcus-spot-execute-once hash PLAN_JSON
-  arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SHA256"
+  arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SHA256
+  arcus-spot-execute-once resume CONFIG_YAML"
+}
+
+async fn executor_from_config(
+    config: ArcusSpotExecuteOnceConfig,
+) -> Result<ArcusSpotLiveExecutor<ArcusSpotKmsSigner>> {
+    if !config.ledger_path.is_absolute() {
+        bail!("Arcus execution ledger_path must be absolute");
+    }
+    if config.router.chain_id != config.chain.chain_id
+        || config.router.chain_id != config.kms.chain_id
+    {
+        bail!("Arcus router, chain RPC, and KMS chain IDs must match");
+    }
+    let client =
+        ArcusSpotClient::new(config.router).context("invalid Arcus router configuration")?;
+    let chain =
+        ArcusSpotChainClient::new(config.chain).context("invalid Arcus chain configuration")?;
+    let signer = build_arcus_spot_kms_signer(&config.kms).await?;
+    let store = ArcusSpotExecutionLedgerStore::new(config.ledger_path);
+    ArcusSpotLiveExecutor::new(config.executor, client, chain, signer, store)
+}
+
+fn write_attempt(attempt: &ArcusSpotExecutionAttempt) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer_pretty(&mut stdout, attempt)
+        .context("failed to serialize execution result")?;
+    stdout.write_all(b"\n")?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -85,31 +115,18 @@ async fn main() -> Result<()> {
                     "approval digest mismatch: supplied {approved_digest}, computed {computed_digest}"
                 );
             }
-            if !config.ledger_path.is_absolute() {
-                bail!("Arcus execution ledger_path must be absolute");
-            }
-            if config.router.chain_id != config.chain.chain_id
-                || config.router.chain_id != config.kms.chain_id
-            {
-                bail!("Arcus router, chain RPC, and KMS chain IDs must match");
-            }
-
-            let client = ArcusSpotClient::new(config.router)
-                .context("invalid Arcus router configuration")?;
-            let chain = ArcusSpotChainClient::new(config.chain)
-                .context("invalid Arcus chain configuration")?;
-            let signer = build_arcus_spot_kms_signer(&config.kms).await?;
-            let store = ArcusSpotExecutionLedgerStore::new(config.ledger_path);
-            let mut executor =
-                ArcusSpotLiveExecutor::new(config.executor, client, chain, signer, store)?;
+            let mut executor = executor_from_config(config).await?;
             let attempt = executor.execute_plan_once(&plan).await?;
-
-            let stdout = io::stdout();
-            let mut stdout = stdout.lock();
-            serde_json::to_writer_pretty(&mut stdout, &attempt)
-                .context("failed to serialize execution result")?;
-            stdout.write_all(b"\n")?;
-            Ok(())
+            write_attempt(&attempt)
+        }
+        [command, config_path] if command == "resume" => {
+            let config_path = Path::new(config_path);
+            let config_bytes = read_private_regular_file(config_path, "config")?;
+            let config: ArcusSpotExecuteOnceConfig = serde_yaml::from_slice(&config_bytes)
+                .with_context(|| format!("invalid config {}", config_path.display()))?;
+            let mut executor = executor_from_config(config).await?;
+            let attempt = executor.resume_status_and_reconcile().await?;
+            write_attempt(&attempt)
         }
         _ => bail!(usage()),
     }
@@ -119,6 +136,11 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_exposes_explicit_resume_command() {
+        assert!(usage().contains("resume CONFIG_YAML"));
+    }
 
     #[test]
     fn approval_digest_is_canonical_and_amount_sensitive() {

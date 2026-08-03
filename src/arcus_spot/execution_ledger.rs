@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use dex_connector::ArcusSpotSwapStatus;
 use ethers::types::{Address, H256, U256};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -437,6 +438,11 @@ fn apply_status(
     Ok(())
 }
 
+/// Process-wide ownership of one execution ledger.
+pub struct ArcusSpotExecutionLedgerLock {
+    _file: File,
+}
+
 pub struct ArcusSpotExecutionLedgerStore {
     path: PathBuf,
 }
@@ -448,6 +454,50 @@ impl ArcusSpotExecutionLedgerStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Claim the ledger for one executor process. The separate lock inode is
+    /// stable even though ledger persistence atomically renames the JSON file.
+    pub fn acquire_exclusive_lock(&self) -> Result<ArcusSpotExecutionLedgerLock> {
+        let parent = self
+            .path
+            .parent()
+            .context("Arcus execution ledger path has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Arcus execution ledger path has no valid file name")?;
+        let lock_path = parent.join(format!(".{file_name}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open Arcus ledger lock {}", lock_path.display()))?;
+        let metadata = file.metadata().with_context(|| {
+            format!(
+                "failed to inspect Arcus ledger lock {}",
+                lock_path.display()
+            )
+        })?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "Arcus execution ledger lock {} must be a mode-0600 regular file",
+                lock_path.display()
+            );
+        }
+        FileExt::try_lock_exclusive(&file).with_context(|| {
+            format!(
+                "another Arcus executor already holds ledger lock {}",
+                lock_path.display()
+            )
+        })?;
+        Ok(ArcusSpotExecutionLedgerLock { _file: file })
     }
 
     pub fn load_or_create(&self, now: DateTime<Utc>) -> Result<ArcusSpotExecutionLedger> {
@@ -660,6 +710,28 @@ mod tests {
             ledger.active.as_ref().unwrap().phase,
             ArcusSpotExecutionPhase::Unknown
         );
+    }
+
+    #[test]
+    fn store_lock_serializes_executor_processes() {
+        let dir = tempdir().unwrap();
+        let store = ArcusSpotExecutionLedgerStore::new(dir.path().join("ledger.json"));
+        let first = store.acquire_exclusive_lock().unwrap();
+
+        let error = store.acquire_exclusive_lock().err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("another Arcus executor already holds"));
+        drop(first);
+
+        let second = store.acquire_exclusive_lock().unwrap();
+        let mode = fs::metadata(dir.path().join(".ledger.json.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(second);
     }
 
     #[test]

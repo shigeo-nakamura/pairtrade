@@ -22,6 +22,7 @@ once_cell = "1.19"
 rand = { version = "0.8", features = ["std", "std_rng"] }
 bincode = "1.3"
 libc = "0.2"
+fs2 = "0.4"
 # Optional S3 mirror for the status writer (bot-strategy#343). Engaged only
 # when STATUS_S3_BUCKET / STATUS_S3_KEY_PREFIX env vars are set; without
 # them the writer stays local-only and the SDK is dead code at runtime.
