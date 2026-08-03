@@ -177,6 +177,7 @@ where
             .await
             .context("Arcus on-chain preflight failed")?;
         let submission = sign_arcus_spot_quote(
+            &self.client,
             &observation,
             &self.signer,
             preflight.exact_value_permit.as_ref(),
