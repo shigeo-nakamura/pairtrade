@@ -164,6 +164,9 @@ pub struct ArcusSpotRuntimeState {
     /// a gain). See `risk_mark`'s overnight-gap handling.
     pub last_equity_usd: Option<Decimal>,
     pub risk_halt: Option<ArcusSpotRiskHalt>,
+    #[cfg(feature = "arcus-spot-live")]
+    #[serde(default)]
+    pub last_live_execution_idempotency_key: Option<String>,
 }
 
 impl ArcusSpotRuntimeState {
@@ -180,6 +183,8 @@ impl ArcusSpotRuntimeState {
             daily_baseline_equity_usd: None,
             last_equity_usd: None,
             risk_halt: None,
+            #[cfg(feature = "arcus-spot-live")]
+            last_live_execution_idempotency_key: None,
         }
     }
 }
@@ -245,6 +250,45 @@ impl ArcusSpotRuntime {
         Ok(Self { config, state })
     }
 
+    pub fn from_state(
+        mut config: ArcusSpotRuntimeConfig,
+        state: ArcusSpotRuntimeState,
+    ) -> Result<Self, String> {
+        config.normalize();
+        config.validate()?;
+        if state.inventory.token_a < config.inventory_floors.token_a
+            || state.inventory.token_b < config.inventory_floors.token_b
+        {
+            return Err("restored Arcus inventory is below a configured floor".to_string());
+        }
+        if state
+            .relative_log_price_history
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err("restored Arcus price history contains a non-finite value".to_string());
+        }
+        match state.regime {
+            ArcusSpotRegime::Neutral if state.rotated_quantity.is_some() => {
+                return Err("neutral restored Arcus state has a rotated quantity".to_string())
+            }
+            ArcusSpotRegime::RotatedAToB | ArcusSpotRegime::RotatedBToA => {
+                if state
+                    .rotated_quantity
+                    .is_none_or(|quantity| quantity <= Decimal::ZERO)
+                    || state.last_rotation_at.is_none()
+                {
+                    return Err(
+                        "rotated restored Arcus state lacks a positive quantity or timestamp"
+                            .to_string(),
+                    );
+                }
+            }
+            ArcusSpotRegime::Neutral => {}
+        }
+        Ok(Self { config, state })
+    }
+
     pub fn config(&self) -> &ArcusSpotRuntimeConfig {
         &self.config
     }
@@ -252,6 +296,26 @@ impl ArcusSpotRuntime {
     pub fn state(&self) -> &ArcusSpotRuntimeState {
         &self.state
     }
+    #[cfg(feature = "arcus-spot-live")]
+    pub fn apply_confirmed_live_fill_once(
+        &mut self,
+        plan: &ArcusSpotRotationPlan,
+        actual_sell_quantity: Decimal,
+        actual_buy_quantity: Decimal,
+        filled_at: DateTime<Utc>,
+        idempotency_key: &str,
+    ) -> Result<bool, String> {
+        if idempotency_key.trim().is_empty() {
+            return Err("confirmed live fill idempotency key must not be empty".to_string());
+        }
+        if self.state.last_live_execution_idempotency_key.as_deref() == Some(idempotency_key) {
+            return Ok(false);
+        }
+        self.apply_confirmed_live_fill(plan, actual_sell_quantity, actual_buy_quantity, filled_at)?;
+        self.state.last_live_execution_idempotency_key = Some(idempotency_key.to_string());
+        Ok(true)
+    }
+
     /// Commit a wallet-balance-reconciled live fill. Planning never mutates
     /// live inventory; callers invoke this only after the durable execution
     /// ledger reaches Confirmed and exact balance reconciliation succeeds.
@@ -3513,6 +3577,43 @@ mod tests {
             runtime.state().inventory.token_b,
             before.token_b + plan.buy_quantity
         );
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn confirmed_live_fill_is_idempotent_by_execution_key() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        assert!(runtime
+            .apply_confirmed_live_fill_once(
+                &plan,
+                plan.sell_quantity,
+                plan.buy_quantity,
+                event_time(),
+                "arcus-spot-00000000000000000001-aabbccddeeff0011",
+            )
+            .unwrap());
+        let committed = runtime.state().clone();
+        assert!(!runtime
+            .apply_confirmed_live_fill_once(
+                &plan,
+                plan.sell_quantity,
+                plan.buy_quantity,
+                event_time(),
+                "arcus-spot-00000000000000000001-aabbccddeeff0011",
+            )
+            .unwrap());
+        assert_eq!(runtime.state(), &committed);
     }
 
     #[cfg(feature = "arcus-spot-live")]

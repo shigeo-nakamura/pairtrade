@@ -4,7 +4,7 @@ use super::{
     ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotRotationPlan,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use dex_connector::{
     sign_arcus_spot_quote, ArcusSpotClient, ArcusSpotQuoteRoutePolicy,
     ArcusSpotSignableQuoteRequest, ArcusSpotSubmitError,
@@ -13,6 +13,7 @@ use ethers::{
     signers::Signer,
     types::{Address, H256, U256},
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt::Display, str::FromStr};
 
@@ -66,6 +67,14 @@ impl ArcusSpotLiveExecutorConfig {
         )?;
         Ok((taker, permit2))
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArcusSpotReconciledRuntimeFill {
+    pub actual_sell_quantity: Decimal,
+    pub actual_buy_quantity: Decimal,
+    pub reconciled_at: DateTime<Utc>,
+    pub idempotency_key: String,
 }
 
 pub struct ArcusSpotLiveExecutor<S> {
@@ -191,17 +200,29 @@ where
         let payload_hash = submission.payload_hash()?;
         let intent = ArcusSpotExecutionIntent {
             venue: ARCUS_VENUE.to_string(),
+            sell_symbol: plan.sell_symbol.clone(),
+            buy_symbol: plan.buy_symbol.clone(),
             sell_token: observation.sell_token.address,
             buy_token: observation.buy_token.address,
             sell_amount_raw: plan.sell_amount_raw.clone(),
             minimum_buy_amount_raw: minimum_buy.to_string(),
         };
 
-        self.ledger
-            .prepare(payload_hash, intent, preflight.balances, Utc::now())?;
+        self.validate_plan_age(plan)
+            .context("Arcus strategy plan expired before durable preparation")?;
+        self.ledger.prepare(
+            self.client.config().chain_id,
+            self.config.taker.clone(),
+            payload_hash,
+            intent,
+            preflight.balances,
+            Utc::now(),
+        )?;
         self.store
             .persist(&self.ledger)
             .context("failed to persist prepared Arcus execution")?;
+        self.validate_plan_age(plan)
+            .context("Arcus strategy plan expired before dispatch")?;
         self.ledger.mark_dispatching(Utc::now())?;
         self.store
             .persist(&self.ledger)
@@ -261,9 +282,11 @@ where
                     .swap_status(ARCUS_VENUE, tx_hash)
                     .await
                     .context("Arcus status poll failed")?;
-                self.ledger
-                    .record_polled_status(&status.payload, Utc::now())?;
+                let mutation = self
+                    .ledger
+                    .record_polled_status(&status.payload, Utc::now());
                 self.store.persist(&self.ledger)?;
+                mutation?;
             }
             Some(ArcusSpotExecutionPhase::Confirmed) => {}
             other => bail!("Arcus status resume is not allowed in phase {other:?}"),
@@ -275,6 +298,66 @@ where
         self.active_attempt()
     }
 
+    pub fn reconciled_runtime_fill(
+        &self,
+        plan: &ArcusSpotRotationPlan,
+    ) -> Result<ArcusSpotReconciledRuntimeFill> {
+        let active = self.active_attempt()?;
+        if active.phase != ArcusSpotExecutionPhase::Reconciled {
+            bail!("Arcus runtime fill requires a reconciled execution attempt");
+        }
+        if !active.intent.venue.eq_ignore_ascii_case(&plan.venue)
+            || !active
+                .intent
+                .sell_symbol
+                .eq_ignore_ascii_case(&plan.sell_symbol)
+            || !active
+                .intent
+                .buy_symbol
+                .eq_ignore_ascii_case(&plan.buy_symbol)
+            || active.intent.sell_amount_raw != plan.sell_amount_raw
+        {
+            bail!("Arcus reconciled attempt does not match the approved runtime plan");
+        }
+        let post = active
+            .post_balances
+            .as_ref()
+            .context("reconciled Arcus attempt omitted post balances")?;
+        let pre_sell = parse_amount("pre sell balance", &active.pre_balances.sell_balance_raw)?;
+        let pre_buy = parse_amount("pre buy balance", &active.pre_balances.buy_balance_raw)?;
+        let post_sell = parse_amount("post sell balance", &post.sell_balance_raw)?;
+        let post_buy = parse_amount("post buy balance", &post.buy_balance_raw)?;
+        let sold_raw = pre_sell
+            .checked_sub(post_sell)
+            .context("reconciled Arcus sell balance increased")?;
+        let bought_raw = post_buy
+            .checked_sub(pre_buy)
+            .context("reconciled Arcus buy balance decreased")?;
+        if sold_raw != parse_amount("intent sell amount", &active.intent.sell_amount_raw)? {
+            bail!("reconciled Arcus sell delta no longer matches the signed intent");
+        }
+        let planned_buy_raw = parse_amount("plan buy amount", &plan.buy_amount_raw)?;
+        if planned_buy_raw.is_zero() || plan.buy_quantity <= Decimal::ZERO {
+            bail!("approved Arcus plan has an invalid buy quantity");
+        }
+        let bought_decimal = u256_decimal("reconciled buy amount", bought_raw)?;
+        let planned_buy_decimal = u256_decimal("planned buy amount", planned_buy_raw)?;
+        let actual_buy_quantity = plan
+            .buy_quantity
+            .checked_mul(bought_decimal)
+            .and_then(|value| value.checked_div(planned_buy_decimal))
+            .context("reconciled Arcus buy quantity exceeds Decimal range")?;
+        if plan.sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
+            bail!("reconciled Arcus runtime quantities must be positive");
+        }
+        Ok(ArcusSpotReconciledRuntimeFill {
+            actual_sell_quantity: plan.sell_quantity,
+            actual_buy_quantity,
+            reconciled_at: active.updated_at,
+            idempotency_key: active.idempotency_key,
+        })
+    }
+
     pub fn archive_reconciled_after_runtime_commit(&mut self) -> Result<()> {
         self.ledger.archive_reconciled()?;
         self.store.persist(&self.ledger)
@@ -284,12 +367,7 @@ where
         if self.ledger.active.is_some() {
             bail!("Arcus execution ledger has an active attempt");
         }
-        let plan_age = Utc::now().signed_duration_since(plan.quote_received_at);
-        if plan_age.num_seconds() < 0
-            || plan_age.num_seconds() > self.config.max_plan_age_secs as i64
-        {
-            bail!("Arcus strategy plan is stale or future-dated");
-        }
+        self.validate_plan_age(plan)?;
         if !plan.venue.eq_ignore_ascii_case(ARCUS_VENUE) {
             bail!("initial live execution requires a direct Arcus strategy plan");
         }
@@ -327,7 +405,7 @@ where
             .ledger
             .history
             .iter()
-            .filter(|attempt| attempt.prepared_at.date_naive() == today)
+            .filter(|attempt| attempt.updated_at.date_naive() == today)
             .count();
         if completed_today >= self.config.max_swaps_per_utc_day as usize {
             bail!("Arcus UTC daily swap cap has been reached");
@@ -338,6 +416,13 @@ where
     async fn reconcile_confirmed(&mut self) -> Result<()> {
         let active = self.active_attempt()?;
         let taker = parse_nonzero_address("taker", &self.config.taker)?;
+        let original_taker = parse_nonzero_address("stored taker", &active.taker)?;
+        if active.chain_id != self.chain.chain_id()
+            || active.chain_id != self.client.config().chain_id
+            || original_taker != taker
+        {
+            bail!("Arcus reconciliation config does not match the original chain and taker");
+        }
         let sell_token = parse_nonzero_address("sell token", &active.intent.sell_token)?;
         let buy_token = parse_nonzero_address("buy token", &active.intent.buy_token)?;
         let post = self
@@ -348,6 +433,16 @@ where
         let mutation = self.ledger.reconcile_balances(post, Utc::now());
         self.store.persist(&self.ledger)?;
         mutation
+    }
+
+    fn validate_plan_age(&self, plan: &ArcusSpotRotationPlan) -> Result<()> {
+        let plan_age = Utc::now().signed_duration_since(plan.quote_received_at);
+        if plan_age.num_seconds() < 0
+            || plan_age.num_seconds() > self.config.max_plan_age_secs as i64
+        {
+            bail!("Arcus strategy plan is stale or future-dated");
+        }
+        Ok(())
     }
 
     fn active_phase(&self) -> Option<ArcusSpotExecutionPhase> {
@@ -443,6 +538,11 @@ fn parse_nonzero_address(label: &str, raw: &str) -> Result<Address> {
 
 fn parse_amount(label: &str, raw: &str) -> Result<U256> {
     U256::from_dec_str(raw.trim()).with_context(|| format!("invalid Arcus {label}"))
+}
+
+fn u256_decimal(label: &str, value: U256) -> Result<Decimal> {
+    Decimal::from_str(&value.to_string())
+        .with_context(|| format!("Arcus {label} exceeds Decimal range"))
 }
 
 #[cfg(test)]

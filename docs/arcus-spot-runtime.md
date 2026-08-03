@@ -47,7 +47,8 @@ With `arcus-spot-live`, the library provides:
 - a library coordinator that connects fresh quote, chain preflight, signing,
   one-shot submit, status polling, and balance reconciliation;
 - a feature-gated one-shot CLI that requires a mode-0600 config, a mode-0600
-  fresh plan, and the exact canonical SHA-256 plan digest on every invocation;
+  fresh plan, and the exact canonical SHA-256 digest of the validated config
+  and plan on every invocation;
 - hard coordinator caps of at most 60-second-old plans, 100 bps slippage, ten
   reconciled swaps per UTC day, and deployer-pinned raw sell maxima;
 - exactly one submit attempt, sticky `UNKNOWN` on ambiguous delivery, safe
@@ -57,10 +58,11 @@ With `arcus-spot-live`, the library provides:
 
 The components intentionally do not form an enabled daemon. The one-shot CLI
 is never invoked or scheduled automatically: its hash mode is non-signing, and
-its execute mode refuses a changed plan because the separately supplied
-canonical digest no longer matches. No KMS key is created, no wallet is funded,
-and no message or transaction is signed by adding this feature. The first real
-signature remains blocked on the exact one-swap approval in bot-strategy #772.
+its execute and resume modes refuse a changed config or plan because the
+separately supplied canonical digest no longer matches. No KMS key is
+created, no wallet is funded, and no message or transaction is signed by
+adding this feature. The first real signature remains blocked on the exact
+one-swap approval in bot-strategy #772.
 
 Validate the gated foundation without network or wallet access:
 
@@ -69,11 +71,13 @@ Validate the gated foundation without network or wallet access:
       --bin arcus-spot-execute-once
 
 For a future explicitly approved probe, first compute the digest from a
-mode-0600 fresh plan and obtain approval for that exact plan. Only then may the
-same digest be supplied to execute:
+mode-0600 validated config plus a mode-0600 fresh plan and obtain approval
+for that exact execution envelope. Only then may the same digest be supplied
+to execute:
 
-    arcus-spot-execute-once hash PLAN_JSON
+    arcus-spot-execute-once hash CONFIG_YAML PLAN_JSON
     arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SHA256
+    arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SHA256
 
 ## Deterministic replay
 

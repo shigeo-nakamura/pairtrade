@@ -12,7 +12,7 @@ use std::{
     str::FromStr,
 };
 
-const EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 1;
+const EXECUTION_LEDGER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +37,8 @@ impl ArcusSpotExecutionPhase {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArcusSpotExecutionIntent {
     pub venue: String,
+    pub sell_symbol: String,
+    pub buy_symbol: String,
     pub sell_token: String,
     pub buy_token: String,
     pub sell_amount_raw: String,
@@ -47,6 +49,12 @@ impl ArcusSpotExecutionIntent {
     fn validate(&self) -> Result<(Address, Address, U256, U256)> {
         if !self.venue.eq_ignore_ascii_case("arcus") {
             bail!("initial live execution requires venue=arcus");
+        }
+        if self.sell_symbol.trim().is_empty()
+            || self.buy_symbol.trim().is_empty()
+            || self.sell_symbol.eq_ignore_ascii_case(&self.buy_symbol)
+        {
+            bail!("execution symbols must be distinct and non-empty");
         }
         let sell_token =
             Address::from_str(&self.sell_token).context("invalid execution sell_token")?;
@@ -101,6 +109,8 @@ pub struct ArcusSpotExecutionAttempt {
     pub sequence: u64,
     pub idempotency_key: String,
     pub payload_hash: String,
+    pub chain_id: u64,
+    pub taker: String,
     pub prepared_at: DateTime<Utc>,
     pub dispatched_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
@@ -165,6 +175,14 @@ impl ArcusSpotExecutionLedger {
             }
             previous = attempt.sequence;
             attempt.intent.validate()?;
+            if attempt.chain_id == 0 {
+                bail!("Arcus execution attempt chain_id must be non-zero");
+            }
+            let taker =
+                Address::from_str(&attempt.taker).context("invalid execution attempt taker")?;
+            if taker == Address::zero() {
+                bail!("Arcus execution attempt taker must not be zero");
+            }
             let (sell_token, buy_token, _, _) = attempt.intent.validate()?;
             attempt.pre_balances.validate_for(sell_token, buy_token)?;
             if let Some(post) = &attempt.post_balances {
@@ -185,6 +203,8 @@ impl ArcusSpotExecutionLedger {
 
     pub fn prepare(
         &mut self,
+        chain_id: u64,
+        taker: impl Into<String>,
         payload_hash: impl Into<String>,
         intent: ArcusSpotExecutionIntent,
         pre_balances: ArcusSpotBalanceSnapshot,
@@ -196,6 +216,14 @@ impl ArcusSpotExecutionLedger {
                 active.sequence,
                 active.phase
             );
+        }
+        if chain_id == 0 {
+            bail!("Arcus execution chain_id must be non-zero");
+        }
+        let taker = taker.into();
+        let parsed_taker = Address::from_str(&taker).context("invalid execution taker")?;
+        if parsed_taker == Address::zero() {
+            bail!("Arcus execution taker must not be zero");
         }
         let payload_hash = payload_hash.into();
         validate_payload_hash(&payload_hash)?;
@@ -216,6 +244,8 @@ impl ArcusSpotExecutionLedger {
             sequence,
             idempotency_key: format!("arcus-spot-{sequence:020}-{hash_suffix}"),
             payload_hash,
+            chain_id,
+            taker,
             prepared_at: now,
             dispatched_at: None,
             updated_at: now,
@@ -418,6 +448,8 @@ fn apply_status(
         let previous = H256::from_str(previous).context("invalid stored txHash")?;
         if previous != tx_hash {
             active.phase = ArcusSpotExecutionPhase::Unknown;
+            active.updated_at = now;
+            active.router_status = Some(status.status.clone());
             active.detail = Some("router changed txHash for an active attempt".to_string());
             bail!("router txHash changed across status observations");
         }
@@ -590,6 +622,8 @@ mod tests {
     fn intent() -> ArcusSpotExecutionIntent {
         ArcusSpotExecutionIntent {
             venue: "arcus".to_string(),
+            sell_symbol: "NVDA".to_string(),
+            buy_symbol: "AMD".to_string(),
             sell_token: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
             buy_token: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string(),
             sell_amount_raw: "1000".to_string(),
@@ -626,6 +660,8 @@ mod tests {
         let mut ledger = ArcusSpotExecutionLedger::default();
         ledger
             .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
                 format!("sha256:{}", "a".repeat(64)),
                 intent(),
                 balances("5000", "2000", now),
@@ -646,6 +682,8 @@ mod tests {
         let mut ledger = ArcusSpotExecutionLedger::default();
         ledger
             .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
                 format!("sha256:{}", "a".repeat(64)),
                 intent(),
                 balances("5000", "2000", now),
@@ -654,6 +692,8 @@ mod tests {
             .unwrap();
         assert!(ledger
             .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
                 format!("sha256:{}", "b".repeat(64)),
                 intent(),
                 balances("5000", "2000", now),
@@ -668,6 +708,8 @@ mod tests {
         let mut ledger = ArcusSpotExecutionLedger::default();
         ledger
             .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
                 format!("sha256:{}", "a".repeat(64)),
                 intent(),
                 balances("5000", "2000", now),
@@ -693,6 +735,8 @@ mod tests {
         let mut ledger = ArcusSpotExecutionLedger::default();
         ledger
             .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
                 format!("sha256:{}", "a".repeat(64)),
                 intent(),
                 balances("5000", "2000", now),
@@ -710,6 +754,39 @@ mod tests {
             ledger.active.as_ref().unwrap().phase,
             ArcusSpotExecutionPhase::Unknown
         );
+    }
+
+    #[test]
+    fn changed_polled_hash_is_persisted_as_unknown() {
+        let dir = tempdir().unwrap();
+        let store = ArcusSpotExecutionLedgerStore::new(dir.path().join("ledger.json"));
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(1);
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.mark_dispatching(now).unwrap();
+        ledger
+            .record_submit_status(&status("submitted"), now)
+            .unwrap();
+        let mut changed = status("submitted");
+        changed.tx_hash = format!("{:#x}", H256::from_low_u64_be(2));
+        assert!(ledger.record_polled_status(&changed, later).is_err());
+        store.persist(&ledger).unwrap();
+
+        let loaded = store.load_or_create(later).unwrap();
+        let active = loaded.active.unwrap();
+        assert_eq!(active.phase, ArcusSpotExecutionPhase::Unknown);
+        assert_eq!(active.updated_at, later);
+        assert!(active.detail.unwrap().contains("changed txHash"));
     }
 
     #[test]
@@ -742,6 +819,8 @@ mod tests {
         let mut ledger = store.load_or_create(now).unwrap();
         ledger
             .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
                 format!("sha256:{}", "a".repeat(64)),
                 intent(),
                 balances("5000", "2000", now),
