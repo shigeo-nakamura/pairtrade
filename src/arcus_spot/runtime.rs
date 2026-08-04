@@ -296,6 +296,27 @@ impl ArcusSpotRuntime {
     pub fn state(&self) -> &ArcusSpotRuntimeState {
         &self.state
     }
+
+    /// Reject a plan whose trigger/direction can't possibly be committed
+    /// against the runtime's *current* regime, before it is ever signed or
+    /// submitted.
+    ///
+    /// `apply_confirmed_live_fill` already enforces this same consistency,
+    /// but only after the swap has already executed on-chain and balances
+    /// were reconciled -- by which point rejecting a stale plan (approved
+    /// against an earlier regime, then submitted after the checkpoint moved
+    /// on, e.g. from a second in-flight approval or an operator running a
+    /// leftover approved plan file) leaves the wallet already swapped with
+    /// nowhere for the fill to go. Calling this first lets a caller refuse
+    /// before dispatch instead (Codex P1 follow-up, pairtrade#181).
+    #[cfg(feature = "arcus-spot-live")]
+    pub fn validate_plan_consistent_with_state(
+        &self,
+        plan: &ArcusSpotRotationPlan,
+    ) -> Result<(), String> {
+        require_fill_consistent_with_regime(self.state.regime, plan.trigger, plan.direction)
+    }
+
     #[cfg(feature = "arcus-spot-live")]
     pub fn apply_confirmed_live_fill_once(
         &mut self,
@@ -342,29 +363,7 @@ impl ArcusSpotRuntime {
         if filled_at < plan.quote_received_at {
             return Err("confirmed fill predates its quote receipt".to_string());
         }
-
-        match (self.state.regime, plan.trigger, plan.direction) {
-            (
-                ArcusSpotRegime::Neutral,
-                ArcusSpotRotationTrigger::EntrySignal,
-                ArcusSpotDirection::TokenAToTokenB | ArcusSpotDirection::TokenBToTokenA,
-            )
-            | (
-                ArcusSpotRegime::RotatedAToB,
-                ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit,
-                ArcusSpotDirection::TokenBToTokenA,
-            )
-            | (
-                ArcusSpotRegime::RotatedBToA,
-                ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit,
-                ArcusSpotDirection::TokenAToTokenB,
-            ) => {}
-            other => {
-                return Err(format!(
-                    "confirmed fill is inconsistent with runtime state: {other:?}"
-                ))
-            }
-        }
+        require_fill_consistent_with_regime(self.state.regime, plan.trigger, plan.direction)?;
 
         let mut next = self.state.clone();
         let mut after = next.inventory;
@@ -1901,6 +1900,37 @@ fn verify_round_trip_linkage_and_loss(
     Ok(recomputed)
 }
 
+/// Shared by `apply_confirmed_live_fill` (post-fill commit) and
+/// `ArcusSpotRuntime::validate_plan_consistent_with_state` (pre-dispatch
+/// check): only these regime/trigger/direction combinations can ever be
+/// committed without corrupting the runtime's entry/exit state machine.
+fn require_fill_consistent_with_regime(
+    regime: ArcusSpotRegime,
+    trigger: ArcusSpotRotationTrigger,
+    direction: ArcusSpotDirection,
+) -> Result<(), String> {
+    match (regime, trigger, direction) {
+        (
+            ArcusSpotRegime::Neutral,
+            ArcusSpotRotationTrigger::EntrySignal,
+            ArcusSpotDirection::TokenAToTokenB | ArcusSpotDirection::TokenBToTokenA,
+        )
+        | (
+            ArcusSpotRegime::RotatedAToB,
+            ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit,
+            ArcusSpotDirection::TokenBToTokenA,
+        )
+        | (
+            ArcusSpotRegime::RotatedBToA,
+            ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit,
+            ArcusSpotDirection::TokenAToTokenB,
+        ) => Ok(()),
+        other => Err(format!(
+            "fill is inconsistent with runtime state: {other:?}"
+        )),
+    }
+}
+
 fn parse_positive_or_zero(field: &str, value: Option<&str>) -> Result<Decimal, ArcusSpotHold> {
     let value = value.ok_or_else(|| {
         ArcusSpotHold::new(
@@ -1923,7 +1953,7 @@ fn parse_positive_or_zero(field: &str, value: Option<&str>) -> Result<Decimal, A
     Ok(parsed)
 }
 
-fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
+pub(crate) fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
     let raw = raw.trim();
     if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(format!(
@@ -1948,12 +1978,11 @@ fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
 }
 
 /// Inverse of `raw_amount_to_quantity`: renders a token quantity back to the
-/// integer raw-unit string a route would carry. `build_plan` no longer
-/// synthesizes prorated fills (see the floor/rotation-limit rejections
-/// above), so this is currently exercised only by tests; kept as a
-/// production-quality utility rather than folded into the test module.
-#[cfg(test)]
-fn quantity_to_raw_amount(quantity: Decimal, decimals: u32) -> Result<String, String> {
+/// integer raw-unit string a route would carry. Used by
+/// `live_executor::require_raw_matches_decimal_quantity` to cross-check a
+/// plan's raw and decimal amounts against each other before dispatch
+/// (Codex P1 follow-up, pairtrade#181).
+pub(crate) fn quantity_to_raw_amount(quantity: Decimal, decimals: u32) -> Result<String, String> {
     if quantity < Decimal::ZERO {
         return Err(format!("quantity {quantity} must be non-negative"));
     }
@@ -3614,6 +3643,56 @@ mod tests {
             )
             .unwrap());
         assert_eq!(runtime.state(), &committed);
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn plan_consistent_with_state_is_accepted_before_any_fill() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        runtime.validate_plan_consistent_with_state(&plan).unwrap();
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn stale_plan_from_a_prior_regime_is_rejected_before_dispatch() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        // Approve an entry plan while still Neutral...
+        let stale_entry_plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        // ...but the checkpoint has since rotated (e.g. a prior fill
+        // already committed), so re-dispatching that same approved plan
+        // must now be refused rather than reach a second submission.
+        runtime
+            .apply_confirmed_live_fill(
+                &stale_entry_plan,
+                stale_entry_plan.sell_quantity,
+                stale_entry_plan.buy_quantity,
+                event_time(),
+            )
+            .unwrap();
+        assert!(runtime
+            .validate_plan_consistent_with_state(&stale_entry_plan)
+            .is_err());
     }
 
     #[cfg(feature = "arcus-spot-live")]

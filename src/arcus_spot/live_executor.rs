@@ -192,6 +192,29 @@ where
         if quote.sell_amount != plan.sell_amount_raw {
             bail!("fresh Arcus quote changed the planned exact sell amount");
         }
+        // Nothing upstream cross-checks a plan's raw (on-chain, what
+        // actually gets swapped) and decimal (what the runtime commits to
+        // its checkpoint) amounts against each other. A plan whose
+        // sell_amount_raw/sell_quantity or buy_amount_raw/buy_quantity are
+        // inconsistent for the fresh token's own decimals would still swap
+        // correctly on-chain (raw amounts drive the wire submission) while
+        // finalize_reconciled_attempt records a decimal quantity that
+        // doesn't describe what was actually swapped, diverging runtime
+        // inventory from wallet balances even though every balance
+        // reconciliation upstream reported exact (Codex P1 follow-up,
+        // pairtrade#181).
+        require_raw_matches_decimal_quantity(
+            "sell",
+            &plan.sell_amount_raw,
+            plan.sell_quantity,
+            observation.sell_token.decimals,
+        )?;
+        require_raw_matches_decimal_quantity(
+            "buy",
+            &plan.buy_amount_raw,
+            plan.buy_quantity,
+            observation.buy_token.decimals,
+        )?;
         let minimum_buy = quote.minimum_received()?;
         require_fresh_quote_matches_approved_plan(plan, minimum_buy, self.config.slippage_bps)?;
         let deadline = quote.expires_at()?;
@@ -595,6 +618,26 @@ fn u256_decimal(label: &str, value: U256) -> Result<Decimal> {
         .with_context(|| format!("Arcus {label} exceeds Decimal range"))
 }
 
+/// Require a plan's raw (on-chain base units) and decimal (human/runtime)
+/// amounts to describe the same quantity under the token's real decimals,
+/// rather than trusting them to already agree (Codex P1 follow-up,
+/// pairtrade#181).
+fn require_raw_matches_decimal_quantity(
+    label: &str,
+    raw: &str,
+    quantity: Decimal,
+    decimals: u32,
+) -> Result<()> {
+    let expected_raw = super::quantity_to_raw_amount(quantity, decimals)
+        .map_err(|error| anyhow!("Arcus plan {label} amount: {error}"))?;
+    if expected_raw != raw {
+        bail!(
+            "Arcus plan {label}_amount_raw {raw} does not match {label}_quantity {quantity} at {decimals} decimals (expected {expected_raw})"
+        );
+    }
+    Ok(())
+}
+
 /// Distinct symbols alone don't prove a plan's direction actually matches
 /// the runtime's configured pair: a plan claiming `TokenAToTokenB` while in
 /// fact selling the configured token B would otherwise pass, and
@@ -731,5 +774,19 @@ mod tests {
         plan.sell_symbol = "AMD".to_string();
         plan.buy_symbol = "NVDA".to_string();
         assert!(require_plan_direction_matches_pair(&plan, &pair()).is_err());
+    }
+
+    #[test]
+    fn raw_matching_its_decimal_quantity_is_accepted() {
+        require_raw_matches_decimal_quantity("sell", "1000000000000000000", Decimal::ONE, 18)
+            .unwrap();
+    }
+
+    #[test]
+    fn raw_inconsistent_with_its_decimal_quantity_is_rejected() {
+        // 1000 raw units at 18 decimals is 0.000000000000001, not 1.
+        assert!(
+            require_raw_matches_decimal_quantity("sell", "1000", Decimal::ONE, 18).is_err()
+        );
     }
 }
