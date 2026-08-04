@@ -146,6 +146,23 @@ where
         if plan_config_digest.trim().is_empty() {
             bail!("Arcus execute_plan_once requires a non-empty plan_config_digest");
         }
+        // A one-swap approval is meant to authorize exactly one swap.
+        // Checking only `active` (Codex P1 follow-up, pairtrade#181) lets
+        // the identical approved digest be resubmitted after its first
+        // attempt already reconciled and archived -- the ledger happily
+        // assigns a new sequence/idempotency key, so this would dispatch
+        // and sign a second real swap on the same one-time approval before
+        // the runtime commit seam (which only guards inventory/regime
+        // state, not the ledger) ever gets a chance to reject it. Treat any
+        // digest already present in history as consumed.
+        if self
+            .ledger
+            .history
+            .iter()
+            .any(|attempt| attempt.intent.plan_config_digest == plan_config_digest)
+        {
+            bail!("Arcus approval digest has already been used for a prior execution attempt");
+        }
         self.validate_plan(plan)?;
         let request = ArcusSpotSignableQuoteRequest::new(
             plan.sell_symbol.clone(),
