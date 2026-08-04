@@ -43,6 +43,17 @@ pub struct ArcusSpotExecutionIntent {
     pub buy_token: String,
     pub sell_amount_raw: String,
     pub minimum_buy_amount_raw: String,
+    /// The CLI's approved config+plan digest at prepare time (see
+    /// `approval_digest` in `arcus_spot_execute_once.rs`).
+    ///
+    /// Both `execute` and `resume` independently verify their own
+    /// invocation's config+plan against a caller-supplied approved digest,
+    /// but that alone doesn't prove `resume` was given the *same* plan
+    /// `execute` was: two different plans can each carry their own valid
+    /// approval. Persisting the digest here and requiring a resumed fill's
+    /// digest to match it closes that gap (Codex P1 follow-up,
+    /// pairtrade#181).
+    pub plan_config_digest: String,
 }
 
 impl ArcusSpotExecutionIntent {
@@ -55,6 +66,9 @@ impl ArcusSpotExecutionIntent {
             || self.sell_symbol.eq_ignore_ascii_case(&self.buy_symbol)
         {
             bail!("execution symbols must be distinct and non-empty");
+        }
+        if self.plan_config_digest.trim().is_empty() {
+            bail!("execution intent plan_config_digest must not be empty");
         }
         let sell_token =
             Address::from_str(&self.sell_token).context("invalid execution sell_token")?;
@@ -628,6 +642,7 @@ mod tests {
             buy_token: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string(),
             sell_amount_raw: "1000".to_string(),
             minimum_buy_amount_raw: "980".to_string(),
+            plan_config_digest: format!("sha256:{}", "c".repeat(64)),
         }
     }
 
@@ -652,6 +667,13 @@ mod tests {
             swap: None,
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn empty_plan_config_digest_is_rejected() {
+        let mut value = intent();
+        value.plan_config_digest = String::new();
+        assert!(value.validate().is_err());
     }
 
     #[test]

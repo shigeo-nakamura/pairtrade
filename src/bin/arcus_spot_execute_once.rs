@@ -119,7 +119,14 @@ async fn executor_from_config(
         .context("invalid Arcus chain configuration")?;
     let signer = build_arcus_spot_kms_signer(&config.kms).await?;
     let store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
-    ArcusSpotLiveExecutor::new(config.executor.clone(), client, chain, signer, store)
+    ArcusSpotLiveExecutor::new(
+        config.executor.clone(),
+        config.runtime.pair.clone(),
+        client,
+        chain,
+        signer,
+        store,
+    )
 }
 
 const RUNTIME_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -215,12 +222,13 @@ fn finalize_reconciled_attempt(
     config: &ArcusSpotExecuteOnceConfig,
     executor: &mut ArcusSpotLiveExecutor<ArcusSpotKmsSigner>,
     plan: &ArcusSpotRotationPlan,
+    plan_config_digest: &str,
     attempt: ArcusSpotExecutionAttempt,
 ) -> Result<ArcusSpotExecutionAttempt> {
     if attempt.phase != ArcusSpotExecutionPhase::Reconciled {
         return Ok(attempt);
     }
-    let fill = executor.reconciled_runtime_fill(plan)?;
+    let fill = executor.reconciled_runtime_fill(plan, plan_config_digest)?;
     let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
     let mut runtime = store.load_or_create(&config.runtime)?;
     runtime
@@ -286,8 +294,9 @@ async fn main() -> Result<()> {
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
             require_approval_digest(&config, &plan, approved_digest)?;
             let mut executor = executor_from_config(&config).await?;
-            let attempt = executor.execute_plan_once(&plan).await?;
-            let attempt = finalize_reconciled_attempt(&config, &mut executor, &plan, attempt)?;
+            let attempt = executor.execute_plan_once(&plan, approved_digest).await?;
+            let attempt =
+                finalize_reconciled_attempt(&config, &mut executor, &plan, approved_digest, attempt)?;
             write_attempt(&attempt)
         }
         [command, config_path, plan_path, approved_digest] if command == "resume" => {
@@ -296,7 +305,8 @@ async fn main() -> Result<()> {
             require_approval_digest(&config, &plan, approved_digest)?;
             let mut executor = executor_from_config(&config).await?;
             let attempt = executor.resume_status_and_reconcile().await?;
-            let attempt = finalize_reconciled_attempt(&config, &mut executor, &plan, attempt)?;
+            let attempt =
+                finalize_reconciled_attempt(&config, &mut executor, &plan, approved_digest, attempt)?;
             write_attempt(&attempt)
         }
         _ => bail!(usage()),

@@ -1,12 +1,13 @@
 use super::{
-    ArcusSpotChainClient, ArcusSpotChainPreflightRequest, ArcusSpotExecutionAttempt,
-    ArcusSpotExecutionIntent, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock,
-    ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotRotationPlan,
+    ArcusSpotChainClient, ArcusSpotChainPreflightRequest, ArcusSpotDirection,
+    ArcusSpotExecutionAttempt, ArcusSpotExecutionIntent, ArcusSpotExecutionLedger,
+    ArcusSpotExecutionLedgerLock, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
+    ArcusSpotRotationPlan,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use dex_connector::{
-    sign_arcus_spot_quote, ArcusSpotClient, ArcusSpotQuoteRoutePolicy,
+    sign_arcus_spot_quote, ArcusSpotClient, ArcusSpotPair, ArcusSpotQuoteRoutePolicy,
     ArcusSpotSignableQuoteRequest, ArcusSpotSubmitError,
 };
 use ethers::{
@@ -79,6 +80,10 @@ pub struct ArcusSpotReconciledRuntimeFill {
 
 pub struct ArcusSpotLiveExecutor<S> {
     config: ArcusSpotLiveExecutorConfig,
+    // Sourced solely from the runtime's own `pair` config field (see
+    // `executor_from_config`), never a second, independently-editable YAML
+    // entry: two copies of the same fact could otherwise silently drift.
+    pair: ArcusSpotPair,
     client: ArcusSpotClient,
     chain: ArcusSpotChainClient,
     signer: S,
@@ -94,12 +99,16 @@ where
 {
     pub fn new(
         config: ArcusSpotLiveExecutorConfig,
+        pair: ArcusSpotPair,
         client: ArcusSpotClient,
         chain: ArcusSpotChainClient,
         signer: S,
         store: ArcusSpotExecutionLedgerStore,
     ) -> Result<Self> {
         let (taker, _) = config.validate()?;
+        if pair.sell_symbol.eq_ignore_ascii_case(&pair.buy_symbol) {
+            bail!("Arcus runtime pair symbols must be distinct");
+        }
         if client.config().chain_id != chain.chain_id()
             || signer.chain_id() != client.config().chain_id
         {
@@ -115,6 +124,7 @@ where
         let ledger = store.load_or_create(Utc::now())?;
         Ok(Self {
             config,
+            pair,
             client,
             chain,
             signer,
@@ -131,7 +141,11 @@ where
     pub async fn execute_plan_once(
         &mut self,
         plan: &ArcusSpotRotationPlan,
+        plan_config_digest: &str,
     ) -> Result<ArcusSpotExecutionAttempt> {
+        if plan_config_digest.trim().is_empty() {
+            bail!("Arcus execute_plan_once requires a non-empty plan_config_digest");
+        }
         self.validate_plan(plan)?;
         let request = ArcusSpotSignableQuoteRequest::new(
             plan.sell_symbol.clone(),
@@ -206,6 +220,7 @@ where
             buy_token: observation.buy_token.address,
             sell_amount_raw: plan.sell_amount_raw.clone(),
             minimum_buy_amount_raw: minimum_buy.to_string(),
+            plan_config_digest: plan_config_digest.to_string(),
         };
 
         self.validate_plan_age(plan)
@@ -301,10 +316,23 @@ where
     pub fn reconciled_runtime_fill(
         &self,
         plan: &ArcusSpotRotationPlan,
+        plan_config_digest: &str,
     ) -> Result<ArcusSpotReconciledRuntimeFill> {
         let active = self.active_attempt()?;
         if active.phase != ArcusSpotExecutionPhase::Reconciled {
             bail!("Arcus runtime fill requires a reconciled execution attempt");
+        }
+        // Venue/symbols/sell_amount_raw alone don't prove `resume` (or a
+        // fresh `execute` racing an existing attempt) was given the exact
+        // plan that was actually prepared and dispatched: a different plan
+        // can independently satisfy those same fields while differing in
+        // sell_quantity/buy_quantity/direction/trigger, which
+        // finalize_reconciled_attempt would then commit as if they
+        // described the executed swap. The digest captures the full
+        // approved plan (and config), so a mismatch here means this is
+        // provably not the same plan (Codex P1 follow-up, pairtrade#181).
+        if active.intent.plan_config_digest != plan_config_digest {
+            bail!("Arcus reconciled attempt was prepared under a different approved plan/config");
         }
         if !active.intent.venue.eq_ignore_ascii_case(&plan.venue)
             || !active
@@ -374,6 +402,7 @@ where
         if plan.sell_symbol.eq_ignore_ascii_case(&plan.buy_symbol) {
             bail!("Arcus strategy plan symbols must be distinct");
         }
+        require_plan_direction_matches_pair(plan, &self.pair)?;
         let sell_amount = parse_amount("plan sell_amount_raw", &plan.sell_amount_raw)?;
         if sell_amount.is_zero() {
             bail!("Arcus strategy plan sell amount must be positive");
@@ -545,6 +574,35 @@ fn u256_decimal(label: &str, value: U256) -> Result<Decimal> {
         .with_context(|| format!("Arcus {label} exceeds Decimal range"))
 }
 
+/// Distinct symbols alone don't prove a plan's direction actually matches
+/// the runtime's configured pair: a plan claiming `TokenAToTokenB` while in
+/// fact selling the configured token B would otherwise pass, and
+/// `apply_confirmed_live_fill` later interprets that direction as A-to-B
+/// regardless, mutating checkpoint inventory in the wrong orientation
+/// relative to the real wallet delta (Codex P1 follow-up, pairtrade#181).
+fn require_plan_direction_matches_pair(
+    plan: &ArcusSpotRotationPlan,
+    pair: &ArcusSpotPair,
+) -> Result<()> {
+    let (expected_sell, expected_buy) = match plan.direction {
+        ArcusSpotDirection::TokenAToTokenB => (pair.sell_symbol.as_str(), pair.buy_symbol.as_str()),
+        ArcusSpotDirection::TokenBToTokenA => (pair.buy_symbol.as_str(), pair.sell_symbol.as_str()),
+    };
+    if !plan.sell_symbol.eq_ignore_ascii_case(expected_sell)
+        || !plan.buy_symbol.eq_ignore_ascii_case(expected_buy)
+    {
+        bail!(
+            "Arcus strategy plan symbols {}/{} do not match the runtime pair {}/{} for direction {:?}",
+            plan.sell_symbol,
+            plan.buy_symbol,
+            pair.sell_symbol,
+            pair.buy_symbol,
+            plan.direction
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,5 +678,37 @@ mod tests {
             .inventory_floor_raw
             .insert("nvda".to_string(), "100".to_string());
         assert!(value.validate().is_err());
+    }
+
+    fn pair() -> ArcusSpotPair {
+        ArcusSpotPair {
+            sell_symbol: "NVDA".to_string(),
+            buy_symbol: "AMD".to_string(),
+        }
+    }
+
+    #[test]
+    fn plan_direction_must_match_the_runtime_pair() {
+        let mut plan = plan_with_buy_amount("1000");
+        plan.direction = crate::arcus_spot::ArcusSpotDirection::TokenAToTokenB;
+        plan.sell_symbol = "NVDA".to_string();
+        plan.buy_symbol = "AMD".to_string();
+        require_plan_direction_matches_pair(&plan, &pair()).unwrap();
+
+        plan.direction = crate::arcus_spot::ArcusSpotDirection::TokenBToTokenA;
+        plan.sell_symbol = "AMD".to_string();
+        plan.buy_symbol = "NVDA".to_string();
+        require_plan_direction_matches_pair(&plan, &pair()).unwrap();
+    }
+
+    #[test]
+    fn plan_claiming_a_to_b_while_actually_selling_token_b_is_rejected() {
+        let mut plan = plan_with_buy_amount("1000");
+        // Distinct symbols, but the wrong orientation for TokenAToTokenB
+        // given the runtime pair sell_symbol=NVDA/buy_symbol=AMD.
+        plan.direction = crate::arcus_spot::ArcusSpotDirection::TokenAToTokenB;
+        plan.sell_symbol = "AMD".to_string();
+        plan.buy_symbol = "NVDA".to_string();
+        assert!(require_plan_direction_matches_pair(&plan, &pair()).is_err());
     }
 }
