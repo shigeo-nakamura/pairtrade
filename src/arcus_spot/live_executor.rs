@@ -260,7 +260,11 @@ where
             .persist(&self.ledger)
             .context("failed to persist Arcus dispatch marker")?;
 
-        match self.client.submit_signed_quote_once(&submission).await {
+        match self
+            .client
+            .submit_signed_quote_once(&submission, preflight.exact_value_permit.as_ref())
+            .await
+        {
             Ok(observation) => {
                 if let Err(error) = self
                     .ledger
