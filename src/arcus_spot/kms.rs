@@ -171,9 +171,20 @@ impl ArcusSpotKmsSigner {
         Ok(EthereumSignature {
             r: U256::from_big_endian(r_bytes.as_slice()),
             s: U256::from_big_endian(s_bytes.as_slice()),
-            v: u64::from(recovery_id.to_byte()),
+            v: ethereum_v(recovery_id),
         })
     }
+}
+
+/// `RecoveryId::to_byte()` returns the raw 0/1 recovery id, not the
+/// Ethereum-form 27/28 that ecrecover-based verifiers (the Arcus router,
+/// and EIP-2612 token permit contracts) expect; `ethers::Signer`
+/// implementations like LocalWallet already return 27/28. A serialized 0/1
+/// v would still let our own local recovery-id search above succeed (it
+/// tries both raw values), but be rejected downstream (Codex P1 follow-up,
+/// pairtrade#181).
+fn ethereum_v(recovery_id: RecoveryId) -> u64 {
+    u64::from(recovery_id.to_byte()) + 27
 }
 
 #[async_trait]
@@ -261,6 +272,12 @@ mod tests {
             chain_id: 4663,
             expected_address: "0x7600000000000000000000000000000000000001".to_string(),
         }
+    }
+
+    #[test]
+    fn recovery_id_maps_to_ethereum_form_v() {
+        assert_eq!(ethereum_v(RecoveryId::from_byte(0).unwrap()), 27);
+        assert_eq!(ethereum_v(RecoveryId::from_byte(1).unwrap()), 28);
     }
 
     #[test]

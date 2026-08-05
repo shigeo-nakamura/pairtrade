@@ -376,22 +376,27 @@ async fn main() -> Result<()> {
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
             let plan_config_digest = require_approval_signature(&config, &plan, approval_signature)?;
-            // A plan can pass every check above (venue, symbols/direction,
-            // a genuinely signed approval) while still being stale relative
-            // to the *current* runtime checkpoint -- e.g. approved against
-            // an earlier regime, then submitted after a prior swap already
-            // rotated it. Previously only finalize_reconciled_attempt
-            // caught this, via apply_confirmed_live_fill_once, but only
-            // after the swap had already executed on-chain and balances
-            // were reconciled (Codex P1 follow-up, pairtrade#181). Refuse
-            // it here instead, before any signing or submission.
+            // executor_from_config acquires the exclusive ledger lock
+            // (inside ArcusSpotLiveExecutor::new); the runtime-checkpoint
+            // consistency check must happen only *after* that, and must
+            // re-read the checkpoint fresh rather than reuse anything
+            // loaded earlier. A plan can pass every check above (venue,
+            // symbols/direction, a genuinely signed approval) while still
+            // being stale relative to the checkpoint another overlapping
+            // `execute` invocation commits and archives while this one is
+            // still constructing its client/chain/KMS signer -- checking
+            // before the lock (or reusing a pre-lock read) leaves that
+            // window open, letting a plan valid against the old regime
+            // still be signed and dispatched against the now-stale state
+            // (Codex P1 follow-up, pairtrade#181, refining an earlier
+            // fix in the same area).
+            let mut executor = executor_from_config(&config).await?;
             let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let runtime = runtime_store.load_or_create(&config.runtime)?;
             runtime
                 .validate_plan_consistent_with_state(&plan)
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
-            let mut executor = executor_from_config(&config).await?;
             let attempt = executor
                 .execute_plan_once(&plan, &plan_config_digest)
                 .await?;
