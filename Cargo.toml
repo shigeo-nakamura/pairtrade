@@ -47,6 +47,11 @@ k256 = { version = "0.13.3", optional = true }
 spki = { version = "0.7.2", optional = true }
 thiserror = { version = "1", optional = true }
 url = { version = "2", optional = true }
+# Verifies the offline-signed one-swap approval (bot-strategy#772,
+# pairtrade#181): the execute/resume CLI holds only the Ed25519 public key,
+# never the signing key, so it cannot mint its own approval.
+ed25519-dalek = { version = "2.2", optional = true }
+hex = { version = "0.4", optional = true }
 debot-utils = "1.0.*"
 
 dex-connector = { path = "../dex-connector", default-features = false }
@@ -72,6 +77,8 @@ arcus-spot-live = [
     "dep:spki",
     "dep:thiserror",
     "dep:url",
+    "dep:ed25519-dalek",
+    "dep:hex",
 ]
 hyperliquid-sdk = ["dex-connector/hyperliquid-sdk"]
 
