@@ -48,8 +48,10 @@ With `arcus-spot-live`, the library provides:
   one-shot submit, status polling, and balance reconciliation;
 - a feature-gated one-shot CLI that requires a mode-0600 config, a mode-0600
   fresh plan, and an Ed25519 signature -- over the canonical SHA-256 digest
-  of the validated config and plan, verified against a public key embedded
-  in config -- on every invocation; the matching private key must never
+  of the validated config and plan, verified against a public key sourced
+  from `ARCUS_APPROVAL_PUBLIC_KEY` (never the config/plan files themselves,
+  so the same routine deploy path that writes them can't also redefine who
+  approves) -- on every invocation; the matching private key must never
   exist on this host, so the CLI can request approval but cannot mint it
   itself;
 - hard coordinator caps of at most 60-second-old plans, 100 bps slippage, ten
@@ -75,8 +77,12 @@ Validate the gated foundation without network or wallet access:
 
 For a future explicitly approved probe: generate an approval keypair once, on
 a machine that will never run `execute`/`resume` (the private key file must
-never be copied to that host), and embed the printed public key in every
-config's `approval_public_key`:
+never be copied to that host), and set the printed public key as the
+`ARCUS_APPROVAL_PUBLIC_KEY` environment variable wherever `execute`/`resume`
+run (e.g. a systemd drop-in) -- deliberately *not* a field in `CONFIG_YAML`:
+a host that can write that routinely-deployed config could otherwise
+generate its own keypair, put its own public half there, and sign its own
+"approval" with the matching private key it also holds.
 
     arcus-spot-execute-once keygen APPROVAL_KEY_FILE
 

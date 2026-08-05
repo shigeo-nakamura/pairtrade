@@ -24,7 +24,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// approval_public_key is deliberately NOT a field on this struct. It used
+// to be, but that made it part of the exact payload the executor itself
+// controls and includes in the approval digest: a host that can write
+// CONFIG_YAML (the normal, routine deploy path for the rest of this
+// config) could generate its own Ed25519 keypair, put the public half
+// here, compute the resulting digest, sign it with the matching private
+// key it also holds, and `execute` would accept that self-issued
+// "approval" -- completely defeating the point of requiring a signature
+// (Codex P1 follow-up, pairtrade#181, refining the initial signed-approval
+// design). The trust anchor now comes from the ARCUS_APPROVAL_PUBLIC_KEY
+// environment variable instead, provisioned via a systemd drop-in kept
+// separate from the routine config/plan deploy path (see
+// docs/arcus-spot-runtime.md), and is never part of the signed payload.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArcusSpotExecuteOnceConfig {
     router: ArcusSpotConfig,
     chain: ArcusSpotChainConfig,
@@ -33,14 +47,15 @@ struct ArcusSpotExecuteOnceConfig {
     ledger_path: PathBuf,
     runtime: ArcusSpotRuntimeConfig,
     runtime_state_path: PathBuf,
-    /// Hex-encoded Ed25519 public key. The matching private key must never
-    /// exist on this host: it is held only by whoever runs `sign-approval`
-    /// on a separate, offline machine. Without this asymmetry, an
-    /// "approval" is just a value the executor could compute and supply to
-    /// itself -- a SHA-256 digest alone proved nothing about a human's
-    /// consent, since the same binary that executes also exposes `hash`
-    /// (Codex P1 follow-up, pairtrade#181).
-    approval_public_key: String,
+}
+
+const APPROVAL_PUBLIC_KEY_ENV: &str = "ARCUS_APPROVAL_PUBLIC_KEY";
+
+fn approval_public_key_from_env() -> Result<VerifyingKey> {
+    let raw = env::var(APPROVAL_PUBLIC_KEY_ENV).with_context(|| {
+        format!("{APPROVAL_PUBLIC_KEY_ENV} must be set (outside any config/plan file)")
+    })?;
+    parse_approval_public_key(&raw)
 }
 
 #[derive(Serialize)]
@@ -83,8 +98,9 @@ fn usage() -> &'static str {
 
 keygen/sign-approval are meant to run on a separate, offline machine: the
 resulting private key file must never be copied to the host that runs
-execute/resume. Embed keygen's printed public key in each config's
-approval_public_key."
+execute/resume. execute/resume require keygen's printed public key in the
+ARCUS_APPROVAL_PUBLIC_KEY environment variable -- never in CONFIG_YAML,
+which that same host routinely writes/deploys."
 }
 
 fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
@@ -116,7 +132,6 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     if kms_address != executor_taker {
         bail!("Arcus KMS expected_address must match executor taker");
     }
-    parse_approval_public_key(&config.approval_public_key)?;
     Ok(())
 }
 
@@ -294,32 +309,30 @@ fn load_config_and_plan(
 }
 
 /// Verify `approval_signature_hex` is a genuine Ed25519 signature, under
-/// `config.approval_public_key`, over the canonical config+plan digest --
-/// then return that digest for the caller to bind into the execution
-/// ledger. Unlike comparing the digest directly against a caller-supplied
-/// copy of itself, this cannot be satisfied by anything the executor could
-/// compute on its own: only whoever holds the matching private key (never
-/// present on this host) can produce a valid signature.
+/// `approval_public_key` (sourced from `ARCUS_APPROVAL_PUBLIC_KEY`, never
+/// from the config/plan files this digest itself covers -- see the comment
+/// on `ArcusSpotExecuteOnceConfig`), over the canonical config+plan digest.
+/// Returns that digest for the caller to bind into the execution ledger.
+/// Unlike comparing the digest directly against a caller-supplied copy of
+/// itself, this cannot be satisfied by anything the executor could compute
+/// on its own: only whoever holds the matching private key (never present
+/// on this host) can produce a valid signature.
 fn require_approval_signature(
     config: &ArcusSpotExecuteOnceConfig,
     plan: &ArcusSpotRotationPlan,
+    approval_public_key: &VerifyingKey,
     approval_signature_hex: &str,
 ) -> Result<String> {
     let computed_digest = approval_digest(config, plan)?;
-    verify_approval_signature(
-        &computed_digest,
-        &config.approval_public_key,
-        approval_signature_hex,
-    )?;
+    verify_approval_signature(&computed_digest, approval_public_key, approval_signature_hex)?;
     Ok(computed_digest)
 }
 
 fn verify_approval_signature(
     digest: &str,
-    approval_public_key_hex: &str,
+    public_key: &VerifyingKey,
     approval_signature_hex: &str,
 ) -> Result<()> {
-    let public_key = parse_approval_public_key(approval_public_key_hex)?;
     let signature_bytes = hex::decode(approval_signature_hex.trim())
         .context("approval signature must be hex-encoded")?;
     let signature_bytes: [u8; SIGNATURE_LENGTH] = signature_bytes
@@ -375,7 +388,9 @@ async fn main() -> Result<()> {
         [command, config_path, plan_path, approval_signature] if command == "execute" => {
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
-            let plan_config_digest = require_approval_signature(&config, &plan, approval_signature)?;
+            let approval_public_key = approval_public_key_from_env()?;
+            let plan_config_digest =
+                require_approval_signature(&config, &plan, &approval_public_key, approval_signature)?;
             // executor_from_config acquires the exclusive ledger lock
             // (inside ArcusSpotLiveExecutor::new); the runtime-checkpoint
             // consistency check must happen only *after* that, and must
@@ -412,7 +427,9 @@ async fn main() -> Result<()> {
         [command, config_path, plan_path, approval_signature] if command == "resume" => {
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
-            let plan_config_digest = require_approval_signature(&config, &plan, approval_signature)?;
+            let approval_public_key = approval_public_key_from_env()?;
+            let plan_config_digest =
+                require_approval_signature(&config, &plan, &approval_public_key, approval_signature)?;
             let mut executor = executor_from_config(&config).await?;
             let attempt = executor.resume_status_and_reconcile().await?;
             let attempt = finalize_reconciled_attempt(
@@ -517,44 +534,61 @@ cumulative_loss_limit_usd: "10"
     #[test]
     fn genuine_approval_signature_verifies() {
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
-        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
         let digest = "sha256:abc123";
         let signature_hex = hex::encode(signing_key.sign(digest.as_bytes()).to_bytes());
 
-        verify_approval_signature(digest, &public_key_hex, &signature_hex).unwrap();
+        verify_approval_signature(digest, &signing_key.verifying_key(), &signature_hex).unwrap();
     }
 
     #[test]
     fn approval_signature_from_a_different_key_is_rejected() {
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let other_key = SigningKey::generate(&mut rand::rngs::OsRng);
-        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
         let digest = "sha256:abc123";
-        // Signed by a different key than the one embedded in the config --
-        // exactly what an executor without the real private key would be
-        // stuck with if it tried to mint its own "approval".
+        // Signed by a different key than the trusted one -- exactly what
+        // a host without the real private key would be stuck with if it
+        // tried to mint its own "approval".
         let signature_hex = hex::encode(other_key.sign(digest.as_bytes()).to_bytes());
 
-        assert!(verify_approval_signature(digest, &public_key_hex, &signature_hex).is_err());
+        assert!(
+            verify_approval_signature(digest, &signing_key.verifying_key(), &signature_hex)
+                .is_err()
+        );
     }
 
     #[test]
     fn approval_signature_over_a_different_digest_is_rejected() {
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
-        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
         let signed_digest = "sha256:abc123";
         let presented_digest = "sha256:def456";
         let signature_hex = hex::encode(signing_key.sign(signed_digest.as_bytes()).to_bytes());
 
-        assert!(
-            verify_approval_signature(presented_digest, &public_key_hex, &signature_hex)
-                .is_err()
-        );
+        assert!(verify_approval_signature(
+            presented_digest,
+            &signing_key.verifying_key(),
+            &signature_hex
+        )
+        .is_err());
     }
 
     #[test]
     fn malformed_approval_public_key_is_rejected() {
         assert!(parse_approval_public_key("not-hex").is_err());
         assert!(parse_approval_public_key("aabbcc").is_err());
+    }
+
+    #[test]
+    fn approval_public_key_is_not_a_field_of_the_executed_config() {
+        // The whole point of the fix: config/plan files (the routine,
+        // automatable deploy path) cannot carry or influence the trust
+        // anchor at all -- there is no field for it to occupy.
+        let value = serde_json::to_value(&json!({
+            "router": {}, "chain": {}, "kms": {}, "executor": {},
+            "ledger_path": "/tmp/x", "runtime": {}, "runtime_state_path": "/tmp/y",
+            "approval_public_key": "ff".repeat(32),
+        }))
+        .unwrap();
+        let error = serde_json::from_value::<ArcusSpotExecuteOnceConfig>(value).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 }
