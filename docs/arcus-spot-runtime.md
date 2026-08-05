@@ -47,8 +47,11 @@ With `arcus-spot-live`, the library provides:
 - a library coordinator that connects fresh quote, chain preflight, signing,
   one-shot submit, status polling, and balance reconciliation;
 - a feature-gated one-shot CLI that requires a mode-0600 config, a mode-0600
-  fresh plan, and the exact canonical SHA-256 digest of the validated config
-  and plan on every invocation;
+  fresh plan, and an Ed25519 signature -- over the canonical SHA-256 digest
+  of the validated config and plan, verified against a public key embedded
+  in config -- on every invocation; the matching private key must never
+  exist on this host, so the CLI can request approval but cannot mint it
+  itself;
 - hard coordinator caps of at most 60-second-old plans, 100 bps slippage, ten
   reconciled swaps per UTC day, and deployer-pinned raw sell maxima;
 - exactly one submit attempt, sticky `UNKNOWN` on ambiguous delivery, safe
@@ -59,10 +62,10 @@ With `arcus-spot-live`, the library provides:
 The components intentionally do not form an enabled daemon. The one-shot CLI
 is never invoked or scheduled automatically: its hash mode is non-signing, and
 its execute and resume modes refuse a changed config or plan because the
-separately supplied canonical digest no longer matches. No KMS key is
-created, no wallet is funded, and no message or transaction is signed by
-adding this feature. The first real signature remains blocked on the exact
-one-swap approval in bot-strategy #772.
+supplied Ed25519 signature no longer verifies against the recomputed
+canonical digest. No KMS key is created, no wallet is funded, and no message
+or transaction is signed by adding this feature. The first real signature
+remains blocked on the exact one-swap approval in bot-strategy #772.
 
 Validate the gated foundation without network or wallet access:
 
@@ -70,14 +73,21 @@ Validate the gated foundation without network or wallet access:
     cargo test --no-default-features --features arcus-spot-live \
       --bin arcus-spot-execute-once
 
-For a future explicitly approved probe, first compute the digest from a
-mode-0600 validated config plus a mode-0600 fresh plan and obtain approval
-for that exact execution envelope. Only then may the same digest be supplied
+For a future explicitly approved probe: generate an approval keypair once, on
+a machine that will never run `execute`/`resume` (the private key file must
+never be copied to that host), and embed the printed public key in every
+config's `approval_public_key`:
+
+    arcus-spot-execute-once keygen APPROVAL_KEY_FILE
+
+Then, for each execution envelope: compute its digest, sign that digest
+*offline* with the private key, and only then supply the resulting signature
 to execute:
 
     arcus-spot-execute-once hash CONFIG_YAML PLAN_JSON
-    arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SHA256
-    arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SHA256
+    arcus-spot-execute-once sign-approval DIGEST APPROVAL_KEY_FILE
+    arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
+    arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
 
 ## Deterministic replay
 
