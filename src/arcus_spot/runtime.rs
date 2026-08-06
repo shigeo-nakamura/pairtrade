@@ -1993,6 +1993,13 @@ pub(crate) fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal
 /// `live_executor::require_raw_matches_decimal_quantity` to cross-check a
 /// plan's raw and decimal amounts against each other before dispatch
 /// (Codex P1 follow-up, pairtrade#181).
+///
+/// Rejects a quantity that is not exactly representable at `decimals`
+/// instead of rounding it: silently truncating (e.g. quantity `1.9` at
+/// `decimals=0`) would let a raw amount that discards the fractional part
+/// pass the cross-check it exists to enforce, corrupting inventory by the
+/// truncated amount once the wallet actually sells the raw units (Codex P1
+/// follow-up, pairtrade#181).
 pub(crate) fn quantity_to_raw_amount(quantity: Decimal, decimals: u32) -> Result<String, String> {
     if quantity < Decimal::ZERO {
         return Err(format!("quantity {quantity} must be non-negative"));
@@ -2005,8 +2012,13 @@ pub(crate) fn quantity_to_raw_amount(quantity: Decimal, decimals: u32) -> Result
     })?;
     let raw = quantity
         .checked_mul(scale)
-        .map(|value| value.round_dp_with_strategy(0, RoundingStrategy::ToZero))
         .ok_or_else(|| format!("quantity {quantity} exceeds the replay Decimal range"))?;
+    if raw.fract() != Decimal::ZERO {
+        return Err(format!(
+            "quantity {quantity} is not exactly representable at {decimals} decimals \
+             (scaled value {raw} has a fractional raw unit)"
+        ));
+    }
     Ok(raw.trunc().to_string())
 }
 
@@ -2504,6 +2516,15 @@ mod tests {
         );
         assert_eq!(quantity_to_raw_amount(Decimal::ZERO, 6).unwrap(), "0");
         assert!(quantity_to_raw_amount(Decimal::from(-1), 6).is_err());
+    }
+
+    #[test]
+    fn quantity_to_raw_amount_rejects_a_fractional_raw_unit() {
+        let error = quantity_to_raw_amount(Decimal::from_str("1.9").unwrap(), 0).unwrap_err();
+        assert!(
+            error.contains("not exactly representable"),
+            "unexpected error: {error}"
+        );
     }
 
     fn round_trip_row(

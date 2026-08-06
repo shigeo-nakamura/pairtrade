@@ -850,6 +850,20 @@ mod tests {
     }
 
     #[test]
+    fn a_truncated_raw_amount_for_a_fractional_quantity_is_rejected() {
+        // At decimals=0, quantity 1.9 has no exact raw representation; a raw
+        // amount of "1" is the truncation Codex flagged, not a legitimate
+        // match, and must be rejected rather than silently accepted.
+        assert!(require_raw_matches_decimal_quantity(
+            "sell",
+            "1",
+            Decimal::from_str("1.9").unwrap(),
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
     fn fresh_quote_token_addresses_matching_the_plan_are_accepted() {
         let plan = plan_with_buy_amount("1000");
         require_fresh_quote_token_addresses_match_plan(
