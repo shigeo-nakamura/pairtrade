@@ -318,12 +318,44 @@ impl ArcusSpotRuntime {
     /// leftover approved plan file) leaves the wallet already swapped with
     /// nowhere for the fill to go. Calling this first lets a caller refuse
     /// before dispatch instead (Codex P1 follow-up, pairtrade#181).
+    ///
+    /// Regime/trigger/direction agreement alone is not sufficient: a plan
+    /// can still describe a swap `apply_confirmed_live_fill` would later
+    /// reject outright (Codex P1 follow-up). Two further invariants that
+    /// commit path already enforces are checked here too, before dispatch
+    /// rather than after:
+    /// - an exit plan must not sell more than the remaining tracked open
+    ///   quantity from a prior partial exit;
+    /// - an entry plan must not be dispatched while a sticky risk halt is
+    ///   engaged, matching the planning path's own hard block.
     #[cfg(feature = "arcus-spot-live")]
     pub fn validate_plan_consistent_with_state(
         &self,
         plan: &ArcusSpotRotationPlan,
     ) -> Result<(), String> {
-        require_fill_consistent_with_regime(self.state.regime, plan.trigger, plan.direction)
+        require_fill_consistent_with_regime(self.state.regime, plan.trigger, plan.direction)?;
+        match plan.trigger {
+            ArcusSpotRotationTrigger::EntrySignal => {
+                if let Some(halt) = &self.state.risk_halt {
+                    return Err(format!(
+                        "cannot dispatch an entry plan while the risk halt is active: {halt:?}"
+                    ));
+                }
+            }
+            ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit => {
+                let open = self
+                    .state
+                    .rotated_quantity
+                    .ok_or("rotated regime has no tracked open quantity")?;
+                if plan.sell_quantity > open {
+                    return Err(format!(
+                        "plan sell_quantity {} exceeds the remaining rotated quantity {open}",
+                        plan.sell_quantity
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "arcus-spot-live")]
@@ -3725,6 +3757,54 @@ mod tests {
         assert!(runtime
             .validate_plan_consistent_with_state(&stale_entry_plan)
             .is_err());
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn exit_plan_larger_than_the_remaining_rotated_quantity_is_rejected_before_dispatch() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(60, 3));
+        runtime.state.last_rotation_at =
+            Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
+        let snapshot = snapshot_with_valid_row(event_time());
+        let event = runtime.step_at(&snapshot, event_time());
+        let plan = match event.decision {
+            ArcusSpotDecision::WouldRotate { plan } => plan,
+            other => panic!("expected a partial max-hold exit, got {other:?}"),
+        };
+        // Commit that partial exit, leaving less open than this same
+        // approved plan's own sell_quantity -- re-dispatching it (e.g. a
+        // leftover approval file, or a second in-flight approval racing the
+        // first) must now be refused rather than overselling the remaining
+        // rotated position.
+        runtime
+            .apply_confirmed_live_fill(&plan, plan.sell_quantity, plan.buy_quantity, event_time())
+            .unwrap();
+        assert!(runtime.validate_plan_consistent_with_state(&plan).is_err());
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn entry_plan_is_rejected_before_dispatch_while_the_risk_halt_is_active() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        runtime.update_risk_baselines(event_time(), Decimal::from(300));
+        let mark = runtime.risk_mark(Decimal::from(297));
+        runtime.engage_risk_halt(event_time(), mark);
+        assert!(runtime.validate_plan_consistent_with_state(&plan).is_err());
     }
 
     #[cfg(feature = "arcus-spot-live")]
