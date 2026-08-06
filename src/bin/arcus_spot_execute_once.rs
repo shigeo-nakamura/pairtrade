@@ -200,6 +200,11 @@ async fn executor_from_config(
         .context("invalid Arcus chain configuration")?;
     let signer = build_arcus_spot_kms_signer(&config.kms).await?;
     let store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    // Lock on runtime_state_path, not ledger_path: the runtime checkpoint is
+    // the single shared source of truth two racing invocations could
+    // otherwise both dispatch against, while ledger_path is only where this
+    // particular invocation happens to persist its own attempt history
+    // (Codex P1 follow-up, pairtrade#181).
     ArcusSpotLiveExecutor::new(
         config.executor.clone(),
         config.runtime.pair.clone(),
@@ -207,6 +212,7 @@ async fn executor_from_config(
         chain,
         signer,
         store,
+        &config.runtime_state_path,
     )
 }
 

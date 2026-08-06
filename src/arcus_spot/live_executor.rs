@@ -16,7 +16,7 @@ use ethers::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt::Display, str::FromStr};
+use std::{collections::BTreeMap, fmt::Display, path::Path, str::FromStr};
 
 const ARCUS_VENUE: &str = "arcus";
 const CANONICAL_PERMIT2: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
@@ -104,6 +104,7 @@ where
         chain: ArcusSpotChainClient,
         signer: S,
         store: ArcusSpotExecutionLedgerStore,
+        lock_namespace: &Path,
     ) -> Result<Self> {
         let (taker, _) = config.validate()?;
         if pair.sell_symbol.eq_ignore_ascii_case(&pair.buy_symbol) {
@@ -120,7 +121,7 @@ where
                 signer.address()
             );
         }
-        let ledger_lock = store.acquire_exclusive_lock()?;
+        let ledger_lock = store.acquire_exclusive_lock(lock_namespace)?;
         let ledger = store.load_or_create(Utc::now())?;
         Ok(Self {
             config,
@@ -449,10 +450,22 @@ where
         if plan.sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
             bail!("reconciled Arcus runtime quantities must be positive");
         }
+        // `updated_at` is bumped on every status transition, including a
+        // `resume` that reconciles long after the swap actually confirmed
+        // on-chain -- using it here would make the runtime's
+        // `last_rotation_at` (and therefore `max_hold_secs`) start counting
+        // from whenever resume happened to run instead of from the real
+        // fill, letting a rotated position sit open arbitrarily longer than
+        // configured. `dispatched_at` is set once, at submission, and never
+        // overwritten afterward, so it is the right (conservative) fill
+        // time to report (Codex P1 follow-up, pairtrade#181).
+        let filled_at = active
+            .dispatched_at
+            .context("reconciled Arcus attempt is missing its dispatch time")?;
         Ok(ArcusSpotReconciledRuntimeFill {
             actual_sell_quantity: plan.sell_quantity,
             actual_buy_quantity,
-            reconciled_at: active.updated_at,
+            reconciled_at: filled_at,
             idempotency_key: active.idempotency_key,
         })
     }

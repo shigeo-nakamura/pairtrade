@@ -526,20 +526,32 @@ impl ArcusSpotExecutionLedgerStore {
         &self.path
     }
 
-    /// Claim the ledger for one executor process. The separate lock inode is
-    /// stable even though ledger persistence atomically renames the JSON file.
-    pub fn acquire_exclusive_lock(&self) -> Result<ArcusSpotExecutionLedgerLock> {
-        let parent = self
-            .path
+    /// Claim the ledger for one executor process, keyed by `lock_namespace`
+    /// rather than this store's own `path`.
+    ///
+    /// `path` (the ledger JSON location) is a per-deployment operator
+    /// setting; two configs that share the same wallet/runtime checkpoint
+    /// but were independently given different `ledger_path` values would
+    /// otherwise take out two unrelated locks, both succeed, and dispatch
+    /// concurrently against the same on-chain state -- their checkpoint
+    /// renames could then overwrite one fill with the other, and the
+    /// separate ledger histories would also bypass the daily cap (Codex P1
+    /// follow-up, pairtrade#181). The caller must pass a namespace that
+    /// genuinely identifies the shared state being protected, e.g. the
+    /// runtime checkpoint path.
+    pub fn acquire_exclusive_lock(
+        &self,
+        lock_namespace: &Path,
+    ) -> Result<ArcusSpotExecutionLedgerLock> {
+        let parent = lock_namespace
             .parent()
-            .context("Arcus execution ledger path has no parent")?;
+            .context("Arcus execution lock namespace has no parent")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
-        let file_name = self
-            .path
+        let file_name = lock_namespace
             .file_name()
             .and_then(|name| name.to_str())
-            .context("Arcus execution ledger path has no valid file name")?;
+            .context("Arcus execution lock namespace has no valid file name")?;
         let lock_path = parent.join(format!(".{file_name}.lock"));
         let file = OpenOptions::new()
             .create(true)
@@ -880,22 +892,42 @@ mod tests {
     fn store_lock_serializes_executor_processes() {
         let dir = tempdir().unwrap();
         let store = ArcusSpotExecutionLedgerStore::new(dir.path().join("ledger.json"));
-        let first = store.acquire_exclusive_lock().unwrap();
+        let namespace = dir.path().join("runtime-state.json");
+        let first = store.acquire_exclusive_lock(&namespace).unwrap();
 
-        let error = store.acquire_exclusive_lock().err().unwrap();
+        let error = store.acquire_exclusive_lock(&namespace).err().unwrap();
         assert!(error
             .to_string()
             .contains("another Arcus executor already holds"));
         drop(first);
 
-        let second = store.acquire_exclusive_lock().unwrap();
-        let mode = fs::metadata(dir.path().join(".ledger.json.lock"))
+        let second = store.acquire_exclusive_lock(&namespace).unwrap();
+        let mode = fs::metadata(dir.path().join(".runtime-state.json.lock"))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
         drop(second);
+    }
+
+    #[test]
+    fn two_stores_with_different_ledger_paths_still_conflict_on_a_shared_lock_namespace() {
+        // Two configs can legitimately (or through misconfiguration) point
+        // at different ledger_path values while sharing the same wallet and
+        // runtime checkpoint; both must still be refused a concurrent lock,
+        // since the ledger_path itself proves nothing about which on-chain
+        // state is being protected (Codex P1 follow-up, pairtrade#181).
+        let dir = tempdir().unwrap();
+        let namespace = dir.path().join("runtime-state.json");
+        let store_a = ArcusSpotExecutionLedgerStore::new(dir.path().join("ledger-a.json"));
+        let store_b = ArcusSpotExecutionLedgerStore::new(dir.path().join("ledger-b.json"));
+        let first = store_a.acquire_exclusive_lock(&namespace).unwrap();
+        let error = store_b.acquire_exclusive_lock(&namespace).err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("another Arcus executor already holds"));
+        drop(first);
     }
 
     #[test]
