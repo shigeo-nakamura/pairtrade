@@ -22,6 +22,7 @@ once_cell = "1.19"
 rand = { version = "0.8", features = ["std", "std_rng"] }
 bincode = "1.3"
 libc = "0.2"
+fs2 = "0.4"
 # Optional S3 mirror for the status writer (bot-strategy#343). Engaged only
 # when STATUS_S3_BUCKET / STATUS_S3_KEY_PREFIX env vars are set; without
 # them the writer stays local-only and the SDK is dead code at runtime.
@@ -39,7 +40,18 @@ prometheus = { version = "0.13", default-features = false }
 # (deploy ≠ restart) is detectable within minutes. Already in the tree
 # transitively; this only promotes it to a direct dep.
 sha2 = "0.10"
-
+ethers = { version = "2.0.14", default-features = false, features = ["abigen", "eip712", "rustls"], optional = true }
+rusoto_core = { version = "0.48", optional = true }
+rusoto_kms = { version = "0.48", optional = true }
+k256 = { version = "0.13.3", optional = true }
+spki = { version = "0.7.2", optional = true }
+thiserror = { version = "1", optional = true }
+url = { version = "2", optional = true }
+# Verifies the offline-signed one-swap approval (bot-strategy#772,
+# pairtrade#181): the execute/resume CLI holds only the Ed25519 public key,
+# never the signing key, so it cannot mint its own approval.
+ed25519-dalek = { version = "2.2", optional = true }
+hex = { version = "0.4", optional = true }
 debot-utils = "1.0.*"
 
 dex-connector = { path = "../dex-connector", default-features = false }
@@ -55,6 +67,19 @@ lighter-sdk = ["dex-connector/lighter-sdk"]
 extended-sdk = ["dex-connector/extended-sdk"]
 arcus-sdk = ["dex-connector/arcus-sdk"]
 arcus-spot-sdk = ["dex-connector/arcus-spot-sdk"]
+arcus-spot-live = [
+    "arcus-spot-sdk",
+    "dex-connector/arcus-spot-execution",
+    "dep:ethers",
+    "dep:rusoto_core",
+    "dep:rusoto_kms",
+    "dep:k256",
+    "dep:spki",
+    "dep:thiserror",
+    "dep:url",
+    "dep:ed25519-dalek",
+    "dep:hex",
+]
 hyperliquid-sdk = ["dex-connector/hyperliquid-sdk"]
 
 [[bin]]
@@ -69,3 +94,8 @@ path = "src/bin/convert_data.rs"
 name = "arcus-spot-runtime"
 path = "src/bin/arcus_spot_runtime.rs"
 required-features = ["arcus-spot-sdk"]
+
+[[bin]]
+name = "arcus-spot-execute-once"
+path = "src/bin/arcus_spot_execute_once.rs"
+required-features = ["arcus-spot-live"]

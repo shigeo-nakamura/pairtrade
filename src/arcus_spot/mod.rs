@@ -5,10 +5,26 @@
 //! dex-connector and can either emit read-only plans or apply those plans to
 //! an isolated replay inventory.
 
+#[cfg(feature = "arcus-spot-live")]
+mod chain;
 mod config;
+#[cfg(feature = "arcus-spot-live")]
+mod execution_ledger;
+#[cfg(feature = "arcus-spot-live")]
+mod kms;
+#[cfg(feature = "arcus-spot-live")]
+mod live_executor;
 mod replay;
 mod runtime;
 
+#[cfg(feature = "arcus-spot-live")]
+pub use chain::*;
 pub use config::*;
+#[cfg(feature = "arcus-spot-live")]
+pub use execution_ledger::*;
+#[cfg(feature = "arcus-spot-live")]
+pub use kms::*;
+#[cfg(feature = "arcus-spot-live")]
+pub use live_executor::*;
 pub use replay::*;
 pub use runtime::*;
