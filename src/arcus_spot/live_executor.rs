@@ -215,6 +215,11 @@ where
             plan.buy_quantity,
             observation.buy_token.decimals,
         )?;
+        require_fresh_quote_token_addresses_match_plan(
+            plan,
+            &observation.sell_token.address,
+            &observation.buy_token.address,
+        )?;
         let minimum_buy = quote.minimum_received()?;
         require_fresh_quote_matches_approved_plan(plan, minimum_buy, self.config.slippage_bps)?;
         let deadline = quote.expires_at()?;
@@ -276,8 +281,19 @@ where
         self.store
             .persist(&self.ledger)
             .context("failed to persist prepared Arcus execution")?;
-        self.validate_plan_age(plan)
-            .context("Arcus strategy plan expired before dispatch")?;
+        if let Err(error) = self.validate_plan_age(plan) {
+            // Explicitly reject the just-persisted Prepared attempt rather
+            // than leave it for the next invocation's restart recovery to
+            // mislabel as OperatorHold (Codex P2 follow-up, pairtrade#181).
+            self.ledger.cancel_prepared(
+                format!("plan expired before dispatch: {error:#}"),
+                Utc::now(),
+            )?;
+            self.store
+                .persist(&self.ledger)
+                .context("failed to persist Arcus prepared-attempt cancellation")?;
+            return Err(error).context("Arcus strategy plan expired before dispatch");
+        }
         self.ledger.mark_dispatching(Utc::now())?;
         self.store
             .persist(&self.ledger)
@@ -638,6 +654,36 @@ fn require_raw_matches_decimal_quantity(
     Ok(())
 }
 
+/// The approval digest covers the plan's symbols, not any token address --
+/// a symbol registry can, legitimately or through compromise/
+/// misconfiguration, resolve the same symbol to a different ERC-20
+/// contract by execution time than it did when this plan was built and
+/// approved. Without this check, preflight and signing would proceed
+/// against whatever the *fresh* quote resolves to, with nothing to compare
+/// it against, so the ledger and balance reconciliation could succeed
+/// against a replacement contract while runtime inventory still accounts
+/// for the originally intended pair (Codex P1 follow-up, pairtrade#181).
+fn require_fresh_quote_token_addresses_match_plan(
+    plan: &ArcusSpotRotationPlan,
+    fresh_sell_token_address: &str,
+    fresh_buy_token_address: &str,
+) -> Result<()> {
+    if !fresh_sell_token_address.eq_ignore_ascii_case(&plan.sell_token_address)
+        || !fresh_buy_token_address.eq_ignore_ascii_case(&plan.buy_token_address)
+    {
+        bail!(
+            "fresh Arcus quote resolved {}/{} to {}/{}, but the approved plan pinned {}/{}",
+            plan.sell_symbol,
+            plan.buy_symbol,
+            fresh_sell_token_address,
+            fresh_buy_token_address,
+            plan.sell_token_address,
+            plan.buy_token_address
+        );
+    }
+    Ok(())
+}
+
 /// Distinct symbols alone don't prove a plan's direction actually matches
 /// the runtime's configured pair: a plan claiming `TokenAToTokenB` while in
 /// fact selling the configured token B would otherwise pass, and
@@ -696,6 +742,8 @@ mod tests {
             trigger: crate::arcus_spot::ArcusSpotRotationTrigger::EntrySignal,
             sell_symbol: "NVDA".to_string(),
             buy_symbol: "AMD".to_string(),
+            sell_token_address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            buy_token_address: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string(),
             sell_quantity: rust_decimal::Decimal::ONE,
             buy_quantity: rust_decimal::Decimal::ONE,
             sell_amount_raw: "1000".to_string(),
@@ -788,5 +836,29 @@ mod tests {
         assert!(
             require_raw_matches_decimal_quantity("sell", "1000", Decimal::ONE, 18).is_err()
         );
+    }
+
+    #[test]
+    fn fresh_quote_token_addresses_matching_the_plan_are_accepted() {
+        let plan = plan_with_buy_amount("1000");
+        require_fresh_quote_token_addresses_match_plan(
+            &plan,
+            &plan.sell_token_address,
+            &plan.buy_token_address,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fresh_quote_token_address_drift_is_rejected() {
+        let plan = plan_with_buy_amount("1000");
+        // A registry that now resolves the approved sell symbol to a
+        // different contract than the one pinned on the approved plan.
+        assert!(require_fresh_quote_token_addresses_match_plan(
+            &plan,
+            "0x0000000000000000000000000000000000000099",
+            &plan.buy_token_address,
+        )
+        .is_err());
     }
 }

@@ -286,6 +286,30 @@ impl ArcusSpotExecutionLedger {
         Ok(())
     }
 
+    /// Explicitly reject a prepared (signed, not yet dispatched) attempt --
+    /// e.g. because the plan aged out between prepare and the immediately-
+    /// pre-dispatch recheck. Without this, an error returned at that point
+    /// leaves the just-persisted Prepared attempt untouched; the next
+    /// invocation's restart recovery would then reinterpret it as
+    /// OperatorHold ("restart found a prepared signed payload"), which is
+    /// both a misleading narrative (nothing crashed; we chose not to
+    /// dispatch) and a state neither `execute` nor `resume` know how to
+    /// move past, permanently blocking future swaps (Codex P2 follow-up,
+    /// pairtrade#181). Rejected -- like Unknown/OperatorHold -- still
+    /// requires an operator to look at it before a new plan can execute;
+    /// this only makes that review start from an honest description of
+    /// what happened.
+    pub fn cancel_prepared(&mut self, detail: impl Into<String>, now: DateTime<Utc>) -> Result<()> {
+        let active = self.active_mut()?;
+        if active.phase != ArcusSpotExecutionPhase::Prepared {
+            bail!("only a prepared Arcus attempt can be cancelled");
+        }
+        active.phase = ArcusSpotExecutionPhase::Rejected;
+        active.updated_at = now;
+        active.detail = Some(detail.into());
+        Ok(())
+    }
+
     pub fn record_submit_status(
         &mut self,
         status: &ArcusSpotSwapStatus,
@@ -674,6 +698,47 @@ mod tests {
         let mut value = intent();
         value.plan_config_digest = String::new();
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn cancel_prepared_rejects_without_dispatching() {
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.cancel_prepared("plan expired", now).unwrap();
+        let active = ledger.active.clone().unwrap();
+        assert_eq!(active.phase, ArcusSpotExecutionPhase::Rejected);
+        assert_eq!(active.detail.as_deref(), Some("plan expired"));
+        // Cancelling never dispatched, so a restart afterward must not
+        // reinterpret this as an interrupted in-flight submission.
+        assert!(!ledger.recover_after_restart(now));
+    }
+
+    #[test]
+    fn cancel_prepared_refuses_a_dispatching_attempt() {
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.mark_dispatching(now).unwrap();
+        assert!(ledger.cancel_prepared("too late", now).is_err());
     }
 
     #[test]

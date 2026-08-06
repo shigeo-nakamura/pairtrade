@@ -94,6 +94,15 @@ pub struct ArcusSpotRotationPlan {
     pub trigger: ArcusSpotRotationTrigger,
     pub sell_symbol: String,
     pub buy_symbol: String,
+    /// The ERC-20 contract addresses `sell_symbol`/`buy_symbol` resolved
+    /// to when this plan was built. A symbol registry can, legitimately
+    /// or through compromise/misconfiguration, resolve the same symbol to
+    /// a different contract by execution time; without pinning the
+    /// address the operator actually approved, execution would sign and
+    /// settle against whatever the *fresh* quote resolves to, with
+    /// nothing to compare it against (Codex P1 follow-up, pairtrade#181).
+    pub sell_token_address: String,
+    pub buy_token_address: String,
     pub sell_quantity: Decimal,
     pub buy_quantity: Decimal,
     pub sell_amount_raw: String,
@@ -1393,6 +1402,8 @@ impl ArcusSpotRuntime {
             trigger,
             sell_symbol: sell_token.symbol.clone(),
             buy_symbol: buy_token.symbol.clone(),
+            sell_token_address: sell_token.address.clone(),
+            buy_token_address: buy_token.address.clone(),
             sell_quantity,
             buy_quantity,
             sell_amount_raw,
