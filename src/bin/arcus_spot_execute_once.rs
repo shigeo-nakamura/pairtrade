@@ -20,7 +20,7 @@ use std::{
     env, fs,
     fs::{File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -33,10 +33,15 @@ use std::{
 // key it also holds, and `execute` would accept that self-issued
 // "approval" -- completely defeating the point of requiring a signature
 // (Codex P1 follow-up, pairtrade#181, refining the initial signed-approval
-// design). The trust anchor now comes from the ARCUS_APPROVAL_PUBLIC_KEY
-// environment variable instead, provisioned via a systemd drop-in kept
-// separate from the routine config/plan deploy path (see
-// docs/arcus-spot-runtime.md), and is never part of the signed payload.
+// design). An environment variable turned out to be no better: anything
+// invoking this binary directly controls its own process environment, so
+// the same "executor identity" that can run `execute` at all could set
+// its own value there too (Codex P1 follow-up, refining that fix again).
+// The trust anchor now comes from a fixed file path this process cannot
+// itself have written -- verified by ownership/permission bits the kernel
+// enforces regardless of how this binary is invoked, unlike an inherited
+// environment -- provisioned by an administrator (e.g. via SSM) separate
+// from the routine config/plan deploy path (see docs/arcus-spot-runtime.md).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArcusSpotExecuteOnceConfig {
@@ -49,13 +54,46 @@ struct ArcusSpotExecuteOnceConfig {
     runtime_state_path: PathBuf,
 }
 
-const APPROVAL_PUBLIC_KEY_ENV: &str = "ARCUS_APPROVAL_PUBLIC_KEY";
+const APPROVAL_PUBLIC_KEY_PATH: &str = "/etc/arcus-spot/approval_public_key";
 
-fn approval_public_key_from_env() -> Result<VerifyingKey> {
-    let raw = env::var(APPROVAL_PUBLIC_KEY_ENV).with_context(|| {
-        format!("{APPROVAL_PUBLIC_KEY_ENV} must be set (outside any config/plan file)")
+/// Read the trust anchor from a fixed, administrator-owned file this
+/// process cannot itself have written. A caller-controlled input (a
+/// config field, an inherited environment variable) can always be set to
+/// whatever the caller wants by definition -- only file ownership/mode,
+/// enforced by the kernel independent of how this binary was invoked,
+/// can prove the *current* process lacks write access to it.
+fn approval_public_key_from_admin_file() -> Result<VerifyingKey> {
+    approval_public_key_from_file(Path::new(APPROVAL_PUBLIC_KEY_PATH))
+}
+
+fn approval_public_key_from_file(path: &Path) -> Result<VerifyingKey> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!("failed to inspect approval public key file {}", path.display())
     })?;
-    parse_approval_public_key(&raw)
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "approval public key file {} must be a regular non-symlink file",
+            path.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        bail!(
+            "approval public key file {} must not be group- or other-writable",
+            path.display()
+        );
+    }
+    // SAFETY: geteuid() takes no arguments, performs no memory access, and
+    // cannot fail.
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() == current_uid {
+        bail!(
+            "approval public key file {} is owned by this process's own uid ({current_uid}) -- it must be administrator-owned, not writable by the identity running execute/resume",
+            path.display()
+        );
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read approval public key file {}", path.display()))?;
+    parse_approval_public_key(raw.trim())
 }
 
 #[derive(Serialize)]
@@ -98,9 +136,11 @@ fn usage() -> &'static str {
 
 keygen/sign-approval are meant to run on a separate, offline machine: the
 resulting private key file must never be copied to the host that runs
-execute/resume. execute/resume require keygen's printed public key in the
-ARCUS_APPROVAL_PUBLIC_KEY environment variable -- never in CONFIG_YAML,
-which that same host routinely writes/deploys."
+execute/resume. execute/resume require keygen's printed public key at
+/etc/arcus-spot/approval_public_key, deployed by an administrator and
+owned by a different uid than the one running this binary -- never in
+CONFIG_YAML or an inherited environment variable, either of which the
+executor identity itself could set."
 }
 
 fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
@@ -388,7 +428,7 @@ async fn main() -> Result<()> {
         [command, config_path, plan_path, approval_signature] if command == "execute" => {
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
-            let approval_public_key = approval_public_key_from_env()?;
+            let approval_public_key = approval_public_key_from_admin_file()?;
             let plan_config_digest =
                 require_approval_signature(&config, &plan, &approval_public_key, approval_signature)?;
             // executor_from_config acquires the exclusive ledger lock
@@ -427,7 +467,7 @@ async fn main() -> Result<()> {
         [command, config_path, plan_path, approval_signature] if command == "resume" => {
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
-            let approval_public_key = approval_public_key_from_env()?;
+            let approval_public_key = approval_public_key_from_admin_file()?;
             let plan_config_digest =
                 require_approval_signature(&config, &plan, &approval_public_key, approval_signature)?;
             let mut executor = executor_from_config(&config).await?;
@@ -575,6 +615,48 @@ cumulative_loss_limit_usd: "10"
     fn malformed_approval_public_key_is_rejected() {
         assert!(parse_approval_public_key("not-hex").is_err());
         assert!(parse_approval_public_key("aabbcc").is_err());
+    }
+
+    #[test]
+    fn approval_public_key_file_owned_by_this_process_is_rejected() {
+        // The exact scenario this file-based trust anchor exists to
+        // defend against: this test process is the only uid available to
+        // write the file with, so a file it owns is precisely what a
+        // compromised/self-approving executor identity would produce.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("approval_public_key");
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        fs::write(&path, hex::encode(signing_key.verifying_key().to_bytes())).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = approval_public_key_from_file(&path).unwrap_err();
+        assert!(error.to_string().contains("owned by this process's own uid"));
+    }
+
+    #[test]
+    fn approval_public_key_file_that_is_group_writable_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("approval_public_key");
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        fs::write(&path, hex::encode(signing_key.verifying_key().to_bytes())).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+
+        let error = approval_public_key_from_file(&path).unwrap_err();
+        assert!(error.to_string().contains("group- or other-writable"));
+    }
+
+    #[test]
+    fn approval_public_key_symlink_is_rejected() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real_key");
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        fs::write(&target, hex::encode(signing_key.verifying_key().to_bytes())).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("approval_public_key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = approval_public_key_from_file(&link).unwrap_err();
+        assert!(error.to_string().contains("non-symlink"));
     }
 
     #[test]

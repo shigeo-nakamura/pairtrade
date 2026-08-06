@@ -364,6 +364,17 @@ where
                 mutation?;
             }
             Some(ArcusSpotExecutionPhase::Confirmed) => {}
+            // reconcile_confirmed can durably persist Reconciled and then
+            // the process exits or errors before the caller's runtime
+            // commit + ledger archive finish. execute refuses to start a
+            // new plan while any attempt remains active, and this match
+            // previously refused to even return the existing Reconciled
+            // attempt, permanently blocking recovery -- even though
+            // finalize_reconciled_attempt's commit path
+            // (apply_confirmed_live_fill_once) is already idempotent by
+            // execution key and safe to invoke again (Codex P1
+            // follow-up, pairtrade#181).
+            Some(ArcusSpotExecutionPhase::Reconciled) => {}
             other => bail!("Arcus status resume is not allowed in phase {other:?}"),
         }
         if self.active_phase() == Some(ArcusSpotExecutionPhase::Confirmed) {

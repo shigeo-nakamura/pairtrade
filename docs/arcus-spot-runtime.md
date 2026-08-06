@@ -48,12 +48,13 @@ With `arcus-spot-live`, the library provides:
   one-shot submit, status polling, and balance reconciliation;
 - a feature-gated one-shot CLI that requires a mode-0600 config, a mode-0600
   fresh plan, and an Ed25519 signature -- over the canonical SHA-256 digest
-  of the validated config and plan, verified against a public key sourced
-  from `ARCUS_APPROVAL_PUBLIC_KEY` (never the config/plan files themselves,
-  so the same routine deploy path that writes them can't also redefine who
-  approves) -- on every invocation; the matching private key must never
-  exist on this host, so the CLI can request approval but cannot mint it
-  itself;
+  of the validated config and plan, verified against a public key read from
+  `/etc/arcus-spot/approval_public_key`, a fixed path this process must not
+  itself own or be able to write (checked via file ownership/mode, not an
+  inherited environment variable or a config/plan field either of which the
+  same identity running `execute` could set) -- on every invocation; the
+  matching private key must never exist on this host, so the CLI can
+  request approval but cannot mint it itself;
 - hard coordinator caps of at most 60-second-old plans, 100 bps slippage, ten
   reconciled swaps per UTC day, and deployer-pinned raw sell maxima;
 - exactly one submit attempt, sticky `UNKNOWN` on ambiguous delivery, safe
@@ -77,12 +78,14 @@ Validate the gated foundation without network or wallet access:
 
 For a future explicitly approved probe: generate an approval keypair once, on
 a machine that will never run `execute`/`resume` (the private key file must
-never be copied to that host), and set the printed public key as the
-`ARCUS_APPROVAL_PUBLIC_KEY` environment variable wherever `execute`/`resume`
-run (e.g. a systemd drop-in) -- deliberately *not* a field in `CONFIG_YAML`:
-a host that can write that routinely-deployed config could otherwise
-generate its own keypair, put its own public half there, and sign its own
-"approval" with the matching private key it also holds.
+never be copied to that host), and have an administrator deploy the printed
+public key to `/etc/arcus-spot/approval_public_key` on the `execute`/`resume`
+host, owned by a different uid than the one running this binary and not
+group- or other-writable -- deliberately *not* a field in `CONFIG_YAML` and
+*not* an inherited environment variable: a host that can write the
+routinely-deployed config, or that controls its own process environment,
+could otherwise generate its own keypair, put its own public half there, and
+sign its own "approval" with the matching private key it also holds.
 
     arcus-spot-execute-once keygen APPROVAL_KEY_FILE
 
