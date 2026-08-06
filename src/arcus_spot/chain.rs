@@ -23,7 +23,14 @@ abigen!(
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArcusSpotChainConfig {
-    pub rpc_url: String,
+    /// Tried in order on every call; a later entry is only used when every
+    /// earlier one fails at the transport level (connection/timeout/RPC
+    /// error), never as a substitute source of truth after a successful but
+    /// unexpected response -- a chain-id mismatch or business-rule failure
+    /// from the first reachable endpoint is reported as-is, not silently
+    /// retried against a different endpoint that might paper over a real
+    /// misconfiguration.
+    pub rpc_urls: Vec<String>,
     pub chain_id: u64,
     pub request_interval_ms: u64,
 }
@@ -36,12 +43,21 @@ impl ArcusSpotChainConfig {
         if self.request_interval_ms == 0 {
             bail!("Arcus request_interval_ms must be non-zero");
         }
-        let url = url::Url::parse(self.rpc_url.trim()).context("invalid Arcus RPC URL")?;
-        if !matches!(url.scheme(), "https" | "http") {
-            bail!("Arcus RPC URL must use http or https");
+        if self.rpc_urls.is_empty() {
+            bail!("Arcus rpc_urls must not be empty");
         }
-        if url.host_str().is_none() || url.username() != "" || url.password().is_some() {
-            bail!("Arcus RPC URL must have a host and no inline credentials");
+        let mut seen = std::collections::BTreeSet::new();
+        for rpc_url in &self.rpc_urls {
+            let url = url::Url::parse(rpc_url.trim()).context("invalid Arcus RPC URL")?;
+            if !matches!(url.scheme(), "https" | "http") {
+                bail!("Arcus RPC URL must use http or https");
+            }
+            if url.host_str().is_none() || url.username() != "" || url.password().is_some() {
+                bail!("Arcus RPC URL must have a host and no inline credentials");
+            }
+            if !seen.insert(rpc_url.trim().to_string()) {
+                bail!("Arcus rpc_urls contains a duplicate entry: {rpc_url}");
+            }
         }
         Ok(())
     }
@@ -115,23 +131,76 @@ pub struct ArcusSpotChainPreflight {
 #[derive(Clone)]
 pub struct ArcusSpotChainClient {
     config: ArcusSpotChainConfig,
-    provider: Arc<Provider<Http>>,
+    providers: Vec<Arc<Provider<Http>>>,
+}
+
+/// Raw, not-yet-validated results of one preflight round-trip against a
+/// single provider. Kept separate from `ArcusSpotChainPreflight` so a
+/// failed *business* check (chain-id mismatch, floor violation) on the
+/// first reachable provider is never silently retried against another --
+/// only a transport-level error triggers `try_providers` to move on.
+struct RawPreflightReads {
+    chain_id: U256,
+    sell_balance: U256,
+    buy_balance: U256,
+    gas_balance: U256,
+    allowance: U256,
+}
+
+struct RawBalanceReads {
+    chain_id: U256,
+    sell_balance: U256,
+    buy_balance: U256,
+    gas_balance: U256,
 }
 
 impl ArcusSpotChainClient {
     pub fn new(config: ArcusSpotChainConfig) -> Result<Self> {
         config.validate()?;
-        let provider = Provider::<Http>::try_from(config.rpc_url.trim())
-            .context("could not construct Arcus RPC provider")?
-            .interval(Duration::from_millis(config.request_interval_ms));
-        Ok(Self {
-            config,
-            provider: Arc::new(provider),
-        })
+        let providers = config
+            .rpc_urls
+            .iter()
+            .map(|rpc_url| {
+                Provider::<Http>::try_from(rpc_url.trim())
+                    .with_context(|| format!("could not construct Arcus RPC provider for {rpc_url}"))
+                    .map(|provider| {
+                        Arc::new(provider.interval(Duration::from_millis(config.request_interval_ms)))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { config, providers })
     }
 
     pub fn chain_id(&self) -> u64 {
         self.config.chain_id
+    }
+
+    /// Run `attempt` against each configured provider in order, returning
+    /// the first success together with the provider that produced it (so a
+    /// caller needing a follow-up read can stay on the same provider rather
+    /// than risking an inconsistent mix). Every attempt failing returns the
+    /// *last* provider's error -- earlier transport errors are still
+    /// visible in logs via `log::warn!`, but the caller only needs one
+    /// final cause.
+    async fn try_providers<T, F, Fut>(&self, attempt: F) -> Result<(T, Arc<Provider<Http>>)>
+    where
+        F: Fn(Arc<Provider<Http>>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut last_error = None;
+        for (index, provider) in self.providers.iter().enumerate() {
+            match attempt(provider.clone()).await {
+                Ok(value) => return Ok((value, provider.clone())),
+                Err(error) => {
+                    log::warn!(
+                        "[ARCUS_RPC] provider {index} ({}) failed: {error:#}",
+                        self.config.rpc_urls[index]
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Arcus rpc_urls is empty")))
     }
 
     pub async fn preflight(
@@ -139,23 +208,42 @@ impl ArcusSpotChainClient {
         request: &ArcusSpotChainPreflightRequest,
     ) -> Result<ArcusSpotChainPreflight> {
         let request_values = request.validate()?;
-        let sell_contract = ArcusSpotErc20::new(request_values.sell_token, self.provider.clone());
-        let buy_contract = ArcusSpotErc20::new(request_values.buy_token, self.provider.clone());
-        let sell_balance_call = sell_contract.balance_of(request_values.taker);
-        let buy_balance_call = buy_contract.balance_of(request_values.taker);
-        let allowance_call = sell_contract.allowance(request_values.taker, request_values.permit2);
-        let (chain_id, sell_balance, buy_balance, gas_balance, allowance) = tokio::join!(
-            self.provider.get_chainid(),
-            sell_balance_call.call(),
-            buy_balance_call.call(),
-            self.provider.get_balance(request_values.taker, None),
-            allowance_call.call(),
-        );
-        let chain_id = chain_id.context("Arcus chainId read failed")?;
-        let sell_balance = sell_balance.context("Arcus sell balance read failed")?;
-        let buy_balance = buy_balance.context("Arcus buy balance read failed")?;
-        let gas_balance = gas_balance.context("Arcus gas balance read failed")?;
-        let allowance = allowance.context("Arcus Permit2 allowance read failed")?;
+        let (raw, provider) = self
+            .try_providers(|provider| {
+                let sell_token = request_values.sell_token;
+                let buy_token = request_values.buy_token;
+                let taker = request_values.taker;
+                let permit2 = request_values.permit2;
+                async move {
+                    let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
+                    let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
+                    let sell_balance_call = sell_contract.balance_of(taker);
+                    let buy_balance_call = buy_contract.balance_of(taker);
+                    let allowance_call = sell_contract.allowance(taker, permit2);
+                    let (chain_id, sell_balance, buy_balance, gas_balance, allowance) = tokio::join!(
+                        provider.get_chainid(),
+                        sell_balance_call.call(),
+                        buy_balance_call.call(),
+                        provider.get_balance(taker, None),
+                        allowance_call.call(),
+                    );
+                    Ok(RawPreflightReads {
+                        chain_id: chain_id.context("Arcus chainId read failed")?,
+                        sell_balance: sell_balance.context("Arcus sell balance read failed")?,
+                        buy_balance: buy_balance.context("Arcus buy balance read failed")?,
+                        gas_balance: gas_balance.context("Arcus gas balance read failed")?,
+                        allowance: allowance.context("Arcus Permit2 allowance read failed")?,
+                    })
+                }
+            })
+            .await?;
+        let RawPreflightReads {
+            chain_id,
+            sell_balance,
+            buy_balance,
+            gas_balance,
+            allowance,
+        } = raw;
         if chain_id != U256::from(self.config.chain_id) {
             bail!(
                 "Arcus RPC chainId {chain_id} does not match configured {}",
@@ -173,6 +261,11 @@ impl ArcusSpotChainClient {
         let exact_value_permit = if allowance == request_values.required_sell {
             None
         } else {
+            // Stay on the exact provider that answered the reads above --
+            // mixing in a different one here for the nonce would risk a
+            // permit built against a nonce that doesn't match the balance
+            // state this preflight already validated.
+            let sell_contract = ArcusSpotErc20::new(request_values.sell_token, provider.clone());
             let token_name_call = sell_contract.name();
             let nonce_call = sell_contract.nonces(request_values.taker);
             let (token_name, nonce) = tokio::try_join!(token_name_call.call(), nonce_call.call(),)
@@ -224,20 +317,32 @@ impl ArcusSpotChainClient {
         {
             bail!("invalid Arcus balance request addresses");
         }
-        let sell_contract = ArcusSpotErc20::new(sell_token, self.provider.clone());
-        let buy_contract = ArcusSpotErc20::new(buy_token, self.provider.clone());
-        let sell_balance_call = sell_contract.balance_of(taker);
-        let buy_balance_call = buy_contract.balance_of(taker);
-        let (chain_id, sell_balance, buy_balance, gas_balance) = tokio::join!(
-            self.provider.get_chainid(),
-            sell_balance_call.call(),
-            buy_balance_call.call(),
-            self.provider.get_balance(taker, None),
-        );
-        let chain_id = chain_id.context("Arcus chainId read failed")?;
-        let sell_balance = sell_balance.context("Arcus sell balance read failed")?;
-        let buy_balance = buy_balance.context("Arcus buy balance read failed")?;
-        let gas_balance = gas_balance.context("Arcus gas balance read failed")?;
+        let (raw, _provider) = self
+            .try_providers(|provider| async move {
+                let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
+                let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
+                let sell_balance_call = sell_contract.balance_of(taker);
+                let buy_balance_call = buy_contract.balance_of(taker);
+                let (chain_id, sell_balance, buy_balance, gas_balance) = tokio::join!(
+                    provider.get_chainid(),
+                    sell_balance_call.call(),
+                    buy_balance_call.call(),
+                    provider.get_balance(taker, None),
+                );
+                Ok(RawBalanceReads {
+                    chain_id: chain_id.context("Arcus chainId read failed")?,
+                    sell_balance: sell_balance.context("Arcus sell balance read failed")?,
+                    buy_balance: buy_balance.context("Arcus buy balance read failed")?,
+                    gas_balance: gas_balance.context("Arcus gas balance read failed")?,
+                })
+            })
+            .await?;
+        let RawBalanceReads {
+            chain_id,
+            sell_balance,
+            buy_balance,
+            gas_balance,
+        } = raw;
         if chain_id != U256::from(self.config.chain_id) {
             bail!("Arcus RPC chainId changed during balance reconciliation");
         }
@@ -352,10 +457,105 @@ mod tests {
     #[test]
     fn rejects_inline_rpc_credentials() {
         let config = ArcusSpotChainConfig {
-            rpc_url: "https://user:secret@example.invalid".to_string(),
+            rpc_urls: vec!["https://user:secret@example.invalid".to_string()],
             chain_id: 4663,
             request_interval_ms: 100,
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_rpc_urls() {
+        let config = ArcusSpotChainConfig {
+            rpc_urls: vec![],
+            chain_id: 4663,
+            request_interval_ms: 100,
+        };
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
+    }
+
+    #[test]
+    fn rejects_duplicate_rpc_urls() {
+        let config = ArcusSpotChainConfig {
+            rpc_urls: vec![
+                "https://a.example.invalid".to_string(),
+                "https://a.example.invalid".to_string(),
+            ],
+            chain_id: 4663,
+            request_interval_ms: 100,
+        };
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn accepts_multiple_distinct_rpc_urls() {
+        let config = ArcusSpotChainConfig {
+            rpc_urls: vec![
+                "https://a.example.invalid".to_string(),
+                "https://b.example.invalid".to_string(),
+            ],
+            chain_id: 4663,
+            request_interval_ms: 100,
+        };
+        config.validate().unwrap();
+        let client = ArcusSpotChainClient::new(config).unwrap();
+        assert_eq!(client.providers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn try_providers_falls_back_after_an_earlier_provider_errors() {
+        let config = ArcusSpotChainConfig {
+            rpc_urls: vec![
+                "https://a.example.invalid".to_string(),
+                "https://b.example.invalid".to_string(),
+            ],
+            chain_id: 4663,
+            request_interval_ms: 100,
+        };
+        let client = ArcusSpotChainClient::new(config).unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = client
+            .try_providers(|_provider| {
+                let attempts = attempts.clone();
+                async move {
+                    let seen = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if seen == 0 {
+                        bail!("simulated transport failure on the first provider");
+                    }
+                    Ok(seen)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.0, 1, "expected the second provider's result");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn try_providers_returns_the_last_error_when_every_provider_fails() {
+        let config = ArcusSpotChainConfig {
+            rpc_urls: vec![
+                "https://a.example.invalid".to_string(),
+                "https://b.example.invalid".to_string(),
+            ],
+            chain_id: 4663,
+            request_interval_ms: 100,
+        };
+        let client = ArcusSpotChainClient::new(config).unwrap();
+        let error = client
+            .try_providers(|provider| async move {
+                Err::<(), _>(anyhow::anyhow!("down: {provider:?}"))
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("down"));
     }
 }
