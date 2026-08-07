@@ -538,9 +538,15 @@ where
         }
         let sell_token = parse_nonzero_address("sell token", &active.intent.sell_token)?;
         let buy_token = parse_nonzero_address("buy token", &active.intent.buy_token)?;
+        // Deliberately not the fallback-capable `balances()`: a secondary
+        // provider that hasn't yet indexed this specific confirmed swap
+        // would return the pre-swap balance as an apparently valid
+        // snapshot, and reconcile_balances would misread that as a
+        // genuine reconciliation failure and permanently mark the attempt
+        // Unknown (Codex P1 follow-up, pairtrade#182).
         let post = self
             .chain
-            .balances(taker, sell_token, buy_token)
+            .balances_requiring_primary_provider(taker, sell_token, buy_token)
             .await
             .context("Arcus post-submit balance read failed")?;
         let mutation = self.ledger.reconcile_balances(post, Utc::now());

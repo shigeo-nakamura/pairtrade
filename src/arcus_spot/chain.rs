@@ -171,6 +171,34 @@ impl From<anyhow::Error> for ProviderAttemptError {
     }
 }
 
+/// Result of one `ethers` contract call, split into the three shapes a
+/// caller needs to react to differently: succeeded; failed at the
+/// transport/RPC level (worth retrying against another provider); or
+/// failed with the provider having genuinely answered -- a revert or a
+/// decoding failure, meaning the contract itself doesn't behave as
+/// expected, which no other provider on the same chain would answer any
+/// differently.
+enum ContractCallOutcome<T> {
+    Ok(T),
+    Transport(anyhow::Error),
+    NonTransport(anyhow::Error),
+}
+
+fn classify_contract_call<T>(
+    result: std::result::Result<T, ethers::contract::ContractError<Provider<Http>>>,
+) -> ContractCallOutcome<T> {
+    match result {
+        Ok(value) => ContractCallOutcome::Ok(value),
+        Err(ethers::contract::ContractError::MiddlewareError { e }) => {
+            ContractCallOutcome::Transport(anyhow::Error::new(e))
+        }
+        Err(ethers::contract::ContractError::ProviderError { e }) => {
+            ContractCallOutcome::Transport(anyhow::Error::new(e))
+        }
+        Err(other) => ContractCallOutcome::NonTransport(anyhow::anyhow!(other)),
+    }
+}
+
 /// Strip everything but scheme/host/port before this URL can reach a log
 /// line -- RPC providers commonly embed an API token in the path or query
 /// string, and `ArcusSpotChainConfig::validate` only forbids inline
@@ -324,46 +352,68 @@ impl ArcusSpotChainClient {
                 } else {
                     let token_name_call = sell_contract.name();
                     let nonce_call = sell_contract.nonces(request_values.taker);
-                    let name_and_nonce: Result<(String, U256)> =
-                        tokio::try_join!(token_name_call.call(), nonce_call.call())
-                            .context("sell token does not expose the required EIP-2612 metadata");
-                    let (token_name, nonce) =
-                        name_and_nonce.map_err(ProviderAttemptError::Transient)?;
+                    // Concurrent, but each leg's error is classified on
+                    // its own: a reachable provider that simply doesn't
+                    // support one of these calls is a real, permanent
+                    // property of the token contract (Fatal -- a later
+                    // provider can't paper over it), while an actual
+                    // transport/RPC failure must stay Transient so
+                    // try_providers can retry the whole preflight on a
+                    // healthy endpoint (Codex P1/P2 follow-up,
+                    // pairtrade#182).
+                    let (name_result, nonce_result) =
+                        tokio::join!(token_name_call.call(), nonce_call.call());
+                    let token_name = match classify_contract_call(name_result) {
+                        ContractCallOutcome::Ok(name) => name,
+                        ContractCallOutcome::Transport(error) => {
+                            return Err(ProviderAttemptError::Transient(
+                                error.context("Arcus EIP-2612 name() read failed"),
+                            ));
+                        }
+                        ContractCallOutcome::NonTransport(error) => {
+                            return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                                "sell token does not support the required EIP-2612 name(): {error}"
+                            )));
+                        }
+                    };
+                    let nonce = match classify_contract_call(nonce_result) {
+                        ContractCallOutcome::Ok(nonce) => nonce,
+                        ContractCallOutcome::Transport(error) => {
+                            return Err(ProviderAttemptError::Transient(
+                                error.context("Arcus EIP-2612 nonces() read failed"),
+                            ));
+                        }
+                        ContractCallOutcome::NonTransport(error) => {
+                            return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                                "sell token does not support the required EIP-2612 nonces(): {error}"
+                            )));
+                        }
+                    };
                     // A reachable provider returning an empty name is
                     // invalid data from a working endpoint, not a sign it
-                    // is unreachable -- Fatal for the same reason the
-                    // floor/allowance checks above are, so a later
-                    // provider can't paper over it (Codex P1 follow-up,
-                    // pairtrade#182).
+                    // is unreachable -- Fatal for the same reason as above.
                     if token_name.trim().is_empty() {
                         return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
                             "sell token returned an empty EIP-2612 name"
                         )));
                     }
 
-                    // Only a confirmed non-transport response (the
-                    // contract reverted, or its return data didn't decode
-                    // as a string -- i.e. it simply doesn't implement
-                    // EIP-2612's optional version()) defaults to the
-                    // legacy "1". An actual transport/RPC failure must
-                    // stay Transient so try_providers can retry the whole
-                    // preflight on a healthy endpoint instead of silently
-                    // guessing a version that could build a permit the
-                    // token's real EIP-712 domain will reject (Codex P2
-                    // follow-up, pairtrade#182).
-                    let version_result: Result<String> = match sell_contract.version().call().await {
-                        Ok(version) => Ok(version),
-                        Err(ethers::contract::ContractError::MiddlewareError { e }) => {
-                            Err(anyhow::Error::new(e))
-                                .context("Arcus EIP-2612 version() read failed")
+                    // version() is different: only a confirmed
+                    // non-transport response (the contract reverted, or
+                    // its return data didn't decode -- i.e. it simply
+                    // doesn't implement EIP-2612's optional version())
+                    // defaults to the legacy "1", rather than being Fatal
+                    // like name()/nonces() above, since a missing
+                    // version() is a normal, spec-permitted token shape.
+                    let token_version = match classify_contract_call(sell_contract.version().call().await) {
+                        ContractCallOutcome::Ok(version) => version,
+                        ContractCallOutcome::Transport(error) => {
+                            return Err(ProviderAttemptError::Transient(
+                                error.context("Arcus EIP-2612 version() read failed"),
+                            ));
                         }
-                        Err(ethers::contract::ContractError::ProviderError { e }) => {
-                            Err(anyhow::Error::new(e))
-                                .context("Arcus EIP-2612 version() read failed")
-                        }
-                        Err(_) => Ok("1".to_string()),
+                        ContractCallOutcome::NonTransport(_) => "1".to_string(),
                     };
-                    let token_version = version_result.map_err(ProviderAttemptError::Transient)?;
                     if token_version.trim().is_empty() {
                         return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
                             "sell token returned an empty EIP-2612 version"
@@ -423,39 +473,10 @@ impl ArcusSpotChainClient {
         {
             bail!("invalid Arcus balance request addresses");
         }
+        let chain_id = self.config.chain_id;
         let (raw, _provider) = self
-            .try_providers(|provider| async move {
-                // Sequential and fatal-on-mismatch for the same reason as
-                // in `preflight`: a wrong-but-successfully-fetched chain id
-                // must never be masked by a sibling call's transport error
-                // inside the same tokio::join!.
-                let chain_id = provider
-                    .get_chainid()
-                    .await
-                    .context("Arcus chainId read failed")?;
-                if chain_id != U256::from(self.config.chain_id) {
-                    return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
-                        "Arcus RPC chainId changed during balance reconciliation"
-                    )));
-                }
-                let coherent: Result<RawBalanceReads> = async {
-                    let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
-                    let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
-                    let sell_balance_call = sell_contract.balance_of(taker);
-                    let buy_balance_call = buy_contract.balance_of(taker);
-                    let (sell_balance, buy_balance, gas_balance) = tokio::join!(
-                        sell_balance_call.call(),
-                        buy_balance_call.call(),
-                        provider.get_balance(taker, None),
-                    );
-                    Ok(RawBalanceReads {
-                        sell_balance: sell_balance.context("Arcus sell balance read failed")?,
-                        buy_balance: buy_balance.context("Arcus buy balance read failed")?,
-                        gas_balance: gas_balance.context("Arcus gas balance read failed")?,
-                    })
-                }
-                .await;
-                coherent.map_err(ProviderAttemptError::Transient)
+            .try_providers(|provider| {
+                read_balances_from_provider(provider, chain_id, taker, sell_token, buy_token)
             })
             .await?;
         let RawBalanceReads {
@@ -472,6 +493,95 @@ impl ArcusSpotChainClient {
             gas_balance,
         ))
     }
+
+    /// Like `balances`, but reads only the first configured provider and
+    /// never falls back to another one.
+    ///
+    /// Reconciling a just-confirmed swap needs proof that whichever
+    /// provider answered has actually observed *that* transaction --
+    /// falling back to a secondary provider that is merely reachable but
+    /// lagging behind the primary would return the pre-swap balance as an
+    /// apparently valid snapshot. `reconcile_balances` would then see a
+    /// zero/incorrect delta and treat it as a genuine reconciliation
+    /// failure, permanently marking the attempt sticky `Unknown` -- worse
+    /// than the pre-fallback behavior of a transport error simply leaving
+    /// it retryable. Until this can instead prove the answering provider
+    /// has indexed the confirmed transaction/block, refusing to fall back
+    /// at all is the safe choice here (Codex P1 follow-up, pairtrade#182).
+    pub async fn balances_requiring_primary_provider(
+        &self,
+        taker: Address,
+        sell_token: Address,
+        buy_token: Address,
+    ) -> Result<ArcusSpotBalanceSnapshot> {
+        if taker == Address::zero()
+            || sell_token == Address::zero()
+            || buy_token == Address::zero()
+            || sell_token == buy_token
+        {
+            bail!("invalid Arcus balance request addresses");
+        }
+        let provider = self
+            .providers
+            .first()
+            .context("Arcus rpc_urls is empty")?
+            .clone();
+        let raw = read_balances_from_provider(provider, self.config.chain_id, taker, sell_token, buy_token)
+            .await
+            .map_err(|error| match error {
+                ProviderAttemptError::Fatal(error) | ProviderAttemptError::Transient(error) => {
+                    error
+                }
+            })?;
+        Ok(balance_snapshot(
+            taker,
+            sell_token,
+            buy_token,
+            raw.sell_balance,
+            raw.buy_balance,
+            raw.gas_balance,
+        ))
+    }
+}
+
+async fn read_balances_from_provider(
+    provider: Arc<Provider<Http>>,
+    expected_chain_id: u64,
+    taker: Address,
+    sell_token: Address,
+    buy_token: Address,
+) -> Result<RawBalanceReads, ProviderAttemptError> {
+    // Sequential and fatal-on-mismatch for the same reason as in
+    // `preflight`: a wrong-but-successfully-fetched chain id must never be
+    // masked by a sibling call's transport error inside the same
+    // tokio::join!.
+    let chain_id = provider
+        .get_chainid()
+        .await
+        .context("Arcus chainId read failed")?;
+    if chain_id != U256::from(expected_chain_id) {
+        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+            "Arcus RPC chainId changed during balance reconciliation"
+        )));
+    }
+    let coherent: Result<RawBalanceReads> = async {
+        let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
+        let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
+        let sell_balance_call = sell_contract.balance_of(taker);
+        let buy_balance_call = buy_contract.balance_of(taker);
+        let (sell_balance, buy_balance, gas_balance) = tokio::join!(
+            sell_balance_call.call(),
+            buy_balance_call.call(),
+            provider.get_balance(taker, None),
+        );
+        Ok(RawBalanceReads {
+            sell_balance: sell_balance.context("Arcus sell balance read failed")?,
+            buy_balance: buy_balance.context("Arcus buy balance read failed")?,
+            gas_balance: gas_balance.context("Arcus gas balance read failed")?,
+        })
+    }
+    .await;
+    coherent.map_err(ProviderAttemptError::Transient)
 }
 
 fn enforce_balance_limits(
