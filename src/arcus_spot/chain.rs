@@ -134,24 +134,57 @@ pub struct ArcusSpotChainClient {
     providers: Vec<Arc<Provider<Http>>>,
 }
 
-/// Raw, not-yet-validated results of one preflight round-trip against a
-/// single provider. Kept separate from `ArcusSpotChainPreflight` so a
-/// failed *business* check (chain-id mismatch, floor violation) on the
-/// first reachable provider is never silently retried against another --
-/// only a transport-level error triggers `try_providers` to move on.
-struct RawPreflightReads {
-    chain_id: U256,
+/// Result of one complete, coherent preflight round-trip against a single
+/// provider (balance/allowance reads plus, when needed, the EIP-2612
+/// metadata fetch) -- one atomic attempt so a transport failure partway
+/// through still retries the *whole* thing against the next provider
+/// instead of leaving a half-finished result no caller asked for.
+struct PreflightAttempt {
     sell_balance: U256,
     buy_balance: U256,
     gas_balance: U256,
     allowance: U256,
+    exact_value_permit: Option<ArcusSpotEip2612PermitContext>,
 }
 
 struct RawBalanceReads {
-    chain_id: U256,
     sell_balance: U256,
     buy_balance: U256,
     gas_balance: U256,
+}
+
+/// Distinguishes "this provider might just be unreachable right now, try
+/// the next one" from "this provider answered, but with something a
+/// different provider must never be allowed to silently paper over" --
+/// namely a wrong chain id, which is a network-identity mismatch, not a
+/// value that can legitimately differ by provider freshness the way a
+/// balance or allowance can.
+enum ProviderAttemptError {
+    Transient(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ProviderAttemptError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Transient(error)
+    }
+}
+
+/// Strip everything but scheme/host/port before this URL can reach a log
+/// line -- RPC providers commonly embed an API token in the path or query
+/// string, and `ArcusSpotChainConfig::validate` only forbids inline
+/// userinfo credentials, not that far more common pattern.
+fn redact_rpc_url(rpc_url: &str) -> String {
+    match url::Url::parse(rpc_url.trim()) {
+        Ok(url) => match url.host_str() {
+            Some(host) => match url.port() {
+                Some(port) => format!("{}://{host}:{port}", url.scheme()),
+                None => format!("{}://{host}", url.scheme()),
+            },
+            None => "<unparseable RPC URL>".to_string(),
+        },
+        Err(_) => "<unparseable RPC URL>".to_string(),
+    }
 }
 
 impl ArcusSpotChainClient {
@@ -178,23 +211,25 @@ impl ArcusSpotChainClient {
     /// Run `attempt` against each configured provider in order, returning
     /// the first success together with the provider that produced it (so a
     /// caller needing a follow-up read can stay on the same provider rather
-    /// than risking an inconsistent mix). Every attempt failing returns the
-    /// *last* provider's error -- earlier transport errors are still
-    /// visible in logs via `log::warn!`, but the caller only needs one
-    /// final cause.
+    /// than risking an inconsistent mix). `ProviderAttemptError::Fatal`
+    /// aborts immediately without trying later providers. Every attempt
+    /// failing with only `Transient` errors returns the *last* one --
+    /// earlier transport errors are still visible in logs via
+    /// `log::warn!`, but the caller only needs one final cause.
     async fn try_providers<T, F, Fut>(&self, attempt: F) -> Result<(T, Arc<Provider<Http>>)>
     where
         F: Fn(Arc<Provider<Http>>) -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
+        Fut: std::future::Future<Output = Result<T, ProviderAttemptError>>,
     {
         let mut last_error = None;
         for (index, provider) in self.providers.iter().enumerate() {
             match attempt(provider.clone()).await {
                 Ok(value) => return Ok((value, provider.clone())),
-                Err(error) => {
+                Err(ProviderAttemptError::Fatal(error)) => return Err(error),
+                Err(ProviderAttemptError::Transient(error)) => {
                     log::warn!(
                         "[ARCUS_RPC] provider {index} ({}) failed: {error:#}",
-                        self.config.rpc_urls[index]
+                        redact_rpc_url(&self.config.rpc_urls[index])
                     );
                     last_error = Some(error);
                 }
@@ -208,48 +243,103 @@ impl ArcusSpotChainClient {
         request: &ArcusSpotChainPreflightRequest,
     ) -> Result<ArcusSpotChainPreflight> {
         let request_values = request.validate()?;
-        let (raw, provider) = self
+        let permit_deadline = request.permit_deadline;
+        let (attempt, _provider) = self
             .try_providers(|provider| {
                 let sell_token = request_values.sell_token;
                 let buy_token = request_values.buy_token;
                 let taker = request_values.taker;
                 let permit2 = request_values.permit2;
+                let required_sell = request_values.required_sell;
                 async move {
-                    let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
-                    let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
-                    let sell_balance_call = sell_contract.balance_of(taker);
-                    let buy_balance_call = buy_contract.balance_of(taker);
-                    let allowance_call = sell_contract.allowance(taker, permit2);
-                    let (chain_id, sell_balance, buy_balance, gas_balance, allowance) = tokio::join!(
-                        provider.get_chainid(),
-                        sell_balance_call.call(),
-                        buy_balance_call.call(),
-                        provider.get_balance(taker, None),
-                        allowance_call.call(),
-                    );
-                    Ok(RawPreflightReads {
-                        chain_id: chain_id.context("Arcus chainId read failed")?,
-                        sell_balance: sell_balance.context("Arcus sell balance read failed")?,
-                        buy_balance: buy_balance.context("Arcus buy balance read failed")?,
-                        gas_balance: gas_balance.context("Arcus gas balance read failed")?,
-                        allowance: allowance.context("Arcus Permit2 allowance read failed")?,
-                    })
+                    // Checked on its own, sequentially, before any of the
+                    // concurrent reads below: this is the one field where a
+                    // successful-but-wrong answer must never be masked by a
+                    // sibling call's transport error inside the same
+                    // tokio::join! (which would make try_providers treat a
+                    // definitively wrong-network provider as merely
+                    // "unreachable" and silently move on).
+                    let chain_id = provider
+                        .get_chainid()
+                        .await
+                        .context("Arcus chainId read failed")?;
+                    if chain_id != U256::from(self.config.chain_id) {
+                        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                            "Arcus RPC chainId {chain_id} does not match configured {}",
+                            self.config.chain_id
+                        )));
+                    }
+
+                    let coherent: Result<PreflightAttempt> = async {
+                        let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
+                        let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
+                        let sell_balance_call = sell_contract.balance_of(taker);
+                        let buy_balance_call = buy_contract.balance_of(taker);
+                        let allowance_call = sell_contract.allowance(taker, permit2);
+                        let (sell_balance, buy_balance, gas_balance, allowance) = tokio::join!(
+                            sell_balance_call.call(),
+                            buy_balance_call.call(),
+                            provider.get_balance(taker, None),
+                            allowance_call.call(),
+                        );
+                        let sell_balance = sell_balance.context("Arcus sell balance read failed")?;
+                        let buy_balance = buy_balance.context("Arcus buy balance read failed")?;
+                        let gas_balance = gas_balance.context("Arcus gas balance read failed")?;
+                        let allowance = allowance.context("Arcus Permit2 allowance read failed")?;
+
+                        // An overbroad allowance is rejected by the caller
+                        // once this attempt returns, so there is no point
+                        // spending a follow-up round-trip on metadata this
+                        // preflight is about to fail anyway.
+                        let exact_value_permit = if allowance >= required_sell {
+                            None
+                        } else {
+                            let token_name_call = sell_contract.name();
+                            let nonce_call = sell_contract.nonces(taker);
+                            let (token_name, nonce) =
+                                tokio::try_join!(token_name_call.call(), nonce_call.call())
+                                    .context(
+                                        "sell token does not expose the required EIP-2612 metadata",
+                                    )?;
+                            if token_name.trim().is_empty() {
+                                bail!("sell token returned an empty EIP-2612 name");
+                            }
+                            let token_version = sell_contract
+                                .version()
+                                .call()
+                                .await
+                                .unwrap_or_else(|_| "1".to_string());
+                            if token_version.trim().is_empty() {
+                                bail!("sell token returned an empty EIP-2612 version");
+                            }
+                            Some(ArcusSpotEip2612PermitContext {
+                                token_name,
+                                token_version,
+                                nonce: nonce.to_string(),
+                                deadline: permit_deadline,
+                            })
+                        };
+
+                        Ok(PreflightAttempt {
+                            sell_balance,
+                            buy_balance,
+                            gas_balance,
+                            allowance,
+                            exact_value_permit,
+                        })
+                    }
+                    .await;
+                    coherent.map_err(ProviderAttemptError::Transient)
                 }
             })
             .await?;
-        let RawPreflightReads {
-            chain_id,
+        let PreflightAttempt {
             sell_balance,
             buy_balance,
             gas_balance,
             allowance,
-        } = raw;
-        if chain_id != U256::from(self.config.chain_id) {
-            bail!(
-                "Arcus RPC chainId {chain_id} does not match configured {}",
-                self.config.chain_id
-            );
-        }
+            exact_value_permit,
+        } = attempt;
         enforce_balance_limits(sell_balance, buy_balance, gas_balance, &request_values)?;
         if allowance > request_values.required_sell {
             bail!(
@@ -257,37 +347,6 @@ impl ArcusSpotChainClient {
                 request_values.required_sell
             );
         }
-
-        let exact_value_permit = if allowance == request_values.required_sell {
-            None
-        } else {
-            // Stay on the exact provider that answered the reads above --
-            // mixing in a different one here for the nonce would risk a
-            // permit built against a nonce that doesn't match the balance
-            // state this preflight already validated.
-            let sell_contract = ArcusSpotErc20::new(request_values.sell_token, provider.clone());
-            let token_name_call = sell_contract.name();
-            let nonce_call = sell_contract.nonces(request_values.taker);
-            let (token_name, nonce) = tokio::try_join!(token_name_call.call(), nonce_call.call(),)
-                .context("sell token does not expose the required EIP-2612 metadata")?;
-            if token_name.trim().is_empty() {
-                bail!("sell token returned an empty EIP-2612 name");
-            }
-            let token_version = sell_contract
-                .version()
-                .call()
-                .await
-                .unwrap_or_else(|_| "1".to_string());
-            if token_version.trim().is_empty() {
-                bail!("sell token returned an empty EIP-2612 version");
-            }
-            Some(ArcusSpotEip2612PermitContext {
-                token_name,
-                token_version,
-                nonce: nonce.to_string(),
-                deadline: request.permit_deadline,
-            })
-        };
 
         Ok(ArcusSpotChainPreflight {
             chain_id: self.config.chain_id,
@@ -319,33 +378,44 @@ impl ArcusSpotChainClient {
         }
         let (raw, _provider) = self
             .try_providers(|provider| async move {
-                let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
-                let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
-                let sell_balance_call = sell_contract.balance_of(taker);
-                let buy_balance_call = buy_contract.balance_of(taker);
-                let (chain_id, sell_balance, buy_balance, gas_balance) = tokio::join!(
-                    provider.get_chainid(),
-                    sell_balance_call.call(),
-                    buy_balance_call.call(),
-                    provider.get_balance(taker, None),
-                );
-                Ok(RawBalanceReads {
-                    chain_id: chain_id.context("Arcus chainId read failed")?,
-                    sell_balance: sell_balance.context("Arcus sell balance read failed")?,
-                    buy_balance: buy_balance.context("Arcus buy balance read failed")?,
-                    gas_balance: gas_balance.context("Arcus gas balance read failed")?,
-                })
+                // Sequential and fatal-on-mismatch for the same reason as
+                // in `preflight`: a wrong-but-successfully-fetched chain id
+                // must never be masked by a sibling call's transport error
+                // inside the same tokio::join!.
+                let chain_id = provider
+                    .get_chainid()
+                    .await
+                    .context("Arcus chainId read failed")?;
+                if chain_id != U256::from(self.config.chain_id) {
+                    return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                        "Arcus RPC chainId changed during balance reconciliation"
+                    )));
+                }
+                let coherent: Result<RawBalanceReads> = async {
+                    let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
+                    let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
+                    let sell_balance_call = sell_contract.balance_of(taker);
+                    let buy_balance_call = buy_contract.balance_of(taker);
+                    let (sell_balance, buy_balance, gas_balance) = tokio::join!(
+                        sell_balance_call.call(),
+                        buy_balance_call.call(),
+                        provider.get_balance(taker, None),
+                    );
+                    Ok(RawBalanceReads {
+                        sell_balance: sell_balance.context("Arcus sell balance read failed")?,
+                        buy_balance: buy_balance.context("Arcus buy balance read failed")?,
+                        gas_balance: gas_balance.context("Arcus gas balance read failed")?,
+                    })
+                }
+                .await;
+                coherent.map_err(ProviderAttemptError::Transient)
             })
             .await?;
         let RawBalanceReads {
-            chain_id,
             sell_balance,
             buy_balance,
             gas_balance,
         } = raw;
-        if chain_id != U256::from(self.config.chain_id) {
-            bail!("Arcus RPC chainId changed during balance reconciliation");
-        }
         Ok(balance_snapshot(
             taker,
             sell_token,
@@ -528,7 +598,9 @@ mod tests {
                 async move {
                     let seen = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if seen == 0 {
-                        bail!("simulated transport failure on the first provider");
+                        return Err(ProviderAttemptError::Transient(anyhow::anyhow!(
+                            "simulated transport failure on the first provider"
+                        )));
                     }
                     Ok(seen)
                 }
@@ -552,10 +624,62 @@ mod tests {
         let client = ArcusSpotChainClient::new(config).unwrap();
         let error = client
             .try_providers(|provider| async move {
-                Err::<(), _>(anyhow::anyhow!("down: {provider:?}"))
+                Err::<(), _>(ProviderAttemptError::Transient(anyhow::anyhow!(
+                    "down: {provider:?}"
+                )))
             })
             .await
             .unwrap_err();
         assert!(error.to_string().contains("down"));
+    }
+
+    #[tokio::test]
+    async fn try_providers_stops_immediately_on_a_fatal_error() {
+        // A Fatal error (a definitively wrong chain id, not a transport
+        // hiccup) must never be masked by falling back to another
+        // provider -- a different, correctly-configured provider silently
+        // "fixing" the response would hide that the first one is on the
+        // wrong network entirely.
+        let config = ArcusSpotChainConfig {
+            rpc_urls: vec![
+                "https://a.example.invalid".to_string(),
+                "https://b.example.invalid".to_string(),
+            ],
+            chain_id: 4663,
+            request_interval_ms: 100,
+        };
+        let client = ArcusSpotChainClient::new(config).unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let error = client
+            .try_providers(|_provider| {
+                let attempts = attempts.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err::<(), _>(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                        "wrong chain id"
+                    )))
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("wrong chain id"));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a fatal error must not trigger a fallback attempt on the next provider"
+        );
+    }
+
+    #[test]
+    fn redact_rpc_url_strips_path_and_query() {
+        assert_eq!(
+            redact_rpc_url("https://provider.example/v3/super-secret-api-key?id=1"),
+            "https://provider.example"
+        );
+        assert_eq!(
+            redact_rpc_url("https://provider.example:8545/v3/super-secret-api-key"),
+            "https://provider.example:8545"
+        );
+        assert_eq!(redact_rpc_url("not a url"), "<unparseable RPC URL>");
     }
 }
