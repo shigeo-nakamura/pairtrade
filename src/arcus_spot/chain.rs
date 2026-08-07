@@ -319,35 +319,64 @@ impl ArcusSpotChainClient {
                     )));
                 }
 
-                let metadata: Result<Option<ArcusSpotEip2612PermitContext>> = async {
-                    if allowance == request_values.required_sell {
-                        return Ok(None);
-                    }
+                let exact_value_permit = if allowance == request_values.required_sell {
+                    None
+                } else {
                     let token_name_call = sell_contract.name();
                     let nonce_call = sell_contract.nonces(request_values.taker);
-                    let (token_name, nonce) =
+                    let name_and_nonce: Result<(String, U256)> =
                         tokio::try_join!(token_name_call.call(), nonce_call.call())
-                            .context("sell token does not expose the required EIP-2612 metadata")?;
+                            .context("sell token does not expose the required EIP-2612 metadata");
+                    let (token_name, nonce) =
+                        name_and_nonce.map_err(ProviderAttemptError::Transient)?;
+                    // A reachable provider returning an empty name is
+                    // invalid data from a working endpoint, not a sign it
+                    // is unreachable -- Fatal for the same reason the
+                    // floor/allowance checks above are, so a later
+                    // provider can't paper over it (Codex P1 follow-up,
+                    // pairtrade#182).
                     if token_name.trim().is_empty() {
-                        bail!("sell token returned an empty EIP-2612 name");
+                        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                            "sell token returned an empty EIP-2612 name"
+                        )));
                     }
-                    let token_version = sell_contract
-                        .version()
-                        .call()
-                        .await
-                        .unwrap_or_else(|_| "1".to_string());
+
+                    // Only a confirmed non-transport response (the
+                    // contract reverted, or its return data didn't decode
+                    // as a string -- i.e. it simply doesn't implement
+                    // EIP-2612's optional version()) defaults to the
+                    // legacy "1". An actual transport/RPC failure must
+                    // stay Transient so try_providers can retry the whole
+                    // preflight on a healthy endpoint instead of silently
+                    // guessing a version that could build a permit the
+                    // token's real EIP-712 domain will reject (Codex P2
+                    // follow-up, pairtrade#182).
+                    let version_result: Result<String> = match sell_contract.version().call().await {
+                        Ok(version) => Ok(version),
+                        Err(ethers::contract::ContractError::MiddlewareError { e }) => {
+                            Err(anyhow::Error::new(e))
+                                .context("Arcus EIP-2612 version() read failed")
+                        }
+                        Err(ethers::contract::ContractError::ProviderError { e }) => {
+                            Err(anyhow::Error::new(e))
+                                .context("Arcus EIP-2612 version() read failed")
+                        }
+                        Err(_) => Ok("1".to_string()),
+                    };
+                    let token_version = version_result.map_err(ProviderAttemptError::Transient)?;
                     if token_version.trim().is_empty() {
-                        bail!("sell token returned an empty EIP-2612 version");
+                        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                            "sell token returned an empty EIP-2612 version"
+                        )));
                     }
-                    Ok(Some(ArcusSpotEip2612PermitContext {
+
+                    Some(ArcusSpotEip2612PermitContext {
                         token_name,
                         token_version,
                         nonce: nonce.to_string(),
                         deadline: permit_deadline,
-                    }))
-                }
-                .await;
-                let exact_value_permit = metadata.map_err(ProviderAttemptError::Transient)?;
+                    })
+                };
 
                 Ok(PreflightAttempt {
                     sell_balance,
