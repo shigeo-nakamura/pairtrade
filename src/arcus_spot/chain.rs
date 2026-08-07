@@ -76,6 +76,7 @@ pub struct ArcusSpotChainPreflightRequest {
     pub permit_deadline: u64,
 }
 
+#[derive(Clone, Copy)]
 struct ValidatedPreflightRequest {
     taker: Address,
     sell_token: Address,
@@ -227,8 +228,16 @@ impl ArcusSpotChainClient {
                 Ok(value) => return Ok((value, provider.clone())),
                 Err(ProviderAttemptError::Fatal(error)) => return Err(error),
                 Err(ProviderAttemptError::Transient(error)) => {
+                    // Only the top-level context message (e.g. "Arcus
+                    // chainId read failed"), never the full `{:#}` source
+                    // chain: the wrapped HTTP-client error for a
+                    // connection/timeout failure commonly includes the
+                    // request URL itself, which can carry an API token in
+                    // its path or query -- the same leak `redact_rpc_url`
+                    // exists to prevent, through a different value
+                    // (Codex P1 follow-up, pairtrade#182).
                     log::warn!(
-                        "[ARCUS_RPC] provider {index} ({}) failed: {error:#}",
+                        "[ARCUS_RPC] provider {index} ({}) failed: {error}",
                         redact_rpc_url(&self.config.rpc_urls[index])
                     );
                     last_error = Some(error);
@@ -245,92 +254,108 @@ impl ArcusSpotChainClient {
         let request_values = request.validate()?;
         let permit_deadline = request.permit_deadline;
         let (attempt, _provider) = self
-            .try_providers(|provider| {
-                let sell_token = request_values.sell_token;
-                let buy_token = request_values.buy_token;
-                let taker = request_values.taker;
-                let permit2 = request_values.permit2;
-                let required_sell = request_values.required_sell;
-                async move {
-                    // Checked on its own, sequentially, before any of the
-                    // concurrent reads below: this is the one field where a
-                    // successful-but-wrong answer must never be masked by a
-                    // sibling call's transport error inside the same
-                    // tokio::join! (which would make try_providers treat a
-                    // definitively wrong-network provider as merely
-                    // "unreachable" and silently move on).
-                    let chain_id = provider
-                        .get_chainid()
-                        .await
-                        .context("Arcus chainId read failed")?;
-                    if chain_id != U256::from(self.config.chain_id) {
-                        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
-                            "Arcus RPC chainId {chain_id} does not match configured {}",
-                            self.config.chain_id
-                        )));
-                    }
-
-                    let coherent: Result<PreflightAttempt> = async {
-                        let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
-                        let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
-                        let sell_balance_call = sell_contract.balance_of(taker);
-                        let buy_balance_call = buy_contract.balance_of(taker);
-                        let allowance_call = sell_contract.allowance(taker, permit2);
-                        let (sell_balance, buy_balance, gas_balance, allowance) = tokio::join!(
-                            sell_balance_call.call(),
-                            buy_balance_call.call(),
-                            provider.get_balance(taker, None),
-                            allowance_call.call(),
-                        );
-                        let sell_balance = sell_balance.context("Arcus sell balance read failed")?;
-                        let buy_balance = buy_balance.context("Arcus buy balance read failed")?;
-                        let gas_balance = gas_balance.context("Arcus gas balance read failed")?;
-                        let allowance = allowance.context("Arcus Permit2 allowance read failed")?;
-
-                        // An overbroad allowance is rejected by the caller
-                        // once this attempt returns, so there is no point
-                        // spending a follow-up round-trip on metadata this
-                        // preflight is about to fail anyway.
-                        let exact_value_permit = if allowance >= required_sell {
-                            None
-                        } else {
-                            let token_name_call = sell_contract.name();
-                            let nonce_call = sell_contract.nonces(taker);
-                            let (token_name, nonce) =
-                                tokio::try_join!(token_name_call.call(), nonce_call.call())
-                                    .context(
-                                        "sell token does not expose the required EIP-2612 metadata",
-                                    )?;
-                            if token_name.trim().is_empty() {
-                                bail!("sell token returned an empty EIP-2612 name");
-                            }
-                            let token_version = sell_contract
-                                .version()
-                                .call()
-                                .await
-                                .unwrap_or_else(|_| "1".to_string());
-                            if token_version.trim().is_empty() {
-                                bail!("sell token returned an empty EIP-2612 version");
-                            }
-                            Some(ArcusSpotEip2612PermitContext {
-                                token_name,
-                                token_version,
-                                nonce: nonce.to_string(),
-                                deadline: permit_deadline,
-                            })
-                        };
-
-                        Ok(PreflightAttempt {
-                            sell_balance,
-                            buy_balance,
-                            gas_balance,
-                            allowance,
-                            exact_value_permit,
-                        })
-                    }
-                    .await;
-                    coherent.map_err(ProviderAttemptError::Transient)
+            .try_providers(|provider| async move {
+                // Checked on its own, sequentially, before any of the
+                // concurrent reads below: this is the one field where a
+                // successful-but-wrong answer must never be masked by a
+                // sibling call's transport error inside the same
+                // tokio::join! (which would make try_providers treat a
+                // definitively wrong-network provider as merely
+                // "unreachable" and silently move on).
+                let chain_id = provider
+                    .get_chainid()
+                    .await
+                    .context("Arcus chainId read failed")?;
+                if chain_id != U256::from(self.config.chain_id) {
+                    return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                        "Arcus RPC chainId {chain_id} does not match configured {}",
+                        self.config.chain_id
+                    )));
                 }
+
+                let sell_contract = ArcusSpotErc20::new(request_values.sell_token, provider.clone());
+                let buy_contract = ArcusSpotErc20::new(request_values.buy_token, provider.clone());
+                let sell_balance_call = sell_contract.balance_of(request_values.taker);
+                let buy_balance_call = buy_contract.balance_of(request_values.taker);
+                let allowance_call =
+                    sell_contract.allowance(request_values.taker, request_values.permit2);
+                let (sell_balance, buy_balance, gas_balance, allowance) = tokio::join!(
+                    sell_balance_call.call(),
+                    buy_balance_call.call(),
+                    provider.get_balance(request_values.taker, None),
+                    allowance_call.call(),
+                );
+                let reads: Result<(U256, U256, U256, U256)> = (|| {
+                    Ok((
+                        sell_balance.context("Arcus sell balance read failed")?,
+                        buy_balance.context("Arcus buy balance read failed")?,
+                        gas_balance.context("Arcus gas balance read failed")?,
+                        allowance.context("Arcus Permit2 allowance read failed")?,
+                    ))
+                })();
+                let (sell_balance, buy_balance, gas_balance, allowance) =
+                    reads.map_err(ProviderAttemptError::Transient)?;
+
+                // Both checks below are evaluated on *this* provider's own
+                // successful reads, immediately, as Fatal: a floor
+                // violation or an overbroad allowance is real on-chain
+                // safety-relevant state this provider just reported, not a
+                // sign it is unreachable, so it must never be swallowed by
+                // a later provider's fallback whose (possibly staler) view
+                // happens to look clean (Codex P1 follow-up, pairtrade#182).
+                // Checking this before the metadata fetch below also means
+                // a transport failure in that fetch can no longer mask
+                // either finding by making the whole attempt look merely
+                // Transient.
+                if let Err(error) =
+                    enforce_balance_limits(sell_balance, buy_balance, gas_balance, &request_values)
+                {
+                    return Err(ProviderAttemptError::Fatal(error));
+                }
+                if allowance > request_values.required_sell {
+                    return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                        "Permit2 allowance {allowance} exceeds the exact required amount {}; refusing an overbroad approval",
+                        request_values.required_sell
+                    )));
+                }
+
+                let metadata: Result<Option<ArcusSpotEip2612PermitContext>> = async {
+                    if allowance == request_values.required_sell {
+                        return Ok(None);
+                    }
+                    let token_name_call = sell_contract.name();
+                    let nonce_call = sell_contract.nonces(request_values.taker);
+                    let (token_name, nonce) =
+                        tokio::try_join!(token_name_call.call(), nonce_call.call())
+                            .context("sell token does not expose the required EIP-2612 metadata")?;
+                    if token_name.trim().is_empty() {
+                        bail!("sell token returned an empty EIP-2612 name");
+                    }
+                    let token_version = sell_contract
+                        .version()
+                        .call()
+                        .await
+                        .unwrap_or_else(|_| "1".to_string());
+                    if token_version.trim().is_empty() {
+                        bail!("sell token returned an empty EIP-2612 version");
+                    }
+                    Ok(Some(ArcusSpotEip2612PermitContext {
+                        token_name,
+                        token_version,
+                        nonce: nonce.to_string(),
+                        deadline: permit_deadline,
+                    }))
+                }
+                .await;
+                let exact_value_permit = metadata.map_err(ProviderAttemptError::Transient)?;
+
+                Ok(PreflightAttempt {
+                    sell_balance,
+                    buy_balance,
+                    gas_balance,
+                    allowance,
+                    exact_value_permit,
+                })
             })
             .await?;
         let PreflightAttempt {
@@ -340,13 +365,6 @@ impl ArcusSpotChainClient {
             allowance,
             exact_value_permit,
         } = attempt;
-        enforce_balance_limits(sell_balance, buy_balance, gas_balance, &request_values)?;
-        if allowance > request_values.required_sell {
-            bail!(
-                "Permit2 allowance {allowance} exceeds the exact required amount {}; refusing an overbroad approval",
-                request_values.required_sell
-            );
-        }
 
         Ok(ArcusSpotChainPreflight {
             chain_id: self.config.chain_id,
