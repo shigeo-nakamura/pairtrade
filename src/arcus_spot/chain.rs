@@ -5,7 +5,7 @@ use dex_connector::ArcusSpotEip2612PermitContext;
 use ethers::{
     contract::abigen,
     providers::{Http, Middleware, Provider},
-    types::{Address, H256, U256},
+    types::{Address, BlockId, H256, U256},
 };
 use serde::{Deserialize, Serialize};
 use std::{str::FromStr, sync::Arc, time::Duration};
@@ -564,7 +564,7 @@ impl ArcusSpotChainClient {
         let chain_id = self.config.chain_id;
         let (raw, _provider) = self
             .try_providers(|provider| {
-                read_balances_from_provider(provider, chain_id, taker, sell_token, buy_token)
+                read_balances_from_provider(provider, chain_id, taker, sell_token, buy_token, None)
             })
             .await?;
         let RawBalanceReads {
@@ -621,20 +621,35 @@ impl ArcusSpotChainClient {
         let receipt = provider
             .get_transaction_receipt(confirmed_tx_hash)
             .await
-            .context("Arcus confirmed-transaction receipt read failed")?;
-        if receipt.is_none() {
-            bail!(
-                "Arcus primary provider has not yet indexed confirmed tx {confirmed_tx_hash:#x}; \
-                 refusing to read balances until it has, rather than risk a stale pre-swap snapshot"
-            );
-        }
-        let raw = read_balances_from_provider(provider, self.config.chain_id, taker, sell_token, buy_token)
-            .await
-            .map_err(|error| match error {
-                ProviderAttemptError::Fatal(error) | ProviderAttemptError::Transient(error) => {
-                    error
-                }
+            .context("Arcus confirmed-transaction receipt read failed")?
+            .with_context(|| {
+                format!(
+                    "Arcus primary provider has not yet indexed confirmed tx {confirmed_tx_hash:#x}; \
+                     refusing to read balances until it has, rather than risk a stale pre-swap snapshot"
+                )
             })?;
+        // A single RPC URL commonly load-balances across a pool of
+        // backend nodes: the receipt lookup above and the balance reads
+        // below are separate requests that can land on *different*
+        // backends behind that one URL, so confirming the receipt exists
+        // is not, by itself, proof the balance reads will see it too.
+        // Pin every balance read to the receipt's own block instead of
+        // "latest" (Codex P1 follow-up, pairtrade#182, round 7).
+        let receipt_block = receipt
+            .block_number
+            .context("Arcus confirmed-transaction receipt is missing its block number")?;
+        let raw = read_balances_from_provider(
+            provider,
+            self.config.chain_id,
+            taker,
+            sell_token,
+            buy_token,
+            Some(BlockId::Number(receipt_block.into())),
+        )
+        .await
+        .map_err(|error| match error {
+            ProviderAttemptError::Fatal(error) | ProviderAttemptError::Transient(error) => error,
+        })?;
         Ok(balance_snapshot(
             taker,
             sell_token,
@@ -646,12 +661,24 @@ impl ArcusSpotChainClient {
     }
 }
 
+/// `pinned_block`: `None` reads "latest" (fine for preflight/status
+/// reads, where there is no specific transaction that must already be
+/// visible). Reconciliation passes `Some(receipt_block)` instead: a
+/// single configured RPC URL commonly load-balances across a pool of
+/// backend nodes, so confirming the *receipt* is present on whichever
+/// backend answered that specific request is not enough -- a *different*
+/// backend behind the same URL can answer the very next request and
+/// still be lagging. Reading every balance at the receipt's own block
+/// makes a backend that hasn't indexed that block error out instead of
+/// silently substituting its own, possibly-earlier "latest" (Codex P1
+/// follow-up, pairtrade#182, round 7).
 async fn read_balances_from_provider(
     provider: Arc<Provider<Http>>,
     expected_chain_id: u64,
     taker: Address,
     sell_token: Address,
     buy_token: Address,
+    pinned_block: Option<BlockId>,
 ) -> Result<RawBalanceReads, ProviderAttemptError> {
     // Sequential and fatal-on-mismatch for the same reason as in
     // `preflight`: a wrong-but-successfully-fetched chain id must never be
@@ -666,24 +693,60 @@ async fn read_balances_from_provider(
             "Arcus RPC chainId changed during balance reconciliation"
         )));
     }
-    let coherent: Result<RawBalanceReads> = async {
-        let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
-        let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
-        let sell_balance_call = sell_contract.balance_of(taker);
-        let buy_balance_call = buy_contract.balance_of(taker);
-        let (sell_balance, buy_balance, gas_balance) = tokio::join!(
-            sell_balance_call.call(),
-            buy_balance_call.call(),
-            provider.get_balance(taker, None),
-        );
-        Ok(RawBalanceReads {
-            sell_balance: sell_balance.context("Arcus sell balance read failed")?,
-            buy_balance: buy_balance.context("Arcus buy balance read failed")?,
-            gas_balance: gas_balance.context("Arcus gas balance read failed")?,
-        })
+
+    let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
+    let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
+    let mut sell_balance_call = sell_contract.balance_of(taker);
+    let mut buy_balance_call = buy_contract.balance_of(taker);
+    if let Some(block) = pinned_block {
+        sell_balance_call = sell_balance_call.block(block);
+        buy_balance_call = buy_balance_call.block(block);
     }
-    .await;
-    coherent.map_err(ProviderAttemptError::Transient)
+    let (sell_balance_result, buy_balance_result, gas_balance_result) = tokio::join!(
+        sell_balance_call.call(),
+        buy_balance_call.call(),
+        provider.get_balance(taker, pinned_block),
+    );
+    // Same "classify, let any Fatal finding outrank a sibling's Transport
+    // error" shape as preflight's balance/allowance batch (Codex P2
+    // follow-up, pairtrade#182, round 7): a reachable provider's revert/
+    // decode failure on balanceOf is a real, permanent property of the
+    // token contract, not evidence of unreachability, and must not be
+    // masked by a sibling merely transport-failing.
+    let sell_balance_outcome = classify_contract_call(sell_balance_result);
+    let buy_balance_outcome = classify_contract_call(buy_balance_result);
+    let gas_balance_outcome = match gas_balance_result {
+        Ok(value) => ContractCallOutcome::Ok(value),
+        Err(error) => ContractCallOutcome::Transport(anyhow::Error::new(error)),
+    };
+
+    if let ContractCallOutcome::NonTransport(error) = &sell_balance_outcome {
+        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+            "Arcus sell balance read returned an unexpected response: {error}"
+        )));
+    }
+    if let ContractCallOutcome::NonTransport(error) = &buy_balance_outcome {
+        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+            "Arcus buy balance read returned an unexpected response: {error}"
+        )));
+    }
+
+    let mut transient_error: Option<anyhow::Error> = None;
+    for outcome in [&sell_balance_outcome, &buy_balance_outcome, &gas_balance_outcome] {
+        if let ContractCallOutcome::Transport(_) = outcome {
+            transient_error
+                .get_or_insert_with(|| anyhow::anyhow!("Arcus balance read failed (transport)"));
+        }
+    }
+    if let Some(error) = transient_error {
+        return Err(ProviderAttemptError::Transient(error));
+    }
+
+    Ok(RawBalanceReads {
+        sell_balance: expect_ok(sell_balance_outcome),
+        buy_balance: expect_ok(buy_balance_outcome),
+        gas_balance: expect_ok(gas_balance_outcome),
+    })
 }
 
 // Split into one function per field (rather than one combined check) so
