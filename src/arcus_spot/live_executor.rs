@@ -538,15 +538,25 @@ where
         }
         let sell_token = parse_nonzero_address("sell token", &active.intent.sell_token)?;
         let buy_token = parse_nonzero_address("buy token", &active.intent.buy_token)?;
+        let confirmed_tx_hash = active
+            .tx_hash
+            .as_deref()
+            .context("Arcus confirmed attempt is missing its transaction hash")?
+            .parse::<H256>()
+            .context("Arcus confirmed attempt has an invalid transaction hash")?;
         // Deliberately not the fallback-capable `balances()`: a secondary
         // provider that hasn't yet indexed this specific confirmed swap
         // would return the pre-swap balance as an apparently valid
         // snapshot, and reconcile_balances would misread that as a
         // genuine reconciliation failure and permanently mark the attempt
-        // Unknown (Codex P1 follow-up, pairtrade#182).
+        // Unknown (Codex P1 follow-up, pairtrade#182). The primary-only
+        // read additionally requires the confirmed tx's own receipt to be
+        // present before trusting its balances, since the primary itself
+        // could be a node recovering from an outage and still catching up
+        // (Codex P1 follow-up, pairtrade#182, round 6).
         let post = self
             .chain
-            .balances_requiring_primary_provider(taker, sell_token, buy_token)
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, confirmed_tx_hash)
             .await
             .context("Arcus post-submit balance read failed")?;
         let mutation = self.ledger.reconcile_balances(post, Utc::now());

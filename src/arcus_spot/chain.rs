@@ -5,7 +5,7 @@ use dex_connector::ArcusSpotEip2612PermitContext;
 use ethers::{
     contract::abigen,
     providers::{Http, Middleware, Provider},
-    types::{Address, U256},
+    types::{Address, H256, U256},
 };
 use serde::{Deserialize, Serialize};
 use std::{str::FromStr, sync::Arc, time::Duration};
@@ -406,9 +406,18 @@ impl ArcusSpotChainClient {
                     ("gas balance", &gas_balance_outcome),
                     ("Permit2 allowance", &allowance_outcome),
                 ] {
-                    if let ContractCallOutcome::Transport(error) = outcome {
+                    // Label only, never the underlying error's own Display:
+                    // the wrapped HTTP-client error for a connection/
+                    // timeout failure commonly embeds the request URL,
+                    // which can carry an API token -- interpolating it
+                    // into a *new* top-level message would leak it
+                    // regardless of which format specifier the eventual
+                    // log line uses, since it becomes part of what `{}`
+                    // itself prints (Codex P1 follow-up, pairtrade#182,
+                    // round 6).
+                    if let ContractCallOutcome::Transport(_) = outcome {
                         transient_error.get_or_insert_with(|| {
-                            anyhow::anyhow!("Arcus {label} read failed: {error}")
+                            anyhow::anyhow!("Arcus {label} read failed (transport)")
                         });
                     }
                 }
@@ -456,15 +465,18 @@ impl ArcusSpotChainClient {
                         )));
                     }
 
+                    // Label only, same reasoning as the balance/allowance
+                    // batch above -- these are Transport (HTTP-layer)
+                    // failures, whose wrapped error can carry a leaked URL
+                    // (Codex P1 follow-up, pairtrade#182, round 6).
                     let mut transient_error: Option<anyhow::Error> = None;
-                    if let ContractCallOutcome::Transport(error) = &name_outcome {
-                        transient_error.get_or_insert_with(|| {
-                            anyhow::anyhow!("Arcus EIP-2612 name() read failed: {error}")
-                        });
+                    if let ContractCallOutcome::Transport(_) = &name_outcome {
+                        transient_error
+                            .get_or_insert_with(|| anyhow::anyhow!("Arcus EIP-2612 name() read failed (transport)"));
                     }
-                    if let ContractCallOutcome::Transport(error) = &nonce_outcome {
+                    if let ContractCallOutcome::Transport(_) = &nonce_outcome {
                         transient_error.get_or_insert_with(|| {
-                            anyhow::anyhow!("Arcus EIP-2612 nonces() read failed: {error}")
+                            anyhow::anyhow!("Arcus EIP-2612 nonces() read failed (transport)")
                         });
                     }
                     if let Some(error) = transient_error {
@@ -574,21 +586,25 @@ impl ArcusSpotChainClient {
     /// never falls back to another one.
     ///
     /// Reconciling a just-confirmed swap needs proof that whichever
-    /// provider answered has actually observed *that* transaction --
+    /// provider answered has actually observed *that* transaction: neither
     /// falling back to a secondary provider that is merely reachable but
-    /// lagging behind the primary would return the pre-swap balance as an
-    /// apparently valid snapshot. `reconcile_balances` would then see a
-    /// zero/incorrect delta and treat it as a genuine reconciliation
-    /// failure, permanently marking the attempt sticky `Unknown` -- worse
-    /// than the pre-fallback behavior of a transport error simply leaving
-    /// it retryable. Until this can instead prove the answering provider
-    /// has indexed the confirmed transaction/block, refusing to fall back
-    /// at all is the safe choice here (Codex P1 follow-up, pairtrade#182).
+    /// lagging, nor trusting the primary unconditionally (it can itself be
+    /// a node recovering from an outage, still catching up), is safe --
+    /// either would return the pre-swap balance as an apparently valid
+    /// snapshot, and `reconcile_balances` would read that as a genuine
+    /// reconciliation failure and permanently mark the attempt sticky
+    /// `Unknown` (Codex P1 follow-up, pairtrade#182, rounds 4 and 6). This
+    /// never falls back to another provider (see the struct-level
+    /// rationale), and additionally requires `confirmed_tx_hash`'s receipt
+    /// to actually be present on the one provider it does use before
+    /// trusting any balance it reports; a missing receipt returns a plain
+    /// retryable error rather than a stale snapshot.
     pub async fn balances_requiring_primary_provider(
         &self,
         taker: Address,
         sell_token: Address,
         buy_token: Address,
+        confirmed_tx_hash: H256,
     ) -> Result<ArcusSpotBalanceSnapshot> {
         if taker == Address::zero()
             || sell_token == Address::zero()
@@ -602,6 +618,16 @@ impl ArcusSpotChainClient {
             .first()
             .context("Arcus rpc_urls is empty")?
             .clone();
+        let receipt = provider
+            .get_transaction_receipt(confirmed_tx_hash)
+            .await
+            .context("Arcus confirmed-transaction receipt read failed")?;
+        if receipt.is_none() {
+            bail!(
+                "Arcus primary provider has not yet indexed confirmed tx {confirmed_tx_hash:#x}; \
+                 refusing to read balances until it has, rather than risk a stale pre-swap snapshot"
+            );
+        }
         let raw = read_balances_from_provider(provider, self.config.chain_id, taker, sell_token, buy_token)
             .await
             .map_err(|error| match error {
