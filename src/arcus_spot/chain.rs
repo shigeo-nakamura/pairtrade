@@ -56,7 +56,15 @@ impl ArcusSpotChainConfig {
                 bail!("Arcus RPC URL must have a host and no inline credentials");
             }
             if !seen.insert(rpc_url.trim().to_string()) {
-                bail!("Arcus rpc_urls contains a duplicate entry: {rpc_url}");
+                // Redacted for the same reason the provider-failure log
+                // line is: an RPC URL commonly carries an API token in its
+                // path or query string, and this validation error can
+                // surface wherever startup/config errors are displayed or
+                // logged (Codex P2 follow-up, pairtrade#182, round 5).
+                bail!(
+                    "Arcus rpc_urls contains a duplicate entry: {}",
+                    redact_rpc_url(rpc_url)
+                );
             }
         }
         Ok(())
@@ -199,6 +207,18 @@ fn classify_contract_call<T>(
     }
 }
 
+/// Extract the `Ok` value after the caller has already handled every
+/// `NonTransport` (as Fatal) and `Transport` (as Transient) outcome in
+/// the batch this belongs to -- by construction, only `Ok` can remain.
+fn expect_ok<T>(outcome: ContractCallOutcome<T>) -> T {
+    match outcome {
+        ContractCallOutcome::Ok(value) => value,
+        ContractCallOutcome::Transport(_) | ContractCallOutcome::NonTransport(_) => {
+            unreachable!("expect_ok called after Fatal/Transient outcomes were already handled")
+        }
+    }
+}
+
 /// Strip everything but scheme/host/port before this URL can reach a log
 /// line -- RPC providers commonly embed an API token in the path or query
 /// string, and `ArcusSpotChainConfig::validate` only forbids inline
@@ -307,96 +327,152 @@ impl ArcusSpotChainClient {
                 let buy_balance_call = buy_contract.balance_of(request_values.taker);
                 let allowance_call =
                     sell_contract.allowance(request_values.taker, request_values.permit2);
-                let (sell_balance, buy_balance, gas_balance, allowance) = tokio::join!(
-                    sell_balance_call.call(),
-                    buy_balance_call.call(),
-                    provider.get_balance(request_values.taker, None),
-                    allowance_call.call(),
-                );
-                let reads: Result<(U256, U256, U256, U256)> = (|| {
-                    Ok((
-                        sell_balance.context("Arcus sell balance read failed")?,
-                        buy_balance.context("Arcus buy balance read failed")?,
-                        gas_balance.context("Arcus gas balance read failed")?,
-                        allowance.context("Arcus Permit2 allowance read failed")?,
-                    ))
-                })();
-                let (sell_balance, buy_balance, gas_balance, allowance) =
-                    reads.map_err(ProviderAttemptError::Transient)?;
+                let (sell_balance_result, buy_balance_result, gas_balance_result, allowance_result) =
+                    tokio::join!(
+                        sell_balance_call.call(),
+                        buy_balance_call.call(),
+                        provider.get_balance(request_values.taker, None),
+                        allowance_call.call(),
+                    );
+                let sell_balance_outcome = classify_contract_call(sell_balance_result);
+                let buy_balance_outcome = classify_contract_call(buy_balance_result);
+                let allowance_outcome = classify_contract_call(allowance_result);
+                // get_balance is a direct provider call, not a contract
+                // call, so it has no revert/decode concept -- any failure
+                // there is transport-level by construction.
+                let gas_balance_outcome = match gas_balance_result {
+                    Ok(value) => ContractCallOutcome::Ok(value),
+                    Err(error) => ContractCallOutcome::Transport(anyhow::Error::new(error)),
+                };
 
-                // Both checks below are evaluated on *this* provider's own
-                // successful reads, immediately, as Fatal: a floor
-                // violation or an overbroad allowance is real on-chain
-                // safety-relevant state this provider just reported, not a
-                // sign it is unreachable, so it must never be swallowed by
-                // a later provider's fallback whose (possibly staler) view
-                // happens to look clean (Codex P1 follow-up, pairtrade#182).
-                // Checking this before the metadata fetch below also means
-                // a transport failure in that fetch can no longer mask
-                // either finding by making the whole attempt look merely
-                // Transient.
-                if let Err(error) =
-                    enforce_balance_limits(sell_balance, buy_balance, gas_balance, &request_values)
-                {
-                    return Err(ProviderAttemptError::Fatal(error));
-                }
-                if allowance > request_values.required_sell {
+                // Evaluate every outcome that succeeded immediately, as
+                // Fatal, *before* looking at whether any sibling merely
+                // transport-failed: a floor violation, an overbroad
+                // allowance, or a non-transport contract-level failure
+                // (a revert/decoding error on a reachable provider) is
+                // real on-chain safety-relevant state this provider just
+                // reported, not a sign it is unreachable. Discovering it
+                // only after failing to unwrap every field together (as
+                // the tuple-of-`?` version of this code did) would let a
+                // sibling's ordinary transport error make the whole
+                // attempt look Transient and mask it (Codex P1 follow-up,
+                // pairtrade#182, round 5).
+                if let ContractCallOutcome::NonTransport(error) = &sell_balance_outcome {
                     return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
-                        "Permit2 allowance {allowance} exceeds the exact required amount {}; refusing an overbroad approval",
-                        request_values.required_sell
+                        "Arcus sell balance read returned an unexpected response: {error}"
                     )));
                 }
+                if let ContractCallOutcome::Ok(value) = &sell_balance_outcome {
+                    if let Err(error) = enforce_sell_floor(*value, &request_values) {
+                        return Err(ProviderAttemptError::Fatal(error));
+                    }
+                }
+                if let ContractCallOutcome::NonTransport(error) = &buy_balance_outcome {
+                    return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                        "Arcus buy balance read returned an unexpected response: {error}"
+                    )));
+                }
+                if let ContractCallOutcome::Ok(value) = &buy_balance_outcome {
+                    if let Err(error) = enforce_buy_floor(*value, &request_values) {
+                        return Err(ProviderAttemptError::Fatal(error));
+                    }
+                }
+                if let ContractCallOutcome::Ok(value) = &gas_balance_outcome {
+                    if let Err(error) = enforce_gas_floor(*value, &request_values) {
+                        return Err(ProviderAttemptError::Fatal(error));
+                    }
+                }
+                if let ContractCallOutcome::NonTransport(error) = &allowance_outcome {
+                    return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                        "Arcus Permit2 allowance read returned an unexpected response: {error}"
+                    )));
+                }
+                if let ContractCallOutcome::Ok(value) = &allowance_outcome {
+                    if *value > request_values.required_sell {
+                        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                            "Permit2 allowance {value} exceeds the exact required amount {}; refusing an overbroad approval",
+                            request_values.required_sell
+                        )));
+                    }
+                }
+
+                // Nothing Fatal was found among whichever fields
+                // succeeded; only now does a sibling's transport failure
+                // matter, and only then is the whole attempt Transient.
+                let mut transient_error: Option<anyhow::Error> = None;
+                for (label, outcome) in [
+                    ("sell balance", &sell_balance_outcome),
+                    ("buy balance", &buy_balance_outcome),
+                    ("gas balance", &gas_balance_outcome),
+                    ("Permit2 allowance", &allowance_outcome),
+                ] {
+                    if let ContractCallOutcome::Transport(error) = outcome {
+                        transient_error.get_or_insert_with(|| {
+                            anyhow::anyhow!("Arcus {label} read failed: {error}")
+                        });
+                    }
+                }
+                if let Some(error) = transient_error {
+                    return Err(ProviderAttemptError::Transient(error));
+                }
+
+                let sell_balance = expect_ok(sell_balance_outcome);
+                let buy_balance = expect_ok(buy_balance_outcome);
+                let gas_balance = expect_ok(gas_balance_outcome);
+                let allowance = expect_ok(allowance_outcome);
 
                 let exact_value_permit = if allowance == request_values.required_sell {
                     None
                 } else {
                     let token_name_call = sell_contract.name();
                     let nonce_call = sell_contract.nonces(request_values.taker);
-                    // Concurrent, but each leg's error is classified on
-                    // its own: a reachable provider that simply doesn't
-                    // support one of these calls is a real, permanent
-                    // property of the token contract (Fatal -- a later
-                    // provider can't paper over it), while an actual
-                    // transport/RPC failure must stay Transient so
-                    // try_providers can retry the whole preflight on a
-                    // healthy endpoint (Codex P1/P2 follow-up,
-                    // pairtrade#182).
+                    // Same "collect every outcome, let any Fatal finding
+                    // take precedence over a sibling's Transport error"
+                    // shape as the balance/allowance batch above (Codex
+                    // P1/P2 follow-up, pairtrade#182, rounds 4-5): a
+                    // reachable provider's empty name, or its outright
+                    // lack of support for one of these calls, must not be
+                    // masked by the *other* call merely transport-failing.
                     let (name_result, nonce_result) =
                         tokio::join!(token_name_call.call(), nonce_call.call());
-                    let token_name = match classify_contract_call(name_result) {
-                        ContractCallOutcome::Ok(name) => name,
-                        ContractCallOutcome::Transport(error) => {
-                            return Err(ProviderAttemptError::Transient(
-                                error.context("Arcus EIP-2612 name() read failed"),
-                            ));
-                        }
-                        ContractCallOutcome::NonTransport(error) => {
-                            return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
-                                "sell token does not support the required EIP-2612 name(): {error}"
-                            )));
-                        }
-                    };
-                    let nonce = match classify_contract_call(nonce_result) {
-                        ContractCallOutcome::Ok(nonce) => nonce,
-                        ContractCallOutcome::Transport(error) => {
-                            return Err(ProviderAttemptError::Transient(
-                                error.context("Arcus EIP-2612 nonces() read failed"),
-                            ));
-                        }
-                        ContractCallOutcome::NonTransport(error) => {
-                            return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
-                                "sell token does not support the required EIP-2612 nonces(): {error}"
-                            )));
-                        }
-                    };
-                    // A reachable provider returning an empty name is
-                    // invalid data from a working endpoint, not a sign it
-                    // is unreachable -- Fatal for the same reason as above.
-                    if token_name.trim().is_empty() {
+                    let name_outcome = classify_contract_call(name_result);
+                    let nonce_outcome = classify_contract_call(nonce_result);
+
+                    if let ContractCallOutcome::NonTransport(error) = &name_outcome {
                         return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
-                            "sell token returned an empty EIP-2612 name"
+                            "sell token does not support the required EIP-2612 name(): {error}"
                         )));
                     }
+                    if let ContractCallOutcome::Ok(name) = &name_outcome {
+                        if name.trim().is_empty() {
+                            return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                                "sell token returned an empty EIP-2612 name"
+                            )));
+                        }
+                    }
+                    if let ContractCallOutcome::NonTransport(error) = &nonce_outcome {
+                        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                            "sell token does not support the required EIP-2612 nonces(): {error}"
+                        )));
+                    }
+
+                    let mut transient_error: Option<anyhow::Error> = None;
+                    if let ContractCallOutcome::Transport(error) = &name_outcome {
+                        transient_error.get_or_insert_with(|| {
+                            anyhow::anyhow!("Arcus EIP-2612 name() read failed: {error}")
+                        });
+                    }
+                    if let ContractCallOutcome::Transport(error) = &nonce_outcome {
+                        transient_error.get_or_insert_with(|| {
+                            anyhow::anyhow!("Arcus EIP-2612 nonces() read failed: {error}")
+                        });
+                    }
+                    if let Some(error) = transient_error {
+                        return Err(ProviderAttemptError::Transient(error));
+                    }
+
+                    let token_name = expect_ok(name_outcome);
+                    let nonce = expect_ok(nonce_outcome);
 
                     // version() is different: only a confirmed
                     // non-transport response (the contract reverted, or
@@ -584,12 +660,11 @@ async fn read_balances_from_provider(
     coherent.map_err(ProviderAttemptError::Transient)
 }
 
-fn enforce_balance_limits(
-    sell_balance: U256,
-    buy_balance: U256,
-    gas_balance: U256,
-    request: &ValidatedPreflightRequest,
-) -> Result<()> {
+// Split into one function per field (rather than one combined check) so
+// each can be evaluated the instant its own value is known, independent
+// of whether a *sibling* read succeeded or transport-failed (Codex P1
+// follow-up, pairtrade#182, round 5).
+fn enforce_sell_floor(sell_balance: U256, request: &ValidatedPreflightRequest) -> Result<()> {
     let residual = sell_balance
         .checked_sub(request.required_sell)
         .context("sell balance is below the required amount")?;
@@ -599,12 +674,20 @@ fn enforce_balance_limits(
             request.sell_floor
         );
     }
+    Ok(())
+}
+
+fn enforce_buy_floor(buy_balance: U256, request: &ValidatedPreflightRequest) -> Result<()> {
     if buy_balance < request.buy_floor {
         bail!(
             "current buy balance {buy_balance} is below floor {}",
             request.buy_floor
         );
     }
+    Ok(())
+}
+
+fn enforce_gas_floor(gas_balance: U256, request: &ValidatedPreflightRequest) -> Result<()> {
     if gas_balance < request.minimum_gas {
         bail!(
             "gas balance {gas_balance} is below minimum {}",
@@ -613,6 +696,7 @@ fn enforce_balance_limits(
     }
     Ok(())
 }
+
 
 fn balance_snapshot(
     _taker: Address,
@@ -672,13 +756,16 @@ mod tests {
     #[test]
     fn rejects_floor_violation() {
         let values = request().validate().unwrap();
-        assert!(enforce_balance_limits(
-            U256::from(1499),
-            U256::from(500),
-            U256::from(100),
-            &values,
-        )
-        .is_err());
+        assert!(enforce_sell_floor(U256::from(1499), &values).is_err());
+        assert!(enforce_buy_floor(U256::from(500), &values).is_ok());
+        assert!(enforce_gas_floor(U256::from(100), &values).is_ok());
+    }
+
+    #[test]
+    fn granular_floor_checks_are_independent() {
+        let values = request().validate().unwrap();
+        assert!(enforce_buy_floor(U256::from(1), &values).is_err());
+        assert!(enforce_gas_floor(U256::from(1), &values).is_err());
     }
 
     #[test]
