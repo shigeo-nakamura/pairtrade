@@ -632,19 +632,27 @@ impl ArcusSpotChainClient {
         // backend nodes: the receipt lookup above and the balance reads
         // below are separate requests that can land on *different*
         // backends behind that one URL, so confirming the receipt exists
-        // is not, by itself, proof the balance reads will see it too.
-        // Pin every balance read to the receipt's own block instead of
-        // "latest" (Codex P1 follow-up, pairtrade#182, round 7).
-        let receipt_block = receipt
-            .block_number
-            .context("Arcus confirmed-transaction receipt is missing its block number")?;
+        // is not, by itself, proof the balance reads will see it too. Pin
+        // every balance read to the receipt's own block *hash*, not just
+        // its height: a pool of nodes behind one URL can disagree about
+        // which block occupies a given height during a reorg (or simply
+        // be serving different forks), and a plain height-based BlockId
+        // would let a balance read silently resolve against a different
+        // block than the one that actually contains the confirmed
+        // transaction. A hash uniquely identifies one block regardless of
+        // height collisions across forks, so a node that reorged away
+        // from it errors instead of substituting a different block
+        // (Codex P1 follow-up, pairtrade#182, round 8).
+        let receipt_block_hash = receipt
+            .block_hash
+            .context("Arcus confirmed-transaction receipt is missing its block hash")?;
         let raw = read_balances_from_provider(
             provider,
             self.config.chain_id,
             taker,
             sell_token,
             buy_token,
-            Some(BlockId::Number(receipt_block.into())),
+            Some(BlockId::Hash(receipt_block_hash)),
         )
         .await
         .map_err(|error| match error {
