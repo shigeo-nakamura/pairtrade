@@ -582,23 +582,25 @@ impl ArcusSpotChainClient {
         ))
     }
 
-    /// Like `balances`, but reads only the first configured provider and
-    /// never falls back to another one.
+    /// Like `balances`, but requires proof that whichever provider answers
+    /// has actually observed `confirmed_tx_hash` before trusting any
+    /// balance it reports.
     ///
-    /// Reconciling a just-confirmed swap needs proof that whichever
-    /// provider answered has actually observed *that* transaction: neither
-    /// falling back to a secondary provider that is merely reachable but
-    /// lagging, nor trusting the primary unconditionally (it can itself be
-    /// a node recovering from an outage, still catching up), is safe --
-    /// either would return the pre-swap balance as an apparently valid
-    /// snapshot, and `reconcile_balances` would read that as a genuine
-    /// reconciliation failure and permanently mark the attempt sticky
-    /// `Unknown` (Codex P1 follow-up, pairtrade#182, rounds 4 and 6). This
-    /// never falls back to another provider (see the struct-level
-    /// rationale), and additionally requires `confirmed_tx_hash`'s receipt
-    /// to actually be present on the one provider it does use before
-    /// trusting any balance it reports; a missing receipt returns a plain
-    /// retryable error rather than a stale snapshot.
+    /// Earlier rounds of this method refused to fall back to a secondary
+    /// provider at all, since a merely-reachable-but-lagging provider
+    /// could otherwise return the pre-swap balance as an apparently valid
+    /// snapshot and `reconcile_balances` would read that as a genuine
+    /// reconciliation failure, permanently marking the attempt sticky
+    /// `Unknown` (Codex P1 follow-up, pairtrade#182, rounds 4 and 6). Now
+    /// that every attempt requires the confirmed transaction's own
+    /// receipt to be present, and pins every balance read to that
+    /// receipt's exact block hash (rounds 7-8), that proof is what makes
+    /// a result trustworthy -- not which provider happened to answer. So
+    /// falling back through every configured provider is safe again, and
+    /// restores availability a permanently-primary-only design would
+    /// otherwise lose if provider 0 specifically never catches up (Codex
+    /// P1 follow-up, pairtrade#182, round 9): "hasn't indexed this tx yet"
+    /// is `Transient` on any provider, and try_providers moves on.
     pub async fn balances_requiring_primary_provider(
         &self,
         taker: Address,
@@ -613,51 +615,47 @@ impl ArcusSpotChainClient {
         {
             bail!("invalid Arcus balance request addresses");
         }
-        let provider = self
-            .providers
-            .first()
-            .context("Arcus rpc_urls is empty")?
-            .clone();
-        let receipt = provider
-            .get_transaction_receipt(confirmed_tx_hash)
-            .await
-            .context("Arcus confirmed-transaction receipt read failed")?
-            .with_context(|| {
-                format!(
-                    "Arcus primary provider has not yet indexed confirmed tx {confirmed_tx_hash:#x}; \
-                     refusing to read balances until it has, rather than risk a stale pre-swap snapshot"
+        let chain_id = self.config.chain_id;
+        let (raw, _provider) = self
+            .try_providers(|provider| async move {
+                let receipt = provider
+                    .get_transaction_receipt(confirmed_tx_hash)
+                    .await
+                    .context("Arcus confirmed-transaction receipt read failed")?;
+                let Some(receipt) = receipt else {
+                    return Err(ProviderAttemptError::Transient(anyhow::anyhow!(
+                        "Arcus provider has not yet indexed confirmed tx {confirmed_tx_hash:#x}"
+                    )));
+                };
+                // A single RPC URL commonly load-balances across a pool
+                // of backend nodes: the receipt lookup above and the
+                // balance reads below are separate requests that can
+                // land on *different* backends behind that one URL, so
+                // confirming the receipt exists is not, by itself, proof
+                // the balance reads will see it too. Pin every balance
+                // read to the receipt's own block *hash*, not just its
+                // height: nodes behind one URL can disagree about which
+                // block occupies a given height during a reorg, and a
+                // plain height-based BlockId would let a balance read
+                // silently resolve against a different block than the
+                // one that actually contains the confirmed transaction. A
+                // hash uniquely identifies one block regardless of height
+                // collisions across forks, so a node that reorged away
+                // from it errors instead of substituting a different one.
+                let receipt_block_hash = receipt.block_hash.context(
+                    "Arcus confirmed-transaction receipt is missing its block hash",
+                )?;
+                read_balances_from_provider(
+                    provider,
+                    chain_id,
+                    taker,
+                    sell_token,
+                    buy_token,
+                    Some(BlockId::Hash(receipt_block_hash)),
                 )
-            })?;
-        // A single RPC URL commonly load-balances across a pool of
-        // backend nodes: the receipt lookup above and the balance reads
-        // below are separate requests that can land on *different*
-        // backends behind that one URL, so confirming the receipt exists
-        // is not, by itself, proof the balance reads will see it too. Pin
-        // every balance read to the receipt's own block *hash*, not just
-        // its height: a pool of nodes behind one URL can disagree about
-        // which block occupies a given height during a reorg (or simply
-        // be serving different forks), and a plain height-based BlockId
-        // would let a balance read silently resolve against a different
-        // block than the one that actually contains the confirmed
-        // transaction. A hash uniquely identifies one block regardless of
-        // height collisions across forks, so a node that reorged away
-        // from it errors instead of substituting a different block
-        // (Codex P1 follow-up, pairtrade#182, round 8).
-        let receipt_block_hash = receipt
-            .block_hash
-            .context("Arcus confirmed-transaction receipt is missing its block hash")?;
-        let raw = read_balances_from_provider(
-            provider,
-            self.config.chain_id,
-            taker,
-            sell_token,
-            buy_token,
-            Some(BlockId::Hash(receipt_block_hash)),
-        )
-        .await
-        .map_err(|error| match error {
-            ProviderAttemptError::Fatal(error) | ProviderAttemptError::Transient(error) => error,
-        })?;
+                .await
+            })
+            .await?;
         Ok(balance_snapshot(
             taker,
             sell_token,
