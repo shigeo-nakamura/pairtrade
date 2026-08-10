@@ -675,6 +675,20 @@ impl PairTradeEngine {
         if self.cfg.backtest_mode {
             return;
         }
+        // In live dry_run mode, exits are simulated: execute.rs's
+        // exit_dry_run path still bumps total_pnl/total_funding_carry (the
+        // two inputs to `accounted_pnl` below) via write_pnl_record, but
+        // those simulated results never touch the connector-sourced
+        // equity_cache real equity is read from. Every simulated exit would
+        // otherwise permanently diverge `accounted_pnl` from real equity,
+        // making every following flat/settled observation look like a
+        // material, unreconciled accounting move -- deferring detection of
+        // real deposits/withdrawals indefinitely and leaving the DD peak
+        // and daily denominator stale for the rest of the dry-run session
+        // (Codex P2 follow-up, bot-strategy#783).
+        if self.cfg.dry_run {
+            return;
+        }
         let threshold_bps = self.cfg.risk.max_session_loss_bps;
         let daily_threshold_bps = self.cfg.risk.max_daily_loss_bps;
         let min_usd = self.cfg.risk.session_dd_capital_event_min_usd;
@@ -1383,7 +1397,8 @@ fn reconcile_capital_delta(
     let baseline_capital_basis = baseline_equity - baseline_accounted_pnl;
     let current_capital_basis = current_equity - current_accounted_pnl;
     let disposition =
-        match classify_capital_event(baseline_capital_basis, current_capital_basis, min_usd) {
+        match classify_capital_basis_delta(baseline_capital_basis, current_capital_basis, min_usd)
+        {
             None => CapitalDisposition::Reconciled,
             Some(_) if accounted_pnl_delta.abs() >= min_usd || position_seen_since_baseline => {
                 CapitalDisposition::Ambiguous
@@ -1399,18 +1414,31 @@ fn reconcile_capital_delta(
     }
 }
 
-/// Whether an unexplained equity delta observed while flat-and-settled is a
-/// capital event (deposit / withdrawal). Returns the signed delta when
-/// `|current − baseline| ≥ min_usd`, else `None`. `baseline ≤ 0` means the
-/// reference is not yet established (no event). Pure split of the gating
-/// maths in `detect_capital_event_and_rebaseline` for unit testing.
-/// bot-strategy#575 ①.
-pub(in crate::pairtrade) fn classify_capital_event(
-    baseline: f64,
-    current: f64,
-    min_usd: f64,
-) -> Option<f64> {
-    if min_usd <= 0.0 || baseline <= 0.0 || current <= 0.0 {
+/// Whether an unexplained delta in a derived capital-*basis* value
+/// (`equity - accounted PnL`) observed while flat-and-settled is a capital
+/// event (deposit / withdrawal). Returns the signed delta when
+/// `|current − baseline| ≥ min_usd`, else `None`. Pure split of the
+/// gating maths in `reconcile_capital_delta` for unit testing.
+///
+/// Deliberately has no non-positivity guard on `baseline`/`current`: unlike
+/// raw equity, a capital basis can legitimately be zero or negative -- e.g.
+/// a baseline of $1,053.27 with $53.27 already-accounted realized PnL
+/// (basis $1,000), followed by a withdrawal down to $0.01 equity with that
+/// same accounted PnL still outstanding (basis -$53.26) -- without that
+/// meaning "reference not yet established". An earlier version of this
+/// reconciliation reused a raw-equity-oriented `baseline <= 0.0 || current
+/// <= 0.0` guard here, which silently reclassified exactly that withdrawal
+/// as `Reconciled` instead of `Verified`, and then -- because the paired
+/// baseline advances to the same negative basis on every following
+/// observation -- permanently blocked capital-event detection for the rest
+/// of the round, since every subsequent baseline stayed <= 0 too (a later
+/// redeposit would have been silently ignored the same way). The "not yet
+/// established" case for this call site is already handled upstream, by
+/// `capital_baseline_equity <= 0.0` and `capital_baseline_accounted_pnl ==
+/// None`, so no non-positivity guard belongs here at all (Codex P1
+/// follow-up, bot-strategy#783).
+fn classify_capital_basis_delta(baseline: f64, current: f64, min_usd: f64) -> Option<f64> {
+    if min_usd <= 0.0 {
         return None;
     }
     let delta = current - baseline;
@@ -1738,35 +1766,72 @@ mod tests {
         assert!(deferred.position_seen_since_baseline);
     }
 
-    // bot-strategy#575 ①: capital-event classification. A deposit /
-    // withdrawal of at least `min_usd` while flat is an event; a smaller
-    // drift (or an unset/zero baseline) is not.
+    // bot-strategy#783 (Codex P1 follow-up): a near-full withdrawal after a
+    // positive round makes the capital *basis* (equity - accounted PnL)
+    // negative even though live equity ($0.01) is completely valid. This
+    // must still verify as a real capital event, not be silently swallowed
+    // as "no signal" the way reusing classify_capital_event's raw-equity
+    // ≤0 guard did.
     #[test]
-    fn classify_capital_event_detects_deposit_and_withdrawal() {
-        assert_eq!(classify_capital_event(950.0, 960.0, 5.0), Some(10.0));
-        assert_eq!(classify_capital_event(950.0, 940.0, 5.0), Some(-10.0));
+    fn capital_reconciliation_verifies_a_withdrawal_that_makes_the_basis_negative() {
+        // baseline: $1,053.27 equity, $53.27 already-accounted PnL -> basis $1,000.
+        // current: $0.01 equity, same $53.27 accounted PnL -> basis -$53.26.
+        let withdrawal = reconcile_capital_delta(1_053.27, 0.01, 53.27, 53.27, false, 5.0);
+        assert_eq!(
+            withdrawal.disposition,
+            CapitalDisposition::Verified(-1_053.26)
+        );
     }
 
     #[test]
-    fn classify_capital_event_ignores_sub_threshold_drift() {
-        assert_eq!(classify_capital_event(950.0, 953.0, 5.0), None);
-        assert_eq!(classify_capital_event(950.0, 950.0, 5.0), None);
+    fn capital_reconciliation_verifies_a_redeposit_after_a_negative_basis_baseline() {
+        // Continues the withdrawal above: the paired baseline has advanced
+        // to the negative basis (-$53.26 = $0.01 equity - $53.27 accounted
+        // PnL). A subsequent redeposit to $500.01 must still be detected --
+        // the old code permanently stopped detecting anything once the
+        // baseline itself went <= 0.
+        let redeposit = reconcile_capital_delta(0.01, 500.01, 53.27, 53.27, false, 5.0);
+        assert_eq!(redeposit.disposition, CapitalDisposition::Verified(500.0));
+    }
+
+    // bot-strategy#575 ① / #783: capital-basis-delta classification. A
+    // deposit/withdrawal of at least `min_usd` while flat is an event; a
+    // smaller drift is not. Unlike the raw-equity classifier this replaced,
+    // a non-positive baseline/current basis is not special-cased -- see
+    // classify_capital_basis_delta's own doc comment.
+    #[test]
+    fn classify_capital_basis_delta_detects_deposit_and_withdrawal() {
+        assert_eq!(classify_capital_basis_delta(950.0, 960.0, 5.0), Some(10.0));
+        assert_eq!(classify_capital_basis_delta(950.0, 940.0, 5.0), Some(-10.0));
     }
 
     #[test]
-    fn classify_capital_event_boundary_is_inclusive() {
+    fn classify_capital_basis_delta_ignores_sub_threshold_drift() {
+        assert_eq!(classify_capital_basis_delta(950.0, 953.0, 5.0), None);
+        assert_eq!(classify_capital_basis_delta(950.0, 950.0, 5.0), None);
+    }
+
+    #[test]
+    fn classify_capital_basis_delta_boundary_is_inclusive() {
         // Exactly min_usd counts as an event (≥, not >).
-        assert_eq!(classify_capital_event(950.0, 955.0, 5.0), Some(5.0));
+        assert_eq!(classify_capital_basis_delta(950.0, 955.0, 5.0), Some(5.0));
     }
 
     #[test]
-    fn classify_capital_event_unset_baseline_or_disabled() {
-        // Unset baseline (≤ 0) establishes the reference elsewhere — no event.
-        assert_eq!(classify_capital_event(0.0, 960.0, 5.0), None);
-        // min_usd = 0 disables detection.
-        assert_eq!(classify_capital_event(950.0, 9_000.0, 0.0), None);
-        // Non-positive current (connector hiccup) is not an event.
-        assert_eq!(classify_capital_event(950.0, 0.0, 5.0), None);
+    fn classify_capital_basis_delta_disabled_when_min_usd_zero() {
+        assert_eq!(classify_capital_basis_delta(950.0, 9_000.0, 0.0), None);
+    }
+
+    #[test]
+    fn classify_capital_basis_delta_handles_a_non_positive_basis() {
+        // A negative basis (equity below already-accounted PnL) is a real,
+        // ordinary value here, not a sentinel for "unset" -- see
+        // reconcile_capital_delta's own tests for the full withdrawal/
+        // redeposit scenario this exists to support.
+        assert_eq!(
+            classify_capital_basis_delta(-53.26, 446.74, 5.0),
+            Some(500.0)
+        );
     }
 
     // bot-strategy#575 ②: RISK_ACK re-anchor token parsing.
