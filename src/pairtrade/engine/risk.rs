@@ -675,20 +675,6 @@ impl PairTradeEngine {
         if self.cfg.backtest_mode {
             return;
         }
-        // In live dry_run mode, exits are simulated: execute.rs's
-        // exit_dry_run path still bumps total_pnl/total_funding_carry (the
-        // two inputs to `accounted_pnl` below) via write_pnl_record, but
-        // those simulated results never touch the connector-sourced
-        // equity_cache real equity is read from. Every simulated exit would
-        // otherwise permanently diverge `accounted_pnl` from real equity,
-        // making every following flat/settled observation look like a
-        // material, unreconciled accounting move -- deferring detection of
-        // real deposits/withdrawals indefinitely and leaving the DD peak
-        // and daily denominator stale for the rest of the dry-run session
-        // (Codex P2 follow-up, bot-strategy#783).
-        if self.cfg.dry_run {
-            return;
-        }
         let threshold_bps = self.cfg.risk.max_session_loss_bps;
         let daily_threshold_bps = self.cfg.risk.max_daily_loss_bps;
         let min_usd = self.cfg.risk.session_dd_capital_event_min_usd;
@@ -742,6 +728,11 @@ impl PairTradeEngine {
                 reference_change: Option<(f64, f64)>,
                 prev_start_equity: f64,
             },
+            /// A settled trade/funding move reconciled cleanly with no
+            /// reference change and no prior deferral -- nothing to log or
+            /// report, but the paired baseline was advanced in memory and
+            /// must still be persisted (see the comment at its call site).
+            ReconciledQuietly,
         }
 
         let detected: Option<Rebaseline> = {
@@ -882,7 +873,20 @@ impl PairTradeEngine {
                                         reconciliation,
                                     })
                                 } else {
-                                    None
+                                    // The ordinary case: a settled trade/funding
+                                    // move reconciled cleanly with no reference
+                                    // change and no prior deferral, nothing worth
+                                    // logging. But the paired baseline above was
+                                    // still advanced in memory -- without
+                                    // persisting it here, a restart between this
+                                    // tick and the next *interesting* rebaseline
+                                    // would reload the previous, now-stale
+                                    // baseline, double-count everything settled
+                                    // since, and (per the Ambiguous branch's own
+                                    // guard) can leave a later real deposit stuck
+                                    // Ambiguous forever (Codex P1 follow-up,
+                                    // bot-strategy#783).
+                                    Some(Rebaseline::ReconciledQuietly)
                                 }
                             }
                             CapitalDisposition::Ambiguous => {
@@ -1142,6 +1146,9 @@ impl PairTradeEngine {
                         "action": "seed_guarded_paired_baseline_without_reanchor",
                     })),
                 );
+                self.persist_risk_state();
+            }
+            Some(Rebaseline::ReconciledQuietly) => {
                 self.persist_risk_state();
             }
             None => {}
