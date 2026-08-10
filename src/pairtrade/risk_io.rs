@@ -58,6 +58,10 @@ pub(super) struct InstanceRiskState {
     /// `pnl_today` for at-a-glance attribution.
     #[serde(default)]
     pub funding_carry_today: f64,
+    /// Round-scoped cumulative funding carry used with `total_pnl` to
+    /// reconcile delayed account-equity settlement. bot-strategy#783.
+    #[serde(default)]
+    pub total_funding_carry: f64,
     /// Periodic equity samples used to compute the rolling peak for
     /// `max_session_loss_bps` (Phase 3-1). One sample per
     /// `session_dd_sample_secs`; entries older than
@@ -74,6 +78,14 @@ pub(super) struct InstanceRiskState {
     /// into the rolling peak. bot-strategy#575 ①.
     #[serde(default)]
     pub capital_baseline_equity: f64,
+    /// Accounted PnL (`total_pnl + total_funding_carry`) captured with the
+    /// equity baseline. `None` marks a pre-#783 snapshot.
+    #[serde(default)]
+    pub capital_baseline_accounted_pnl: Option<f64>,
+    /// Whether a position was observed after the paired baseline. This makes an
+    /// unexplained recovery-close settlement fail safe across restarts.
+    #[serde(default)]
+    pub capital_position_seen_since_baseline: bool,
     /// Sticky halt flag set when the rolling-peak DD threshold trips.
     /// Persists across restarts so a crash inside the cooling-off
     /// window does not silently re-arm the bot. Cleared only by the
@@ -125,6 +137,8 @@ impl InstanceRiskState {
         self.last_stop_loss_per_pair.clear();
         self.equity_samples.clear();
         self.capital_baseline_equity = 0.0;
+        self.capital_baseline_accounted_pnl = None;
+        self.capital_position_seen_since_baseline = false;
         self.session_halted = false;
         self.session_halt_reason = None;
         self.session_halt_ts = None;
@@ -139,6 +153,7 @@ impl InstanceRiskState {
         self.total_trades = 0;
         self.total_wins = 0;
         self.total_pnl = 0.0;
+        self.total_funding_carry = 0.0;
         self.peak_pnl = 0.0;
         self.max_dd = 0.0;
     }
@@ -262,6 +277,9 @@ mod tests {
             InstanceRiskState {
                 realized_pnl_today: -4.20,
                 funding_carry_today: -0.85,
+                total_funding_carry: -1.25,
+                capital_baseline_accounted_pnl: Some(10.75),
+                capital_position_seen_since_baseline: true,
                 ..InstanceRiskState::default()
             },
         );
@@ -286,6 +304,10 @@ mod tests {
             "realized_pnl_today round-trip mismatch: {}",
             restored.realized_pnl_today
         );
+
+        assert!((restored.total_funding_carry - (-1.25)).abs() < 1e-9);
+        assert_eq!(restored.capital_baseline_accounted_pnl, Some(10.75));
+        assert!(restored.capital_position_seen_since_baseline);
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&tmpdir);
@@ -315,11 +337,14 @@ mod tests {
             session_start_ts: 1_700_000_000,
             realized_pnl_today: -4.20,
             funding_carry_today: -0.85,
+            total_funding_carry: -1.25,
             equity_samples: vec![EquitySample {
                 ts: 1_700_000_000,
                 equity: 500.0,
             }],
             capital_baseline_equity: 500.0,
+            capital_baseline_accounted_pnl: Some(11.25),
+            capital_position_seen_since_baseline: true,
             session_halted: true,
             session_halt_reason: Some("session_dd_500bps".to_string()),
             session_halt_ts: Some(1_700_000_500),
@@ -346,12 +371,15 @@ mod tests {
         assert!(s.last_stop_loss_per_pair.is_empty());
         assert!(s.equity_samples.is_empty());
         assert_eq!(s.capital_baseline_equity, 0.0);
+        assert_eq!(s.capital_baseline_accounted_pnl, None);
+        assert!(!s.capital_position_seen_since_baseline);
         assert!(!s.session_halted);
         assert_eq!(s.session_halt_reason, None);
         assert_eq!(s.session_halt_ts, None);
         assert_eq!(s.total_trades, 0);
         assert_eq!(s.total_wins, 0);
         assert_eq!(s.total_pnl, 0.0);
+        assert_eq!(s.total_funding_carry, 0.0);
         assert_eq!(s.peak_pnl, 0.0);
         assert_eq!(s.max_dd, 0.0);
 

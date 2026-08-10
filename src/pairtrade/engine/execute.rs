@@ -175,6 +175,7 @@ impl PairTradeEngine {
                             self.write_pnl_record(inst_idx, record);
                             self.instances[inst_idx].realized_pnl_today += pnl_value;
                             self.instances[inst_idx].funding_carry_today += carry_usd;
+                            self.instances[inst_idx].total_funding_carry += carry_usd;
                             // write_pnl_record always bumps total_trades / total_pnl
                             // (now persisted, bot-strategy#320), so the snapshot is
                             // dirty regardless of pnl sign.

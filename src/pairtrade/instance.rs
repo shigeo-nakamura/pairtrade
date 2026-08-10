@@ -84,6 +84,11 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// status.json as `funding_carry_today` for dashboard attribution.
     /// bot-strategy#371.
     pub(in crate::pairtrade) funding_carry_today: f64,
+    /// Round-scoped cumulative funding carry. Unlike `funding_carry_today`,
+    /// this does not reset at UTC rollover: capital-event reconciliation
+    /// needs the full funding movement since its last settled baseline to
+    /// distinguish exchange settlement from a transfer. bot-strategy#783.
+    pub(in crate::pairtrade) total_funding_carry: f64,
     /// True once `realized_pnl_today` has breached
     /// `max_daily_loss_bps`. Used for transition logging only
     /// (activate/clear); the live gate check is recomputed every tick
@@ -93,10 +98,23 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// `risk.session_dd_sample_secs` cadence; entries older than
     /// `risk.session_dd_lookback_secs` are pruned in-place.
     pub(in crate::pairtrade) equity_samples: Vec<risk_io::EquitySample>,
-    /// bot-strategy#575 ①: last equity captured while continuously flat and
-    /// settled, the reference for deposit / withdrawal detection. 0.0 =
-    /// unset. Persisted via `InstanceRiskState`.
+    /// Last settled account equity used by capital reconciliation. It is
+    /// paired with `capital_baseline_accounted_pnl` so realized trade PnL and
+    /// funding that settle after a close are backed out before a transfer is
+    /// inferred. 0.0 = unset. Persisted via `InstanceRiskState`.
     pub(in crate::pairtrade) capital_baseline_equity: f64,
+    /// `total_pnl + total_funding_carry` captured with
+    /// `capital_baseline_equity`. `None` identifies a pre-#783 snapshot and
+    /// is migrated on the next flat/settled observation.
+    pub(in crate::pairtrade) capital_baseline_accounted_pnl: Option<f64>,
+    /// True after any position was observed since the paired baseline. Persisted
+    /// so an unaccounted recovery close cannot be mistaken for a transfer.
+    pub(in crate::pairtrade) capital_position_seen_since_baseline: bool,
+    /// Runtime-only latch that prevents an ambiguous post-close settlement
+    /// from emitting the same risk-history event on every tick. It never
+    /// authorizes a rebaseline; it clears only after accounting and equity
+    /// reconcile or a verified capital event lands.
+    pub(in crate::pairtrade) capital_rebaseline_deferred: bool,
     /// bot-strategy#575 ①: when this instance most recently became flat
     /// (no open or pending positions). `detect_capital_event_and_rebaseline`
     /// requires `session_dd_capital_settle_secs` of continuous flatness

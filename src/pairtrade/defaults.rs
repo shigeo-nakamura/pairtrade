@@ -155,10 +155,10 @@ pub(super) const DEFAULT_SESSION_DD_SAMPLE_SECS: u64 = 3600;
 pub(super) const DEFAULT_MAX_NOTIONAL_HEADROOM: f64 = 0.0;
 
 // Deposit-aware DD rebaseline — bot-strategy#575 ①. While an instance is
-// flat (so live equity == pure collateral, no unrealized mark noise) and has
-// been flat for at least `session_dd_capital_settle_secs`, an unexplained
-// equity jump of at least `session_dd_capital_event_min_usd` is treated as a
-// capital event (deposit / withdrawal / sub-account transfer) and the rolling
+// flat and settled, a material equity jump is reconciled against round-scoped
+// realized trade PnL and funding. Only the residual delta is treated as a capital
+// event when no material accounting movement makes it ambiguous. The event
+// may represent a deposit, withdrawal, or sub-account transfer; the rolling
 // session-DD peak is rebaselined to the new equity (DD → 0). This stops a
 // sticky 30-day peak from pinning a halted variant at the boundary after a
 // top-up. 0 USD disables the detection. The settle window guards against

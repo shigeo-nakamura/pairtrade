@@ -12,15 +12,15 @@
 # code-path reset that fires on a normal round_id transition; kept in
 # sync so this manual bootstrap and the automatic reset zero the same
 # fields — bot-strategy#767 round2):
-#   - total_trades, total_wins, total_pnl, peak_pnl, max_dd  (#320)
+#   - total_trades, total_wins, total_pnl, total_funding_carry,
+#     peak_pnl, max_dd                                        (#320 / #783)
 #   - consecutive_losses, circuit_breaker_until_ts            (risk gating)
 #   - last_stop_loss_per_pair                                 (#316 cool-down anchors)
 #   - equity_samples                                          (#185 Phase 3-1, leverage-scale dependent)
 #   - session_halted, session_halt_reason, session_halt_ts    (#185 Phase 3-1)
-#   - capital_baseline_equity                                 (#752 capital-event rebaseline anchor;
-#     leaving this set to the previous round's baseline lets the next settled risk
-#     check classify a round-boundary collateral/reference change against the old
-#     round and shift session_start_equity by that delta)
+#   - capital_baseline_equity / accounted PnL / position flag (#752 / #783 capital-event anchors;
+#     clearing all three prevents the next round from comparing collateral and
+#     accounting values against different round scopes)
 #
 # Fields NOT touched (correctly auto-rolling at UTC midnight, do not need
 # round-boundary handling):
@@ -101,6 +101,7 @@ RESET='.instances |= with_entries(.value += {
     total_trades: 0,
     total_wins: 0,
     total_pnl: 0,
+    total_funding_carry: 0,
     peak_pnl: 0,
     max_dd: 0,
     consecutive_losses: 0,
@@ -108,6 +109,8 @@ RESET='.instances |= with_entries(.value += {
     last_stop_loss_per_pair: {},
     equity_samples: [],
     capital_baseline_equity: 0,
+    capital_baseline_accounted_pnl: null,
+    capital_position_seen_since_baseline: false,
     session_halted: false,
     session_halt_reason: null,
     session_halt_ts: null
@@ -119,11 +122,12 @@ echo
 
 echo "=== BEFORE (per-instance, abbreviated) ==="
 jq '.instances | with_entries(.value |= {
-    total_trades, total_wins, total_pnl, peak_pnl, max_dd,
+    total_trades, total_wins, total_pnl, total_funding_carry, peak_pnl, max_dd,
     consecutive_losses, circuit_breaker_until_ts,
     last_stop_loss_per_pair: (.last_stop_loss_per_pair // {} | length),
     equity_samples_n: (.equity_samples // [] | length),
-    capital_baseline_equity,
+    capital_baseline_equity, capital_baseline_accounted_pnl,
+    capital_position_seen_since_baseline,
     session_halted
 })' "$STATE_PATH"
 
@@ -131,11 +135,12 @@ if [[ $DRY_RUN -eq 1 ]]; then
     echo
     echo "=== AFTER (preview, dry-run) ==="
     jq "$RESET | .instances | with_entries(.value |= {
-        total_trades, total_wins, total_pnl, peak_pnl, max_dd,
+        total_trades, total_wins, total_pnl, total_funding_carry, peak_pnl, max_dd,
         consecutive_losses, circuit_breaker_until_ts,
         last_stop_loss_per_pair: (.last_stop_loss_per_pair // {} | length),
         equity_samples_n: (.equity_samples // [] | length),
-        capital_baseline_equity,
+        capital_baseline_equity, capital_baseline_accounted_pnl,
+        capital_position_seen_since_baseline,
         session_halted
     })" "$STATE_PATH"
     echo
@@ -158,11 +163,12 @@ trap - EXIT
 echo
 echo "=== AFTER (per-instance, abbreviated) ==="
 jq '.instances | with_entries(.value |= {
-    total_trades, total_wins, total_pnl, peak_pnl, max_dd,
+    total_trades, total_wins, total_pnl, total_funding_carry, peak_pnl, max_dd,
     consecutive_losses, circuit_breaker_until_ts,
     last_stop_loss_per_pair: (.last_stop_loss_per_pair // {} | length),
     equity_samples_n: (.equity_samples // [] | length),
-    capital_baseline_equity,
+    capital_baseline_equity, capital_baseline_accounted_pnl,
+    capital_position_seen_since_baseline,
     session_halted
 })' "$STATE_PATH"
 

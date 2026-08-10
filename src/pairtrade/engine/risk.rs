@@ -508,6 +508,10 @@ impl PairTradeEngine {
                     // equity rather than the pre-ack value.
                     if equity > 0.0 {
                         inst.capital_baseline_equity = equity;
+                        inst.capital_baseline_accounted_pnl =
+                            Some(inst.total_pnl + inst.total_funding_carry);
+                        inst.capital_position_seen_since_baseline = false;
+                        inst.capital_rebaseline_deferred = false;
                     }
                     format!(", peak re-anchored to equity={:.2} (DD→0)", equity)
                 } else {
@@ -649,31 +653,24 @@ impl PairTradeEngine {
         // without a restart, instead of freezing at the persisted sample.
     }
 
-    /// Detect a capital event (deposit / withdrawal / sub-account transfer)
-    /// and rebaseline the rolling session-DD peak to the new equity so the
-    /// drawdown budget resets (DD → 0). bot-strategy#575 ①.
+    /// Detect a verified capital event (deposit / withdrawal / sub-account
+    /// transfer) and rebaseline the rolling session-DD peak. bot-strategy#575
+    /// ① / bot-strategy#783.
     ///
-    /// Detection is intentionally scoped to a **flat, settled** instance:
-    /// when no position is open, live equity equals pure collateral (no
-    /// unrealized mark-to-market noise), and with no trades in flight the
-    /// only thing that can move it is a capital flow. An equity change of at
-    /// least `session_dd_capital_event_min_usd` versus the last settled-flat
-    /// reading is therefore attributable to a capital event, never to trading
-    /// PnL (which moves equity only while a position is open — i.e. not flat).
-    /// The `session_dd_capital_settle_secs` dwell guards against reading a
-    /// post-close collateral-settlement lag as a deposit; a halted variant,
-    /// flat since the halt, always clears it.
+    /// A flat account can still move after a close: pairtrade records the
+    /// realized fill PnL/funding before Lighter's cached account equity shows
+    /// the corresponding settlement. Therefore raw `equity - baseline` is
+    /// not capital evidence. We reconcile it against the round-scoped trade
+    /// PnL and funding accumulated since the baseline:
     ///
-    /// On a detected event the rolling peak is collapsed to current equity
-    /// and `session_start_equity` (the daily-DD denominator) is shifted by
-    /// the same delta so both gates reflect the new deployable capital. If
-    /// the configured equity reference changed across a restart, that change
-    /// is committed on this same flat/settled observation: a real collateral
-    /// delta wins (and is applied once); without a delta the new configured
-    /// reference becomes the denominator. The sticky `session_halted` flag is
-    /// deliberately **not** cleared here — resuming trading stays an explicit
-    /// operator action (RISK_ACK), this only restores the headroom so that ack
-    /// does not immediately re-breach.
+    /// `inferred capital = raw equity delta - accounted PnL delta`.
+    ///
+    /// A delta is allowed to erase the DD peak only when it is still material
+    /// and no material accounted-PnL movement makes the classification
+    /// ambiguous. Ambiguous observations are audited and fail safe: the peak
+    /// and daily denominator remain untouched until exchange equity catches
+    /// up. A genuine transfer made after the prior PnL has reconciled retains
+    /// the automatic #575 behavior.
     pub(in crate::pairtrade) fn detect_capital_event_and_rebaseline(&mut self, inst_idx: usize) {
         if self.cfg.backtest_mode {
             return;
@@ -690,15 +687,6 @@ impl PairTradeEngine {
                     || (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9,
             )
         };
-        // No peak to rebaseline when both session DD and daily DD are
-        // disabled, and detection is off when the threshold is 0 USD. A
-        // pending config-reference change is the exception: it must still be
-        // reconciled at the same flat/settled safety boundary. Daily DD
-        // shares this denominator (session_start_equity) with session DD, so
-        // disabling only max_session_loss_bps must not also stop capital
-        // deltas from updating it — otherwise a withdrawal followed by a
-        // redeposit leaves the daily-DD denominator stuck (bot-strategy#752
-        // review).
         if (threshold_bps == 0 && daily_threshold_bps == 0 || min_usd <= 0.0)
             && !reference_reconciliation_pending
         {
@@ -713,6 +701,7 @@ impl PairTradeEngine {
                 equity: f64,
                 prev_start_equity: f64,
                 reference_change: Option<(f64, f64)>,
+                reconciliation: CapitalReconciliation,
             },
             Reference {
                 equity: f64,
@@ -720,6 +709,24 @@ impl PairTradeEngine {
                 previous_reference: f64,
                 new_reference: f64,
                 observed_delta: Option<f64>,
+            },
+            Deferred {
+                equity: f64,
+                baseline_equity: f64,
+                reconciliation: CapitalReconciliation,
+                baseline_advanced: bool,
+            },
+            DeferredCleared {
+                equity: f64,
+                reconciliation: CapitalReconciliation,
+            },
+            BaselineMigrated {
+                previous_equity: f64,
+                equity: f64,
+                accounted_pnl: f64,
+                raw_equity_delta: f64,
+                reference_change: Option<(f64, f64)>,
+                prev_start_equity: f64,
             },
         }
 
@@ -736,15 +743,14 @@ impl PairTradeEngine {
                 s.position.is_none() && s.pending_entry.is_none() && s.pending_exit.is_none()
             });
             if !flat {
-                // Not flat: equity carries unrealized PnL, so any delta is
-                // ambiguous. Disarm and re-seed the baseline on the next
-                // settled-flat tick.
+                // Preserve the last settled baseline while the position is
+                // open. Unrealized PnL makes the current reading unusable,
+                // but the old baseline is exactly what lets the next flat
+                // observation reconcile the newly realized PnL.
+                inst.capital_position_seen_since_baseline = true;
                 inst.flat_since = None;
-                inst.capital_baseline_equity = 0.0;
                 return;
             }
-            // Flat: arm the dwell timer, then require it to mature before
-            // trusting the reading.
             let settled = match inst.flat_since {
                 Some(since) => since.elapsed().as_secs() >= settle_secs,
                 None => {
@@ -755,24 +761,17 @@ impl PairTradeEngine {
             if !settled {
                 return;
             }
+
+            let accounted_pnl = inst.total_pnl + inst.total_funding_carry;
             let baseline = inst.capital_baseline_equity;
             if baseline <= 0.0 {
-                // First settled reading establishes the reference; no event.
                 inst.capital_baseline_equity = equity;
+                inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
+                inst.capital_position_seen_since_baseline = false;
+                inst.capital_rebaseline_deferred = false;
                 if reference_reconciliation_pending {
                     let prev_start_equity = inst.session_start_equity;
                     let previous_reference = inst.session_equity_reference_usd;
-                    // A cleared baseline gives no signal to compare
-                    // session_start_equity against (InstanceRiskState::
-                    // reset_round_bound zeroes capital_baseline_equity on a
-                    // round transition while deliberately preserving
-                    // session_start_equity, so a legacy snapshot can land
-                    // here carrying a real, already-applied deposit or
-                    // withdrawal adjustment). Without a baseline to validate
-                    // against, only adopt the fresh reference for a
-                    // non-legacy operator-driven config change; a legacy
-                    // denominator is preserved verbatim, same policy as the
-                    // baseline-available branches below (Codex review).
                     if !legacy_reference {
                         inst.session_start_equity = inst.equity_reference_usd;
                     }
@@ -788,125 +787,157 @@ impl PairTradeEngine {
                     None
                 }
             } else {
-                let capital_delta = classify_capital_event(baseline, equity, min_usd);
-                match capital_delta {
+                let raw_equity_delta = equity - baseline;
+                let baseline_accounted = inst.capital_baseline_accounted_pnl;
+
+                match baseline_accounted {
                     None => {
-                        // Stable collateral — keep the baseline tracking current
-                        // so a future discrete jump is measured against the
-                        // latest value.
-                        inst.capital_baseline_equity = equity;
+                        // A pre-#783 snapshot does not say how much accounted PnL
+                        // was already reflected in its raw equity baseline. Seed a
+                        // guarded paired baseline without erasing DD. One further
+                        // stable settle window clears the guard; any intervening
+                        // balance movement advances the candidate, never the peak.
+                        let prev_start_equity = inst.session_start_equity;
+                        let previous_reference = inst.session_equity_reference_usd;
+                        let reference_change = reference_reconciliation_pending
+                            .then_some((previous_reference, inst.equity_reference_usd));
                         if reference_reconciliation_pending {
-                            let prev_start_equity = inst.session_start_equity;
-                            let previous_reference = inst.session_equity_reference_usd;
-                            // An operator-driven config reference change
-                            // (previous_reference already valid) always
-                            // becomes authoritative here, since no
-                            // simultaneous capital flow exists to apply
-                            // instead. A pre-#752 legacy snapshot
-                            // (previous_reference <= 0, `legacy_reference`)
-                            // needs more care: if its persisted denominator
-                            // is within `min_usd` of the tracked capital
-                            // baseline, that denominator already reflects a
-                            // real adjustment the old code applied — e.g. a
-                            // withdrawal down to near-zero — and resetting
-                            // it here would resurrect that capital, then
-                            // double-count it against a later redeposit
-                            // (bot-strategy#752 review). Only reset when the
-                            // legacy denominator diverges from the baseline
-                            // by more than `min_usd`, which has no known
-                            // capital-event explanation and is more likely
-                            // #752 rollover drift. `baseline` is raw settled
-                            // equity, which (unlike this denominator) keeps
-                            // accruing realized trading PnL and funding
-                            // between capital events; back `total_pnl`
-                            // (round-scoped, resets alongside `baseline` on a
-                            // round transition) and today's `funding_carry_today`
-                            // out of it first, or ordinary trading profit /
-                            // funding since the last real capital event would
-                            // itself look like #752 drift and discard a
-                            // legitimate adjustment (Codex review). No
-                            // lifetime funding accumulator exists, so this
-                            // still under-corrects for funding predating
-                            // today's rollover — a known residual, bounded by
-                            // this being a one-time migration check.
-                            let baseline_capital_basis =
-                                baseline - inst.total_pnl - inst.funding_carry_today;
+                            let current_capital_basis = equity - accounted_pnl;
                             let legacy_denominator_trustworthy = legacy_reference
-                                && min_usd > 0.0
-                                && (prev_start_equity - baseline_capital_basis).abs() < min_usd;
+                                && (prev_start_equity - current_capital_basis).abs() < min_usd;
                             if !legacy_denominator_trustworthy {
                                 inst.session_start_equity = inst.equity_reference_usd;
                             }
                             inst.session_equity_reference_usd = inst.equity_reference_usd;
-                            Some(Rebaseline::Reference {
-                                equity,
-                                prev_start_equity,
-                                previous_reference,
-                                new_reference: inst.equity_reference_usd,
-                                observed_delta: None,
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    Some(delta) => {
-                        // Capital event. Collapse the rolling peak to current
-                        // equity (DD → 0) and shift the daily-DD denominator by
-                        // the same delta. realized_pnl_today is left untouched —
-                        // a deposit does not erase the day's trading PnL.
-                        // Reference reconciliation also serves daily DD when
-                        // rolling session DD is disabled. In that combination
-                        // the samples are inert and must not be mutated.
-                        if threshold_bps > 0 {
-                            reanchor_peak_samples(&mut inst.equity_samples, equity, now_ts);
-                        }
-                        let prev_start_equity = inst.session_start_equity;
-                        if legacy_reference {
-                            // A pre-#752 snapshot's persisted
-                            // session_start_equity has no known relationship
-                            // to this delta in general — it was never tracked
-                            // against equity_reference_usd — so the safe
-                            // default is still to adopt the configured
-                            // reference directly, discarding the delta.
-                            // Exception: if `prev_start_equity` already
-                            // tracked `baseline` coming into this tick (the
-                            // ordinary pre-#752 case, not #752 rollover
-                            // drift), it IS trustworthy, and a genuine
-                            // detected delta (e.g. a withdrawal while the bot
-                            // was stopped) must be applied on top of it —
-                            // discarding it here would leave the daily-DD
-                            // denominator blind to a real capital move
-                            // (bot-strategy#752 review). Same `total_pnl` /
-                            // `funding_carry_today` correction as the
-                            // no-delta branch above: raw `baseline` carries
-                            // realized trading PnL and funding that this
-                            // denominator deliberately excludes.
-                            let baseline_capital_basis =
-                                baseline - inst.total_pnl - inst.funding_carry_today;
-                            let legacy_denominator_trustworthy = min_usd > 0.0
-                                && (prev_start_equity - baseline_capital_basis).abs() < min_usd;
-                            inst.session_start_equity = if legacy_denominator_trustworthy {
-                                (prev_start_equity + delta).max(0.0)
-                            } else {
-                                inst.equity_reference_usd
-                            };
-                        } else {
-                            inst.session_start_equity =
-                                (inst.session_start_equity + delta).max(0.0);
                         }
                         inst.capital_baseline_equity = equity;
-                        let reference_change = reference_reconciliation_pending.then_some({
-                            (inst.session_equity_reference_usd, inst.equity_reference_usd)
-                        });
-                        if reference_reconciliation_pending {
-                            inst.session_equity_reference_usd = inst.equity_reference_usd;
-                        }
-                        Some(Rebaseline::Capital {
-                            delta,
+                        inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
+                        inst.capital_position_seen_since_baseline = true;
+                        inst.capital_rebaseline_deferred = false;
+                        inst.flat_since = Some(Instant::now());
+                        Some(Rebaseline::BaselineMigrated {
+                            previous_equity: baseline,
                             equity,
-                            prev_start_equity,
+                            accounted_pnl,
+                            raw_equity_delta,
                             reference_change,
+                            prev_start_equity,
                         })
+                    }
+                    Some(baseline_accounted_pnl) => {
+                        let reconciliation = reconcile_capital_delta(
+                            baseline,
+                            equity,
+                            baseline_accounted_pnl,
+                            accounted_pnl,
+                            inst.capital_position_seen_since_baseline,
+                            min_usd,
+                        );
+
+                        match reconciliation.disposition {
+                            CapitalDisposition::Reconciled => {
+                                // Trade/funding settlement (or sub-threshold
+                                // noise) is now reflected by exchange equity.
+                                // Advance both halves of the paired baseline.
+                                inst.capital_baseline_equity = equity;
+                                inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
+                                inst.capital_position_seen_since_baseline = false;
+                                let was_deferred =
+                                    std::mem::replace(&mut inst.capital_rebaseline_deferred, false);
+                                if reference_reconciliation_pending {
+                                    let prev_start_equity = inst.session_start_equity;
+                                    let previous_reference = inst.session_equity_reference_usd;
+                                    let current_capital_basis = equity - accounted_pnl;
+                                    let legacy_denominator_trustworthy = legacy_reference
+                                        && (prev_start_equity - current_capital_basis).abs()
+                                            < min_usd;
+                                    if !legacy_denominator_trustworthy {
+                                        inst.session_start_equity = inst.equity_reference_usd;
+                                    }
+                                    inst.session_equity_reference_usd = inst.equity_reference_usd;
+                                    Some(Rebaseline::Reference {
+                                        equity,
+                                        prev_start_equity,
+                                        previous_reference,
+                                        new_reference: inst.equity_reference_usd,
+                                        observed_delta: Some(reconciliation.inferred_capital_delta),
+                                    })
+                                } else if was_deferred {
+                                    Some(Rebaseline::DeferredCleared {
+                                        equity,
+                                        reconciliation,
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                            CapitalDisposition::Ambiguous => {
+                                // When the only ambiguity is prior position
+                                // activity, move the guarded candidate to the
+                                // latest flat reading and require another settle
+                                // window. This eventually clears missing-accounting
+                                // recovery paths without ever reanchoring the peak.
+                                let baseline_advanced = reconciliation.position_seen_since_baseline
+                                    && reconciliation.accounted_pnl_delta.abs() < min_usd;
+                                if baseline_advanced {
+                                    inst.capital_baseline_equity = equity;
+                                    inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
+                                    inst.flat_since = Some(Instant::now());
+                                }
+                                if inst.capital_rebaseline_deferred && !baseline_advanced {
+                                    None
+                                } else {
+                                    inst.capital_rebaseline_deferred = true;
+                                    Some(Rebaseline::Deferred {
+                                        equity,
+                                        baseline_equity: baseline,
+                                        reconciliation,
+                                        baseline_advanced,
+                                    })
+                                }
+                            }
+                            CapitalDisposition::Verified(delta) => {
+                                if threshold_bps > 0 {
+                                    reanchor_peak_samples(&mut inst.equity_samples, equity, now_ts);
+                                }
+                                let prev_start_equity = inst.session_start_equity;
+                                if legacy_reference {
+                                    let baseline_capital_basis = baseline - baseline_accounted_pnl;
+                                    let legacy_denominator_trustworthy =
+                                        (prev_start_equity - baseline_capital_basis).abs()
+                                            < min_usd;
+                                    inst.session_start_equity = if legacy_denominator_trustworthy {
+                                        (prev_start_equity + delta).max(0.0)
+                                    } else {
+                                        inst.equity_reference_usd
+                                    };
+                                } else {
+                                    inst.session_start_equity =
+                                        (inst.session_start_equity + delta).max(0.0);
+                                }
+                                inst.capital_baseline_equity = equity;
+                                inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
+                                inst.capital_position_seen_since_baseline = false;
+                                inst.capital_rebaseline_deferred = false;
+                                let reference_change =
+                                    reference_reconciliation_pending.then_some({
+                                        (
+                                            inst.session_equity_reference_usd,
+                                            inst.equity_reference_usd,
+                                        )
+                                    });
+                                if reference_reconciliation_pending {
+                                    inst.session_equity_reference_usd = inst.equity_reference_usd;
+                                }
+                                Some(Rebaseline::Capital {
+                                    delta,
+                                    equity,
+                                    prev_start_equity,
+                                    reference_change,
+                                    reconciliation,
+                                })
+                            }
+                        }
                     }
                 }
             }
@@ -918,14 +949,17 @@ impl PairTradeEngine {
                 equity,
                 prev_start_equity,
                 reference_change,
+                reconciliation,
             }) => {
                 let kind = if delta > 0.0 { "deposit" } else { "withdrawal" };
                 let new_start_equity = self.instances[inst_idx].session_start_equity;
                 log::warn!(
-                    "[SESSION_DD] {} capital {} detected: Δ={:.2} equity={:.2}; rolling peak rebaselined to current (DD→0), session_start_equity {:.2} -> {:.2}",
+                    "[SESSION_DD] {} verified capital {}: inferred={:.2} raw_equity_delta={:.2} accounted_pnl_delta={:.2} equity={:.2}; rolling peak rebaselined to current (DD→0), session_start_equity {:.2} -> {:.2}",
                     self.instances[inst_idx].id,
                     kind,
                     delta,
+                    reconciliation.raw_equity_delta,
+                    reconciliation.accounted_pnl_delta,
                     equity,
                     prev_start_equity,
                     new_start_equity,
@@ -936,7 +970,12 @@ impl PairTradeEngine {
                     "capital_rebaseline",
                     Some(kind.to_string()),
                     Some(serde_json::json!({
+                        "evidence": "equity_minus_realized_pnl_and_funding",
                         "delta_usd": delta,
+                        "raw_equity_delta_usd": reconciliation.raw_equity_delta,
+                        "accounted_pnl_delta_usd": reconciliation.accounted_pnl_delta,
+                        "inferred_capital_delta_usd": reconciliation.inferred_capital_delta,
+                        "position_seen_since_baseline": reconciliation.position_seen_since_baseline,
                         "equity": equity,
                         "prev_session_start_equity": prev_start_equity,
                         "new_session_start_equity": new_start_equity,
@@ -983,6 +1022,110 @@ impl PairTradeEngine {
                         "observed_delta_usd": observed_delta,
                         "prev_session_start_equity": prev_start_equity,
                         "new_session_start_equity": self.instances[inst_idx].session_start_equity,
+                    })),
+                );
+                self.persist_risk_state();
+            }
+            Some(Rebaseline::Deferred {
+                equity,
+                baseline_equity,
+                reconciliation,
+                baseline_advanced,
+            }) => {
+                let action = if baseline_advanced {
+                    "advance_guarded_baseline_retain_peak_and_denominator"
+                } else {
+                    "retain_peak_and_denominator"
+                };
+                log::warn!(
+                    "[SESSION_DD] {} capital rebaseline deferred: raw_equity_delta={:.2} accounted_pnl_delta={:.2} inferred_capital_delta={:.2} baseline={:.2} equity={:.2} action={}",
+                    self.instances[inst_idx].id,
+                    reconciliation.raw_equity_delta,
+                    reconciliation.accounted_pnl_delta,
+                    reconciliation.inferred_capital_delta,
+                    baseline_equity,
+                    equity,
+                    action,
+                );
+                self.record_risk_event_for_instance(
+                    inst_idx,
+                    "session_dd",
+                    "capital_rebaseline_deferred",
+                    Some("ambiguous_with_accounting_or_position_activity".to_string()),
+                    Some(serde_json::json!({
+                        "evidence": "equity_minus_realized_pnl_and_funding",
+                        "raw_equity_delta_usd": reconciliation.raw_equity_delta,
+                        "accounted_pnl_delta_usd": reconciliation.accounted_pnl_delta,
+                        "inferred_capital_delta_usd": reconciliation.inferred_capital_delta,
+                        "position_seen_since_baseline": reconciliation.position_seen_since_baseline,
+                        "baseline_equity": baseline_equity,
+                        "equity": equity,
+                        "action": action,
+                    })),
+                );
+                self.persist_risk_state();
+            }
+            Some(Rebaseline::DeferredCleared {
+                equity,
+                reconciliation,
+            }) => {
+                log::info!(
+                    "[SESSION_DD] {} deferred capital classification cleared after equity/PnL reconciliation: raw_equity_delta={:.2} accounted_pnl_delta={:.2} inferred_capital_delta={:.2} equity={:.2}",
+                    self.instances[inst_idx].id,
+                    reconciliation.raw_equity_delta,
+                    reconciliation.accounted_pnl_delta,
+                    reconciliation.inferred_capital_delta,
+                    equity,
+                );
+                self.record_risk_event_for_instance(
+                    inst_idx,
+                    "session_dd",
+                    "capital_rebaseline_deferred_cleared",
+                    Some("equity_pnl_reconciled".to_string()),
+                    Some(serde_json::json!({
+                        "raw_equity_delta_usd": reconciliation.raw_equity_delta,
+                        "accounted_pnl_delta_usd": reconciliation.accounted_pnl_delta,
+                        "inferred_capital_delta_usd": reconciliation.inferred_capital_delta,
+                        "position_seen_since_baseline": reconciliation.position_seen_since_baseline,
+                        "equity": equity,
+                        "action": "baseline_advanced_without_reanchor",
+                    })),
+                );
+                self.persist_risk_state();
+            }
+            Some(Rebaseline::BaselineMigrated {
+                previous_equity,
+                equity,
+                accounted_pnl,
+                raw_equity_delta,
+                reference_change,
+                prev_start_equity,
+            }) => {
+                log::warn!(
+                    "[SESSION_DD] {} pre-#783 capital baseline migrated without reanchor: baseline={:.2} equity={:.2} raw_delta={:.2} accounted_pnl={:.2}; guarded until a stable settle window, retaining DD peak",
+                    self.instances[inst_idx].id,
+                    previous_equity,
+                    equity,
+                    raw_equity_delta,
+                    accounted_pnl,
+                );
+                self.record_risk_event_for_instance(
+                    inst_idx,
+                    "session_dd",
+                    "capital_baseline_migrated",
+                    Some("pre_783_snapshot_unpaired".to_string()),
+                    Some(serde_json::json!({
+                        "previous_baseline_equity": previous_equity,
+                        "equity": equity,
+                        "raw_equity_delta_usd": raw_equity_delta,
+                        "accounted_pnl": accounted_pnl,
+                        "reference_change": reference_change.map(|(previous, new)| serde_json::json!({
+                            "previous": previous,
+                            "new": new,
+                        })),
+                        "prev_session_start_equity": prev_start_equity,
+                        "new_session_start_equity": self.instances[inst_idx].session_start_equity,
+                        "action": "seed_guarded_paired_baseline_without_reanchor",
                     })),
                 );
                 self.persist_risk_state();
@@ -1195,6 +1338,64 @@ pub(in crate::pairtrade) fn reanchor_peak_samples(
     samples.clear();
     if equity > 0.0 {
         samples.push(risk_io::EquitySample { ts, equity });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CapitalReconciliation {
+    raw_equity_delta: f64,
+    accounted_pnl_delta: f64,
+    inferred_capital_delta: f64,
+    position_seen_since_baseline: bool,
+    disposition: CapitalDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CapitalDisposition {
+    /// Equity and the bot's realized trade/funding accounting agree within
+    /// the configured materiality threshold. Advance the paired baseline;
+    /// do not erase the rolling DD peak.
+    Reconciled,
+    /// A material inferred capital delta with no material accounting move in
+    /// flight. This is strong enough for the existing automatic rebaseline.
+    Verified(f64),
+    /// Both accounted PnL/funding and inferred capital moved materially.
+    /// Equity-only data cannot distinguish a transfer from delayed or
+    /// imperfect settlement, so rebaseline must fail safe.
+    Ambiguous,
+}
+
+/// Reconcile a flat account-equity movement against trade/funding accounting.
+/// Raw equity changes alone are not capital evidence because connector balance
+/// caching can publish the close PnL several minutes after pairtrade records
+/// the fill. bot-strategy#783.
+fn reconcile_capital_delta(
+    baseline_equity: f64,
+    current_equity: f64,
+    baseline_accounted_pnl: f64,
+    current_accounted_pnl: f64,
+    position_seen_since_baseline: bool,
+    min_usd: f64,
+) -> CapitalReconciliation {
+    let raw_equity_delta = current_equity - baseline_equity;
+    let accounted_pnl_delta = current_accounted_pnl - baseline_accounted_pnl;
+    let inferred_capital_delta = raw_equity_delta - accounted_pnl_delta;
+    let baseline_capital_basis = baseline_equity - baseline_accounted_pnl;
+    let current_capital_basis = current_equity - current_accounted_pnl;
+    let disposition =
+        match classify_capital_event(baseline_capital_basis, current_capital_basis, min_usd) {
+            None => CapitalDisposition::Reconciled,
+            Some(_) if accounted_pnl_delta.abs() >= min_usd || position_seen_since_baseline => {
+                CapitalDisposition::Ambiguous
+            }
+            Some(delta) => CapitalDisposition::Verified(delta),
+        };
+    CapitalReconciliation {
+        raw_equity_delta,
+        accounted_pnl_delta,
+        inferred_capital_delta,
+        position_seen_since_baseline,
+        disposition,
     }
 }
 
@@ -1507,6 +1708,34 @@ mod tests {
         assert_eq!(restored.total_pnl, 0.0);
         assert_eq!(restored.peak_pnl, 0.0);
         assert_eq!(restored.max_dd, 0.0);
+    }
+
+    // bot-strategy#783: delayed close settlement is not a capital event.
+    #[test]
+    fn capital_reconciliation_matches_realized_pnl_and_funding() {
+        let reconciled = reconcile_capital_delta(1_000.0, 1_025.0, 0.0, 25.0, false, 5.0);
+        assert_eq!(reconciled.disposition, CapitalDisposition::Reconciled);
+        assert!((reconciled.inferred_capital_delta).abs() < 1e-9);
+    }
+
+    #[test]
+    fn capital_reconciliation_defers_stale_equity_after_close() {
+        let deferred = reconcile_capital_delta(1_000.0, 1_000.0, 0.0, 25.0, false, 5.0);
+        assert_eq!(deferred.disposition, CapitalDisposition::Ambiguous);
+        assert!((deferred.inferred_capital_delta - (-25.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn capital_reconciliation_verifies_transfer_without_accounting_move() {
+        let deposit = reconcile_capital_delta(1_000.0, 1_500.0, 25.0, 25.0, false, 5.0);
+        assert_eq!(deposit.disposition, CapitalDisposition::Verified(500.0));
+    }
+
+    #[test]
+    fn capital_reconciliation_defers_unaccounted_move_after_position() {
+        let deferred = reconcile_capital_delta(1_000.0, 950.0, 0.0, 0.0, true, 5.0);
+        assert_eq!(deferred.disposition, CapitalDisposition::Ambiguous);
+        assert!(deferred.position_seen_since_baseline);
     }
 
     // bot-strategy#575 ①: capital-event classification. A deposit /

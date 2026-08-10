@@ -316,6 +316,11 @@ for name, inst in d.get('instances', {}).items():
             if base is not None:
                 inst['equity_samples'] = [{'ts': now_ts, 'equity': base}]
                 inst['capital_baseline_equity'] = base
+                inst['capital_baseline_accounted_pnl'] = (
+                    float(inst.get('total_pnl', 0.0))
+                    + float(inst.get('total_funding_carry', 0.0))
+                )
+                inst['capital_position_seen_since_baseline'] = False
                 msg += f' (peak reanchored to {base:.2f}, DD->0)'
             else:
                 msg += ' (reanchor skipped: no equity reference available)'

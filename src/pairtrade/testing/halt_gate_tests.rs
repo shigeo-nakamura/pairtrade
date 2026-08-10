@@ -479,9 +479,13 @@ impl Harness {
             session_start_ts: now_ts,
             realized_pnl_today: 0.0,
             funding_carry_today: 0.0,
+            total_funding_carry: 0.0,
             daily_loss_halted: false,
             equity_samples: Vec::new(),
             capital_baseline_equity: 0.0,
+            capital_baseline_accounted_pnl: Some(0.0),
+            capital_position_seen_since_baseline: false,
+            capital_rebaseline_deferred: false,
             flat_since: None,
             session_halted: false,
             session_halt_reason: None,
@@ -964,6 +968,167 @@ fn deposit_while_flat_rebaselines_peak_without_clearing_halt() {
     assert_eq!(dd, 0.0, "DD is reset to 0 at the new base");
 }
 
+// bot-strategy#783: Round 9 repeatedly observed a close PnL/funding movement
+// in account equity only after pairtrade had already recorded the realized
+// accounting. Those delayed balance updates must advance the paired baseline
+// without ever collapsing the pre-existing DD peak. A later genuine transfer
+// with no accounting movement must retain the automatic #575 rebaseline.
+#[test]
+fn round9_delayed_settlement_sequence_never_reanchors_without_transfer() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-round9-settlement");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    let now = chrono::Utc::now().timestamp();
+    let mut settled_equity = 6_000.0;
+    let mut total_trade_pnl = 0.0;
+    let mut total_funding = 0.0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 6_000.0;
+        inst.session_equity_reference_usd = 6_000.0;
+        inst.equity_cache = settled_equity;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 6_088.33,
+        }];
+        inst.capital_baseline_equity = settled_equity;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.session_start_equity = 6_000.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    // The five false A-arm deltas recorded in Round 9. Split a small part of
+    // each movement into funding so both accounting components are covered.
+    let movements = [
+        (6.50, 0.1256),
+        (17.50, 0.0557),
+        (-14.00, 0.0221),
+        (9.60, 0.0866),
+        (-7.10, 0.0252),
+    ];
+    for (trade_pnl, funding) in movements {
+        let movement = trade_pnl + funding;
+        total_trade_pnl += trade_pnl;
+        total_funding += funding;
+        {
+            let inst = &mut h.engine.instances[0];
+            inst.total_pnl = total_trade_pnl;
+            inst.total_funding_carry = total_funding;
+            // Connector/account cache has not reflected the close yet.
+            inst.equity_cache = settled_equity;
+        }
+        h.engine.detect_capital_event_and_rebaseline(0);
+        {
+            let inst = &h.engine.instances[0];
+            assert!(
+                inst.capital_rebaseline_deferred,
+                "material accounted PnL with stale equity must be deferred"
+            );
+            assert_eq!(inst.equity_samples.len(), 1);
+            assert!((inst.equity_samples[0].equity - 6_088.33).abs() < 1e-9);
+            assert!((inst.session_start_equity - 6_000.0).abs() < 1e-9);
+        }
+
+        // The exchange balance catches up. Raw equity and accounted PnL now
+        // agree, so the baseline advances without DD reanchor.
+        settled_equity += movement;
+        h.engine.instances[0].equity_cache = settled_equity;
+        h.engine.detect_capital_event_and_rebaseline(0);
+        let inst = &h.engine.instances[0];
+        assert!(!inst.capital_rebaseline_deferred);
+        assert!((inst.capital_baseline_equity - settled_equity).abs() < 1e-9);
+        assert_eq!(inst.equity_samples.len(), 1);
+        assert!((inst.equity_samples[0].equity - 6_088.33).abs() < 1e-9);
+        assert!((inst.session_start_equity - 6_000.0).abs() < 1e-9);
+    }
+
+    // A genuine $500 transfer after accounting has reconciled remains a
+    // verified capital event and preserves the original #575 behavior.
+    h.engine.instances[0].equity_cache = settled_equity + 500.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(inst.equity_samples.len(), 1);
+    assert!((inst.equity_samples[0].equity - (settled_equity + 500.0)).abs() < 1e-9);
+    assert!((inst.session_start_equity - 6_500.0).abs() < 1e-9);
+}
+
+// A pre-#783 snapshot has no accounted-PnL half for its persisted equity
+// baseline. Upgrade migration must therefore establish a guarded candidate,
+// not infer capital. If a delayed close settlement lands after migration, the
+// candidate follows it and clears only after a stable flat observation.
+#[test]
+fn pre_783_snapshot_migration_never_reanchors_delayed_settlement() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-pre-783-migration");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 6_000.0;
+        inst.session_equity_reference_usd = 6_000.0;
+        inst.session_start_equity = 6_000.0;
+        inst.equity_cache = 6_000.0;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 6_088.33,
+        }];
+        inst.capital_baseline_equity = 6_000.0;
+        inst.capital_baseline_accounted_pnl = None;
+        inst.total_pnl = 10.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    {
+        let inst = &h.engine.instances[0];
+        assert_eq!(inst.capital_baseline_accounted_pnl, Some(10.0));
+        assert!(inst.capital_position_seen_since_baseline);
+        assert_eq!(inst.equity_samples[0].equity, 6_088.33);
+        assert_eq!(inst.session_start_equity, 6_000.0);
+    }
+
+    // The exchange/account cache then reflects the already-accounted close.
+    h.engine.instances[0].equity_cache = 6_010.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    {
+        let inst = &h.engine.instances[0];
+        assert!(inst.capital_rebaseline_deferred);
+        assert!(inst.capital_position_seen_since_baseline);
+        assert_eq!(inst.capital_baseline_equity, 6_010.0);
+        assert_eq!(inst.equity_samples[0].equity, 6_088.33);
+        assert_eq!(inst.session_start_equity, 6_000.0);
+    }
+
+    // A second stable observation clears the guard without touching DD.
+    h.engine.detect_capital_event_and_rebaseline(0);
+    {
+        let inst = &h.engine.instances[0];
+        assert!(!inst.capital_rebaseline_deferred);
+        assert!(!inst.capital_position_seen_since_baseline);
+        assert_eq!(inst.equity_samples[0].equity, 6_088.33);
+        assert_eq!(inst.session_start_equity, 6_000.0);
+    }
+
+    // A later clean transfer remains eligible for the normal #575 reanchor.
+    h.engine.instances[0].equity_cache = 6_510.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(inst.equity_samples[0].equity, 6_510.0);
+    assert_eq!(inst.session_start_equity, 6_500.0);
+}
+
 // bot-strategy#752: a full withdrawal can include accumulated PnL, so its
 // delta need not equal the configured reference. The zero-clamped daily
 // denominator must survive UTC rollover; otherwise the old reference is
@@ -1287,6 +1452,7 @@ fn legacy_snapshot_preserved_despite_realized_pnl_baseline_drift() {
         inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
         inst.total_pnl = 100.0; // realized profit since the deposit
         inst.capital_baseline_equity = 1_600.0; // $1,500 basis + $100 realized profit
+        inst.capital_baseline_accounted_pnl = Some(100.0);
         inst.equity_cache = 1_600.0; // stable — no new capital event this tick
         inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
     }
@@ -1322,6 +1488,7 @@ fn legacy_snapshot_trustworthy_denominator_applies_delta_despite_realized_pnl() 
         inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
         inst.total_pnl = 100.0; // realized profit since the deposit
         inst.capital_baseline_equity = 1_600.0; // $1,500 basis + $100 realized profit
+        inst.capital_baseline_accounted_pnl = Some(100.0);
         inst.equity_cache = 1_100.0; // $500 withdrawn while stopped
         inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
     }
