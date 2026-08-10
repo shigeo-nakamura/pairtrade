@@ -4,7 +4,12 @@
 //! activation path: one invocation can consume exactly one fresh plan after
 //! the validated config-and-plan SHA-256 digest is supplied again.
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use anyhow::{bail, Context, Result};
+use argon2::{Algorithm, Argon2, Params, Version};
 use debot::arcus_spot::{
     build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig,
     ArcusSpotExecutionAttempt, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
@@ -14,6 +19,7 @@ use debot::arcus_spot::{
 };
 use dex_connector::{ArcusSpotClient, ArcusSpotConfig};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,6 +29,7 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
+use zeroize::{Zeroize, Zeroizing};
 
 // approval_public_key is deliberately NOT a field on this struct. It used
 // to be, but that made it part of the exact payload the executor itself
@@ -140,7 +147,17 @@ execute/resume. execute/resume require keygen's printed public key at
 /etc/arcus-spot/approval_public_key, deployed by an administrator and
 owned by a different uid than the one running this binary -- never in
 CONFIG_YAML or an inherited environment variable, either of which the
-executor identity itself could set."
+executor identity itself could set.
+
+keygen writes the private key passphrase-encrypted (Argon2id + AES-256-GCM)
+to PRIVATE_KEY_FILE, and prompts interactively for the passphrase (twice,
+to confirm) -- it is never accepted as a command-line argument or read from
+an environment variable, both of which would leak into shell history or
+the process list. sign-approval prompts for the same passphrase once to
+decrypt. There is no passphrase recovery: losing it makes that key file
+permanently undecryptable, but the wallet itself holds no funds tied to
+this key -- regenerate a fresh keypair with keygen and have an
+administrator redeploy the new public key."
 }
 
 fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
@@ -390,16 +407,178 @@ fn verify_approval_signature(
         .context("approval signature does not verify against approval_public_key for this exact config+plan")
 }
 
-fn read_ed25519_signing_key(path: &Path) -> Result<SigningKey> {
-    let bytes = read_private_regular_file(path, "private key")?;
-    let bytes: [u8; SECRET_KEY_LENGTH] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+// Argon2id parameters (OWASP-recommended minimum as of this writing: 19 MiB
+// memory, 2 iterations, 1 degree of parallelism). Recorded in every
+// encrypted key file rather than re-derived from a compile-time constant,
+// so a future change to these defaults never breaks decrypting an
+// already-written file.
+const ARGON2ID_M_COST_KIB: u32 = 19_456;
+const ARGON2ID_T_COST: u32 = 2;
+const ARGON2ID_P_COST: u32 = 1;
+const APPROVAL_KEY_FILE_VERSION: u32 = 1;
+const KDF_SALT_LEN: usize = 16;
+const AES_GCM_NONCE_LEN: usize = 12;
+
+/// On-disk format for a passphrase-encrypted Ed25519 approval private key
+/// (bot-strategy#772). The raw key never touches disk in plaintext; only
+/// this struct, serialized as JSON, does. Every parameter needed to
+/// reproduce the exact symmetric key is stored alongside the ciphertext,
+/// so this file is self-describing and never depends on a compile-time
+/// default that could silently change between the keygen and
+/// sign-approval invocations (e.g. across a binary upgrade).
+#[derive(Serialize, Deserialize)]
+struct EncryptedApprovalKey {
+    version: u32,
+    kdf: String,
+    kdf_salt_hex: String,
+    kdf_m_cost_kib: u32,
+    kdf_t_cost: u32,
+    kdf_p_cost: u32,
+    cipher: String,
+    nonce_hex: String,
+    ciphertext_hex: String,
+}
+
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut buf = [0u8; N];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf
+}
+
+fn hex_decode_exact<const N: usize>(hex_str: &str, label: &str) -> Result<[u8; N]> {
+    let bytes = hex::decode(hex_str).with_context(|| format!("{label} is not valid hex"))?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| anyhow::anyhow!("{label} must be {N} bytes, got {}", bytes.len()))
+}
+
+fn derive_symmetric_key(
+    passphrase: &[u8],
+    salt: &[u8],
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let params = Params::new(m_cost_kib, t_cost, p_cost, Some(32))
+        .map_err(|error| anyhow::anyhow!("invalid Argon2id parameters: {error}"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0u8; 32]);
+    argon2
+        .hash_password_into(passphrase, salt, key.as_mut())
+        .map_err(|error| anyhow::anyhow!("Argon2id key derivation failed: {error}"))?;
+    Ok(key)
+}
+
+/// Prompts twice (and requires the two entries to match) so a typo when
+/// setting the passphrase can't silently lock the key behind a passphrase
+/// the user didn't intend and has no record of.
+fn read_new_passphrase() -> Result<Zeroizing<Vec<u8>>> {
+    let first = Zeroizing::new(
+        rpassword::prompt_password("Passphrase for the new approval key: ")
+            .context("failed to read passphrase")?,
+    );
+    let second = Zeroizing::new(
+        rpassword::prompt_password("Confirm passphrase: ")
+            .context("failed to read passphrase confirmation")?,
+    );
+    if *first != *second {
+        bail!("passphrases did not match");
+    }
+    if first.is_empty() {
+        bail!("passphrase must not be empty");
+    }
+    Ok(Zeroizing::new(first.as_bytes().to_vec()))
+}
+
+fn read_existing_passphrase(prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let passphrase =
+        Zeroizing::new(rpassword::prompt_password(prompt).context("failed to read passphrase")?);
+    Ok(Zeroizing::new(passphrase.as_bytes().to_vec()))
+}
+
+fn encrypt_signing_key(
+    signing_key: &SigningKey,
+    passphrase: &[u8],
+) -> Result<EncryptedApprovalKey> {
+    let salt = random_bytes::<KDF_SALT_LEN>();
+    let symmetric_key = derive_symmetric_key(
+        passphrase,
+        &salt,
+        ARGON2ID_M_COST_KIB,
+        ARGON2ID_T_COST,
+        ARGON2ID_P_COST,
+    )?;
+    let cipher = Aes256Gcm::new_from_slice(symmetric_key.as_ref())
+        .context("failed to initialize AES-256-GCM")?;
+    let nonce_bytes = random_bytes::<AES_GCM_NONCE_LEN>();
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let mut seed = signing_key.to_bytes();
+    let ciphertext = cipher
+        .encrypt(nonce, seed.as_ref())
+        .map_err(|_| anyhow::anyhow!("AES-256-GCM encryption failed"))?;
+    seed.zeroize();
+    Ok(EncryptedApprovalKey {
+        version: APPROVAL_KEY_FILE_VERSION,
+        kdf: "argon2id".to_string(),
+        kdf_salt_hex: hex::encode(salt),
+        kdf_m_cost_kib: ARGON2ID_M_COST_KIB,
+        kdf_t_cost: ARGON2ID_T_COST,
+        kdf_p_cost: ARGON2ID_P_COST,
+        cipher: "aes-256-gcm".to_string(),
+        nonce_hex: hex::encode(nonce_bytes),
+        ciphertext_hex: hex::encode(ciphertext),
+    })
+}
+
+fn decrypt_signing_key(encrypted: &EncryptedApprovalKey, passphrase: &[u8]) -> Result<SigningKey> {
+    if encrypted.version != APPROVAL_KEY_FILE_VERSION {
+        bail!(
+            "unsupported approval key file version {} (expected {APPROVAL_KEY_FILE_VERSION})",
+            encrypted.version
+        );
+    }
+    if encrypted.kdf != "argon2id" {
+        bail!("unsupported approval key file kdf {:?}", encrypted.kdf);
+    }
+    if encrypted.cipher != "aes-256-gcm" {
+        bail!("unsupported approval key file cipher {:?}", encrypted.cipher);
+    }
+    let salt: [u8; KDF_SALT_LEN] = hex_decode_exact(&encrypted.kdf_salt_hex, "kdf_salt_hex")?;
+    let nonce_bytes: [u8; AES_GCM_NONCE_LEN] = hex_decode_exact(&encrypted.nonce_hex, "nonce_hex")?;
+    let ciphertext =
+        hex::decode(&encrypted.ciphertext_hex).context("ciphertext_hex is not valid hex")?;
+    let symmetric_key = derive_symmetric_key(
+        passphrase,
+        &salt,
+        encrypted.kdf_m_cost_kib,
+        encrypted.kdf_t_cost,
+        encrypted.kdf_p_cost,
+    )?;
+    let cipher = Aes256Gcm::new_from_slice(symmetric_key.as_ref())
+        .context("failed to initialize AES-256-GCM")?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let mut plaintext = cipher.decrypt(nonce, ciphertext.as_ref()).map_err(|_| {
+        anyhow::anyhow!("failed to decrypt the approval key -- wrong passphrase or corrupted file")
+    })?;
+    let seed: [u8; SECRET_KEY_LENGTH] = plaintext.as_slice().try_into().map_err(|_| {
         anyhow::anyhow!(
-            "private key {} must be exactly {SECRET_KEY_LENGTH} raw bytes, got {}",
-            path.display(),
-            bytes.len()
+            "decrypted approval key must be exactly {SECRET_KEY_LENGTH} bytes, got {}",
+            plaintext.len()
         )
     })?;
-    Ok(SigningKey::from_bytes(&bytes))
+    plaintext.zeroize();
+    let signing_key = SigningKey::from_bytes(&seed);
+    let mut seed = seed;
+    seed.zeroize();
+    Ok(signing_key)
+}
+
+fn read_ed25519_signing_key(path: &Path) -> Result<SigningKey> {
+    let bytes = read_private_regular_file(path, "private key")?;
+    let encrypted: EncryptedApprovalKey = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse encrypted approval key {}", path.display()))?;
+    let passphrase = read_existing_passphrase("Passphrase for the approval key: ")?;
+    decrypt_signing_key(&encrypted, &passphrase)
 }
 
 #[tokio::main]
@@ -408,14 +587,18 @@ async fn main() -> Result<()> {
     match arguments.as_slice() {
         [command, key_path] if command == "keygen" => {
             let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+            let passphrase = read_new_passphrase()?;
+            let encrypted = encrypt_signing_key(&signing_key, &passphrase)?;
+            let payload = serde_json::to_vec_pretty(&encrypted)
+                .context("failed to serialize the encrypted approval key")?;
             let mut file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .mode(0o600)
                 .open(key_path)
                 .with_context(|| format!("failed to create {key_path}"))?;
-            file.write_all(&signing_key.to_bytes())?;
-            eprintln!("wrote private key to {key_path} -- copy it to an offline machine ONLY, never to the execute/resume host");
+            file.write_all(&payload)?;
+            eprintln!("wrote passphrase-encrypted private key to {key_path} -- copy it to an offline machine ONLY, never to the execute/resume host. The passphrase is not stored anywhere; losing it makes this file permanently undecryptable (regenerate a fresh key with keygen if that happens -- the wallet itself is unaffected, see docs/arcus-spot-runtime.md).");
             println!("{}", hex::encode(signing_key.verifying_key().to_bytes()));
             Ok(())
         }
@@ -575,6 +758,54 @@ cumulative_loss_limit_usd: "10"
             approval_digest(&config, &changed_plan).unwrap()
         );
         assert_eq!(approval_digest(&config, &plan).unwrap().len(), 71);
+    }
+
+    #[test]
+    fn encrypted_approval_key_round_trips_with_the_correct_passphrase() {
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let encrypted = encrypt_signing_key(&signing_key, b"correct horse battery staple").unwrap();
+        let decrypted =
+            decrypt_signing_key(&encrypted, b"correct horse battery staple").unwrap();
+        assert_eq!(decrypted.to_bytes(), signing_key.to_bytes());
+    }
+
+    #[test]
+    fn encrypted_approval_key_rejects_the_wrong_passphrase() {
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let encrypted = encrypt_signing_key(&signing_key, b"correct horse battery staple").unwrap();
+        assert!(decrypt_signing_key(&encrypted, b"wrong passphrase").is_err());
+    }
+
+    #[test]
+    fn encrypted_approval_key_rejects_tampered_ciphertext() {
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut encrypted =
+            encrypt_signing_key(&signing_key, b"correct horse battery staple").unwrap();
+        let mut raw = hex::decode(&encrypted.ciphertext_hex).unwrap();
+        raw[0] ^= 0xFF;
+        encrypted.ciphertext_hex = hex::encode(raw);
+        // AES-GCM is authenticated: any bit flip in the ciphertext must be
+        // detected and rejected, not silently decrypted into garbage that
+        // then fails a downstream length/format check instead.
+        assert!(decrypt_signing_key(&encrypted, b"correct horse battery staple").is_err());
+    }
+
+    #[test]
+    fn encrypted_approval_key_rejects_an_unsupported_file_version() {
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut encrypted = encrypt_signing_key(&signing_key, b"passphrase").unwrap();
+        encrypted.version = APPROVAL_KEY_FILE_VERSION + 1;
+        assert!(decrypt_signing_key(&encrypted, b"passphrase").is_err());
+    }
+
+    #[test]
+    fn encrypted_approval_key_file_round_trips_through_json() {
+        let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let encrypted = encrypt_signing_key(&signing_key, b"passphrase").unwrap();
+        let json = serde_json::to_vec(&encrypted).unwrap();
+        let parsed: EncryptedApprovalKey = serde_json::from_slice(&json).unwrap();
+        let decrypted = decrypt_signing_key(&parsed, b"passphrase").unwrap();
+        assert_eq!(decrypted.to_bytes(), signing_key.to_bytes());
     }
 
     #[test]
