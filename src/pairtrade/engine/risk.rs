@@ -733,9 +733,14 @@ impl PairTradeEngine {
             /// report, but the paired baseline was advanced in memory and
             /// must still be persisted (see the comment at its call site).
             ReconciledQuietly,
+            /// `capital_position_seen_since_baseline` just latched false-to-
+            /// true (a position opened after the last settled baseline) --
+            /// nothing to log, but this transition must survive a restart
+            /// (see the comment at its call site).
+            PositionActivityLatched,
         }
 
-        let detected: Option<Rebaseline> = {
+        let detected: Option<Rebaseline> = 'reconcile: {
             let inst = &mut self.instances[inst_idx];
             if !inst.equity_initialized {
                 return;
@@ -751,10 +756,22 @@ impl PairTradeEngine {
                 // Preserve the last settled baseline while the position is
                 // open. Unrealized PnL makes the current reading unusable,
                 // but the old baseline is exactly what lets the next flat
-                // observation reconcile the newly realized PnL.
-                inst.capital_position_seen_since_baseline = true;
+                // observation reconcile the newly realized PnL. Only the
+                // false-to-true transition needs persisting (and only that
+                // transition -- not every tick a position stays open): if
+                // the service stops while this flag is true only in memory,
+                // restart restores the last-persisted (false) value, and a
+                // startup force-close that flattens without recording
+                // realized PnL then gets misclassified as a verified
+                // deposit/withdrawal instead of correctly deferring (Codex
+                // P1 follow-up, bot-strategy#783).
+                let was_seen = std::mem::replace(&mut inst.capital_position_seen_since_baseline, true);
                 inst.flat_since = None;
-                return;
+                break 'reconcile if was_seen {
+                    None
+                } else {
+                    Some(Rebaseline::PositionActivityLatched)
+                };
             }
             let settled = match inst.flat_since {
                 Some(since) => since.elapsed().as_secs() >= settle_secs,
@@ -844,6 +861,22 @@ impl PairTradeEngine {
                                 // Trade/funding settlement (or sub-threshold
                                 // noise) is now reflected by exchange equity.
                                 // Advance both halves of the paired baseline.
+                                // Captured before mutation so the ordinary
+                                // (reference-unchanged, not-previously-
+                                // deferred) branch below can tell whether
+                                // this tick actually moved anything -- on a
+                                // truly idle account (equity_cache untouched
+                                // since the last tick, which is common: it's
+                                // only refreshed on its own cache cadence,
+                                // not every gating cycle) nothing here
+                                // changes at all, and persisting anyway would
+                                // rewrite the whole risk-state file every
+                                // single tick for every instance (Codex P2
+                                // follow-up, bot-strategy#783).
+                                let baseline_or_latch_changed = inst.capital_baseline_equity
+                                    != equity
+                                    || inst.capital_baseline_accounted_pnl != Some(accounted_pnl)
+                                    || inst.capital_position_seen_since_baseline;
                                 inst.capital_baseline_equity = equity;
                                 inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
                                 inst.capital_position_seen_since_baseline = false;
@@ -872,7 +905,7 @@ impl PairTradeEngine {
                                         equity,
                                         reconciliation,
                                     })
-                                } else {
+                                } else if baseline_or_latch_changed {
                                     // The ordinary case: a settled trade/funding
                                     // move reconciled cleanly with no reference
                                     // change and no prior deferral, nothing worth
@@ -887,6 +920,11 @@ impl PairTradeEngine {
                                     // Ambiguous forever (Codex P1 follow-up,
                                     // bot-strategy#783).
                                     Some(Rebaseline::ReconciledQuietly)
+                                } else {
+                                    // Nothing moved at all: same equity, same
+                                    // accounted PnL, no latch to clear. Skip
+                                    // the write entirely.
+                                    None
                                 }
                             }
                             CapitalDisposition::Ambiguous => {
@@ -1149,6 +1187,9 @@ impl PairTradeEngine {
                 self.persist_risk_state();
             }
             Some(Rebaseline::ReconciledQuietly) => {
+                self.persist_risk_state();
+            }
+            Some(Rebaseline::PositionActivityLatched) => {
                 self.persist_risk_state();
             }
             None => {}

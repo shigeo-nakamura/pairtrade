@@ -1192,6 +1192,98 @@ fn withdrawal_rollover_redeposit_counts_new_capital_once() {
     assert!((inst.capital_baseline_equity - 6_000.01).abs() < 1e-9);
 }
 
+// bot-strategy#783 Codex P1 follow-up: the false-to-true
+// capital_position_seen_since_baseline transition must be persisted so a
+// startup force-close (which can flatten a still-open position without
+// recording realized PnL) does not restore a stale `false` and get its
+// resulting equity settlement misclassified as a verified deposit/
+// withdrawal. But only that transition -- not every tick a position stays
+// open (Codex P2 follow-up: constant per-tick rewrites while a position is
+// simply held would defeat the sampling policy's deliberate avoidance of
+// per-tick disk writes).
+#[test]
+fn position_activity_latch_persists_only_on_the_false_to_true_transition() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-latch");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+    }
+    h.seed_aged_position(0);
+    assert!(
+        !h.engine.risk_state_path.exists(),
+        "no risk state written before the first capital-event tick"
+    );
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let persisted = risk_io::load_risk_state(&h.engine.risk_state_path);
+    let persisted_inst = persisted
+        .instances
+        .get("hg-cap-latch")
+        .expect("the false-to-true latch transition is persisted");
+    assert!(persisted_inst.capital_position_seen_since_baseline);
+
+    // Still in the same position on the next tick: the latch is already
+    // true, so nothing changed and this tick must not rewrite the file.
+    std::fs::remove_file(&h.engine.risk_state_path).unwrap();
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        !h.engine.risk_state_path.exists(),
+        "no redundant persist while the latch is already true and the position is still open"
+    );
+}
+
+// bot-strategy#783 Codex P2 follow-up: a settled, flat account whose equity
+// and accounting have not moved since the last reconciliation must not
+// rewrite risk_state.json on every tick -- only a real change to either half
+// of the paired baseline (or a latch) is worth the write.
+#[test]
+fn reconciled_quiet_tick_does_not_persist_when_nothing_changed() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-idle");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        // A real, one-time trade settlement: equity and accounted PnL move
+        // together by the same $10, so this reconciles cleanly and the
+        // paired baseline genuinely advances -- the first tick must persist.
+        inst.equity_cache = 1_010.0;
+        inst.total_pnl = 10.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.risk_state_path.exists(),
+        "a genuine baseline advance is persisted"
+    );
+
+    // Nothing moved since: same cached equity, same accounted PnL, already
+    // reconciled. Must not rewrite the file.
+    std::fs::remove_file(&h.engine.risk_state_path).unwrap();
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        !h.engine.risk_state_path.exists(),
+        "an idle, already-reconciled tick must not rewrite risk_state.json"
+    );
+}
+
 // A reference change at the restart boundary stays pending until the same
 // flat/settled observation used for capital detection. When a matching
 // transfer is present, the observed delta wins and the new reference is only
