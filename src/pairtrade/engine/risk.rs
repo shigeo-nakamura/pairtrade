@@ -186,6 +186,7 @@ impl PairTradeEngine {
                     }
                     inst.equity_cache = eq.max(0.0);
                     inst.last_equity_fetch = Some(Instant::now());
+                    inst.last_successful_equity_fetch = Some(Instant::now());
                     // bot-strategy#366: arm the session-DD gate only after a
                     // connector-sourced balance has actually landed. Before
                     // this point `equity_cache` is still the YAML
@@ -914,30 +915,40 @@ impl PairTradeEngine {
                                     std::mem::replace(&mut inst.capital_rebaseline_deferred, false);
                                 inst.capital_rebaseline_deferred_since = None;
                                 // A position closing does not guarantee its
-                                // effect on equity has landed yet:
-                                // equity_cache only refreshes every
-                                // EQUITY_REFRESH_CACHE_SECS, so the very
-                                // first quiet observation right after a
-                                // close (e.g. a startup force-close, or the
-                                // guard a pre-#783 migration seeds
-                                // unconditionally) reflects that the cache
-                                // simply has not been checked against fresh
-                                // equity yet -- not that accounting has
-                                // genuinely reconciled with it. Clearing the
-                                // guard here regardless would let a *later*,
-                                // unrelated capital event slip through
-                                // misclassified once the stale cache finally
-                                // refreshes. Only clear it once either a
-                                // real movement was actually observed and
-                                // resolved via the deferred path above, or
-                                // enough time has passed since becoming flat
-                                // that the cache has had a full chance to
-                                // catch up (Codex P1 follow-up,
-                                // bot-strategy#783).
+                                // effect on equity has landed yet, and an
+                                // elapsed-time proxy for "it must have
+                                // refreshed by now" is unsound:
+                                // refresh_equity_if_needed re-arms
+                                // last_equity_fetch (and so the cache
+                                // interval) even when the underlying fetch
+                                // *fails*, so equity_cache can stay stale
+                                // indefinitely through repeated failures
+                                // while wall-clock time keeps passing. If a
+                                // startup force-close's PnL was never
+                                // recorded (accounted_pnl_delta stays 0
+                                // forever) and equity genuinely never
+                                // refreshed before the guard cleared, the
+                                // real gap only surfaces once a fetch
+                                // finally succeeds -- by which point it is
+                                // misclassified as a verified deposit/
+                                // withdrawal (Codex P1 follow-up,
+                                // bot-strategy#783). was_deferred alone is
+                                // safe (a Reconciled disposition after being
+                                // Ambiguous is only reachable if equity
+                                // itself actually moved to make the basis
+                                // read clean again -- algebraically
+                                // impossible on a still-stale reading), but
+                                // the fallback for a *never-ambiguous*,
+                                // quiet-since-latch tick must require an
+                                // actual successful equity observation made
+                                // after becoming flat, not merely enough
+                                // elapsed time for one to have plausibly
+                                // happened.
                                 if was_deferred
                                     || !reconciliation.position_seen_since_baseline
                                     || inst.flat_since.is_some_and(|since| {
-                                        since.elapsed().as_secs() >= EQUITY_REFRESH_CACHE_SECS
+                                        inst.last_successful_equity_fetch
+                                            .is_some_and(|fetch| fetch >= since)
                                     })
                                 {
                                     inst.capital_position_seen_since_baseline = false;
@@ -1016,17 +1027,28 @@ impl PairTradeEngine {
                                 // explained, e.g. a delayed-settlement
                                 // migration candidate). Any other
                                 // sub-threshold-but-nonzero accounted move
-                                // must instead wait for flat_since to show a
-                                // full EQUITY_REFRESH_CACHE_SECS chance for
-                                // equity to catch up with *everything*
-                                // realized since the position closed, not
-                                // just this tick's own delta (Codex P1
-                                // follow-up, bot-strategy#783).
+                                // must instead wait for an actual
+                                // successful equity observation made after
+                                // the position closed -- not merely enough
+                                // elapsed time for one to have plausibly
+                                // happened, since refresh_equity_if_needed
+                                // re-arms its own cache-interval clock even
+                                // when the underlying fetch fails, so
+                                // equity_cache can stay stale indefinitely
+                                // through repeated failures while wall-clock
+                                // time keeps passing (Codex P1 follow-up,
+                                // bot-strategy#783). (accounted_delta_settled
+                                // needs no equivalent check: equity_cache
+                                // only ever changes via a successful fetch,
+                                // so `equity` differing from the anchor's
+                                // baseline_equity is itself proof one
+                                // already happened.)
                                 let accounted_delta_settled =
                                     reconciliation.accounted_pnl_delta.abs() <= CAPITAL_DELTA_EPSILON;
                                 let position_guard_can_clear = accounted_delta_settled
                                     || inst.flat_since.is_some_and(|since| {
-                                        since.elapsed().as_secs() >= EQUITY_REFRESH_CACHE_SECS
+                                        inst.last_successful_equity_fetch
+                                            .is_some_and(|fetch| fetch >= since)
                                     });
                                 let baseline_advanced = reconciliation.position_seen_since_baseline
                                     && reconciliation.accounted_pnl_delta.abs() < min_usd
@@ -1078,8 +1100,36 @@ impl PairTradeEngine {
                                     .capital_rebaseline_deferred_since
                                     .map(|since| since.elapsed().as_secs())
                                     .unwrap_or(0);
-                                let gave_up =
-                                    !baseline_advanced && stuck_secs >= CAPITAL_REBASELINE_GIVEUP_SECS;
+                                // The timeout is for a genuinely
+                                // inseparable close-plus-transfer, not for
+                                // "equity refreshes have been unavailable
+                                // the whole time" -- if the account was
+                                // never actually re-observed with fresh
+                                // equity since the deferral began, force-
+                                // advancing baseline_equity to the still-
+                                // stale current reading (while
+                                // baseline_accounted_pnl jumps to the fully
+                                // caught-up accounted_pnl) manufactures an
+                                // instant mismatch: the next real, fresh
+                                // equity refresh then looks like a clean
+                                // capital move with no accounting delta,
+                                // even though it is exactly the same
+                                // outstanding settlement debt the timeout
+                                // was supposed to be giving up on
+                                // disentangling (Codex P2 follow-up,
+                                // bot-strategy#783). Only give up once at
+                                // least one successful equity observation
+                                // landed during the stuck window and it
+                                // still did not resolve.
+                                let equity_confirmed_since_deferred = inst
+                                    .capital_rebaseline_deferred_since
+                                    .is_some_and(|deferred_at| {
+                                        inst.last_successful_equity_fetch
+                                            .is_some_and(|fetch| fetch >= deferred_at)
+                                    });
+                                let gave_up = !baseline_advanced
+                                    && stuck_secs >= CAPITAL_REBASELINE_GIVEUP_SECS
+                                    && equity_confirmed_since_deferred;
 
                                 if gave_up {
                                     inst.capital_baseline_equity = equity;

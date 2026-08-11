@@ -466,6 +466,7 @@ impl Harness {
             connector: self._connector.clone(),
             equity_cache: DEFAULT_EQUITY_USD,
             last_equity_fetch: None,
+            last_successful_equity_fetch: None,
             equity_initialized: false,
             equity_reference_usd: DEFAULT_EQUITY_USD,
             states,
@@ -1243,16 +1244,30 @@ fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
     assert!(h.engine.instances[0].capital_rebaseline_deferred_since.is_some());
 
     // Simulate the give-up window having elapsed without needing to
-    // actually sleep: back-date the deferred-since clock.
+    // actually sleep: back-date the deferred-since clock. Equity was never
+    // actually re-observed during that window (e.g. a stretch of failing
+    // /account calls) -- elapsed time alone must not be enough to give up,
+    // or the anchor force-advances baseline_equity to a still-stale
+    // reading while baseline_accounted_pnl jumps to the fully-caught-up
+    // total, manufacturing a mismatch the next real refresh misreads as a
+    // clean capital move.
     h.engine.instances[0].capital_rebaseline_deferred_since = Some(
         Instant::now() - Duration::from_secs(engine::risk::CAPITAL_REBASELINE_GIVEUP_SECS + 1),
     );
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "elapsed time alone, without an actual successful equity observation, must not give up"
+    );
+
+    // Now a fetch actually succeeds while still stuck.
+    h.engine.instances[0].last_successful_equity_fetch = Some(Instant::now());
     h.engine.detect_capital_event_and_rebaseline(0);
 
     let inst = &h.engine.instances[0];
     assert!(
         !inst.capital_rebaseline_deferred,
-        "the deferral gives up after the timeout instead of staying stuck forever"
+        "the deferral gives up once equity has actually been re-observed and the timeout has elapsed"
     );
     assert!(inst.capital_rebaseline_deferred_since.is_none());
     assert!(
@@ -1310,14 +1325,25 @@ fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapse
         "a quiet reading right after the guard latches must not clear it yet"
     );
 
-    // Back-date flat_since past the equity-cache lag window without
-    // actually sleeping.
+    // Back-date flat_since past the equity-cache lag window, but equity was
+    // never actually re-observed since (last_successful_equity_fetch stays
+    // None) -- elapsed time alone must not be enough. refresh_equity_if_needed
+    // re-arms its cache-interval clock even on a failed fetch, so this is
+    // exactly the state a stretch of failing /account calls would leave.
     h.engine.instances[0].flat_since =
         Some(Instant::now() - Duration::from_secs(EQUITY_REFRESH_CACHE_SECS + 1));
     h.engine.detect_capital_event_and_rebaseline(0);
     assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "elapsed time alone, without an actual successful equity observation, must not clear the guard"
+    );
+
+    // Now a fetch actually succeeds.
+    h.engine.instances[0].last_successful_equity_fetch = Some(Instant::now());
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
         !h.engine.instances[0].capital_position_seen_since_baseline,
-        "the guard clears once the equity-cache lag window has elapsed"
+        "the guard clears once equity has actually been observed since becoming flat"
     );
 }
 

@@ -168,6 +168,7 @@ impl PairTradeEngine {
                 connector: instance_connector,
                 equity_cache: strategy.equity_reference_usd,
                 last_equity_fetch,
+                last_successful_equity_fetch: None,
                 equity_initialized: false,
                 equity_reference_usd: strategy.equity_reference_usd,
                 states,

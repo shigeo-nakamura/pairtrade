@@ -38,6 +38,19 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// Per-instance live equity from the instance's connector.
     pub(in crate::pairtrade) equity_cache: f64,
     pub(in crate::pairtrade) last_equity_fetch: Option<Instant>,
+    /// When `equity_cache` was last actually updated by a *successful*
+    /// `fetch_equity_rest` (the `Ok` branch only). Unlike
+    /// `last_equity_fetch` -- which advances on a failed fetch too (a
+    /// throttled/errored `/account` still re-arms the cache-interval
+    /// clock so the next tick doesn't retry immediately) -- this is the
+    /// only reliable signal that `equity_cache` reflects a fresh read
+    /// rather than a stale value the cache interval merely stopped
+    /// re-fetching. `detect_capital_event_and_rebaseline` needs this
+    /// distinction: clearing a guard because enough wall-clock time has
+    /// passed is not the same as clearing it because equity was actually
+    /// observed again (Codex P1/P2 follow-up, bot-strategy#783). Runtime
+    /// only, not persisted.
+    pub(in crate::pairtrade) last_successful_equity_fetch: Option<Instant>,
     /// False until the first successful `fetch_equity_rest` writes a
     /// connector-sourced balance into `equity_cache`. Not persisted —
     /// always starts false on engine boot. Gates session-DD evaluation
