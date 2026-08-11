@@ -115,6 +115,20 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// authorizes a rebaseline; it clears only after accounting and equity
     /// reconcile or a verified capital event lands.
     pub(in crate::pairtrade) capital_rebaseline_deferred: bool,
+    /// Runtime-only: when the *current* deferred streak began. Some
+    /// ambiguous observations (e.g. a real transfer landing exactly when a
+    /// position closes with material PnL) can never satisfy the ordinary
+    /// `baseline_advanced` exit -- that requires the accounted delta itself
+    /// to be sub-threshold, which a genuine material close PnL never is --
+    /// leaving the account stuck deferred forever with no way to detect any
+    /// later capital event either. After `CAPITAL_REBASELINE_GIVEUP_SECS`
+    /// of continuous deferral, `detect_capital_event_and_rebaseline` gives
+    /// up: the anchor advances to the current reading so future events
+    /// remain detectable, without crediting this specific one to either
+    /// accounting or a transfer since it cannot disentangle them. Reset to
+    /// `None` whenever the deferred streak ends or restarts (mirrors
+    /// `flat_since`; not persisted).
+    pub(in crate::pairtrade) capital_rebaseline_deferred_since: Option<Instant>,
     /// bot-strategy#575 ①: when this instance most recently became flat
     /// (no open or pending positions). `detect_capital_event_and_rebaseline`
     /// requires `session_dd_capital_settle_secs` of continuous flatness

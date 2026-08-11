@@ -183,6 +183,7 @@ impl PairTradeEngine {
             inst.capital_baseline_accounted_pnl = state.capital_baseline_accounted_pnl;
             inst.capital_position_seen_since_baseline = state.capital_position_seen_since_baseline;
             inst.capital_rebaseline_deferred = false;
+            inst.capital_rebaseline_deferred_since = None;
             inst.session_halted = state.session_halted;
             inst.session_halt_reason = state.session_halt_reason.clone();
             inst.session_halt_ts = state.session_halt_ts;

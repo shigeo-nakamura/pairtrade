@@ -133,6 +133,7 @@ impl PairTradeEngine {
                 capital_baseline_accounted_pnl: Some(0.0),
                 capital_position_seen_since_baseline: false,
                 capital_rebaseline_deferred: false,
+                capital_rebaseline_deferred_since: None,
                 flat_since: None,
                 session_halted: false,
                 session_halt_reason: None,

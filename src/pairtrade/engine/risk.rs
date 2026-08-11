@@ -512,6 +512,7 @@ impl PairTradeEngine {
                             Some(inst.total_pnl + inst.total_funding_carry);
                         inst.capital_position_seen_since_baseline = false;
                         inst.capital_rebaseline_deferred = false;
+                        inst.capital_rebaseline_deferred_since = None;
                     }
                     format!(", peak re-anchored to equity={:.2} (DD→0)", equity)
                 } else {
@@ -736,6 +737,18 @@ impl PairTradeEngine {
                 equity: f64,
                 reconciliation: CapitalReconciliation,
             },
+            /// A deferred ambiguity that could never satisfy
+            /// `baseline_advanced` (the accounted delta itself is material,
+            /// e.g. a real transfer landed alongside a material close PnL)
+            /// stayed unresolved for `CAPITAL_REBASELINE_GIVEUP_SECS`. The
+            /// anchor is force-advanced without crediting either
+            /// accounting or a transfer, so future capital events remain
+            /// detectable instead of being blocked forever.
+            DeferredGivenUp {
+                equity: f64,
+                reconciliation: CapitalReconciliation,
+                stuck_secs: u64,
+            },
             BaselineMigrated {
                 previous_equity: f64,
                 equity: f64,
@@ -807,6 +820,7 @@ impl PairTradeEngine {
                 inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
                 inst.capital_position_seen_since_baseline = false;
                 inst.capital_rebaseline_deferred = false;
+                inst.capital_rebaseline_deferred_since = None;
                 if reference_reconciliation_pending {
                     let prev_start_equity = inst.session_start_equity;
                     let previous_reference = inst.session_equity_reference_usd;
@@ -852,6 +866,7 @@ impl PairTradeEngine {
                         inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
                         inst.capital_position_seen_since_baseline = true;
                         inst.capital_rebaseline_deferred = false;
+                        inst.capital_rebaseline_deferred_since = None;
                         inst.flat_since = Some(Instant::now());
                         Some(Rebaseline::BaselineMigrated {
                             previous_equity: baseline,
@@ -898,6 +913,7 @@ impl PairTradeEngine {
                                 inst.capital_position_seen_since_baseline = false;
                                 let was_deferred =
                                     std::mem::replace(&mut inst.capital_rebaseline_deferred, false);
+                                inst.capital_rebaseline_deferred_since = None;
                                 if reference_reconciliation_pending {
                                     let prev_start_equity = inst.session_start_equity;
                                     let previous_reference = inst.session_equity_reference_usd;
@@ -956,10 +972,56 @@ impl PairTradeEngine {
                                     inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
                                     inst.flat_since = Some(Instant::now());
                                 }
-                                if inst.capital_rebaseline_deferred && !baseline_advanced {
+                                let was_deferred = inst.capital_rebaseline_deferred;
+                                if !was_deferred || baseline_advanced {
+                                    // A fresh deferral, or the candidate just
+                                    // advanced to a new point: (re)start the
+                                    // give-up clock below so a run of
+                                    // harmless small-PnL advances never
+                                    // counts toward giving up on a
+                                    // different, still-unresolved ambiguity.
+                                    inst.capital_rebaseline_deferred_since = Some(Instant::now());
+                                }
+                                inst.capital_rebaseline_deferred = true;
+
+                                // Some ambiguous observations can never
+                                // satisfy baseline_advanced: it requires the
+                                // accounted delta itself to be sub-threshold,
+                                // which a genuine material close PnL landing
+                                // alongside a real transfer never is. Left
+                                // unresolved, that leaves the account
+                                // deferred forever with no path to detect
+                                // any later, unrelated capital event either
+                                // (Codex P2 follow-up, bot-strategy#783).
+                                // After a long, continuous deferred streak,
+                                // give up: advance the anchor to the current
+                                // reading so future events remain
+                                // detectable. session_start_equity and the
+                                // DD peak are deliberately left untouched --
+                                // this specific event cannot be disentangled
+                                // between accounting and a transfer, so
+                                // neither is credited.
+                                let stuck_secs = inst
+                                    .capital_rebaseline_deferred_since
+                                    .map(|since| since.elapsed().as_secs())
+                                    .unwrap_or(0);
+                                let gave_up =
+                                    !baseline_advanced && stuck_secs >= CAPITAL_REBASELINE_GIVEUP_SECS;
+
+                                if gave_up {
+                                    inst.capital_baseline_equity = equity;
+                                    inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
+                                    inst.capital_position_seen_since_baseline = false;
+                                    inst.capital_rebaseline_deferred = false;
+                                    inst.capital_rebaseline_deferred_since = None;
+                                    Some(Rebaseline::DeferredGivenUp {
+                                        equity,
+                                        reconciliation,
+                                        stuck_secs,
+                                    })
+                                } else if was_deferred && !baseline_advanced {
                                     None
                                 } else {
-                                    inst.capital_rebaseline_deferred = true;
                                     Some(Rebaseline::Deferred {
                                         equity,
                                         baseline_equity: baseline,
@@ -991,6 +1053,7 @@ impl PairTradeEngine {
                                 inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
                                 inst.capital_position_seen_since_baseline = false;
                                 inst.capital_rebaseline_deferred = false;
+                                inst.capital_rebaseline_deferred_since = None;
                                 let reference_change =
                                     reference_reconciliation_pending.then_some({
                                         (
@@ -1133,6 +1196,40 @@ impl PairTradeEngine {
                         "baseline_equity": baseline_equity,
                         "equity": equity,
                         "action": action,
+                    })),
+                );
+                self.persist_risk_state();
+            }
+            Some(Rebaseline::DeferredGivenUp {
+                equity,
+                reconciliation,
+                stuck_secs,
+            }) => {
+                log::warn!(
+                    "[SESSION_DD] {} capital rebaseline deferral gave up after {}s stuck (limit {}s): raw_equity_delta={:.2} accounted_pnl_delta={:.2} inferred_capital_delta={:.2} equity={:.2}; anchor force-advanced, neither accounting nor a transfer credited for this event",
+                    self.instances[inst_idx].id,
+                    stuck_secs,
+                    CAPITAL_REBASELINE_GIVEUP_SECS,
+                    reconciliation.raw_equity_delta,
+                    reconciliation.accounted_pnl_delta,
+                    reconciliation.inferred_capital_delta,
+                    equity,
+                );
+                self.record_risk_event_for_instance(
+                    inst_idx,
+                    "session_dd",
+                    "capital_rebaseline_deferred_gave_up",
+                    Some("unresolvable_ambiguity_timeout".to_string()),
+                    Some(serde_json::json!({
+                        "evidence": "equity_minus_realized_pnl_and_funding",
+                        "raw_equity_delta_usd": reconciliation.raw_equity_delta,
+                        "accounted_pnl_delta_usd": reconciliation.accounted_pnl_delta,
+                        "inferred_capital_delta_usd": reconciliation.inferred_capital_delta,
+                        "position_seen_since_baseline": reconciliation.position_seen_since_baseline,
+                        "equity": equity,
+                        "stuck_secs": stuck_secs,
+                        "giveup_limit_secs": CAPITAL_REBASELINE_GIVEUP_SECS,
+                        "action": "force_advance_anchor_no_credit",
                     })),
                 );
                 self.persist_risk_state();
@@ -1443,13 +1540,24 @@ enum CapitalDisposition {
     Ambiguous,
 }
 
-/// Floating-point tolerance for "did this value move at all" checks in
+/// Floating-point tolerance for "is this value exactly zero" checks in
 /// `reconcile_capital_delta`, distinct from the operator-configured
-/// `min_usd` materiality threshold: this is used to detect whether
-/// `equity_cache` is bit-for-bit unchanged since the last observation
-/// (only refreshed on its own cadence, see `EQUITY_REFRESH_CACHE_SECS`),
-/// not whether a movement is small enough to ignore.
+/// `min_usd` materiality threshold: `min_usd` decides whether a residual is
+/// large enough to matter; this decides whether it is genuinely zero (safe
+/// to forget) versus merely small (must be retained -- see
+/// `inferred_capital_delta`'s use in the disposition match).
 const CAPITAL_DELTA_EPSILON: f64 = 1e-9;
+
+/// How long a deferred ambiguity may stay unresolved before
+/// `detect_capital_event_and_rebaseline` gives up on disentangling it from
+/// accounting and force-advances the anchor anyway (see
+/// `capital_rebaseline_deferred_since`'s doc comment on `StrategyInstance`).
+/// Deliberately independent of the operator-configured
+/// `session_dd_capital_settle_secs`, which can legitimately be 0 for fast
+/// detection -- multiplying a 0 settle window would give up immediately,
+/// defeating the fail-safe deferral this is meant to eventually escape
+/// rather than replace.
+pub(in crate::pairtrade) const CAPITAL_REBASELINE_GIVEUP_SECS: u64 = 900;
 
 /// Reconcile a flat account-equity movement against trade/funding accounting.
 /// Raw equity changes alone are not capital evidence because connector balance
@@ -1471,25 +1579,35 @@ fn reconcile_capital_delta(
     let disposition =
         match classify_capital_basis_delta(baseline_capital_basis, current_capital_basis, min_usd)
         {
-            // The basis looks reconciled, but only because this tick's own
-            // accounted-PnL move happens to be small enough to hide under
-            // min_usd while equity itself did not move at all (bit-exact,
-            // not just "small" -- equity_cache is only refreshed on its own
-            // cadence, so an unrefreshed tick reads back the identical
-            // value). Advancing the anchor here would silently forgive that
-            // gap; a second such sub-threshold move before equity ever
-            // catches up then accumulates completely unnoticed, since each
-            // individual move keeps resetting the anchor it would otherwise
-            // be measured against. Defer instead: the anchor stays pinned,
-            // so the next accounted-only move is measured against the same
-            // un-advanced point and the accumulated gap is what eventually
-            // gets compared -- either to min_usd (existing Ambiguous
-            // threshold below) or, once equity genuinely moves to explain
-            // it (raw_equity_delta then reads as more than noise), back to
-            // this same basis check, which resolves it for real (Codex P1
-            // follow-up, bot-strategy#783).
+            // The basis is within min_usd, but that alone does not mean
+            // there is zero outstanding debt -- only that whatever debt
+            // exists is currently small enough to hide under the
+            // materiality threshold. Resetting the anchor to the current
+            // (equity, accounted_pnl) point here discards that residual
+            // entirely; a run of several such resets, each individually
+            // sub-threshold but all draining equity's catch-up in the same
+            // direction (accounted moves ahead, equity trails behind by a
+            // few dollars every tick), can accumulate a materially larger
+            // gap that never gets compared as a whole, since each tick's
+            // reset erases the previous one's contribution before the next
+            // is even measured. Both conditions matter: accounted_pnl_delta
+            // alone catches "did accounting move at all," but a pure
+            // equity-only drift (accounted_pnl_delta == 0, e.g. ordinary
+            // mark noise) must still reconcile normally, or a still-open-
+            // position latch that only ever clears via Reconciled/Verified
+            // would never clear. inferred_capital_delta alone (the earlier
+            // version of this guard) instead falsely flagged that same
+            // pure equity drift, since it is nonzero whenever raw equity
+            // and accounted PnL merely *differ* rather than specifically
+            // when accounting moved. Requiring both: accounting genuinely
+            // moved this tick AND equity has not (yet) moved enough to
+            // fully explain it relative to the retained anchor -- is what
+            // distinguishes "still accumulating debt" (defer) from "this
+            // tick's equity move fully explains the retained debt" (safe
+            // to reconcile, however that debt built up across however many
+            // prior deferred ticks) (Codex P1 follow-up, bot-strategy#783).
             None if accounted_pnl_delta.abs() > CAPITAL_DELTA_EPSILON
-                && raw_equity_delta.abs() <= CAPITAL_DELTA_EPSILON =>
+                && inferred_capital_delta.abs() > CAPITAL_DELTA_EPSILON =>
             {
                 CapitalDisposition::Ambiguous
             }
@@ -1919,6 +2037,74 @@ mod tests {
             "equity catching up to the full accounted total resolves as delayed settlement, not an $8 verified deposit"
         );
         assert!(tick3.inferred_capital_delta.abs() < 1e-9);
+    }
+
+    // bot-strategy#783 (Codex P1 follow-up, second round): equity does not
+    // have to be bit-exact frozen for the same accumulation to happen --
+    // partial catch-up each tick (raw equity moves, just not by as much as
+    // accounted_pnl) leaves the same kind of residual behind, and each
+    // tick's residual is individually below min_usd.
+    #[test]
+    fn capital_reconciliation_accumulates_partial_catch_up_residuals_until_equity_fully_catches_up()
+    {
+        let min_usd = 5.0;
+        let baseline_equity = 1_000.0;
+        let baseline_accounted_pnl = 0.0;
+
+        let tick1 = reconcile_capital_delta(
+            baseline_equity,
+            1_001.0,
+            baseline_accounted_pnl,
+            4.0,
+            false,
+            min_usd,
+        );
+        assert_eq!(
+            tick1.disposition,
+            CapitalDisposition::Ambiguous,
+            "a $3 residual (equity +1 vs accounted +4) defers instead of resetting the anchor"
+        );
+
+        let tick2 = reconcile_capital_delta(
+            baseline_equity,
+            1_002.0,
+            baseline_accounted_pnl,
+            8.0,
+            false,
+            min_usd,
+        );
+        assert_eq!(
+            tick2.disposition,
+            CapitalDisposition::Ambiguous,
+            "the accumulated $6 residual against the un-advanced anchor now exceeds min_usd on its own"
+        );
+
+        let tick3 = reconcile_capital_delta(
+            baseline_equity,
+            1_008.0,
+            baseline_accounted_pnl,
+            8.0,
+            false,
+            min_usd,
+        );
+        assert_eq!(
+            tick3.disposition,
+            CapitalDisposition::Reconciled,
+            "equity fully catching up to the accounted total resolves as delayed settlement, not a $6 verified deposit"
+        );
+        assert!(tick3.inferred_capital_delta.abs() < 1e-9);
+    }
+
+    // A pure equity-only drift (nothing traded, accounted_pnl unchanged)
+    // must still reconcile normally even while position_seen_since_baseline
+    // is stuck true from an earlier migration -- the P1 accumulation guard
+    // must not block the ordinary Reconciled path this depends on to ever
+    // clear the latch (regression for a fix that briefly broke
+    // deposit_while_flat_rebaselines_peak_without_clearing_halt).
+    #[test]
+    fn capital_reconciliation_reconciles_pure_equity_drift_with_no_accounted_move() {
+        let drift = reconcile_capital_delta(950.0, 953.0, 0.0, 0.0, true, 5.0);
+        assert_eq!(drift.disposition, CapitalDisposition::Reconciled);
     }
 
     // bot-strategy#783 (Codex P1 follow-up): a near-full withdrawal after a

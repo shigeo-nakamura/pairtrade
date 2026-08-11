@@ -486,6 +486,7 @@ impl Harness {
             capital_baseline_accounted_pnl: Some(0.0),
             capital_position_seen_since_baseline: false,
             capital_rebaseline_deferred: false,
+            capital_rebaseline_deferred_since: None,
             flat_since: None,
             session_halted: false,
             session_halt_reason: None,
@@ -1195,6 +1196,78 @@ fn withdrawal_rollover_redeposit_counts_new_capital_once() {
         "a capital event never erases current-session realized PnL"
     );
     assert!((inst.capital_baseline_equity - 6_000.01).abs() < 1e-9);
+}
+
+// bot-strategy#783 Codex P2 follow-up: a real transfer landing exactly when
+// a position closes with material PnL can never satisfy baseline_advanced
+// (it requires the accounted delta itself to be sub-threshold, which a
+// genuine material close PnL never is). Left unresolved, the account would
+// stay deferred forever, blocking detection of every later, unrelated
+// capital event too -- not just this one.
+#[test]
+fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-giveup");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.session_start_equity = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    // A $10 close settles at the same instant a $100 deposit lands: equity
+    // moves to $1,110 while accounted PnL moves by $10. Neither
+    // Reconciled nor Verified applies (accounted_pnl_delta exceeds min_usd
+    // on its own), so this is Ambiguous and cannot naturally clear.
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_cache = 1_110.0;
+        inst.total_pnl = 10.0;
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "an unresolvable ambiguity defers rather than guessing"
+    );
+    assert!(h.engine.instances[0].capital_rebaseline_deferred_since.is_some());
+
+    // Simulate the give-up window having elapsed without needing to
+    // actually sleep: back-date the deferred-since clock.
+    h.engine.instances[0].capital_rebaseline_deferred_since = Some(
+        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_REBASELINE_GIVEUP_SECS + 1),
+    );
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        !inst.capital_rebaseline_deferred,
+        "the deferral gives up after the timeout instead of staying stuck forever"
+    );
+    assert!(inst.capital_rebaseline_deferred_since.is_none());
+    assert!(
+        (inst.capital_baseline_equity - 1_110.0).abs() < 1e-9,
+        "the anchor force-advances to the current reading"
+    );
+
+    // A later, genuinely clean $100 deposit must now be detectable again --
+    // the whole point of giving up instead of staying stuck.
+    h.engine.instances[0].equity_cache = 1_210.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        (h.engine.instances[0].session_start_equity - 1_100.0).abs() < 1e-9,
+        "capital-event detection recovered after the give-up and caught the later deposit"
+    );
 }
 
 // bot-strategy#783 Codex P1 follow-up: the false-to-true
