@@ -2077,6 +2077,62 @@ fn risk_ack_reanchor_clears_halt_and_resets_peak() {
     );
 }
 
+// bot-strategy#783 (Codex P1 follow-up): step_shared processes the ack
+// before refreshing equity in the same tick, so an out-of-band halt flatten
+// whose PnL has not settled yet can still have a stale equity_cache when the
+// reanchor runs. The peak/candidate must still reanchor (the operator
+// explicitly asked for that), but the position guard must survive until a
+// confirmed-fresh equity read proves the stale reading is safe to trust.
+#[test]
+fn risk_ack_reanchor_keeps_position_guard_on_stale_equity() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-ack-reanchor-guard");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.session_halted = true;
+        inst.session_halt_reason = Some("session_dd_500bps_lev1.0".to_string());
+        inst.session_halt_ts = Some(now);
+        inst.equity_initialized = true;
+        inst.equity_cache = 950.0;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 1_003.0,
+        }];
+        // An out-of-band flatten just happened; its settlement has not
+        // landed in equity_cache yet (no successful fetch since).
+        inst.capital_position_seen_since_baseline = true;
+        inst.flat_since = Some(Instant::now());
+    }
+
+    std::fs::write(risk_ack_path(), "ack by op: reanchor=true").unwrap();
+    h.engine.consume_risk_ack();
+
+    let inst = &h.engine.instances[0];
+    assert!(!inst.session_halted, "ack still clears the halt");
+    assert!(
+        (inst.equity_samples[0].equity - 950.0).abs() < 1e-9,
+        "peak still reanchors to current equity -- the operator explicitly asked for that"
+    );
+    assert!(
+        inst.capital_position_seen_since_baseline,
+        "the position guard survives a reanchor on stale (not confirmed-fresh) equity"
+    );
+
+    // Once equity is actually confirmed fresh, a later reanchor does clear it.
+    h.engine.instances[0].session_halted = true;
+    h.engine.instances[0].last_successful_equity_fetch = Some(Instant::now());
+    std::fs::write(risk_ack_path(), "ack by op: reanchor=true").unwrap();
+    h.engine.consume_risk_ack();
+    assert!(
+        !h.engine.instances[0].capital_position_seen_since_baseline,
+        "the guard clears once equity is confirmed fresh"
+    );
+}
+
 #[test]
 fn risk_ack_without_reanchor_leaves_peak_intact() {
     let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());

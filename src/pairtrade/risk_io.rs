@@ -138,7 +138,18 @@ impl InstanceRiskState {
         self.equity_samples.clear();
         self.capital_baseline_equity = 0.0;
         self.capital_baseline_accounted_pnl = None;
-        self.capital_position_seen_since_baseline = false;
+        // Seeded true, not false: a round transition can happen while a
+        // venue position is still open, and load_risk_state applies this
+        // reset before force_close_on_startup ever runs (engine/step.rs).
+        // If that startup force-close's settlement has not landed in
+        // equity yet, clearing the guard here would let it reach the next
+        // detect_capital_event_and_rebaseline tick with no protection at
+        // all, right when it is most needed -- misclassifying the delayed
+        // settlement as a verified capital event once equity catches up
+        // (Codex P1 follow-up, bot-strategy#783). This mirrors the
+        // pre-#783-migration seed's own defensive posture: guard until a
+        // stable, confirmed-fresh observation proves it is safe to trust.
+        self.capital_position_seen_since_baseline = true;
         self.session_halted = false;
         self.session_halt_reason = None;
         self.session_halt_ts = None;
@@ -372,7 +383,12 @@ mod tests {
         assert!(s.equity_samples.is_empty());
         assert_eq!(s.capital_baseline_equity, 0.0);
         assert_eq!(s.capital_baseline_accounted_pnl, None);
-        assert!(!s.capital_position_seen_since_baseline);
+        // Seeded true (not merely preserved), not false: a round can flip
+        // while a position is still open, and this reset runs before
+        // force_close_on_startup, so the guard must default to "not yet
+        // proven safe" rather than "trust immediately" (Codex P1 follow-up,
+        // bot-strategy#783).
+        assert!(s.capital_position_seen_since_baseline);
         assert!(!s.session_halted);
         assert_eq!(s.session_halt_reason, None);
         assert_eq!(s.session_halt_ts, None);

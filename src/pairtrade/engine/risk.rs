@@ -511,9 +511,30 @@ impl PairTradeEngine {
                         inst.capital_baseline_equity = equity;
                         inst.capital_baseline_accounted_pnl =
                             Some(inst.total_pnl + inst.total_funding_carry);
-                        inst.capital_position_seen_since_baseline = false;
-                        inst.capital_rebaseline_deferred = false;
-                        inst.capital_rebaseline_deferred_since = None;
+                        // step_shared processes the ack before refreshing
+                        // equity in the same tick, so `equity` above can
+                        // still be the pre-close balance if this halt was
+                        // triggered by an out-of-band flatten whose PnL
+                        // has not landed yet. Clearing the guard on that
+                        // stale reading would remove the only protection
+                        // for the unrecorded close: once the connector
+                        // later reports the real settlement, it gets
+                        // classified as a verified deposit/withdrawal
+                        // (Codex P1 follow-up, bot-strategy#783). Reanchor
+                        // the candidate (the operator explicitly asked for
+                        // that), but only clear the guard itself once a
+                        // successful equity observation after becoming
+                        // flat confirms this reading is genuinely fresh.
+                        let equity_confirmed_since_flat = inst.flat_since.is_some_and(|since| {
+                            inst.last_successful_equity_fetch.is_some_and(|fetch| fetch >= since)
+                        });
+                        if !inst.capital_position_seen_since_baseline
+                            || equity_confirmed_since_flat
+                        {
+                            inst.capital_position_seen_since_baseline = false;
+                            inst.capital_rebaseline_deferred = false;
+                            inst.capital_rebaseline_deferred_since = None;
+                        }
                     }
                     format!(", peak re-anchored to equity={:.2} (DD→0)", equity)
                 } else {
@@ -819,7 +840,25 @@ impl PairTradeEngine {
             if baseline <= 0.0 {
                 inst.capital_baseline_equity = equity;
                 inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
-                inst.capital_position_seen_since_baseline = false;
+                // A missing baseline does not only mean "genuinely fresh
+                // start" -- risk_io.rs's round-transition reset also zeroes
+                // it defensively (capital_position_seen_since_baseline=true)
+                // specifically because a round can flip while a position is
+                // still open, and load_risk_state applies that reset before
+                // force_close_on_startup ever runs. Unconditionally forcing
+                // the guard to false here would discard that protection on
+                // the very next tick, right as an unrecorded startup
+                // force-close's settlement is still pending (Codex P1
+                // follow-up, bot-strategy#783). Only clear it if it was
+                // already false, or a successful equity observation after
+                // becoming flat confirms this reading is genuinely fresh.
+                if !inst.capital_position_seen_since_baseline
+                    || inst.flat_since.is_some_and(|since| {
+                        inst.last_successful_equity_fetch.is_some_and(|fetch| fetch >= since)
+                    })
+                {
+                    inst.capital_position_seen_since_baseline = false;
+                }
                 inst.capital_rebaseline_deferred = false;
                 inst.capital_rebaseline_deferred_since = None;
                 if reference_reconciliation_pending {
