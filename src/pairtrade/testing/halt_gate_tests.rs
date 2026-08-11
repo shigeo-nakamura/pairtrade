@@ -1406,6 +1406,64 @@ fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapse
     );
 }
 
+// bot-strategy#783 (Codex P1 follow-up, fifth round): an ordinary close that
+// is already fully reflected in equity on its very first flat tick must
+// clear the position guard immediately -- it must not have to wait for
+// `equity_confirmed_settled`'s freshness window, which exists to cover a
+// different failure mode (equity moved with no accounting evidence to lean
+// on at all). `reconcile_capital_delta` only reaches `Reconciled` with a
+// material `accounted_pnl_delta` when the basis is an *exact* match (any
+// residual routes to `Ambiguous` instead, per its own guard), so a material
+// accounted_pnl_delta here is itself proof the equity move is fully
+// explained -- leaving the latch up regardless would misclassify the very
+// next genuine deposit/withdrawal as position-ambiguous for as long as it
+// takes the freshness guard to separately mature.
+#[test]
+fn reconciled_close_with_material_accounted_delta_clears_guard_immediately() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-guard-accounted-clear");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        // As if a position had been open since the last confirmed baseline
+        // (the ordinary open->flat transition latches this true).
+        inst.capital_position_seen_since_baseline = true;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+        // A $50 close, already fully reflected in equity by this first
+        // observation -- no freshness proof set up (capital_guard_*
+        // fields are left at their defaults), so if the guard clears here
+        // it can only be via the accounted-delta path, not the freshness
+        // fallback.
+        inst.total_pnl = 50.0;
+        inst.equity_cache = 1_050.0;
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        !inst.capital_position_seen_since_baseline,
+        "a material accounted_pnl_delta that fully explains the equity move \
+         must clear the guard on its first observation, without waiting for \
+         equity_confirmed_settled"
+    );
+    assert_eq!(inst.capital_baseline_equity, 1_050.0);
+    assert_eq!(inst.capital_baseline_accounted_pnl, Some(50.0));
+    assert!(
+        !inst.capital_rebaseline_deferred,
+        "a clean Reconciled disposition is never deferred"
+    );
+}
+
 // bot-strategy#783 (Codex P1 follow-up, fourth round): the position-guard's
 // own baseline_advanced escape hatch had the identical sub-threshold
 // accumulation bug the no-position Reconciled path already had fixed --

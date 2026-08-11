@@ -1018,8 +1018,36 @@ impl PairTradeEngine {
                                 // already-material accounted_pnl_delta
                                 // cannot do -- it would stay Ambiguous
                                 // until the full amount lands.
+                                //
+                                // A material accounted_pnl_delta reaching
+                                // this branch is itself proof of a complete
+                                // settlement: `reconcile_capital_delta`
+                                // routes any tick where accounting moved
+                                // materially AND a residual basis gap
+                                // remains to `Ambiguous`, not `Reconciled`
+                                // (see its own comment). So a `Reconciled`
+                                // disposition with `accounted_pnl_delta`
+                                // above the exact-zero epsilon means our own
+                                // bookkeeping fully explains this tick's
+                                // equity move -- an ordinary close already
+                                // reflected in equity on its first flat
+                                // tick. Clearing the latch here does not
+                                // need `equity_confirmed_settled`'s freshness
+                                // proof, which exists to cover the opposite
+                                // case (equity moved with *no* accounting
+                                // evidence to lean on, e.g. an unaccounted
+                                // startup force-close). Leaving the latch up
+                                // in the accounted case would misclassify
+                                // the next genuine deposit/withdrawal as
+                                // position-ambiguous for as long as it takes
+                                // the freshness guard to separately mature
+                                // (Codex P1 follow-up, bot-strategy#783).
+                                let accounted_pnl_delta_material =
+                                    reconciliation.accounted_pnl_delta.abs()
+                                        > CAPITAL_DELTA_EPSILON;
                                 if was_deferred
                                     || !reconciliation.position_seen_since_baseline
+                                    || accounted_pnl_delta_material
                                     || equity_confirmed_settled(inst, equity)
                                 {
                                     inst.capital_position_seen_since_baseline = false;
