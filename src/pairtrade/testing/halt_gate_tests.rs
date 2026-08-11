@@ -1321,6 +1321,70 @@ fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapse
     );
 }
 
+// bot-strategy#783 (Codex P1 follow-up, fourth round): the position-guard's
+// own baseline_advanced escape hatch had the identical sub-threshold
+// accumulation bug the no-position Reconciled path already had fixed --
+// two individually-sub-threshold closes ($4 each against a $5 threshold)
+// each independently advancing the accounted anchor while equity stays
+// put, so the eventual delayed $8 equity refresh reconciles against an
+// anchor that already silently absorbed both instead of being compared as
+// a whole.
+#[test]
+fn position_guard_baseline_advance_retains_accumulated_sub_threshold_debt() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-guard-accum");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.capital_position_seen_since_baseline = true;
+        inst.session_start_equity = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        inst.equity_reference_usd = 1_000.0;
+        inst.flat_since = Some(Instant::now());
+    }
+
+    // First $4 win: equity_cache has not refreshed yet.
+    h.engine.instances[0].total_pnl = 4.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert_eq!(
+        h.engine.instances[0].capital_baseline_accounted_pnl,
+        Some(0.0),
+        "a fresh sub-threshold close within the cache-lag window must not advance the anchor"
+    );
+
+    // Second $4 win: still no equity refresh.
+    h.engine.instances[0].total_pnl = 8.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert_eq!(
+        h.engine.instances[0].capital_baseline_accounted_pnl,
+        Some(0.0),
+        "the anchor stays pinned to the original point so the two closes accumulate together"
+    );
+
+    // Equity finally catches up to reflect both wins.
+    h.engine.instances[0].equity_cache = 1_008.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert!(
+        !inst.capital_position_seen_since_baseline,
+        "the guard clears once equity fully explains the accumulated $8"
+    );
+    assert!(
+        (inst.session_start_equity - 1_000.0).abs() < 1e-9,
+        "the delayed $8 settlement must not be misclassified as a verified deposit"
+    );
+}
+
 // bot-strategy#783 Codex P1 follow-up: the false-to-true
 // capital_position_seen_since_baseline transition must be persisted so a
 // startup force-close (which can flatten a still-open position without

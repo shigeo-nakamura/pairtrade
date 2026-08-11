@@ -993,9 +993,54 @@ impl PairTradeEngine {
                                 // latest flat reading and require another settle
                                 // window. This eventually clears missing-accounting
                                 // recovery paths without ever reanchoring the peak.
+                                //
+                                // Gating purely on "this tick's accounted
+                                // delta is individually sub-threshold" used
+                                // to let repeated small closes each slip
+                                // under min_usd and independently advance
+                                // the anchor, the same accumulation bug the
+                                // no-position Reconciled path had (fixed
+                                // above) -- e.g. two $4 wins before the
+                                // 300-second equity-cache refresh, each
+                                // advancing the accounted baseline while
+                                // equity stays put, so the eventual delayed
+                                // $8 refresh reconciles against an anchor
+                                // that already silently absorbed both closes
+                                // instead of being compared as a whole.
+                                // Mirrors the no-position Reconciled path's
+                                // own guard exactly: a quick advance is only
+                                // trusted when nothing new is unaccounted
+                                // for THIS tick (accounted_pnl_delta is
+                                // genuinely ~0 -- equity is simply catching
+                                // up to what the accounting already fully
+                                // explained, e.g. a delayed-settlement
+                                // migration candidate). Any other
+                                // sub-threshold-but-nonzero accounted move
+                                // must instead wait for flat_since to show a
+                                // full EQUITY_REFRESH_CACHE_SECS chance for
+                                // equity to catch up with *everything*
+                                // realized since the position closed, not
+                                // just this tick's own delta (Codex P1
+                                // follow-up, bot-strategy#783).
+                                let accounted_delta_settled =
+                                    reconciliation.accounted_pnl_delta.abs() <= CAPITAL_DELTA_EPSILON;
+                                let position_guard_can_clear = accounted_delta_settled
+                                    || inst.flat_since.is_some_and(|since| {
+                                        since.elapsed().as_secs() >= EQUITY_REFRESH_CACHE_SECS
+                                    });
                                 let baseline_advanced = reconciliation.position_seen_since_baseline
-                                    && reconciliation.accounted_pnl_delta.abs() < min_usd;
+                                    && reconciliation.accounted_pnl_delta.abs() < min_usd
+                                    && position_guard_can_clear;
                                 if baseline_advanced {
+                                    // Advance the guarded *candidate* only --
+                                    // capital_position_seen_since_baseline
+                                    // stays latched. Clearing it is left to
+                                    // the Reconciled branch's own
+                                    // was_deferred path on a *subsequent*
+                                    // tick, once this now-advanced candidate
+                                    // itself holds steady through another
+                                    // observation, rather than trusting a
+                                    // single tick's advance as sufficient.
                                     inst.capital_baseline_equity = equity;
                                     inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
                                     inst.flat_since = Some(Instant::now());
