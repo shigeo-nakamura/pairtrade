@@ -169,6 +169,8 @@ impl PairTradeEngine {
                 equity_cache: strategy.equity_reference_usd,
                 last_equity_fetch,
                 capital_guard_equity_snapshot: None,
+                capital_guard_last_observed_equity: None,
+                capital_guard_stable_since: None,
                 equity_initialized: false,
                 equity_reference_usd: strategy.equity_reference_usd,
                 states,

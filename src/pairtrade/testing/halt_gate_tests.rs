@@ -467,6 +467,8 @@ impl Harness {
             equity_cache: DEFAULT_EQUITY_USD,
             last_equity_fetch: None,
             capital_guard_equity_snapshot: None,
+            capital_guard_last_observed_equity: None,
+            capital_guard_stable_since: None,
             equity_initialized: false,
             equity_reference_usd: DEFAULT_EQUITY_USD,
             states,
@@ -1105,19 +1107,45 @@ fn pre_783_snapshot_migration_never_reanchors_delayed_settlement() {
         assert_eq!(inst.session_start_equity, 6_000.0);
     }
 
-    // The exchange/account cache then reflects the already-accounted close.
+    // The exchange/account cache then reflects the already-accounted close
+    // -- but this is the *first* tick to see the new value, so it is not
+    // yet confirmed as a complete (vs. still-settling) reading and the
+    // candidate does not advance yet.
     h.engine.instances[0].equity_cache = 6_010.0;
     h.engine.detect_capital_event_and_rebaseline(0);
     {
         let inst = &h.engine.instances[0];
         assert!(inst.capital_rebaseline_deferred);
         assert!(inst.capital_position_seen_since_baseline);
-        assert_eq!(inst.capital_baseline_equity, 6_010.0);
+        assert_eq!(
+            inst.capital_baseline_equity, 6_000.0,
+            "a first-seen reading is not yet trusted as a complete settlement"
+        );
         assert_eq!(inst.equity_samples[0].equity, 6_088.33);
         assert_eq!(inst.session_start_equity, 6_000.0);
     }
 
-    // A second stable observation clears the guard without touching DD.
+    // Simulate the stability window having elapsed without needing to
+    // actually sleep: back-date the stable-since clock captured when
+    // $6,010 was first observed above.
+    h.engine.instances[0].capital_guard_stable_since = Some(
+        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
+    );
+    h.engine.detect_capital_event_and_rebaseline(0);
+    {
+        let inst = &h.engine.instances[0];
+        assert!(inst.capital_rebaseline_deferred);
+        assert!(inst.capital_position_seen_since_baseline);
+        assert_eq!(
+            inst.capital_baseline_equity, 6_010.0,
+            "now confirmed complete, the candidate advances"
+        );
+        assert_eq!(inst.equity_samples[0].equity, 6_088.33);
+        assert_eq!(inst.session_start_equity, 6_000.0);
+    }
+
+    // A further stable observation at the now-advanced anchor clears the
+    // guard without touching DD.
     h.engine.detect_capital_event_and_rebaseline(0);
     {
         let inst = &h.engine.instances[0];
@@ -1262,14 +1290,26 @@ fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
 
     // Equity is now genuinely re-observed at a new value (not the same
     // $1,110 reading re-reported by a stale WS cache -- a same-valued
-    // "successful" read proves nothing, per this test's own next case).
+    // "successful" read proves nothing). But this is only the first tick
+    // to see it, so it is not yet trusted as a *complete* settlement.
     h.engine.instances[0].equity_cache = 1_110.5;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "a first-seen changed value is not yet trusted -- it might still be mid-update"
+    );
+
+    // Simulate the stability window having elapsed without needing to
+    // actually sleep.
+    h.engine.instances[0].capital_guard_stable_since = Some(
+        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
+    );
     h.engine.detect_capital_event_and_rebaseline(0);
 
     let inst = &h.engine.instances[0];
     assert!(
         !inst.capital_rebaseline_deferred,
-        "the deferral gives up once equity has been genuinely re-observed and the timeout has elapsed"
+        "the deferral gives up once equity has been genuinely re-observed, held steady, and the timeout has elapsed"
     );
     assert!(inst.capital_rebaseline_deferred_since.is_none());
     assert!(
@@ -1344,12 +1384,25 @@ fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapse
         );
     }
 
-    // Now equity is genuinely re-observed at a new value.
+    // Now equity is genuinely re-observed at a new value -- but this is
+    // still only the first tick to see it, so it is not yet trusted as a
+    // *complete* settlement (it could be one leg of a multi-update one).
     h.engine.instances[0].equity_cache = 1_000.01;
     h.engine.detect_capital_event_and_rebaseline(0);
     assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "a first-seen changed value is not yet trusted -- it might still be mid-update"
+    );
+
+    // Simulate the stability window having elapsed without needing to
+    // actually sleep.
+    h.engine.instances[0].capital_guard_stable_since = Some(
+        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
+    );
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
         !h.engine.instances[0].capital_position_seen_since_baseline,
-        "the guard clears once equity has genuinely changed since becoming flat"
+        "the guard clears once equity has genuinely changed and held steady since becoming flat"
     );
 }
 
@@ -2128,18 +2181,22 @@ fn risk_ack_reanchor_keeps_position_guard_on_stale_equity() {
         "the position guard survives a reanchor on stale (not confirmed-fresh) equity"
     );
 
-    // Once equity is actually confirmed fresh -- a normal reconciliation
+    // Once equity is actually confirmed settled -- a normal reconciliation
     // tick captured a snapshot (as detect_capital_event_and_rebaseline
-    // does), and equity has since genuinely moved away from it -- a later
-    // reanchor does clear the guard.
+    // does), equity has since genuinely moved away from it, and it has
+    // held steady for the stability window -- a later reanchor does clear
+    // the guard.
     h.engine.instances[0].session_halted = true;
     h.engine.instances[0].capital_guard_equity_snapshot = Some(950.0);
     h.engine.instances[0].equity_cache = 951.0;
+    h.engine.instances[0].capital_guard_stable_since = Some(
+        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
+    );
     std::fs::write(risk_ack_path(), "ack by op: reanchor=true").unwrap();
     h.engine.consume_risk_ack();
     assert!(
         !h.engine.instances[0].capital_position_seen_since_baseline,
-        "the guard clears once equity is confirmed fresh"
+        "the guard clears once equity is confirmed settled"
     );
 }
 

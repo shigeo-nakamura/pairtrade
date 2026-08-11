@@ -52,6 +52,25 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// proving a genuine new observation landed (Codex P1 follow-up,
     /// bot-strategy#783). Runtime only, not persisted.
     pub(in crate::pairtrade) capital_guard_equity_snapshot: Option<f64>,
+    /// `equity_cache` as of the most recent tick that examined it, updated
+    /// unconditionally every `detect_capital_event_and_rebaseline` call
+    /// regardless of disposition. Paired with `capital_guard_stable_since`
+    /// to detect not just "has equity moved past the untrusted snapshot"
+    /// but "has it *stopped* moving": an unaccounted settlement that lands
+    /// in several separate updates (e.g. a two-leg close reported as -$2
+    /// then later -$8 more) must not be trusted the moment the first
+    /// partial update is observed, or the remaining, still-pending portion
+    /// gets compared against a baseline that already absorbed the first
+    /// partial move and gets misclassified as a fresh capital event once
+    /// it lands (Codex P1 follow-up, bot-strategy#783). Runtime only, not
+    /// persisted.
+    pub(in crate::pairtrade) capital_guard_last_observed_equity: Option<f64>,
+    /// When `capital_guard_last_observed_equity` most recently changed
+    /// value. A reading is only trusted as a *complete* settlement once it
+    /// has held steady for `CAPITAL_GUARD_STABILITY_SECS` -- not merely
+    /// once, on the very first tick that differs from the pre-close
+    /// snapshot. Runtime only, not persisted.
+    pub(in crate::pairtrade) capital_guard_stable_since: Option<Instant>,
     /// False until the first successful `fetch_equity_rest` writes a
     /// connector-sourced balance into `equity_cache`. Not persisted —
     /// always starts false on engine boot. Gates session-DD evaluation

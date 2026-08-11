@@ -522,19 +522,12 @@ impl PairTradeEngine {
                         // (Codex P1 follow-up, bot-strategy#783). Reanchor
                         // the candidate (the operator explicitly asked for
                         // that), but only clear the guard itself once
-                        // equity is confirmed to have genuinely moved
-                        // since becoming flat -- a same-valued "successful"
-                        // read is not enough: dex-connector's WS-derived
-                        // balance_cache means a fetch can return the
-                        // identical still-stale value if the underlying
-                        // push that would update it was never received
-                        // (e.g. a missed fill event after a force-close;
-                        // Codex P1 follow-up, bot-strategy#783).
-                        let equity_confirmed_since_flat = inst
-                            .capital_guard_equity_snapshot
-                            .is_some_and(|snapshot| equity != snapshot);
+                        // equity_confirmed_settled proves this reading is a
+                        // genuine, *complete* settlement -- relies on the
+                        // ordinary per-tick reconciliation loop having
+                        // already been tracking stability while halted.
                         if !inst.capital_position_seen_since_baseline
-                            || equity_confirmed_since_flat
+                            || equity_confirmed_settled(inst, equity)
                         {
                             inst.capital_position_seen_since_baseline = false;
                             inst.capital_rebaseline_deferred = false;
@@ -805,6 +798,16 @@ impl PairTradeEngine {
             if equity <= 0.0 {
                 return;
             }
+            // Tracked unconditionally, every tick, regardless of
+            // disposition or flatness: this is the sole source of "has
+            // equity stopped changing" used by every guard-clearing check
+            // below. A settlement that lands in several separate updates
+            // must not be trusted the moment the first partial update is
+            // observed (Codex P1 follow-up, bot-strategy#783).
+            if inst.capital_guard_last_observed_equity != Some(equity) {
+                inst.capital_guard_last_observed_equity = Some(equity);
+                inst.capital_guard_stable_since = Some(Instant::now());
+            }
             let flat = inst.states.values().all(|s| {
                 s.position.is_none() && s.pending_entry.is_none() && s.pending_exit.is_none()
             });
@@ -840,6 +843,16 @@ impl PairTradeEngine {
             if !settled {
                 return;
             }
+            // Backfill only: the ordinary path already latched this above,
+            // at the instant flat_since itself transitioned from None. This
+            // covers instances that reach here with flat_since already set
+            // but no snapshot ever latched -- a pre-#783 snapshot restored
+            // mid-flat, or any other path that seeded flat_since directly
+            // without going through that transition -- so
+            // equity_confirmed_settled always has a pre-close reading to
+            // compare against instead of being permanently unsatisfiable
+            // (Codex P1 follow-up, bot-strategy#783).
+            inst.capital_guard_equity_snapshot.get_or_insert(equity);
 
             let accounted_pnl = inst.total_pnl + inst.total_funding_carry;
             let baseline = inst.capital_baseline_equity;
@@ -856,14 +869,11 @@ impl PairTradeEngine {
                 // the very next tick, right as an unrecorded startup
                 // force-close's settlement is still pending (Codex P1
                 // follow-up, bot-strategy#783). Only clear it if it was
-                // already false, or equity is confirmed to have genuinely
-                // moved since becoming flat (not just a same-valued
-                // "successful" read of a stale WS-derived cache -- Codex
-                // P1 follow-up, bot-strategy#783).
+                // already false, or equity_confirmed_settled proves this
+                // reading is a genuine, complete settlement (Codex P1
+                // follow-up, bot-strategy#783).
                 if !inst.capital_position_seen_since_baseline
-                    || inst
-                        .capital_guard_equity_snapshot
-                        .is_some_and(|snapshot| equity != snapshot)
+                    || equity_confirmed_settled(inst, equity)
                 {
                     inst.capital_position_seen_since_baseline = false;
                 }
@@ -915,8 +925,18 @@ impl PairTradeEngine {
                         inst.capital_position_seen_since_baseline = true;
                         inst.capital_rebaseline_deferred = false;
                         inst.capital_rebaseline_deferred_since = None;
-                        inst.flat_since = Some(Instant::now());
-                        inst.capital_guard_equity_snapshot = Some(equity);
+                        // Deliberately does NOT repin flat_since or
+                        // capital_guard_equity_snapshot: those track "when
+                        // did we last go flat" / "what did equity read at
+                        // that pre-close moment" (already backfilled above
+                        // if needed), and a paired-baseline migration is
+                        // not a new flat transition. Overwriting the
+                        // snapshot to *this* (still freshly-observed, not
+                        // yet stability-confirmed) equity would make
+                        // equity_confirmed_settled compare a reading
+                        // against itself, which can never differ no matter
+                        // how long it holds steady (Codex P1 follow-up,
+                        // bot-strategy#783).
                         Some(Rebaseline::BaselineMigrated {
                             previous_equity: baseline,
                             equity,
@@ -988,16 +1008,19 @@ impl PairTradeEngine {
                                 // impossible on a still-stale reading), but
                                 // the fallback for a *never-ambiguous*,
                                 // quiet-since-latch tick must require
-                                // equity to be confirmed as having
-                                // genuinely moved since becoming flat --
-                                // not merely a same-valued "successful"
-                                // read of a stale WS-derived cache (Codex
-                                // P1 follow-up, bot-strategy#783).
+                                // equity_confirmed_settled to prove this
+                                // reading is a genuine, complete settlement
+                                // (Codex P1 follow-up, bot-strategy#783).
+                                // was_deferred needs no equivalent check:
+                                // Reconciled is only reachable once the
+                                // basis has returned all the way to zero,
+                                // which a partial update of an
+                                // already-material accounted_pnl_delta
+                                // cannot do -- it would stay Ambiguous
+                                // until the full amount lands.
                                 if was_deferred
                                     || !reconciliation.position_seen_since_baseline
-                                    || inst
-                                        .capital_guard_equity_snapshot
-                                        .is_some_and(|snapshot| equity != snapshot)
+                                    || equity_confirmed_settled(inst, equity)
                                 {
                                     inst.capital_position_seen_since_baseline = false;
                                 }
@@ -1073,29 +1096,20 @@ impl PairTradeEngine {
                                 // genuinely ~0 -- equity is simply catching
                                 // up to what the accounting already fully
                                 // explained, e.g. a delayed-settlement
-                                // migration candidate). Any other
-                                // sub-threshold-but-nonzero accounted move
-                                // must instead wait for equity to be
-                                // confirmed as having genuinely moved since
-                                // the position closed -- not merely a
-                                // same-valued "successful" read: dex-
-                                // connector's WS-derived balance_cache means
-                                // a fetch can return the identical stale
-                                // value if the underlying push that would
-                                // update it was never received (Codex P1
-                                // follow-up, bot-strategy#783).
-                                // (accounted_delta_settled needs no
-                                // equivalent check: equity_cache only ever
-                                // changes via a successful fetch, so
-                                // `equity` differing from the anchor's
-                                // baseline_equity is itself proof one
-                                // already happened.)
+                                // migration candidate) -- but even then,
+                                // equity_confirmed_settled is required: a
+                                // multi-leg settlement can show zero *new*
+                                // accounted movement on a tick that is still
+                                // only a partial reflection of an earlier
+                                // recorded amount, and trusting that partial
+                                // reading the instant it first differs (not
+                                // once it has actually stopped changing)
+                                // reproduces the same misclassification risk
+                                // (Codex P1 follow-up, bot-strategy#783).
                                 let accounted_delta_settled =
                                     reconciliation.accounted_pnl_delta.abs() <= CAPITAL_DELTA_EPSILON;
-                                let position_guard_can_clear = accounted_delta_settled
-                                    || inst
-                                        .capital_guard_equity_snapshot
-                                        .is_some_and(|snapshot| equity != snapshot);
+                                let position_guard_can_clear =
+                                    accounted_delta_settled && equity_confirmed_settled(inst, equity);
                                 let baseline_advanced = reconciliation.position_seen_since_baseline
                                     && reconciliation.accounted_pnl_delta.abs() < min_usd
                                     && position_guard_can_clear;
@@ -1111,8 +1125,15 @@ impl PairTradeEngine {
                                     // single tick's advance as sufficient.
                                     inst.capital_baseline_equity = equity;
                                     inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
-                                    inst.flat_since = Some(Instant::now());
-                                    inst.capital_guard_equity_snapshot = Some(equity);
+                                    // flat_since / capital_guard_equity_snapshot are
+                                    // deliberately left untouched here for the same
+                                    // reason as the migration branch above: this is
+                                    // the candidate *advancing*, not a new flat
+                                    // transition, and repinning the snapshot to the
+                                    // value that just got confirmed would make the
+                                    // next equity_confirmed_settled check compare it
+                                    // against itself (Codex P1 follow-up,
+                                    // bot-strategy#783).
                                 }
                                 let was_deferred = inst.capital_rebaseline_deferred;
                                 if !was_deferred || baseline_advanced {
@@ -1122,12 +1143,21 @@ impl PairTradeEngine {
                                     // harmless small-PnL advances never
                                     // counts toward giving up on a
                                     // different, still-unresolved ambiguity.
-                                    // Also refresh the shared freshness
-                                    // snapshot so the give-up condition
-                                    // below measures change from *this*
-                                    // point, not a stale earlier one.
+                                    // capital_guard_equity_snapshot is
+                                    // deliberately NOT refreshed here: it
+                                    // stays pinned to the pre-close reading
+                                    // captured when this flat window began,
+                                    // so equity_confirmed_settled keeps
+                                    // measuring "has this settled away from
+                                    // what it read right after the close"
+                                    // rather than being repinned to the
+                                    // still-unconfirmed current reading on
+                                    // every deferred tick, which would make
+                                    // it compare a value against itself and
+                                    // never confirm no matter how long it
+                                    // holds steady (Codex P1 follow-up,
+                                    // bot-strategy#783).
                                     inst.capital_rebaseline_deferred_since = Some(Instant::now());
-                                    inst.capital_guard_equity_snapshot = Some(equity);
                                 }
                                 inst.capital_rebaseline_deferred = true;
 
@@ -1170,17 +1200,12 @@ impl PairTradeEngine {
                                 // was supposed to be giving up on
                                 // disentangling (Codex P2 follow-up,
                                 // bot-strategy#783). Only give up once
-                                // equity is confirmed to have genuinely
-                                // moved during the stuck window and it
-                                // still did not resolve -- not merely a
-                                // same-valued "successful" read of a stale
-                                // WS-derived cache.
-                                let equity_confirmed_since_deferred = inst
-                                    .capital_guard_equity_snapshot
-                                    .is_some_and(|snapshot| equity != snapshot);
+                                // equity_confirmed_settled proves a genuine,
+                                // complete settlement landed during the
+                                // stuck window and it still did not resolve.
                                 let gave_up = !baseline_advanced
                                     && stuck_secs >= CAPITAL_REBASELINE_GIVEUP_SECS
-                                    && equity_confirmed_since_deferred;
+                                    && equity_confirmed_settled(inst, equity);
 
                                 if gave_up {
                                     inst.capital_baseline_equity = equity;
@@ -1732,6 +1757,34 @@ const CAPITAL_DELTA_EPSILON: f64 = 1e-9;
 /// defeating the fail-safe deferral this is meant to eventually escape
 /// rather than replace.
 pub(in crate::pairtrade) const CAPITAL_REBASELINE_GIVEUP_SECS: u64 = 900;
+
+/// How long `equity_cache` must hold the same value, after having already
+/// moved past the pre-close (untrusted) reading, before that reading is
+/// trusted as a *complete* settlement rather than one leg of a still-
+/// in-progress multi-update one. An unaccounted close whose equity impact
+/// lands in several separate WS pushes (e.g. a two-leg settlement reported
+/// as -$2 then, moments later, -$8 more) would otherwise have its position
+/// guard cleared the instant the first partial update differs from the
+/// pre-close snapshot, leaving the remaining portion to land against an
+/// anchor that already absorbed the first leg and get misclassified as a
+/// fresh capital event (Codex P1 follow-up, bot-strategy#783).
+pub(in crate::pairtrade) const CAPITAL_GUARD_STABILITY_SECS: u64 = 60;
+
+/// Whether `equity` is safe to trust as a *complete* settlement: it must
+/// have moved past the pre-close (untrusted) `capital_guard_equity_snapshot`
+/// -- proving the feed is not simply re-reporting a stuck WS-cached value
+/// -- AND held steady at its current value for `CAPITAL_GUARD_STABILITY_SECS`
+/// -- proving it is not one leg of a still-in-progress multi-update
+/// settlement. Both conditions independently defend against a distinct
+/// Codex-found failure mode (bot-strategy#783): a same-valued "successful"
+/// read, and a partial update trusted before the rest of it lands.
+fn equity_confirmed_settled(inst: &StrategyInstance, equity: f64) -> bool {
+    inst.capital_guard_equity_snapshot
+        .is_some_and(|snapshot| equity != snapshot)
+        && inst
+            .capital_guard_stable_since
+            .is_some_and(|since| since.elapsed().as_secs() >= CAPITAL_GUARD_STABILITY_SECS)
+}
 
 /// Reconcile a flat account-equity movement against trade/funding accounting.
 /// Raw equity changes alone are not capital evidence because connector balance

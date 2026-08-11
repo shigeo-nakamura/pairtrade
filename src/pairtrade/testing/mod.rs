@@ -114,6 +114,8 @@ impl PairTradeEngine {
                 equity_cache: DEFAULT_EQUITY_USD,
                 last_equity_fetch: None,
                 capital_guard_equity_snapshot: None,
+                capital_guard_last_observed_equity: None,
+                capital_guard_stable_since: None,
                 equity_initialized: false,
                 equity_reference_usd: DEFAULT_EQUITY_USD,
                 states: HashMap::new(),
