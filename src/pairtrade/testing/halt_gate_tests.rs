@@ -466,7 +466,7 @@ impl Harness {
             connector: self._connector.clone(),
             equity_cache: DEFAULT_EQUITY_USD,
             last_equity_fetch: None,
-            last_successful_equity_fetch: None,
+            capital_guard_equity_snapshot: None,
             equity_initialized: false,
             equity_reference_usd: DEFAULT_EQUITY_USD,
             states,
@@ -1260,24 +1260,26 @@ fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
         "elapsed time alone, without an actual successful equity observation, must not give up"
     );
 
-    // Now a fetch actually succeeds while still stuck.
-    h.engine.instances[0].last_successful_equity_fetch = Some(Instant::now());
+    // Equity is now genuinely re-observed at a new value (not the same
+    // $1,110 reading re-reported by a stale WS cache -- a same-valued
+    // "successful" read proves nothing, per this test's own next case).
+    h.engine.instances[0].equity_cache = 1_110.5;
     h.engine.detect_capital_event_and_rebaseline(0);
 
     let inst = &h.engine.instances[0];
     assert!(
         !inst.capital_rebaseline_deferred,
-        "the deferral gives up once equity has actually been re-observed and the timeout has elapsed"
+        "the deferral gives up once equity has been genuinely re-observed and the timeout has elapsed"
     );
     assert!(inst.capital_rebaseline_deferred_since.is_none());
     assert!(
-        (inst.capital_baseline_equity - 1_110.0).abs() < 1e-9,
+        (inst.capital_baseline_equity - 1_110.5).abs() < 1e-9,
         "the anchor force-advances to the current reading"
     );
 
     // A later, genuinely clean $100 deposit must now be detectable again --
     // the whole point of giving up instead of staying stuck.
-    h.engine.instances[0].equity_cache = 1_210.0;
+    h.engine.instances[0].equity_cache = 1_210.5;
     h.engine.detect_capital_event_and_rebaseline(0);
     assert!(
         (h.engine.instances[0].session_start_equity - 1_100.0).abs() < 1e-9,
@@ -1313,10 +1315,10 @@ fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapse
         inst.capital_baseline_equity = 1_000.0;
         inst.capital_baseline_accounted_pnl = Some(0.0);
         inst.capital_position_seen_since_baseline = true;
-        // Just became flat: settle_secs=0 makes this tick eligible to
-        // reconcile immediately, but the guard's own timing gate is
-        // independent of settle_secs.
-        inst.flat_since = Some(Instant::now());
+        // flat_since starts unset so the first detect call below takes the
+        // "just became flat" branch, which is what captures the freshness
+        // snapshot -- settle_secs=0 makes this tick eligible to reconcile
+        // immediately either way.
     }
 
     h.engine.detect_capital_event_and_rebaseline(0);
@@ -1324,26 +1326,30 @@ fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapse
         h.engine.instances[0].capital_position_seen_since_baseline,
         "a quiet reading right after the guard latches must not clear it yet"
     );
-
-    // Back-date flat_since past the equity-cache lag window, but equity was
-    // never actually re-observed since (last_successful_equity_fetch stays
-    // None) -- elapsed time alone must not be enough. refresh_equity_if_needed
-    // re-arms its cache-interval clock even on a failed fetch, so this is
-    // exactly the state a stretch of failing /account calls would leave.
-    h.engine.instances[0].flat_since =
-        Some(Instant::now() - Duration::from_secs(EQUITY_REFRESH_CACHE_SECS + 1));
-    h.engine.detect_capital_event_and_rebaseline(0);
     assert!(
-        h.engine.instances[0].capital_position_seen_since_baseline,
-        "elapsed time alone, without an actual successful equity observation, must not clear the guard"
+        (h.engine.instances[0].capital_guard_equity_snapshot.unwrap() - 1_000.0).abs() < 1e-9
     );
 
-    // Now a fetch actually succeeds.
-    h.engine.instances[0].last_successful_equity_fetch = Some(Instant::now());
+    // Repeated ticks reporting the identical value -- exactly what a
+    // stuck WS-derived balance_cache would return if the update that
+    // should have landed was never received -- must never clear the
+    // guard, no matter how many times it's re-observed. A timestamp-only
+    // "a fetch succeeded" signal would have been fooled by this; only the
+    // value itself changing proves anything.
+    for _ in 0..3 {
+        h.engine.detect_capital_event_and_rebaseline(0);
+        assert!(
+            h.engine.instances[0].capital_position_seen_since_baseline,
+            "a repeated same-valued equity read must never clear the guard"
+        );
+    }
+
+    // Now equity is genuinely re-observed at a new value.
+    h.engine.instances[0].equity_cache = 1_000.01;
     h.engine.detect_capital_event_and_rebaseline(0);
     assert!(
         !h.engine.instances[0].capital_position_seen_since_baseline,
-        "the guard clears once equity has actually been observed since becoming flat"
+        "the guard clears once equity has genuinely changed since becoming flat"
     );
 }
 
@@ -2122,9 +2128,13 @@ fn risk_ack_reanchor_keeps_position_guard_on_stale_equity() {
         "the position guard survives a reanchor on stale (not confirmed-fresh) equity"
     );
 
-    // Once equity is actually confirmed fresh, a later reanchor does clear it.
+    // Once equity is actually confirmed fresh -- a normal reconciliation
+    // tick captured a snapshot (as detect_capital_event_and_rebaseline
+    // does), and equity has since genuinely moved away from it -- a later
+    // reanchor does clear the guard.
     h.engine.instances[0].session_halted = true;
-    h.engine.instances[0].last_successful_equity_fetch = Some(Instant::now());
+    h.engine.instances[0].capital_guard_equity_snapshot = Some(950.0);
+    h.engine.instances[0].equity_cache = 951.0;
     std::fs::write(risk_ack_path(), "ack by op: reanchor=true").unwrap();
     h.engine.consume_risk_ack();
     assert!(

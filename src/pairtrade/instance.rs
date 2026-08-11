@@ -38,19 +38,20 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// Per-instance live equity from the instance's connector.
     pub(in crate::pairtrade) equity_cache: f64,
     pub(in crate::pairtrade) last_equity_fetch: Option<Instant>,
-    /// When `equity_cache` was last actually updated by a *successful*
-    /// `fetch_equity_rest` (the `Ok` branch only). Unlike
-    /// `last_equity_fetch` -- which advances on a failed fetch too (a
-    /// throttled/errored `/account` still re-arms the cache-interval
-    /// clock so the next tick doesn't retry immediately) -- this is the
-    /// only reliable signal that `equity_cache` reflects a fresh read
-    /// rather than a stale value the cache interval merely stopped
-    /// re-fetching. `detect_capital_event_and_rebaseline` needs this
-    /// distinction: clearing a guard because enough wall-clock time has
-    /// passed is not the same as clearing it because equity was actually
-    /// observed again (Codex P1/P2 follow-up, bot-strategy#783). Runtime
-    /// only, not persisted.
-    pub(in crate::pairtrade) last_successful_equity_fetch: Option<Instant>,
+    /// `equity_cache`'s value captured at the moment
+    /// `detect_capital_event_and_rebaseline` most recently (re)started
+    /// requiring proof that a fresh observation has landed (whenever
+    /// `flat_since` or `capital_rebaseline_deferred_since` resets). A
+    /// timestamp of "when did a fetch last succeed" is not a reliable
+    /// freshness signal on its own: dex-connector's WS-derived
+    /// `balance_cache` means a "successful" fetch can return the
+    /// identical still-stale value if the underlying push that would
+    /// update it was never received (e.g. a missed fill event after a
+    /// startup force-close). Comparing the current reading against this
+    /// snapshot instead requires the actual *value* to have moved,
+    /// proving a genuine new observation landed (Codex P1 follow-up,
+    /// bot-strategy#783). Runtime only, not persisted.
+    pub(in crate::pairtrade) capital_guard_equity_snapshot: Option<f64>,
     /// False until the first successful `fetch_equity_rest` writes a
     /// connector-sourced balance into `equity_cache`. Not persisted —
     /// always starts false on engine boot. Gates session-DD evaluation

@@ -320,7 +320,19 @@ for name, inst in d.get('instances', {}).items():
                     float(inst.get('total_pnl', 0.0))
                     + float(inst.get('total_funding_carry', 0.0))
                 )
-                inst['capital_position_seen_since_baseline'] = False
+                # Seeded true, not false: this edit happens entirely
+                # offline (service already stopped) using either an
+                # operator-supplied --collateral or the last persisted
+                # equity sample, neither of which is a confirmed-fresh
+                # post-flat equity observation. If a position was closing
+                # (or force-closes on the next restart) without its
+                # settlement having landed in this snapshot, clearing the
+                # guard here would let that delayed settlement be
+                # misclassified as a verified capital event once the bot
+                # restarts and the connector actually reports it. Guard
+                # until detect_capital_event_and_rebaseline's own
+                # confirmed-fresh check clears it for real.
+                inst['capital_position_seen_since_baseline'] = True
                 msg += f' (peak reanchored to {base:.2f}, DD->0)'
             else:
                 msg += ' (reanchor skipped: no equity reference available)'

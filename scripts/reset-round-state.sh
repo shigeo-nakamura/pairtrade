@@ -19,8 +19,14 @@
 #   - equity_samples                                          (#185 Phase 3-1, leverage-scale dependent)
 #   - session_halted, session_halt_reason, session_halt_ts    (#185 Phase 3-1)
 #   - capital_baseline_equity / accounted PnL / position flag (#752 / #783 capital-event anchors;
-#     clearing all three prevents the next round from comparing collateral and
-#     accounting values against different round scopes)
+#     clearing the first two prevents the next round from comparing collateral and
+#     accounting values against different round scopes. The position flag is
+#     seeded true, not false: this reset runs while the service is stopped, and
+#     force_close_on_startup can flatten a position carried across the round
+#     boundary without its settlement landing in equity before the first
+#     post-restart tick. Matches InstanceRiskState::reset_round_bound()'s own
+#     defensive seed -- guard until a confirmed-fresh post-flat equity read
+#     proves it safe to trust, same as an automatic round transition.)
 #
 # Fields NOT touched (correctly auto-rolling at UTC midnight, do not need
 # round-boundary handling):
@@ -110,7 +116,7 @@ RESET='.instances |= with_entries(.value += {
     equity_samples: [],
     capital_baseline_equity: 0,
     capital_baseline_accounted_pnl: null,
-    capital_position_seen_since_baseline: false,
+    capital_position_seen_since_baseline: true,
     session_halted: false,
     session_halt_reason: null,
     session_halt_ts: null

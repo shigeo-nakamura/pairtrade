@@ -184,6 +184,7 @@ impl PairTradeEngine {
             inst.capital_position_seen_since_baseline = state.capital_position_seen_since_baseline;
             inst.capital_rebaseline_deferred = false;
             inst.capital_rebaseline_deferred_since = None;
+            inst.capital_guard_equity_snapshot = None;
             inst.session_halted = state.session_halted;
             inst.session_halt_reason = state.session_halt_reason.clone();
             inst.session_halt_ts = state.session_halt_ts;

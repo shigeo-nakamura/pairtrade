@@ -186,7 +186,6 @@ impl PairTradeEngine {
                     }
                     inst.equity_cache = eq.max(0.0);
                     inst.last_equity_fetch = Some(Instant::now());
-                    inst.last_successful_equity_fetch = Some(Instant::now());
                     // bot-strategy#366: arm the session-DD gate only after a
                     // connector-sourced balance has actually landed. Before
                     // this point `equity_cache` is still the YAML
@@ -522,12 +521,18 @@ impl PairTradeEngine {
                         // classified as a verified deposit/withdrawal
                         // (Codex P1 follow-up, bot-strategy#783). Reanchor
                         // the candidate (the operator explicitly asked for
-                        // that), but only clear the guard itself once a
-                        // successful equity observation after becoming
-                        // flat confirms this reading is genuinely fresh.
-                        let equity_confirmed_since_flat = inst.flat_since.is_some_and(|since| {
-                            inst.last_successful_equity_fetch.is_some_and(|fetch| fetch >= since)
-                        });
+                        // that), but only clear the guard itself once
+                        // equity is confirmed to have genuinely moved
+                        // since becoming flat -- a same-valued "successful"
+                        // read is not enough: dex-connector's WS-derived
+                        // balance_cache means a fetch can return the
+                        // identical still-stale value if the underlying
+                        // push that would update it was never received
+                        // (e.g. a missed fill event after a force-close;
+                        // Codex P1 follow-up, bot-strategy#783).
+                        let equity_confirmed_since_flat = inst
+                            .capital_guard_equity_snapshot
+                            .is_some_and(|snapshot| equity != snapshot);
                         if !inst.capital_position_seen_since_baseline
                             || equity_confirmed_since_flat
                         {
@@ -828,6 +833,7 @@ impl PairTradeEngine {
                 Some(since) => since.elapsed().as_secs() >= settle_secs,
                 None => {
                     inst.flat_since = Some(Instant::now());
+                    inst.capital_guard_equity_snapshot = Some(equity);
                     settle_secs == 0
                 }
             };
@@ -850,12 +856,14 @@ impl PairTradeEngine {
                 // the very next tick, right as an unrecorded startup
                 // force-close's settlement is still pending (Codex P1
                 // follow-up, bot-strategy#783). Only clear it if it was
-                // already false, or a successful equity observation after
-                // becoming flat confirms this reading is genuinely fresh.
+                // already false, or equity is confirmed to have genuinely
+                // moved since becoming flat (not just a same-valued
+                // "successful" read of a stale WS-derived cache -- Codex
+                // P1 follow-up, bot-strategy#783).
                 if !inst.capital_position_seen_since_baseline
-                    || inst.flat_since.is_some_and(|since| {
-                        inst.last_successful_equity_fetch.is_some_and(|fetch| fetch >= since)
-                    })
+                    || inst
+                        .capital_guard_equity_snapshot
+                        .is_some_and(|snapshot| equity != snapshot)
                 {
                     inst.capital_position_seen_since_baseline = false;
                 }
@@ -908,6 +916,7 @@ impl PairTradeEngine {
                         inst.capital_rebaseline_deferred = false;
                         inst.capital_rebaseline_deferred_since = None;
                         inst.flat_since = Some(Instant::now());
+                        inst.capital_guard_equity_snapshot = Some(equity);
                         Some(Rebaseline::BaselineMigrated {
                             previous_equity: baseline,
                             equity,
@@ -978,17 +987,17 @@ impl PairTradeEngine {
                                 // read clean again -- algebraically
                                 // impossible on a still-stale reading), but
                                 // the fallback for a *never-ambiguous*,
-                                // quiet-since-latch tick must require an
-                                // actual successful equity observation made
-                                // after becoming flat, not merely enough
-                                // elapsed time for one to have plausibly
-                                // happened.
+                                // quiet-since-latch tick must require
+                                // equity to be confirmed as having
+                                // genuinely moved since becoming flat --
+                                // not merely a same-valued "successful"
+                                // read of a stale WS-derived cache (Codex
+                                // P1 follow-up, bot-strategy#783).
                                 if was_deferred
                                     || !reconciliation.position_seen_since_baseline
-                                    || inst.flat_since.is_some_and(|since| {
-                                        inst.last_successful_equity_fetch
-                                            .is_some_and(|fetch| fetch >= since)
-                                    })
+                                    || inst
+                                        .capital_guard_equity_snapshot
+                                        .is_some_and(|snapshot| equity != snapshot)
                                 {
                                     inst.capital_position_seen_since_baseline = false;
                                 }
@@ -1066,29 +1075,27 @@ impl PairTradeEngine {
                                 // explained, e.g. a delayed-settlement
                                 // migration candidate). Any other
                                 // sub-threshold-but-nonzero accounted move
-                                // must instead wait for an actual
-                                // successful equity observation made after
-                                // the position closed -- not merely enough
-                                // elapsed time for one to have plausibly
-                                // happened, since refresh_equity_if_needed
-                                // re-arms its own cache-interval clock even
-                                // when the underlying fetch fails, so
-                                // equity_cache can stay stale indefinitely
-                                // through repeated failures while wall-clock
-                                // time keeps passing (Codex P1 follow-up,
-                                // bot-strategy#783). (accounted_delta_settled
-                                // needs no equivalent check: equity_cache
-                                // only ever changes via a successful fetch,
-                                // so `equity` differing from the anchor's
+                                // must instead wait for equity to be
+                                // confirmed as having genuinely moved since
+                                // the position closed -- not merely a
+                                // same-valued "successful" read: dex-
+                                // connector's WS-derived balance_cache means
+                                // a fetch can return the identical stale
+                                // value if the underlying push that would
+                                // update it was never received (Codex P1
+                                // follow-up, bot-strategy#783).
+                                // (accounted_delta_settled needs no
+                                // equivalent check: equity_cache only ever
+                                // changes via a successful fetch, so
+                                // `equity` differing from the anchor's
                                 // baseline_equity is itself proof one
                                 // already happened.)
                                 let accounted_delta_settled =
                                     reconciliation.accounted_pnl_delta.abs() <= CAPITAL_DELTA_EPSILON;
                                 let position_guard_can_clear = accounted_delta_settled
-                                    || inst.flat_since.is_some_and(|since| {
-                                        inst.last_successful_equity_fetch
-                                            .is_some_and(|fetch| fetch >= since)
-                                    });
+                                    || inst
+                                        .capital_guard_equity_snapshot
+                                        .is_some_and(|snapshot| equity != snapshot);
                                 let baseline_advanced = reconciliation.position_seen_since_baseline
                                     && reconciliation.accounted_pnl_delta.abs() < min_usd
                                     && position_guard_can_clear;
@@ -1105,6 +1112,7 @@ impl PairTradeEngine {
                                     inst.capital_baseline_equity = equity;
                                     inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
                                     inst.flat_since = Some(Instant::now());
+                                    inst.capital_guard_equity_snapshot = Some(equity);
                                 }
                                 let was_deferred = inst.capital_rebaseline_deferred;
                                 if !was_deferred || baseline_advanced {
@@ -1114,7 +1122,12 @@ impl PairTradeEngine {
                                     // harmless small-PnL advances never
                                     // counts toward giving up on a
                                     // different, still-unresolved ambiguity.
+                                    // Also refresh the shared freshness
+                                    // snapshot so the give-up condition
+                                    // below measures change from *this*
+                                    // point, not a stale earlier one.
                                     inst.capital_rebaseline_deferred_since = Some(Instant::now());
+                                    inst.capital_guard_equity_snapshot = Some(equity);
                                 }
                                 inst.capital_rebaseline_deferred = true;
 
@@ -1156,16 +1169,15 @@ impl PairTradeEngine {
                                 // outstanding settlement debt the timeout
                                 // was supposed to be giving up on
                                 // disentangling (Codex P2 follow-up,
-                                // bot-strategy#783). Only give up once at
-                                // least one successful equity observation
-                                // landed during the stuck window and it
-                                // still did not resolve.
+                                // bot-strategy#783). Only give up once
+                                // equity is confirmed to have genuinely
+                                // moved during the stuck window and it
+                                // still did not resolve -- not merely a
+                                // same-valued "successful" read of a stale
+                                // WS-derived cache.
                                 let equity_confirmed_since_deferred = inst
-                                    .capital_rebaseline_deferred_since
-                                    .is_some_and(|deferred_at| {
-                                        inst.last_successful_equity_fetch
-                                            .is_some_and(|fetch| fetch >= deferred_at)
-                                    });
+                                    .capital_guard_equity_snapshot
+                                    .is_some_and(|snapshot| equity != snapshot);
                                 let gave_up = !baseline_advanced
                                     && stuck_secs >= CAPITAL_REBASELINE_GIVEUP_SECS
                                     && equity_confirmed_since_deferred;
