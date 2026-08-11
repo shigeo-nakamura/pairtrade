@@ -1270,6 +1270,57 @@ fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
     );
 }
 
+// bot-strategy#783 (Codex P1 follow-up, third round): a position closing
+// (or a pre-#783 migration, which seeds the guard unconditionally) does not
+// guarantee equity_cache has caught up yet -- it only refreshes every
+// EQUITY_REFRESH_CACHE_SECS. A quiet first observation right after the
+// guard latches must not clear it before that window has had a chance to
+// elapse, or a later, unrelated capital event landing once the cache
+// finally refreshes gets misclassified.
+#[test]
+fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapses() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-guard-timing");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        // Equity and accounted PnL already match the anchor exactly --
+        // nothing to reconcile on its own -- but the guard is latched true,
+        // as if a position just closed (or a pre-#783 migration just ran).
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.capital_position_seen_since_baseline = true;
+        // Just became flat: settle_secs=0 makes this tick eligible to
+        // reconcile immediately, but the guard's own timing gate is
+        // independent of settle_secs.
+        inst.flat_since = Some(Instant::now());
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "a quiet reading right after the guard latches must not clear it yet"
+    );
+
+    // Back-date flat_since past the equity-cache lag window without
+    // actually sleeping.
+    h.engine.instances[0].flat_since =
+        Some(Instant::now() - Duration::from_secs(EQUITY_REFRESH_CACHE_SECS + 1));
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        !h.engine.instances[0].capital_position_seen_since_baseline,
+        "the guard clears once the equity-cache lag window has elapsed"
+    );
+}
+
 // bot-strategy#783 Codex P1 follow-up: the false-to-true
 // capital_position_seen_since_baseline transition must be persisted so a
 // startup force-close (which can flatten a still-open position without

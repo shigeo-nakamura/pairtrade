@@ -910,10 +910,38 @@ impl PairTradeEngine {
                                     || inst.capital_position_seen_since_baseline;
                                 inst.capital_baseline_equity = equity;
                                 inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
-                                inst.capital_position_seen_since_baseline = false;
                                 let was_deferred =
                                     std::mem::replace(&mut inst.capital_rebaseline_deferred, false);
                                 inst.capital_rebaseline_deferred_since = None;
+                                // A position closing does not guarantee its
+                                // effect on equity has landed yet:
+                                // equity_cache only refreshes every
+                                // EQUITY_REFRESH_CACHE_SECS, so the very
+                                // first quiet observation right after a
+                                // close (e.g. a startup force-close, or the
+                                // guard a pre-#783 migration seeds
+                                // unconditionally) reflects that the cache
+                                // simply has not been checked against fresh
+                                // equity yet -- not that accounting has
+                                // genuinely reconciled with it. Clearing the
+                                // guard here regardless would let a *later*,
+                                // unrelated capital event slip through
+                                // misclassified once the stale cache finally
+                                // refreshes. Only clear it once either a
+                                // real movement was actually observed and
+                                // resolved via the deferred path above, or
+                                // enough time has passed since becoming flat
+                                // that the cache has had a full chance to
+                                // catch up (Codex P1 follow-up,
+                                // bot-strategy#783).
+                                if was_deferred
+                                    || !reconciliation.position_seen_since_baseline
+                                    || inst.flat_since.is_some_and(|since| {
+                                        since.elapsed().as_secs() >= EQUITY_REFRESH_CACHE_SECS
+                                    })
+                                {
+                                    inst.capital_position_seen_since_baseline = false;
+                                }
                                 if reference_reconciliation_pending {
                                     let prev_start_equity = inst.session_start_equity;
                                     let previous_reference = inst.session_equity_reference_usd;
