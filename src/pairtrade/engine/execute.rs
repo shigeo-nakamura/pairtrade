@@ -176,19 +176,6 @@ impl PairTradeEngine {
                             self.instances[inst_idx].realized_pnl_today += pnl_value;
                             self.instances[inst_idx].funding_carry_today += carry_usd;
                             self.instances[inst_idx].total_funding_carry += carry_usd;
-                            // A simulated dry-run exit bumps total_pnl/
-                            // total_funding_carry above via write_pnl_record
-                            // (the two inputs to the bot-strategy#783 capital-
-                            // event detector's `accounted_pnl`), but never
-                            // touches the connector-sourced equity that
-                            // detector reads real equity from. Mark it the
-                            // same way an actually-still-open real position
-                            // is marked, so the detector's existing
-                            // fail-safe Ambiguous path defers reconciliation
-                            // on the next flat/settled tick instead of
-                            // treating the resulting divergence as a genuine
-                            // capital move (Codex P2 follow-up).
-                            self.instances[inst_idx].capital_position_seen_since_baseline = true;
                             // write_pnl_record always bumps total_trades / total_pnl
                             // (now persisted, bot-strategy#320), so the snapshot is
                             // dirty regardless of pnl sign.

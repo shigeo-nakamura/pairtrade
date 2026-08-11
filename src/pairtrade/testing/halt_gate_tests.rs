@@ -850,6 +850,7 @@ async fn halted_instance_equity_tracks_collateral_without_restart() {
     let mut h = Harness::new("hg-halt-equity");
     h.engine.cfg.risk.max_session_loss_bps = 500; // session DD enabled → sampling on
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 0.0; // isolate ③ from ①
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_sample_secs = 1; // a fresh sample bucket each second
     {
         let inst = &mut h.engine.instances[0];
@@ -905,6 +906,7 @@ fn deposit_while_flat_rebaselines_peak_without_clearing_halt() {
     let mut h = Harness::new("hg-cap-deposit");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     let now = chrono::Utc::now().timestamp();
@@ -981,6 +983,7 @@ fn round9_delayed_settlement_sequence_never_reanchors_without_transfer() {
     let mut h = Harness::new("hg-cap-round9-settlement");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     let now = chrono::Utc::now().timestamp();
@@ -1070,6 +1073,7 @@ fn pre_783_snapshot_migration_never_reanchors_delayed_settlement() {
     let mut h = Harness::new("hg-cap-pre-783-migration");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     let now = chrono::Utc::now().timestamp();
@@ -1141,6 +1145,7 @@ fn withdrawal_rollover_redeposit_counts_new_capital_once() {
     let mut h = Harness::new("hg-cap-rollover");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     let now = chrono::Utc::now().timestamp();
@@ -1209,6 +1214,7 @@ fn position_activity_latch_persists_only_on_the_false_to_true_transition() {
     let mut h = Harness::new("hg-cap-latch");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     {
@@ -1254,6 +1260,7 @@ fn reconciled_quiet_tick_does_not_persist_when_nothing_changed() {
     let mut h = Harness::new("hg-cap-idle");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     {
@@ -1296,6 +1303,7 @@ fn reference_change_and_redeposit_at_restart_reconcile_once() {
     let mut before = Harness::new("hg-cap-ref-restart");
     before.engine.cfg.risk.max_session_loss_bps = 500;
     before.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    before.engine.cfg.dry_run = false;
     before.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     let path = before.engine.risk_state_path.clone();
     let now = chrono::Utc::now().timestamp();
@@ -1318,6 +1326,7 @@ fn reference_change_and_redeposit_at_restart_reconcile_once() {
     restarted.engine.risk_state_path = path;
     restarted.engine.cfg.risk.max_session_loss_bps = 500;
     restarted.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    restarted.engine.cfg.dry_run = false;
     restarted.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     restarted.engine.instances[0].equity_reference_usd = 6_000.0;
     restarted.engine.load_risk_state();
@@ -1358,6 +1367,7 @@ fn legacy_snapshot_stale_denominator_reconciles_when_flat_settled() {
     let mut h = Harness::new("hg-cap-legacy");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     h.engine.instances[0].equity_reference_usd = 6_000.0;
     let now = chrono::Utc::now().timestamp();
@@ -1421,6 +1431,7 @@ fn legacy_snapshot_consistent_denominator_preserved_when_flat_settled() {
     let mut h = Harness::new("hg-cap-legacy-withdrawn");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1462,6 +1473,7 @@ fn legacy_snapshot_trustworthy_denominator_applies_detected_delta() {
     let mut h = Harness::new("hg-cap-legacy-delta-trustworthy");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1496,6 +1508,7 @@ fn legacy_snapshot_untrustworthy_denominator_discards_delta() {
     let mut h = Harness::new("hg-cap-legacy-delta-untrustworthy");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1535,6 +1548,7 @@ fn legacy_snapshot_preserved_despite_realized_pnl_baseline_drift() {
     let mut h = Harness::new("hg-cap-legacy-pnl-drift");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1571,6 +1585,7 @@ fn legacy_snapshot_trustworthy_denominator_applies_delta_despite_realized_pnl() 
     let mut h = Harness::new("hg-cap-legacy-delta-pnl-drift");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1610,6 +1625,7 @@ fn legacy_snapshot_with_cleared_baseline_preserves_denominator_on_round_transiti
     let mut h = Harness::new("hg-cap-legacy-cleared-baseline");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1645,6 +1661,7 @@ fn legacy_reference_reconciles_without_reanchoring_disabled_session_dd() {
     let mut h = Harness::new("hg-cap-legacy-disabled");
     h.engine.cfg.risk.max_session_loss_bps = 0;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     let now = chrono::Utc::now().timestamp();
     {
@@ -1690,6 +1707,7 @@ fn capital_delta_updates_daily_dd_denominator_when_session_dd_disabled() {
     h.engine.cfg.risk.max_session_loss_bps = 0;
     h.engine.cfg.risk.max_daily_loss_bps = 300;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1724,6 +1742,7 @@ fn reference_change_without_capital_event_adopts_new_reference_when_settled() {
     let mut h = Harness::new("hg-cap-ref-only");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1754,6 +1773,7 @@ fn unrealized_pnl_while_in_position_does_not_rebaseline() {
     let mut h = Harness::new("hg-cap-trading");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     let now = chrono::Utc::now().timestamp();

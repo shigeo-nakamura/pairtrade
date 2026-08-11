@@ -675,6 +675,22 @@ impl PairTradeEngine {
         if self.cfg.backtest_mode {
             return;
         }
+        // In live dry_run mode, exits are simulated: execute.rs's
+        // exit_dry_run path still bumps total_pnl/total_funding_carry (the
+        // two inputs to `accounted_pnl` below) via write_pnl_record, but
+        // those simulated results never touch the connector-sourced
+        // equity_cache real equity is read from, and never will -- a
+        // dry-run trade has no matching real settlement to ever catch up
+        // to. Marking capital_position_seen_since_baseline defers detection
+        // (as a still-open real position does) rather than corrupting it,
+        // but the gap it defers on only ever grows over a long dry-run
+        // session, so the deferral never clears and capital-event detection
+        // is permanently disabled for the rest of the session either way.
+        // Skip it outright instead, so at least it is visibly off rather
+        // than silently stuck (Codex P2 follow-up, bot-strategy#783).
+        if self.cfg.dry_run {
+            return;
+        }
         let threshold_bps = self.cfg.risk.max_session_loss_bps;
         let daily_threshold_bps = self.cfg.risk.max_daily_loss_bps;
         let min_usd = self.cfg.risk.session_dd_capital_event_min_usd;
@@ -1427,6 +1443,14 @@ enum CapitalDisposition {
     Ambiguous,
 }
 
+/// Floating-point tolerance for "did this value move at all" checks in
+/// `reconcile_capital_delta`, distinct from the operator-configured
+/// `min_usd` materiality threshold: this is used to detect whether
+/// `equity_cache` is bit-for-bit unchanged since the last observation
+/// (only refreshed on its own cadence, see `EQUITY_REFRESH_CACHE_SECS`),
+/// not whether a movement is small enough to ignore.
+const CAPITAL_DELTA_EPSILON: f64 = 1e-9;
+
 /// Reconcile a flat account-equity movement against trade/funding accounting.
 /// Raw equity changes alone are not capital evidence because connector balance
 /// caching can publish the close PnL several minutes after pairtrade records
@@ -1447,6 +1471,28 @@ fn reconcile_capital_delta(
     let disposition =
         match classify_capital_basis_delta(baseline_capital_basis, current_capital_basis, min_usd)
         {
+            // The basis looks reconciled, but only because this tick's own
+            // accounted-PnL move happens to be small enough to hide under
+            // min_usd while equity itself did not move at all (bit-exact,
+            // not just "small" -- equity_cache is only refreshed on its own
+            // cadence, so an unrefreshed tick reads back the identical
+            // value). Advancing the anchor here would silently forgive that
+            // gap; a second such sub-threshold move before equity ever
+            // catches up then accumulates completely unnoticed, since each
+            // individual move keeps resetting the anchor it would otherwise
+            // be measured against. Defer instead: the anchor stays pinned,
+            // so the next accounted-only move is measured against the same
+            // un-advanced point and the accumulated gap is what eventually
+            // gets compared -- either to min_usd (existing Ambiguous
+            // threshold below) or, once equity genuinely moves to explain
+            // it (raw_equity_delta then reads as more than noise), back to
+            // this same basis check, which resolves it for real (Codex P1
+            // follow-up, bot-strategy#783).
+            None if accounted_pnl_delta.abs() > CAPITAL_DELTA_EPSILON
+                && raw_equity_delta.abs() <= CAPITAL_DELTA_EPSILON =>
+            {
+                CapitalDisposition::Ambiguous
+            }
             None => CapitalDisposition::Reconciled,
             Some(_) if accounted_pnl_delta.abs() >= min_usd || position_seen_since_baseline => {
                 CapitalDisposition::Ambiguous
@@ -1812,6 +1858,67 @@ mod tests {
         let deferred = reconcile_capital_delta(1_000.0, 950.0, 0.0, 0.0, true, 5.0);
         assert_eq!(deferred.disposition, CapitalDisposition::Ambiguous);
         assert!(deferred.position_seen_since_baseline);
+    }
+
+    // bot-strategy#783 (Codex P1 follow-up): equity is bit-for-bit unchanged
+    // (not just "small" -- exactly the same cached value, i.e. it has not
+    // been refreshed yet) while a $4 accounted move keeps the capital basis
+    // itself under the $5 threshold. Reconciling this silently would let a
+    // second such move accumulate past min_usd completely unnoticed, since
+    // each individual sub-threshold move would keep resetting the anchor it
+    // is measured against.
+    #[test]
+    fn capital_reconciliation_defers_a_sub_threshold_accounted_move_with_frozen_equity() {
+        let deferred = reconcile_capital_delta(1_000.0, 1_000.0, 0.0, 4.0, false, 5.0);
+        assert_eq!(deferred.disposition, CapitalDisposition::Ambiguous);
+    }
+
+    // The accumulation scenario end to end: two individually sub-threshold
+    // wins ($4 each against a $5 threshold) while equity_cache stays frozen
+    // must not silently reconcile away the growing gap, and once equity
+    // finally catches up to the full $8, that must resolve as delayed
+    // settlement -- not a $8 verified deposit that resets the DD peak and
+    // inflates the daily denominator.
+    #[test]
+    fn capital_reconciliation_accumulates_sub_threshold_accounted_moves_until_equity_catches_up() {
+        let min_usd = 5.0;
+        // The anchor stays pinned at (1_000.0, 0.0) throughout: Ambiguous
+        // does not advance it while position_seen_since_baseline is false,
+        // mirroring detect_capital_event_and_rebaseline's baseline_advanced
+        // gate.
+        let baseline_equity = 1_000.0;
+        let baseline_accounted_pnl = 0.0;
+
+        let tick1 =
+            reconcile_capital_delta(baseline_equity, 1_000.0, baseline_accounted_pnl, 4.0, false, min_usd);
+        assert_eq!(
+            tick1.disposition,
+            CapitalDisposition::Ambiguous,
+            "the first sub-threshold accounted move defers instead of silently resetting the anchor"
+        );
+
+        let tick2 =
+            reconcile_capital_delta(baseline_equity, 1_000.0, baseline_accounted_pnl, 8.0, false, min_usd);
+        assert_eq!(
+            tick2.disposition,
+            CapitalDisposition::Ambiguous,
+            "the accumulated $8 gap against the un-advanced anchor now exceeds min_usd on its own"
+        );
+
+        let tick3 = reconcile_capital_delta(
+            baseline_equity,
+            1_008.0,
+            baseline_accounted_pnl,
+            8.0,
+            false,
+            min_usd,
+        );
+        assert_eq!(
+            tick3.disposition,
+            CapitalDisposition::Reconciled,
+            "equity catching up to the full accounted total resolves as delayed settlement, not an $8 verified deposit"
+        );
+        assert!(tick3.inferred_capital_delta.abs() < 1e-9);
     }
 
     // bot-strategy#783 (Codex P1 follow-up): a near-full withdrawal after a
