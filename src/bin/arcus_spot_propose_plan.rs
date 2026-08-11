@@ -29,9 +29,39 @@ use dex_connector::{ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSp
 use serde::Deserialize;
 use std::{
     env, fs,
+    fs::OpenOptions,
     io::{self, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
+
+/// Writes `bytes` to `path` as a private (mode 0600), non-symlink regular
+/// file -- every subsequent `hash`/`execute`/`resume` invocation rejects a
+/// plan file that isn't already mode 0600 (`read_private_regular_file` in
+/// arcus_spot_execute_once.rs), and under the common `umask 022` a plain
+/// `fs::write` would create a brand new file as 0644, silently breaking the
+/// advertised propose-to-execute workflow. `.mode(0o600)` on `OpenOptions`
+/// only takes effect when the open call actually creates the inode, so a
+/// stale plan file left over at this exact path from a prior run (already
+/// 0644, or looser) would keep its old permissions across an overwrite;
+/// `set_permissions` after opening fixes that regardless of whether this
+/// call created the file or reused an existing one.
+fn write_private_plan_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))
+}
 
 /// A strict subset of `arcus-spot-execute-once`'s config schema: only the
 /// fields a read-only plan proposal needs. Deliberately *not*
@@ -186,7 +216,7 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
             if let Some(out_path) = out_path {
                 let bytes =
                     serde_json::to_vec_pretty(plan).context("failed to serialize plan")?;
-                fs::write(out_path, bytes)
+                write_private_plan_file(Path::new(out_path), &bytes)
                     .with_context(|| format!("failed to write plan to {out_path}"))?;
                 eprintln!(
                     "wrote a fresh plan to {out_path} -- run hash/sign-approval/execute well \
