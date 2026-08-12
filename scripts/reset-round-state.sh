@@ -18,15 +18,18 @@
 #   - last_stop_loss_per_pair                                 (#316 cool-down anchors)
 #   - equity_samples                                          (#185 Phase 3-1, leverage-scale dependent)
 #   - session_halted, session_halt_reason, session_halt_ts    (#185 Phase 3-1)
-#   - capital_baseline_equity / accounted PnL / position flag (#752 / #783 capital-event anchors;
-#     clearing the first two prevents the next round from comparing collateral and
-#     accounting values against different round scopes. The position flag is
-#     seeded true, not false: this reset runs while the service is stopped, and
-#     force_close_on_startup can flatten a position carried across the round
-#     boundary without its settlement landing in equity before the first
-#     post-restart tick. Matches InstanceRiskState::reset_round_bound()'s own
-#     defensive seed -- guard until a confirmed-fresh post-flat equity read
-#     proves it safe to trust, same as an automatic round transition.)
+#   - capital_baseline_equity / accounted PnL                  (#752 / #783 capital-event anchors;
+#     clearing these prevents the next round from comparing collateral and
+#     accounting values against different round scopes. capital_position_seen_since_baseline
+#     is deliberately NOT touched -- it only ever flips false -> true
+#     synchronously with an immediate persist, so a persisted false reliably
+#     means the instance really was flat and settled, and forcing it to true
+#     here would invent position activity on an already-clean instance,
+#     permanently misclassifying its next real deposit/withdrawal as
+#     position-ambiguous until CAPITAL_GUARD_QUIET_REOBSERVATIONS
+#     independent post-restart equity reads confirm it (Codex P2 follow-up,
+#     bot-strategy#783). Matches InstanceRiskState::reset_round_bound(),
+#     which preserves this same field for the same reason.)
 #
 # Fields NOT touched (correctly auto-rolling at UTC midnight, do not need
 # round-boundary handling):
@@ -116,7 +119,6 @@ RESET='.instances |= with_entries(.value += {
     equity_samples: [],
     capital_baseline_equity: 0,
     capital_baseline_accounted_pnl: null,
-    capital_position_seen_since_baseline: true,
     session_halted: false,
     session_halt_reason: null,
     session_halt_ts: null
