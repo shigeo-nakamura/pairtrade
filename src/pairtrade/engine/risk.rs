@@ -870,6 +870,22 @@ impl PairTradeEngine {
                 None => {
                     inst.flat_since = Some(Instant::now());
                     inst.capital_guard_equity_snapshot = Some(equity);
+                    // capital_guard_stable_since/_generation accumulate
+                    // unconditionally every tick regardless of flat state
+                    // (see the top of this function) -- while a position is
+                    // open, equity_cache simply not changing proves nothing
+                    // about post-close settlement completeness, since it's
+                    // a low-frequency dashboard-only cache during that
+                    // period, not evidence anything has settled. Without
+                    // resetting here, "credit" accumulated entirely before
+                    // this close could already satisfy the stability window
+                    // the instant the settle dwell passes, clearing the
+                    // guard against the still-stale pre-close reading
+                    // instead of the close's actual settlement (Codex P1
+                    // follow-up, bot-strategy#783).
+                    inst.capital_guard_last_observed_equity = Some(equity);
+                    inst.capital_guard_stable_since = Some(Instant::now());
+                    inst.capital_guard_stable_since_generation = inst.equity_fetch_generation;
                     settle_secs == 0
                 }
             };

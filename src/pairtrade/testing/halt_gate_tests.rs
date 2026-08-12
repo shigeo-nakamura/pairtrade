@@ -1549,6 +1549,64 @@ fn ambiguous_deferral_visible_from_the_first_tick_still_gives_up_via_reobservati
     assert!((inst.capital_baseline_equity - 1_110.0).abs() < 1e-9);
 }
 
+// bot-strategy#783 (Codex P1 follow-up, eighth round): capital_guard_stable_since
+// / capital_guard_stable_since_generation accumulate unconditionally every
+// tick, regardless of flat state -- while a position is open, equity_cache
+// simply not changing (it's a low-frequency dashboard-only cache during
+// that period, see EQUITY_REFRESH_CACHE_SECS's own doc comment) proves
+// nothing about post-close settlement completeness. Without resetting them
+// at the flat transition, "stability credit" accumulated entirely *before*
+// a close could already satisfy equity_confirmed_settled the instant the
+// settle dwell passes, clearing the guard against the still-stale pre-close
+// reading of an unaccounted close (e.g. a startup force-close whose PnL was
+// never recorded) instead of that close's actual settlement.
+#[test]
+fn flat_transition_resets_stale_stability_credit_from_the_open_position() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-flat-transition-reset");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        // An unaccounted close just happened (total_pnl never recorded, as
+        // a startup force-close would leave it) -- equity_cache has not
+        // caught up yet, still reading the pre-close value.
+        inst.equity_cache = 1_000.0;
+        inst.capital_position_seen_since_baseline = true;
+        inst.flat_since = None; // first tick observing the instance as flat
+        // Stale credit accumulated entirely *before* this close, while a
+        // position was open and equity_cache happened to sit at the exact
+        // same value the whole time: many confirmed re-observations, long
+        // past the stability window.
+        inst.capital_guard_last_observed_equity = Some(1_000.0);
+        inst.capital_guard_stable_since =
+            Some(Instant::now() - Duration::from_secs(10 * engine::risk::CAPITAL_GUARD_STABILITY_SECS));
+        inst.capital_guard_stable_since_generation = 0;
+        inst.equity_fetch_generation = 10;
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        inst.capital_position_seen_since_baseline,
+        "stale stability credit from before the close must not immediately \
+         clear the guard against the still-stale pre-close equity reading"
+    );
+    assert_eq!(
+        inst.capital_baseline_equity, 1_000.0,
+        "no rebaseline against a still-unsettled, unaccounted close"
+    );
+}
+
 // bot-strategy#783 (Codex P1 follow-up, third round): a position closing
 // (or a pre-#783 migration, which seeds the guard unconditionally) does not
 // guarantee equity_cache has caught up yet -- it only refreshes every
