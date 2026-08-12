@@ -1607,6 +1607,38 @@ fn flat_transition_resets_stale_stability_credit_from_the_open_position() {
     );
 }
 
+// bot-strategy#783 (Codex P2 follow-up, ninth round): step_setup's
+// detect_capital_event_and_rebaseline (which normally latches and persists
+// capital_position_seen_since_baseline on the open->flat transition) runs
+// before step_execute_entry ever creates a pending_entry -- so that
+// transition would only be observed on the *next* tick's step_setup call.
+// step_execute_entry must latch (and persist) the guard itself, synchronously,
+// the moment it creates a nonempty entry, rather than waiting.
+#[tokio::test]
+async fn entry_creation_latches_position_guard_synchronously() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-entry-guard-latch");
+    h.engine.cfg.dry_run = false;
+    h.engine.instances[0].capital_position_seen_since_baseline = false;
+
+    h.step().await;
+
+    assert!(
+        h.position(0).is_some() || h.engine.instances[0].states[PAIR_KEY]
+            .pending_entry
+            .is_some(),
+        "the module's documented z-trajectory must fire an entry on the first step"
+    );
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "step_execute_entry must latch the guard synchronously when it \
+         creates a nonempty entry, without waiting for the next tick's \
+         step_setup to notice the open position"
+    );
+}
+
 // bot-strategy#783 (Codex P1 follow-up, third round): a position closing
 // (or a pre-#783 migration, which seeds the guard unconditionally) does not
 // guarantee equity_cache has caught up yet -- it only refreshes every
