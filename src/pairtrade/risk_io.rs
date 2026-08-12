@@ -138,18 +138,26 @@ impl InstanceRiskState {
         self.equity_samples.clear();
         self.capital_baseline_equity = 0.0;
         self.capital_baseline_accounted_pnl = None;
-        // Seeded true, not false: a round transition can happen while a
-        // venue position is still open, and load_risk_state applies this
-        // reset before force_close_on_startup ever runs (engine/step.rs).
-        // If that startup force-close's settlement has not landed in
-        // equity yet, clearing the guard here would let it reach the next
-        // detect_capital_event_and_rebaseline tick with no protection at
-        // all, right when it is most needed -- misclassifying the delayed
-        // settlement as a verified capital event once equity catches up
-        // (Codex P1 follow-up, bot-strategy#783). This mirrors the
-        // pre-#783-migration seed's own defensive posture: guard until a
-        // stable, confirmed-fresh observation proves it is safe to trust.
-        self.capital_position_seen_since_baseline = true;
+        // Deliberately NOT reset (unlike every other round-bound field
+        // above): preserve whatever value is already persisted instead of
+        // forcing it. `capital_position_seen_since_baseline` only ever
+        // flips false -> true synchronously in the same tick a position
+        // opens, immediately followed by a synchronous persist_risk_state()
+        // call (see detect_capital_event_and_rebaseline's
+        // PositionActivityLatched arm) -- so a persisted `false` reliably
+        // means the instance really was flat and settled as of the last
+        // write, not merely a race that lost a pending `true`. A round
+        // transition on an account that was already clean must not invent
+        // position activity out of thin air: `capital_guard_equity_snapshot`
+        // gets backfilled to the same current equity the very next tick
+        // (see detect_capital_event_and_rebaseline), so
+        // equity_confirmed_settled could never prove the invented guard
+        // safe to clear on a truly quiet account, permanently misclassifying
+        // the next real deposit/withdrawal as position-ambiguous (Codex P1
+        // follow-up, bot-strategy#783). A persisted `true` (position
+        // activity recorded, or never yet resolved) is preserved exactly as
+        // before, still guarding load_risk_state -> force_close_on_startup's
+        // own race.
         self.session_halted = false;
         self.session_halt_reason = None;
         self.session_halt_ts = None;
@@ -383,11 +391,11 @@ mod tests {
         assert!(s.equity_samples.is_empty());
         assert_eq!(s.capital_baseline_equity, 0.0);
         assert_eq!(s.capital_baseline_accounted_pnl, None);
-        // Seeded true (not merely preserved), not false: a round can flip
-        // while a position is still open, and this reset runs before
-        // force_close_on_startup, so the guard must default to "not yet
-        // proven safe" rather than "trust immediately" (Codex P1 follow-up,
-        // bot-strategy#783).
+        // Preserved, not forced: this fixture starts latched true (as if a
+        // position had been open at last persist), and the reset leaves it
+        // untouched rather than resetting it (Codex P1 follow-up,
+        // bot-strategy#783; see reset_round_bound_preserves_clean_guard for
+        // the "already flat" contrast case).
         assert!(s.capital_position_seen_since_baseline);
         assert!(!s.session_halted);
         assert_eq!(s.session_halt_reason, None);
@@ -414,6 +422,34 @@ mod tests {
             s.entry_blocked_pairs.get("BTC/ETH").map(String::as_str),
             Some("entry_reconcile_trim_failed_ETH")
         );
+    }
+
+    // bot-strategy#783 (Codex P1 follow-up, seventh round): a round
+    // transition on an account that was already flat and settled (guard
+    // legitimately false at last persist) must not invent position
+    // activity out of thin air. capital_position_seen_since_baseline only
+    // ever flips false -> true synchronously with an immediate
+    // persist_risk_state() call (see
+    // detect_capital_event_and_rebaseline's PositionActivityLatched arm),
+    // so a persisted false reliably means the instance really was clean --
+    // forcing it back to true here would permanently misclassify the next
+    // real deposit/withdrawal as position-ambiguous, since
+    // capital_guard_equity_snapshot gets backfilled to the same current
+    // equity the very next tick and can never prove the invented guard
+    // safe to clear.
+    #[test]
+    fn reset_round_bound_preserves_clean_guard() {
+        let mut s = populated_instance();
+        s.capital_position_seen_since_baseline = false;
+        s.reset_round_bound();
+
+        assert!(
+            !s.capital_position_seen_since_baseline,
+            "a round transition on an already-clean account must not invent \
+             position activity"
+        );
+        assert_eq!(s.capital_baseline_equity, 0.0);
+        assert_eq!(s.capital_baseline_accounted_pnl, None);
     }
 
     fn make_snapshot(round_id: Option<&str>) -> RiskStateSnapshot {

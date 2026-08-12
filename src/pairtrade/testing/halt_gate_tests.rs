@@ -469,6 +469,8 @@ impl Harness {
             capital_guard_equity_snapshot: None,
             capital_guard_last_observed_equity: None,
             capital_guard_stable_since: None,
+            equity_fetch_generation: 0,
+            capital_guard_stable_since_generation: 0,
             equity_initialized: false,
             equity_reference_usd: DEFAULT_EQUITY_USD,
             states,
@@ -1127,10 +1129,12 @@ fn pre_783_snapshot_migration_never_reanchors_delayed_settlement() {
 
     // Simulate the stability window having elapsed without needing to
     // actually sleep: back-date the stable-since clock captured when
-    // $6,010 was first observed above.
+    // $6,010 was first observed above, and simulate the genuine
+    // re-observation equity_confirmed_settled now also requires.
     h.engine.instances[0].capital_guard_stable_since = Some(
         Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
     );
+    h.engine.instances[0].equity_fetch_generation += 1;
     h.engine.detect_capital_event_and_rebaseline(0);
     {
         let inst = &h.engine.instances[0];
@@ -1191,12 +1195,14 @@ fn pre_783_migration_on_already_quiet_account_seeds_guard_cleared() {
         inst.capital_baseline_accounted_pnl = None; // pre-#783 snapshot
         inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
         // Equity has already been observed at this exact value for well
-        // past the stability window -- e.g. a long-idle, fully-settled
+        // past the stability window, with a genuine connector
+        // re-observation in between -- e.g. a long-idle, fully-settled
         // account -- before this migration tick ever runs.
         inst.capital_guard_last_observed_equity = Some(1_000.0);
         inst.capital_guard_stable_since = Some(
             Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
         );
+        inst.equity_fetch_generation = 1;
     }
 
     h.engine.detect_capital_event_and_rebaseline(0);
@@ -1421,10 +1427,11 @@ fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
     );
 
     // Simulate the stability window having elapsed without needing to
-    // actually sleep.
+    // actually sleep, with a genuine re-observation landing in between.
     h.engine.instances[0].capital_guard_stable_since = Some(
         Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
     );
+    h.engine.instances[0].equity_fetch_generation += 1;
     h.engine.detect_capital_event_and_rebaseline(0);
 
     let inst = &h.engine.instances[0];
@@ -1516,14 +1523,31 @@ fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapse
     );
 
     // Simulate the stability window having elapsed without needing to
-    // actually sleep.
+    // actually sleep -- but with no genuine re-observation in that window
+    // (equity_cache just sitting frozen, unrefreshed: EQUITY_REFRESH_CACHE_SECS
+    // is 300s, five times CAPITAL_GUARD_STABILITY_SECS, so this is the
+    // ordinary case, not an edge case). Elapsed wall time alone must not
+    // be enough to confirm settlement, or a still-partial value that
+    // merely hasn't been re-fetched yet gets trusted before the rest of
+    // it lands.
     h.engine.instances[0].capital_guard_stable_since = Some(
         Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
     );
     h.engine.detect_capital_event_and_rebaseline(0);
     assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "elapsed time alone, without an actual fresh connector re-observation, must not clear the guard"
+    );
+
+    // A genuine re-observation now lands (whether or not the value itself
+    // changes -- fetch_equity_rest bumps equity_fetch_generation on any
+    // successful connector read).
+    h.engine.instances[0].equity_fetch_generation += 1;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
         !h.engine.instances[0].capital_position_seen_since_baseline,
-        "the guard clears once equity has genuinely changed and held steady since becoming flat"
+        "the guard clears once equity has genuinely changed, held steady since becoming flat, \
+         and a fresh connector observation has confirmed it"
     );
 }
 
@@ -2371,6 +2395,7 @@ fn risk_ack_reanchor_keeps_position_guard_on_stale_equity() {
     h.engine.instances[0].capital_guard_stable_since = Some(
         Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
     );
+    h.engine.instances[0].equity_fetch_generation += 1;
     std::fs::write(risk_ack_path(), "ack by op: reanchor=true").unwrap();
     h.engine.consume_risk_ack();
     assert!(

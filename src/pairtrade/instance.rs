@@ -71,6 +71,26 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// once, on the very first tick that differs from the pre-close
     /// snapshot. Runtime only, not persisted.
     pub(in crate::pairtrade) capital_guard_stable_since: Option<Instant>,
+    /// Incremented every time `fetch_equity_rest` writes a genuinely
+    /// connector-sourced value into `equity_cache` (not on a fetch failure,
+    /// and not on the pre-init zero-reading skip). `CAPITAL_GUARD_STABILITY_SECS`
+    /// alone measures wall-clock time since `capital_guard_stable_since`
+    /// armed, but `equity_cache` is only actually refreshed on its own
+    /// `EQUITY_REFRESH_CACHE_SECS` (300s) cadence -- longer than the 60s
+    /// stability window. A value that lands, then sits frozen in the cache
+    /// for the next 60s with zero refresh attempts, would otherwise satisfy
+    /// the elapsed-time check without ever having been re-observed from the
+    /// exchange even once, so a still-in-flight multi-leg settlement's
+    /// remaining portion lands against a guard that already cleared (Codex
+    /// P1 follow-up, bot-strategy#783). Runtime only, not persisted.
+    pub(in crate::pairtrade) equity_fetch_generation: u64,
+    /// `equity_fetch_generation`'s value captured at the moment
+    /// `capital_guard_stable_since` most recently (re)armed. Stability is
+    /// only trusted once `equity_fetch_generation` has advanced past this,
+    /// proving at least one genuine connector observation landed during the
+    /// window (Codex P1 follow-up, bot-strategy#783). Runtime only, not
+    /// persisted.
+    pub(in crate::pairtrade) capital_guard_stable_since_generation: u64,
     /// False until the first successful `fetch_equity_rest` writes a
     /// connector-sourced balance into `equity_cache`. Not persisted —
     /// always starts false on engine boot. Gates session-DD evaluation
