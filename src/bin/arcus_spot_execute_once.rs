@@ -139,7 +139,14 @@ fn usage() -> &'static str {
   arcus-spot-execute-once hash CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once sign-approval DIGEST PRIVATE_KEY_FILE
   arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
+  arcus-spot-execute-once auto-execute CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
+
+auto-execute skips the offline human approval signature (explicit owner
+decision while total inventory at risk stays small -- see the comment at
+its call site). Every other gate execute enforces is unchanged: plan/config
+validation, staleness, on-chain preflight, exact-value Permit2, slippage,
+and loss stops.
 
 keygen/sign-approval are meant to run on a separate, offline machine: the
 resulting private key file must never be copied to the host that runs
@@ -634,6 +641,49 @@ async fn main() -> Result<()> {
             // still be signed and dispatched against the now-stale state
             // (Codex P1 follow-up, pairtrade#181, refining an earlier
             // fix in the same area).
+            let mut executor = executor_from_config(&config).await?;
+            let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            let runtime = runtime_store.load_or_create(&config.runtime)?;
+            runtime
+                .validate_plan_consistent_with_state(&plan)
+                .map_err(anyhow::Error::msg)
+                .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
+            let attempt = executor
+                .execute_plan_once(&plan, &plan_config_digest)
+                .await?;
+            let attempt = finalize_reconciled_attempt(
+                &config,
+                &mut executor,
+                &plan,
+                &plan_config_digest,
+                attempt,
+            )?;
+            write_attempt(&attempt)
+        }
+        [command, config_path, plan_path] if command == "auto-execute" => {
+            // Skips the offline Ed25519 approval signature required by
+            // `execute`. Explicit owner decision (bot-strategy#772,
+            // 2026-08-12): while total inventory at risk stays small, the
+            // per-swap human-signing round trip is pure friction with no
+            // safety benefit proportionate to the amount at stake, and the
+            // approval gate's original purpose -- proving this brand-new
+            // execution path actually works against the real Arcus API
+            // before trusting it unattended -- was already served by the
+            // one-swap acceptance test's earlier signed attempts (which
+            // exercised every other gate below: config/plan structural
+            // validation, on-chain preflight, exact-value permit
+            // construction, slippage, staleness). Every other safety gate
+            // is unchanged and still enforced identically to `execute`:
+            // plan/config structural validation, `max_plan_age_secs`/
+            // `max_quote_age_secs`, inventory floors, daily/cumulative
+            // loss stops, exact-value-only Permit2, and the runtime
+            // checkpoint consistency check below. Revisit this decision
+            // (return to requiring `execute` with a human signature, or
+            // add a scale-dependent threshold) before any inventory
+            // scale-up beyond what is currently approved on #772.
+            let (config, plan) =
+                load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
+            let plan_config_digest = approval_digest(&config, &plan)?;
             let mut executor = executor_from_config(&config).await?;
             let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let runtime = runtime_store.load_or_create(&config.runtime)?;
