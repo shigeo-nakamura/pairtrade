@@ -1163,6 +1163,127 @@ fn pre_783_snapshot_migration_never_reanchors_delayed_settlement() {
     assert_eq!(inst.session_start_equity, 6_500.0);
 }
 
+// bot-strategy#783 (Codex P1 follow-up, sixth round): a pre-#783 snapshot
+// migration on a clean, already-quiet account must not latch the position
+// guard permanently. equity_confirmed_settled can never clear it afterward
+// here specifically because capital_guard_equity_snapshot gets backfilled to
+// this same current equity -- a truly static account will never produce the
+// "equity changed away from its snapshot" evidence that check requires. If
+// equity_cache has already held steady for a full stability window by the
+// time the migration runs, that itself proves nothing was still catching
+// up, so the guard must seed pre-cleared.
+#[test]
+fn pre_783_migration_on_already_quiet_account_seeds_guard_cleared() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-migration-quiet");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = None; // pre-#783 snapshot
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+        // Equity has already been observed at this exact value for well
+        // past the stability window -- e.g. a long-idle, fully-settled
+        // account -- before this migration tick ever runs.
+        inst.capital_guard_last_observed_equity = Some(1_000.0);
+        inst.capital_guard_stable_since = Some(
+            Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
+        );
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        !inst.capital_position_seen_since_baseline,
+        "an already-stable account must seed the migration guard pre-cleared, \
+         since equity_confirmed_settled can never prove it later"
+    );
+    assert_eq!(inst.capital_baseline_accounted_pnl, Some(0.0));
+}
+
+// Contrast case: the same migration, but equity has not yet been observed
+// long enough to prove nothing is still catching up. The guard must latch,
+// same as before this fix.
+#[test]
+fn pre_783_migration_on_freshly_observed_account_seeds_guard_latched() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-migration-fresh");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = None; // pre-#783 snapshot
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+        // capital_guard_stable_since is left unset -- the migration tick
+        // below is the first time this equity is ever observed.
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        inst.capital_position_seen_since_baseline,
+        "a freshly-observed account has no proof yet that settlement is \
+         complete, so the guard must still latch"
+    );
+    assert_eq!(inst.capital_baseline_accounted_pnl, Some(0.0));
+}
+
+// bot-strategy#783 (Codex P2 follow-up, sixth round): dry_run must still
+// migrate the daily-loss denominator when equity_usd_reference changes,
+// even though capital-flow reconciliation itself stays off (no real
+// settlement to reconcile against in dry_run).
+#[test]
+fn dry_run_still_migrates_equity_reference() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-dry-run-reference");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = true;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        // Operator bumped equity_usd_reference from $1,000 to $2,000 and
+        // restarted; session_equity_reference_usd still holds the old value.
+        inst.equity_reference_usd = 2_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        inst.session_start_equity = 1_000.0;
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_equity_reference_usd, 2_000.0,
+        "dry_run must still sync the reference even though capital-flow \
+         reconciliation stays off"
+    );
+    assert_eq!(
+        inst.session_start_equity, 2_000.0,
+        "the daily-loss denominator must follow the new reference in dry_run too"
+    );
+}
+
 // bot-strategy#752: a full withdrawal can include accumulated PnL, so its
 // delta need not equal the configured reference. The zero-clamped daily
 // denominator must survive UTC rollover; otherwise the old reference is

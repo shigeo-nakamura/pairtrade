@@ -696,6 +696,18 @@ impl PairTradeEngine {
         if self.cfg.backtest_mode {
             return;
         }
+        let threshold_bps = self.cfg.risk.max_session_loss_bps;
+        let daily_threshold_bps = self.cfg.risk.max_daily_loss_bps;
+        let min_usd = self.cfg.risk.session_dd_capital_event_min_usd;
+        let (legacy_reference, reference_reconciliation_pending) = {
+            let inst = &self.instances[inst_idx];
+            let legacy = inst.session_equity_reference_usd <= 0.0;
+            (
+                legacy,
+                legacy
+                    || (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9,
+            )
+        };
         // In live dry_run mode, exits are simulated: execute.rs's
         // exit_dry_run path still bumps total_pnl/total_funding_carry (the
         // two inputs to `accounted_pnl` below) via write_pnl_record, but
@@ -709,21 +721,32 @@ impl PairTradeEngine {
         // is permanently disabled for the rest of the session either way.
         // Skip it outright instead, so at least it is visibly off rather
         // than silently stuck (Codex P2 follow-up, bot-strategy#783).
+        //
+        // `equity_usd_reference` migration is independent of that: it only
+        // syncs session_start_equity/session_equity_reference_usd to the
+        // operator-declared reference, with no dependence on real
+        // settlement data. Skipping it too left a dry_run deployment's
+        // daily-loss denominator pinned to the pre-edit reference forever
+        // after any equity_usd_reference change survived a restart (Codex
+        // P2 follow-up, bot-strategy#783).
         if self.cfg.dry_run {
+            if reference_reconciliation_pending {
+                let inst = &mut self.instances[inst_idx];
+                let prev_start_equity = inst.session_start_equity;
+                if !legacy_reference {
+                    inst.session_start_equity = inst.equity_reference_usd;
+                }
+                inst.session_equity_reference_usd = inst.equity_reference_usd;
+                log::info!(
+                    "[SESSION_DD] {} dry_run equity_usd_reference migrated: session_start_equity {:.2} -> {:.2}",
+                    inst.id,
+                    prev_start_equity,
+                    inst.session_start_equity,
+                );
+                self.persist_risk_state();
+            }
             return;
         }
-        let threshold_bps = self.cfg.risk.max_session_loss_bps;
-        let daily_threshold_bps = self.cfg.risk.max_daily_loss_bps;
-        let min_usd = self.cfg.risk.session_dd_capital_event_min_usd;
-        let (legacy_reference, reference_reconciliation_pending) = {
-            let inst = &self.instances[inst_idx];
-            let legacy = inst.session_equity_reference_usd <= 0.0;
-            (
-                legacy,
-                legacy
-                    || (inst.session_equity_reference_usd - inst.equity_reference_usd).abs() > 1e-9,
-            )
-        };
         if (threshold_bps == 0 && daily_threshold_bps == 0 || min_usd <= 0.0)
             && !reference_reconciliation_pending
         {
@@ -922,7 +945,28 @@ impl PairTradeEngine {
                         }
                         inst.capital_baseline_equity = equity;
                         inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
-                        inst.capital_position_seen_since_baseline = true;
+                        // A pre-#783 snapshot cannot say whether an
+                        // unaccounted close's settlement might still be
+                        // catching up, so this normally seeds the guard
+                        // latched. But equity_confirmed_settled can never
+                        // clear it afterward for a clean, already-quiet
+                        // migration: capital_guard_equity_snapshot is
+                        // backfilled to this same current equity (see
+                        // above), and that check requires equity to
+                        // *differ* from its own snapshot -- a account that
+                        // truly has nothing left to settle will never
+                        // produce that difference, latching the guard
+                        // permanently and misclassifying the first real
+                        // deposit/withdrawal as position-ambiguous. Seed it
+                        // pre-cleared instead when equity_cache has already
+                        // held its current value for a full stability
+                        // window by the time this migration runs -- that is
+                        // itself proof nothing was still catching up (Codex
+                        // P1 follow-up, bot-strategy#783).
+                        inst.capital_position_seen_since_baseline =
+                            !inst.capital_guard_stable_since.is_some_and(|since| {
+                                since.elapsed().as_secs() >= CAPITAL_GUARD_STABILITY_SECS
+                            });
                         inst.capital_rebaseline_deferred = false;
                         inst.capital_rebaseline_deferred_since = None;
                         // Deliberately does NOT repin flat_since or
