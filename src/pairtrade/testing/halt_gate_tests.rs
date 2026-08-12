@@ -1167,60 +1167,20 @@ fn pre_783_snapshot_migration_never_reanchors_delayed_settlement() {
     assert_eq!(inst.session_start_equity, 6_500.0);
 }
 
-// bot-strategy#783 (Codex P1 follow-up, sixth round): a pre-#783 snapshot
-// migration on a clean, already-quiet account must not latch the position
-// guard permanently. equity_confirmed_settled can never clear it afterward
-// here specifically because capital_guard_equity_snapshot gets backfilled to
-// this same current equity -- a truly static account will never produce the
-// "equity changed away from its snapshot" evidence that check requires. If
-// equity_cache has already held steady for a full stability window by the
-// time the migration runs, that itself proves nothing was still catching
-// up, so the guard must seed pre-cleared.
+// bot-strategy#783 (Codex P1 follow-up, seventh round): a pre-#783 snapshot
+// migration always seeds the position guard latched -- trying to pre-clear
+// it at the migration tick itself was tried (sixth round) and reverted: the
+// branch runs exactly once (capital_baseline_accounted_pnl flips to Some
+// immediately, so it is never reached again for this instance) and the
+// pre-close settle dwell that gates reaching it at all is shorter than the
+// equity refresh cadence, so a second genuine re-observation essentially
+// never lands before this one-shot tick has to decide. Clearing a clean
+// migration's guard instead happens on an ordinary *later* tick, which
+// keeps running indefinitely -- see the
+// quiet_account_after_migration_clears_via_repeated_reobservations test
+// below for that path.
 #[test]
-fn pre_783_migration_on_already_quiet_account_seeds_guard_cleared() {
-    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
-    clear_sentinels();
-
-    let mut h = Harness::new("hg-cap-migration-quiet");
-    h.engine.cfg.risk.max_session_loss_bps = 500;
-    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
-    h.engine.cfg.dry_run = false;
-    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
-
-    {
-        let inst = &mut h.engine.instances[0];
-        inst.equity_initialized = true;
-        inst.equity_cache = 1_000.0;
-        inst.capital_baseline_equity = 1_000.0;
-        inst.capital_baseline_accounted_pnl = None; // pre-#783 snapshot
-        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
-        // Equity has already been observed at this exact value for well
-        // past the stability window, with a genuine connector
-        // re-observation in between -- e.g. a long-idle, fully-settled
-        // account -- before this migration tick ever runs.
-        inst.capital_guard_last_observed_equity = Some(1_000.0);
-        inst.capital_guard_stable_since = Some(
-            Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
-        );
-        inst.equity_fetch_generation = 1;
-    }
-
-    h.engine.detect_capital_event_and_rebaseline(0);
-
-    let inst = &h.engine.instances[0];
-    assert!(
-        !inst.capital_position_seen_since_baseline,
-        "an already-stable account must seed the migration guard pre-cleared, \
-         since equity_confirmed_settled can never prove it later"
-    );
-    assert_eq!(inst.capital_baseline_accounted_pnl, Some(0.0));
-}
-
-// Contrast case: the same migration, but equity has not yet been observed
-// long enough to prove nothing is still catching up. The guard must latch,
-// same as before this fix.
-#[test]
-fn pre_783_migration_on_freshly_observed_account_seeds_guard_latched() {
+fn pre_783_migration_always_seeds_guard_latched() {
     let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
     clear_sentinels();
 
@@ -1237,8 +1197,14 @@ fn pre_783_migration_on_freshly_observed_account_seeds_guard_latched() {
         inst.capital_baseline_equity = 1_000.0;
         inst.capital_baseline_accounted_pnl = None; // pre-#783 snapshot
         inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
-        // capital_guard_stable_since is left unset -- the migration tick
-        // below is the first time this equity is ever observed.
+        // Even an equity value that had already been sitting quietly for a
+        // while, with a genuine re-observation behind it, does not change
+        // the outcome -- this branch does not look at that evidence at all.
+        inst.capital_guard_last_observed_equity = Some(1_000.0);
+        inst.capital_guard_stable_since = Some(
+            Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
+        );
+        inst.equity_fetch_generation = 5;
     }
 
     h.engine.detect_capital_event_and_rebaseline(0);
@@ -1246,10 +1212,69 @@ fn pre_783_migration_on_freshly_observed_account_seeds_guard_latched() {
     let inst = &h.engine.instances[0];
     assert!(
         inst.capital_position_seen_since_baseline,
-        "a freshly-observed account has no proof yet that settlement is \
-         complete, so the guard must still latch"
+        "a pre-#783 migration always seeds the guard latched, regardless of \
+         any pre-existing stability evidence"
     );
     assert_eq!(inst.capital_baseline_accounted_pnl, Some(0.0));
+}
+
+// bot-strategy#783 (Codex P1 follow-up, seventh round): equity_confirmed_settled's
+// "moved past the pre-close snapshot" requirement can never be satisfied by
+// an account that never has a capital event -- capital_guard_equity_snapshot
+// gets backfilled to the same current equity the tick after migration, so a
+// genuinely idle account would stay latched forever without the quiet-path
+// fallback. CAPITAL_GUARD_QUIET_REOBSERVATIONS (2) independent genuine
+// re-observations of the same unchanged value, spanning a full stability
+// window, must clear it -- one alone is not enough (a stuck same-valued
+// cache read could produce exactly one).
+#[test]
+fn quiet_account_after_migration_clears_via_repeated_reobservations() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-migration-quiet-reconfirm");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = None; // pre-#783 snapshot
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    // Migration tick: seeds capital_baseline_accounted_pnl (routing all
+    // further ticks through the ordinary Reconciled path) and latches the
+    // guard, as always.
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(h.engine.instances[0].capital_position_seen_since_baseline);
+    let armed_generation = h.engine.instances[0].capital_guard_stable_since_generation;
+
+    // Simulate the stability window having elapsed with exactly ONE genuine
+    // re-observation since the window armed -- not enough on the quiet path.
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
+    h.engine.instances[0].equity_fetch_generation = armed_generation + 1;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "a single re-observation of an unchanged value is not enough when \
+         there is no \"moved past the snapshot\" evidence to lean on"
+    );
+
+    // A second independent re-observation, still at the same value, meets
+    // CAPITAL_GUARD_QUIET_REOBSERVATIONS.
+    h.engine.instances[0].equity_fetch_generation = armed_generation + 2;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        !h.engine.instances[0].capital_position_seen_since_baseline,
+        "two independent re-observations of an unchanged value clear the \
+         guard on a genuinely idle account"
+    );
 }
 
 // bot-strategy#783 (Codex P2 follow-up, sixth round): dry_run must still
@@ -1453,6 +1478,75 @@ fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
         (h.engine.instances[0].session_start_equity - 1_100.0).abs() < 1e-9,
         "capital-event detection recovered after the give-up and caught the later deposit"
     );
+}
+
+// bot-strategy#783 (Codex P2 follow-up, seventh round): the give-up path
+// above relies on equity_confirmed_settled, whose "moved past the pre-close
+// snapshot" evidence is unavailable when the combined close-plus-transfer
+// amount is already the very first reading observed while flat -- there is
+// no earlier, different value to have moved away from.
+// capital_guard_equity_snapshot backfills to that same first reading, so
+// only the quiet-reobservations path can ever let this one give up.
+#[test]
+fn ambiguous_deferral_visible_from_the_first_tick_still_gives_up_via_reobservations() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-giveup-same-valued");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.session_start_equity = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        // flat_since starts unset: the $1,110 combined close-plus-transfer
+        // reading below is the *first* value this instance ever observes
+        // while flat, so capital_guard_equity_snapshot backfills to it
+        // directly -- there is no earlier, different pre-close reading to
+        // have moved away from.
+        inst.equity_cache = 1_110.0;
+        inst.total_pnl = 10.0;
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "an unresolvable ambiguity defers rather than guessing"
+    );
+    let armed_generation = h.engine.instances[0].capital_guard_stable_since_generation;
+
+    // The give-up window elapses, with equity never moving away from its
+    // own snapshot -- and only one genuine re-observation so far. Not
+    // enough on the quiet path.
+    h.engine.instances[0].capital_rebaseline_deferred_since = Some(
+        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_REBASELINE_GIVEUP_SECS + 1),
+    );
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
+    h.engine.instances[0].equity_fetch_generation = armed_generation + 1;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "one re-observation of an unchanged value is not enough when there \
+         is no \"moved past the snapshot\" evidence to lean on"
+    );
+
+    // A second independent re-observation, still at the same value, meets
+    // CAPITAL_GUARD_QUIET_REOBSERVATIONS and the deferral finally gives up.
+    h.engine.instances[0].equity_fetch_generation = armed_generation + 2;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert!(
+        !inst.capital_rebaseline_deferred,
+        "two independent re-observations of an unchanged value let an \
+         always-ambiguous, never-moving deferral give up too"
+    );
+    assert!((inst.capital_baseline_equity - 1_110.0).abs() < 1e-9);
 }
 
 // bot-strategy#783 (Codex P1 follow-up, third round): a position closing

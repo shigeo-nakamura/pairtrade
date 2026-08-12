@@ -957,26 +957,29 @@ impl PairTradeEngine {
                         inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
                         // A pre-#783 snapshot cannot say whether an
                         // unaccounted close's settlement might still be
-                        // catching up, so this normally seeds the guard
-                        // latched. But equity_confirmed_settled can never
-                        // clear it afterward for a clean, already-quiet
-                        // migration: capital_guard_equity_snapshot is
-                        // backfilled to this same current equity (see
-                        // above), and that check requires equity to
-                        // *differ* from its own snapshot -- a account that
-                        // truly has nothing left to settle will never
-                        // produce that difference, latching the guard
-                        // permanently and misclassifying the first real
-                        // deposit/withdrawal as position-ambiguous. Seed it
-                        // pre-cleared instead when equity_cache has already
-                        // held its current value for a full stability
-                        // window, proven by a genuine connector
-                        // re-observation, by the time this migration runs
-                        // -- that is itself proof nothing was still
-                        // catching up (Codex P1 follow-up,
-                        // bot-strategy#783).
-                        inst.capital_position_seen_since_baseline =
-                            !capital_guard_stability_proven(inst);
+                        // catching up, so this always seeds the guard
+                        // latched -- trying to pre-clear it here requires
+                        // proof (a genuine re-observation after the window
+                        // armed) that structurally cannot exist yet: this
+                        // branch runs exactly once (capital_baseline_accounted_pnl
+                        // flips to Some right below and this whole match
+                        // arm is never reached again), and the pre-close
+                        // dwell (session_dd_capital_settle_secs, default
+                        // 60s) that gates reaching it at all is shorter
+                        // than the equity refresh cadence
+                        // (EQUITY_REFRESH_CACHE_SECS, 300s) -- so a second
+                        // fetch essentially never lands before this tick
+                        // has to make its one-shot decision (Codex P1
+                        // follow-up, bot-strategy#783, sixth round: this
+                        // was tried, and left the guard latched on every
+                        // ordinary restart). Clearing instead happens on
+                        // an ordinary *later* tick, which unlike this
+                        // branch keeps running indefinitely: see
+                        // equity_confirmed_settled's repeated-confirmation
+                        // path for how a quiet account too can eventually
+                        // prove itself (Codex P1 follow-up, bot-strategy#783,
+                        // seventh round).
+                        inst.capital_position_seen_since_baseline = true;
                         inst.capital_rebaseline_deferred = false;
                         inst.capital_rebaseline_deferred_since = None;
                         // Deliberately does NOT repin flat_since or
@@ -1852,41 +1855,65 @@ pub(in crate::pairtrade) const CAPITAL_REBASELINE_GIVEUP_SECS: u64 = 900;
 /// fresh capital event (Codex P1 follow-up, bot-strategy#783).
 pub(in crate::pairtrade) const CAPITAL_GUARD_STABILITY_SECS: u64 = 60;
 
-/// Whether `equity` is safe to trust as a *complete* settlement: it must
-/// have moved past the pre-close (untrusted) `capital_guard_equity_snapshot`
-/// -- proving the feed is not simply re-reporting a stuck WS-cached value
-/// -- AND held steady at its current value for `CAPITAL_GUARD_STABILITY_SECS`
-/// across at least one genuine connector re-observation -- proving it is not
-/// one leg of a still-in-progress multi-update settlement that merely
-/// hasn't been re-fetched yet. `CAPITAL_GUARD_STABILITY_SECS` (60s) is
-/// shorter than `EQUITY_REFRESH_CACHE_SECS` (300s), so elapsed wall time
-/// alone is not sufficient: `equity_cache` can sit frozen at a still-partial
-/// value for the whole stability window without a single fresh fetch
-/// happening, satisfying the elapsed check without the exchange having ever
-/// been asked again. Requiring `equity_fetch_generation` to have advanced
-/// past the value captured when the window armed closes that gap. All three
-/// conditions independently defend against a distinct Codex-found failure
-/// mode (bot-strategy#783): a same-valued "successful" read, a partial
-/// update trusted before the rest of it lands, and elapsed time standing in
-/// for a re-observation that never happened.
-fn equity_confirmed_settled(inst: &StrategyInstance, equity: f64) -> bool {
-    inst.capital_guard_equity_snapshot
-        .is_some_and(|snapshot| equity != snapshot)
-        && capital_guard_stability_proven(inst)
-}
+/// How many genuine connector re-observations (see `equity_fetch_generation`)
+/// an unchanged reading needs before it is trusted with no "moved past the
+/// pre-close snapshot" evidence to lean on -- e.g. a truly idle account, or
+/// a pre-#783 migration seeded on one that never has a capital event to
+/// prove itself against. One re-observation alone cannot rule out a stuck
+/// WS-cached value being read back verbatim (bot-strategy#783); requiring a
+/// second, independent one makes that far less likely without waiting
+/// indefinitely.
+const CAPITAL_GUARD_QUIET_REOBSERVATIONS: u64 = 2;
 
-/// Whether `capital_guard_stable_since` has genuinely proven
-/// `CAPITAL_GUARD_STABILITY_SECS` of quiet: elapsed wall time alone is not
-/// sufficient (see `equity_confirmed_settled`'s doc comment) -- a real
-/// connector re-observation must also have landed since the window armed,
-/// or a value that simply hasn't been re-fetched yet would pass. Split out
-/// so the pre-#783 migration seed (which has no pre-close snapshot to
-/// compare against, and so cannot use `equity_confirmed_settled` directly)
-/// can reuse the same proof (Codex P1 follow-up, bot-strategy#783).
-fn capital_guard_stability_proven(inst: &StrategyInstance) -> bool {
-    inst.capital_guard_stable_since
-        .is_some_and(|since| since.elapsed().as_secs() >= CAPITAL_GUARD_STABILITY_SECS)
-        && inst.equity_fetch_generation > inst.capital_guard_stable_since_generation
+/// Whether `equity` is safe to trust as a *complete* settlement.
+///
+/// The strong path: `equity` has moved past the pre-close (untrusted)
+/// `capital_guard_equity_snapshot` -- proving the feed is not simply
+/// re-reporting a stuck WS-cached value -- AND held steady at its current
+/// value for `CAPITAL_GUARD_STABILITY_SECS` across at least one genuine
+/// connector re-observation -- proving it is not one leg of a
+/// still-in-progress multi-update settlement that merely hasn't been
+/// re-fetched yet.
+///
+/// The quiet path: `equity` never moved away from the pre-close snapshot at
+/// all (or there was no snapshot -- the pre-#783 migration seed has none to
+/// compare against). That's ambiguous on its own: a genuinely idle account
+/// with nothing to move away from looks identical to a stuck same-valued
+/// read. `CAPITAL_GUARD_QUIET_REOBSERVATIONS` independent re-observations
+/// resolve it -- a stuck WS cache surviving that many separate fetch
+/// attempts unchanged is far less likely than a truly settled account
+/// reporting the same real balance every time it's asked.
+///
+/// `CAPITAL_GUARD_STABILITY_SECS` (60s) is shorter than
+/// `EQUITY_REFRESH_CACHE_SECS` (300s), so elapsed wall time alone is never
+/// sufficient on either path: `equity_cache` can sit frozen for a whole
+/// stability window without a single fresh fetch happening, satisfying the
+/// elapsed check without the exchange having ever been asked again.
+/// Requiring `equity_fetch_generation` to have advanced past the value
+/// captured when the window armed closes that gap. Together these defend
+/// against every Codex-found failure mode on this path (bot-strategy#783):
+/// a same-valued "successful" read, a partial update trusted before the
+/// rest of it lands, elapsed time standing in for a re-observation that
+/// never happened, and a quiet account with no "moved away" evidence ever
+/// being able to prove itself at all.
+fn equity_confirmed_settled(inst: &StrategyInstance, equity: f64) -> bool {
+    let stable_elapsed = inst
+        .capital_guard_stable_since
+        .is_some_and(|since| since.elapsed().as_secs() >= CAPITAL_GUARD_STABILITY_SECS);
+    if !stable_elapsed {
+        return false;
+    }
+    let reobservations = inst
+        .equity_fetch_generation
+        .saturating_sub(inst.capital_guard_stable_since_generation);
+    let moved_past_snapshot = inst
+        .capital_guard_equity_snapshot
+        .is_some_and(|snapshot| equity != snapshot);
+    if moved_past_snapshot {
+        reobservations >= 1
+    } else {
+        reobservations >= CAPITAL_GUARD_QUIET_REOBSERVATIONS
+    }
 }
 
 /// Reconcile a flat account-equity movement against trade/funding accounting.
