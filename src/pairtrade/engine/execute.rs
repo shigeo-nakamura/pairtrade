@@ -613,21 +613,6 @@ impl PairTradeEngine {
                                 .with_leg_decision_ts(),
                             );
                         }
-                        // bot-strategy#783 Codex P2 follow-up: step_setup's
-                        // detect_capital_event_and_rebaseline (which normally
-                        // latches and persists capital_position_seen_since_baseline
-                        // on the open->flat transition) runs before this
-                        // entry exists — that transition is only observed on
-                        // the *next* tick's step_setup call. If the process
-                        // exits before then, the persisted guard is still
-                        // false, and a startup force-close that flattens
-                        // this position without recording its PnL would be
-                        // misclassified as a verified capital event once
-                        // the delayed settlement lands. Latch and persist
-                        // synchronously here instead of waiting. dry_run has
-                        // no real venue position for force_close_on_startup
-                        // to ever find, so there is nothing to guard.
-                        self.latch_capital_position_activity(inst_idx);
                     }
                 }
             }

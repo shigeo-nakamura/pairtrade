@@ -857,7 +857,8 @@ impl PairTradeEngine {
                 // realized PnL then gets misclassified as a verified
                 // deposit/withdrawal instead of correctly deferring (Codex
                 // P1 follow-up, bot-strategy#783).
-                let was_seen = std::mem::replace(&mut inst.capital_position_seen_since_baseline, true);
+                let was_seen =
+                    std::mem::replace(&mut inst.capital_position_seen_since_baseline, true);
                 inst.flat_since = None;
                 break 'reconcile if was_seen {
                     None
@@ -1046,10 +1047,10 @@ impl PairTradeEngine {
                                 // rewrite the whole risk-state file every
                                 // single tick for every instance (Codex P2
                                 // follow-up, bot-strategy#783).
-                                let baseline_or_latch_changed = inst.capital_baseline_equity
-                                    != equity
-                                    || inst.capital_baseline_accounted_pnl != Some(accounted_pnl)
-                                    || inst.capital_position_seen_since_baseline;
+                                let baseline_changed = inst.capital_baseline_equity != equity
+                                    || inst.capital_baseline_accounted_pnl != Some(accounted_pnl);
+                                let position_guard_before =
+                                    inst.capital_position_seen_since_baseline;
                                 inst.capital_baseline_equity = equity;
                                 inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
                                 let was_deferred =
@@ -1125,6 +1126,9 @@ impl PairTradeEngine {
                                 {
                                     inst.capital_position_seen_since_baseline = false;
                                 }
+                                let baseline_or_latch_changed = baseline_changed
+                                    || position_guard_before
+                                        != inst.capital_position_seen_since_baseline;
                                 if reference_reconciliation_pending {
                                     let prev_start_equity = inst.session_start_equity;
                                     let previous_reference = inst.session_equity_reference_usd;
@@ -1208,9 +1212,10 @@ impl PairTradeEngine {
                                 // reproduces the same misclassification risk
                                 // (Codex P1 follow-up, bot-strategy#783).
                                 let accounted_delta_settled =
-                                    reconciliation.accounted_pnl_delta.abs() <= CAPITAL_DELTA_EPSILON;
-                                let position_guard_can_clear =
-                                    accounted_delta_settled && equity_confirmed_settled(inst, equity);
+                                    reconciliation.accounted_pnl_delta.abs()
+                                        <= CAPITAL_DELTA_EPSILON;
+                                let position_guard_can_clear = accounted_delta_settled
+                                    && equity_confirmed_settled(inst, equity);
                                 let baseline_advanced = reconciliation.position_seen_since_baseline
                                     && reconciliation.accounted_pnl_delta.abs() < min_usd
                                     && position_guard_can_clear;
@@ -1949,47 +1954,49 @@ fn reconcile_capital_delta(
     let inferred_capital_delta = raw_equity_delta - accounted_pnl_delta;
     let baseline_capital_basis = baseline_equity - baseline_accounted_pnl;
     let current_capital_basis = current_equity - current_accounted_pnl;
-    let disposition =
-        match classify_capital_basis_delta(baseline_capital_basis, current_capital_basis, min_usd)
+    let disposition = match classify_capital_basis_delta(
+        baseline_capital_basis,
+        current_capital_basis,
+        min_usd,
+    ) {
+        // The basis is within min_usd, but that alone does not mean
+        // there is zero outstanding debt -- only that whatever debt
+        // exists is currently small enough to hide under the
+        // materiality threshold. Resetting the anchor to the current
+        // (equity, accounted_pnl) point here discards that residual
+        // entirely; a run of several such resets, each individually
+        // sub-threshold but all draining equity's catch-up in the same
+        // direction (accounted moves ahead, equity trails behind by a
+        // few dollars every tick), can accumulate a materially larger
+        // gap that never gets compared as a whole, since each tick's
+        // reset erases the previous one's contribution before the next
+        // is even measured. Both conditions matter: accounted_pnl_delta
+        // alone catches "did accounting move at all," but a pure
+        // equity-only drift (accounted_pnl_delta == 0, e.g. ordinary
+        // mark noise) must still reconcile normally, or a still-open-
+        // position latch that only ever clears via Reconciled/Verified
+        // would never clear. inferred_capital_delta alone (the earlier
+        // version of this guard) instead falsely flagged that same
+        // pure equity drift, since it is nonzero whenever raw equity
+        // and accounted PnL merely *differ* rather than specifically
+        // when accounting moved. Requiring both: accounting genuinely
+        // moved this tick AND equity has not (yet) moved enough to
+        // fully explain it relative to the retained anchor -- is what
+        // distinguishes "still accumulating debt" (defer) from "this
+        // tick's equity move fully explains the retained debt" (safe
+        // to reconcile, however that debt built up across however many
+        // prior deferred ticks) (Codex P1 follow-up, bot-strategy#783).
+        None if accounted_pnl_delta.abs() > CAPITAL_DELTA_EPSILON
+            && inferred_capital_delta.abs() > CAPITAL_DELTA_EPSILON =>
         {
-            // The basis is within min_usd, but that alone does not mean
-            // there is zero outstanding debt -- only that whatever debt
-            // exists is currently small enough to hide under the
-            // materiality threshold. Resetting the anchor to the current
-            // (equity, accounted_pnl) point here discards that residual
-            // entirely; a run of several such resets, each individually
-            // sub-threshold but all draining equity's catch-up in the same
-            // direction (accounted moves ahead, equity trails behind by a
-            // few dollars every tick), can accumulate a materially larger
-            // gap that never gets compared as a whole, since each tick's
-            // reset erases the previous one's contribution before the next
-            // is even measured. Both conditions matter: accounted_pnl_delta
-            // alone catches "did accounting move at all," but a pure
-            // equity-only drift (accounted_pnl_delta == 0, e.g. ordinary
-            // mark noise) must still reconcile normally, or a still-open-
-            // position latch that only ever clears via Reconciled/Verified
-            // would never clear. inferred_capital_delta alone (the earlier
-            // version of this guard) instead falsely flagged that same
-            // pure equity drift, since it is nonzero whenever raw equity
-            // and accounted PnL merely *differ* rather than specifically
-            // when accounting moved. Requiring both: accounting genuinely
-            // moved this tick AND equity has not (yet) moved enough to
-            // fully explain it relative to the retained anchor -- is what
-            // distinguishes "still accumulating debt" (defer) from "this
-            // tick's equity move fully explains the retained debt" (safe
-            // to reconcile, however that debt built up across however many
-            // prior deferred ticks) (Codex P1 follow-up, bot-strategy#783).
-            None if accounted_pnl_delta.abs() > CAPITAL_DELTA_EPSILON
-                && inferred_capital_delta.abs() > CAPITAL_DELTA_EPSILON =>
-            {
-                CapitalDisposition::Ambiguous
-            }
-            None => CapitalDisposition::Reconciled,
-            Some(_) if accounted_pnl_delta.abs() >= min_usd || position_seen_since_baseline => {
-                CapitalDisposition::Ambiguous
-            }
-            Some(delta) => CapitalDisposition::Verified(delta),
-        };
+            CapitalDisposition::Ambiguous
+        }
+        None => CapitalDisposition::Reconciled,
+        Some(_) if accounted_pnl_delta.abs() >= min_usd || position_seen_since_baseline => {
+            CapitalDisposition::Ambiguous
+        }
+        Some(delta) => CapitalDisposition::Verified(delta),
+    };
     CapitalReconciliation {
         raw_equity_delta,
         accounted_pnl_delta,
@@ -2380,16 +2387,28 @@ mod tests {
         let baseline_equity = 1_000.0;
         let baseline_accounted_pnl = 0.0;
 
-        let tick1 =
-            reconcile_capital_delta(baseline_equity, 1_000.0, baseline_accounted_pnl, 4.0, false, min_usd);
+        let tick1 = reconcile_capital_delta(
+            baseline_equity,
+            1_000.0,
+            baseline_accounted_pnl,
+            4.0,
+            false,
+            min_usd,
+        );
         assert_eq!(
             tick1.disposition,
             CapitalDisposition::Ambiguous,
             "the first sub-threshold accounted move defers instead of silently resetting the anchor"
         );
 
-        let tick2 =
-            reconcile_capital_delta(baseline_equity, 1_000.0, baseline_accounted_pnl, 8.0, false, min_usd);
+        let tick2 = reconcile_capital_delta(
+            baseline_equity,
+            1_000.0,
+            baseline_accounted_pnl,
+            8.0,
+            false,
+            min_usd,
+        );
         assert_eq!(
             tick2.disposition,
             CapitalDisposition::Ambiguous,

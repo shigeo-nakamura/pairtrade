@@ -1131,9 +1131,8 @@ fn pre_783_snapshot_migration_never_reanchors_delayed_settlement() {
     // actually sleep: back-date the stable-since clock captured when
     // $6,010 was first observed above, and simulate the genuine
     // re-observation equity_confirmed_settled now also requires.
-    h.engine.instances[0].capital_guard_stable_since = Some(
-        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
-    );
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
     h.engine.instances[0].equity_fetch_generation += 1;
     h.engine.detect_capital_event_and_rebaseline(0);
     {
@@ -1421,7 +1420,9 @@ fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
         h.engine.instances[0].capital_rebaseline_deferred,
         "an unresolvable ambiguity defers rather than guessing"
     );
-    assert!(h.engine.instances[0].capital_rebaseline_deferred_since.is_some());
+    assert!(h.engine.instances[0]
+        .capital_rebaseline_deferred_since
+        .is_some());
 
     // Simulate the give-up window having elapsed without needing to
     // actually sleep: back-date the deferred-since clock. Equity was never
@@ -1453,9 +1454,8 @@ fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
 
     // Simulate the stability window having elapsed without needing to
     // actually sleep, with a genuine re-observation landing in between.
-    h.engine.instances[0].capital_guard_stable_since = Some(
-        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
-    );
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
     h.engine.instances[0].equity_fetch_generation += 1;
     h.engine.detect_capital_event_and_rebaseline(0);
 
@@ -1582,13 +1582,14 @@ fn flat_transition_resets_stale_stability_credit_from_the_open_position() {
         inst.equity_cache = 1_000.0;
         inst.capital_position_seen_since_baseline = true;
         inst.flat_since = None; // first tick observing the instance as flat
-        // Stale credit accumulated entirely *before* this close, while a
-        // position was open and equity_cache happened to sit at the exact
-        // same value the whole time: many confirmed re-observations, long
-        // past the stability window.
+                                // Stale credit accumulated entirely *before* this close, while a
+                                // position was open and equity_cache happened to sit at the exact
+                                // same value the whole time: many confirmed re-observations, long
+                                // past the stability window.
         inst.capital_guard_last_observed_equity = Some(1_000.0);
-        inst.capital_guard_stable_since =
-            Some(Instant::now() - Duration::from_secs(10 * engine::risk::CAPITAL_GUARD_STABILITY_SECS));
+        inst.capital_guard_stable_since = Some(
+            Instant::now() - Duration::from_secs(10 * engine::risk::CAPITAL_GUARD_STABILITY_SECS),
+        );
         inst.capital_guard_stable_since_generation = 0;
         inst.equity_fetch_generation = 10;
     }
@@ -1626,9 +1627,10 @@ async fn entry_creation_latches_position_guard_synchronously() {
     h.step().await;
 
     assert!(
-        h.position(0).is_some() || h.engine.instances[0].states[PAIR_KEY]
-            .pending_entry
-            .is_some(),
+        h.position(0).is_some()
+            || h.engine.instances[0].states[PAIR_KEY]
+                .pending_entry
+                .is_some(),
         "the module's documented z-trajectory must fire an entry on the first step"
     );
     assert!(
@@ -1678,9 +1680,7 @@ fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapse
         h.engine.instances[0].capital_position_seen_since_baseline,
         "a quiet reading right after the guard latches must not clear it yet"
     );
-    assert!(
-        (h.engine.instances[0].capital_guard_equity_snapshot.unwrap() - 1_000.0).abs() < 1e-9
-    );
+    assert!((h.engine.instances[0].capital_guard_equity_snapshot.unwrap() - 1_000.0).abs() < 1e-9);
 
     // Repeated ticks reporting the identical value -- exactly what a
     // stuck WS-derived balance_cache would return if the update that
@@ -1714,9 +1714,8 @@ fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapse
     // be enough to confirm settlement, or a still-partial value that
     // merely hasn't been re-fetched yet gets trusted before the rest of
     // it lands.
-    h.engine.instances[0].capital_guard_stable_since = Some(
-        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
-    );
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
     h.engine.detect_capital_event_and_rebaseline(0);
     assert!(
         h.engine.instances[0].capital_position_seen_since_baseline,
@@ -1948,6 +1947,29 @@ fn reconciled_quiet_tick_does_not_persist_when_nothing_changed() {
     assert!(
         !h.engine.risk_state_path.exists(),
         "an idle, already-reconciled tick must not rewrite risk_state.json"
+    );
+
+    // A post-close guard can intentionally remain true while waiting for
+    // confirmed connector observations. Its current value is not itself a
+    // state transition and must not force the same synchronous rewrite on
+    // every intervening strategy tick.
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.capital_position_seen_since_baseline = true;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+        inst.capital_guard_equity_snapshot = Some(inst.equity_cache);
+        inst.capital_guard_last_observed_equity = Some(inst.equity_cache);
+        inst.capital_guard_stable_since = Some(Instant::now());
+        inst.capital_guard_stable_since_generation = inst.equity_fetch_generation;
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "the unconfirmed post-close guard must remain latched"
+    );
+    assert!(
+        !h.engine.risk_state_path.exists(),
+        "an unchanged true guard must not rewrite risk_state.json every tick"
     );
 }
 
@@ -2576,9 +2598,8 @@ fn risk_ack_reanchor_keeps_position_guard_on_stale_equity() {
     h.engine.instances[0].session_halted = true;
     h.engine.instances[0].capital_guard_equity_snapshot = Some(950.0);
     h.engine.instances[0].equity_cache = 951.0;
-    h.engine.instances[0].capital_guard_stable_since = Some(
-        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
-    );
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
     h.engine.instances[0].equity_fetch_generation += 1;
     std::fs::write(risk_ack_path(), "ack by op: reanchor=true").unwrap();
     h.engine.consume_risk_ack();

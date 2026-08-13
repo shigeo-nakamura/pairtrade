@@ -995,6 +995,13 @@ impl PairTradeEngine {
             post_only,
             hybrid_active
         );
+        // All local quantization and hedge-ratio gates have passed. Persist a
+        // conservative exposure guard before the first fallible venue submit:
+        // the venue can accept an order even if this process exits before the
+        // awaited response arrives, in which case no pending leg can be
+        // registered in memory. bot-strategy#783.
+        self.latch_capital_position_activity(inst_idx);
+
         let mut legs: Vec<PendingLeg> = Vec::new();
         let res_a = self
             .create_order_with_post_only_retry(PostOnlyOrderRequest {

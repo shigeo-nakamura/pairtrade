@@ -82,6 +82,9 @@ struct DummyConnector {
     filled_by_symbol: Mutex<HashMap<String, VecDeque<FilledRows>>>,
     positions_script: Mutex<VecDeque<Vec<PositionSnapshot>>>,
     reject_reduce_only_orders: AtomicBool,
+    /// Optional ordering assertion for bot-strategy#783: the capital guard
+    /// must already be durable when the connector side effect begins.
+    guard_path_expected_before_create: Mutex<Option<std::path::PathBuf>>,
     positions_should_fail: AtomicBool,
     /// bot-strategy#721: threshold after which `get_positions` starts
     /// failing (mirrors `ticker_fail_after_calls`), so a test can serve
@@ -274,6 +277,17 @@ impl DexConnector for DummyConnector {
         reduce_only: bool,
         _expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
+        if let Some(path) = self
+            .guard_path_expected_before_create
+            .lock()
+            .unwrap()
+            .as_ref()
+        {
+            assert!(
+                path.exists(),
+                "capital guard must be persisted before connector create_order begins"
+            );
+        }
         let order_id = format!("test-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let ordered_price = price.unwrap_or(Decimal::ONE);
         self.calls
@@ -1346,6 +1360,47 @@ async fn reconcile_pending_orders_noop_when_no_pendings() {
     assert!(state.pending_entry.is_none());
     assert!(state.pending_exit.is_none());
     assert!(state.position.is_none());
+}
+
+/// Once entry preflight gates pass, the capital guard must be durable before
+/// the first connector create_order call. The awaited venue request can be
+/// accepted even if the process exits before its response reaches us.
+#[tokio::test]
+async fn place_pair_orders_persists_guard_before_first_submit() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+    *connector.guard_path_expected_before_create.lock().unwrap() =
+        Some(engine.risk_state_path.clone());
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let legs = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect("entry placement should succeed");
+
+    assert_eq!(legs.len(), 2);
+    assert!(engine.instances[0].capital_position_seen_since_baseline);
+    let persisted = risk_io::load_risk_state(&engine.risk_state_path);
+    assert!(persisted.instances["default"].capital_position_seen_since_baseline);
 }
 
 #[tokio::test]
