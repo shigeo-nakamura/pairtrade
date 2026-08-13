@@ -1707,8 +1707,13 @@ async fn taker_fallback_drops_stale_refresh_when_final_attempt_refresh_fails() {
 /// can clean up the orphaned leg-A.
 #[test]
 fn register_partial_leg_failure_writes_pending_entry() {
+    use tempfile::TempDir;
+
     let connector = Arc::new(DummyConnector::default());
     let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
     seed_state(&mut engine, "AAA/BBB");
     let placed_legs = vec![PendingLeg {
         symbol: "AAA".to_string(),
@@ -1757,6 +1762,21 @@ fn register_partial_leg_failure_writes_pending_entry() {
     assert_eq!(pending.legs[0].symbol, "AAA");
     assert_eq!(pending.legs[0].order_id, "leg-a");
     assert_eq!(pending.direction, PositionDirection::LongSpread);
+    assert!(
+        engine.instances[0].capital_position_seen_since_baseline,
+        "a placed entry leg creates venue exposure and must latch the capital guard"
+    );
+    assert!(
+        engine.instances[0].flat_since.is_none(),
+        "partial entry exposure must clear the flat-settlement dwell"
+    );
+
+    let persisted = risk_io::load_risk_state(&engine.risk_state_path);
+    let persisted_inst = persisted
+        .instances
+        .get("default")
+        .expect("partial-entry guard transition must be persisted before returning");
+    assert!(persisted_inst.capital_position_seen_since_baseline);
 }
 
 /// Same surface, exit side: must land in `pending_exit` so the next

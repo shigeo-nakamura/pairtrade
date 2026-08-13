@@ -627,17 +627,7 @@ impl PairTradeEngine {
                         // synchronously here instead of waiting. dry_run has
                         // no real venue position for force_close_on_startup
                         // to ever find, so there is nothing to guard.
-                        if !self.cfg.dry_run {
-                            let inst = &mut self.instances[inst_idx];
-                            let was_seen = std::mem::replace(
-                                &mut inst.capital_position_seen_since_baseline,
-                                true,
-                            );
-                            inst.flat_since = None;
-                            if !was_seen {
-                                self.persist_risk_state();
-                            }
-                        }
+                        self.latch_capital_position_activity(inst_idx);
                     }
                 }
             }

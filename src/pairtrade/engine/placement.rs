@@ -1451,6 +1451,21 @@ impl PairTradeEngine {
         Ok((legs, takeover_at))
     }
 
+    pub(in crate::pairtrade) fn latch_capital_position_activity(&mut self, inst_idx: usize) {
+        // dry_run never creates venue exposure, so its simulated positions
+        // cannot produce a delayed account-equity settlement on restart.
+        if self.cfg.dry_run {
+            return;
+        }
+
+        let inst = &mut self.instances[inst_idx];
+        let was_seen = std::mem::replace(&mut inst.capital_position_seen_since_baseline, true);
+        inst.flat_since = None;
+        if !was_seen {
+            self.persist_risk_state();
+        }
+    }
+
     pub(in crate::pairtrade) fn register_partial_leg_failure(
         &mut self,
         inst_idx: usize,
@@ -1460,8 +1475,10 @@ impl PairTradeEngine {
         err: &anyhow::Error,
         is_exit: bool,
     ) {
+        let mut registered_live_entry = false;
         if let Some(partial) = err.downcast_ref::<PartialOrderPlacementError>() {
             if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                let has_placed_leg = !partial.legs().is_empty();
                 let pending = PendingOrders {
                     legs: partial.legs().to_vec(),
                     direction,
@@ -1478,8 +1495,18 @@ impl PairTradeEngine {
                     state.pending_exit = Some(pending);
                 } else {
                     state.pending_entry = Some(pending);
+                    registered_live_entry = has_placed_leg;
                 }
             }
+        }
+
+        // A partial entry has already created venue exposure even though the
+        // fallible two-leg placement returns Err. Persist the capital guard
+        // before that error reaches the caller so an immediate process exit
+        // followed by startup force-close cannot turn the unaccounted close
+        // settlement into a false capital event. bot-strategy#783.
+        if registered_live_entry {
+            self.latch_capital_position_activity(inst_idx);
         }
     }
 }
