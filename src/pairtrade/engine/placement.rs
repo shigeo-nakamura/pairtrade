@@ -57,6 +57,7 @@ struct PostOnlyOrderRequest<'a> {
     allow_post_only: bool,
     max_post_only_attempts: usize,
     fallback_to_taker: bool,
+    capital_guard_inst_idx: Option<usize>,
 }
 
 pub(in crate::pairtrade) struct OrderSubmitMetadata {
@@ -744,6 +745,7 @@ impl PairTradeEngine {
             allow_post_only,
             max_post_only_attempts,
             fallback_to_taker,
+            capital_guard_inst_idx,
         } = request;
         let use_post_only = allow_post_only && self.should_post_only();
         let max_attempts = max_post_only_attempts.max(1);
@@ -789,6 +791,9 @@ impl PairTradeEngine {
                 }
                 None => self.order_submit_metadata(symbol, size, side, prices),
             };
+            if let Some(inst_idx) = capital_guard_inst_idx {
+                self.latch_capital_position_activity(inst_idx);
+            }
             match self
                 .connector
                 .create_order(symbol, size, side, limit, spread, reduce_only, None)
@@ -995,13 +1000,6 @@ impl PairTradeEngine {
             post_only,
             hybrid_active
         );
-        // All local quantization and hedge-ratio gates have passed. Persist a
-        // conservative exposure guard before the first fallible venue submit:
-        // the venue can accept an order even if this process exits before the
-        // awaited response arrives, in which case no pending leg can be
-        // registered in memory. bot-strategy#783.
-        self.latch_capital_position_activity(inst_idx);
-
         let mut legs: Vec<PendingLeg> = Vec::new();
         let res_a = self
             .create_order_with_post_only_retry(PostOnlyOrderRequest {
@@ -1013,6 +1011,7 @@ impl PairTradeEngine {
                 allow_post_only: true,
                 max_post_only_attempts: entry_attempts,
                 fallback_to_taker: false,
+                capital_guard_inst_idx: Some(inst_idx),
             })
             .await
             .context("place leg A")?;
@@ -1056,6 +1055,7 @@ impl PairTradeEngine {
                 allow_post_only: true,
                 max_post_only_attempts: entry_attempts,
                 fallback_to_taker: false,
+                capital_guard_inst_idx: Some(inst_idx),
             })
             .await
         {
@@ -1280,6 +1280,7 @@ impl PairTradeEngine {
                     allow_post_only: true,
                     max_post_only_attempts: POST_ONLY_EXIT_ATTEMPTS,
                     fallback_to_taker: true,
+                    capital_guard_inst_idx: None,
                 })
                 .await
             };
@@ -1361,6 +1362,7 @@ impl PairTradeEngine {
                     allow_post_only: true,
                     max_post_only_attempts: POST_ONLY_EXIT_ATTEMPTS,
                     fallback_to_taker: true,
+                    capital_guard_inst_idx: None,
                 })
                 .await
             };

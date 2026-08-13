@@ -539,9 +539,14 @@ impl PairTradeEngine {
                             || equity_confirmed_settled(inst, equity)
                         {
                             inst.capital_position_seen_since_baseline = false;
-                            inst.capital_rebaseline_deferred = false;
-                            inst.capital_rebaseline_deferred_since = None;
                         }
+                        // The operator-supplied reanchor replaces the paired
+                        // baseline even when the guard must survive for a
+                        // partial/unaccounted settlement. Keeping the old
+                        // deferred marker would make the next quiet Reconciled
+                        // tick clear that guard via was_deferred.
+                        inst.capital_rebaseline_deferred = false;
+                        inst.capital_rebaseline_deferred_since = None;
                     }
                     format!(", peak re-anchored to equity={:.2} (DD→0)", equity)
                 } else {

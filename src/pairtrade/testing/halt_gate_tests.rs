@@ -2558,6 +2558,8 @@ fn risk_ack_reanchor_keeps_position_guard_on_stale_equity() {
 
     let mut h = Harness::new("hg-ack-reanchor-guard");
     h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     let now = chrono::Utc::now().timestamp();
     {
         let inst = &mut h.engine.instances[0];
@@ -2573,6 +2575,8 @@ fn risk_ack_reanchor_keeps_position_guard_on_stale_equity() {
         // An out-of-band flatten just happened; its settlement has not
         // landed in equity_cache yet (no successful fetch since).
         inst.capital_position_seen_since_baseline = true;
+        inst.capital_rebaseline_deferred = true;
+        inst.capital_rebaseline_deferred_since = Some(Instant::now());
         inst.flat_since = Some(Instant::now());
     }
 
@@ -2588,6 +2592,18 @@ fn risk_ack_reanchor_keeps_position_guard_on_stale_equity() {
     assert!(
         inst.capital_position_seen_since_baseline,
         "the position guard survives a reanchor on stale (not confirmed-fresh) equity"
+    );
+    assert!(
+        !inst.capital_rebaseline_deferred && inst.capital_rebaseline_deferred_since.is_none(),
+        "reanchor replaces the paired baseline, so stale deferred state must be cleared"
+    );
+
+    // A quiet reconciliation against the new ack baseline must not mistake
+    // the cleared deferred marker for evidence that settlement completed.
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "the next quiet tick must retain the unconfirmed settlement guard"
     );
 
     // Once equity is actually confirmed settled -- a normal reconciliation

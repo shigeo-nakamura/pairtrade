@@ -1403,6 +1403,45 @@ async fn place_pair_orders_persists_guard_before_first_submit() {
     assert!(persisted.instances["default"].capital_position_seen_since_baseline);
 }
 
+/// A pre-submit post-only pricing failure proves no venue side effect happened.
+/// It must not latch the capital guard or delay a later genuine transfer.
+#[tokio::test]
+async fn place_pair_orders_does_not_latch_guard_before_a_real_submit() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    *connector.ticker_fail_after_calls.lock().unwrap() = Some(0);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    // Quantization falls back to the requested sizes, but both the fresh
+    // ticker read and the decision-time price lookup fail before create_order.
+    let price_map = HashMap::new();
+    let err = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("missing post-only pricing must fail before submit");
+
+    assert!(format!("{err:#}").contains("Missing reference price"));
+    assert!(connector.calls.lock().unwrap().is_empty());
+    assert!(!engine.instances[0].capital_position_seen_since_baseline);
+    assert!(!engine.risk_state_path.exists());
+}
+
 #[tokio::test]
 async fn close_pair_orders_records_taker_mode_after_post_only_fallback() {
     let connector = Arc::new(DummyConnector::default());
