@@ -11,7 +11,9 @@ ExecStart=/bin/bash /opt/debot/scripts/debot-pair-robinhood-lighter.sh
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5
-TimeoutStopSec=10860
+# Allow the 10,860s strategy grace to expire, then leave three minutes for
+# the final reduce-only exchange close and orderly process shutdown.
+TimeoutStopSec=11040
 StandardOutput=journal
 StandardError=journal
 
