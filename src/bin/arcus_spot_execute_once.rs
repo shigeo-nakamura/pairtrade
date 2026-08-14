@@ -472,10 +472,38 @@ fn resolve_path_for_collision_check(path: &Path) -> PathBuf {
     let (Some(parent), Some(file_name)) = (normalized.parent(), normalized.file_name()) else {
         return normalized;
     };
-    match fs::canonicalize(parent) {
-        Ok(canonical_parent) => canonical_parent.join(file_name),
-        Err(_) => normalized,
+    // Walk up from `parent` toward the root, canonicalizing the longest
+    // existing ancestor and reappending whatever components don't exist
+    // yet on top of it. Trying only the immediate parent (and giving up
+    // entirely if that one doesn't exist yet) misses a symlink further up
+    // the tree whenever the leaf directory itself hasn't been created --
+    // e.g. `/var/lib/alias -> real`, an absent `real/new`, and paths under
+    // `alias/new/...` vs. `real/new/...`: the immediate parent (`.../new`)
+    // doesn't exist under either name, but `alias` itself does and
+    // resolves to `real` (Codex P2 follow-up, pairtrade#186).
+    let mut ancestor = parent;
+    let mut pending_components: Vec<&std::ffi::OsStr> = Vec::new();
+    let canonical_ancestor = loop {
+        match fs::canonicalize(ancestor) {
+            Ok(canonical) => break canonical,
+            Err(_) => match (ancestor.file_name(), ancestor.parent()) {
+                (Some(name), Some(next)) => {
+                    pending_components.push(name);
+                    ancestor = next;
+                }
+                // No existing ancestor anywhere in the prefix (or we
+                // walked off the top of the path) -- nothing left to
+                // canonicalize against.
+                _ => return normalized,
+            },
+        }
+    };
+    let mut resolved = canonical_ancestor;
+    for component in pending_components.into_iter().rev() {
+        resolved.push(component);
     }
+    resolved.push(file_name);
+    resolved
 }
 
 fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
@@ -1534,6 +1562,27 @@ runtime:
         assert_eq!(
             resolve_path_for_collision_check(path),
             lexically_normalize(path)
+        );
+    }
+
+    #[test]
+    fn resolve_path_for_collision_check_sees_through_a_symlinked_grandparent() {
+        // Codex P2 follow-up, pairtrade#186: the immediate parent itself
+        // doesn't exist here (only the symlinked grandparent does), which
+        // the single-level canonicalize(parent) attempt alone cannot see
+        // through.
+        let dir = tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let via_alias = resolve_path_for_collision_check(&alias_dir.join("new").join("x.json"));
+        let via_real = resolve_path_for_collision_check(&real_dir.join("new").join("x.json"));
+        assert_eq!(
+            via_alias, via_real,
+            "a symlinked grandparent must resolve to the same path as its target even when the \
+             immediate parent directory doesn't exist yet"
         );
     }
 
