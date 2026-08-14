@@ -220,6 +220,21 @@ same checkpoint against each other: `live-tick` and `arcus-spot-propose-plan`
 both call `step_at`, and a per-binary sidecar could not see a fresher
 snapshot the other one had just persisted.
 
+The checkpoint lock is dropped between `step_at`/persist and the dispatch
+below (re-acquired fresh inside `executor_from_config`, since a second
+acquisition by the same process from a separate open file description
+would conflict rather than nest). A concurrent `live-tick` or
+`arcus-spot-propose-plan` can advance the checkpoint to a newer observation
+in that window; `validate_plan_consistent_with_state` alone only checks
+regime/trigger/direction/open-quantity structural consistency, not that
+the plan corresponds to the checkpoint's *current* observation. Before
+`validate_plan_consistent_with_state`, `live-tick` therefore also compares
+the freshly re-read checkpoint's `last_observation_at` against the value
+captured when this plan was computed, and refuses to dispatch if the
+checkpoint has moved on -- otherwise an entry could be submitted based on
+a signal state a newer tick has already superseded (Codex P1 follow-up,
+pairtrade#186).
+
 Before dispatching, `live-tick` durably writes the plan it built, at mode
 0600, to `<runtime_state_path's directory>/live-tick-pending-plan.json`.
 If the process exits after the swap is `Submitted` but before it is

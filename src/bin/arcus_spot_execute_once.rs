@@ -1090,6 +1090,10 @@ async fn main() -> Result<()> {
             // same checkpoint (Codex P2 follow-up, pairtrade#186; see
             // ArcusSpotRuntimeState::last_observation_at's doc comment).
             let event = runtime.step_at(&snapshot, Utc::now());
+            // Captured now, under the lock, so dispatch below can bind the
+            // plan to the exact observation it was computed from -- see
+            // its use after the lock is re-acquired.
+            let plan_observation_at = runtime.state().last_observation_at;
             // Persisted unconditionally, independent of the decision below:
             // the accumulated price-history window is exactly what next
             // tick's signal depends on, and losing a tick's contribution
@@ -1124,6 +1128,28 @@ async fn main() -> Result<()> {
             // between.
             let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let fresh_runtime = runtime_store.load_or_create(&config.runtime)?;
+            // validate_plan_consistent_with_state only checks regime/
+            // trigger/direction/open-quantity structural consistency, not
+            // that this plan corresponds to the checkpoint's *current*
+            // observation -- a concurrent live-tick or propose-plan
+            // processing a newer snapshot after this invocation's own
+            // checkpoint lock was dropped (above) could persist a new
+            // signal state whose regime happens to still be structurally
+            // consistent even though the newer observation itself now
+            // says Observe, or favors the opposite direction. Reject
+            // outright if the checkpoint has moved past the exact
+            // observation this plan was computed from, rather than
+            // dispatching an entry based on a signal state that no longer
+            // reflects the runtime's own most recent evaluation (Codex P1
+            // follow-up, pairtrade#186).
+            if fresh_runtime.state().last_observation_at != plan_observation_at {
+                bail!(
+                    "Arcus live-tick plan is stale: the runtime checkpoint has advanced to a \
+                     newer observation ({:?}) since this plan was computed from ({:?})",
+                    fresh_runtime.state().last_observation_at,
+                    plan_observation_at
+                );
+            }
             fresh_runtime
                 .validate_plan_consistent_with_state(&plan)
                 .map_err(anyhow::Error::msg)
