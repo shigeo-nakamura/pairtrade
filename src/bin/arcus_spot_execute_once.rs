@@ -468,20 +468,24 @@ fn lexically_normalize(path: &Path) -> PathBuf {
 /// as-yet-nonexistent parent cannot itself be a symlink pointing somewhere
 /// collision-relevant.
 fn resolve_path_for_collision_check(path: &Path) -> PathBuf {
-    let normalized = lexically_normalize(path);
-    let (Some(parent), Some(file_name)) = (normalized.parent(), normalized.file_name()) else {
-        return normalized;
-    };
-    // Walk up from `parent` toward the root, canonicalizing the longest
-    // existing ancestor and reappending whatever components don't exist
-    // yet on top of it. Trying only the immediate parent (and giving up
-    // entirely if that one doesn't exist yet) misses a symlink further up
-    // the tree whenever the leaf directory itself hasn't been created --
-    // e.g. `/var/lib/alias -> real`, an absent `real/new`, and paths under
-    // `alias/new/...` vs. `real/new/...`: the immediate parent (`.../new`)
-    // doesn't exist under either name, but `alias` itself does and
-    // resolves to `real` (Codex P2 follow-up, pairtrade#186).
-    let mut ancestor = parent;
+    // Walk up from the path itself (deliberately *not* lexically
+    // normalized first) toward the root, canonicalizing the longest
+    // existing prefix and reappending whatever trailing components don't
+    // exist yet on top of it. Pre-collapsing `..` as plain text before
+    // canonicalizing is wrong whenever it crosses a symlink boundary:
+    // with `/var/lib/base/alias -> /var/lib/other/child`,
+    // `alias/../sibling` actually names `/var/lib/other/sibling` (go
+    // through the symlink, then up from *its target's* parent), not
+    // `/var/lib/base/sibling` -- a textual collapse of `alias/..` can't
+    // know that, and only `fs::canonicalize`, given the still-embedded
+    // `..` and symlink together, resolves it correctly (Codex P2
+    // follow-up, pairtrade#186). `fs::canonicalize` only accepts a path
+    // that exists in full, so this still has to walk up from the leaf
+    // for the (common) case where the file itself doesn't exist yet;
+    // `lexically_normalize` is applied once at the very end, to the
+    // combined (by-then symlink-free) result, purely to collapse a `..`
+    // that landed in the not-yet-existing trailing suffix.
+    let mut ancestor = path;
     let mut pending_components: Vec<&std::ffi::OsStr> = Vec::new();
     let canonical_ancestor = loop {
         match fs::canonicalize(ancestor) {
@@ -494,16 +498,15 @@ fn resolve_path_for_collision_check(path: &Path) -> PathBuf {
                 // No existing ancestor anywhere in the prefix (or we
                 // walked off the top of the path) -- nothing left to
                 // canonicalize against.
-                _ => return normalized,
+                _ => return lexically_normalize(path),
             },
         }
     };
-    let mut resolved = canonical_ancestor;
+    let mut combined = canonical_ancestor;
     for component in pending_components.into_iter().rev() {
-        resolved.push(component);
+        combined.push(component);
     }
-    resolved.push(file_name);
-    resolved
+    lexically_normalize(&combined)
 }
 
 fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
@@ -1609,6 +1612,33 @@ runtime:
             via_alias, via_real,
             "a symlinked grandparent must resolve to the same path as its target even when the \
              immediate parent directory doesn't exist yet"
+        );
+    }
+
+    #[test]
+    fn resolve_path_for_collision_check_resolves_parent_dir_traversal_across_a_symlink() {
+        // Codex P2 follow-up, pairtrade#186: `..` must be resolved using
+        // filesystem semantics together with any symlink it crosses, not
+        // collapsed as plain text first. alias -> target_parent/child, so
+        // alias/../sibling actually names target_parent/sibling (go
+        // through the symlink, then up from *its target's* parent) --
+        // not a sibling of `alias` itself.
+        let dir = tempdir().unwrap();
+        let target_parent = dir.path().join("target_parent");
+        fs::create_dir(&target_parent).unwrap();
+        fs::create_dir(target_parent.join("child")).unwrap();
+        let sibling = target_parent.join("sibling");
+        fs::create_dir(&sibling).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(target_parent.join("child"), &alias).unwrap();
+
+        let via_traversal =
+            resolve_path_for_collision_check(&alias.join("..").join("sibling").join("x.json"));
+        let via_direct = resolve_path_for_collision_check(&sibling.join("x.json"));
+        assert_eq!(
+            via_traversal, via_direct,
+            "a `..` crossing a symlink must resolve relative to the symlink's target, not the \
+             symlink's own location"
         );
     }
 
