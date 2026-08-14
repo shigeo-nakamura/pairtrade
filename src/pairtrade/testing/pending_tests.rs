@@ -32,7 +32,7 @@ type ModifyCall = (
 );
 
 #[derive(Default)]
-struct DummyConnector {
+pub(in crate::pairtrade) struct DummyConnector {
     calls: Mutex<Vec<DummyCall>>,
     next_id: AtomicUsize,
     balance_calls: AtomicUsize,

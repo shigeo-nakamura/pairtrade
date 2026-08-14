@@ -966,8 +966,24 @@ impl PairTradeEngine {
                         let previous_reference = inst.session_equity_reference_usd;
                         let reference_change = reference_reconciliation_pending
                             .then_some((previous_reference, inst.equity_reference_usd));
+                        // total_funding_carry and capital_baseline_accounted_pnl
+                        // (whose None-ness is what put us in this match arm)
+                        // were introduced together in bot-strategy#783, so a
+                        // snapshot reaching here always deserialized
+                        // total_funding_carry as 0.0 too -- even though
+                        // funding_carry_today (bot-strategy#371, present in
+                        // every prior snapshot) already holds the real
+                        // accumulated carry for the current session. Backfill
+                        // it into this one-shot migration's accounted PnL (and
+                        // the baseline persisted below, so the two stay
+                        // consistent with each other) instead of silently
+                        // dropping it: otherwise an otherwise-valid legacy
+                        // denominator can fail the trust check below and reset
+                        // session_start_equity, resurrecting previously
+                        // withdrawn capital (Codex P2 follow-up, bot-strategy#783).
+                        let migration_accounted_pnl = accounted_pnl + inst.funding_carry_today;
                         if reference_reconciliation_pending {
-                            let current_capital_basis = equity - accounted_pnl;
+                            let current_capital_basis = equity - migration_accounted_pnl;
                             let legacy_denominator_trustworthy = legacy_reference
                                 && (prev_start_equity - current_capital_basis).abs() < min_usd;
                             if !legacy_denominator_trustworthy {
@@ -976,7 +992,7 @@ impl PairTradeEngine {
                             inst.session_equity_reference_usd = inst.equity_reference_usd;
                         }
                         inst.capital_baseline_equity = equity;
-                        inst.capital_baseline_accounted_pnl = Some(accounted_pnl);
+                        inst.capital_baseline_accounted_pnl = Some(migration_accounted_pnl);
                         // A pre-#783 snapshot cannot say whether an
                         // unaccounted close's settlement might still be
                         // catching up, so this always seeds the guard
@@ -2070,6 +2086,62 @@ pub(in crate::pairtrade) fn ack_requests_reanchor(payload: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pairtrade::pending_tests::DummyConnector;
+    use std::sync::Arc;
+
+    /// Codex P2 follow-up, bot-strategy#783: a pre-#783 ("legacy") snapshot
+    /// deserializes total_funding_carry as 0.0 (the field did not exist
+    /// yet) while funding_carry_today (bot-strategy#371, present in every
+    /// prior snapshot) already holds the real accumulated funding for the
+    /// session. Before the fix, the one-shot migration branch's implied
+    /// capital basis silently dropped that funding, understating
+    /// current_capital_basis and failing the legacy-denominator trust
+    /// check even though the true (funding-inclusive) basis exactly
+    /// matched the prior session_start_equity -- forcing an unwarranted
+    /// reset to equity_reference_usd and resurrecting previously
+    /// withdrawn capital. With the fix, funding_carry_today is folded in
+    /// and no reset occurs.
+    #[test]
+    fn legacy_migration_backfills_funding_carry_today_into_the_trust_check() {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        engine.cfg.dry_run = false;
+        engine.cfg.risk.session_dd_capital_settle_secs = 0;
+        let dir = tempfile::TempDir::new().unwrap();
+        engine.risk_state_path = dir.path().join("risk_state.json");
+
+        let inst = &mut engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 500.0;
+        // legacy_reference: no prior #783 reference ever recorded.
+        inst.session_equity_reference_usd = 0.0;
+        // An operator-declared reference that must NOT be adopted: the
+        // true, funding-inclusive legacy basis already matches
+        // session_start_equity below, so this is not a genuine event.
+        inst.equity_reference_usd = 450.0;
+        inst.session_start_equity = 500.0;
+        inst.capital_baseline_equity = 400.0;
+        // None marks a pre-#783 snapshot -- the exact branch under test.
+        inst.capital_baseline_accounted_pnl = None;
+        inst.total_pnl = 10.0;
+        inst.total_funding_carry = 0.0; // legacy default, field did not exist
+        inst.funding_carry_today = -10.0; // real funding this session
+
+        engine.detect_capital_event_and_rebaseline(0);
+
+        let inst = &engine.instances[0];
+        assert_eq!(
+            inst.session_start_equity, 500.0,
+            "a trustworthy legacy denominator (once funding_carry_today is \
+             included) must not be reset to equity_reference_usd"
+        );
+        assert_eq!(
+            inst.capital_baseline_accounted_pnl,
+            Some(0.0),
+            "the persisted baseline must reflect the same funding-inclusive \
+             accounted PnL the trust check itself used"
+        );
+    }
 
     // 2026-04-23 18:29:50 UTC — 1745432990 — Thu of day 20203 (UNIX/86400)
     const TS_2026_04_23_18_29: i64 = 1_745_432_990;
