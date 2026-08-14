@@ -15,7 +15,7 @@ mod strategy;
 mod universe;
 mod validate;
 
-pub use fingerprint::{sha256_12, EffectiveConfig};
+pub use fingerprint::EffectiveConfig;
 pub use params::PairParams;
 pub use resolved::{PairTradeConfig, WarmStartMode};
 pub use risk::{DailyLossAction, RiskConfig};
