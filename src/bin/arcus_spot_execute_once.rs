@@ -62,6 +62,103 @@ struct ArcusSpotExecuteOnceConfig {
 }
 
 const APPROVAL_PUBLIC_KEY_PATH: &str = "/etc/arcus-spot/approval_public_key";
+const AUTO_EXECUTE_POLICY_PATH: &str = "/etc/arcus-spot/auto_execute_policy.json";
+
+/// Administrator-set ceiling for `auto-execute`/`auto-resume`, enforced
+/// independently of whatever CONFIG_YAML the executor identity supplies.
+/// Read from the same fixed, non-self-writable path pattern as
+/// `approval_public_key` (Codex P1 follow-up, pairtrade#186): without
+/// this, the executor identity could point `ledger_path`/
+/// `runtime_state_path` at a fresh location to reset the daily swap count
+/// and prior history, or raise `maximum_sell_amount_raw` past what was
+/// actually approved on bot-strategy#772 -- the offline signature
+/// `execute` requires is exactly what used to make those caller-controlled
+/// config values safe.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotAutoExecutePolicy {
+    ledger_path: PathBuf,
+    runtime_state_path: PathBuf,
+    max_sell_amount_raw: std::collections::BTreeMap<String, String>,
+}
+
+fn auto_execute_policy_from_admin_file() -> Result<ArcusSpotAutoExecutePolicy> {
+    auto_execute_policy_from_file(Path::new(AUTO_EXECUTE_POLICY_PATH))
+}
+
+fn auto_execute_policy_from_file(path: &Path) -> Result<ArcusSpotAutoExecutePolicy> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!("failed to inspect auto-execute policy file {}", path.display())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "auto-execute policy file {} must be a regular non-symlink file",
+            path.display()
+        );
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        bail!(
+            "auto-execute policy file {} must not be group- or other-writable",
+            path.display()
+        );
+    }
+    // SAFETY: geteuid() takes no arguments, performs no memory access, and
+    // cannot fail.
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() == current_uid {
+        bail!(
+            "auto-execute policy file {} is owned by this process's own uid ({current_uid}) -- it must be administrator-owned, not writable by the identity running auto-execute/auto-resume",
+            path.display()
+        );
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read auto-execute policy file {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("invalid auto-execute policy file {}", path.display()))
+}
+
+/// Rejects a config whose caller-controlled `ledger_path`/
+/// `runtime_state_path`/`maximum_sell_amount_raw` fall outside what the
+/// administrator-owned policy actually approved, closing exactly the gap
+/// `execute`'s signature used to close (Codex P1 follow-up, pairtrade#186).
+fn require_config_within_auto_execute_policy(
+    config: &ArcusSpotExecuteOnceConfig,
+    policy: &ArcusSpotAutoExecutePolicy,
+) -> Result<()> {
+    if config.ledger_path != policy.ledger_path {
+        bail!(
+            "auto-execute config ledger_path {} does not match the administrator-approved path {}",
+            config.ledger_path.display(),
+            policy.ledger_path.display()
+        );
+    }
+    if config.runtime_state_path != policy.runtime_state_path {
+        bail!(
+            "auto-execute config runtime_state_path {} does not match the administrator-approved path {}",
+            config.runtime_state_path.display(),
+            policy.runtime_state_path.display()
+        );
+    }
+    for (symbol, configured_max) in &config.executor.maximum_sell_amount_raw {
+        let ceiling_raw = policy.max_sell_amount_raw.get(symbol).ok_or_else(|| {
+            anyhow::anyhow!(
+                "auto-execute config sets maximum_sell_amount_raw for {symbol}, which has no administrator-approved ceiling"
+            )
+        })?;
+        let configured_value: u128 = configured_max.parse().with_context(|| {
+            format!("auto-execute config maximum_sell_amount_raw for {symbol} is not a valid raw amount")
+        })?;
+        let ceiling_value: u128 = ceiling_raw.parse().with_context(|| {
+            format!("auto-execute policy max_sell_amount_raw for {symbol} is not a valid raw amount")
+        })?;
+        if configured_value > ceiling_value {
+            bail!(
+                "auto-execute config maximum_sell_amount_raw for {symbol} ({configured_value}) exceeds the administrator-approved ceiling ({ceiling_value})"
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Read the trust anchor from a fixed, administrator-owned file this
 /// process cannot itself have written. A caller-controlled input (a
@@ -141,12 +238,18 @@ fn usage() -> &'static str {
   arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
   arcus-spot-execute-once auto-execute CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
+  arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
 
-auto-execute skips the offline human approval signature (explicit owner
-decision while total inventory at risk stays small -- see the comment at
-its call site). Every other gate execute enforces is unchanged: plan/config
-validation, staleness, on-chain preflight, exact-value Permit2, slippage,
-and loss stops.
+auto-execute/auto-resume skip the offline human approval signature
+(explicit owner decision while total inventory at risk stays small -- see
+the comment at their call sites). Every other gate execute/resume enforce
+is unchanged: plan/config validation, staleness, on-chain preflight,
+exact-value Permit2, slippage, and loss stops. In place of the signature,
+CONFIG_YAML's ledger_path, runtime_state_path, and maximum_sell_amount_raw
+must match an administrator-owned policy file at
+/etc/arcus-spot/auto_execute_policy.json (same ownership/mode trust model
+as approval_public_key) -- otherwise the executor identity could bypass
+the daily swap cap and stakes ceiling by supplying fresh values itself.
 
 keygen/sign-approval are meant to run on a separate, offline machine: the
 resulting private key file must never be copied to the host that runs
@@ -683,6 +786,8 @@ async fn main() -> Result<()> {
             // scale-up beyond what is currently approved on #772.
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
+            let policy = auto_execute_policy_from_admin_file()?;
+            require_config_within_auto_execute_policy(&config, &policy)?;
             let plan_config_digest = approval_digest(&config, &plan)?;
             let mut executor = executor_from_config(&config).await?;
             let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
@@ -694,6 +799,31 @@ async fn main() -> Result<()> {
             let attempt = executor
                 .execute_plan_once(&plan, &plan_config_digest)
                 .await?;
+            let attempt = finalize_reconciled_attempt(
+                &config,
+                &mut executor,
+                &plan,
+                &plan_config_digest,
+                attempt,
+            )?;
+            write_attempt(&attempt)
+        }
+        [command, config_path, plan_path] if command == "auto-resume" => {
+            // Signatureless counterpart to `resume`, gated the same way as
+            // `auto-execute`: an attempt dispatched via `auto-execute` that
+            // comes back `Submitted` (not yet confirmed) or crashes before
+            // runtime commit otherwise has no recovery path that doesn't
+            // require the offline signature this command family exists to
+            // skip -- an unattended flow that can start unattended but
+            // then dead-ends waiting for a human is not actually unattended
+            // (Codex P2 follow-up, pairtrade#186).
+            let (config, plan) =
+                load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
+            let policy = auto_execute_policy_from_admin_file()?;
+            require_config_within_auto_execute_policy(&config, &policy)?;
+            let plan_config_digest = approval_digest(&config, &plan)?;
+            let mut executor = executor_from_config(&config).await?;
+            let attempt = executor.resume_status_and_reconcile().await?;
             let attempt = finalize_reconciled_attempt(
                 &config,
                 &mut executor,
@@ -735,6 +865,8 @@ mod tests {
         assert!(usage().contains("resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX"));
         assert!(usage().contains("keygen"));
         assert!(usage().contains("sign-approval"));
+        assert!(usage().contains("auto-execute CONFIG_YAML PLAN_JSON"));
+        assert!(usage().contains("auto-resume CONFIG_YAML PLAN_JSON"));
     }
 
     fn live_runtime_config() -> ArcusSpotRuntimeConfig {
@@ -959,5 +1091,190 @@ cumulative_loss_limit_usd: "10"
         .unwrap();
         let error = serde_json::from_value::<ArcusSpotExecuteOnceConfig>(value).unwrap_err();
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    fn execute_once_config(
+        ledger_path: &str,
+        runtime_state_path: &str,
+        max_sell_nvda: &str,
+    ) -> ArcusSpotExecuteOnceConfig {
+        serde_yaml::from_str(&format!(
+            r#"
+router:
+  router_base_url: "https://router.spot.arcus.xyz"
+  meta_base_url: "https://api.arcus.xyz"
+  indexer_base_url: "https://indexer.spot.arcus.xyz"
+  chain_id: 4663
+  request_timeout_ms: 30000
+  min_request_interval_ms: 250
+  max_attempts: 3
+  retry_base_delay_ms: 500
+  max_retry_delay_ms: 30000
+  user_agent: "test"
+  trusted_permit2_spenders:
+    arcus:
+      - "0x006102b16A04c20306A28b652745D3973D7D24fa"
+  trusted_token_addresses:
+    NVDA: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC"
+    AMD: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC"
+  trusted_token_decimals:
+    NVDA: 18
+    AMD: 18
+chain:
+  rpc_urls:
+    - "https://rpc.mainnet.chain.robinhood.com"
+  chain_id: 4663
+  request_interval_ms: 200
+kms:
+  region: "eu-central-1"
+  key_id: "alias/test"
+  chain_id: 4663
+  expected_address: "0x812B6A6da8E0dF1fBCA7939ae32089Cf85c5DF05"
+executor:
+  taker: "0x812B6A6da8E0dF1fBCA7939ae32089Cf85c5DF05"
+  permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+  slippage_bps: 50
+  minimum_gas_balance_wei: "1000000000000000"
+  inventory_floor_raw:
+    NVDA: "50000000000000000"
+    AMD: "20000000000000000"
+  maximum_sell_amount_raw:
+    NVDA: "{max_sell_nvda}"
+    AMD: "21084353605755395"
+  max_swaps_per_utc_day: 10
+  max_plan_age_secs: 60
+ledger_path: {ledger_path}
+runtime_state_path: {runtime_state_path}
+runtime:
+  mode: live
+  chain_id: 4663
+  pair:
+    sell_symbol: NVDA
+    buy_symbol: AMD
+  notional_usd: "10"
+  initial_inventory:
+    token_a: "0.35"
+    token_b: "0.16"
+  inventory_floors:
+    token_a: "0.05"
+    token_b: "0.02"
+  max_rotation_fraction: "0.25"
+  signal_window_samples: 96
+  min_signal_samples: 32
+  entry_z_score: 2.5
+  exit_z_score: 0.25
+  max_quote_age_secs: 60
+  max_hold_secs: 86400
+  max_all_in_round_trip_cost_bps: "120"
+  gas_buffer_bps: "10"
+  settlement_buffer_bps: "10"
+  max_inventory_imbalance_fraction: "0.75"
+  daily_loss_limit_usd: "2"
+  cumulative_loss_limit_usd: "10"
+"#
+        ))
+        .unwrap()
+    }
+
+    fn auto_execute_policy(ledger_path: &str, runtime_state_path: &str, max_sell_nvda: &str) -> ArcusSpotAutoExecutePolicy {
+        ArcusSpotAutoExecutePolicy {
+            ledger_path: PathBuf::from(ledger_path),
+            runtime_state_path: PathBuf::from(runtime_state_path),
+            max_sell_amount_raw: std::collections::BTreeMap::from([
+                ("NVDA".to_string(), max_sell_nvda.to_string()),
+                ("AMD".to_string(), "21084353605755395".to_string()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn auto_execute_policy_accepts_a_config_within_limits() {
+        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        require_config_within_auto_execute_policy(&config, &policy).unwrap();
+    }
+
+    #[test]
+    fn auto_execute_policy_rejects_a_redirected_ledger_path() {
+        // Without this, the executor identity could point ledger_path at a
+        // fresh, empty file to silently reset the daily swap count and
+        // prior attempt history that the real ledger accumulates.
+        let config = execute_once_config("/tmp/attacker-chosen/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
+        assert!(error.to_string().contains("ledger_path"));
+    }
+
+    #[test]
+    fn auto_execute_policy_rejects_a_redirected_runtime_state_path() {
+        let config = execute_once_config("/var/lib/x/ledger.json", "/tmp/attacker-chosen/runtime.json", "1000");
+        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
+        assert!(error.to_string().contains("runtime_state_path"));
+    }
+
+    #[test]
+    fn auto_execute_policy_rejects_a_sell_ceiling_raised_past_the_administrator_limit() {
+        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "999999999999");
+        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
+        assert!(error.to_string().contains("maximum_sell_amount_raw"));
+    }
+
+    #[test]
+    fn auto_execute_policy_accepts_a_sell_ceiling_at_or_below_the_limit() {
+        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        require_config_within_auto_execute_policy(&config, &policy).unwrap();
+    }
+
+    #[test]
+    fn auto_execute_policy_rejects_a_symbol_with_no_administrator_ceiling() {
+        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = ArcusSpotAutoExecutePolicy {
+            ledger_path: PathBuf::from("/var/lib/x/ledger.json"),
+            runtime_state_path: PathBuf::from("/var/lib/x/runtime.json"),
+            max_sell_amount_raw: std::collections::BTreeMap::new(),
+        };
+        let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
+        assert!(error.to_string().contains("no administrator-approved ceiling"));
+    }
+
+    #[test]
+    fn auto_execute_policy_file_owned_by_this_process_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auto_execute_policy.json");
+        fs::write(&path, r#"{"ledger_path":"/x","runtime_state_path":"/y","max_sell_amount_raw":{}}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = auto_execute_policy_from_file(&path).unwrap_err();
+        assert!(error.to_string().contains("administrator-owned"));
+    }
+
+    #[test]
+    fn auto_execute_policy_file_that_is_group_writable_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auto_execute_policy.json");
+        fs::write(&path, r#"{"ledger_path":"/x","runtime_state_path":"/y","max_sell_amount_raw":{}}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        let error = auto_execute_policy_from_file(&path).unwrap_err();
+        // Group-writable AND owned by this process -- the ownership check
+        // fires first, which is still a correct rejection; assert on
+        // whichever this environment's fs::write() ownership produces.
+        assert!(
+            error.to_string().contains("group- or other-writable")
+                || error.to_string().contains("administrator-owned")
+        );
+    }
+
+    #[test]
+    fn auto_execute_policy_symlink_is_rejected() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real_policy.json");
+        fs::write(&target, r#"{"ledger_path":"/x","runtime_state_path":"/y","max_sell_amount_raw":{}}"#).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("auto_execute_policy.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = auto_execute_policy_from_file(&link).unwrap_err();
+        assert!(error.to_string().contains("non-symlink"));
     }
 }
