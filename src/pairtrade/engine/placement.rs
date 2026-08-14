@@ -57,6 +57,16 @@ struct PostOnlyOrderRequest<'a> {
     allow_post_only: bool,
     max_post_only_attempts: usize,
     fallback_to_taker: bool,
+    capital_guard_inst_idx: Option<usize>,
+}
+
+/// See `PairTradeEngine::capital_guard_prior_state` /
+/// `unlatch_capital_guard_if_no_order_was_ever_created`.
+#[derive(Clone, Copy)]
+struct CapitalGuardPriorState {
+    inst_idx: usize,
+    was_seen: bool,
+    flat_since: Option<Instant>,
 }
 
 pub(in crate::pairtrade) struct OrderSubmitMetadata {
@@ -744,6 +754,7 @@ impl PairTradeEngine {
             allow_post_only,
             max_post_only_attempts,
             fallback_to_taker,
+            capital_guard_inst_idx,
         } = request;
         let use_post_only = allow_post_only && self.should_post_only();
         let max_attempts = max_post_only_attempts.max(1);
@@ -757,6 +768,18 @@ impl PairTradeEngine {
         // attempt actually saw, instead of the stale decision-time `prices` map.
         #[allow(unused_assignments)]
         let mut last_submit_snapshot: Option<SymbolSnapshot> = None;
+        // Captured once, before the first attempt: every attempt below
+        // reuses the same inst_idx, and the guard can only ever transition
+        // false-to-true on the very first one, so this is the sole
+        // reference point unlatch needs regardless of how many attempts
+        // this operation ends up making.
+        let capital_guard_prior_state =
+            capital_guard_inst_idx.map(|inst_idx| self.capital_guard_prior_state(inst_idx));
+        // Whether *every* create_order attempt this operation has made so
+        // far definitively proved no order was created. A single ambiguous
+        // attempt anywhere latches this false permanently, since that one
+        // attempt alone could have created real exposure.
+        let mut capital_guard_every_attempt_definitively_rejected = true;
 
         let last_err = loop {
             attempt += 1;
@@ -769,6 +792,21 @@ impl PairTradeEngine {
                 (self.limit_price_for(symbol, side, prices), None)
             };
             if use_post_only && limit.is_none() {
+                // A later retry's own pricing failure (not attempt 1's,
+                // which the guard-latch below hasn't even run for yet on
+                // this operation) never reaches create_order, so it can't
+                // change what the prior attempts already proved. If every
+                // one of them was a definitive DexError::ServerResponse,
+                // this exit must still unlatch -- otherwise this early
+                // return silently bypasses every unlatch call the loop
+                // and taker-fallback paths make, leaving the guard latched
+                // indefinitely (Codex P2 follow-up, bot-strategy#783).
+                if attempt > 1 {
+                    self.unlatch_capital_guard_if_no_order_was_ever_created(
+                        capital_guard_prior_state,
+                        capital_guard_every_attempt_definitively_rejected,
+                    );
+                }
                 return Err(DexError::Transient(format!(
                     "[ORDER] Missing reference price for post-only {}",
                     symbol
@@ -789,6 +827,9 @@ impl PairTradeEngine {
                 }
                 None => self.order_submit_metadata(symbol, size, side, prices),
             };
+            if let Some(inst_idx) = capital_guard_inst_idx {
+                self.latch_capital_position_activity(inst_idx);
+            }
             match self
                 .connector
                 .create_order(symbol, size, side, limit, spread, reduce_only, None)
@@ -803,7 +844,13 @@ impl PairTradeEngine {
                     ));
                 }
                 Err(err) => {
+                    capital_guard_every_attempt_definitively_rejected &=
+                        matches!(err, DexError::ServerResponse(_));
                     if !use_post_only {
+                        self.unlatch_capital_guard_if_no_order_was_ever_created(
+                            capital_guard_prior_state,
+                            capital_guard_every_attempt_definitively_rejected,
+                        );
                         return Err(err);
                     }
                     if attempt >= max_attempts || start.elapsed() >= max_elapsed {
@@ -858,13 +905,28 @@ impl PairTradeEngine {
                 }
                 None => self.order_submit_metadata(symbol, size, side, prices),
             };
-            return self
+            return match self
                 .connector
                 .create_order(symbol, size, side, None, None, reduce_only, None)
                 .await
-                .map(|response| Self::order_result_from_response(response, false, None, meta));
+            {
+                Ok(response) => Ok(Self::order_result_from_response(response, false, None, meta)),
+                Err(err) => {
+                    capital_guard_every_attempt_definitively_rejected &=
+                        matches!(err, DexError::ServerResponse(_));
+                    self.unlatch_capital_guard_if_no_order_was_ever_created(
+                        capital_guard_prior_state,
+                        capital_guard_every_attempt_definitively_rejected,
+                    );
+                    Err(err)
+                }
+            };
         }
 
+        self.unlatch_capital_guard_if_no_order_was_ever_created(
+            capital_guard_prior_state,
+            capital_guard_every_attempt_definitively_rejected,
+        );
         Err(last_err)
     }
 
@@ -1006,6 +1068,7 @@ impl PairTradeEngine {
                 allow_post_only: true,
                 max_post_only_attempts: entry_attempts,
                 fallback_to_taker: false,
+                capital_guard_inst_idx: Some(inst_idx),
             })
             .await
             .context("place leg A")?;
@@ -1049,6 +1112,7 @@ impl PairTradeEngine {
                 allow_post_only: true,
                 max_post_only_attempts: entry_attempts,
                 fallback_to_taker: false,
+                capital_guard_inst_idx: Some(inst_idx),
             })
             .await
         {
@@ -1273,6 +1337,7 @@ impl PairTradeEngine {
                     allow_post_only: true,
                     max_post_only_attempts: POST_ONLY_EXIT_ATTEMPTS,
                     fallback_to_taker: true,
+                    capital_guard_inst_idx: None,
                 })
                 .await
             };
@@ -1354,6 +1419,7 @@ impl PairTradeEngine {
                     allow_post_only: true,
                     max_post_only_attempts: POST_ONLY_EXIT_ATTEMPTS,
                     fallback_to_taker: true,
+                    capital_guard_inst_idx: None,
                 })
                 .await
             };
@@ -1451,6 +1517,70 @@ impl PairTradeEngine {
         Ok((legs, takeover_at))
     }
 
+    pub(in crate::pairtrade) fn latch_capital_position_activity(&mut self, inst_idx: usize) {
+        // dry_run never creates venue exposure, so its simulated positions
+        // cannot produce a delayed account-equity settlement on restart.
+        if self.cfg.dry_run {
+            return;
+        }
+
+        let inst = &mut self.instances[inst_idx];
+        let was_seen = std::mem::replace(&mut inst.capital_position_seen_since_baseline, true);
+        inst.flat_since = None;
+        if !was_seen {
+            self.persist_risk_state();
+        }
+    }
+
+    /// Snapshot of the fields `latch_capital_position_activity` mutates,
+    /// taken immediately before calling it so a definitively-failed
+    /// single-shot attempt can be rolled back precisely rather than
+    /// guessed at afterwards (Codex P2 follow-up, bot-strategy#783).
+    fn capital_guard_prior_state(&self, inst_idx: usize) -> CapitalGuardPriorState {
+        let inst = &self.instances[inst_idx];
+        CapitalGuardPriorState {
+            inst_idx,
+            was_seen: inst.capital_position_seen_since_baseline,
+            flat_since: inst.flat_since,
+        }
+    }
+
+    /// Undo the optimistic latch `latch_capital_position_activity`
+    /// performed before the first create_order attempt of one logical
+    /// placement operation (a single shot, or a post-only retry loop plus
+    /// optional taker fallback), but only when every one of these holds:
+    /// - this operation is the one that flipped the guard false-to-true
+    ///   (an already-latched guard from a genuine earlier fill this
+    ///   session must survive untouched);
+    /// - `definitively_no_order_created` is true, meaning *every* attempt
+    ///   this operation made returned `DexError::ServerResponse` -- a
+    ///   completed HTTP round trip carrying an explicit non-2xx rejection
+    ///   (e.g. insufficient balance). Every other variant either means a
+    ///   given attempt's outcome is unknown (`Transient`) or is not
+    ///   returned by `create_order` at all. A single ambiguous attempt
+    ///   anywhere in the sequence must keep the whole operation's guard
+    ///   latched, since that one attempt alone could have created real
+    ///   exposure even if every other attempt was definitively rejected.
+    fn unlatch_capital_guard_if_no_order_was_ever_created(
+        &mut self,
+        prior: Option<CapitalGuardPriorState>,
+        definitively_no_order_created: bool,
+    ) {
+        if self.cfg.dry_run {
+            return;
+        }
+        let Some(prior) = prior else {
+            return;
+        };
+        if prior.was_seen || !definitively_no_order_created {
+            return;
+        }
+        let inst = &mut self.instances[prior.inst_idx];
+        inst.capital_position_seen_since_baseline = false;
+        inst.flat_since = prior.flat_since;
+        self.persist_risk_state();
+    }
+
     pub(in crate::pairtrade) fn register_partial_leg_failure(
         &mut self,
         inst_idx: usize,
@@ -1460,8 +1590,10 @@ impl PairTradeEngine {
         err: &anyhow::Error,
         is_exit: bool,
     ) {
+        let mut registered_live_entry = false;
         if let Some(partial) = err.downcast_ref::<PartialOrderPlacementError>() {
             if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                let has_placed_leg = !partial.legs().is_empty();
                 let pending = PendingOrders {
                     legs: partial.legs().to_vec(),
                     direction,
@@ -1478,8 +1610,18 @@ impl PairTradeEngine {
                     state.pending_exit = Some(pending);
                 } else {
                     state.pending_entry = Some(pending);
+                    registered_live_entry = has_placed_leg;
                 }
             }
+        }
+
+        // A partial entry has already created venue exposure even though the
+        // fallible two-leg placement returns Err. Persist the capital guard
+        // before that error reaches the caller so an immediate process exit
+        // followed by startup force-close cannot turn the unaccounted close
+        // settlement into a false capital event. bot-strategy#783.
+        if registered_live_entry {
+            self.latch_capital_position_activity(inst_idx);
         }
     }
 }

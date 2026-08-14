@@ -170,6 +170,10 @@ pub struct PairTradeConfig {
     /// process actually read, so a drift monitor can detect a config that was
     /// deployed but never loaded (deploy ≠ restart, bot-strategy#580).
     pub config_source_path: Option<String>,
+    /// Full SHA-256 of the exact YAML bytes parsed into this config. Captured
+    /// in the same read as deserialization so a concurrent deploy cannot make
+    /// startup acknowledge a config version that the engine did not load.
+    pub config_source_sha256: Option<String>,
 }
 
 impl PairTradeConfig {

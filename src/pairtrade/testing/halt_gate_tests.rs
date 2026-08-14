@@ -466,6 +466,11 @@ impl Harness {
             connector: self._connector.clone(),
             equity_cache: DEFAULT_EQUITY_USD,
             last_equity_fetch: None,
+            capital_guard_equity_snapshot: None,
+            capital_guard_last_observed_equity: None,
+            capital_guard_stable_since: None,
+            equity_fetch_generation: 0,
+            capital_guard_stable_since_generation: 0,
             equity_initialized: false,
             equity_reference_usd: DEFAULT_EQUITY_USD,
             states,
@@ -479,9 +484,14 @@ impl Harness {
             session_start_ts: now_ts,
             realized_pnl_today: 0.0,
             funding_carry_today: 0.0,
+            total_funding_carry: 0.0,
             daily_loss_halted: false,
             equity_samples: Vec::new(),
             capital_baseline_equity: 0.0,
+            capital_baseline_accounted_pnl: Some(0.0),
+            capital_position_seen_since_baseline: false,
+            capital_rebaseline_deferred: false,
+            capital_rebaseline_deferred_since: None,
             flat_since: None,
             session_halted: false,
             session_halt_reason: None,
@@ -846,6 +856,7 @@ async fn halted_instance_equity_tracks_collateral_without_restart() {
     let mut h = Harness::new("hg-halt-equity");
     h.engine.cfg.risk.max_session_loss_bps = 500; // session DD enabled → sampling on
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 0.0; // isolate ③ from ①
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_sample_secs = 1; // a fresh sample bucket each second
     {
         let inst = &mut h.engine.instances[0];
@@ -901,6 +912,7 @@ fn deposit_while_flat_rebaselines_peak_without_clearing_halt() {
     let mut h = Harness::new("hg-cap-deposit");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     let now = chrono::Utc::now().timestamp();
@@ -964,6 +976,344 @@ fn deposit_while_flat_rebaselines_peak_without_clearing_halt() {
     assert_eq!(dd, 0.0, "DD is reset to 0 at the new base");
 }
 
+// bot-strategy#783: Round 9 repeatedly observed a close PnL/funding movement
+// in account equity only after pairtrade had already recorded the realized
+// accounting. Those delayed balance updates must advance the paired baseline
+// without ever collapsing the pre-existing DD peak. A later genuine transfer
+// with no accounting movement must retain the automatic #575 rebaseline.
+#[test]
+fn round9_delayed_settlement_sequence_never_reanchors_without_transfer() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-round9-settlement");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    let now = chrono::Utc::now().timestamp();
+    let mut settled_equity = 6_000.0;
+    let mut total_trade_pnl = 0.0;
+    let mut total_funding = 0.0;
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 6_000.0;
+        inst.session_equity_reference_usd = 6_000.0;
+        inst.equity_cache = settled_equity;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 6_088.33,
+        }];
+        inst.capital_baseline_equity = settled_equity;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.session_start_equity = 6_000.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    // The five false A-arm deltas recorded in Round 9. Split a small part of
+    // each movement into funding so both accounting components are covered.
+    let movements = [
+        (6.50, 0.1256),
+        (17.50, 0.0557),
+        (-14.00, 0.0221),
+        (9.60, 0.0866),
+        (-7.10, 0.0252),
+    ];
+    for (trade_pnl, funding) in movements {
+        let movement = trade_pnl + funding;
+        total_trade_pnl += trade_pnl;
+        total_funding += funding;
+        {
+            let inst = &mut h.engine.instances[0];
+            inst.total_pnl = total_trade_pnl;
+            inst.total_funding_carry = total_funding;
+            // Connector/account cache has not reflected the close yet.
+            inst.equity_cache = settled_equity;
+        }
+        h.engine.detect_capital_event_and_rebaseline(0);
+        {
+            let inst = &h.engine.instances[0];
+            assert!(
+                inst.capital_rebaseline_deferred,
+                "material accounted PnL with stale equity must be deferred"
+            );
+            assert_eq!(inst.equity_samples.len(), 1);
+            assert!((inst.equity_samples[0].equity - 6_088.33).abs() < 1e-9);
+            assert!((inst.session_start_equity - 6_000.0).abs() < 1e-9);
+        }
+
+        // The exchange balance catches up. Raw equity and accounted PnL now
+        // agree, so the baseline advances without DD reanchor.
+        settled_equity += movement;
+        h.engine.instances[0].equity_cache = settled_equity;
+        h.engine.detect_capital_event_and_rebaseline(0);
+        let inst = &h.engine.instances[0];
+        assert!(!inst.capital_rebaseline_deferred);
+        assert!((inst.capital_baseline_equity - settled_equity).abs() < 1e-9);
+        assert_eq!(inst.equity_samples.len(), 1);
+        assert!((inst.equity_samples[0].equity - 6_088.33).abs() < 1e-9);
+        assert!((inst.session_start_equity - 6_000.0).abs() < 1e-9);
+    }
+
+    // A genuine $500 transfer after accounting has reconciled remains a
+    // verified capital event and preserves the original #575 behavior.
+    h.engine.instances[0].equity_cache = settled_equity + 500.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(inst.equity_samples.len(), 1);
+    assert!((inst.equity_samples[0].equity - (settled_equity + 500.0)).abs() < 1e-9);
+    assert!((inst.session_start_equity - 6_500.0).abs() < 1e-9);
+}
+
+// A pre-#783 snapshot has no accounted-PnL half for its persisted equity
+// baseline. Upgrade migration must therefore establish a guarded candidate,
+// not infer capital. If a delayed close settlement lands after migration, the
+// candidate follows it and clears only after a stable flat observation.
+#[test]
+fn pre_783_snapshot_migration_never_reanchors_delayed_settlement() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-pre-783-migration");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_reference_usd = 6_000.0;
+        inst.session_equity_reference_usd = 6_000.0;
+        inst.session_start_equity = 6_000.0;
+        inst.equity_cache = 6_000.0;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 6_088.33,
+        }];
+        inst.capital_baseline_equity = 6_000.0;
+        inst.capital_baseline_accounted_pnl = None;
+        inst.total_pnl = 10.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    {
+        let inst = &h.engine.instances[0];
+        assert_eq!(inst.capital_baseline_accounted_pnl, Some(10.0));
+        assert!(inst.capital_position_seen_since_baseline);
+        assert_eq!(inst.equity_samples[0].equity, 6_088.33);
+        assert_eq!(inst.session_start_equity, 6_000.0);
+    }
+
+    // The exchange/account cache then reflects the already-accounted close
+    // -- but this is the *first* tick to see the new value, so it is not
+    // yet confirmed as a complete (vs. still-settling) reading and the
+    // candidate does not advance yet.
+    h.engine.instances[0].equity_cache = 6_010.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    {
+        let inst = &h.engine.instances[0];
+        assert!(inst.capital_rebaseline_deferred);
+        assert!(inst.capital_position_seen_since_baseline);
+        assert_eq!(
+            inst.capital_baseline_equity, 6_000.0,
+            "a first-seen reading is not yet trusted as a complete settlement"
+        );
+        assert_eq!(inst.equity_samples[0].equity, 6_088.33);
+        assert_eq!(inst.session_start_equity, 6_000.0);
+    }
+
+    // Simulate the stability window having elapsed without needing to
+    // actually sleep: back-date the stable-since clock captured when
+    // $6,010 was first observed above, and simulate the genuine
+    // re-observation equity_confirmed_settled now also requires.
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
+    h.engine.instances[0].equity_fetch_generation += 1;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    {
+        let inst = &h.engine.instances[0];
+        assert!(inst.capital_rebaseline_deferred);
+        assert!(inst.capital_position_seen_since_baseline);
+        assert_eq!(
+            inst.capital_baseline_equity, 6_010.0,
+            "now confirmed complete, the candidate advances"
+        );
+        assert_eq!(inst.equity_samples[0].equity, 6_088.33);
+        assert_eq!(inst.session_start_equity, 6_000.0);
+    }
+
+    // A further stable observation at the now-advanced anchor clears the
+    // guard without touching DD.
+    h.engine.detect_capital_event_and_rebaseline(0);
+    {
+        let inst = &h.engine.instances[0];
+        assert!(!inst.capital_rebaseline_deferred);
+        assert!(!inst.capital_position_seen_since_baseline);
+        assert_eq!(inst.equity_samples[0].equity, 6_088.33);
+        assert_eq!(inst.session_start_equity, 6_000.0);
+    }
+
+    // A later clean transfer remains eligible for the normal #575 reanchor.
+    h.engine.instances[0].equity_cache = 6_510.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert_eq!(inst.equity_samples[0].equity, 6_510.0);
+    assert_eq!(inst.session_start_equity, 6_500.0);
+}
+
+// bot-strategy#783 (Codex P1 follow-up, seventh round): a pre-#783 snapshot
+// migration always seeds the position guard latched -- trying to pre-clear
+// it at the migration tick itself was tried (sixth round) and reverted: the
+// branch runs exactly once (capital_baseline_accounted_pnl flips to Some
+// immediately, so it is never reached again for this instance) and the
+// pre-close settle dwell that gates reaching it at all is shorter than the
+// equity refresh cadence, so a second genuine re-observation essentially
+// never lands before this one-shot tick has to decide. Clearing a clean
+// migration's guard instead happens on an ordinary *later* tick, which
+// keeps running indefinitely -- see the
+// quiet_account_after_migration_clears_via_repeated_reobservations test
+// below for that path.
+#[test]
+fn pre_783_migration_always_seeds_guard_latched() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-migration-fresh");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = None; // pre-#783 snapshot
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+        // Even an equity value that had already been sitting quietly for a
+        // while, with a genuine re-observation behind it, does not change
+        // the outcome -- this branch does not look at that evidence at all.
+        inst.capital_guard_last_observed_equity = Some(1_000.0);
+        inst.capital_guard_stable_since = Some(
+            Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1),
+        );
+        inst.equity_fetch_generation = 5;
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        inst.capital_position_seen_since_baseline,
+        "a pre-#783 migration always seeds the guard latched, regardless of \
+         any pre-existing stability evidence"
+    );
+    assert_eq!(inst.capital_baseline_accounted_pnl, Some(0.0));
+}
+
+// bot-strategy#783 (Codex P1 follow-up, seventh round): equity_confirmed_settled's
+// "moved past the pre-close snapshot" requirement can never be satisfied by
+// an account that never has a capital event -- capital_guard_equity_snapshot
+// gets backfilled to the same current equity the tick after migration, so a
+// genuinely idle account would stay latched forever without the quiet-path
+// fallback. CAPITAL_GUARD_QUIET_REOBSERVATIONS (2) independent genuine
+// re-observations of the same unchanged value, spanning a full stability
+// window, must clear it -- one alone is not enough (a stuck same-valued
+// cache read could produce exactly one).
+#[test]
+fn quiet_account_after_migration_clears_via_repeated_reobservations() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-migration-quiet-reconfirm");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = None; // pre-#783 snapshot
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    // Migration tick: seeds capital_baseline_accounted_pnl (routing all
+    // further ticks through the ordinary Reconciled path) and latches the
+    // guard, as always.
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(h.engine.instances[0].capital_position_seen_since_baseline);
+    let armed_generation = h.engine.instances[0].capital_guard_stable_since_generation;
+
+    // Simulate the stability window having elapsed with exactly ONE genuine
+    // re-observation since the window armed -- not enough on the quiet path.
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
+    h.engine.instances[0].equity_fetch_generation = armed_generation + 1;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "a single re-observation of an unchanged value is not enough when \
+         there is no \"moved past the snapshot\" evidence to lean on"
+    );
+
+    // A second independent re-observation, still at the same value, meets
+    // CAPITAL_GUARD_QUIET_REOBSERVATIONS.
+    h.engine.instances[0].equity_fetch_generation = armed_generation + 2;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        !h.engine.instances[0].capital_position_seen_since_baseline,
+        "two independent re-observations of an unchanged value clear the \
+         guard on a genuinely idle account"
+    );
+}
+
+// bot-strategy#783 (Codex P2 follow-up, sixth round): dry_run must still
+// migrate the daily-loss denominator when equity_usd_reference changes,
+// even though capital-flow reconciliation itself stays off (no real
+// settlement to reconcile against in dry_run).
+#[test]
+fn dry_run_still_migrates_equity_reference() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-dry-run-reference");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = true;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        // Operator bumped equity_usd_reference from $1,000 to $2,000 and
+        // restarted; session_equity_reference_usd still holds the old value.
+        inst.equity_reference_usd = 2_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        inst.session_start_equity = 1_000.0;
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert_eq!(
+        inst.session_equity_reference_usd, 2_000.0,
+        "dry_run must still sync the reference even though capital-flow \
+         reconciliation stays off"
+    );
+    assert_eq!(
+        inst.session_start_equity, 2_000.0,
+        "the daily-loss denominator must follow the new reference in dry_run too"
+    );
+}
+
 // bot-strategy#752: a full withdrawal can include accumulated PnL, so its
 // delta need not equal the configured reference. The zero-clamped daily
 // denominator must survive UTC rollover; otherwise the old reference is
@@ -976,6 +1326,7 @@ fn withdrawal_rollover_redeposit_counts_new_capital_once() {
     let mut h = Harness::new("hg-cap-rollover");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     let now = chrono::Utc::now().timestamp();
@@ -1027,6 +1378,601 @@ fn withdrawal_rollover_redeposit_counts_new_capital_once() {
     assert!((inst.capital_baseline_equity - 6_000.01).abs() < 1e-9);
 }
 
+// bot-strategy#783 Codex P2 follow-up: a real transfer landing exactly when
+// a position closes with material PnL can never satisfy baseline_advanced
+// (it requires the accounted delta itself to be sub-threshold, which a
+// genuine material close PnL never is). Left unresolved, the account would
+// stay deferred forever, blocking detection of every later, unrelated
+// capital event too -- not just this one.
+#[test]
+fn ambiguous_deferral_gives_up_after_the_giveup_window_and_stays_detectable() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-giveup");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.session_start_equity = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+
+    // A $10 close settles at the same instant a $100 deposit lands: equity
+    // moves to $1,110 while accounted PnL moves by $10. Neither
+    // Reconciled nor Verified applies (accounted_pnl_delta exceeds min_usd
+    // on its own), so this is Ambiguous and cannot naturally clear.
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_cache = 1_110.0;
+        inst.total_pnl = 10.0;
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "an unresolvable ambiguity defers rather than guessing"
+    );
+    assert!(h.engine.instances[0]
+        .capital_rebaseline_deferred_since
+        .is_some());
+
+    // Simulate the give-up window having elapsed without needing to
+    // actually sleep: back-date the deferred-since clock. Equity was never
+    // actually re-observed during that window (e.g. a stretch of failing
+    // /account calls) -- elapsed time alone must not be enough to give up,
+    // or the anchor force-advances baseline_equity to a still-stale
+    // reading while baseline_accounted_pnl jumps to the fully-caught-up
+    // total, manufacturing a mismatch the next real refresh misreads as a
+    // clean capital move.
+    h.engine.instances[0].capital_rebaseline_deferred_since = Some(
+        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_REBASELINE_GIVEUP_SECS + 1),
+    );
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "elapsed time alone, without an actual successful equity observation, must not give up"
+    );
+
+    // Equity is now genuinely re-observed at a new value (not the same
+    // $1,110 reading re-reported by a stale WS cache -- a same-valued
+    // "successful" read proves nothing). But this is only the first tick
+    // to see it, so it is not yet trusted as a *complete* settlement.
+    h.engine.instances[0].equity_cache = 1_110.5;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "a first-seen changed value is not yet trusted -- it might still be mid-update"
+    );
+
+    // Simulate the stability window having elapsed without needing to
+    // actually sleep, with a genuine re-observation landing in between.
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
+    h.engine.instances[0].equity_fetch_generation += 1;
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        !inst.capital_rebaseline_deferred,
+        "the deferral gives up once equity has been genuinely re-observed, held steady, and the timeout has elapsed"
+    );
+    assert!(inst.capital_rebaseline_deferred_since.is_none());
+    assert!(
+        (inst.capital_baseline_equity - 1_110.5).abs() < 1e-9,
+        "the anchor force-advances to the current reading"
+    );
+
+    // A later, genuinely clean $100 deposit must now be detectable again --
+    // the whole point of giving up instead of staying stuck.
+    h.engine.instances[0].equity_cache = 1_210.5;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        (h.engine.instances[0].session_start_equity - 1_100.0).abs() < 1e-9,
+        "capital-event detection recovered after the give-up and caught the later deposit"
+    );
+}
+
+// bot-strategy#783 (Codex P2 follow-up, seventh round): the give-up path
+// above relies on equity_confirmed_settled, whose "moved past the pre-close
+// snapshot" evidence is unavailable when the combined close-plus-transfer
+// amount is already the very first reading observed while flat -- there is
+// no earlier, different value to have moved away from.
+// capital_guard_equity_snapshot backfills to that same first reading, so
+// only the quiet-reobservations path can ever let this one give up.
+#[test]
+fn ambiguous_deferral_visible_from_the_first_tick_still_gives_up_via_reobservations() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-giveup-same-valued");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.session_start_equity = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        // flat_since starts unset: the $1,110 combined close-plus-transfer
+        // reading below is the *first* value this instance ever observes
+        // while flat, so capital_guard_equity_snapshot backfills to it
+        // directly -- there is no earlier, different pre-close reading to
+        // have moved away from.
+        inst.equity_cache = 1_110.0;
+        inst.total_pnl = 10.0;
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "an unresolvable ambiguity defers rather than guessing"
+    );
+    let armed_generation = h.engine.instances[0].capital_guard_stable_since_generation;
+
+    // The give-up window elapses, with equity never moving away from its
+    // own snapshot -- and only one genuine re-observation so far. Not
+    // enough on the quiet path.
+    h.engine.instances[0].capital_rebaseline_deferred_since = Some(
+        Instant::now() - Duration::from_secs(engine::risk::CAPITAL_REBASELINE_GIVEUP_SECS + 1),
+    );
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
+    h.engine.instances[0].equity_fetch_generation = armed_generation + 1;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_rebaseline_deferred,
+        "one re-observation of an unchanged value is not enough when there \
+         is no \"moved past the snapshot\" evidence to lean on"
+    );
+
+    // A second independent re-observation, still at the same value, meets
+    // CAPITAL_GUARD_QUIET_REOBSERVATIONS and the deferral finally gives up.
+    h.engine.instances[0].equity_fetch_generation = armed_generation + 2;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert!(
+        !inst.capital_rebaseline_deferred,
+        "two independent re-observations of an unchanged value let an \
+         always-ambiguous, never-moving deferral give up too"
+    );
+    assert!((inst.capital_baseline_equity - 1_110.0).abs() < 1e-9);
+}
+
+// bot-strategy#783 (Codex P1 follow-up, eighth round): capital_guard_stable_since
+// / capital_guard_stable_since_generation accumulate unconditionally every
+// tick, regardless of flat state -- while a position is open, equity_cache
+// simply not changing (it's a low-frequency dashboard-only cache during
+// that period, see EQUITY_REFRESH_CACHE_SECS's own doc comment) proves
+// nothing about post-close settlement completeness. Without resetting them
+// at the flat transition, "stability credit" accumulated entirely *before*
+// a close could already satisfy equity_confirmed_settled the instant the
+// settle dwell passes, clearing the guard against the still-stale pre-close
+// reading of an unaccounted close (e.g. a startup force-close whose PnL was
+// never recorded) instead of that close's actual settlement.
+#[test]
+fn flat_transition_resets_stale_stability_credit_from_the_open_position() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-flat-transition-reset");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        // An unaccounted close just happened (total_pnl never recorded, as
+        // a startup force-close would leave it) -- equity_cache has not
+        // caught up yet, still reading the pre-close value.
+        inst.equity_cache = 1_000.0;
+        inst.capital_position_seen_since_baseline = true;
+        inst.flat_since = None; // first tick observing the instance as flat
+                                // Stale credit accumulated entirely *before* this close, while a
+                                // position was open and equity_cache happened to sit at the exact
+                                // same value the whole time: many confirmed re-observations, long
+                                // past the stability window.
+        inst.capital_guard_last_observed_equity = Some(1_000.0);
+        inst.capital_guard_stable_since = Some(
+            Instant::now() - Duration::from_secs(10 * engine::risk::CAPITAL_GUARD_STABILITY_SECS),
+        );
+        inst.capital_guard_stable_since_generation = 0;
+        inst.equity_fetch_generation = 10;
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        inst.capital_position_seen_since_baseline,
+        "stale stability credit from before the close must not immediately \
+         clear the guard against the still-stale pre-close equity reading"
+    );
+    assert_eq!(
+        inst.capital_baseline_equity, 1_000.0,
+        "no rebaseline against a still-unsettled, unaccounted close"
+    );
+}
+
+// bot-strategy#783 (Codex P2 follow-up, ninth round): step_setup's
+// detect_capital_event_and_rebaseline (which normally latches and persists
+// capital_position_seen_since_baseline on the open->flat transition) runs
+// before step_execute_entry ever creates a pending_entry -- so that
+// transition would only be observed on the *next* tick's step_setup call.
+// step_execute_entry must latch (and persist) the guard itself, synchronously,
+// the moment it creates a nonempty entry, rather than waiting.
+#[tokio::test]
+async fn entry_creation_latches_position_guard_synchronously() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-entry-guard-latch");
+    h.engine.cfg.dry_run = false;
+    h.engine.instances[0].capital_position_seen_since_baseline = false;
+
+    h.step().await;
+
+    assert!(
+        h.position(0).is_some()
+            || h.engine.instances[0].states[PAIR_KEY]
+                .pending_entry
+                .is_some(),
+        "the module's documented z-trajectory must fire an entry on the first step"
+    );
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "step_execute_entry must latch the guard synchronously when it \
+         creates a nonempty entry, without waiting for the next tick's \
+         step_setup to notice the open position"
+    );
+}
+
+// bot-strategy#783 (Codex P1 follow-up, third round): a position closing
+// (or a pre-#783 migration, which seeds the guard unconditionally) does not
+// guarantee equity_cache has caught up yet -- it only refreshes every
+// EQUITY_REFRESH_CACHE_SECS. A quiet first observation right after the
+// guard latches must not clear it before that window has had a chance to
+// elapse, or a later, unrelated capital event landing once the cache
+// finally refreshes gets misclassified.
+#[test]
+fn position_guard_survives_a_quiet_tick_until_the_equity_cache_lag_window_elapses() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-guard-timing");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        // Equity and accounted PnL already match the anchor exactly --
+        // nothing to reconcile on its own -- but the guard is latched true,
+        // as if a position just closed (or a pre-#783 migration just ran).
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.capital_position_seen_since_baseline = true;
+        // flat_since starts unset so the first detect call below takes the
+        // "just became flat" branch, which is what captures the freshness
+        // snapshot -- settle_secs=0 makes this tick eligible to reconcile
+        // immediately either way.
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "a quiet reading right after the guard latches must not clear it yet"
+    );
+    assert!((h.engine.instances[0].capital_guard_equity_snapshot.unwrap() - 1_000.0).abs() < 1e-9);
+
+    // Repeated ticks reporting the identical value -- exactly what a
+    // stuck WS-derived balance_cache would return if the update that
+    // should have landed was never received -- must never clear the
+    // guard, no matter how many times it's re-observed. A timestamp-only
+    // "a fetch succeeded" signal would have been fooled by this; only the
+    // value itself changing proves anything.
+    for _ in 0..3 {
+        h.engine.detect_capital_event_and_rebaseline(0);
+        assert!(
+            h.engine.instances[0].capital_position_seen_since_baseline,
+            "a repeated same-valued equity read must never clear the guard"
+        );
+    }
+
+    // Now equity is genuinely re-observed at a new value -- but this is
+    // still only the first tick to see it, so it is not yet trusted as a
+    // *complete* settlement (it could be one leg of a multi-update one).
+    h.engine.instances[0].equity_cache = 1_000.01;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "a first-seen changed value is not yet trusted -- it might still be mid-update"
+    );
+
+    // Simulate the stability window having elapsed without needing to
+    // actually sleep -- but with no genuine re-observation in that window
+    // (equity_cache just sitting frozen, unrefreshed: EQUITY_REFRESH_CACHE_SECS
+    // is 300s, five times CAPITAL_GUARD_STABILITY_SECS, so this is the
+    // ordinary case, not an edge case). Elapsed wall time alone must not
+    // be enough to confirm settlement, or a still-partial value that
+    // merely hasn't been re-fetched yet gets trusted before the rest of
+    // it lands.
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "elapsed time alone, without an actual fresh connector re-observation, must not clear the guard"
+    );
+
+    // A genuine re-observation now lands (whether or not the value itself
+    // changes -- fetch_equity_rest bumps equity_fetch_generation on any
+    // successful connector read).
+    h.engine.instances[0].equity_fetch_generation += 1;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        !h.engine.instances[0].capital_position_seen_since_baseline,
+        "the guard clears once equity has genuinely changed, held steady since becoming flat, \
+         and a fresh connector observation has confirmed it"
+    );
+}
+
+// bot-strategy#783 (Codex P1 follow-up, fifth round): an ordinary close that
+// is already fully reflected in equity on its very first flat tick must
+// clear the position guard immediately -- it must not have to wait for
+// `equity_confirmed_settled`'s freshness window, which exists to cover a
+// different failure mode (equity moved with no accounting evidence to lean
+// on at all). `reconcile_capital_delta` only reaches `Reconciled` with a
+// material `accounted_pnl_delta` when the basis is an *exact* match (any
+// residual routes to `Ambiguous` instead, per its own guard), so a material
+// accounted_pnl_delta here is itself proof the equity move is fully
+// explained -- leaving the latch up regardless would misclassify the very
+// next genuine deposit/withdrawal as position-ambiguous for as long as it
+// takes the freshness guard to separately mature.
+#[test]
+fn reconciled_close_with_material_accounted_delta_clears_guard_immediately() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-guard-accounted-clear");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        // As if a position had been open since the last confirmed baseline
+        // (the ordinary open->flat transition latches this true).
+        inst.capital_position_seen_since_baseline = true;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+        // A $50 close, already fully reflected in equity by this first
+        // observation -- no freshness proof set up (capital_guard_*
+        // fields are left at their defaults), so if the guard clears here
+        // it can only be via the accounted-delta path, not the freshness
+        // fallback.
+        inst.total_pnl = 50.0;
+        inst.equity_cache = 1_050.0;
+    }
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+
+    let inst = &h.engine.instances[0];
+    assert!(
+        !inst.capital_position_seen_since_baseline,
+        "a material accounted_pnl_delta that fully explains the equity move \
+         must clear the guard on its first observation, without waiting for \
+         equity_confirmed_settled"
+    );
+    assert_eq!(inst.capital_baseline_equity, 1_050.0);
+    assert_eq!(inst.capital_baseline_accounted_pnl, Some(50.0));
+    assert!(
+        !inst.capital_rebaseline_deferred,
+        "a clean Reconciled disposition is never deferred"
+    );
+}
+
+// bot-strategy#783 (Codex P1 follow-up, fourth round): the position-guard's
+// own baseline_advanced escape hatch had the identical sub-threshold
+// accumulation bug the no-position Reconciled path already had fixed --
+// two individually-sub-threshold closes ($4 each against a $5 threshold)
+// each independently advancing the accounted anchor while equity stays
+// put, so the eventual delayed $8 equity refresh reconciles against an
+// anchor that already silently absorbed both instead of being compared as
+// a whole.
+#[test]
+fn position_guard_baseline_advance_retains_accumulated_sub_threshold_debt() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-guard-accum");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.capital_position_seen_since_baseline = true;
+        inst.session_start_equity = 1_000.0;
+        inst.session_equity_reference_usd = 1_000.0;
+        inst.equity_reference_usd = 1_000.0;
+        inst.flat_since = Some(Instant::now());
+    }
+
+    // First $4 win: equity_cache has not refreshed yet.
+    h.engine.instances[0].total_pnl = 4.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert_eq!(
+        h.engine.instances[0].capital_baseline_accounted_pnl,
+        Some(0.0),
+        "a fresh sub-threshold close within the cache-lag window must not advance the anchor"
+    );
+
+    // Second $4 win: still no equity refresh.
+    h.engine.instances[0].total_pnl = 8.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert_eq!(
+        h.engine.instances[0].capital_baseline_accounted_pnl,
+        Some(0.0),
+        "the anchor stays pinned to the original point so the two closes accumulate together"
+    );
+
+    // Equity finally catches up to reflect both wins.
+    h.engine.instances[0].equity_cache = 1_008.0;
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let inst = &h.engine.instances[0];
+    assert!(
+        !inst.capital_position_seen_since_baseline,
+        "the guard clears once equity fully explains the accumulated $8"
+    );
+    assert!(
+        (inst.session_start_equity - 1_000.0).abs() < 1e-9,
+        "the delayed $8 settlement must not be misclassified as a verified deposit"
+    );
+}
+
+// bot-strategy#783 Codex P1 follow-up: the false-to-true
+// capital_position_seen_since_baseline transition must be persisted so a
+// startup force-close (which can flatten a still-open position without
+// recording realized PnL) does not restore a stale `false` and get its
+// resulting equity settlement misclassified as a verified deposit/
+// withdrawal. But only that transition -- not every tick a position stays
+// open (Codex P2 follow-up: constant per-tick rewrites while a position is
+// simply held would defeat the sampling policy's deliberate avoidance of
+// per-tick disk writes).
+#[test]
+fn position_activity_latch_persists_only_on_the_false_to_true_transition() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-latch");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        inst.equity_cache = 1_000.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+    }
+    h.seed_aged_position(0);
+    assert!(
+        !h.engine.risk_state_path.exists(),
+        "no risk state written before the first capital-event tick"
+    );
+
+    h.engine.detect_capital_event_and_rebaseline(0);
+    let persisted = risk_io::load_risk_state(&h.engine.risk_state_path);
+    let persisted_inst = persisted
+        .instances
+        .get("hg-cap-latch")
+        .expect("the false-to-true latch transition is persisted");
+    assert!(persisted_inst.capital_position_seen_since_baseline);
+
+    // Still in the same position on the next tick: the latch is already
+    // true, so nothing changed and this tick must not rewrite the file.
+    std::fs::remove_file(&h.engine.risk_state_path).unwrap();
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        !h.engine.risk_state_path.exists(),
+        "no redundant persist while the latch is already true and the position is still open"
+    );
+}
+
+// bot-strategy#783 Codex P2 follow-up: a settled, flat account whose equity
+// and accounting have not moved since the last reconciliation must not
+// rewrite risk_state.json on every tick -- only a real change to either half
+// of the paired baseline (or a latch) is worth the write.
+#[test]
+fn reconciled_quiet_tick_does_not_persist_when_nothing_changed() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-cap-idle");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.equity_initialized = true;
+        // A real, one-time trade settlement: equity and accounted PnL move
+        // together by the same $10, so this reconciles cleanly and the
+        // paired baseline genuinely advances -- the first tick must persist.
+        inst.equity_cache = 1_010.0;
+        inst.total_pnl = 10.0;
+        inst.capital_baseline_equity = 1_000.0;
+        inst.capital_baseline_accounted_pnl = Some(0.0);
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.risk_state_path.exists(),
+        "a genuine baseline advance is persisted"
+    );
+
+    // Nothing moved since: same cached equity, same accounted PnL, already
+    // reconciled. Must not rewrite the file.
+    std::fs::remove_file(&h.engine.risk_state_path).unwrap();
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        !h.engine.risk_state_path.exists(),
+        "an idle, already-reconciled tick must not rewrite risk_state.json"
+    );
+
+    // A post-close guard can intentionally remain true while waiting for
+    // confirmed connector observations. Its current value is not itself a
+    // state transition and must not force the same synchronous rewrite on
+    // every intervening strategy tick.
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.capital_position_seen_since_baseline = true;
+        inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
+        inst.capital_guard_equity_snapshot = Some(inst.equity_cache);
+        inst.capital_guard_last_observed_equity = Some(inst.equity_cache);
+        inst.capital_guard_stable_since = Some(Instant::now());
+        inst.capital_guard_stable_since_generation = inst.equity_fetch_generation;
+    }
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "the unconfirmed post-close guard must remain latched"
+    );
+    assert!(
+        !h.engine.risk_state_path.exists(),
+        "an unchanged true guard must not rewrite risk_state.json every tick"
+    );
+}
+
 // A reference change at the restart boundary stays pending until the same
 // flat/settled observation used for capital detection. When a matching
 // transfer is present, the observed delta wins and the new reference is only
@@ -1039,6 +1985,7 @@ fn reference_change_and_redeposit_at_restart_reconcile_once() {
     let mut before = Harness::new("hg-cap-ref-restart");
     before.engine.cfg.risk.max_session_loss_bps = 500;
     before.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    before.engine.cfg.dry_run = false;
     before.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     let path = before.engine.risk_state_path.clone();
     let now = chrono::Utc::now().timestamp();
@@ -1061,6 +2008,7 @@ fn reference_change_and_redeposit_at_restart_reconcile_once() {
     restarted.engine.risk_state_path = path;
     restarted.engine.cfg.risk.max_session_loss_bps = 500;
     restarted.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    restarted.engine.cfg.dry_run = false;
     restarted.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     restarted.engine.instances[0].equity_reference_usd = 6_000.0;
     restarted.engine.load_risk_state();
@@ -1101,6 +2049,7 @@ fn legacy_snapshot_stale_denominator_reconciles_when_flat_settled() {
     let mut h = Harness::new("hg-cap-legacy");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     h.engine.instances[0].equity_reference_usd = 6_000.0;
     let now = chrono::Utc::now().timestamp();
@@ -1164,6 +2113,7 @@ fn legacy_snapshot_consistent_denominator_preserved_when_flat_settled() {
     let mut h = Harness::new("hg-cap-legacy-withdrawn");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1205,6 +2155,7 @@ fn legacy_snapshot_trustworthy_denominator_applies_detected_delta() {
     let mut h = Harness::new("hg-cap-legacy-delta-trustworthy");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1239,6 +2190,7 @@ fn legacy_snapshot_untrustworthy_denominator_discards_delta() {
     let mut h = Harness::new("hg-cap-legacy-delta-untrustworthy");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1278,6 +2230,7 @@ fn legacy_snapshot_preserved_despite_realized_pnl_baseline_drift() {
     let mut h = Harness::new("hg-cap-legacy-pnl-drift");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1287,6 +2240,7 @@ fn legacy_snapshot_preserved_despite_realized_pnl_baseline_drift() {
         inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
         inst.total_pnl = 100.0; // realized profit since the deposit
         inst.capital_baseline_equity = 1_600.0; // $1,500 basis + $100 realized profit
+        inst.capital_baseline_accounted_pnl = Some(100.0);
         inst.equity_cache = 1_600.0; // stable — no new capital event this tick
         inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
     }
@@ -1313,6 +2267,7 @@ fn legacy_snapshot_trustworthy_denominator_applies_delta_despite_realized_pnl() 
     let mut h = Harness::new("hg-cap-legacy-delta-pnl-drift");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1322,6 +2277,7 @@ fn legacy_snapshot_trustworthy_denominator_applies_delta_despite_realized_pnl() 
         inst.session_start_equity = 1_500.0; // config $1,000 + legitimate $500 deposit
         inst.total_pnl = 100.0; // realized profit since the deposit
         inst.capital_baseline_equity = 1_600.0; // $1,500 basis + $100 realized profit
+        inst.capital_baseline_accounted_pnl = Some(100.0);
         inst.equity_cache = 1_100.0; // $500 withdrawn while stopped
         inst.flat_since = Some(Instant::now() - Duration::from_secs(120));
     }
@@ -1351,6 +2307,7 @@ fn legacy_snapshot_with_cleared_baseline_preserves_denominator_on_round_transiti
     let mut h = Harness::new("hg-cap-legacy-cleared-baseline");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1386,6 +2343,7 @@ fn legacy_reference_reconciles_without_reanchoring_disabled_session_dd() {
     let mut h = Harness::new("hg-cap-legacy-disabled");
     h.engine.cfg.risk.max_session_loss_bps = 0;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     let now = chrono::Utc::now().timestamp();
     {
@@ -1431,6 +2389,7 @@ fn capital_delta_updates_daily_dd_denominator_when_session_dd_disabled() {
     h.engine.cfg.risk.max_session_loss_bps = 0;
     h.engine.cfg.risk.max_daily_loss_bps = 300;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1465,6 +2424,7 @@ fn reference_change_without_capital_event_adopts_new_reference_when_settled() {
     let mut h = Harness::new("hg-cap-ref-only");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
     {
         let inst = &mut h.engine.instances[0];
@@ -1495,6 +2455,7 @@ fn unrealized_pnl_while_in_position_does_not_rebaseline() {
     let mut h = Harness::new("hg-cap-trading");
     h.engine.cfg.risk.max_session_loss_bps = 500;
     h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.dry_run = false;
     h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
 
     let now = chrono::Utc::now().timestamp();
@@ -1581,6 +2542,86 @@ fn risk_ack_reanchor_clears_halt_and_resets_peak() {
     assert!(
         !Path::new(risk_ack_path()).exists(),
         "the ack sentinel is consumed"
+    );
+}
+
+// bot-strategy#783 (Codex P1 follow-up): step_shared processes the ack
+// before refreshing equity in the same tick, so an out-of-band halt flatten
+// whose PnL has not settled yet can still have a stale equity_cache when the
+// reanchor runs. The peak/candidate must still reanchor (the operator
+// explicitly asked for that), but the position guard must survive until a
+// confirmed-fresh equity read proves the stale reading is safe to trust.
+#[test]
+fn risk_ack_reanchor_keeps_position_guard_on_stale_equity() {
+    let _serial = gate_lock().lock().unwrap_or_else(|e| e.into_inner());
+    clear_sentinels();
+
+    let mut h = Harness::new("hg-ack-reanchor-guard");
+    h.engine.cfg.risk.max_session_loss_bps = 500;
+    h.engine.cfg.risk.session_dd_capital_event_min_usd = 5.0;
+    h.engine.cfg.risk.session_dd_capital_settle_secs = 0;
+    let now = chrono::Utc::now().timestamp();
+    {
+        let inst = &mut h.engine.instances[0];
+        inst.session_halted = true;
+        inst.session_halt_reason = Some("session_dd_500bps_lev1.0".to_string());
+        inst.session_halt_ts = Some(now);
+        inst.equity_initialized = true;
+        inst.equity_cache = 950.0;
+        inst.equity_samples = vec![EquitySample {
+            ts: now - 100,
+            equity: 1_003.0,
+        }];
+        // An out-of-band flatten just happened; its settlement has not
+        // landed in equity_cache yet (no successful fetch since).
+        inst.capital_position_seen_since_baseline = true;
+        inst.capital_rebaseline_deferred = true;
+        inst.capital_rebaseline_deferred_since = Some(Instant::now());
+        inst.flat_since = Some(Instant::now());
+    }
+
+    std::fs::write(risk_ack_path(), "ack by op: reanchor=true").unwrap();
+    h.engine.consume_risk_ack();
+
+    let inst = &h.engine.instances[0];
+    assert!(!inst.session_halted, "ack still clears the halt");
+    assert!(
+        (inst.equity_samples[0].equity - 950.0).abs() < 1e-9,
+        "peak still reanchors to current equity -- the operator explicitly asked for that"
+    );
+    assert!(
+        inst.capital_position_seen_since_baseline,
+        "the position guard survives a reanchor on stale (not confirmed-fresh) equity"
+    );
+    assert!(
+        !inst.capital_rebaseline_deferred && inst.capital_rebaseline_deferred_since.is_none(),
+        "reanchor replaces the paired baseline, so stale deferred state must be cleared"
+    );
+
+    // A quiet reconciliation against the new ack baseline must not mistake
+    // the cleared deferred marker for evidence that settlement completed.
+    h.engine.detect_capital_event_and_rebaseline(0);
+    assert!(
+        h.engine.instances[0].capital_position_seen_since_baseline,
+        "the next quiet tick must retain the unconfirmed settlement guard"
+    );
+
+    // Once equity is actually confirmed settled -- a normal reconciliation
+    // tick captured a snapshot (as detect_capital_event_and_rebaseline
+    // does), equity has since genuinely moved away from it, and it has
+    // held steady for the stability window -- a later reanchor does clear
+    // the guard.
+    h.engine.instances[0].session_halted = true;
+    h.engine.instances[0].capital_guard_equity_snapshot = Some(950.0);
+    h.engine.instances[0].equity_cache = 951.0;
+    h.engine.instances[0].capital_guard_stable_since =
+        Some(Instant::now() - Duration::from_secs(engine::risk::CAPITAL_GUARD_STABILITY_SECS + 1));
+    h.engine.instances[0].equity_fetch_generation += 1;
+    std::fs::write(risk_ack_path(), "ack by op: reanchor=true").unwrap();
+    h.engine.consume_risk_ack();
+    assert!(
+        !h.engine.instances[0].capital_position_seen_since_baseline,
+        "the guard clears once equity is confirmed settled"
     );
 }
 

@@ -38,6 +38,59 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// Per-instance live equity from the instance's connector.
     pub(in crate::pairtrade) equity_cache: f64,
     pub(in crate::pairtrade) last_equity_fetch: Option<Instant>,
+    /// `equity_cache`'s value captured at the moment
+    /// `detect_capital_event_and_rebaseline` most recently (re)started
+    /// requiring proof that a fresh observation has landed (whenever
+    /// `flat_since` or `capital_rebaseline_deferred_since` resets). A
+    /// timestamp of "when did a fetch last succeed" is not a reliable
+    /// freshness signal on its own: dex-connector's WS-derived
+    /// `balance_cache` means a "successful" fetch can return the
+    /// identical still-stale value if the underlying push that would
+    /// update it was never received (e.g. a missed fill event after a
+    /// startup force-close). Comparing the current reading against this
+    /// snapshot instead requires the actual *value* to have moved,
+    /// proving a genuine new observation landed (Codex P1 follow-up,
+    /// bot-strategy#783). Runtime only, not persisted.
+    pub(in crate::pairtrade) capital_guard_equity_snapshot: Option<f64>,
+    /// `equity_cache` as of the most recent tick that examined it, updated
+    /// unconditionally every `detect_capital_event_and_rebaseline` call
+    /// regardless of disposition. Paired with `capital_guard_stable_since`
+    /// to detect not just "has equity moved past the untrusted snapshot"
+    /// but "has it *stopped* moving": an unaccounted settlement that lands
+    /// in several separate updates (e.g. a two-leg close reported as -$2
+    /// then later -$8 more) must not be trusted the moment the first
+    /// partial update is observed, or the remaining, still-pending portion
+    /// gets compared against a baseline that already absorbed the first
+    /// partial move and gets misclassified as a fresh capital event once
+    /// it lands (Codex P1 follow-up, bot-strategy#783). Runtime only, not
+    /// persisted.
+    pub(in crate::pairtrade) capital_guard_last_observed_equity: Option<f64>,
+    /// When `capital_guard_last_observed_equity` most recently changed
+    /// value. A reading is only trusted as a *complete* settlement once it
+    /// has held steady for `CAPITAL_GUARD_STABILITY_SECS` -- not merely
+    /// once, on the very first tick that differs from the pre-close
+    /// snapshot. Runtime only, not persisted.
+    pub(in crate::pairtrade) capital_guard_stable_since: Option<Instant>,
+    /// Incremented every time `fetch_equity_rest` writes a genuinely
+    /// connector-sourced value into `equity_cache` (not on a fetch failure,
+    /// and not on the pre-init zero-reading skip). `CAPITAL_GUARD_STABILITY_SECS`
+    /// alone measures wall-clock time since `capital_guard_stable_since`
+    /// armed, but `equity_cache` is only actually refreshed on its own
+    /// `EQUITY_REFRESH_CACHE_SECS` (300s) cadence -- longer than the 60s
+    /// stability window. A value that lands, then sits frozen in the cache
+    /// for the next 60s with zero refresh attempts, would otherwise satisfy
+    /// the elapsed-time check without ever having been re-observed from the
+    /// exchange even once, so a still-in-flight multi-leg settlement's
+    /// remaining portion lands against a guard that already cleared (Codex
+    /// P1 follow-up, bot-strategy#783). Runtime only, not persisted.
+    pub(in crate::pairtrade) equity_fetch_generation: u64,
+    /// `equity_fetch_generation`'s value captured at the moment
+    /// `capital_guard_stable_since` most recently (re)armed. Stability is
+    /// only trusted once `equity_fetch_generation` has advanced past this,
+    /// proving at least one genuine connector observation landed during the
+    /// window (Codex P1 follow-up, bot-strategy#783). Runtime only, not
+    /// persisted.
+    pub(in crate::pairtrade) capital_guard_stable_since_generation: u64,
     /// False until the first successful `fetch_equity_rest` writes a
     /// connector-sourced balance into `equity_cache`. Not persisted —
     /// always starts false on engine boot. Gates session-DD evaluation
@@ -84,6 +137,11 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// status.json as `funding_carry_today` for dashboard attribution.
     /// bot-strategy#371.
     pub(in crate::pairtrade) funding_carry_today: f64,
+    /// Round-scoped cumulative funding carry. Unlike `funding_carry_today`,
+    /// this does not reset at UTC rollover: capital-event reconciliation
+    /// needs the full funding movement since its last settled baseline to
+    /// distinguish exchange settlement from a transfer. bot-strategy#783.
+    pub(in crate::pairtrade) total_funding_carry: f64,
     /// True once `realized_pnl_today` has breached
     /// `max_daily_loss_bps`. Used for transition logging only
     /// (activate/clear); the live gate check is recomputed every tick
@@ -93,10 +151,37 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// `risk.session_dd_sample_secs` cadence; entries older than
     /// `risk.session_dd_lookback_secs` are pruned in-place.
     pub(in crate::pairtrade) equity_samples: Vec<risk_io::EquitySample>,
-    /// bot-strategy#575 ①: last equity captured while continuously flat and
-    /// settled, the reference for deposit / withdrawal detection. 0.0 =
-    /// unset. Persisted via `InstanceRiskState`.
+    /// Last settled account equity used by capital reconciliation. It is
+    /// paired with `capital_baseline_accounted_pnl` so realized trade PnL and
+    /// funding that settle after a close are backed out before a transfer is
+    /// inferred. 0.0 = unset. Persisted via `InstanceRiskState`.
     pub(in crate::pairtrade) capital_baseline_equity: f64,
+    /// `total_pnl + total_funding_carry` captured with
+    /// `capital_baseline_equity`. `None` identifies a pre-#783 snapshot and
+    /// is migrated on the next flat/settled observation.
+    pub(in crate::pairtrade) capital_baseline_accounted_pnl: Option<f64>,
+    /// True after any position was observed since the paired baseline. Persisted
+    /// so an unaccounted recovery close cannot be mistaken for a transfer.
+    pub(in crate::pairtrade) capital_position_seen_since_baseline: bool,
+    /// Runtime-only latch that prevents an ambiguous post-close settlement
+    /// from emitting the same risk-history event on every tick. It never
+    /// authorizes a rebaseline; it clears only after accounting and equity
+    /// reconcile or a verified capital event lands.
+    pub(in crate::pairtrade) capital_rebaseline_deferred: bool,
+    /// Runtime-only: when the *current* deferred streak began. Some
+    /// ambiguous observations (e.g. a real transfer landing exactly when a
+    /// position closes with material PnL) can never satisfy the ordinary
+    /// `baseline_advanced` exit -- that requires the accounted delta itself
+    /// to be sub-threshold, which a genuine material close PnL never is --
+    /// leaving the account stuck deferred forever with no way to detect any
+    /// later capital event either. After `CAPITAL_REBASELINE_GIVEUP_SECS`
+    /// of continuous deferral, `detect_capital_event_and_rebaseline` gives
+    /// up: the anchor advances to the current reading so future events
+    /// remain detectable, without crediting this specific one to either
+    /// accounting or a transfer since it cannot disentangle them. Reset to
+    /// `None` whenever the deferred streak ends or restarts (mirrors
+    /// `flat_since`; not persisted).
+    pub(in crate::pairtrade) capital_rebaseline_deferred_since: Option<Instant>,
     /// bot-strategy#575 ①: when this instance most recently became flat
     /// (no open or pending positions). `detect_capital_event_and_rebaseline`
     /// requires `session_dd_capital_settle_secs` of continuous flatness

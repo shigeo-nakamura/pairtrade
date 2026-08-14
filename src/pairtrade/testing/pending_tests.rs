@@ -32,7 +32,7 @@ type ModifyCall = (
 );
 
 #[derive(Default)]
-struct DummyConnector {
+pub(in crate::pairtrade) struct DummyConnector {
     calls: Mutex<Vec<DummyCall>>,
     next_id: AtomicUsize,
     balance_calls: AtomicUsize,
@@ -82,11 +82,21 @@ struct DummyConnector {
     filled_by_symbol: Mutex<HashMap<String, VecDeque<FilledRows>>>,
     positions_script: Mutex<VecDeque<Vec<PositionSnapshot>>>,
     reject_reduce_only_orders: AtomicBool,
+    /// Optional ordering assertion for bot-strategy#783: the capital guard
+    /// must already be durable when the connector side effect begins.
+    guard_path_expected_before_create: Mutex<Option<std::path::PathBuf>>,
     positions_should_fail: AtomicBool,
     /// bot-strategy#721: threshold after which `get_positions` starts
     /// failing (mirrors `ticker_fail_after_calls`), so a test can serve
     /// one successful stale read and then fail the settle re-reads.
     positions_fail_after_calls: Mutex<Option<usize>>,
+    /// Codex P2 follow-up, bot-strategy#783: reject every create_order
+    /// call with DexError::ServerResponse (a completed round trip
+    /// carrying an explicit venue rejection) instead of the generic
+    /// Transient `reject_priced_orders`/`reject_reduce_only_orders`
+    /// produce, so tests can exercise the capital-guard unlatch path
+    /// that only fires on a definitive no-order-created rejection.
+    reject_orders_with_server_response: AtomicBool,
 }
 
 /// Scripted `(order_id, filled_size)` rows for one `get_filled_orders` call.
@@ -274,12 +284,28 @@ impl DexConnector for DummyConnector {
         reduce_only: bool,
         _expiry_secs: Option<u64>,
     ) -> Result<CreateOrderResponse, DexError> {
+        if let Some(path) = self
+            .guard_path_expected_before_create
+            .lock()
+            .unwrap()
+            .as_ref()
+        {
+            assert!(
+                path.exists(),
+                "capital guard must be persisted before connector create_order begins"
+            );
+        }
         let order_id = format!("test-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let ordered_price = price.unwrap_or(Decimal::ONE);
         self.calls
             .lock()
             .unwrap()
             .push((symbol.to_string(), size, side, price, reduce_only));
+        if self.reject_orders_with_server_response.load(Ordering::SeqCst) {
+            return Err(DexError::ServerResponse(
+                "insufficient balance (test)".to_string(),
+            ));
+        }
         if self.reject_priced_orders.load(Ordering::SeqCst) && price.is_some() {
             return Err(DexError::Transient("priced order rejected".to_string()));
         }
@@ -1348,6 +1374,334 @@ async fn reconcile_pending_orders_noop_when_no_pendings() {
     assert!(state.position.is_none());
 }
 
+/// Once entry preflight gates pass, the capital guard must be durable before
+/// the first connector create_order call. The awaited venue request can be
+/// accepted even if the process exits before its response reaches us.
+#[tokio::test]
+async fn place_pair_orders_persists_guard_before_first_submit() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+    *connector.guard_path_expected_before_create.lock().unwrap() =
+        Some(engine.risk_state_path.clone());
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let legs = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect("entry placement should succeed");
+
+    assert_eq!(legs.len(), 2);
+    assert!(engine.instances[0].capital_position_seen_since_baseline);
+    let persisted = risk_io::load_risk_state(&engine.risk_state_path);
+    assert!(persisted.instances["default"].capital_position_seen_since_baseline);
+}
+
+/// A pre-submit post-only pricing failure proves no venue side effect happened.
+/// It must not latch the capital guard or delay a later genuine transfer.
+#[tokio::test]
+async fn place_pair_orders_does_not_latch_guard_before_a_real_submit() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    *connector.ticker_fail_after_calls.lock().unwrap() = Some(0);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    // Quantization falls back to the requested sizes, but both the fresh
+    // ticker read and the decision-time price lookup fail before create_order.
+    let price_map = HashMap::new();
+    let err = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("missing post-only pricing must fail before submit");
+
+    assert!(format!("{err:#}").contains("Missing reference price"));
+    assert!(connector.calls.lock().unwrap().is_empty());
+    assert!(!engine.instances[0].capital_position_seen_since_baseline);
+    assert!(!engine.risk_state_path.exists());
+}
+
+/// Codex P2 follow-up, bot-strategy#783: create_order latches the guard
+/// before every single-shot attempt so a crash mid-call can't hide a real
+/// fill, but a DexError::ServerResponse means the venue definitively sent
+/// back a rejection -- no order was created. That latch must unwind so a
+/// later, genuine collateral top-up correctly reanchors instead of being
+/// absorbed as position-ambiguous.
+#[tokio::test]
+async fn place_pair_orders_unlatches_guard_after_a_definitive_no_order_rejection() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .reject_orders_with_server_response
+        .store(true, Ordering::SeqCst);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let err = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("a definitive venue rejection must surface as an error");
+
+    assert!(format!("{err:#}").contains("insufficient balance"));
+    assert!(
+        !engine.instances[0].capital_position_seen_since_baseline,
+        "guard must unwind after a definitive no-order-created rejection"
+    );
+    let persisted = risk_io::load_risk_state(&engine.risk_state_path);
+    assert!(!persisted.instances["default"].capital_position_seen_since_baseline);
+}
+
+/// The unlatch above must never clear a guard some *earlier*, genuine fill
+/// already latched this session -- only the exact attempt that set it may
+/// undo it.
+#[tokio::test]
+async fn place_pair_orders_definitive_rejection_does_not_clear_a_pre_existing_guard() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+    // Simulate an earlier, genuine fill in this session before this
+    // attempt's own latch/unlatch cycle runs.
+    engine.latch_capital_position_activity(0);
+    assert!(engine.instances[0].capital_position_seen_since_baseline);
+
+    connector
+        .reject_orders_with_server_response
+        .store(true, Ordering::SeqCst);
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let _ = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("a definitive venue rejection must surface as an error");
+
+    assert!(
+        engine.instances[0].capital_position_seen_since_baseline,
+        "a pre-existing guard from an earlier fill must survive untouched"
+    );
+}
+
+/// Fresh Codex finding beyond the single-shot case above (P2 follow-up,
+/// bot-strategy#783): a post-only entry config retries create_order up to
+/// POST_ONLY_ENTRY_ATTEMPTS times before giving up (entries never fall
+/// back to taker). If *every one* of those attempts comes back
+/// DexError::ServerResponse, no order was ever created at any point in
+/// the whole operation -- exactly as provable as the single-shot case,
+/// just spread across more attempts -- so the guard must still unwind.
+#[tokio::test]
+async fn place_pair_orders_unlatches_guard_when_every_post_only_retry_is_definitively_rejected() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .reject_orders_with_server_response
+        .store(true, Ordering::SeqCst);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0; // enables should_post_only()
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let err = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("every attempt definitively rejected must surface as an error");
+
+    assert!(format!("{err:#}").contains("insufficient balance"));
+    assert!(
+        !engine.instances[0].capital_position_seen_since_baseline,
+        "guard must unwind once every post-only retry attempt is proven \
+         to have created no order"
+    );
+    let persisted = risk_io::load_risk_state(&engine.risk_state_path);
+    assert!(!persisted.instances["default"].capital_position_seen_since_baseline);
+}
+
+/// Contrast case: if even one attempt in the same retry sequence is
+/// ambiguous (Transient) rather than definitive, the guard must stay
+/// latched -- that one attempt alone could have created real exposure.
+#[tokio::test]
+async fn place_pair_orders_keeps_guard_latched_if_any_post_only_retry_is_ambiguous() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    // Ambiguous (Transient) rejection on every priced (post-only) attempt --
+    // ambiguous, not definitive, so it must never unlatch.
+    connector.reject_priced_orders.store(true, Ordering::SeqCst);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let _ = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("every attempt ambiguously rejected must surface as an error");
+
+    assert!(
+        engine.instances[0].capital_position_seen_since_baseline,
+        "an ambiguous (Transient) attempt anywhere in the sequence must \
+         keep the guard latched"
+    );
+}
+
+/// Fresh Codex finding beyond the retry-loop case above (P2 follow-up,
+/// bot-strategy#783): if attempt 1 is a definitive DexError::ServerResponse
+/// and attempt 2's own pricing refresh then fails (never reaching
+/// create_order at all), the "missing reference price" early return must
+/// still unlatch -- every actual submission this operation made was
+/// definitively rejected, and a pricing failure that never even attempted
+/// an order can't change that.
+#[tokio::test]
+async fn place_pair_orders_unlatches_guard_when_a_later_retry_loses_pricing() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .reject_orders_with_server_response
+        .store(true, Ordering::SeqCst);
+    // Attempt 1's own ticker refresh succeeds (call 1); attempt 2's fails
+    // (call 2+), and the empty price_map below has nothing to fall back
+    // to, so attempt 2 hits the "missing reference price" early return.
+    *connector.ticker_fail_after_calls.lock().unwrap() = Some(1);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::new();
+
+    let err = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("a lost pricing refresh after a definitive rejection must still error");
+
+    assert!(format!("{err:#}").contains("Missing reference price"));
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        1,
+        "exactly one create_order attempt (attempt 1) should have run"
+    );
+    assert!(
+        !engine.instances[0].capital_position_seen_since_baseline,
+        "the guard must unwind: the one real attempt was definitively \
+         rejected, and the pricing failure that ended the loop never \
+         attempted an order at all"
+    );
+}
+
 #[tokio::test]
 async fn close_pair_orders_records_taker_mode_after_post_only_fallback() {
     let connector = Arc::new(DummyConnector::default());
@@ -1707,8 +2061,13 @@ async fn taker_fallback_drops_stale_refresh_when_final_attempt_refresh_fails() {
 /// can clean up the orphaned leg-A.
 #[test]
 fn register_partial_leg_failure_writes_pending_entry() {
+    use tempfile::TempDir;
+
     let connector = Arc::new(DummyConnector::default());
     let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
     seed_state(&mut engine, "AAA/BBB");
     let placed_legs = vec![PendingLeg {
         symbol: "AAA".to_string(),
@@ -1757,6 +2116,21 @@ fn register_partial_leg_failure_writes_pending_entry() {
     assert_eq!(pending.legs[0].symbol, "AAA");
     assert_eq!(pending.legs[0].order_id, "leg-a");
     assert_eq!(pending.direction, PositionDirection::LongSpread);
+    assert!(
+        engine.instances[0].capital_position_seen_since_baseline,
+        "a placed entry leg creates venue exposure and must latch the capital guard"
+    );
+    assert!(
+        engine.instances[0].flat_since.is_none(),
+        "partial entry exposure must clear the flat-settlement dwell"
+    );
+
+    let persisted = risk_io::load_risk_state(&engine.risk_state_path);
+    let persisted_inst = persisted
+        .instances
+        .get("default")
+        .expect("partial-entry guard transition must be persisted before returning");
+    assert!(persisted_inst.capital_position_seen_since_baseline);
 }
 
 /// Same surface, exit side: must land in `pending_exit` so the next
