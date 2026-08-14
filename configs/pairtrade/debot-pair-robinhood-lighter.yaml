@@ -1,7 +1,8 @@
 # Robinhood Chain Lighter launch configuration (#790/#794).
-# One BTC/ETH strategy only. Parameters clone the current promoted Round 9
-# production arm at a fixed $1,000 equity reference. Launch remains DRY_RUN
-# until the read-side soak and explicit live gate are complete.
+# One BTC/ETH strategy only. Parameters clone the Frankfurt canary to favor
+# frequent positions for points/airdrop farming, at a fixed $2,000 equity
+# reference. Launch remains DRY_RUN until the read-side soak and explicit live
+# gate are complete.
 
 dex_name: lighter
 rest_endpoint: https://api.rh.lighter.xyz
@@ -38,18 +39,19 @@ metrics_window_length: 240
 warm_start_mode: relaxed
 warm_start_min_bars: 60
 
-# Preserve the promoted Round 9 A/C multi-timeframe entry gate.
+# Preserve the Frankfurt canary multi-timeframe entry gate.
 mtf_windows: [15]
 mtf_z_min: 0.5
 
-# Current promoted Round 9 production parameters, single $1,000 arm.
-entry_z_score_base: 1.5
-entry_z_score_min: 1.0
-entry_z_score_max: 2.0
-exit_z_score: 0.1
-stop_loss_z_score: 8.0
-force_close_time_secs: 10800
-shutdown_grace_secs: 10860
+# Frankfurt canary parameters. The lower entry threshold is intentionally more
+# permissive than the production arm so the bot opens positions more often.
+entry_z_score_base: 1.0
+entry_z_score_min: 0.8
+entry_z_score_max: 1.5
+exit_z_score: 0.2
+stop_loss_z_score: 4.0
+force_close_time_secs: 7200
+shutdown_grace_secs: 7260
 
 # Post-stop cool-down (#316). 600 s blocks immediate re-entry after a
 # stop_loss_z exit on the same direction — Round 4 BT sweep on 5/3-5/8
@@ -62,8 +64,8 @@ stop_loss_cooldown_secs: 600
 risk_pct_per_trade: 0.40
 # Fixed reference matches the initial deposited collateral. Live equity drift
 # is intentionally not mixed into thresholds or sizing within the launch month.
-equity_usd_reference: 1000
-max_leverage: 10  # Round 4 (#278) bumped from 5. bps-based risk gates are leverage-invariant.
+equity_usd_reference: 2000
+max_leverage: 5  # Match canary; typical per-leg notional is about $2,000.
 max_loss_r_mult: 1.0
 
 # Execution
@@ -109,7 +111,7 @@ circuit_breaker_tier2_cooldown_secs: 3600
 # any leverage and changing max_leverage does not require rewriting the bps.
 # Typical 100–500 bps. See #185 leverage-neutralization amendment.
 risk:
-  # 300 bps at 10x is a 30% equity daily drawdown gate. Action `block`
+  # 300 bps at 5x is a 15% equity daily drawdown gate. Action `block`
   # refuses new entries while existing positions exit normally, auto-resume
   # at next UTC midnight.
   max_daily_loss_bps: 300
@@ -117,9 +119,10 @@ risk:
   daily_reset_utc_hour: 0
   # Phase 3-1: rolling-peak session DD. Sticky halt + auto-flatten of the
   # breaching instance, cleared only by `sudo touch /opt/debot-robinhood-lighter/RISK_ACK`.
-  # 50 bps at 10x is a 5% equity rolling-peak drawdown gate.
-  max_session_loss_bps: 50
+  # Match canary's 10% equity rolling-peak drawdown gate so normal execution
+  # noise does not prematurely stop the points-farming loop.
+  max_session_loss_bps: 200
   session_dd_lookback_secs: 2592000  # 30 d
   session_dd_sample_secs: 3600       # 1 h
-  # Per-leg cap: $1,000 reference × 10x leverage × 1.0 = $10,000.
+  # Per-leg cap: $2,000 reference × 5x leverage × 1.0 = $10,000.
   max_notional_headroom: 1.0
