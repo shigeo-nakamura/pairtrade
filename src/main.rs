@@ -52,10 +52,11 @@ async fn run_single() -> std::io::Result<()> {
     // process_start / version_info gauges via `/metrics`.
     debot::pairtrade::start_metrics_exporter();
     let cfg = PairTradeConfig::from_env_or_yaml().expect("invalid pair trade config");
+    let loaded_config_sha = cfg.config_source_sha256.clone();
     let mut engine = init_engine_with_retry(cfg)
         .await
         .expect("failed to initialize pair trade engine");
-    clear_restart_pending_after_initialization()?;
+    clear_restart_pending_after_initialization(loaded_config_sha.as_deref())?;
     engine.run().await.map_err(std::io::Error::other)
 }
 
@@ -64,18 +65,59 @@ async fn run_single() -> std::io::Result<()> {
 /// path (including credential decryption and connector initialization) has
 /// succeeded. An unset variable keeps this behavior opt-in for the dedicated
 /// deployment that owns the marker.
-fn clear_restart_pending_after_initialization() -> std::io::Result<()> {
+fn clear_restart_pending_after_initialization(
+    loaded_config_sha: Option<&str>,
+) -> std::io::Result<()> {
     let Some(path) = env::var_os("RESTART_PENDING_PATH").filter(|path| !path.is_empty()) else {
         return Ok(());
     };
+    clear_restart_pending_marker(std::path::Path::new(&path), loaded_config_sha)
+}
 
-    match std::fs::remove_file(&path) {
+fn clear_restart_pending_marker(
+    path: &std::path::Path,
+    loaded_config_sha: Option<&str>,
+) -> std::io::Result<()> {
+    let marker = match std::fs::read_to_string(path) {
+        Ok(marker) => marker,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let marker_sha = marker
+        .lines()
+        .find_map(|line| line.strip_prefix("new_sha="));
+    if marker_sha.is_none() || marker_sha != loaded_config_sha {
+        log::warn!(
+            "[STARTUP] preserving restart-pending marker: deployed sha does not match loaded config"
+        );
+        return Ok(());
+    }
+
+    match std::fs::remove_file(path) {
         Ok(()) => {
             log::info!("[STARTUP] cleared restart-pending marker after initialization");
             Ok(())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod restart_pending_tests {
+    use super::clear_restart_pending_marker;
+
+    #[test]
+    fn clears_only_a_marker_for_the_loaded_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("RESTART_PENDING");
+
+        std::fs::write(&marker, "new_sha=new\n").unwrap();
+        clear_restart_pending_marker(&marker, Some("old")).unwrap();
+        assert!(marker.exists());
+
+        clear_restart_pending_marker(&marker, Some("new")).unwrap();
+        assert!(!marker.exists());
     }
 }
 

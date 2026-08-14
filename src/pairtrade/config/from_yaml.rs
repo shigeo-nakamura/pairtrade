@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs::File;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -32,9 +31,10 @@ impl PairTradeConfig {
 
     pub fn from_yaml_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_ref = path.as_ref();
-        let file = File::open(path_ref)
-            .with_context(|| format!("failed to open PairTrade config {}", path_ref.display()))?;
-        let yaml: PairTradeYaml = serde_yaml::from_reader(file)
+        let yaml_bytes = std::fs::read(path_ref)
+            .with_context(|| format!("failed to read PairTrade config {}", path_ref.display()))?;
+        let config_source_sha256 = super::fingerprint::sha256_hex(&yaml_bytes);
+        let yaml: PairTradeYaml = serde_yaml::from_slice(&yaml_bytes)
             .with_context(|| format!("failed to parse PairTrade config {}", path_ref.display()))?;
 
         let history_file_from_yaml = yaml.history_file.is_some();
@@ -152,6 +152,7 @@ impl PairTradeConfig {
             risk: resolve_risk_config(yaml.risk.as_ref())?,
             round_id: yaml.round_id.clone(),
             config_source_path: Some(path_ref.display().to_string()),
+            config_source_sha256: Some(config_source_sha256),
         };
 
         cfg.apply_env_overrides(history_file_from_yaml, warm_start_min_from_yaml)?;
