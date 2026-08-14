@@ -65,7 +65,7 @@ risk_pct_per_trade: 0.40
 # Fixed reference matches the initial deposited collateral. Live equity drift
 # is intentionally not mixed into thresholds or sizing within the launch month.
 equity_usd_reference: 2000
-max_leverage: 5  # Match canary; typical per-leg notional is about $2,000.
+max_leverage: 20  # Points-farming profile; typical per-leg notional is about $8,000.
 max_loss_r_mult: 1.0
 
 # Execution
@@ -107,22 +107,22 @@ circuit_breaker_tier2_losses: 8
 circuit_breaker_tier2_cooldown_secs: 3600
 
 # Risk gates (bot-strategy#185). All bps fields are now leverage-invariant:
-# the bot multiplies them by max_leverage internally so a single value covers
-# any leverage and changing max_leverage does not require rewriting the bps.
+# the bot multiplies them by max_leverage internally. Keep the products below
+# stable when leverage changes so the effective equity drawdown limits stay fixed.
 # Typical 100–500 bps. See #185 leverage-neutralization amendment.
 risk:
-  # 300 bps at 5x is a 15% equity daily drawdown gate. Action `block`
+  # 75 bps at 20x is a 15% equity daily drawdown gate. Action `block`
   # refuses new entries while existing positions exit normally, auto-resume
   # at next UTC midnight.
-  max_daily_loss_bps: 300
+  max_daily_loss_bps: 75
   max_daily_loss_action: block
   daily_reset_utc_hour: 0
   # Phase 3-1: rolling-peak session DD. Sticky halt + auto-flatten of the
   # breaching instance, cleared only by `sudo touch /opt/debot-robinhood-lighter/RISK_ACK`.
-  # Match canary's 10% equity rolling-peak drawdown gate so normal execution
-  # noise does not prematurely stop the points-farming loop.
-  max_session_loss_bps: 200
+  # 50 bps at 20x preserves the canary-equivalent 10% equity rolling-peak
+  # drawdown gate while normal execution noise can keep the farming loop active.
+  max_session_loss_bps: 50
   session_dd_lookback_secs: 2592000  # 30 d
   session_dd_sample_secs: 3600       # 1 h
-  # Per-leg cap: $2,000 reference × 5x leverage × 1.0 = $10,000.
-  max_notional_headroom: 1.0
+  # Per-leg cap: $2,000 reference × 20x leverage × 0.25 = $10,000.
+  max_notional_headroom: 0.25
