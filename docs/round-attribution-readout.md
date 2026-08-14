@@ -2,6 +2,10 @@
 
 This runbook turns a pairtrade round readout into a repeatable attribution packet. It is diagnostic only: no YAML change, restart, or live config mutation belongs in this workflow.
 
+For the companion flat-collateral, external-MDD, bot-PnL divergence, pairwise
+opportunity, and execution snapshot, follow
+[`round-performance-snapshot.md`](round-performance-snapshot.md).
+
 ## Readout Checklist
 
 Work top to bottom; the preflight is a hard gate before any A/B/C scoring.
