@@ -61,7 +61,8 @@ struct PostOnlyOrderRequest<'a> {
 }
 
 /// See `PairTradeEngine::capital_guard_prior_state` /
-/// `unlatch_capital_guard_after_definitive_rejection`.
+/// `unlatch_capital_guard_if_no_order_was_ever_created`.
+#[derive(Clone, Copy)]
 struct CapitalGuardPriorState {
     inst_idx: usize,
     was_seen: bool,
@@ -767,6 +768,18 @@ impl PairTradeEngine {
         // attempt actually saw, instead of the stale decision-time `prices` map.
         #[allow(unused_assignments)]
         let mut last_submit_snapshot: Option<SymbolSnapshot> = None;
+        // Captured once, before the first attempt: every attempt below
+        // reuses the same inst_idx, and the guard can only ever transition
+        // false-to-true on the very first one, so this is the sole
+        // reference point unlatch needs regardless of how many attempts
+        // this operation ends up making.
+        let capital_guard_prior_state =
+            capital_guard_inst_idx.map(|inst_idx| self.capital_guard_prior_state(inst_idx));
+        // Whether *every* create_order attempt this operation has made so
+        // far definitively proved no order was created. A single ambiguous
+        // attempt anywhere latches this false permanently, since that one
+        // attempt alone could have created real exposure.
+        let mut capital_guard_every_attempt_definitively_rejected = true;
 
         let last_err = loop {
             attempt += 1;
@@ -799,8 +812,6 @@ impl PairTradeEngine {
                 }
                 None => self.order_submit_metadata(symbol, size, side, prices),
             };
-            let capital_guard_prior_state =
-                capital_guard_inst_idx.map(|inst_idx| self.capital_guard_prior_state(inst_idx));
             if let Some(inst_idx) = capital_guard_inst_idx {
                 self.latch_capital_position_activity(inst_idx);
             }
@@ -818,10 +829,12 @@ impl PairTradeEngine {
                     ));
                 }
                 Err(err) => {
+                    capital_guard_every_attempt_definitively_rejected &=
+                        matches!(err, DexError::ServerResponse(_));
                     if !use_post_only {
-                        self.unlatch_capital_guard_after_definitive_rejection(
+                        self.unlatch_capital_guard_if_no_order_was_ever_created(
                             capital_guard_prior_state,
-                            &err,
+                            capital_guard_every_attempt_definitively_rejected,
                         );
                         return Err(err);
                     }
@@ -877,13 +890,28 @@ impl PairTradeEngine {
                 }
                 None => self.order_submit_metadata(symbol, size, side, prices),
             };
-            return self
+            return match self
                 .connector
                 .create_order(symbol, size, side, None, None, reduce_only, None)
                 .await
-                .map(|response| Self::order_result_from_response(response, false, None, meta));
+            {
+                Ok(response) => Ok(Self::order_result_from_response(response, false, None, meta)),
+                Err(err) => {
+                    capital_guard_every_attempt_definitively_rejected &=
+                        matches!(err, DexError::ServerResponse(_));
+                    self.unlatch_capital_guard_if_no_order_was_ever_created(
+                        capital_guard_prior_state,
+                        capital_guard_every_attempt_definitively_rejected,
+                    );
+                    Err(err)
+                }
+            };
         }
 
+        self.unlatch_capital_guard_if_no_order_was_ever_created(
+            capital_guard_prior_state,
+            capital_guard_every_attempt_definitively_rejected,
+        );
         Err(last_err)
     }
 
@@ -1503,28 +1531,25 @@ impl PairTradeEngine {
     }
 
     /// Undo the optimistic latch `latch_capital_position_activity`
-    /// performed immediately before a single create_order attempt, but
-    /// only when every one of these holds:
-    /// - this exact attempt is the one that flipped the guard
-    ///   false-to-true (an already-latched guard from a genuine earlier
-    ///   fill this session must survive untouched);
-    /// - the connector error definitively proves the venue never created
-    ///   an order. `DexError::ServerResponse` means a completed HTTP
-    ///   round trip carrying an explicit non-2xx rejection (e.g.
-    ///   insufficient balance); every other variant either means the
-    ///   round trip's outcome is unknown (`Transient`) or is not returned
-    ///   by `create_order` at all.
-    ///
-    /// Deliberately scoped to the caller's single-shot (non-post-only, no
-    /// retry) branch only: once a post-only retry loop or taker-fallback
-    /// attempt has run, an *earlier* attempt in the same sequence may
-    /// have been genuinely ambiguous even if the last one was definitive,
-    /// so the guard must stay latched there regardless of how the final
-    /// attempt's error classifies.
-    fn unlatch_capital_guard_after_definitive_rejection(
+    /// performed before the first create_order attempt of one logical
+    /// placement operation (a single shot, or a post-only retry loop plus
+    /// optional taker fallback), but only when every one of these holds:
+    /// - this operation is the one that flipped the guard false-to-true
+    ///   (an already-latched guard from a genuine earlier fill this
+    ///   session must survive untouched);
+    /// - `definitively_no_order_created` is true, meaning *every* attempt
+    ///   this operation made returned `DexError::ServerResponse` -- a
+    ///   completed HTTP round trip carrying an explicit non-2xx rejection
+    ///   (e.g. insufficient balance). Every other variant either means a
+    ///   given attempt's outcome is unknown (`Transient`) or is not
+    ///   returned by `create_order` at all. A single ambiguous attempt
+    ///   anywhere in the sequence must keep the whole operation's guard
+    ///   latched, since that one attempt alone could have created real
+    ///   exposure even if every other attempt was definitively rejected.
+    fn unlatch_capital_guard_if_no_order_was_ever_created(
         &mut self,
         prior: Option<CapitalGuardPriorState>,
-        err: &DexError,
+        definitively_no_order_created: bool,
     ) {
         if self.cfg.dry_run {
             return;
@@ -1532,7 +1557,7 @@ impl PairTradeEngine {
         let Some(prior) = prior else {
             return;
         };
-        if prior.was_seen || !matches!(err, DexError::ServerResponse(_)) {
+        if prior.was_seen || !definitively_no_order_created {
             return;
         }
         let inst = &mut self.instances[prior.inst_idx];

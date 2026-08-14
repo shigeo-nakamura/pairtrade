@@ -981,7 +981,26 @@ impl PairTradeEngine {
                         // denominator can fail the trust check below and reset
                         // session_start_equity, resurrecting previously
                         // withdrawn capital (Codex P2 follow-up, bot-strategy#783).
-                        let migration_accounted_pnl = accounted_pnl + inst.funding_carry_today;
+                        //
+                        // Backfilling only this one-shot seed is not enough
+                        // (fresh Codex finding beyond the above): the *live*
+                        // total_funding_carry accumulator stays at its legacy
+                        // default of zero, so the very next reconciliation
+                        // recomputes accounted_pnl (total_pnl +
+                        // total_funding_carry, read fresh, not from this
+                        // seeded baseline) short by exactly the migrated
+                        // amount. With unchanged equity that looks like a
+                        // negative accounted-PnL move with no matching basis
+                        // change, so capital-event detection goes Ambiguous
+                        // and stays deferred for at least the give-up window
+                        // -- or repeatedly across restarts, since nothing
+                        // ever corrects the accumulator itself. Backfill it
+                        // too, once, so every future accounted_pnl already
+                        // includes what this legacy snapshot's
+                        // funding_carry_today represented.
+                        let legacy_funding_carry_today = inst.funding_carry_today;
+                        inst.total_funding_carry += legacy_funding_carry_today;
+                        let migration_accounted_pnl = accounted_pnl + legacy_funding_carry_today;
                         if reference_reconciliation_pending {
                             let current_capital_basis = equity - migration_accounted_pnl;
                             let legacy_denominator_trustworthy = legacy_reference
@@ -2140,6 +2159,12 @@ mod tests {
             Some(0.0),
             "the persisted baseline must reflect the same funding-inclusive \
              accounted PnL the trust check itself used"
+        );
+        assert_eq!(
+            inst.total_funding_carry, -10.0,
+            "the live accumulator must also be backfilled, or the very next \
+             reconciliation recomputes accounted_pnl short by the migrated \
+             amount and misclassifies unchanged equity as Ambiguous"
         );
     }
 

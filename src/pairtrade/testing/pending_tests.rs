@@ -1548,6 +1548,103 @@ async fn place_pair_orders_definitive_rejection_does_not_clear_a_pre_existing_gu
     );
 }
 
+/// Fresh Codex finding beyond the single-shot case above (P2 follow-up,
+/// bot-strategy#783): a post-only entry config retries create_order up to
+/// POST_ONLY_ENTRY_ATTEMPTS times before giving up (entries never fall
+/// back to taker). If *every one* of those attempts comes back
+/// DexError::ServerResponse, no order was ever created at any point in
+/// the whole operation -- exactly as provable as the single-shot case,
+/// just spread across more attempts -- so the guard must still unwind.
+#[tokio::test]
+async fn place_pair_orders_unlatches_guard_when_every_post_only_retry_is_definitively_rejected() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .reject_orders_with_server_response
+        .store(true, Ordering::SeqCst);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0; // enables should_post_only()
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let err = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("every attempt definitively rejected must surface as an error");
+
+    assert!(format!("{err:#}").contains("insufficient balance"));
+    assert!(
+        !engine.instances[0].capital_position_seen_since_baseline,
+        "guard must unwind once every post-only retry attempt is proven \
+         to have created no order"
+    );
+    let persisted = risk_io::load_risk_state(&engine.risk_state_path);
+    assert!(!persisted.instances["default"].capital_position_seen_since_baseline);
+}
+
+/// Contrast case: if even one attempt in the same retry sequence is
+/// ambiguous (Transient) rather than definitive, the guard must stay
+/// latched -- that one attempt alone could have created real exposure.
+#[tokio::test]
+async fn place_pair_orders_keeps_guard_latched_if_any_post_only_retry_is_ambiguous() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    // Ambiguous (Transient) rejection on every priced (post-only) attempt --
+    // ambiguous, not definitive, so it must never unlatch.
+    connector.reject_priced_orders.store(true, Ordering::SeqCst);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let _ = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("every attempt ambiguously rejected must surface as an error");
+
+    assert!(
+        engine.instances[0].capital_position_seen_since_baseline,
+        "an ambiguous (Transient) attempt anywhere in the sequence must \
+         keep the guard latched"
+    );
+}
+
 #[tokio::test]
 async fn close_pair_orders_records_taker_mode_after_post_only_fallback() {
     let connector = Arc::new(DummyConnector::default());
