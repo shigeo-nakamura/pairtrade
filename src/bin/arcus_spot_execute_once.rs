@@ -18,7 +18,10 @@ use debot::arcus_spot::{
     ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntimeCheckpointStore,
     ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode,
 };
-use dex_connector::{ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorderSnapshot};
+use dex_connector::{
+    ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig,
+    ArcusSpotRecorderSnapshot,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -322,6 +325,51 @@ fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<Pa
     Ok(parent.join("live-tick-pending-plan.json"))
 }
 
+/// Fixed, deterministic path -- next to the runtime checkpoint, alongside
+/// `live_tick_pending_plan_path` -- recording the `collection_finished_at`
+/// of the last recorder snapshot `live-tick` actually advanced `step_at`
+/// with. See `live_tick_snapshot_already_consumed`.
+fn live_tick_last_observation_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
+    let parent = config
+        .runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(parent.join("live-tick-last-observation.json"))
+}
+
+#[derive(Serialize, Deserialize)]
+struct LiveTickLastObservation {
+    collection_finished_at: chrono::DateTime<Utc>,
+}
+
+/// True when `collection_finished_at` exactly matches the last snapshot
+/// `live-tick` actually advanced `step_at` with -- a no-op tick, safe to
+/// skip entirely rather than re-consuming the same observation (Codex P2
+/// follow-up, pairtrade#186).
+fn live_tick_snapshot_already_consumed(
+    path: &Path,
+    collection_finished_at: chrono::DateTime<Utc>,
+) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let bytes = read_private_regular_file(path, "live-tick last observation")?;
+    let last: LiveTickLastObservation = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid live-tick last observation {}", path.display()))?;
+    Ok(last.collection_finished_at == collection_finished_at)
+}
+
+fn write_live_tick_last_observation(
+    path: &Path,
+    collection_finished_at: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(&LiveTickLastObservation {
+        collection_finished_at,
+    })
+    .context("failed to serialize live-tick last observation")?;
+    write_private_regular_file_atomic(path, &bytes)
+}
+
 fn usage() -> &'static str {
     "usage:
   arcus-spot-execute-once keygen PRIVATE_KEY_FILE
@@ -332,16 +380,21 @@ fn usage() -> &'static str {
   arcus-spot-execute-once auto-execute CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
   arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
-  arcus-spot-execute-once live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON
+  arcus-spot-execute-once live-tick CONFIG_YAML
 
-live-tick is the unattended-probe entry point: it evaluates the strategy
-signal (ArcusSpotRuntime::step_at) against one fresh recorder snapshot,
-always persists the resulting runtime checkpoint under an exclusive lock,
-and only when that genuinely decides WouldRotate does it build and dispatch
-a plan -- through the same policy-gated, signatureless path as
-auto-execute. Meant to be invoked on a timer shortly after each recorder
-snapshot lands; most ticks decide Observe and touch neither the KMS signer
-nor the network. Before dispatching, it durably writes the plan it built to
+live-tick is the unattended-probe entry point: it fetches exactly one live
+snapshot itself (the same public, read-only recorder client
+arcus-spot-propose-plan and the archival collector use -- never a
+caller-supplied file, which would have no authenticated origin), evaluates
+the strategy signal (ArcusSpotRuntime::step_at) against it, always persists
+the resulting runtime checkpoint under an exclusive lock, and only when
+that genuinely decides WouldRotate does it build and dispatch a plan --
+through the same policy-gated, signatureless path as auto-execute. Meant to
+be invoked on a timer; most ticks decide Observe and touch neither the KMS
+signer nor the submission network. A tick whose snapshot exactly repeats
+the last one it actually advanced step_at with (by collection_finished_at)
+is a no-op: re-consuming it would artificially reweight the z-score
+history. Before dispatching, it durably writes the plan it built to
 <runtime_state_path's directory>/live-tick-pending-plan.json (mode 0600);
 if the process exits after Submitted but before confirmation, recover with
 auto-resume CONFIG_YAML <that path>.
@@ -406,6 +459,18 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
         bail!(
             "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick pending-plan path {}",
             pending_plan_path.display()
+        );
+    }
+    // Same reasoning, for live-tick's other derived path: its atomic
+    // replace would just as easily destroy the checkpoint or ledger.
+    let last_observation_path = live_tick_last_observation_path(config)?;
+    if last_observation_path == config.ledger_path
+        || last_observation_path == config.runtime_state_path
+        || last_observation_path == pending_plan_path
+    {
+        bail!(
+            "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick last-observation path {}",
+            last_observation_path.display()
         );
     }
     config.runtime.normalize();
@@ -894,25 +959,50 @@ async fn main() -> Result<()> {
             )?;
             write_attempt(&attempt)
         }
-        [command, config_path, snapshot_path] if command == "live-tick" => {
+        [command, config_path] if command == "live-tick" => {
             // The unattended-probe entry point: evaluate the strategy
             // signal against one fresh recorder snapshot and, only if it
             // genuinely fires, dispatch through the exact same
             // policy-gated, signatureless path as `auto-execute`. Most
             // ticks decide `Observe` (no position warranted) and never
-            // touch the KMS signer or the network beyond the on-disk
-            // snapshot already written by the recorder timer -- this is
-            // the "future read-only daemon [that] must call step_at with
-            // the current UTC time" flagged as not-yet-built in this same
-            // doc (bot-strategy#772/#775, 7-day activity probe).
+            // touch the KMS signer or the network beyond the one read-only
+            // snapshot fetch below -- this is the "future read-only daemon
+            // [that] must call step_at with the current UTC time" flagged
+            // as not-yet-built in this same doc (bot-strategy#772/#775,
+            // 7-day activity probe).
             let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
             let config = parse_config(&config_bytes, Path::new(config_path))?;
             let policy = auto_execute_policy_from_admin_file()?;
             require_config_within_auto_execute_policy(&config, &policy)?;
 
-            let snapshot_bytes = read_private_regular_file(Path::new(snapshot_path), "recorder snapshot")?;
-            let snapshot: ArcusSpotRecorderSnapshot = serde_json::from_slice(&snapshot_bytes)
-                .with_context(|| format!("invalid recorder snapshot {snapshot_path}"))?;
+            // Fetch the snapshot live, from the same public, read-only
+            // recorder client the archival collector and
+            // arcus-spot-propose-plan use -- never from a caller-supplied
+            // file. An earlier version took RECORDER_SNAPSHOT_JSON as a
+            // second argument; read_private_regular_file only checks its
+            // mode/type, not its origin, so the executor identity could
+            // fabricate an internally-consistent snapshot (prices, route
+            // records) that drives step_at to EntrySignal even though the
+            // real market never crossed the threshold, dispatched through
+            // this exact signatureless path (Codex P1 follow-up,
+            // pairtrade#186). Fetching it here, the same way propose-plan
+            // does, means the snapshot's provenance is inherent rather
+            // than merely asserted.
+            let client = ArcusSpotClient::new(config.router.clone())
+                .context("invalid Arcus router configuration")?;
+            let recorder_config = ArcusSpotRecorderConfig::from_csv(
+                &format!(
+                    "{}/{}",
+                    config.runtime.pair.sell_symbol, config.runtime.pair.buy_symbol
+                ),
+                &config.runtime.notional_usd.normalize().to_string(),
+            )
+            .context(
+                "failed to build a single-pair recorder config from the runtime pair/notional",
+            )?;
+            let recorder = ArcusSpotRecorder::new(client, recorder_config)
+                .context("invalid Arcus recorder configuration")?;
+            let snapshot: ArcusSpotRecorderSnapshot = recorder.collect_once().await;
 
             let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             // Hold the same exclusive lock `execute`/`auto-execute` take
@@ -933,6 +1023,30 @@ async fn main() -> Result<()> {
                 ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
             let checkpoint_lock =
                 ledger_store_for_checkpoint.acquire_exclusive_lock(&config.runtime_state_path)?;
+
+            // step_at mutates sequence/signal-window/risk state
+            // unconditionally on every call, so re-evaluating the exact
+            // same observation twice (a retried invocation racing the
+            // next tick, or two ticks landing between genuinely fresh
+            // recorder data) would artificially consume warm-up samples
+            // and reweight the z-score history, intermittently creating
+            // or suppressing rotation signals (Codex P2 follow-up,
+            // pairtrade#186). Checked and updated under the same lock as
+            // the checkpoint read-modify-write below, so a concurrent tick
+            // can't race this check against this tick's own update.
+            let last_observation_path = live_tick_last_observation_path(&config)?;
+            if live_tick_snapshot_already_consumed(
+                &last_observation_path,
+                snapshot.collection_finished_at,
+            )? {
+                drop(checkpoint_lock);
+                eprintln!(
+                    "live-tick: snapshot already consumed (collection_finished_at={}), skipping",
+                    snapshot.collection_finished_at
+                );
+                return Ok(());
+            }
+
             let mut runtime = store.load_or_create(&config.runtime)?;
             let event = runtime.step_at(&snapshot, Utc::now());
             // Persisted unconditionally, independent of the decision below:
@@ -941,6 +1055,7 @@ async fn main() -> Result<()> {
             // because this run happened not to rotate would silently widen
             // gaps in the very history the entry/exit z-score needs.
             store.persist(&runtime)?;
+            write_live_tick_last_observation(&last_observation_path, snapshot.collection_finished_at)?;
             drop(checkpoint_lock);
 
             let plan = match event.decision.clone() {
@@ -1019,7 +1134,8 @@ mod tests {
         assert!(usage().contains("sign-approval"));
         assert!(usage().contains("auto-execute CONFIG_YAML PLAN_JSON"));
         assert!(usage().contains("auto-resume CONFIG_YAML PLAN_JSON"));
-        assert!(usage().contains("live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON"));
+        assert!(usage().contains("live-tick CONFIG_YAML"));
+        assert!(!usage().contains("live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON"));
         assert!(usage().contains("hash-config CONFIG_YAML"));
     }
 
@@ -1364,6 +1480,50 @@ runtime:
         );
         let error = validate_config(&mut config).unwrap_err();
         assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    #[test]
+    fn config_rejects_a_runtime_state_path_colliding_with_the_live_tick_last_observation_path() {
+        let mut config = execute_once_config(
+            "/var/lib/x/ledger.json",
+            "/var/lib/x/live-tick-last-observation.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick last-observation path"));
+    }
+
+    #[test]
+    fn config_rejects_a_ledger_path_colliding_with_the_live_tick_last_observation_path() {
+        let mut config = execute_once_config(
+            "/var/lib/x/live-tick-last-observation.json",
+            "/var/lib/x/runtime.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick last-observation path"));
+    }
+
+    #[test]
+    fn live_tick_snapshot_dedup_round_trips_and_detects_a_repeat() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live-tick-last-observation.json");
+        let first: chrono::DateTime<Utc> = "2026-08-14T00:00:00Z".parse().unwrap();
+        let second: chrono::DateTime<Utc> = "2026-08-14T00:00:05Z".parse().unwrap();
+
+        assert!(!live_tick_snapshot_already_consumed(&path, first).unwrap());
+
+        write_live_tick_last_observation(&path, first).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(live_tick_snapshot_already_consumed(&path, first).unwrap());
+        assert!(!live_tick_snapshot_already_consumed(&path, second).unwrap());
+
+        write_live_tick_last_observation(&path, second).unwrap();
+        assert!(!live_tick_snapshot_already_consumed(&path, first).unwrap());
+        assert!(live_tick_snapshot_already_consumed(&path, second).unwrap());
     }
 
     fn rotation_plan(trigger: &str) -> ArcusSpotRotationPlan {

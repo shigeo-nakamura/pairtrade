@@ -181,19 +181,39 @@ to skip. For a `live-tick`-originated attempt, PLAN_JSON is the file
 
 ## live-tick: the unattended-probe entry point
 
-    arcus-spot-execute-once live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON
+    arcus-spot-execute-once live-tick CONFIG_YAML
 
-Evaluates the strategy signal (`ArcusSpotRuntime::step_at`) against one
-fresh recorder snapshot at the current wall-clock time -- the "future
-read-only daemon [that] must call step_at with the current UTC time" flagged
-above as not yet built. Meant to be invoked on a timer shortly after each
-recorder snapshot lands. Every tick persists the resulting runtime
-checkpoint (under the same exclusive lock `execute`/`auto-execute` hold
-around their own dispatch, so a racing invocation can't clobber a
+Fetches exactly one live snapshot itself -- the same public, read-only
+recorder client `arcus-spot-propose-plan` and the archival collector use --
+and evaluates the strategy signal (`ArcusSpotRuntime::step_at`) against it
+at the current wall-clock time. This is the "future read-only daemon [that]
+must call step_at with the current UTC time" flagged above as not yet
+built. Meant to be invoked on a timer. Every tick persists the resulting
+runtime checkpoint (under the same exclusive lock `execute`/`auto-execute`
+hold around their own dispatch, so a racing invocation can't clobber a
 just-reconciled fill with stale state); only when the tick genuinely decides
 `WouldRotate` does it go on to build and dispatch a plan, through the same
 policy-gated path as `auto-execute`. Most ticks decide `Observe` and never
-touch the KMS signer or the network beyond the on-disk snapshot.
+touch the KMS signer or the submission network.
+
+An earlier version took `RECORDER_SNAPSHOT_JSON` as a second argument.
+`read_private_regular_file` only checks a file's mode and type, not its
+origin, so the executor identity could fabricate an internally-consistent
+snapshot (prices, route records) that drives `step_at` to `EntrySignal`
+even though the real market never crossed the threshold, dispatched
+through this exact signatureless path (Codex P1 follow-up, pairtrade#186).
+Fetching the snapshot live, the same way `propose-plan` does, means its
+provenance is inherent rather than merely asserted.
+
+Every call to `step_at` mutates the signal window and sequence
+unconditionally, whether or not it decides to rotate, so re-evaluating the
+exact same observation twice (a retried invocation racing the next tick,
+or two ticks landing between genuinely fresh recorder data) would
+artificially reweight the z-score history. `live-tick` compares each
+snapshot's `collection_finished_at` against
+`<runtime_state_path's directory>/live-tick-last-observation.json` (mode
+0600, updated under the same lock as the checkpoint) and treats an exact
+repeat as a no-op tick.
 
 Before dispatching, `live-tick` durably writes the plan it built, at mode
 0600, to `<runtime_state_path's directory>/live-tick-pending-plan.json`.
@@ -204,9 +224,9 @@ confirmed, recover with:
       <runtime_state_path's directory>/live-tick-pending-plan.json
 
 Config validation rejects `ledger_path`/`runtime_state_path` values that
-would resolve to this same derived path -- otherwise `live-tick`'s
-atomic-replace write would destroy the checkpoint or ledger file it was
-supposed to be sitting alongside.
+would resolve to either of these two derived paths -- otherwise
+`live-tick`'s atomic-replace write would destroy the checkpoint or ledger
+file it was supposed to be sitting alongside.
 
 ### Known limitation: the executor identity can reset its own state
 
