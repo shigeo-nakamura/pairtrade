@@ -90,6 +90,13 @@ struct DummyConnector {
     /// failing (mirrors `ticker_fail_after_calls`), so a test can serve
     /// one successful stale read and then fail the settle re-reads.
     positions_fail_after_calls: Mutex<Option<usize>>,
+    /// Codex P2 follow-up, bot-strategy#783: reject every create_order
+    /// call with DexError::ServerResponse (a completed round trip
+    /// carrying an explicit venue rejection) instead of the generic
+    /// Transient `reject_priced_orders`/`reject_reduce_only_orders`
+    /// produce, so tests can exercise the capital-guard unlatch path
+    /// that only fires on a definitive no-order-created rejection.
+    reject_orders_with_server_response: AtomicBool,
 }
 
 /// Scripted `(order_id, filled_size)` rows for one `get_filled_orders` call.
@@ -294,6 +301,11 @@ impl DexConnector for DummyConnector {
             .lock()
             .unwrap()
             .push((symbol.to_string(), size, side, price, reduce_only));
+        if self.reject_orders_with_server_response.load(Ordering::SeqCst) {
+            return Err(DexError::ServerResponse(
+                "insufficient balance (test)".to_string(),
+            ));
+        }
         if self.reject_priced_orders.load(Ordering::SeqCst) && price.is_some() {
             return Err(DexError::Transient("priced order rejected".to_string()));
         }
@@ -1440,6 +1452,100 @@ async fn place_pair_orders_does_not_latch_guard_before_a_real_submit() {
     assert!(connector.calls.lock().unwrap().is_empty());
     assert!(!engine.instances[0].capital_position_seen_since_baseline);
     assert!(!engine.risk_state_path.exists());
+}
+
+/// Codex P2 follow-up, bot-strategy#783: create_order latches the guard
+/// before every single-shot attempt so a crash mid-call can't hide a real
+/// fill, but a DexError::ServerResponse means the venue definitively sent
+/// back a rejection -- no order was created. That latch must unwind so a
+/// later, genuine collateral top-up correctly reanchors instead of being
+/// absorbed as position-ambiguous.
+#[tokio::test]
+async fn place_pair_orders_unlatches_guard_after_a_definitive_no_order_rejection() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .reject_orders_with_server_response
+        .store(true, Ordering::SeqCst);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let err = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("a definitive venue rejection must surface as an error");
+
+    assert!(format!("{err:#}").contains("insufficient balance"));
+    assert!(
+        !engine.instances[0].capital_position_seen_since_baseline,
+        "guard must unwind after a definitive no-order-created rejection"
+    );
+    let persisted = risk_io::load_risk_state(&engine.risk_state_path);
+    assert!(!persisted.instances["default"].capital_position_seen_since_baseline);
+}
+
+/// The unlatch above must never clear a guard some *earlier*, genuine fill
+/// already latched this session -- only the exact attempt that set it may
+/// undo it.
+#[tokio::test]
+async fn place_pair_orders_definitive_rejection_does_not_clear_a_pre_existing_guard() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+    // Simulate an earlier, genuine fill in this session before this
+    // attempt's own latch/unlatch cycle runs.
+    engine.latch_capital_position_activity(0);
+    assert!(engine.instances[0].capital_position_seen_since_baseline);
+
+    connector
+        .reject_orders_with_server_response
+        .store(true, Ordering::SeqCst);
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ]);
+
+    let _ = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("a definitive venue rejection must surface as an error");
+
+    assert!(
+        engine.instances[0].capital_position_seen_since_baseline,
+        "a pre-existing guard from an earlier fill must survive untouched"
+    );
 }
 
 #[tokio::test]

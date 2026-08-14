@@ -60,6 +60,14 @@ struct PostOnlyOrderRequest<'a> {
     capital_guard_inst_idx: Option<usize>,
 }
 
+/// See `PairTradeEngine::capital_guard_prior_state` /
+/// `unlatch_capital_guard_after_definitive_rejection`.
+struct CapitalGuardPriorState {
+    inst_idx: usize,
+    was_seen: bool,
+    flat_since: Option<Instant>,
+}
+
 pub(in crate::pairtrade) struct OrderSubmitMetadata {
     submitted_qty: Decimal,
     submit_ts_ms: i64,
@@ -791,6 +799,8 @@ impl PairTradeEngine {
                 }
                 None => self.order_submit_metadata(symbol, size, side, prices),
             };
+            let capital_guard_prior_state =
+                capital_guard_inst_idx.map(|inst_idx| self.capital_guard_prior_state(inst_idx));
             if let Some(inst_idx) = capital_guard_inst_idx {
                 self.latch_capital_position_activity(inst_idx);
             }
@@ -809,6 +819,10 @@ impl PairTradeEngine {
                 }
                 Err(err) => {
                     if !use_post_only {
+                        self.unlatch_capital_guard_after_definitive_rejection(
+                            capital_guard_prior_state,
+                            &err,
+                        );
                         return Err(err);
                     }
                     if attempt >= max_attempts || start.elapsed() >= max_elapsed {
@@ -1473,6 +1487,58 @@ impl PairTradeEngine {
         if !was_seen {
             self.persist_risk_state();
         }
+    }
+
+    /// Snapshot of the fields `latch_capital_position_activity` mutates,
+    /// taken immediately before calling it so a definitively-failed
+    /// single-shot attempt can be rolled back precisely rather than
+    /// guessed at afterwards (Codex P2 follow-up, bot-strategy#783).
+    fn capital_guard_prior_state(&self, inst_idx: usize) -> CapitalGuardPriorState {
+        let inst = &self.instances[inst_idx];
+        CapitalGuardPriorState {
+            inst_idx,
+            was_seen: inst.capital_position_seen_since_baseline,
+            flat_since: inst.flat_since,
+        }
+    }
+
+    /// Undo the optimistic latch `latch_capital_position_activity`
+    /// performed immediately before a single create_order attempt, but
+    /// only when every one of these holds:
+    /// - this exact attempt is the one that flipped the guard
+    ///   false-to-true (an already-latched guard from a genuine earlier
+    ///   fill this session must survive untouched);
+    /// - the connector error definitively proves the venue never created
+    ///   an order. `DexError::ServerResponse` means a completed HTTP
+    ///   round trip carrying an explicit non-2xx rejection (e.g.
+    ///   insufficient balance); every other variant either means the
+    ///   round trip's outcome is unknown (`Transient`) or is not returned
+    ///   by `create_order` at all.
+    ///
+    /// Deliberately scoped to the caller's single-shot (non-post-only, no
+    /// retry) branch only: once a post-only retry loop or taker-fallback
+    /// attempt has run, an *earlier* attempt in the same sequence may
+    /// have been genuinely ambiguous even if the last one was definitive,
+    /// so the guard must stay latched there regardless of how the final
+    /// attempt's error classifies.
+    fn unlatch_capital_guard_after_definitive_rejection(
+        &mut self,
+        prior: Option<CapitalGuardPriorState>,
+        err: &DexError,
+    ) {
+        if self.cfg.dry_run {
+            return;
+        }
+        let Some(prior) = prior else {
+            return;
+        };
+        if prior.was_seen || !matches!(err, DexError::ServerResponse(_)) {
+            return;
+        }
+        let inst = &mut self.instances[prior.inst_idx];
+        inst.capital_position_seen_since_baseline = false;
+        inst.flat_since = prior.flat_since;
+        self.persist_risk_state();
     }
 
     pub(in crate::pairtrade) fn register_partial_leg_failure(
