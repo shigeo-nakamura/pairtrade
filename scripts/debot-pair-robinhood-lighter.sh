@@ -21,6 +21,7 @@ export DEBOT_STATUS_ID=debot-pair-robinhood-lighter
 export LIGHTER_SKIP_SPOT_MARKETS=1
 export LIGHTER_STARTUP_JITTER_SECS=0
 export RISK_ACK_PATH="$STATE_DIR/RISK_ACK"
+export RESTART_PENDING_PATH="$STATE_DIR/RESTART_PENDING"
 
 if [ -f /opt/debot/lib/libsigner.so ]; then
     export LIGHTER_GO_PATH=/opt/debot/lib
@@ -28,7 +29,5 @@ if [ -f /opt/debot/lib/libsigner.so ]; then
 fi
 
 mkdir -p "$DEBOT_STATUS_DIR" "$STATE_DIR/history_archive_robinhood_lighter"
-# Reaching this point means config and credentials loaded successfully for this launch.
-rm -f "$STATE_DIR/RESTART_PENDING"
 cd "$STATE_DIR"
 exec /opt/debot/bin/debot

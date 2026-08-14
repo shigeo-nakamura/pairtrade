@@ -55,7 +55,28 @@ async fn run_single() -> std::io::Result<()> {
     let mut engine = init_engine_with_retry(cfg)
         .await
         .expect("failed to initialize pair trade engine");
+    clear_restart_pending_after_initialization()?;
     engine.run().await.map_err(std::io::Error::other)
+}
+
+/// A config deploy leaves this marker behind while the running service still
+/// uses the old file. Only acknowledge it after the complete engine startup
+/// path (including credential decryption and connector initialization) has
+/// succeeded. An unset variable keeps this behavior opt-in for the dedicated
+/// deployment that owns the marker.
+fn clear_restart_pending_after_initialization() -> std::io::Result<()> {
+    let Some(path) = env::var_os("RESTART_PENDING_PATH").filter(|path| !path.is_empty()) else {
+        return Ok(());
+    };
+
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            log::info!("[STARTUP] cleared restart-pending marker after initialization");
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 // Startup hardening for transient Lighter errors (bot-strategy#120). If
