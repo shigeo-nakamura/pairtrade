@@ -1,0 +1,46 @@
+{
+  "round": "round9",
+  "issue": "bot-strategy#751",
+  "service": "debot-pair-btceth",
+  "host_tag": "frankfurt",
+  "since": "2026-07-25T05:01:56Z",
+  "scheduled_until": "2026-08-22T05:01:56Z",
+  "daily_dd_lookback_days": 30,
+  "pre_window_guard_hours": 24,
+  "pair_match_tolerance_secs": 20,
+  "known_bot_pnl_bias_issue": "bot-strategy#750",
+  "equity_spike_filter": {
+    "enabled": true,
+    "threshold_bps": 1000,
+    "neighbor_tolerance_bps": 5
+  },
+  "variants": {
+    "a": {
+      "agent": "debot-pair-btceth-a",
+      "equity_reference_usd": 6000,
+      "start_collateral_usd": 6000.0093
+    },
+    "b": {
+      "agent": "debot-pair-btceth-b",
+      "equity_reference_usd": 1000,
+      "start_collateral_usd": 1000.0085
+    },
+    "c": {
+      "agent": "debot-pair-btceth-c",
+      "equity_reference_usd": 1000,
+      "start_collateral_usd": 1000.0038
+    }
+  },
+  "comparisons": [
+    {
+      "left": "b",
+      "right": "c",
+      "label": "B-C exit_z 0.2 vs 0.1"
+    },
+    {
+      "left": "a",
+      "right": "c",
+      "label": "A-C 6x execution size"
+    }
+  ]
+}

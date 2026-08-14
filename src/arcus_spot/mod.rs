@@ -7,6 +7,8 @@
 
 #[cfg(feature = "arcus-spot-live")]
 mod chain;
+#[cfg(feature = "arcus-spot-live")]
+mod checkpoint;
 mod config;
 #[cfg(feature = "arcus-spot-live")]
 mod execution_ledger;
@@ -19,6 +21,8 @@ mod runtime;
 
 #[cfg(feature = "arcus-spot-live")]
 pub use chain::*;
+#[cfg(feature = "arcus-spot-live")]
+pub use checkpoint::*;
 pub use config::*;
 #[cfg(feature = "arcus-spot-live")]
 pub use execution_ledger::*;

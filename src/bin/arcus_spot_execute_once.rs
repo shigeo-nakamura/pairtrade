@@ -15,8 +15,8 @@ use debot::arcus_spot::{
     build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision,
     ArcusSpotExecutionAttempt, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
     ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig,
-    ArcusSpotRotationPlan, ArcusSpotRuntime, ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent,
-    ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    ArcusSpotRotationPlan, ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig,
+    ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode,
 };
 use dex_connector::{ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorderSnapshot};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH};
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::{self, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -263,7 +263,7 @@ fn write_private_regular_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
                 temp.display(),
             )
         })?;
-        File::open(parent)?.sync_all()?;
+        fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
@@ -414,95 +414,6 @@ async fn executor_from_config(
         store,
         &config.runtime_state_path,
     )
-}
-
-const RUNTIME_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-struct ArcusSpotRuntimeCheckpoint {
-    schema_version: u32,
-    config: ArcusSpotRuntimeConfig,
-    state: ArcusSpotRuntimeState,
-}
-
-struct ArcusSpotRuntimeCheckpointStore {
-    path: PathBuf,
-}
-
-impl ArcusSpotRuntimeCheckpointStore {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn load_or_create(&self, config: &ArcusSpotRuntimeConfig) -> Result<ArcusSpotRuntime> {
-        if !self.path.exists() {
-            return ArcusSpotRuntime::new(config.clone()).map_err(anyhow::Error::msg);
-        }
-        let bytes = read_private_regular_file(&self.path, "runtime checkpoint")?;
-        let checkpoint: ArcusSpotRuntimeCheckpoint = serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid runtime checkpoint {}", self.path.display()))?;
-        if checkpoint.schema_version != RUNTIME_CHECKPOINT_SCHEMA_VERSION {
-            bail!("unsupported Arcus runtime checkpoint schema");
-        }
-        if checkpoint.config != *config {
-            bail!("Arcus runtime checkpoint config does not match approved config");
-        }
-        ArcusSpotRuntime::from_state(config.clone(), checkpoint.state)
-            .map_err(anyhow::Error::msg)
-            .context("invalid Arcus runtime checkpoint state")
-    }
-
-    fn persist(&self, runtime: &ArcusSpotRuntime) -> Result<()> {
-        let parent = self
-            .path
-            .parent()
-            .context("Arcus runtime_state_path has no parent")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .context("system clock precedes Unix epoch")?
-            .as_nanos();
-        let temp = parent.join(format!(
-            ".{}.tmp.{}.{}",
-            self.path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("runtime-state"),
-            std::process::id(),
-            stamp,
-        ));
-        let checkpoint = ArcusSpotRuntimeCheckpoint {
-            schema_version: RUNTIME_CHECKPOINT_SCHEMA_VERSION,
-            config: runtime.config().clone(),
-            state: runtime.state().clone(),
-        };
-        let result = (|| -> Result<()> {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&temp)
-                .with_context(|| format!("failed to create {}", temp.display()))?;
-            serde_json::to_writer_pretty(&mut file, &checkpoint)
-                .context("failed to serialize Arcus runtime checkpoint")?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            fs::rename(&temp, &self.path).with_context(|| {
-                format!(
-                    "failed to atomically replace {} with {}",
-                    self.path.display(),
-                    temp.display(),
-                )
-            })?;
-            File::open(parent)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result
-    }
 }
 
 fn finalize_reconciled_attempt(

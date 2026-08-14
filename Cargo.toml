@@ -113,3 +113,8 @@ required-features = ["arcus-spot-sdk"]
 name = "arcus-spot-execute-once"
 path = "src/bin/arcus_spot_execute_once.rs"
 required-features = ["arcus-spot-live"]
+
+[[bin]]
+name = "arcus-spot-propose-plan"
+path = "src/bin/arcus_spot_propose_plan.rs"
+required-features = ["arcus-spot-live"]
