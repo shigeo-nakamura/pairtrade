@@ -13,6 +13,7 @@ CONFIG_REL=configs/pairtrade/debot-pair-robinhood-lighter.yaml
 CONFIG_PATH="$INSTALL_DIR/$CONFIG_REL"
 STATE_DIR=/opt/debot-robinhood-lighter
 MARKER="$STATE_DIR/RESTART_PENDING"
+MARKER_LOCK="$STATE_DIR/RESTART_PENDING.lock"
 SERVICE=debot-pair-robinhood-lighter
 
 old_sha=missing
@@ -25,6 +26,10 @@ aws s3 sync "s3://$S3_BUCKET/debot/configs" "$INSTALL_DIR/configs"
 new_sha=$(sha256sum "$CONFIG_PATH" | awk "{print \$1}")
 if [ "$old_sha" != "$new_sha" ] && systemctl is-active --quiet "$SERVICE"; then
     install -d -o ec2-user -g ec2-user -m 0750 "$STATE_DIR"
+    touch "$MARKER_LOCK"
+    chown ec2-user:ec2-user "$MARKER_LOCK"
+    exec 9>"$MARKER_LOCK"
+    flock -x 9
     {
         echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "config=$CONFIG_PATH"

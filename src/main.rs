@@ -78,6 +78,16 @@ fn clear_restart_pending_marker(
     path: &std::path::Path,
     loaded_config_sha: Option<&str>,
 ) -> std::io::Result<()> {
+    use fs2::FileExt;
+
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(std::path::PathBuf::from(lock_path))?;
+    lock.lock_exclusive()?;
+
     let marker = match std::fs::read_to_string(path) {
         Ok(marker) => marker,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
