@@ -46,15 +46,18 @@ With `arcus-spot-live`, the library provides:
 - an atomic mode-0600 execution ledger with a pre-POST dispatch marker;
 - a library coordinator that connects fresh quote, chain preflight, signing,
   one-shot submit, status polling, and balance reconciliation;
-- a feature-gated one-shot CLI that requires a mode-0600 config, a mode-0600
-  fresh plan, and an Ed25519 signature -- over the canonical SHA-256 digest
-  of the validated config and plan, verified against a public key read from
+- a feature-gated one-shot CLI that requires a mode-0600 config and a
+  mode-0600 fresh plan on every invocation; `execute`/`resume` additionally
+  require an Ed25519 signature over the canonical SHA-256 digest of the
+  validated config and plan, verified against a public key read from
   `/etc/arcus-spot/approval_public_key`, a fixed path this process must not
   itself own or be able to write (checked via file ownership/mode, not an
   inherited environment variable or a config/plan field either of which the
-  same identity running `execute` could set) -- on every invocation; the
-  matching private key must never exist on this host, so the CLI can
-  request approval but cannot mint it itself;
+  same identity running `execute` could set); the matching private key must
+  never exist on this host, so the CLI can request approval but cannot mint
+  it itself. `auto-execute` (see below) intentionally skips this signature
+  requirement -- a narrow, explicit exception, not a change to `execute`/
+  `resume` themselves;
 - hard coordinator caps of at most 60-second-old plans, 100 bps slippage, ten
   reconciled swaps per UTC day, and deployer-pinned raw sell maxima;
 - exactly one submit attempt, sticky `UNKNOWN` on ambiguous delivery, safe
@@ -97,6 +100,28 @@ to execute:
     arcus-spot-execute-once sign-approval DIGEST APPROVAL_KEY_FILE
     arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
     arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
+
+## auto-execute: no offline approval signature
+
+    arcus-spot-execute-once auto-execute CONFIG_YAML PLAN_JSON
+
+Runs the exact same path as `execute` -- plan/config validation, runtime
+checkpoint consistency, on-chain preflight, exact-value Permit2, KMS
+signing, submission, and ledger persistence -- except it does not require
+`hash`/`sign-approval`/an Ed25519 signature at all. This is an explicit,
+narrow owner decision (bot-strategy#772, 2026-08-12): the offline-signing
+round trip exists to validate this execution path against the real Arcus
+API before trusting it unattended, and that validation already happened
+across the signed one-swap acceptance test attempts. While total
+inventory at risk stays small, the per-swap human-signing step is pure
+friction with no proportionate safety benefit. Every other gate `execute`
+enforces -- `max_plan_age_secs`/`max_quote_age_secs`, inventory floors,
+daily/cumulative loss stops, exact-value-only Permit2, slippage -- is
+unchanged. `execute`/`resume` themselves, and the approval-key/public-key
+trust model described above, are untouched and still available. Revisit
+this decision (return to requiring a signed `execute`, or add a
+scale-dependent threshold) before any inventory scale-up beyond what is
+currently approved on #772.
 
 ## Deterministic replay
 
