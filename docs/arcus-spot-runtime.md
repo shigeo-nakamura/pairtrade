@@ -207,13 +207,18 @@ provenance is inherent rather than merely asserted.
 
 Every call to `step_at` mutates the signal window and sequence
 unconditionally, whether or not it decides to rotate, so re-evaluating the
-exact same observation twice (a retried invocation racing the next tick,
-or two ticks landing between genuinely fresh recorder data) would
-artificially reweight the z-score history. `live-tick` compares each
-snapshot's `collection_finished_at` against
-`<runtime_state_path's directory>/live-tick-last-observation.json` (mode
-0600, updated under the same lock as the checkpoint) and treats an exact
-repeat as a no-op tick.
+exact same (or an out-of-order) observation twice would artificially
+reweight the z-score history. `step_at` itself tracks
+`collection_finished_at` of the last snapshot it genuinely advanced on, in
+`ArcusSpotRuntimeState::last_observation_at` -- part of the checkpointed
+state, not any individual caller's own bookkeeping -- and rejects a
+snapshot whose `collection_finished_at` is not strictly newer as a no-op
+`Observe { hold: StaleOrDuplicateObservation }` tick. Tracking this inside
+the shared step, under whichever lock the caller already holds around
+load/step_at/persist, is what correctly orders concurrent writers of the
+same checkpoint against each other: `live-tick` and `arcus-spot-propose-plan`
+both call `step_at`, and a per-binary sidecar could not see a fresher
+snapshot the other one had just persisted.
 
 Before dispatching, `live-tick` durably writes the plan it built, at mode
 0600, to `<runtime_state_path's directory>/live-tick-pending-plan.json`.
@@ -224,9 +229,9 @@ confirmed, recover with:
       <runtime_state_path's directory>/live-tick-pending-plan.json
 
 Config validation rejects `ledger_path`/`runtime_state_path` values that
-would resolve to either of these two derived paths -- otherwise
-`live-tick`'s atomic-replace write would destroy the checkpoint or ledger
-file it was supposed to be sitting alongside.
+would resolve to this derived path -- otherwise `live-tick`'s
+atomic-replace write would destroy the checkpoint or ledger file it was
+supposed to be sitting alongside.
 
 ### Known limitation: the executor identity can reset its own state
 

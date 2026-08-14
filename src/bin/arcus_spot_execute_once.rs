@@ -352,59 +352,6 @@ fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<Pa
     Ok(parent.join("live-tick-pending-plan.json"))
 }
 
-/// Fixed, deterministic path -- next to the runtime checkpoint, alongside
-/// `live_tick_pending_plan_path` -- recording the `collection_finished_at`
-/// of the last recorder snapshot `live-tick` actually advanced `step_at`
-/// with. See `live_tick_snapshot_already_consumed`.
-fn live_tick_last_observation_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
-    let parent = config
-        .runtime_state_path
-        .parent()
-        .context("Arcus runtime_state_path has no parent")?;
-    Ok(parent.join("live-tick-last-observation.json"))
-}
-
-#[derive(Serialize, Deserialize)]
-struct LiveTickLastObservation {
-    collection_finished_at: chrono::DateTime<Utc>,
-}
-
-/// True when `collection_finished_at` is not strictly newer than the last
-/// snapshot `live-tick` actually advanced `step_at` with -- a no-op tick,
-/// safe to skip entirely rather than re-consuming or reordering the
-/// observation history (Codex P2 follow-up, pairtrade#186).
-///
-/// Deliberately `<=`, not `==`: two `live-tick` invocations can fetch
-/// concurrently, and the one holding the older snapshot may acquire the
-/// checkpoint lock *after* the one holding the newer snapshot already
-/// advanced and persisted it. An equality-only check would let that late,
-/// strictly-older observation through, appending it after a chronologically
-/// later one and corrupting the signal history the entry/exit z-score
-/// depends on.
-fn live_tick_snapshot_already_consumed(
-    path: &Path,
-    collection_finished_at: chrono::DateTime<Utc>,
-) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let bytes = read_private_regular_file(path, "live-tick last observation")?;
-    let last: LiveTickLastObservation = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid live-tick last observation {}", path.display()))?;
-    Ok(collection_finished_at <= last.collection_finished_at)
-}
-
-fn write_live_tick_last_observation(
-    path: &Path,
-    collection_finished_at: chrono::DateTime<Utc>,
-) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(&LiveTickLastObservation {
-        collection_finished_at,
-    })
-    .context("failed to serialize live-tick last observation")?;
-    write_private_regular_file_atomic(path, &bytes)
-}
-
 fn usage() -> &'static str {
     "usage:
   arcus-spot-execute-once keygen PRIVATE_KEY_FILE
@@ -426,10 +373,13 @@ the resulting runtime checkpoint under an exclusive lock, and only when
 that genuinely decides WouldRotate does it build and dispatch a plan --
 through the same policy-gated, signatureless path as auto-execute. Meant to
 be invoked on a timer; most ticks decide Observe and touch neither the KMS
-signer nor the submission network. A tick whose snapshot exactly repeats
-the last one it actually advanced step_at with (by collection_finished_at)
-is a no-op: re-consuming it would artificially reweight the z-score
-history. Before dispatching, it durably writes the plan it built to
+signer nor the submission network. step_at itself (in the shared runtime,
+tracked in the checkpointed state so every writer of it -- live-tick and
+arcus-spot-propose-plan alike -- is covered) rejects a snapshot whose
+collection_finished_at is not strictly newer than the last one it actually
+advanced on: re-consuming or reordering an observation would artificially
+reweight the z-score history. Before dispatching, it durably writes the
+plan it built to
 <runtime_state_path's directory>/live-tick-pending-plan.json (mode 0600);
 if the process exits after Submitted but before confirmation, recover with
 auto-resume CONFIG_YAML <that path>.
@@ -549,19 +499,6 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
         bail!(
             "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick pending-plan path {}",
             pending_plan_path.display()
-        );
-    }
-    // Same reasoning, for live-tick's other derived path: its atomic
-    // replace would just as easily destroy the checkpoint or ledger.
-    let last_observation_path =
-        resolve_path_for_collision_check(&live_tick_last_observation_path(config)?);
-    if last_observation_path == ledger_path
-        || last_observation_path == runtime_state_path
-        || last_observation_path == pending_plan_path
-    {
-        bail!(
-            "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick last-observation path {}",
-            last_observation_path.display()
         );
     }
     config.runtime.normalize();
@@ -1115,30 +1052,15 @@ async fn main() -> Result<()> {
             let checkpoint_lock =
                 ledger_store_for_checkpoint.acquire_exclusive_lock(&config.runtime_state_path)?;
 
-            // step_at mutates sequence/signal-window/risk state
-            // unconditionally on every call, so re-evaluating the exact
-            // same observation twice (a retried invocation racing the
-            // next tick, or two ticks landing between genuinely fresh
-            // recorder data) would artificially consume warm-up samples
-            // and reweight the z-score history, intermittently creating
-            // or suppressing rotation signals (Codex P2 follow-up,
-            // pairtrade#186). Checked and updated under the same lock as
-            // the checkpoint read-modify-write below, so a concurrent tick
-            // can't race this check against this tick's own update.
-            let last_observation_path = live_tick_last_observation_path(&config)?;
-            if live_tick_snapshot_already_consumed(
-                &last_observation_path,
-                snapshot.collection_finished_at,
-            )? {
-                drop(checkpoint_lock);
-                eprintln!(
-                    "live-tick: snapshot already consumed (collection_finished_at={}), skipping",
-                    snapshot.collection_finished_at
-                );
-                return Ok(());
-            }
-
             let mut runtime = store.load_or_create(&config.runtime)?;
+            // step_at itself rejects a snapshot whose collection_finished_at
+            // is not strictly newer than the last one it genuinely advanced
+            // on -- tracked in the checkpointed state, under this same
+            // lock, rather than in any caller-local bookkeeping, so it
+            // correctly orders this invocation against a concurrent
+            // arcus-spot-propose-plan (or another live-tick) writing the
+            // same checkpoint (Codex P2 follow-up, pairtrade#186; see
+            // ArcusSpotRuntimeState::last_observation_at's doc comment).
             let event = runtime.step_at(&snapshot, Utc::now());
             // Persisted unconditionally, independent of the decision below:
             // the accumulated price-history window is exactly what next
@@ -1146,7 +1068,6 @@ async fn main() -> Result<()> {
             // because this run happened not to rotate would silently widen
             // gaps in the very history the entry/exit z-score needs.
             store.persist(&runtime)?;
-            write_live_tick_last_observation(&last_observation_path, snapshot.collection_finished_at)?;
             drop(checkpoint_lock);
 
             let plan = match event.decision.clone() {
@@ -1574,28 +1495,6 @@ runtime:
     }
 
     #[test]
-    fn config_rejects_a_runtime_state_path_colliding_with_the_live_tick_last_observation_path() {
-        let mut config = execute_once_config(
-            "/var/lib/x/ledger.json",
-            "/var/lib/x/live-tick-last-observation.json",
-            "1000",
-        );
-        let error = validate_config(&mut config).unwrap_err();
-        assert!(error.to_string().contains("live-tick last-observation path"));
-    }
-
-    #[test]
-    fn config_rejects_a_ledger_path_colliding_with_the_live_tick_last_observation_path() {
-        let mut config = execute_once_config(
-            "/var/lib/x/live-tick-last-observation.json",
-            "/var/lib/x/runtime.json",
-            "1000",
-        );
-        let error = validate_config(&mut config).unwrap_err();
-        assert!(error.to_string().contains("live-tick last-observation path"));
-    }
-
-    #[test]
     fn lexically_normalize_resolves_parent_dir_components() {
         assert_eq!(
             lexically_normalize(Path::new("/var/lib/x/sub/../runtime.json")),
@@ -1679,46 +1578,6 @@ runtime:
         assert!(error.to_string().contains("live-tick pending-plan path"));
     }
 
-    #[test]
-    fn live_tick_snapshot_dedup_round_trips_and_detects_a_repeat() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("live-tick-last-observation.json");
-        let first: chrono::DateTime<Utc> = "2026-08-14T00:00:00Z".parse().unwrap();
-        let second: chrono::DateTime<Utc> = "2026-08-14T00:00:05Z".parse().unwrap();
-
-        assert!(!live_tick_snapshot_already_consumed(&path, first).unwrap());
-
-        write_live_tick_last_observation(&path, first).unwrap();
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(live_tick_snapshot_already_consumed(&path, first).unwrap());
-        assert!(!live_tick_snapshot_already_consumed(&path, second).unwrap());
-
-        write_live_tick_last_observation(&path, second).unwrap();
-        assert!(live_tick_snapshot_already_consumed(&path, second).unwrap());
-    }
-
-    #[test]
-    fn live_tick_snapshot_dedup_rejects_a_late_older_observation() {
-        // Codex P2 follow-up, pairtrade#186: two live-tick invocations can
-        // fetch concurrently, and the one holding the older snapshot may
-        // acquire the checkpoint lock *after* the newer one already
-        // advanced and persisted it. An equality-only check would let that
-        // late, strictly-older observation through, corrupting the
-        // chronological signal history.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("live-tick-last-observation.json");
-        let older: chrono::DateTime<Utc> = "2026-08-14T00:00:00Z".parse().unwrap();
-        let newer: chrono::DateTime<Utc> = "2026-08-14T00:00:05Z".parse().unwrap();
-
-        write_live_tick_last_observation(&path, newer).unwrap();
-        assert!(
-            live_tick_snapshot_already_consumed(&path, older).unwrap(),
-            "an observation older than the last consumed one must be treated as a no-op"
-        );
-    }
 
     fn rotation_plan(trigger: &str) -> ArcusSpotRotationPlan {
         serde_json::from_value(serde_json::json!({

@@ -48,6 +48,9 @@ pub enum ArcusSpotHoldCode {
     InventoryFloor,
     RotationLimit,
     InventoryImbalance,
+    /// `collection_finished_at` was not strictly newer than
+    /// `state.last_observation_at` -- see its doc comment.
+    StaleOrDuplicateObservation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,6 +153,23 @@ pub struct ArcusSpotRuntimeState {
     pub inventory: ArcusSpotInventory,
     pub regime: ArcusSpotRegime,
     pub relative_log_price_history: Vec<f64>,
+    /// `collection_finished_at` of the last snapshot `step_at` genuinely
+    /// advanced on (not one it recognized as a repeat of this same field).
+    /// Tracked here, in the checkpointed state itself, rather than by any
+    /// individual caller: every writer of a shared checkpoint --
+    /// `arcus-spot-execute-once`'s `live-tick` and `arcus-spot-propose-plan`
+    /// alike -- calls `step_at`, and only a check inside it, under whichever
+    /// lock the caller already holds around load/step_at/persist, can
+    /// correctly order concurrent writers against each other. A per-caller
+    /// sidecar cannot: one writer's fresher snapshot can be persisted while
+    /// a second, slower writer is still fetching an older one, and that
+    /// second writer's own bookkeeping would have no way to know the
+    /// checkpoint had already moved past it (Codex P2 follow-up,
+    /// pairtrade#186). `None` for a pre-existing checkpoint that predates
+    /// this field -- the first `step_at` call after upgrade is never
+    /// treated as a repeat.
+    #[serde(default)]
+    pub last_observation_at: Option<DateTime<Utc>>,
     pub last_rotation_at: Option<DateTime<Utc>>,
     /// Quantity of the currently-held (bought) token still open from the
     /// entry that produced the current non-Neutral `regime`, denominated in
@@ -185,6 +205,7 @@ impl ArcusSpotRuntimeState {
             inventory,
             regime: ArcusSpotRegime::Neutral,
             relative_log_price_history: Vec::new(),
+            last_observation_at: None,
             last_rotation_at: None,
             rotated_quantity: None,
             initial_equity_usd: None,
@@ -481,6 +502,39 @@ impl ArcusSpotRuntime {
         snapshot: &ArcusSpotRecorderSnapshot,
         evaluation_time: DateTime<Utc>,
     ) -> ArcusSpotRuntimeEvent {
+        // Checked and updated together, before anything else mutates --
+        // see `last_observation_at`'s doc comment for why this must live
+        // here rather than in any individual caller. A repeat leaves
+        // sequence, the signal-window history, and every other field
+        // completely untouched: re-evaluating it would artificially
+        // consume warm-up samples and reweight the z-score history.
+        if let Some(last_observation_at) = self.state.last_observation_at {
+            if snapshot.collection_finished_at <= last_observation_at {
+                return self.event(RuntimeEventInput {
+                    sequence: self.state.sequence,
+                    observed_at: evaluation_time,
+                    inventory_before: self.state.inventory,
+                    regime_before: self.state.regime,
+                    token_a_reference_price_usd: None,
+                    token_b_reference_price_usd: None,
+                    relative_log_price: None,
+                    z_score: None,
+                    risk_before: None,
+                    decision: ArcusSpotDecision::Observe {
+                        hold: ArcusSpotHold::new(
+                            ArcusSpotHoldCode::StaleOrDuplicateObservation,
+                            format!(
+                                "snapshot collection_finished_at {} is not newer than the last \
+                                 observation this runtime already advanced ({last_observation_at})",
+                                snapshot.collection_finished_at
+                            ),
+                        ),
+                    },
+                });
+            }
+        }
+        self.state.last_observation_at = Some(snapshot.collection_finished_at);
+
         self.state.sequence = self.state.sequence.saturating_add(1);
         let sequence = self.state.sequence;
         let inventory_before = self.state.inventory;
@@ -3085,6 +3139,86 @@ mod tests {
         ));
         assert_eq!(event.relative_log_price, Some((150.0_f64 / 50.0_f64).ln()));
         assert_eq!(runtime.state().relative_log_price_history.len(), 1);
+    }
+
+    #[test]
+    fn step_at_rejects_a_repeated_observation() {
+        // Codex P2 follow-up, pairtrade#186: re-evaluating the exact same
+        // observation twice (a retried invocation, or two writers of the
+        // same checkpoint racing each other) must not mutate sequence or
+        // the signal-window history a second time.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let t1 = event_time();
+        let snapshot = snapshot_with_route_unavailable(t1, "150", "50");
+
+        let first = runtime.step_at(&snapshot, t1);
+        assert!(matches!(
+            first.decision,
+            ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::RouteUnavailable
+        ));
+        let sequence_after_first = runtime.state().sequence;
+        let history_len_after_first = runtime.state().relative_log_price_history.len();
+
+        let second = runtime.step_at(&snapshot, t1);
+        assert!(matches!(
+            second.decision,
+            ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::StaleOrDuplicateObservation
+        ));
+        assert_eq!(runtime.state().sequence, sequence_after_first);
+        assert_eq!(
+            runtime.state().relative_log_price_history.len(),
+            history_len_after_first
+        );
+        assert_eq!(second.sequence, first.sequence);
+    }
+
+    #[test]
+    fn step_at_rejects_an_out_of_order_observation() {
+        // A late writer holding an older snapshot (e.g. a concurrent
+        // arcus-spot-propose-plan that fetched before this runtime's more
+        // recent tick already advanced) must not be able to append an
+        // older observation after a newer one already landed.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let older = event_time();
+        let newer = older + chrono::Duration::seconds(5);
+
+        runtime.step_at(&snapshot_with_route_unavailable(newer, "150", "50"), newer);
+        let sequence_after_newer = runtime.state().sequence;
+
+        let late = runtime.step_at(&snapshot_with_route_unavailable(older, "150", "50"), newer);
+        assert!(matches!(
+            late.decision,
+            ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::StaleOrDuplicateObservation
+        ));
+        assert_eq!(runtime.state().sequence, sequence_after_newer);
+        assert_eq!(
+            runtime.state().last_observation_at,
+            Some(newer),
+            "the late, older observation must not overwrite the newer one already recorded"
+        );
+    }
+
+    #[test]
+    fn step_at_accepts_a_strictly_newer_observation() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let t1 = event_time();
+        let t2 = t1 + chrono::Duration::seconds(5);
+
+        runtime.step_at(&snapshot_with_route_unavailable(t1, "150", "50"), t1);
+        let sequence_after_first = runtime.state().sequence;
+        let history_len_after_first = runtime.state().relative_log_price_history.len();
+
+        let second = runtime.step_at(&snapshot_with_route_unavailable(t2, "150", "50"), t2);
+        assert!(matches!(
+            second.decision,
+            ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::RouteUnavailable
+        ));
+        assert_eq!(runtime.state().sequence, sequence_after_first + 1);
+        assert_eq!(
+            runtime.state().relative_log_price_history.len(),
+            history_len_after_first + 1
+        );
+        assert_eq!(runtime.state().last_observation_at, Some(t2));
     }
 
     fn snapshot_with_valid_row(collected_at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
