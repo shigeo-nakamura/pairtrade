@@ -188,6 +188,31 @@ confirmed, recover with:
     arcus-spot-execute-once auto-resume CONFIG_YAML \
       <runtime_state_path's directory>/live-tick-pending-plan.json
 
+### Known limitation: the executor identity can reset its own state
+
+`live-tick`/`auto-execute`/`auto-resume` run as the same OS identity
+(`arcus`) that owns `ledger_path` and `runtime_state_path`, because that
+identity must be able to write those files to persist state at all --
+that write access is not narrower than delete access. The
+`auto_execute_policy.json` digest pins *which config* this identity may run
+(closing the path-redirection and field-tampering gaps above), but it
+cannot stop the identity from deleting the ledger or checkpoint file
+directly: `load_or_create()` treats a missing file as first-run and
+silently recreates empty/default state, which would reset the accumulated
+daily swap count and runtime history (inventory, regime, frozen beta) an
+attacker or a bug in this identity's own tooling could otherwise not touch
+through CONFIG_YAML.
+
+A genuine fix requires privilege separation -- a distinct, more-privileged
+process or service owning the actual writes, with the executor only able to
+request them -- which is disproportionate engineering effort at the current
+inventory scale. This is an explicit, accepted owner decision (bot-strategy
+#772, PR #186, 2026-08-14), mirroring the earlier decision to skip the
+offline approval signature: while total inventory at risk stays small, this
+residual risk is accepted without further mitigation. Revisit alongside the
+`auto-execute` signature-skip decision before any inventory scale-up beyond
+what is currently approved on #772.
+
 ## Deterministic replay
 
 Build with the pinned Arcus connector feature and replay the recorder archive:
