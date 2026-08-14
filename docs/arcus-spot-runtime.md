@@ -123,6 +123,71 @@ this decision (return to requiring a signed `execute`, or add a
 scale-dependent threshold) before any inventory scale-up beyond what is
 currently approved on #772.
 
+In place of the signature, `auto-execute`/`auto-resume`/`live-tick` require
+CONFIG_YAML to match an administrator-approved digest recorded in a fixed,
+administrator-owned file at `/etc/arcus-spot/auto_execute_policy.json`
+(same ownership/mode trust model as `approval_public_key` above: not owned
+by the uid running this binary, not group- or other-writable, not a
+symlink). Its schema is a single field:
+
+    {"approved_config_sha256": "sha256:<hex>"}
+
+An earlier version of this policy compared `ledger_path`, `runtime_state_path`,
+and `maximum_sell_amount_raw` individually. That left every other field --
+`inventory_floor_raw`, `max_swaps_per_utc_day`, router/chain/token identities,
+gas/slippage buffers, and any field added later -- fully executor-controlled;
+a lowered `inventory_floor_raw`, for example, could let an unsigned plan
+violate the real floor, discoverable only after the on-chain swap. Binding
+the whole config by digest closes that class of gap by construction: these
+three commands only ever run against the byte-for-byte exact configuration
+an administrator approved.
+
+To provision or rotate `approved_config_sha256`, run on the execute host
+(or against an identical copy of CONFIG_YAML), then have an administrator
+write the printed digest into the policy file:
+
+    arcus-spot-execute-once hash-config CONFIG_YAML
+
+Any change to CONFIG_YAML -- intentional or not -- requires recomputing and
+redeploying this digest, or `auto-execute`/`auto-resume`/`live-tick` refuse
+to run against it.
+
+## auto-resume: signatureless recovery
+
+    arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
+
+The signatureless counterpart to `resume`, gated by the same
+`auto_execute_policy.json` digest as `auto-execute`. Needed because an
+`auto-execute` or `live-tick` attempt that comes back `Submitted` (not yet
+confirmed), or that crashes before runtime commit, otherwise has no recovery
+path that doesn't require the offline signature this command family exists
+to skip. For a `live-tick`-originated attempt, PLAN_JSON is the file
+`live-tick` itself wrote before dispatching -- see below.
+
+## live-tick: the unattended-probe entry point
+
+    arcus-spot-execute-once live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON
+
+Evaluates the strategy signal (`ArcusSpotRuntime::step_at`) against one
+fresh recorder snapshot at the current wall-clock time -- the "future
+read-only daemon [that] must call step_at with the current UTC time" flagged
+above as not yet built. Meant to be invoked on a timer shortly after each
+recorder snapshot lands. Every tick persists the resulting runtime
+checkpoint (under the same exclusive lock `execute`/`auto-execute` hold
+around their own dispatch, so a racing invocation can't clobber a
+just-reconciled fill with stale state); only when the tick genuinely decides
+`WouldRotate` does it go on to build and dispatch a plan, through the same
+policy-gated path as `auto-execute`. Most ticks decide `Observe` and never
+touch the KMS signer or the network beyond the on-disk snapshot.
+
+Before dispatching, `live-tick` durably writes the plan it built, at mode
+0600, to `<runtime_state_path's directory>/live-tick-pending-plan.json`.
+If the process exits after the swap is `Submitted` but before it is
+confirmed, recover with:
+
+    arcus-spot-execute-once auto-resume CONFIG_YAML \
+      <runtime_state_path's directory>/live-tick-pending-plan.json
+
 ## Deterministic replay
 
 Build with the pinned Arcus connector feature and replay the recorder archive:

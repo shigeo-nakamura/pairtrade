@@ -65,22 +65,29 @@ struct ArcusSpotExecuteOnceConfig {
 const APPROVAL_PUBLIC_KEY_PATH: &str = "/etc/arcus-spot/approval_public_key";
 const AUTO_EXECUTE_POLICY_PATH: &str = "/etc/arcus-spot/auto_execute_policy.json";
 
-/// Administrator-set ceiling for `auto-execute`/`auto-resume`, enforced
-/// independently of whatever CONFIG_YAML the executor identity supplies.
-/// Read from the same fixed, non-self-writable path pattern as
-/// `approval_public_key` (Codex P1 follow-up, pairtrade#186): without
-/// this, the executor identity could point `ledger_path`/
-/// `runtime_state_path` at a fresh location to reset the daily swap count
-/// and prior history, or raise `maximum_sell_amount_raw` past what was
-/// actually approved on bot-strategy#772 -- the offline signature
-/// `execute` requires is exactly what used to make those caller-controlled
-/// config values safe.
+/// Administrator-approved digest binding *the entire* CONFIG_YAML for
+/// `auto-execute`/`auto-resume`/`live-tick`, enforced independently of
+/// whatever config the executor identity actually supplies. Read from the
+/// same fixed, non-self-writable path pattern as `approval_public_key`.
+///
+/// An earlier version of this policy enumerated three fields
+/// (`ledger_path`, `runtime_state_path`, `maximum_sell_amount_raw`)
+/// individually. Codex correctly flagged that as insufficient (P1 follow-up,
+/// pairtrade#186): every field the enumeration *didn't* cover --
+/// `inventory_floor_raw`, `max_swaps_per_utc_day`, router/chain/token
+/// identities, gas/slippage buffers, and any future field -- stayed fully
+/// executor-controlled, so e.g. a lowered `inventory_floor_raw` could let an
+/// unsigned plan violate the real floor, discoverable only after the
+/// on-chain swap. A whole-config digest closes that class of gap by
+/// construction: `auto-execute`/`auto-resume`/`live-tick` only ever run
+/// against the byte-for-byte exact configuration an administrator approved,
+/// the same trust model `execute`'s Ed25519 signature uses over
+/// config+plan, just without the plan (which legitimately varies per swap
+/// with fresh quotes) and without requiring a human in the loop per swap.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArcusSpotAutoExecutePolicy {
-    ledger_path: PathBuf,
-    runtime_state_path: PathBuf,
-    max_sell_amount_raw: std::collections::BTreeMap<String, String>,
+    approved_config_sha256: String,
 }
 
 fn auto_execute_policy_from_admin_file() -> Result<ArcusSpotAutoExecutePolicy> {
@@ -118,45 +125,34 @@ fn auto_execute_policy_from_file(path: &Path) -> Result<ArcusSpotAutoExecutePoli
         .with_context(|| format!("invalid auto-execute policy file {}", path.display()))
 }
 
-/// Rejects a config whose caller-controlled `ledger_path`/
-/// `runtime_state_path`/`maximum_sell_amount_raw` fall outside what the
-/// administrator-owned policy actually approved, closing exactly the gap
-/// `execute`'s signature used to close (Codex P1 follow-up, pairtrade#186).
+/// Computes the same canonical digest form `approval_digest` uses for
+/// config+plan, but over CONFIG_YAML alone -- this is what an administrator
+/// hashes once to populate `approved_config_sha256`, and what every
+/// `auto-execute`/`auto-resume`/`live-tick` invocation recomputes to compare
+/// against it.
+fn auto_execute_config_digest(config: &ArcusSpotExecuteOnceConfig) -> Result<String> {
+    let canonical =
+        serde_json::to_vec(config).context("failed to serialize config for policy digest")?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
+/// Rejects any config that is not byte-for-byte the one an administrator
+/// approved, closing exactly the gap `execute`'s signature used to close
+/// (Codex P1 follow-up, pairtrade#186) -- without this, the executor
+/// identity could freely edit any field of its own CONFIG_YAML (ledger/
+/// checkpoint paths to reset accumulated state, sell ceilings, inventory
+/// floors, swap-per-day caps, router/chain/token identities, ...) and
+/// `auto-execute`/`auto-resume`/`live-tick` would run against it unchecked.
 fn require_config_within_auto_execute_policy(
     config: &ArcusSpotExecuteOnceConfig,
     policy: &ArcusSpotAutoExecutePolicy,
 ) -> Result<()> {
-    if config.ledger_path != policy.ledger_path {
+    let actual_digest = auto_execute_config_digest(config)?;
+    if actual_digest != policy.approved_config_sha256 {
         bail!(
-            "auto-execute config ledger_path {} does not match the administrator-approved path {}",
-            config.ledger_path.display(),
-            policy.ledger_path.display()
+            "auto-execute config does not match the administrator-approved configuration (expected {}, got {actual_digest})",
+            policy.approved_config_sha256
         );
-    }
-    if config.runtime_state_path != policy.runtime_state_path {
-        bail!(
-            "auto-execute config runtime_state_path {} does not match the administrator-approved path {}",
-            config.runtime_state_path.display(),
-            policy.runtime_state_path.display()
-        );
-    }
-    for (symbol, configured_max) in &config.executor.maximum_sell_amount_raw {
-        let ceiling_raw = policy.max_sell_amount_raw.get(symbol).ok_or_else(|| {
-            anyhow::anyhow!(
-                "auto-execute config sets maximum_sell_amount_raw for {symbol}, which has no administrator-approved ceiling"
-            )
-        })?;
-        let configured_value: u128 = configured_max.parse().with_context(|| {
-            format!("auto-execute config maximum_sell_amount_raw for {symbol} is not a valid raw amount")
-        })?;
-        let ceiling_value: u128 = ceiling_raw.parse().with_context(|| {
-            format!("auto-execute policy max_sell_amount_raw for {symbol} is not a valid raw amount")
-        })?;
-        if configured_value > ceiling_value {
-            bail!(
-                "auto-execute config maximum_sell_amount_raw for {symbol} ({configured_value}) exceeds the administrator-approved ceiling ({ceiling_value})"
-            );
-        }
     }
     Ok(())
 }
@@ -231,10 +227,72 @@ fn read_private_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))
 }
 
+/// Atomically writes `bytes` to `path` at mode 0600 (temp file + rename +
+/// parent-dir fsync), mirroring `ArcusSpotRuntimeCheckpointStore::persist`'s
+/// pattern so a reader never observes a partially-written file.
+fn write_private_regular_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("write"),
+        std::process::id(),
+        stamp,
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+            .with_context(|| format!("failed to create {}", temp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                temp.display(),
+            )
+        })?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Fixed, deterministic path -- next to the runtime checkpoint it describes
+/// -- where `live-tick` durably records the plan it is about to dispatch,
+/// before dispatching it. `execute`/`auto-execute` always take PLAN_JSON as
+/// an argument the caller already possesses; `live-tick` instead builds the
+/// plan itself from a fresh strategy evaluation, so without this there is
+/// nothing on disk for `auto-resume` to recover with if the process exits
+/// after a `Submitted`-but-unconfirmed dispatch (Codex P2 follow-up,
+/// pairtrade#186).
+fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
+    let parent = config
+        .runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(parent.join("live-tick-pending-plan.json"))
+}
+
 fn usage() -> &'static str {
     "usage:
   arcus-spot-execute-once keygen PRIVATE_KEY_FILE
   arcus-spot-execute-once hash CONFIG_YAML PLAN_JSON
+  arcus-spot-execute-once hash-config CONFIG_YAML
   arcus-spot-execute-once sign-approval DIGEST PRIVATE_KEY_FILE
   arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
   arcus-spot-execute-once auto-execute CONFIG_YAML PLAN_JSON
@@ -244,22 +302,27 @@ fn usage() -> &'static str {
 
 live-tick is the unattended-probe entry point: it evaluates the strategy
 signal (ArcusSpotRuntime::step_at) against one fresh recorder snapshot,
-always persists the resulting runtime checkpoint, and only when that
-genuinely decides WouldRotate does it build and dispatch a plan -- through
-the same policy-gated, signatureless path as auto-execute. Meant to be
-invoked on a timer shortly after each recorder snapshot lands; most ticks
-decide Observe and touch neither the KMS signer nor the network.
+always persists the resulting runtime checkpoint under an exclusive lock,
+and only when that genuinely decides WouldRotate does it build and dispatch
+a plan -- through the same policy-gated, signatureless path as
+auto-execute. Meant to be invoked on a timer shortly after each recorder
+snapshot lands; most ticks decide Observe and touch neither the KMS signer
+nor the network. Before dispatching, it durably writes the plan it built to
+<runtime_state_path's directory>/live-tick-pending-plan.json (mode 0600);
+if the process exits after Submitted but before confirmation, recover with
+auto-resume CONFIG_YAML <that path>.
 
 auto-execute/auto-resume/live-tick skip the offline human approval signature
 (explicit owner decision while total inventory at risk stays small -- see
 the comment at their call sites). Every other gate execute/resume enforce
 is unchanged: plan/config validation, staleness, on-chain preflight,
 exact-value Permit2, slippage, and loss stops. In place of the signature,
-CONFIG_YAML's ledger_path, runtime_state_path, and maximum_sell_amount_raw
-must match an administrator-owned policy file at
-/etc/arcus-spot/auto_execute_policy.json (same ownership/mode trust model
-as approval_public_key) -- otherwise the executor identity could bypass
-the daily swap cap and stakes ceiling by supplying fresh values itself.
+CONFIG_YAML must byte-for-byte match the exact configuration an
+administrator approved by sha256 digest, recorded in an administrator-owned
+policy file at /etc/arcus-spot/auto_execute_policy.json (same ownership/mode
+trust model as approval_public_key, see docs/arcus-spot-runtime.md for its
+schema) -- otherwise the executor identity could bypass the daily swap cap,
+stakes ceiling, or any other config field by supplying fresh values itself.
 
 keygen/sign-approval are meant to run on a separate, offline machine: the
 resulting private key file must never be copied to the host that runs
@@ -737,6 +800,15 @@ async fn main() -> Result<()> {
             println!("{}", approval_digest(&config, &plan)?);
             Ok(())
         }
+        [command, config_path] if command == "hash-config" => {
+            // What an administrator runs once, against the exact CONFIG_YAML
+            // being deployed, to populate auto_execute_policy.json's
+            // approved_config_sha256 -- see docs/arcus-spot-runtime.md.
+            let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
+            let config = parse_config(&config_bytes, Path::new(config_path))?;
+            println!("{}", auto_execute_config_digest(&config)?);
+            Ok(())
+        }
         [command, digest, key_path] if command == "sign-approval" => {
             let signing_key = read_ed25519_signing_key(Path::new(key_path))?;
             let signature = signing_key.sign(digest.as_bytes());
@@ -873,6 +945,24 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("invalid recorder snapshot {snapshot_path}"))?;
 
             let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            // Hold the same exclusive lock `execute`/`auto-execute` take
+            // before dispatch, but scoped to just this read-modify-write: a
+            // concurrent live-tick, auto-execute, or auto-resume racing this
+            // one could otherwise commit a reconciled fill (new inventory,
+            // regime, and idempotency key) between this tick's load and
+            // persist, and this tick's persist would then silently replace
+            // that newer state with one computed from the pre-fill
+            // snapshot, letting a later tick re-plan against a position
+            // that no longer exists. Released before executor_from_config
+            // acquires its own fresh lock on the same namespace below --
+            // holding it across dispatch too would make that acquisition
+            // conflict with this one from inside the same process, since
+            // flock is scoped per open file description, not per process
+            // (Codex P1 follow-up, pairtrade#186).
+            let ledger_store_for_checkpoint =
+                ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+            let checkpoint_lock =
+                ledger_store_for_checkpoint.acquire_exclusive_lock(&config.runtime_state_path)?;
             let mut runtime = store.load_or_create(&config.runtime)?;
             let event = runtime.step_at(&snapshot, Utc::now());
             // Persisted unconditionally, independent of the decision below:
@@ -881,6 +971,7 @@ async fn main() -> Result<()> {
             // because this run happened not to rotate would silently widen
             // gaps in the very history the entry/exit z-score needs.
             store.persist(&runtime)?;
+            drop(checkpoint_lock);
 
             let plan = match event.decision.clone() {
                 ArcusSpotDecision::WouldRotate { plan } => plan,
@@ -889,6 +980,17 @@ async fn main() -> Result<()> {
                 }
             };
             let plan_config_digest = approval_digest(&config, &plan)?;
+            // Durably record the plan before dispatching it: unlike
+            // execute/auto-execute, live-tick builds this plan itself
+            // rather than receiving it as an argument the caller already
+            // holds a copy of, so without this write, a crash or exit
+            // between submission and confirmation leaves nothing for
+            // `auto-resume` to recover with (Codex P2 follow-up,
+            // pairtrade#186).
+            let pending_plan_path = live_tick_pending_plan_path(&config)?;
+            let plan_bytes = serde_json::to_vec_pretty(&plan)
+                .context("failed to serialize Arcus live-tick plan")?;
+            write_private_regular_file_atomic(&pending_plan_path, &plan_bytes)?;
             let mut executor = executor_from_config(&config).await?;
             // Re-read fresh, same reasoning as `execute`'s own comment
             // above: the plan above was computed before the ledger lock
@@ -948,6 +1050,7 @@ mod tests {
         assert!(usage().contains("auto-execute CONFIG_YAML PLAN_JSON"));
         assert!(usage().contains("auto-resume CONFIG_YAML PLAN_JSON"));
         assert!(usage().contains("live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON"));
+        assert!(usage().contains("hash-config CONFIG_YAML"));
     }
 
     fn live_runtime_config() -> ArcusSpotRuntimeConfig {
@@ -1179,6 +1282,15 @@ cumulative_loss_limit_usd: "10"
         runtime_state_path: &str,
         max_sell_nvda: &str,
     ) -> ArcusSpotExecuteOnceConfig {
+        execute_once_config_with_daily_cap(ledger_path, runtime_state_path, max_sell_nvda, 10)
+    }
+
+    fn execute_once_config_with_daily_cap(
+        ledger_path: &str,
+        runtime_state_path: &str,
+        max_sell_nvda: &str,
+        max_swaps_per_utc_day: u32,
+    ) -> ArcusSpotExecuteOnceConfig {
         serde_yaml::from_str(&format!(
             r#"
 router:
@@ -1222,7 +1334,7 @@ executor:
   maximum_sell_amount_raw:
     NVDA: "{max_sell_nvda}"
     AMD: "21084353605755395"
-  max_swaps_per_utc_day: 10
+  max_swaps_per_utc_day: {max_swaps_per_utc_day}
   max_plan_age_secs: 60
 ledger_path: {ledger_path}
 runtime_state_path: {runtime_state_path}
@@ -1257,21 +1369,16 @@ runtime:
         .unwrap()
     }
 
-    fn auto_execute_policy(ledger_path: &str, runtime_state_path: &str, max_sell_nvda: &str) -> ArcusSpotAutoExecutePolicy {
+    fn auto_execute_policy_for(config: &ArcusSpotExecuteOnceConfig) -> ArcusSpotAutoExecutePolicy {
         ArcusSpotAutoExecutePolicy {
-            ledger_path: PathBuf::from(ledger_path),
-            runtime_state_path: PathBuf::from(runtime_state_path),
-            max_sell_amount_raw: std::collections::BTreeMap::from([
-                ("NVDA".to_string(), max_sell_nvda.to_string()),
-                ("AMD".to_string(), "21084353605755395".to_string()),
-            ]),
+            approved_config_sha256: auto_execute_config_digest(config).unwrap(),
         }
     }
 
     #[test]
-    fn auto_execute_policy_accepts_a_config_within_limits() {
+    fn auto_execute_policy_accepts_a_config_matching_the_approved_digest() {
         let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
-        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy_for(&config);
         require_config_within_auto_execute_policy(&config, &policy).unwrap();
     }
 
@@ -1280,52 +1387,61 @@ runtime:
         // Without this, the executor identity could point ledger_path at a
         // fresh, empty file to silently reset the daily swap count and
         // prior attempt history that the real ledger accumulates.
+        let approved = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy_for(&approved);
         let config = execute_once_config("/tmp/attacker-chosen/ledger.json", "/var/lib/x/runtime.json", "1000");
-        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
         let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
-        assert!(error.to_string().contains("ledger_path"));
+        assert!(error
+            .to_string()
+            .contains("does not match the administrator-approved configuration"));
     }
 
     #[test]
     fn auto_execute_policy_rejects_a_redirected_runtime_state_path() {
+        let approved = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy_for(&approved);
         let config = execute_once_config("/var/lib/x/ledger.json", "/tmp/attacker-chosen/runtime.json", "1000");
-        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
         let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
-        assert!(error.to_string().contains("runtime_state_path"));
+        assert!(error
+            .to_string()
+            .contains("does not match the administrator-approved configuration"));
     }
 
     #[test]
-    fn auto_execute_policy_rejects_a_sell_ceiling_raised_past_the_administrator_limit() {
+    fn auto_execute_policy_rejects_a_sell_ceiling_raised_past_the_administrator_approved_value() {
+        let approved = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy_for(&approved);
         let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "999999999999");
-        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
         let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
-        assert!(error.to_string().contains("maximum_sell_amount_raw"));
+        assert!(error
+            .to_string()
+            .contains("does not match the administrator-approved configuration"));
     }
 
     #[test]
-    fn auto_execute_policy_accepts_a_sell_ceiling_at_or_below_the_limit() {
-        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
-        let policy = auto_execute_policy("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
-        require_config_within_auto_execute_policy(&config, &policy).unwrap();
-    }
-
-    #[test]
-    fn auto_execute_policy_rejects_a_symbol_with_no_administrator_ceiling() {
-        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
-        let policy = ArcusSpotAutoExecutePolicy {
-            ledger_path: PathBuf::from("/var/lib/x/ledger.json"),
-            runtime_state_path: PathBuf::from("/var/lib/x/runtime.json"),
-            max_sell_amount_raw: std::collections::BTreeMap::new(),
-        };
+    fn auto_execute_policy_rejects_a_field_the_old_field_by_field_check_never_covered() {
+        // Regression guard for the exact gap Codex flagged (P1 follow-up,
+        // pairtrade#186): the earlier policy shape only compared
+        // ledger_path/runtime_state_path/maximum_sell_amount_raw, so a
+        // change to any other field -- like max_swaps_per_utc_day here --
+        // would have passed silently. Digest-binding the whole config
+        // closes that regardless of which field changes.
+        let approved =
+            execute_once_config_with_daily_cap("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000", 10);
+        let policy = auto_execute_policy_for(&approved);
+        let config =
+            execute_once_config_with_daily_cap("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000", 999);
         let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
-        assert!(error.to_string().contains("no administrator-approved ceiling"));
+        assert!(error
+            .to_string()
+            .contains("does not match the administrator-approved configuration"));
     }
 
     #[test]
     fn auto_execute_policy_file_owned_by_this_process_is_rejected() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("auto_execute_policy.json");
-        fs::write(&path, r#"{"ledger_path":"/x","runtime_state_path":"/y","max_sell_amount_raw":{}}"#).unwrap();
+        fs::write(&path, r#"{"approved_config_sha256":"sha256:00"}"#).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let error = auto_execute_policy_from_file(&path).unwrap_err();
         assert!(error.to_string().contains("administrator-owned"));
@@ -1335,7 +1451,7 @@ runtime:
     fn auto_execute_policy_file_that_is_group_writable_is_rejected() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("auto_execute_policy.json");
-        fs::write(&path, r#"{"ledger_path":"/x","runtime_state_path":"/y","max_sell_amount_raw":{}}"#).unwrap();
+        fs::write(&path, r#"{"approved_config_sha256":"sha256:00"}"#).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
         let error = auto_execute_policy_from_file(&path).unwrap_err();
         // Group-writable AND owned by this process -- the ownership check
@@ -1384,7 +1500,7 @@ runtime:
     fn auto_execute_policy_symlink_is_rejected() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("real_policy.json");
-        fs::write(&target, r#"{"ledger_path":"/x","runtime_state_path":"/y","max_sell_amount_raw":{}}"#).unwrap();
+        fs::write(&target, r#"{"approved_config_sha256":"sha256:00"}"#).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         let link = dir.path().join("auto_execute_policy.json");
         std::os::unix::fs::symlink(&target, &link).unwrap();
