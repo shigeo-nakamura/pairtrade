@@ -1,0 +1,125 @@
+# Robinhood Chain Lighter launch configuration (#790/#794).
+# One BTC/ETH strategy only. Parameters clone the current promoted Round 9
+# production arm at a fixed $1,000 equity reference. Launch remains DRY_RUN
+# until the read-side soak and explicit live gate are complete.
+
+dex_name: lighter
+rest_endpoint: https://api.rh.lighter.xyz
+web_socket_endpoint: wss://api.rh.lighter.xyz/stream
+dry_run: true
+agent_name: debot-pair-robinhood-lighter
+
+# Data dump for BT (independent of trading; observe_only must be set explicitly)
+enable_data_dump: true
+data_dump_file: /opt/debot-robinhood-lighter/market_data_btceth_robinhood_lighter.jsonl
+observe_only: false
+
+# Hourly snapshot archive for BT replay warm-start (#69)
+# 360 days retention ≈ 168 MB / 8640 files — covers year-long replays and
+# ad-hoc historical analysis at trivial disk cost.
+history_archive_dir: /opt/debot-robinhood-lighter/history_archive_robinhood_lighter
+history_archive_retention_days: 360
+
+# Fixed pair: BTC/ETH only
+universe_pairs:
+- BTC/ETH
+max_active_pairs: 1
+
+# Timing
+interval_secs: 5
+trading_period_secs: 60
+
+# Pair diagnostics (simplified: relaxed thresholds)
+pair_selection_lookback_hours_short: 1
+pair_selection_lookback_hours_long: 2
+adf_p_threshold: 0.15
+half_life_max_hours: 2.0
+metrics_window_length: 240
+warm_start_mode: relaxed
+warm_start_min_bars: 60
+
+# Preserve the promoted Round 9 A/C multi-timeframe entry gate.
+mtf_windows: [15]
+mtf_z_min: 0.5
+
+# Current promoted Round 9 production parameters, single $1,000 arm.
+entry_z_score_base: 1.5
+entry_z_score_min: 1.0
+entry_z_score_max: 2.0
+exit_z_score: 0.1
+stop_loss_z_score: 8.0
+force_close_time_secs: 10800
+shutdown_grace_secs: 10860
+
+# Post-stop cool-down (#316). 600 s blocks immediate re-entry after a
+# stop_loss_z exit on the same direction — Round 4 BT sweep on 5/3-5/8
+# byte-exact (#278): Calmar 1.330 vs 0/1800/3600/7200 baselines
+# (1.109/1.104/1.055/0.760), MaxDD -25%, PnL -9.4%. Catches the 6-min
+# re-entry pathology observed on 2026-05-04 regime shift.
+stop_loss_cooldown_secs: 600
+
+# Risk
+risk_pct_per_trade: 0.40
+# Fixed reference matches the initial deposited collateral. Live equity drift
+# is intentionally not mixed into thresholds or sizing within the launch month.
+equity_usd_reference: 1000
+max_leverage: 10  # Round 4 (#278) bumped from 5. bps-based risk gates are leverage-invariant.
+max_loss_r_mult: 1.0
+
+# Execution
+cooldown_secs: 60
+slippage_bps: 0
+fee_bps: 0
+entry_post_only_timeout_secs: 30
+
+# Filters (relaxed: let z-score do the work)
+spread_velocity_max_sigma_per_min: 0.15
+spread_trend_max_slope_sigma: 1.0
+beta_divergence_max: 0.30
+beta_min: 0.30
+hedge_ratio_max_deviation: 0.20
+entry_vol_lookback_hours: 2
+vol_spike_mult: 3.0
+net_funding_min_per_hour: -0.01
+reeval_jump_z_mult: 1.5
+
+# Phase 2 filters (BT 2026-04-05: beta_gap=3.0 best, +$0.84 vs baseline +$0.20)
+entry_velocity_block_sigma_per_min: 0.0
+funding_entry_z_scale: 0.0
+beta_gap_entry_z_scale: 3.0
+
+# Std collapse guard (bot-strategy#62). Root cause (warm_start single-OLS-beta
+# artifact) was fixed via snapshot v2 spread_history persistence. Guard remains
+# as a hard gate against real-market std collapse: blocks entries when
+# std < 20% of the rolling median of the last 60 bar stds. 11-day observe-only
+# data (2026-04-16 → 2026-04-27) showed only one ~4h episode with |z| ≤ 1.25
+# (no entries blocked), confirming flip-to-block is risk-free.
+std_collapse_window_bars: 60
+std_collapse_min_ratio: 0.2
+std_collapse_observe_only: false
+
+# Circuit breaker
+circuit_breaker_tier1_losses: 5
+circuit_breaker_tier1_cooldown_secs: 600
+circuit_breaker_tier2_losses: 8
+circuit_breaker_tier2_cooldown_secs: 3600
+
+# Risk gates (bot-strategy#185). All bps fields are now leverage-invariant:
+# the bot multiplies them by max_leverage internally so a single value covers
+# any leverage and changing max_leverage does not require rewriting the bps.
+# Typical 100–500 bps. See #185 leverage-neutralization amendment.
+risk:
+  # 300 bps at 10x is a 30% equity daily drawdown gate. Action `block`
+  # refuses new entries while existing positions exit normally, auto-resume
+  # at next UTC midnight.
+  max_daily_loss_bps: 300
+  max_daily_loss_action: block
+  daily_reset_utc_hour: 0
+  # Phase 3-1: rolling-peak session DD. Sticky halt + auto-flatten of the
+  # breaching instance, cleared only by `sudo touch /opt/debot-robinhood-lighter/RISK_ACK`.
+  # 50 bps at 10x is a 5% equity rolling-peak drawdown gate.
+  max_session_loss_bps: 50
+  session_dd_lookback_secs: 2592000  # 30 d
+  session_dd_sample_secs: 3600       # 1 h
+  # Per-leg cap: $1,000 reference × 10x leverage × 1.0 = $10,000.
+  max_notional_headroom: 1.0
