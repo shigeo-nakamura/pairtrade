@@ -792,6 +792,21 @@ impl PairTradeEngine {
                 (self.limit_price_for(symbol, side, prices), None)
             };
             if use_post_only && limit.is_none() {
+                // A later retry's own pricing failure (not attempt 1's,
+                // which the guard-latch below hasn't even run for yet on
+                // this operation) never reaches create_order, so it can't
+                // change what the prior attempts already proved. If every
+                // one of them was a definitive DexError::ServerResponse,
+                // this exit must still unlatch -- otherwise this early
+                // return silently bypasses every unlatch call the loop
+                // and taker-fallback paths make, leaving the guard latched
+                // indefinitely (Codex P2 follow-up, bot-strategy#783).
+                if attempt > 1 {
+                    self.unlatch_capital_guard_if_no_order_was_ever_created(
+                        capital_guard_prior_state,
+                        capital_guard_every_attempt_definitively_rejected,
+                    );
+                }
                 return Err(DexError::Transient(format!(
                     "[ORDER] Missing reference price for post-only {}",
                     symbol

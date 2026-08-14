@@ -1645,6 +1645,63 @@ async fn place_pair_orders_keeps_guard_latched_if_any_post_only_retry_is_ambiguo
     );
 }
 
+/// Fresh Codex finding beyond the retry-loop case above (P2 follow-up,
+/// bot-strategy#783): if attempt 1 is a definitive DexError::ServerResponse
+/// and attempt 2's own pricing refresh then fails (never reaching
+/// create_order at all), the "missing reference price" early return must
+/// still unlatch -- every actual submission this operation made was
+/// definitively rejected, and a pricing failure that never even attempted
+/// an order can't change that.
+#[tokio::test]
+async fn place_pair_orders_unlatches_guard_when_a_later_retry_loses_pricing() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .reject_orders_with_server_response
+        .store(true, Ordering::SeqCst);
+    // Attempt 1's own ticker refresh succeeds (call 1); attempt 2's fails
+    // (call 2+), and the empty price_map below has nothing to fall back
+    // to, so attempt 2 hits the "missing reference price" early return.
+    *connector.ticker_fail_after_calls.lock().unwrap() = Some(1);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 1.0;
+    let dir = TempDir::new().unwrap();
+    engine.risk_state_path = dir.path().join("risk_state.json");
+
+    let pair = super::config::PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    };
+    let price_map = HashMap::new();
+
+    let err = engine
+        .place_pair_orders(
+            0,
+            &pair,
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &price_map,
+        )
+        .await
+        .expect_err("a lost pricing refresh after a definitive rejection must still error");
+
+    assert!(format!("{err:#}").contains("Missing reference price"));
+    assert_eq!(
+        connector.calls.lock().unwrap().len(),
+        1,
+        "exactly one create_order attempt (attempt 1) should have run"
+    );
+    assert!(
+        !engine.instances[0].capital_position_seen_since_baseline,
+        "the guard must unwind: the one real attempt was definitively \
+         rejected, and the pricing failure that ended the loop never \
+         attempted an order at all"
+    );
+}
+
 #[tokio::test]
 async fn close_pair_orders_records_taker_mode_after_post_only_fallback() {
     let connector = Arc::new(DummyConnector::default());
