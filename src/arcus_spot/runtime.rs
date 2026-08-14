@@ -154,7 +154,9 @@ pub struct ArcusSpotRuntimeState {
     pub regime: ArcusSpotRegime,
     pub relative_log_price_history: Vec<f64>,
     /// `collection_finished_at` of the last snapshot `step_at` genuinely
-    /// advanced on (not one it recognized as a repeat of this same field).
+    /// advanced on (not one it recognized as a repeat of this same field,
+    /// and not one it rejected as structurally invalid before validating
+    /// its own timestamps -- see `step_at`'s use of this field for both).
     /// Tracked here, in the checkpointed state itself, rather than by any
     /// individual caller: every writer of a shared checkpoint --
     /// `arcus-spot-execute-once`'s `live-tick` and `arcus-spot-propose-plan`
@@ -533,8 +535,6 @@ impl ArcusSpotRuntime {
                 });
             }
         }
-        self.state.last_observation_at = Some(snapshot.collection_finished_at);
-
         self.state.sequence = self.state.sequence.saturating_add(1);
         let sequence = self.state.sequence;
         let inventory_before = self.state.inventory;
@@ -548,6 +548,17 @@ impl ArcusSpotRuntime {
         let price = match self.price_context(snapshot, evaluation_time) {
             Ok(price) => price,
             Err(hold) => {
+                // Deliberately NOT advancing last_observation_at here: a
+                // structurally invalid snapshot (bad schema, wrong chain,
+                // corrupt/inverted timestamps, unresolvable tokens) proved
+                // nothing trustworthy about collection_finished_at, and
+                // committing it to the watermark before validation would
+                // let a single corrupt record (e.g. a bad bootstrap
+                // archive entry with a far-future timestamp) make every
+                // subsequent legitimate observation look stale or
+                // duplicate until wall time caught up to the bad value --
+                // silently halting signal evaluation (Codex P2 follow-up,
+                // pairtrade#186).
                 return self.event(RuntimeEventInput {
                     sequence,
                     observed_at: evaluation_time,
@@ -562,6 +573,12 @@ impl ArcusSpotRuntime {
                 })
             }
         };
+        // price_context validated schema/mode/chain/timestamps (and
+        // resolved both tokens), so this observation is genuine even if a
+        // later check in this same call still rejects it for an unrelated
+        // reason (e.g. RouteUnavailable) -- advance the watermark now,
+        // not conditioned on anything past this point.
+        self.state.last_observation_at = Some(snapshot.collection_finished_at);
 
         let equity_before = match inventory_before
             .checked_value_usd(price.token_a_price_usd, price.token_b_price_usd)
@@ -3219,6 +3236,64 @@ mod tests {
             history_len_after_first + 1
         );
         assert_eq!(runtime.state().last_observation_at, Some(t2));
+    }
+
+    #[test]
+    fn step_at_does_not_advance_the_watermark_on_a_structurally_invalid_snapshot() {
+        // Codex P2 follow-up, pairtrade#186: a corrupt/invalid snapshot
+        // (here, a wrong chain_id -- price_context's InvalidSnapshot path)
+        // must not commit its collection_finished_at to
+        // last_observation_at. Otherwise a single bad record (e.g. a
+        // far-future timestamp from a corrupt bootstrap archive entry)
+        // would make every subsequent legitimate observation look stale
+        // or duplicate forever, silently halting signal evaluation.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let bad_time = event_time() + chrono::Duration::days(365);
+        let invalid_snapshot: ArcusSpotRecorderSnapshot = serde_json::from_value(json!({
+            "schema_version": 3,
+            "mode": "public_indicative_read_only",
+            "chain_id": 4664,
+            "collection_started_at": bad_time,
+            "collection_finished_at": bad_time,
+            "indexer_stats": {
+                "status": "error",
+                "error": {"stage": "indexer_stats", "classification": "http", "retryable": false, "message": "x"}
+            },
+            "token_metadata": {
+                "status": "error",
+                "error": {"stage": "token_metadata", "classification": "http", "retryable": false, "message": "x"}
+            },
+            "reference_overview": {
+                "status": "error",
+                "error": {"stage": "reference_overview", "classification": "http", "retryable": false, "message": "x"}
+            },
+            "round_trips": []
+        }))
+        .unwrap();
+
+        let event = runtime.step_at(&invalid_snapshot, bad_time);
+        assert!(matches!(
+            event.decision,
+            ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::InvalidSnapshot
+        ));
+        assert_eq!(
+            runtime.state().last_observation_at, None,
+            "an invalid snapshot must not advance the watermark"
+        );
+
+        // A genuinely valid, much-earlier observation must still be
+        // accepted -- proving the bad far-future timestamp above never
+        // became the watermark.
+        let valid_time = event_time();
+        let valid_event = runtime.step_at(
+            &snapshot_with_route_unavailable(valid_time, "150", "50"),
+            valid_time,
+        );
+        assert!(matches!(
+            valid_event.decision,
+            ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::RouteUnavailable
+        ));
+        assert_eq!(runtime.state().last_observation_at, Some(valid_time));
     }
 
     fn snapshot_with_valid_row(collected_at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
