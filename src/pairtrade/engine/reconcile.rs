@@ -284,6 +284,7 @@ impl PairTradeEngine {
     ) {
         self.instances[inst_idx].realized_pnl_today += pnl_value;
         self.instances[inst_idx].funding_carry_today += funding_value;
+        self.instances[inst_idx].total_funding_carry += funding_value;
         let mut risk_state_dirty = true;
         if pnl_value < 0.0 {
             self.instances[inst_idx].consecutive_losses += 1;
