@@ -8,12 +8,15 @@ User=ec2-user
 WorkingDirectory=-/opt/debot-robinhood-lighter
 ExecStartPre=+/usr/bin/install -d -o ec2-user -g ec2-user -m 0750 /opt/debot-robinhood-lighter /home/ec2-user/debot_status
 ExecStart=/bin/bash /opt/debot/scripts/debot-pair-robinhood-lighter.sh
+Environment=PROM_LISTEN=127.0.0.1:9464
+Environment=STATUS_S3_BUCKET=debot-dashboard
+Environment=STATUS_S3_KEY_PREFIX=debot/status/robinhood-lighter
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5
-# Allow the 10,860s strategy grace to expire, then leave three minutes for
+# Allow the 7,260s strategy grace to expire, then leave three minutes for
 # the final reduce-only exchange close and orderly process shutdown.
-TimeoutStopSec=11040
+TimeoutStopSec=7440
 StandardOutput=journal
 StandardError=journal
 
