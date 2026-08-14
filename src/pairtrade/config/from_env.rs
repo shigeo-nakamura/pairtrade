@@ -248,6 +248,7 @@ impl PairTradeConfig {
             risk: RiskConfig::default(),
             round_id: env::var("ROUND_ID").ok().filter(|v| !v.trim().is_empty()),
             config_source_path: None,
+            config_source_sha256: None,
         };
         cfg.default_pair_params = default_pair_params_from_env();
         if cfg.default_pair_params.warm_start_min_bars == 0 {

@@ -13,7 +13,7 @@ use tokio::time::Duration;
 use crate::ports::replay_dex::ReplayConnector;
 
 use super::super::bar::BarBuilder;
-use super::super::config::{sha256_12, EffectiveConfig, PairParams, PairTradeConfig};
+use super::super::config::{EffectiveConfig, PairParams, PairTradeConfig};
 use super::super::instance::{StrategyInstance, EQUITY_REFRESH_CACHE_SECS};
 use super::super::pnl_log::PnlLogger;
 use super::super::state::{PairSharedState, PairState};
@@ -301,25 +301,28 @@ impl PairTradeEngine {
     }
 }
 
-/// Compute `(path, sha256-12, mtime_secs)` for the YAML the config was loaded
-/// from. Returns empty strings / 0 for env-only builds (no source file) or when
-/// the file can't be read — the fingerprint of the *effective* config is the
-/// primary drift signal, the file_* labels are a secondary "file changed since
-/// boot" check. bot-strategy#580.
+/// Return `(path, loaded_sha256-12, current_mtime_secs)` for the YAML source.
+/// The SHA comes from the exact bytes parsed at startup rather than a later
+/// re-read, so it remains trustworthy when a deploy overlaps initialization.
 fn config_source_fingerprint(cfg: &PairTradeConfig) -> (String, String, i64) {
     let path = match cfg.config_source_path.as_deref() {
         Some(p) => p.to_string(),
         None => return (String::new(), String::new(), 0),
     };
-    let (sha, mtime) = match std::fs::read(&path) {
-        Ok(bytes) => {
-            let mtime = std::fs::metadata(&path)
+    let (sha, mtime) = match std::fs::metadata(&path) {
+        Ok(metadata) => {
+            let mtime = metadata
+                .modified()
                 .ok()
-                .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            (sha256_12(&bytes), mtime)
+            let sha = cfg
+                .config_source_sha256
+                .as_deref()
+                .map(|value| value.chars().take(12).collect())
+                .unwrap_or_default();
+            (sha, mtime)
         }
         Err(e) => {
             log::warn!("[CONFIG] could not re-read config file {path} for fingerprint: {e}");

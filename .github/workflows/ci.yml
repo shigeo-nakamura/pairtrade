@@ -346,6 +346,7 @@ jobs:
           # Canary unit (bot-strategy#376) — Frankfurt-only, deployed by this
           # same job.
           aws s3 cp debot/deploy/debot-pair-canary.service "s3://${S3_BUCKET}/deploy/debot-pair-canary.service"
+          aws s3 cp debot/deploy/debot-pair-robinhood-lighter.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
 
       - name: Deploy via SSM (no restart)
         env:
@@ -457,14 +458,33 @@ jobs:
             sleep 10
           done
 
-  # Tokyo Lighter (bot-strategy#218) deploy job was removed 2026-05-18
-  # under bot-strategy#433. The Tokyo Lighter A/B/C bot stayed in DRY_RUN
-  # throughout its life and is being decommissioned alongside the
-  # debot-tokyo instance teardown. Frankfurt Lighter (A/B/C on
-  # i-0c08fba996bc21879) remains the only Lighter pairtrade fleet, served
-  # by the `deploy` job above.
-  #
-  # The Tokyo Extended deploy job (debot-pair-btceth-extended) was removed
-  # 2026-06-13 under bot-strategy#543 — Extended pairtrade was sunset
-  # 2026-06-12 and the debot-tokyo instance terminated, so SSM SendCommand
-  # to TOKYO_INSTANCE_ID failed with InvalidInstanceId on every master push.
+  deploy-robinhood-lighter:
+    name: Deploy binary to Robinhood Lighter host
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    environment: debot
+    env:
+      AWS_REGION: ap-northeast-1
+      INSTALL_DIR: /opt/debot
+      INSTANCE_ID: ${{ vars.ROBINHOOD_LIGHTER_INSTANCE_ID }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy binary and runtime artifacts via SSM (no start/restart)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          test -n "${INSTANCE_ID}"
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy Robinhood Lighter pairtrade artifacts; no start or restart" \
+            --parameters commands="sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/bin ${INSTALL_DIR}/lib ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 cp s3://${S3_BUCKET}/debot/debot ${INSTALL_DIR}/bin/debot,sudo chmod 755 ${INSTALL_DIR}/bin/debot,aws s3 cp s3://${S3_BUCKET}/debot/libsigner.so ${INSTALL_DIR}/lib/libsigner.so,sudo chmod 644 ${INSTALL_DIR}/lib/libsigner.so,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}"
+          aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text

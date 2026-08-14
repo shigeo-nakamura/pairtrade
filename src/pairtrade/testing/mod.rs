@@ -99,6 +99,7 @@ impl PairTradeEngine {
             risk: config::RiskConfig::default(),
             round_id: None,
             config_source_path: None,
+            config_source_sha256: None,
         };
 
         let history_path = PathBuf::from(cfg.history_file.as_str());
