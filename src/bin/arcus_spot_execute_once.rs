@@ -342,10 +342,18 @@ struct LiveTickLastObservation {
     collection_finished_at: chrono::DateTime<Utc>,
 }
 
-/// True when `collection_finished_at` exactly matches the last snapshot
-/// `live-tick` actually advanced `step_at` with -- a no-op tick, safe to
-/// skip entirely rather than re-consuming the same observation (Codex P2
-/// follow-up, pairtrade#186).
+/// True when `collection_finished_at` is not strictly newer than the last
+/// snapshot `live-tick` actually advanced `step_at` with -- a no-op tick,
+/// safe to skip entirely rather than re-consuming or reordering the
+/// observation history (Codex P2 follow-up, pairtrade#186).
+///
+/// Deliberately `<=`, not `==`: two `live-tick` invocations can fetch
+/// concurrently, and the one holding the older snapshot may acquire the
+/// checkpoint lock *after* the one holding the newer snapshot already
+/// advanced and persisted it. An equality-only check would let that late,
+/// strictly-older observation through, appending it after a chronologically
+/// later one and corrupting the signal history the entry/exit z-score
+/// depends on.
 fn live_tick_snapshot_already_consumed(
     path: &Path,
     collection_finished_at: chrono::DateTime<Utc>,
@@ -356,7 +364,7 @@ fn live_tick_snapshot_already_consumed(
     let bytes = read_private_regular_file(path, "live-tick last observation")?;
     let last: LiveTickLastObservation = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid live-tick last observation {}", path.display()))?;
-    Ok(last.collection_finished_at == collection_finished_at)
+    Ok(collection_finished_at <= last.collection_finished_at)
 }
 
 fn write_live_tick_last_observation(
@@ -441,11 +449,42 @@ this key -- regenerate a fresh keypair with keygen and have an
 administrator redeploy the new public key."
 }
 
+/// Resolves `.`/`..` components purely lexically -- no filesystem access,
+/// so this works even before any of these files exist (the common case for
+/// a fresh deployment) unlike `fs::canonicalize`. Sufficient for collision
+/// detection between the absolute paths `validate_config` compares:
+/// without it, `runtime_state_path=/var/lib/x/sub/../runtime.json` and
+/// `ledger_path=/var/lib/x/live-tick-pending-plan.json` compare unequal by
+/// raw `PathBuf` even though the derived pending-plan path (built from
+/// `runtime_state_path`'s parent) actually resolves to the ledger (Codex
+/// P2 follow-up, pairtrade#186).
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !matches!(
+                    normalized.components().next_back(),
+                    None | Some(std::path::Component::RootDir)
+                        | Some(std::path::Component::Prefix(_))
+                ) {
+                    normalized.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     if !config.ledger_path.is_absolute() || !config.runtime_state_path.is_absolute() {
         bail!("Arcus ledger_path and runtime_state_path must be absolute");
     }
-    if config.ledger_path == config.runtime_state_path {
+    let ledger_path = lexically_normalize(&config.ledger_path);
+    let runtime_state_path = lexically_normalize(&config.runtime_state_path);
+    if ledger_path == runtime_state_path {
         bail!("Arcus ledger_path and runtime_state_path must be distinct");
     }
     // live-tick's fixed, derived pending-plan path must not alias either
@@ -454,8 +493,8 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     // ledger_path or runtime_state_path happened to resolve there, that
     // write would destroy the checkpoint or ledger outright and the
     // subsequent fresh load would fail (Codex P2 follow-up, pairtrade#186).
-    let pending_plan_path = live_tick_pending_plan_path(config)?;
-    if pending_plan_path == config.ledger_path || pending_plan_path == config.runtime_state_path {
+    let pending_plan_path = lexically_normalize(&live_tick_pending_plan_path(config)?);
+    if pending_plan_path == ledger_path || pending_plan_path == runtime_state_path {
         bail!(
             "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick pending-plan path {}",
             pending_plan_path.display()
@@ -463,9 +502,9 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     }
     // Same reasoning, for live-tick's other derived path: its atomic
     // replace would just as easily destroy the checkpoint or ledger.
-    let last_observation_path = live_tick_last_observation_path(config)?;
-    if last_observation_path == config.ledger_path
-        || last_observation_path == config.runtime_state_path
+    let last_observation_path = lexically_normalize(&live_tick_last_observation_path(config)?);
+    if last_observation_path == ledger_path
+        || last_observation_path == runtime_state_path
         || last_observation_path == pending_plan_path
     {
         bail!(
@@ -1505,6 +1544,39 @@ runtime:
     }
 
     #[test]
+    fn lexically_normalize_resolves_parent_dir_components() {
+        assert_eq!(
+            lexically_normalize(Path::new("/var/lib/x/sub/../runtime.json")),
+            Path::new("/var/lib/x/runtime.json")
+        );
+        assert_eq!(
+            lexically_normalize(Path::new("/var/lib/./x/runtime.json")),
+            Path::new("/var/lib/x/runtime.json")
+        );
+        // A `..` at the root has nothing left to pop -- stays put rather
+        // than escaping above the root or panicking.
+        assert_eq!(
+            lexically_normalize(Path::new("/../runtime.json")),
+            Path::new("/runtime.json")
+        );
+    }
+
+    #[test]
+    fn config_rejects_a_traversal_disguised_collision_with_the_pending_plan_path() {
+        // Codex P2 follow-up, pairtrade#186: raw PathBuf equality doesn't
+        // catch a ledger_path that is textually different from, but
+        // lexically resolves to, the same file as the derived pending-plan
+        // path -- exactly Codex's own example.
+        let mut config = execute_once_config(
+            "/var/lib/x/live-tick-pending-plan.json",
+            "/var/lib/x/sub/../runtime.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    #[test]
     fn live_tick_snapshot_dedup_round_trips_and_detects_a_repeat() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("live-tick-last-observation.json");
@@ -1522,8 +1594,27 @@ runtime:
         assert!(!live_tick_snapshot_already_consumed(&path, second).unwrap());
 
         write_live_tick_last_observation(&path, second).unwrap();
-        assert!(!live_tick_snapshot_already_consumed(&path, first).unwrap());
         assert!(live_tick_snapshot_already_consumed(&path, second).unwrap());
+    }
+
+    #[test]
+    fn live_tick_snapshot_dedup_rejects_a_late_older_observation() {
+        // Codex P2 follow-up, pairtrade#186: two live-tick invocations can
+        // fetch concurrently, and the one holding the older snapshot may
+        // acquire the checkpoint lock *after* the newer one already
+        // advanced and persisted it. An equality-only check would let that
+        // late, strictly-older observation through, corrupting the
+        // chronological signal history.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live-tick-last-observation.json");
+        let older: chrono::DateTime<Utc> = "2026-08-14T00:00:00Z".parse().unwrap();
+        let newer: chrono::DateTime<Utc> = "2026-08-14T00:00:05Z".parse().unwrap();
+
+        write_live_tick_last_observation(&path, newer).unwrap();
+        assert!(
+            live_tick_snapshot_already_consumed(&path, older).unwrap(),
+            "an observation older than the last consumed one must be treated as a no-op"
+        );
     }
 
     fn rotation_plan(trigger: &str) -> ArcusSpotRotationPlan {
