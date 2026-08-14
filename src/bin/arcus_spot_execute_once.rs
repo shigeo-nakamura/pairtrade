@@ -15,8 +15,8 @@ use debot::arcus_spot::{
     build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision,
     ArcusSpotExecutionAttempt, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
     ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig,
-    ArcusSpotRotationPlan, ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig,
-    ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode,
+    ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntimeCheckpointStore,
+    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode,
 };
 use dex_connector::{ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorderSnapshot};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH};
@@ -152,6 +152,40 @@ fn require_config_within_auto_execute_policy(
         bail!(
             "auto-execute config does not match the administrator-approved configuration (expected {}, got {actual_digest})",
             policy.approved_config_sha256
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a fresh-entry plan on the standalone `auto-execute` path.
+///
+/// `auto_execute_policy.json`'s config digest, `validate_plan_consistent_
+/// with_state`'s regime/trigger check, and `execute_plan_once`'s preflight
+/// (fresh-quote matching, inventory floors, slippage, staleness) all
+/// authenticate *the execution*, not *the strategy decision*: none of them
+/// re-derive whether entry_z_score was genuinely crossed, or re-check the
+/// round-trip-cost, rotation-fraction, or inventory-imbalance gates
+/// `ArcusSpotRuntime::step_at` itself enforces when it proposes a plan.
+/// `execute`'s offline Ed25519 signature used to be what vouched for the
+/// strategy decision underneath those numbers; `auto-execute` drops that
+/// signature entirely, so a plan supplied here has *no* authenticated
+/// provenance at all -- the executor identity could hand-craft one within
+/// every check above and dispatch an entry the strategy never decided on
+/// (Codex P1 follow-up, pairtrade#186).
+///
+/// `live-tick` does not go through this path: it builds its own plan from
+/// `step_at` under the checkpoint lock immediately before dispatch, so that
+/// provenance is inherent rather than merely asserted. A `MeanReversionExit`/
+/// `MaxHoldExit` plan supplied here is still risk-reducing and already
+/// bounded by `validate_plan_consistent_with_state` (cannot exceed the
+/// genuinely open rotated quantity), so only entries are refused.
+fn require_auto_execute_plan_is_not_a_fresh_entry(plan: &ArcusSpotRotationPlan) -> Result<()> {
+    if plan.trigger == ArcusSpotRotationTrigger::EntrySignal {
+        bail!(
+            "auto-execute refuses an entry_signal plan: entries have no cryptographically or \
+             checkpoint-provable link to a genuine strategy decision on this signatureless path. \
+             Use `execute` with an offline-signed approval, or let `live-tick` dispatch the entry \
+             it evaluates and builds itself."
         );
     }
     Ok(())
@@ -324,6 +358,17 @@ trust model as approval_public_key, see docs/arcus-spot-runtime.md for its
 schema) -- otherwise the executor identity could bypass the daily swap cap,
 stakes ceiling, or any other config field by supplying fresh values itself.
 
+The config digest only authenticates *the execution*, not *the strategy
+decision* a plan claims to represent -- it says nothing about whether
+entry_z_score was genuinely crossed, or whether the round-trip-cost,
+rotation-fraction, and inventory-imbalance gates step_at itself enforces
+actually held. auto-execute therefore refuses a caller-supplied
+entry_signal-triggered PLAN_JSON outright: only execute's offline
+signature, or live-tick's own checkpoint-lock-provenanced plan, may
+dispatch an entry. A mean-reversion-exit/max-hold-exit plan is still
+accepted -- it is risk-reducing and already bounded by the runtime
+checkpoint's own genuinely-open rotated quantity.
+
 keygen/sign-approval are meant to run on a separate, offline machine: the
 resulting private key file must never be copied to the host that runs
 execute/resume. execute/resume require keygen's printed public key at
@@ -349,6 +394,19 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     }
     if config.ledger_path == config.runtime_state_path {
         bail!("Arcus ledger_path and runtime_state_path must be distinct");
+    }
+    // live-tick's fixed, derived pending-plan path must not alias either
+    // durable state file: it atomically replaces whatever sits at that
+    // path with plan JSON before constructing the executor, so if
+    // ledger_path or runtime_state_path happened to resolve there, that
+    // write would destroy the checkpoint or ledger outright and the
+    // subsequent fresh load would fail (Codex P2 follow-up, pairtrade#186).
+    let pending_plan_path = live_tick_pending_plan_path(config)?;
+    if pending_plan_path == config.ledger_path || pending_plan_path == config.runtime_state_path {
+        bail!(
+            "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick pending-plan path {}",
+            pending_plan_path.display()
+        );
     }
     config.runtime.normalize();
     config
@@ -788,6 +846,7 @@ async fn main() -> Result<()> {
             // scale-up beyond what is currently approved on #772.
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
+            require_auto_execute_plan_is_not_a_fresh_entry(&plan)?;
             let policy = auto_execute_policy_from_admin_file()?;
             require_config_within_auto_execute_policy(&config, &policy)?;
             let plan_config_digest = approval_digest(&config, &plan)?;
@@ -1278,6 +1337,85 @@ runtime:
 "#
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn config_rejects_a_runtime_state_path_colliding_with_the_live_tick_pending_plan_path() {
+        // live-tick derives its pending-plan path from runtime_state_path's
+        // directory; if runtime_state_path itself resolved there, live-tick
+        // would atomically overwrite the checkpoint with plan JSON right
+        // before the subsequent fresh checkpoint load, destroying it
+        // (Codex P2 follow-up, pairtrade#186).
+        let mut config = execute_once_config(
+            "/var/lib/x/ledger.json",
+            "/var/lib/x/live-tick-pending-plan.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    #[test]
+    fn config_rejects_a_ledger_path_colliding_with_the_live_tick_pending_plan_path() {
+        let mut config = execute_once_config(
+            "/var/lib/x/live-tick-pending-plan.json",
+            "/var/lib/x/runtime.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    fn rotation_plan(trigger: &str) -> ArcusSpotRotationPlan {
+        serde_json::from_value(serde_json::json!({
+            "direction": "token_a_to_token_b",
+            "trigger": trigger,
+            "sell_symbol": "NVDA",
+            "buy_symbol": "AMD",
+            "sell_token_address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+            "buy_token_address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+            "sell_quantity": "0.1",
+            "buy_quantity": "0.05",
+            "sell_amount_raw": "100000000000000000",
+            "buy_amount_raw": "50000000000000000",
+            "venue": "arcus",
+            "quote_received_at": "2026-08-14T00:00:00Z",
+            "optimistic_round_trip_loss_bps": "76.5",
+            "gas_buffer_bps": "10",
+            "settlement_buffer_bps": "10",
+            "all_in_round_trip_cost_bps": "96.5",
+            "predicted_inventory": {"token_a": "0.25", "token_b": "0.21"},
+            "predicted_inventory_imbalance_fraction": "0.1",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn auto_execute_refuses_a_fresh_entry_signal_plan() {
+        // The gap Codex flagged (P1 follow-up, pairtrade#186): nothing on
+        // the signatureless path authenticates that an entry plan's
+        // strategy fields (z-score crossing, round-trip cost, rotation
+        // fraction, inventory imbalance) came from a genuine step_at
+        // evaluation rather than being hand-crafted within every other
+        // check's tolerance.
+        let plan = rotation_plan("entry_signal");
+        let error = require_auto_execute_plan_is_not_a_fresh_entry(&plan).unwrap_err();
+        assert!(error.to_string().contains("entry_signal"));
+    }
+
+    #[test]
+    fn auto_execute_allows_a_mean_reversion_exit_plan() {
+        // Exits are risk-reducing and already bounded by the checkpoint's
+        // own genuinely-open rotated quantity (validate_plan_consistent_
+        // with_state), so they are not restricted to execute/live-tick.
+        let plan = rotation_plan("mean_reversion_exit");
+        require_auto_execute_plan_is_not_a_fresh_entry(&plan).unwrap();
+    }
+
+    #[test]
+    fn auto_execute_allows_a_max_hold_exit_plan() {
+        let plan = rotation_plan("max_hold_exit");
+        require_auto_execute_plan_is_not_a_fresh_entry(&plan).unwrap();
     }
 
     fn auto_execute_policy_for(config: &ArcusSpotExecuteOnceConfig) -> ArcusSpotAutoExecutePolicy {

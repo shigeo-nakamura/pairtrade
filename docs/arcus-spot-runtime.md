@@ -123,6 +123,21 @@ this decision (return to requiring a signed `execute`, or add a
 scale-dependent threshold) before any inventory scale-up beyond what is
 currently approved on #772.
 
+`auto-execute` refuses a caller-supplied `entry_signal`-triggered PLAN_JSON
+outright. Every check above authenticates *the execution* (fresh-quote
+matching, inventory floors, staleness, slippage) but none of them re-derive
+whether `entry_z_score` was genuinely crossed, or re-check the round-trip-
+cost, rotation-fraction, or inventory-imbalance gates `step_at` itself
+enforces when it proposes a plan -- `execute`'s offline signature used to
+be what vouched for that underlying strategy decision, and `auto-execute`
+has nothing in its place. Only `execute` (signed) or `live-tick` (which
+builds its own entry plan from `step_at` under the checkpoint lock,
+immediately before dispatch, so provenance is inherent rather than merely
+asserted) may dispatch an entry. A `mean_reversion_exit`/`max_hold_exit`
+plan is still accepted through `auto-execute` -- it is risk-reducing and
+already bounded by the runtime checkpoint's own genuinely-open rotated
+quantity.
+
 In place of the signature, `auto-execute`/`auto-resume`/`live-tick` require
 CONFIG_YAML to match an administrator-approved digest recorded in a fixed,
 administrator-owned file at `/etc/arcus-spot/auto_execute_policy.json`
@@ -187,6 +202,11 @@ confirmed, recover with:
 
     arcus-spot-execute-once auto-resume CONFIG_YAML \
       <runtime_state_path's directory>/live-tick-pending-plan.json
+
+Config validation rejects `ledger_path`/`runtime_state_path` values that
+would resolve to this same derived path -- otherwise `live-tick`'s
+atomic-replace write would destroy the checkpoint or ledger file it was
+supposed to be sitting alongside.
 
 ### Known limitation: the executor identity can reset its own state
 
