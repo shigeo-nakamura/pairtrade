@@ -10,14 +10,15 @@ use aes_gcm::{
 };
 use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
+use chrono::Utc;
 use debot::arcus_spot::{
-    build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig,
+    build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision,
     ArcusSpotExecutionAttempt, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
     ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig,
-    ArcusSpotRotationPlan, ArcusSpotRuntime, ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode,
-    ArcusSpotRuntimeState,
+    ArcusSpotRotationPlan, ArcusSpotRuntime, ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent,
+    ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
-use dex_connector::{ArcusSpotClient, ArcusSpotConfig};
+use dex_connector::{ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorderSnapshot};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -239,8 +240,17 @@ fn usage() -> &'static str {
   arcus-spot-execute-once auto-execute CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
   arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
+  arcus-spot-execute-once live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON
 
-auto-execute/auto-resume skip the offline human approval signature
+live-tick is the unattended-probe entry point: it evaluates the strategy
+signal (ArcusSpotRuntime::step_at) against one fresh recorder snapshot,
+always persists the resulting runtime checkpoint, and only when that
+genuinely decides WouldRotate does it build and dispatch a plan -- through
+the same policy-gated, signatureless path as auto-execute. Meant to be
+invoked on a timer shortly after each recorder snapshot lands; most ticks
+decide Observe and touch neither the KMS signer nor the network.
+
+auto-execute/auto-resume/live-tick skip the offline human approval signature
 (explicit owner decision while total inventory at risk stays small -- see
 the comment at their call sites). Every other gate execute/resume enforce
 is unchanged: plan/config validation, staleness, on-chain preflight,
@@ -465,6 +475,15 @@ fn write_attempt(attempt: &ArcusSpotExecutionAttempt) -> Result<()> {
     let mut stdout = stdout.lock();
     serde_json::to_writer_pretty(&mut stdout, attempt)
         .context("failed to serialize execution result")?;
+    stdout.write_all(b"\n")?;
+    Ok(())
+}
+
+fn write_live_tick_event(event: &ArcusSpotRuntimeEvent) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer_pretty(&mut stdout, event)
+        .context("failed to serialize live-tick event")?;
     stdout.write_all(b"\n")?;
     Ok(())
 }
@@ -833,6 +852,67 @@ async fn main() -> Result<()> {
             )?;
             write_attempt(&attempt)
         }
+        [command, config_path, snapshot_path] if command == "live-tick" => {
+            // The unattended-probe entry point: evaluate the strategy
+            // signal against one fresh recorder snapshot and, only if it
+            // genuinely fires, dispatch through the exact same
+            // policy-gated, signatureless path as `auto-execute`. Most
+            // ticks decide `Observe` (no position warranted) and never
+            // touch the KMS signer or the network beyond the on-disk
+            // snapshot already written by the recorder timer -- this is
+            // the "future read-only daemon [that] must call step_at with
+            // the current UTC time" flagged as not-yet-built in this same
+            // doc (bot-strategy#772/#775, 7-day activity probe).
+            let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
+            let config = parse_config(&config_bytes, Path::new(config_path))?;
+            let policy = auto_execute_policy_from_admin_file()?;
+            require_config_within_auto_execute_policy(&config, &policy)?;
+
+            let snapshot_bytes = read_private_regular_file(Path::new(snapshot_path), "recorder snapshot")?;
+            let snapshot: ArcusSpotRecorderSnapshot = serde_json::from_slice(&snapshot_bytes)
+                .with_context(|| format!("invalid recorder snapshot {snapshot_path}"))?;
+
+            let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            let mut runtime = store.load_or_create(&config.runtime)?;
+            let event = runtime.step_at(&snapshot, Utc::now());
+            // Persisted unconditionally, independent of the decision below:
+            // the accumulated price-history window is exactly what next
+            // tick's signal depends on, and losing a tick's contribution
+            // because this run happened not to rotate would silently widen
+            // gaps in the very history the entry/exit z-score needs.
+            store.persist(&runtime)?;
+
+            let plan = match event.decision.clone() {
+                ArcusSpotDecision::WouldRotate { plan } => plan,
+                ArcusSpotDecision::Observe { .. } | ArcusSpotDecision::SimulatedFill { .. } => {
+                    return write_live_tick_event(&event);
+                }
+            };
+            let plan_config_digest = approval_digest(&config, &plan)?;
+            let mut executor = executor_from_config(&config).await?;
+            // Re-read fresh, same reasoning as `execute`'s own comment
+            // above: the plan above was computed before the ledger lock
+            // (acquired inside executor_from_config) was held, so another
+            // overlapping invocation could have advanced the checkpoint in
+            // between.
+            let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            let fresh_runtime = runtime_store.load_or_create(&config.runtime)?;
+            fresh_runtime
+                .validate_plan_consistent_with_state(&plan)
+                .map_err(anyhow::Error::msg)
+                .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
+            let attempt = executor
+                .execute_plan_once(&plan, &plan_config_digest)
+                .await?;
+            let attempt = finalize_reconciled_attempt(
+                &config,
+                &mut executor,
+                &plan,
+                &plan_config_digest,
+                attempt,
+            )?;
+            write_attempt(&attempt)
+        }
         [command, config_path, plan_path, approval_signature] if command == "resume" => {
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
@@ -867,6 +947,7 @@ mod tests {
         assert!(usage().contains("sign-approval"));
         assert!(usage().contains("auto-execute CONFIG_YAML PLAN_JSON"));
         assert!(usage().contains("auto-resume CONFIG_YAML PLAN_JSON"));
+        assert!(usage().contains("live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON"));
     }
 
     fn live_runtime_config() -> ArcusSpotRuntimeConfig {
@@ -1264,6 +1345,39 @@ runtime:
             error.to_string().contains("group- or other-writable")
                 || error.to_string().contains("administrator-owned")
         );
+    }
+
+    #[test]
+    fn live_tick_persists_the_checkpoint_even_on_an_observe_decision() {
+        // The behavior live-tick relies on: unlike execute/auto-execute
+        // (which only ever touch the checkpoint via a confirmed fill),
+        // live-tick must persist after *every* tick so the accumulated
+        // price-history window survives even ticks that decide Observe --
+        // otherwise a probe running mostly-Observe (duty-cycle-starved, as
+        // this style of signal generally is) would never actually build up
+        // the history its own entry/exit z-score needs.
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("runtime.json");
+        let config = live_runtime_config();
+        let store = ArcusSpotRuntimeCheckpointStore::new(state_path.clone());
+        let mut runtime = store.load_or_create(&config).unwrap();
+
+        let snapshot: ArcusSpotRecorderSnapshot = serde_json::from_str(
+            r#"{"schema_version":2,"mode":"public_indicative_read_only","chain_id":4663,"collection_started_at":"2026-07-27T00:00:00Z","collection_finished_at":"2026-07-27T00:00:01Z","indexer_stats":{"status":"error","error":{"stage":"indexer_stats","classification":"http","retryable":false,"message":"x"}},"token_metadata":{"status":"error","error":{"stage":"token_metadata","classification":"http","retryable":false,"message":"x"}},"reference_overview":{"status":"error","error":{"stage":"reference_overview","classification":"http","retryable":false,"message":"x"}},"round_trips":[]}"#,
+        )
+        .unwrap();
+
+        let event = runtime.step_at(&snapshot, Utc::now());
+        assert!(matches!(event.decision, ArcusSpotDecision::Observe { .. }));
+        store.persist(&runtime).unwrap();
+
+        assert!(state_path.exists());
+        assert_eq!(
+            fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let reloaded = store.load_or_create(&config).unwrap();
+        assert_eq!(reloaded.state().sequence, runtime.state().sequence);
     }
 
     #[test]
