@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
-    fs::OpenOptions,
-    io::{self, Write},
+    fs::{File, OpenOptions},
+    io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -97,16 +97,52 @@ fn auto_execute_policy_from_admin_file() -> Result<ArcusSpotAutoExecutePolicy> {
     auto_execute_policy_from_file(Path::new(AUTO_EXECUTE_POLICY_PATH))
 }
 
-fn auto_execute_policy_from_file(path: &Path) -> Result<ArcusSpotAutoExecutePolicy> {
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!("failed to inspect auto-execute policy file {}", path.display())
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+/// Opens `path` exactly once, refusing to follow a symlink at the final
+/// path component (`O_NOFOLLOW`), and returns that same open file
+/// alongside its `fstat`-sourced metadata. Callers validate that metadata
+/// and then read from this exact file handle -- never a second, separate
+/// path-based `stat`+`read`, which is racy whenever the identity running
+/// this process can write the file's parent directory: between the check
+/// and a later path-based read, that identity could delete the
+/// already-validated trust anchor and put a symlink to attacker-controlled
+/// content in its place, and the read would silently follow it (Codex P1
+/// follow-up, pairtrade#186). Binding validation and read to the same
+/// open file description closes that race by construction: `open()`
+/// resolves the path exactly once, and everything after operates on the
+/// resulting inode regardless of what happens to the path afterward.
+fn open_regular_file_no_follow(path: &Path, label: &str) -> Result<(File, fs::Metadata)> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+            bail!(
+                "{label} {} must be a regular non-symlink file",
+                path.display()
+            );
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to open {label} {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if !metadata.is_file() {
         bail!(
-            "auto-execute policy file {} must be a regular non-symlink file",
+            "{label} {} must be a regular non-symlink file",
             path.display()
         );
     }
+    Ok((file, metadata))
+}
+
+fn auto_execute_policy_from_file(path: &Path) -> Result<ArcusSpotAutoExecutePolicy> {
+    let (mut file, metadata) =
+        open_regular_file_no_follow(path, "auto-execute policy file")?;
     if metadata.permissions().mode() & 0o022 != 0 {
         bail!(
             "auto-execute policy file {} must not be group- or other-writable",
@@ -122,7 +158,8 @@ fn auto_execute_policy_from_file(path: &Path) -> Result<ArcusSpotAutoExecutePoli
             path.display()
         );
     }
-    let raw = fs::read_to_string(path)
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
         .with_context(|| format!("failed to read auto-execute policy file {}", path.display()))?;
     serde_json::from_str(&raw)
         .with_context(|| format!("invalid auto-execute policy file {}", path.display()))
@@ -205,15 +242,8 @@ fn approval_public_key_from_admin_file() -> Result<VerifyingKey> {
 }
 
 fn approval_public_key_from_file(path: &Path) -> Result<VerifyingKey> {
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!("failed to inspect approval public key file {}", path.display())
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "approval public key file {} must be a regular non-symlink file",
-            path.display()
-        );
-    }
+    let (mut file, metadata) =
+        open_regular_file_no_follow(path, "approval public key file")?;
     if metadata.permissions().mode() & 0o022 != 0 {
         bail!(
             "approval public key file {} must not be group- or other-writable",
@@ -229,7 +259,8 @@ fn approval_public_key_from_file(path: &Path) -> Result<VerifyingKey> {
             path.display()
         );
     }
-    let raw = fs::read_to_string(path)
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
         .with_context(|| format!("failed to read approval public key file {}", path.display()))?;
     parse_approval_public_key(raw.trim())
 }
@@ -247,21 +278,17 @@ fn approval_digest<C: Serialize, P: Serialize>(config: &C, plan: &P) -> Result<S
 }
 
 fn read_private_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "{label} {} must be a regular non-symlink file",
-            path.display()
-        );
-    }
+    let (mut file, metadata) = open_regular_file_no_follow(path, label)?;
     if metadata.permissions().mode() & 0o077 != 0 {
         bail!(
             "{label} {} must not be readable or writable by group/other",
             path.display()
         );
     }
-    fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    Ok(bytes)
 }
 
 /// Atomically writes `bytes` to `path` at mode 0600 (temp file + rename +
@@ -478,12 +505,35 @@ fn lexically_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Resolves symlinks in `path`'s parent directory (via `fs::canonicalize`,
+/// which needs that directory to already exist) and rejoins the file name
+/// -- closing the gap `lexically_normalize` alone leaves open: a symlinked
+/// directory component makes two paths that ultimately name the same file
+/// on disk compare unequal lexically (e.g. `/var/lib/arcus/alias ->
+/// /var/lib/arcus/state` makes `alias/x.json` and `state/x.json` look like
+/// different files even though they are the same one) (Codex P2 follow-up,
+/// pairtrade#186). Falls back to the lexically-normalized path unchanged
+/// when the parent doesn't exist yet -- config validation must keep
+/// working before an operator has created these directories, and an
+/// as-yet-nonexistent parent cannot itself be a symlink pointing somewhere
+/// collision-relevant.
+fn resolve_path_for_collision_check(path: &Path) -> PathBuf {
+    let normalized = lexically_normalize(path);
+    let (Some(parent), Some(file_name)) = (normalized.parent(), normalized.file_name()) else {
+        return normalized;
+    };
+    match fs::canonicalize(parent) {
+        Ok(canonical_parent) => canonical_parent.join(file_name),
+        Err(_) => normalized,
+    }
+}
+
 fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     if !config.ledger_path.is_absolute() || !config.runtime_state_path.is_absolute() {
         bail!("Arcus ledger_path and runtime_state_path must be absolute");
     }
-    let ledger_path = lexically_normalize(&config.ledger_path);
-    let runtime_state_path = lexically_normalize(&config.runtime_state_path);
+    let ledger_path = resolve_path_for_collision_check(&config.ledger_path);
+    let runtime_state_path = resolve_path_for_collision_check(&config.runtime_state_path);
     if ledger_path == runtime_state_path {
         bail!("Arcus ledger_path and runtime_state_path must be distinct");
     }
@@ -493,7 +543,8 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     // ledger_path or runtime_state_path happened to resolve there, that
     // write would destroy the checkpoint or ledger outright and the
     // subsequent fresh load would fail (Codex P2 follow-up, pairtrade#186).
-    let pending_plan_path = lexically_normalize(&live_tick_pending_plan_path(config)?);
+    let pending_plan_path =
+        resolve_path_for_collision_check(&live_tick_pending_plan_path(config)?);
     if pending_plan_path == ledger_path || pending_plan_path == runtime_state_path {
         bail!(
             "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick pending-plan path {}",
@@ -502,7 +553,8 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     }
     // Same reasoning, for live-tick's other derived path: its atomic
     // replace would just as easily destroy the checkpoint or ledger.
-    let last_observation_path = lexically_normalize(&live_tick_last_observation_path(config)?);
+    let last_observation_path =
+        resolve_path_for_collision_check(&live_tick_last_observation_path(config)?);
     if last_observation_path == ledger_path
         || last_observation_path == runtime_state_path
         || last_observation_path == pending_plan_path
@@ -1559,6 +1611,57 @@ runtime:
             lexically_normalize(Path::new("/../runtime.json")),
             Path::new("/runtime.json")
         );
+    }
+
+    #[test]
+    fn resolve_path_for_collision_check_sees_through_a_symlinked_parent() {
+        let dir = tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let via_alias = resolve_path_for_collision_check(&alias_dir.join("x.json"));
+        let via_real = resolve_path_for_collision_check(&real_dir.join("x.json"));
+        assert_eq!(
+            via_alias, via_real,
+            "a symlinked directory component must resolve to the same path as its target"
+        );
+    }
+
+    #[test]
+    fn resolve_path_for_collision_check_falls_back_when_parent_does_not_exist_yet() {
+        let path = Path::new("/nonexistent-parent-dir-arcus-test-xyz/runtime.json");
+        assert_eq!(
+            resolve_path_for_collision_check(path),
+            lexically_normalize(path)
+        );
+    }
+
+    #[test]
+    fn config_rejects_a_symlinked_parent_disguised_collision() {
+        // Codex P2 follow-up, pairtrade#186: lexical normalization alone
+        // can't see through a symlinked directory component -- `alias`
+        // and `state` compare unequal lexically even when `alias` really
+        // points at `state`, so ledger_path=alias/live-tick-pending-plan.json
+        // and runtime_state_path=state/runtime.json alias the same file on
+        // disk despite passing the lexical-only check.
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&state_dir, &alias_dir).unwrap();
+
+        let ledger_path = alias_dir.join("live-tick-pending-plan.json");
+        let runtime_state_path = state_dir.join("runtime.json");
+
+        let mut config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_state_path.to_str().unwrap(),
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick pending-plan path"));
     }
 
     #[test]
