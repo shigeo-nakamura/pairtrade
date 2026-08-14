@@ -10,22 +10,26 @@ use aes_gcm::{
 };
 use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
+use chrono::Utc;
 use debot::arcus_spot::{
-    build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig,
+    build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision,
     ArcusSpotExecutionAttempt, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
     ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig,
-    ArcusSpotRotationPlan, ArcusSpotRuntimeConfig, ArcusSpotRuntimeCheckpointStore,
-    ArcusSpotRuntimeMode,
+    ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntimeCheckpointStore,
+    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode,
 };
-use dex_connector::{ArcusSpotClient, ArcusSpotConfig};
+use dex_connector::{
+    ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig,
+    ArcusSpotRecorderSnapshot,
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
-    fs::OpenOptions,
-    io::{self, Write},
+    fs::{File, OpenOptions},
+    io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -62,6 +66,170 @@ struct ArcusSpotExecuteOnceConfig {
 }
 
 const APPROVAL_PUBLIC_KEY_PATH: &str = "/etc/arcus-spot/approval_public_key";
+const AUTO_EXECUTE_POLICY_PATH: &str = "/etc/arcus-spot/auto_execute_policy.json";
+
+/// Administrator-approved digest binding *the entire* CONFIG_YAML for
+/// `auto-execute`/`auto-resume`/`live-tick`, enforced independently of
+/// whatever config the executor identity actually supplies. Read from the
+/// same fixed, non-self-writable path pattern as `approval_public_key`.
+///
+/// An earlier version of this policy enumerated three fields
+/// (`ledger_path`, `runtime_state_path`, `maximum_sell_amount_raw`)
+/// individually. Codex correctly flagged that as insufficient (P1 follow-up,
+/// pairtrade#186): every field the enumeration *didn't* cover --
+/// `inventory_floor_raw`, `max_swaps_per_utc_day`, router/chain/token
+/// identities, gas/slippage buffers, and any future field -- stayed fully
+/// executor-controlled, so e.g. a lowered `inventory_floor_raw` could let an
+/// unsigned plan violate the real floor, discoverable only after the
+/// on-chain swap. A whole-config digest closes that class of gap by
+/// construction: `auto-execute`/`auto-resume`/`live-tick` only ever run
+/// against the byte-for-byte exact configuration an administrator approved,
+/// the same trust model `execute`'s Ed25519 signature uses over
+/// config+plan, just without the plan (which legitimately varies per swap
+/// with fresh quotes) and without requiring a human in the loop per swap.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotAutoExecutePolicy {
+    approved_config_sha256: String,
+}
+
+fn auto_execute_policy_from_admin_file() -> Result<ArcusSpotAutoExecutePolicy> {
+    auto_execute_policy_from_file(Path::new(AUTO_EXECUTE_POLICY_PATH))
+}
+
+/// Opens `path` exactly once, refusing to follow a symlink at the final
+/// path component (`O_NOFOLLOW`), and returns that same open file
+/// alongside its `fstat`-sourced metadata. Callers validate that metadata
+/// and then read from this exact file handle -- never a second, separate
+/// path-based `stat`+`read`, which is racy whenever the identity running
+/// this process can write the file's parent directory: between the check
+/// and a later path-based read, that identity could delete the
+/// already-validated trust anchor and put a symlink to attacker-controlled
+/// content in its place, and the read would silently follow it (Codex P1
+/// follow-up, pairtrade#186). Binding validation and read to the same
+/// open file description closes that race by construction: `open()`
+/// resolves the path exactly once, and everything after operates on the
+/// resulting inode regardless of what happens to the path afterward.
+fn open_regular_file_no_follow(path: &Path, label: &str) -> Result<(File, fs::Metadata)> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+            bail!(
+                "{label} {} must be a regular non-symlink file",
+                path.display()
+            );
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to open {label} {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "{label} {} must be a regular non-symlink file",
+            path.display()
+        );
+    }
+    Ok((file, metadata))
+}
+
+fn auto_execute_policy_from_file(path: &Path) -> Result<ArcusSpotAutoExecutePolicy> {
+    let (mut file, metadata) =
+        open_regular_file_no_follow(path, "auto-execute policy file")?;
+    if metadata.permissions().mode() & 0o022 != 0 {
+        bail!(
+            "auto-execute policy file {} must not be group- or other-writable",
+            path.display()
+        );
+    }
+    // SAFETY: geteuid() takes no arguments, performs no memory access, and
+    // cannot fail.
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() == current_uid {
+        bail!(
+            "auto-execute policy file {} is owned by this process's own uid ({current_uid}) -- it must be administrator-owned, not writable by the identity running auto-execute/auto-resume",
+            path.display()
+        );
+    }
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .with_context(|| format!("failed to read auto-execute policy file {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("invalid auto-execute policy file {}", path.display()))
+}
+
+/// Computes the same canonical digest form `approval_digest` uses for
+/// config+plan, but over CONFIG_YAML alone -- this is what an administrator
+/// hashes once to populate `approved_config_sha256`, and what every
+/// `auto-execute`/`auto-resume`/`live-tick` invocation recomputes to compare
+/// against it.
+fn auto_execute_config_digest(config: &ArcusSpotExecuteOnceConfig) -> Result<String> {
+    let canonical =
+        serde_json::to_vec(config).context("failed to serialize config for policy digest")?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
+/// Rejects any config that is not byte-for-byte the one an administrator
+/// approved, closing exactly the gap `execute`'s signature used to close
+/// (Codex P1 follow-up, pairtrade#186) -- without this, the executor
+/// identity could freely edit any field of its own CONFIG_YAML (ledger/
+/// checkpoint paths to reset accumulated state, sell ceilings, inventory
+/// floors, swap-per-day caps, router/chain/token identities, ...) and
+/// `auto-execute`/`auto-resume`/`live-tick` would run against it unchecked.
+fn require_config_within_auto_execute_policy(
+    config: &ArcusSpotExecuteOnceConfig,
+    policy: &ArcusSpotAutoExecutePolicy,
+) -> Result<()> {
+    let actual_digest = auto_execute_config_digest(config)?;
+    if actual_digest != policy.approved_config_sha256 {
+        bail!(
+            "auto-execute config does not match the administrator-approved configuration (expected {}, got {actual_digest})",
+            policy.approved_config_sha256
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a fresh-entry plan on the standalone `auto-execute` path.
+///
+/// `auto_execute_policy.json`'s config digest, `validate_plan_consistent_
+/// with_state`'s regime/trigger check, and `execute_plan_once`'s preflight
+/// (fresh-quote matching, inventory floors, slippage, staleness) all
+/// authenticate *the execution*, not *the strategy decision*: none of them
+/// re-derive whether entry_z_score was genuinely crossed, or re-check the
+/// round-trip-cost, rotation-fraction, or inventory-imbalance gates
+/// `ArcusSpotRuntime::step_at` itself enforces when it proposes a plan.
+/// `execute`'s offline Ed25519 signature used to be what vouched for the
+/// strategy decision underneath those numbers; `auto-execute` drops that
+/// signature entirely, so a plan supplied here has *no* authenticated
+/// provenance at all -- the executor identity could hand-craft one within
+/// every check above and dispatch an entry the strategy never decided on
+/// (Codex P1 follow-up, pairtrade#186).
+///
+/// `live-tick` does not go through this path: it builds its own plan from
+/// `step_at` under the checkpoint lock immediately before dispatch, so that
+/// provenance is inherent rather than merely asserted. A `MeanReversionExit`/
+/// `MaxHoldExit` plan supplied here is still risk-reducing and already
+/// bounded by `validate_plan_consistent_with_state` (cannot exceed the
+/// genuinely open rotated quantity), so only entries are refused.
+fn require_auto_execute_plan_is_not_a_fresh_entry(plan: &ArcusSpotRotationPlan) -> Result<()> {
+    if plan.trigger == ArcusSpotRotationTrigger::EntrySignal {
+        bail!(
+            "auto-execute refuses an entry_signal plan: entries have no cryptographically or \
+             checkpoint-provable link to a genuine strategy decision on this signatureless path. \
+             Use `execute` with an offline-signed approval, or let `live-tick` dispatch the entry \
+             it evaluates and builds itself."
+        );
+    }
+    Ok(())
+}
 
 /// Read the trust anchor from a fixed, administrator-owned file this
 /// process cannot itself have written. A caller-controlled input (a
@@ -74,15 +242,8 @@ fn approval_public_key_from_admin_file() -> Result<VerifyingKey> {
 }
 
 fn approval_public_key_from_file(path: &Path) -> Result<VerifyingKey> {
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!("failed to inspect approval public key file {}", path.display())
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "approval public key file {} must be a regular non-symlink file",
-            path.display()
-        );
-    }
+    let (mut file, metadata) =
+        open_regular_file_no_follow(path, "approval public key file")?;
     if metadata.permissions().mode() & 0o022 != 0 {
         bail!(
             "approval public key file {} must not be group- or other-writable",
@@ -98,7 +259,8 @@ fn approval_public_key_from_file(path: &Path) -> Result<VerifyingKey> {
             path.display()
         );
     }
-    let raw = fs::read_to_string(path)
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
         .with_context(|| format!("failed to read approval public key file {}", path.display()))?;
     parse_approval_public_key(raw.trim())
 }
@@ -116,30 +278,134 @@ fn approval_digest<C: Serialize, P: Serialize>(config: &C, plan: &P) -> Result<S
 }
 
 fn read_private_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "{label} {} must be a regular non-symlink file",
-            path.display()
-        );
-    }
+    let (mut file, metadata) = open_regular_file_no_follow(path, label)?;
     if metadata.permissions().mode() & 0o077 != 0 {
         bail!(
             "{label} {} must not be readable or writable by group/other",
             path.display()
         );
     }
-    fs::read(path).with_context(|| format!("failed to read {label} {}", path.display()))
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label} {}", path.display()))?;
+    Ok(bytes)
+}
+
+/// Atomically writes `bytes` to `path` at mode 0600 (temp file + rename +
+/// parent-dir fsync), mirroring `ArcusSpotRuntimeCheckpointStore::persist`'s
+/// pattern so a reader never observes a partially-written file.
+fn write_private_regular_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("write"),
+        std::process::id(),
+        stamp,
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+            .with_context(|| format!("failed to create {}", temp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                temp.display(),
+            )
+        })?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Fixed, deterministic path -- next to the runtime checkpoint it describes
+/// -- where `live-tick` durably records the plan it is about to dispatch,
+/// before dispatching it. `execute`/`auto-execute` always take PLAN_JSON as
+/// an argument the caller already possesses; `live-tick` instead builds the
+/// plan itself from a fresh strategy evaluation, so without this there is
+/// nothing on disk for `auto-resume` to recover with if the process exits
+/// after a `Submitted`-but-unconfirmed dispatch (Codex P2 follow-up,
+/// pairtrade#186).
+fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
+    let parent = config
+        .runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(parent.join("live-tick-pending-plan.json"))
 }
 
 fn usage() -> &'static str {
     "usage:
   arcus-spot-execute-once keygen PRIVATE_KEY_FILE
   arcus-spot-execute-once hash CONFIG_YAML PLAN_JSON
+  arcus-spot-execute-once hash-config CONFIG_YAML
   arcus-spot-execute-once sign-approval DIGEST PRIVATE_KEY_FILE
   arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
+  arcus-spot-execute-once auto-execute CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
+  arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
+  arcus-spot-execute-once live-tick CONFIG_YAML
+
+live-tick is the unattended-probe entry point: it fetches exactly one live
+snapshot itself (the same public, read-only recorder client
+arcus-spot-propose-plan and the archival collector use -- never a
+caller-supplied file, which would have no authenticated origin), evaluates
+the strategy signal (ArcusSpotRuntime::step_at) against it, always persists
+the resulting runtime checkpoint under an exclusive lock, and only when
+that genuinely decides WouldRotate does it build and dispatch a plan --
+through the same policy-gated, signatureless path as auto-execute. Meant to
+be invoked on a timer; most ticks decide Observe and touch neither the KMS
+signer nor the submission network. step_at itself (in the shared runtime,
+tracked in the checkpointed state so every writer of it -- live-tick and
+arcus-spot-propose-plan alike -- is covered) rejects a snapshot whose
+collection_finished_at is not strictly newer than the last one it actually
+advanced on: re-consuming or reordering an observation would artificially
+reweight the z-score history. Before dispatching, it durably writes the
+plan it built to
+<runtime_state_path's directory>/live-tick-pending-plan.json (mode 0600);
+if the process exits after Submitted but before confirmation, recover with
+auto-resume CONFIG_YAML <that path>.
+
+auto-execute/auto-resume/live-tick skip the offline human approval signature
+(explicit owner decision while total inventory at risk stays small -- see
+the comment at their call sites). Every other gate execute/resume enforce
+is unchanged: plan/config validation, staleness, on-chain preflight,
+exact-value Permit2, slippage, and loss stops. In place of the signature,
+CONFIG_YAML must byte-for-byte match the exact configuration an
+administrator approved by sha256 digest, recorded in an administrator-owned
+policy file at /etc/arcus-spot/auto_execute_policy.json (same ownership/mode
+trust model as approval_public_key, see docs/arcus-spot-runtime.md for its
+schema) -- otherwise the executor identity could bypass the daily swap cap,
+stakes ceiling, or any other config field by supplying fresh values itself.
+
+The config digest only authenticates *the execution*, not *the strategy
+decision* a plan claims to represent -- it says nothing about whether
+entry_z_score was genuinely crossed, or whether the round-trip-cost,
+rotation-fraction, and inventory-imbalance gates step_at itself enforces
+actually held. auto-execute therefore refuses a caller-supplied
+entry_signal-triggered PLAN_JSON outright: only execute's offline
+signature, or live-tick's own checkpoint-lock-provenanced plan, may
+dispatch an entry. A mean-reversion-exit/max-hold-exit plan is still
+accepted -- it is risk-reducing and already bounded by the runtime
+checkpoint's own genuinely-open rotated quantity.
 
 keygen/sign-approval are meant to run on a separate, offline machine: the
 resulting private key file must never be copied to the host that runs
@@ -160,12 +426,111 @@ this key -- regenerate a fresh keypair with keygen and have an
 administrator redeploy the new public key."
 }
 
+/// Resolves `.`/`..` components purely lexically -- no filesystem access,
+/// so this works even before any of these files exist (the common case for
+/// a fresh deployment) unlike `fs::canonicalize`. Sufficient for collision
+/// detection between the absolute paths `validate_config` compares:
+/// without it, `runtime_state_path=/var/lib/x/sub/../runtime.json` and
+/// `ledger_path=/var/lib/x/live-tick-pending-plan.json` compare unequal by
+/// raw `PathBuf` even though the derived pending-plan path (built from
+/// `runtime_state_path`'s parent) actually resolves to the ledger (Codex
+/// P2 follow-up, pairtrade#186).
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !matches!(
+                    normalized.components().next_back(),
+                    None | Some(std::path::Component::RootDir)
+                        | Some(std::path::Component::Prefix(_))
+                ) {
+                    normalized.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Resolves symlinks in `path`'s parent directory (via `fs::canonicalize`,
+/// which needs that directory to already exist) and rejoins the file name
+/// -- closing the gap `lexically_normalize` alone leaves open: a symlinked
+/// directory component makes two paths that ultimately name the same file
+/// on disk compare unequal lexically (e.g. `/var/lib/arcus/alias ->
+/// /var/lib/arcus/state` makes `alias/x.json` and `state/x.json` look like
+/// different files even though they are the same one) (Codex P2 follow-up,
+/// pairtrade#186). Falls back to the lexically-normalized path unchanged
+/// when the parent doesn't exist yet -- config validation must keep
+/// working before an operator has created these directories, and an
+/// as-yet-nonexistent parent cannot itself be a symlink pointing somewhere
+/// collision-relevant.
+fn resolve_path_for_collision_check(path: &Path) -> PathBuf {
+    // Walk up from the path itself (deliberately *not* lexically
+    // normalized first) toward the root, canonicalizing the longest
+    // existing prefix and reappending whatever trailing components don't
+    // exist yet on top of it. Pre-collapsing `..` as plain text before
+    // canonicalizing is wrong whenever it crosses a symlink boundary:
+    // with `/var/lib/base/alias -> /var/lib/other/child`,
+    // `alias/../sibling` actually names `/var/lib/other/sibling` (go
+    // through the symlink, then up from *its target's* parent), not
+    // `/var/lib/base/sibling` -- a textual collapse of `alias/..` can't
+    // know that, and only `fs::canonicalize`, given the still-embedded
+    // `..` and symlink together, resolves it correctly (Codex P2
+    // follow-up, pairtrade#186). `fs::canonicalize` only accepts a path
+    // that exists in full, so this still has to walk up from the leaf
+    // for the (common) case where the file itself doesn't exist yet;
+    // `lexically_normalize` is applied once at the very end, to the
+    // combined (by-then symlink-free) result, purely to collapse a `..`
+    // that landed in the not-yet-existing trailing suffix.
+    let mut ancestor = path;
+    let mut pending_components: Vec<&std::ffi::OsStr> = Vec::new();
+    let canonical_ancestor = loop {
+        match fs::canonicalize(ancestor) {
+            Ok(canonical) => break canonical,
+            Err(_) => match (ancestor.file_name(), ancestor.parent()) {
+                (Some(name), Some(next)) => {
+                    pending_components.push(name);
+                    ancestor = next;
+                }
+                // No existing ancestor anywhere in the prefix (or we
+                // walked off the top of the path) -- nothing left to
+                // canonicalize against.
+                _ => return lexically_normalize(path),
+            },
+        }
+    };
+    let mut combined = canonical_ancestor;
+    for component in pending_components.into_iter().rev() {
+        combined.push(component);
+    }
+    lexically_normalize(&combined)
+}
+
 fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     if !config.ledger_path.is_absolute() || !config.runtime_state_path.is_absolute() {
         bail!("Arcus ledger_path and runtime_state_path must be absolute");
     }
-    if config.ledger_path == config.runtime_state_path {
+    let ledger_path = resolve_path_for_collision_check(&config.ledger_path);
+    let runtime_state_path = resolve_path_for_collision_check(&config.runtime_state_path);
+    if ledger_path == runtime_state_path {
         bail!("Arcus ledger_path and runtime_state_path must be distinct");
+    }
+    // live-tick's fixed, derived pending-plan path must not alias either
+    // durable state file: it atomically replaces whatever sits at that
+    // path with plan JSON before constructing the executor, so if
+    // ledger_path or runtime_state_path happened to resolve there, that
+    // write would destroy the checkpoint or ledger outright and the
+    // subsequent fresh load would fail (Codex P2 follow-up, pairtrade#186).
+    let pending_plan_path =
+        resolve_path_for_collision_check(&live_tick_pending_plan_path(config)?);
+    if pending_plan_path == ledger_path || pending_plan_path == runtime_state_path {
+        bail!(
+            "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick pending-plan path {}",
+            pending_plan_path.display()
+        );
     }
     config.runtime.normalize();
     config
@@ -266,6 +631,15 @@ fn write_attempt(attempt: &ArcusSpotExecutionAttempt) -> Result<()> {
     let mut stdout = stdout.lock();
     serde_json::to_writer_pretty(&mut stdout, attempt)
         .context("failed to serialize execution result")?;
+    stdout.write_all(b"\n")?;
+    Ok(())
+}
+
+fn write_live_tick_event(event: &ArcusSpotRuntimeEvent) -> Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer_pretty(&mut stdout, event)
+        .context("failed to serialize live-tick event")?;
     stdout.write_all(b"\n")?;
     Ok(())
 }
@@ -519,6 +893,15 @@ async fn main() -> Result<()> {
             println!("{}", approval_digest(&config, &plan)?);
             Ok(())
         }
+        [command, config_path] if command == "hash-config" => {
+            // What an administrator runs once, against the exact CONFIG_YAML
+            // being deployed, to populate auto_execute_policy.json's
+            // approved_config_sha256 -- see docs/arcus-spot-runtime.md.
+            let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
+            let config = parse_config(&config_bytes, Path::new(config_path))?;
+            println!("{}", auto_execute_config_digest(&config)?);
+            Ok(())
+        }
         [command, digest, key_path] if command == "sign-approval" => {
             let signing_key = read_ed25519_signing_key(Path::new(key_path))?;
             let signature = signing_key.sign(digest.as_bytes());
@@ -549,6 +932,228 @@ async fn main() -> Result<()> {
             let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let runtime = runtime_store.load_or_create(&config.runtime)?;
             runtime
+                .validate_plan_consistent_with_state(&plan)
+                .map_err(anyhow::Error::msg)
+                .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
+            let attempt = executor
+                .execute_plan_once(&plan, &plan_config_digest)
+                .await?;
+            let attempt = finalize_reconciled_attempt(
+                &config,
+                &mut executor,
+                &plan,
+                &plan_config_digest,
+                attempt,
+            )?;
+            write_attempt(&attempt)
+        }
+        [command, config_path, plan_path] if command == "auto-execute" => {
+            // Skips the offline Ed25519 approval signature required by
+            // `execute`. Explicit owner decision (bot-strategy#772,
+            // 2026-08-12): while total inventory at risk stays small, the
+            // per-swap human-signing round trip is pure friction with no
+            // safety benefit proportionate to the amount at stake, and the
+            // approval gate's original purpose -- proving this brand-new
+            // execution path actually works against the real Arcus API
+            // before trusting it unattended -- was already served by the
+            // one-swap acceptance test's earlier signed attempts (which
+            // exercised every other gate below: config/plan structural
+            // validation, on-chain preflight, exact-value permit
+            // construction, slippage, staleness). Every other safety gate
+            // is unchanged and still enforced identically to `execute`:
+            // plan/config structural validation, `max_plan_age_secs`/
+            // `max_quote_age_secs`, inventory floors, daily/cumulative
+            // loss stops, exact-value-only Permit2, and the runtime
+            // checkpoint consistency check below. Revisit this decision
+            // (return to requiring `execute` with a human signature, or
+            // add a scale-dependent threshold) before any inventory
+            // scale-up beyond what is currently approved on #772.
+            let (config, plan) =
+                load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
+            require_auto_execute_plan_is_not_a_fresh_entry(&plan)?;
+            let policy = auto_execute_policy_from_admin_file()?;
+            require_config_within_auto_execute_policy(&config, &policy)?;
+            let plan_config_digest = approval_digest(&config, &plan)?;
+            let mut executor = executor_from_config(&config).await?;
+            let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            let runtime = runtime_store.load_or_create(&config.runtime)?;
+            runtime
+                .validate_plan_consistent_with_state(&plan)
+                .map_err(anyhow::Error::msg)
+                .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
+            let attempt = executor
+                .execute_plan_once(&plan, &plan_config_digest)
+                .await?;
+            let attempt = finalize_reconciled_attempt(
+                &config,
+                &mut executor,
+                &plan,
+                &plan_config_digest,
+                attempt,
+            )?;
+            write_attempt(&attempt)
+        }
+        [command, config_path, plan_path] if command == "auto-resume" => {
+            // Signatureless counterpart to `resume`, gated the same way as
+            // `auto-execute`: an attempt dispatched via `auto-execute` that
+            // comes back `Submitted` (not yet confirmed) or crashes before
+            // runtime commit otherwise has no recovery path that doesn't
+            // require the offline signature this command family exists to
+            // skip -- an unattended flow that can start unattended but
+            // then dead-ends waiting for a human is not actually unattended
+            // (Codex P2 follow-up, pairtrade#186).
+            let (config, plan) =
+                load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
+            let policy = auto_execute_policy_from_admin_file()?;
+            require_config_within_auto_execute_policy(&config, &policy)?;
+            let plan_config_digest = approval_digest(&config, &plan)?;
+            let mut executor = executor_from_config(&config).await?;
+            let attempt = executor.resume_status_and_reconcile().await?;
+            let attempt = finalize_reconciled_attempt(
+                &config,
+                &mut executor,
+                &plan,
+                &plan_config_digest,
+                attempt,
+            )?;
+            write_attempt(&attempt)
+        }
+        [command, config_path] if command == "live-tick" => {
+            // The unattended-probe entry point: evaluate the strategy
+            // signal against one fresh recorder snapshot and, only if it
+            // genuinely fires, dispatch through the exact same
+            // policy-gated, signatureless path as `auto-execute`. Most
+            // ticks decide `Observe` (no position warranted) and never
+            // touch the KMS signer or the network beyond the one read-only
+            // snapshot fetch below -- this is the "future read-only daemon
+            // [that] must call step_at with the current UTC time" flagged
+            // as not-yet-built in this same doc (bot-strategy#772/#775,
+            // 7-day activity probe).
+            let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
+            let config = parse_config(&config_bytes, Path::new(config_path))?;
+            let policy = auto_execute_policy_from_admin_file()?;
+            require_config_within_auto_execute_policy(&config, &policy)?;
+
+            // Fetch the snapshot live, from the same public, read-only
+            // recorder client the archival collector and
+            // arcus-spot-propose-plan use -- never from a caller-supplied
+            // file. An earlier version took RECORDER_SNAPSHOT_JSON as a
+            // second argument; read_private_regular_file only checks its
+            // mode/type, not its origin, so the executor identity could
+            // fabricate an internally-consistent snapshot (prices, route
+            // records) that drives step_at to EntrySignal even though the
+            // real market never crossed the threshold, dispatched through
+            // this exact signatureless path (Codex P1 follow-up,
+            // pairtrade#186). Fetching it here, the same way propose-plan
+            // does, means the snapshot's provenance is inherent rather
+            // than merely asserted.
+            let client = ArcusSpotClient::new(config.router.clone())
+                .context("invalid Arcus router configuration")?;
+            let recorder_config = ArcusSpotRecorderConfig::from_csv(
+                &format!(
+                    "{}/{}",
+                    config.runtime.pair.sell_symbol, config.runtime.pair.buy_symbol
+                ),
+                &config.runtime.notional_usd.normalize().to_string(),
+            )
+            .context(
+                "failed to build a single-pair recorder config from the runtime pair/notional",
+            )?;
+            let recorder = ArcusSpotRecorder::new(client, recorder_config)
+                .context("invalid Arcus recorder configuration")?;
+            let snapshot: ArcusSpotRecorderSnapshot = recorder.collect_once().await;
+
+            let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            // Hold the same exclusive lock `execute`/`auto-execute` take
+            // before dispatch, but scoped to just this read-modify-write: a
+            // concurrent live-tick, auto-execute, or auto-resume racing this
+            // one could otherwise commit a reconciled fill (new inventory,
+            // regime, and idempotency key) between this tick's load and
+            // persist, and this tick's persist would then silently replace
+            // that newer state with one computed from the pre-fill
+            // snapshot, letting a later tick re-plan against a position
+            // that no longer exists. Released before executor_from_config
+            // acquires its own fresh lock on the same namespace below --
+            // holding it across dispatch too would make that acquisition
+            // conflict with this one from inside the same process, since
+            // flock is scoped per open file description, not per process
+            // (Codex P1 follow-up, pairtrade#186).
+            let ledger_store_for_checkpoint =
+                ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+            let checkpoint_lock =
+                ledger_store_for_checkpoint.acquire_exclusive_lock(&config.runtime_state_path)?;
+
+            let mut runtime = store.load_or_create(&config.runtime)?;
+            // step_at itself rejects a snapshot whose collection_finished_at
+            // is not strictly newer than the last one it genuinely advanced
+            // on -- tracked in the checkpointed state, under this same
+            // lock, rather than in any caller-local bookkeeping, so it
+            // correctly orders this invocation against a concurrent
+            // arcus-spot-propose-plan (or another live-tick) writing the
+            // same checkpoint (Codex P2 follow-up, pairtrade#186; see
+            // ArcusSpotRuntimeState::last_observation_at's doc comment).
+            let event = runtime.step_at(&snapshot, Utc::now());
+            // Captured now, under the lock, so dispatch below can bind the
+            // plan to the exact observation it was computed from -- see
+            // its use after the lock is re-acquired.
+            let plan_observation_at = runtime.state().last_observation_at;
+            // Persisted unconditionally, independent of the decision below:
+            // the accumulated price-history window is exactly what next
+            // tick's signal depends on, and losing a tick's contribution
+            // because this run happened not to rotate would silently widen
+            // gaps in the very history the entry/exit z-score needs.
+            store.persist(&runtime)?;
+            drop(checkpoint_lock);
+
+            let plan = match event.decision.clone() {
+                ArcusSpotDecision::WouldRotate { plan } => plan,
+                ArcusSpotDecision::Observe { .. } | ArcusSpotDecision::SimulatedFill { .. } => {
+                    return write_live_tick_event(&event);
+                }
+            };
+            let plan_config_digest = approval_digest(&config, &plan)?;
+            // Durably record the plan before dispatching it: unlike
+            // execute/auto-execute, live-tick builds this plan itself
+            // rather than receiving it as an argument the caller already
+            // holds a copy of, so without this write, a crash or exit
+            // between submission and confirmation leaves nothing for
+            // `auto-resume` to recover with (Codex P2 follow-up,
+            // pairtrade#186).
+            let pending_plan_path = live_tick_pending_plan_path(&config)?;
+            let plan_bytes = serde_json::to_vec_pretty(&plan)
+                .context("failed to serialize Arcus live-tick plan")?;
+            write_private_regular_file_atomic(&pending_plan_path, &plan_bytes)?;
+            let mut executor = executor_from_config(&config).await?;
+            // Re-read fresh, same reasoning as `execute`'s own comment
+            // above: the plan above was computed before the ledger lock
+            // (acquired inside executor_from_config) was held, so another
+            // overlapping invocation could have advanced the checkpoint in
+            // between.
+            let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            let fresh_runtime = runtime_store.load_or_create(&config.runtime)?;
+            // validate_plan_consistent_with_state only checks regime/
+            // trigger/direction/open-quantity structural consistency, not
+            // that this plan corresponds to the checkpoint's *current*
+            // observation -- a concurrent live-tick or propose-plan
+            // processing a newer snapshot after this invocation's own
+            // checkpoint lock was dropped (above) could persist a new
+            // signal state whose regime happens to still be structurally
+            // consistent even though the newer observation itself now
+            // says Observe, or favors the opposite direction. Reject
+            // outright if the checkpoint has moved past the exact
+            // observation this plan was computed from, rather than
+            // dispatching an entry based on a signal state that no longer
+            // reflects the runtime's own most recent evaluation (Codex P1
+            // follow-up, pairtrade#186).
+            if fresh_runtime.state().last_observation_at != plan_observation_at {
+                bail!(
+                    "Arcus live-tick plan is stale: the runtime checkpoint has advanced to a \
+                     newer observation ({:?}) since this plan was computed from ({:?})",
+                    fresh_runtime.state().last_observation_at,
+                    plan_observation_at
+                );
+            }
+            fresh_runtime
                 .validate_plan_consistent_with_state(&plan)
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
@@ -596,6 +1201,11 @@ mod tests {
         assert!(usage().contains("resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX"));
         assert!(usage().contains("keygen"));
         assert!(usage().contains("sign-approval"));
+        assert!(usage().contains("auto-execute CONFIG_YAML PLAN_JSON"));
+        assert!(usage().contains("auto-resume CONFIG_YAML PLAN_JSON"));
+        assert!(usage().contains("live-tick CONFIG_YAML"));
+        assert!(!usage().contains("live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON"));
+        assert!(usage().contains("hash-config CONFIG_YAML"));
     }
 
     fn live_runtime_config() -> ArcusSpotRuntimeConfig {
@@ -820,5 +1430,448 @@ cumulative_loss_limit_usd: "10"
         .unwrap();
         let error = serde_json::from_value::<ArcusSpotExecuteOnceConfig>(value).unwrap_err();
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    fn execute_once_config(
+        ledger_path: &str,
+        runtime_state_path: &str,
+        max_sell_nvda: &str,
+    ) -> ArcusSpotExecuteOnceConfig {
+        execute_once_config_with_daily_cap(ledger_path, runtime_state_path, max_sell_nvda, 10)
+    }
+
+    fn execute_once_config_with_daily_cap(
+        ledger_path: &str,
+        runtime_state_path: &str,
+        max_sell_nvda: &str,
+        max_swaps_per_utc_day: u32,
+    ) -> ArcusSpotExecuteOnceConfig {
+        serde_yaml::from_str(&format!(
+            r#"
+router:
+  router_base_url: "https://router.spot.arcus.xyz"
+  meta_base_url: "https://api.arcus.xyz"
+  indexer_base_url: "https://indexer.spot.arcus.xyz"
+  chain_id: 4663
+  request_timeout_ms: 30000
+  min_request_interval_ms: 250
+  max_attempts: 3
+  retry_base_delay_ms: 500
+  max_retry_delay_ms: 30000
+  user_agent: "test"
+  trusted_permit2_spenders:
+    arcus:
+      - "0x006102b16A04c20306A28b652745D3973D7D24fa"
+  trusted_token_addresses:
+    NVDA: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC"
+    AMD: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC"
+  trusted_token_decimals:
+    NVDA: 18
+    AMD: 18
+chain:
+  rpc_urls:
+    - "https://rpc.mainnet.chain.robinhood.com"
+  chain_id: 4663
+  request_interval_ms: 200
+kms:
+  region: "eu-central-1"
+  key_id: "alias/test"
+  chain_id: 4663
+  expected_address: "0x812B6A6da8E0dF1fBCA7939ae32089Cf85c5DF05"
+executor:
+  taker: "0x812B6A6da8E0dF1fBCA7939ae32089Cf85c5DF05"
+  permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+  slippage_bps: 50
+  minimum_gas_balance_wei: "1000000000000000"
+  inventory_floor_raw:
+    NVDA: "50000000000000000"
+    AMD: "20000000000000000"
+  maximum_sell_amount_raw:
+    NVDA: "{max_sell_nvda}"
+    AMD: "21084353605755395"
+  max_swaps_per_utc_day: {max_swaps_per_utc_day}
+  max_plan_age_secs: 60
+ledger_path: {ledger_path}
+runtime_state_path: {runtime_state_path}
+runtime:
+  mode: live
+  chain_id: 4663
+  pair:
+    sell_symbol: NVDA
+    buy_symbol: AMD
+  notional_usd: "10"
+  initial_inventory:
+    token_a: "0.35"
+    token_b: "0.16"
+  inventory_floors:
+    token_a: "0.05"
+    token_b: "0.02"
+  max_rotation_fraction: "0.25"
+  signal_window_samples: 96
+  min_signal_samples: 32
+  entry_z_score: 2.5
+  exit_z_score: 0.25
+  max_quote_age_secs: 60
+  max_hold_secs: 86400
+  max_all_in_round_trip_cost_bps: "120"
+  gas_buffer_bps: "10"
+  settlement_buffer_bps: "10"
+  max_inventory_imbalance_fraction: "0.75"
+  daily_loss_limit_usd: "2"
+  cumulative_loss_limit_usd: "10"
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn config_rejects_a_runtime_state_path_colliding_with_the_live_tick_pending_plan_path() {
+        // live-tick derives its pending-plan path from runtime_state_path's
+        // directory; if runtime_state_path itself resolved there, live-tick
+        // would atomically overwrite the checkpoint with plan JSON right
+        // before the subsequent fresh checkpoint load, destroying it
+        // (Codex P2 follow-up, pairtrade#186).
+        let mut config = execute_once_config(
+            "/var/lib/x/ledger.json",
+            "/var/lib/x/live-tick-pending-plan.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    #[test]
+    fn config_rejects_a_ledger_path_colliding_with_the_live_tick_pending_plan_path() {
+        let mut config = execute_once_config(
+            "/var/lib/x/live-tick-pending-plan.json",
+            "/var/lib/x/runtime.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    #[test]
+    fn lexically_normalize_resolves_parent_dir_components() {
+        assert_eq!(
+            lexically_normalize(Path::new("/var/lib/x/sub/../runtime.json")),
+            Path::new("/var/lib/x/runtime.json")
+        );
+        assert_eq!(
+            lexically_normalize(Path::new("/var/lib/./x/runtime.json")),
+            Path::new("/var/lib/x/runtime.json")
+        );
+        // A `..` at the root has nothing left to pop -- stays put rather
+        // than escaping above the root or panicking.
+        assert_eq!(
+            lexically_normalize(Path::new("/../runtime.json")),
+            Path::new("/runtime.json")
+        );
+    }
+
+    #[test]
+    fn resolve_path_for_collision_check_sees_through_a_symlinked_parent() {
+        let dir = tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let via_alias = resolve_path_for_collision_check(&alias_dir.join("x.json"));
+        let via_real = resolve_path_for_collision_check(&real_dir.join("x.json"));
+        assert_eq!(
+            via_alias, via_real,
+            "a symlinked directory component must resolve to the same path as its target"
+        );
+    }
+
+    #[test]
+    fn resolve_path_for_collision_check_falls_back_when_parent_does_not_exist_yet() {
+        let path = Path::new("/nonexistent-parent-dir-arcus-test-xyz/runtime.json");
+        assert_eq!(
+            resolve_path_for_collision_check(path),
+            lexically_normalize(path)
+        );
+    }
+
+    #[test]
+    fn resolve_path_for_collision_check_sees_through_a_symlinked_grandparent() {
+        // Codex P2 follow-up, pairtrade#186: the immediate parent itself
+        // doesn't exist here (only the symlinked grandparent does), which
+        // the single-level canonicalize(parent) attempt alone cannot see
+        // through.
+        let dir = tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let via_alias = resolve_path_for_collision_check(&alias_dir.join("new").join("x.json"));
+        let via_real = resolve_path_for_collision_check(&real_dir.join("new").join("x.json"));
+        assert_eq!(
+            via_alias, via_real,
+            "a symlinked grandparent must resolve to the same path as its target even when the \
+             immediate parent directory doesn't exist yet"
+        );
+    }
+
+    #[test]
+    fn resolve_path_for_collision_check_resolves_parent_dir_traversal_across_a_symlink() {
+        // Codex P2 follow-up, pairtrade#186: `..` must be resolved using
+        // filesystem semantics together with any symlink it crosses, not
+        // collapsed as plain text first. alias -> target_parent/child, so
+        // alias/../sibling actually names target_parent/sibling (go
+        // through the symlink, then up from *its target's* parent) --
+        // not a sibling of `alias` itself.
+        let dir = tempdir().unwrap();
+        let target_parent = dir.path().join("target_parent");
+        fs::create_dir(&target_parent).unwrap();
+        fs::create_dir(target_parent.join("child")).unwrap();
+        let sibling = target_parent.join("sibling");
+        fs::create_dir(&sibling).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(target_parent.join("child"), &alias).unwrap();
+
+        let via_traversal =
+            resolve_path_for_collision_check(&alias.join("..").join("sibling").join("x.json"));
+        let via_direct = resolve_path_for_collision_check(&sibling.join("x.json"));
+        assert_eq!(
+            via_traversal, via_direct,
+            "a `..` crossing a symlink must resolve relative to the symlink's target, not the \
+             symlink's own location"
+        );
+    }
+
+    #[test]
+    fn config_rejects_a_symlinked_parent_disguised_collision() {
+        // Codex P2 follow-up, pairtrade#186: lexical normalization alone
+        // can't see through a symlinked directory component -- `alias`
+        // and `state` compare unequal lexically even when `alias` really
+        // points at `state`, so ledger_path=alias/live-tick-pending-plan.json
+        // and runtime_state_path=state/runtime.json alias the same file on
+        // disk despite passing the lexical-only check.
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&state_dir, &alias_dir).unwrap();
+
+        let ledger_path = alias_dir.join("live-tick-pending-plan.json");
+        let runtime_state_path = state_dir.join("runtime.json");
+
+        let mut config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_state_path.to_str().unwrap(),
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    #[test]
+    fn config_rejects_a_traversal_disguised_collision_with_the_pending_plan_path() {
+        // Codex P2 follow-up, pairtrade#186: raw PathBuf equality doesn't
+        // catch a ledger_path that is textually different from, but
+        // lexically resolves to, the same file as the derived pending-plan
+        // path -- exactly Codex's own example.
+        let mut config = execute_once_config(
+            "/var/lib/x/live-tick-pending-plan.json",
+            "/var/lib/x/sub/../runtime.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+
+    fn rotation_plan(trigger: &str) -> ArcusSpotRotationPlan {
+        serde_json::from_value(serde_json::json!({
+            "direction": "token_a_to_token_b",
+            "trigger": trigger,
+            "sell_symbol": "NVDA",
+            "buy_symbol": "AMD",
+            "sell_token_address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+            "buy_token_address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+            "sell_quantity": "0.1",
+            "buy_quantity": "0.05",
+            "sell_amount_raw": "100000000000000000",
+            "buy_amount_raw": "50000000000000000",
+            "venue": "arcus",
+            "quote_received_at": "2026-08-14T00:00:00Z",
+            "optimistic_round_trip_loss_bps": "76.5",
+            "gas_buffer_bps": "10",
+            "settlement_buffer_bps": "10",
+            "all_in_round_trip_cost_bps": "96.5",
+            "predicted_inventory": {"token_a": "0.25", "token_b": "0.21"},
+            "predicted_inventory_imbalance_fraction": "0.1",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn auto_execute_refuses_a_fresh_entry_signal_plan() {
+        // The gap Codex flagged (P1 follow-up, pairtrade#186): nothing on
+        // the signatureless path authenticates that an entry plan's
+        // strategy fields (z-score crossing, round-trip cost, rotation
+        // fraction, inventory imbalance) came from a genuine step_at
+        // evaluation rather than being hand-crafted within every other
+        // check's tolerance.
+        let plan = rotation_plan("entry_signal");
+        let error = require_auto_execute_plan_is_not_a_fresh_entry(&plan).unwrap_err();
+        assert!(error.to_string().contains("entry_signal"));
+    }
+
+    #[test]
+    fn auto_execute_allows_a_mean_reversion_exit_plan() {
+        // Exits are risk-reducing and already bounded by the checkpoint's
+        // own genuinely-open rotated quantity (validate_plan_consistent_
+        // with_state), so they are not restricted to execute/live-tick.
+        let plan = rotation_plan("mean_reversion_exit");
+        require_auto_execute_plan_is_not_a_fresh_entry(&plan).unwrap();
+    }
+
+    #[test]
+    fn auto_execute_allows_a_max_hold_exit_plan() {
+        let plan = rotation_plan("max_hold_exit");
+        require_auto_execute_plan_is_not_a_fresh_entry(&plan).unwrap();
+    }
+
+    fn auto_execute_policy_for(config: &ArcusSpotExecuteOnceConfig) -> ArcusSpotAutoExecutePolicy {
+        ArcusSpotAutoExecutePolicy {
+            approved_config_sha256: auto_execute_config_digest(config).unwrap(),
+        }
+    }
+
+    #[test]
+    fn auto_execute_policy_accepts_a_config_matching_the_approved_digest() {
+        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy_for(&config);
+        require_config_within_auto_execute_policy(&config, &policy).unwrap();
+    }
+
+    #[test]
+    fn auto_execute_policy_rejects_a_redirected_ledger_path() {
+        // Without this, the executor identity could point ledger_path at a
+        // fresh, empty file to silently reset the daily swap count and
+        // prior attempt history that the real ledger accumulates.
+        let approved = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy_for(&approved);
+        let config = execute_once_config("/tmp/attacker-chosen/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the administrator-approved configuration"));
+    }
+
+    #[test]
+    fn auto_execute_policy_rejects_a_redirected_runtime_state_path() {
+        let approved = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy_for(&approved);
+        let config = execute_once_config("/var/lib/x/ledger.json", "/tmp/attacker-chosen/runtime.json", "1000");
+        let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the administrator-approved configuration"));
+    }
+
+    #[test]
+    fn auto_execute_policy_rejects_a_sell_ceiling_raised_past_the_administrator_approved_value() {
+        let approved = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let policy = auto_execute_policy_for(&approved);
+        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "999999999999");
+        let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the administrator-approved configuration"));
+    }
+
+    #[test]
+    fn auto_execute_policy_rejects_a_field_the_old_field_by_field_check_never_covered() {
+        // Regression guard for the exact gap Codex flagged (P1 follow-up,
+        // pairtrade#186): the earlier policy shape only compared
+        // ledger_path/runtime_state_path/maximum_sell_amount_raw, so a
+        // change to any other field -- like max_swaps_per_utc_day here --
+        // would have passed silently. Digest-binding the whole config
+        // closes that regardless of which field changes.
+        let approved =
+            execute_once_config_with_daily_cap("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000", 10);
+        let policy = auto_execute_policy_for(&approved);
+        let config =
+            execute_once_config_with_daily_cap("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000", 999);
+        let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the administrator-approved configuration"));
+    }
+
+    #[test]
+    fn auto_execute_policy_file_owned_by_this_process_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auto_execute_policy.json");
+        fs::write(&path, r#"{"approved_config_sha256":"sha256:00"}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = auto_execute_policy_from_file(&path).unwrap_err();
+        assert!(error.to_string().contains("administrator-owned"));
+    }
+
+    #[test]
+    fn auto_execute_policy_file_that_is_group_writable_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auto_execute_policy.json");
+        fs::write(&path, r#"{"approved_config_sha256":"sha256:00"}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        let error = auto_execute_policy_from_file(&path).unwrap_err();
+        // Group-writable AND owned by this process -- the ownership check
+        // fires first, which is still a correct rejection; assert on
+        // whichever this environment's fs::write() ownership produces.
+        assert!(
+            error.to_string().contains("group- or other-writable")
+                || error.to_string().contains("administrator-owned")
+        );
+    }
+
+    #[test]
+    fn live_tick_persists_the_checkpoint_even_on_an_observe_decision() {
+        // The behavior live-tick relies on: unlike execute/auto-execute
+        // (which only ever touch the checkpoint via a confirmed fill),
+        // live-tick must persist after *every* tick so the accumulated
+        // price-history window survives even ticks that decide Observe --
+        // otherwise a probe running mostly-Observe (duty-cycle-starved, as
+        // this style of signal generally is) would never actually build up
+        // the history its own entry/exit z-score needs.
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("runtime.json");
+        let config = live_runtime_config();
+        let store = ArcusSpotRuntimeCheckpointStore::new(state_path.clone());
+        let mut runtime = store.load_or_create(&config).unwrap();
+
+        let snapshot: ArcusSpotRecorderSnapshot = serde_json::from_str(
+            r#"{"schema_version":2,"mode":"public_indicative_read_only","chain_id":4663,"collection_started_at":"2026-07-27T00:00:00Z","collection_finished_at":"2026-07-27T00:00:01Z","indexer_stats":{"status":"error","error":{"stage":"indexer_stats","classification":"http","retryable":false,"message":"x"}},"token_metadata":{"status":"error","error":{"stage":"token_metadata","classification":"http","retryable":false,"message":"x"}},"reference_overview":{"status":"error","error":{"stage":"reference_overview","classification":"http","retryable":false,"message":"x"}},"round_trips":[]}"#,
+        )
+        .unwrap();
+
+        let event = runtime.step_at(&snapshot, Utc::now());
+        assert!(matches!(event.decision, ArcusSpotDecision::Observe { .. }));
+        store.persist(&runtime).unwrap();
+
+        assert!(state_path.exists());
+        assert_eq!(
+            fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let reloaded = store.load_or_create(&config).unwrap();
+        assert_eq!(reloaded.state().sequence, runtime.state().sequence);
+    }
+
+    #[test]
+    fn auto_execute_policy_symlink_is_rejected() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("real_policy.json");
+        fs::write(&target, r#"{"approved_config_sha256":"sha256:00"}"#).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("auto_execute_policy.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = auto_execute_policy_from_file(&link).unwrap_err();
+        assert!(error.to_string().contains("non-symlink"));
     }
 }
