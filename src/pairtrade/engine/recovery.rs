@@ -21,7 +21,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use dex_connector::{DexError, PositionSnapshot};
 use rust_decimal::Decimal;
 use tokio::time::sleep;
@@ -34,6 +34,55 @@ use super::super::PairTradeEngine;
 use crate::email_client::EmailClient;
 
 impl PairTradeEngine {
+    fn configured_startup_symbols(&self) -> Vec<String> {
+        let mut symbols = self
+            .cfg
+            .universe
+            .iter()
+            .flat_map(|pair| [pair.base.clone(), pair.quote.clone()])
+            .collect::<Vec<_>>();
+        symbols.sort();
+        symbols.dedup();
+        symbols
+    }
+
+    /// Refuse to mutate an account that contains positions outside the
+    /// configured pair universe. A Lighter account can be shared by another
+    /// actor; startup cleanup must never interpret that actor's position as
+    /// stale pairtrade exposure and MARKET-close it (bot-strategy#799).
+    fn ensure_startup_positions_in_universe(&self, positions: &[PositionSnapshot]) -> Result<()> {
+        let configured_symbols = self.configured_startup_symbols();
+        let configured = configured_symbols
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let unexpected = positions
+            .iter()
+            .filter(|position| {
+                position.sign != 0
+                    && position.size > Decimal::ZERO
+                    && !configured.contains(position.symbol.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if unexpected.is_empty() {
+            return Ok(());
+        }
+
+        let unexpected_summary = Self::format_positions_summary(&unexpected);
+        let configured_summary = configured_symbols.join(",");
+        log::error!(
+            "[Startup] refusing cleanup: unexpected positions outside configured universe [{}]: {}",
+            configured_summary,
+            unexpected_summary
+        );
+        Err(anyhow!(
+            "startup cleanup blocked by unexpected positions outside configured universe [{}]: {}",
+            configured_summary,
+            unexpected_summary
+        ))
+    }
+
     fn format_positions_summary(positions: &[PositionSnapshot]) -> String {
         let mut parts = Vec::with_capacity(positions.len());
         for position in positions {
@@ -105,11 +154,10 @@ impl PairTradeEngine {
     /// connected (bot-strategy#405). Treating WS-not-ready as a wait state
     /// here keeps the WARN/ERROR for genuine failures only.
     ///
-    /// Returns `Ok(())` when the connector returns positions (or any other
-    /// non-WS-not-ready outcome — including a different `Err`, which the
-    /// subsequent force-close loop will surface). Returns `Err` only on
-    /// timeout.
-    async fn wait_for_ws_ready(&self, timeout: Duration) -> Result<(), ()> {
+    /// Returns the first available position snapshot. Any non-readiness
+    /// error and timeout fail startup before order cancellation or position
+    /// closing, preserving the mutation-free preflight invariant from #799.
+    async fn wait_for_startup_positions(&self, timeout: Duration) -> Result<Vec<PositionSnapshot>> {
         const POLL_INTERVAL: Duration = Duration::from_secs(2);
         const LOG_INTERVAL: Duration = Duration::from_secs(10);
         let start = Instant::now();
@@ -119,7 +167,10 @@ impl PairTradeEngine {
                 Err(DexError::Transient(ref msg)) if msg.contains("not ready from websocket") => {
                     let now = Instant::now();
                     if now.duration_since(start) >= timeout {
-                        return Err(());
+                        return Err(anyhow!(
+                            "startup positions snapshot not ready after {}s",
+                            timeout.as_secs()
+                        ));
                     }
                     if now >= next_log {
                         log::info!(
@@ -130,7 +181,10 @@ impl PairTradeEngine {
                     }
                     sleep(POLL_INTERVAL).await;
                 }
-                _ => return Ok(()),
+                Ok(positions) => return Ok(positions),
+                Err(err) => {
+                    return Err(anyhow!("startup get_positions failed: {:?}", err));
+                }
             }
         }
     }
@@ -149,22 +203,32 @@ impl PairTradeEngine {
             attempts,
             wait_secs
         );
-        if let Err(err) = self.connector.cancel_all_orders(None).await {
-            log::warn!("[Startup] cancel_all_orders failed: {:?}", err);
+        let configured_symbols = self.configured_startup_symbols();
+        if configured_symbols.is_empty() {
+            return Err(anyhow!(
+                "startup cleanup blocked: configured pair universe is empty"
+            ));
         }
-        if self
-            .wait_for_ws_ready(Duration::from_secs(60))
-            .await
-            .is_err()
-        {
-            log::warn!(
-                "[Startup] WS positions snapshot not ready after 60s; proceeding to retry loop"
-            );
+
+        // bot-strategy#799: the account may contain positions owned by a
+        // different actor. Inspect before the first mutation, then cancel
+        // only configured symbols so unrelated pending orders are untouched.
+        let preflight_positions = self
+            .wait_for_startup_positions(Duration::from_secs(60))
+            .await?;
+        self.ensure_startup_positions_in_universe(&preflight_positions)?;
+        for symbol in &configured_symbols {
+            if let Err(err) = self.connector.cancel_all_orders(Some(symbol.clone())).await {
+                log::warn!("[Startup] cancel_all_orders({}) failed: {:?}", symbol, err);
+            }
         }
         for attempt in 1..=attempts {
             let positions_result = self.connector.get_positions().await;
             match positions_result {
                 Ok(positions) => {
+                    // Re-check on every retry so an external position opened
+                    // after preflight still aborts before any close request.
+                    self.ensure_startup_positions_in_universe(&positions)?;
                     // bot-strategy#487: drop sub-min dust before deciding
                     // whether anything is left to close. Dust can never be
                     // submitted to close_all_positions, so counting it as
@@ -249,6 +313,7 @@ impl PairTradeEngine {
         }
         match self.connector.get_positions().await {
             Ok(positions) => {
+                self.ensure_startup_positions_in_universe(&positions)?;
                 // bot-strategy#487: sub-min dust is not a force-close failure —
                 // it can never be flattened, so do not ERROR/email on it.
                 let (closable, dust) = self.split_dust_positions(positions).await;
