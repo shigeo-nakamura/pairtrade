@@ -141,9 +141,12 @@ jobs:
           # Self-contained deploy: ship the wrapper + unit too so a dispatch
           # run does not depend on a prior ci.yml scripts sync.
           aws s3 cp debot/scripts/debot-pair-hyperliquid-observe.sh "s3://${S3_BUCKET}/debot/scripts/debot-pair-hyperliquid-observe.sh"
+          aws s3 cp debot/scripts/archive_observer_journal.sh "s3://${S3_BUCKET}/debot/scripts/archive_observer_journal.sh"
           aws s3 cp debot/deploy/debot-pair-hyperliquid-observe.service "s3://${S3_BUCKET}/deploy/debot-pair-hyperliquid-observe.service"
+          aws s3 cp debot/deploy/archive-hyperliquid-observer-journal.service "s3://${S3_BUCKET}/deploy/archive-hyperliquid-observer-journal.service"
+          aws s3 cp debot/deploy/archive-hyperliquid-observer-journal.timer "s3://${S3_BUCKET}/deploy/archive-hyperliquid-observer-journal.timer"
 
-      - name: Deploy via SSM (no start)
+      - name: Deploy via SSM (no observer start)
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
@@ -156,7 +159,10 @@ jobs:
               "sudo chmod 755 __INSTALL_DIR__/bin/debot",
               "aws s3 cp s3://__S3_BUCKET__/debot/scripts/debot-pair-hyperliquid-observe.sh /opt/debot/scripts/debot-pair-hyperliquid-observe.sh",
               "sudo chmod 755 /opt/debot/scripts/debot-pair-hyperliquid-observe.sh",
-              "/bin/bash -lc 'set -e; svc=debot-pair-hyperliquid-observe; aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; sudo systemctl daemon-reload; else rm /tmp/$svc.service; fi'"
+              "aws s3 cp s3://__S3_BUCKET__/debot/scripts/archive_observer_journal.sh /opt/debot/scripts/archive_observer_journal.sh",
+              "sudo chmod 755 /opt/debot/scripts/archive_observer_journal.sh",
+              "/bin/bash -lc 'set -e; svc=debot-pair-hyperliquid-observe; aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; sudo systemctl daemon-reload; else rm /tmp/$svc.service; fi'",
+              "/bin/bash -lc 'set -e; base=archive-hyperliquid-observer-journal; aws s3 cp s3://__S3_BUCKET__/deploy/$base.service /tmp/$base.service; aws s3 cp s3://__S3_BUCKET__/deploy/$base.timer /tmp/$base.timer; sudo mv /tmp/$base.service /tmp/$base.timer /etc/systemd/system/; sudo systemctl daemon-reload; sudo systemctl enable --now $base.timer'"
             ]
           }
           JSON
