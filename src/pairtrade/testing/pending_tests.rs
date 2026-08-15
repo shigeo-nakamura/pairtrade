@@ -2431,6 +2431,37 @@ async fn force_close_on_startup_rejects_unexpected_position_without_mutation() {
     );
 }
 
+/// Codex review PR #194: after preflight and close attempts, startup must
+/// fail closed when the final exchange snapshot is unavailable.
+#[tokio::test]
+async fn force_close_on_startup_rejects_unavailable_final_snapshot() {
+    let connector = Arc::new(DummyConnector::default());
+    *connector.positions_to_return.lock().unwrap() = vec![PositionSnapshot {
+        symbol: "BTC".to_string(),
+        size: dec("0.25"),
+        sign: 1,
+        entry_price: Some(dec("100000")),
+    }];
+    // Call 1 is the preflight and call 2 is the only close attempt. The final
+    // verification read (call 3) then fails.
+    *connector.positions_fail_after_calls.lock().unwrap() = Some(2);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    set_btc_eth_universe(&mut engine);
+    engine.cfg.dry_run = false;
+    engine.cfg.startup_force_close_wait_secs = 0;
+    engine.cfg.startup_force_close_attempts = 1;
+
+    let err = engine.force_close_on_startup().await.unwrap_err();
+
+    let message = err.to_string();
+    assert!(
+        message.contains("could not verify final positions"),
+        "{message}"
+    );
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 1);
+}
+
 /// bot-strategy#487: a position below the venue min order size (0.00001
 /// BTC vs Extended's 0.0001 min) can never be submitted to
 /// `close_all_positions` — the connector rejects sub-min sizes — so the

@@ -354,6 +354,11 @@ impl PairTradeEngine {
                     attempts,
                     err
                 );
+                return Err(anyhow!(
+                    "startup cleanup could not verify final positions after {} attempts: {:?}",
+                    attempts,
+                    err
+                ));
             }
         }
         Ok(())
