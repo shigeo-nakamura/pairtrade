@@ -254,17 +254,17 @@ impl PairTradeEngine {
     /// of qty already sitting on the exchange (Frankfurt 2026-05-22 variant
     /// C ETH leg ended at 2× target via this race). Pure relocation from
     /// `reissue_partial_legs` (bot-strategy#502).
-    async fn reissue_leg_fill_state(
-        &mut self,
+    fn reissue_leg_fill_state(
+        &self,
         leg: &PendingLeg,
         local_filled: Decimal,
+        exchange_filled: Option<Decimal>,
         reduce_only: bool,
     ) -> (Decimal, Decimal) {
         if !reduce_only {
-            let exch = self.fetch_residual_position_size(&leg.symbol).await;
-            let r = Self::cap_entry_reissue_remaining(leg.target, local_filled, exch);
+            let r = Self::cap_entry_reissue_remaining(leg.target, local_filled, exchange_filled);
             let effective = leg.target - r;
-            if let Some(exch_qty) = exch {
+            if let Some(exch_qty) = exchange_filled {
                 if exch_qty > local_filled {
                     log::warn!(
                         "[ENTRY_CAP] {} exchange position {} exceeds local filled {} (target {}); \
@@ -455,6 +455,21 @@ impl PairTradeEngine {
         // helpers (exchange-position fetch / order placement) without
         // tripping the borrow against `&pending.legs`.
         let pending_legs: Vec<PendingLeg> = pending.legs.clone();
+        // A venue position is a symbol-level total, while a cancel/reissue
+        // chain is represented by multiple PendingLeg rows (settled slices
+        // followed by the current remainder). Consume the exchange total
+        // across those rows once. Reusing the full total for every row
+        // repeatedly subtracts old fills and shrinks the original target on
+        // each retry (bot-strategy#796).
+        let mut exchange_remaining: HashMap<String, Option<Decimal>> = HashMap::new();
+        if !reduce_only {
+            for leg in &pending_legs {
+                if !exchange_remaining.contains_key(&leg.symbol) {
+                    let qty = self.fetch_residual_position_size(&leg.symbol).await;
+                    exchange_remaining.insert(leg.symbol.clone(), qty);
+                }
+            }
+        }
         for leg in &pending_legs {
             let local_filled = filled_qtys
                 .get(&leg.order_id)
@@ -470,9 +485,21 @@ impl PairTradeEngine {
             // duplicate order on top of qty already sitting on the
             // exchange. Frankfurt 2026-05-22 06:27 UTC variant C ETH leg
             // ended at 2× target (0.8905 → 1.7810) via this race.
-            let (filled, remaining) = self
-                .reissue_leg_fill_state(leg, local_filled, reduce_only)
-                .await;
+            let exchange_filled = if reduce_only {
+                None
+            } else {
+                exchange_remaining
+                    .get_mut(&leg.symbol)
+                    .and_then(|remaining| {
+                        remaining.as_mut().map(|qty| {
+                            let attributed = (*qty).min(leg.target).max(Decimal::ZERO);
+                            *qty = (*qty - attributed).max(Decimal::ZERO);
+                            attributed
+                        })
+                    })
+            };
+            let (filled, remaining) =
+                self.reissue_leg_fill_state(leg, local_filled, exchange_filled, reduce_only);
             if remaining <= Decimal::ZERO {
                 self.cancel_amend_skipped_leg(use_amend, leg).await;
                 new_legs.push(Self::kept_leg(leg, filled));
@@ -910,7 +937,9 @@ impl PairTradeEngine {
                 .create_order(symbol, size, side, None, None, reduce_only, None)
                 .await
             {
-                Ok(response) => Ok(Self::order_result_from_response(response, false, None, meta)),
+                Ok(response) => Ok(Self::order_result_from_response(
+                    response, false, None, meta,
+                )),
                 Err(err) => {
                     capital_guard_every_attempt_definitively_rejected &=
                         matches!(err, DexError::ServerResponse(_));

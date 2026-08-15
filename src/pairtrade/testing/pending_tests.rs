@@ -301,7 +301,10 @@ impl DexConnector for DummyConnector {
             .lock()
             .unwrap()
             .push((symbol.to_string(), size, side, price, reduce_only));
-        if self.reject_orders_with_server_response.load(Ordering::SeqCst) {
+        if self
+            .reject_orders_with_server_response
+            .load(Ordering::SeqCst)
+        {
             return Err(DexError::ServerResponse(
                 "insufficient balance (test)".to_string(),
             ));
@@ -536,6 +539,107 @@ async fn reissue_partial_entry_leg_reorders_remaining() {
     assert_eq!(calls[0].0, "AAA");
     assert_eq!(calls[0].3, Some(dec("100.0")));
     assert!(!calls[0].4);
+}
+
+// bot-strategy#796: the exchange position is cumulative per symbol.
+// A settled slice must consume that total before the fresh remainder is
+// capped, otherwise every retry shrinks the original target again.
+#[tokio::test]
+async fn repeated_entry_reissues_preserve_original_symbol_target() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    *connector.positions_to_return.lock().unwrap() = vec![PositionSnapshot {
+        symbol: "ETH".to_string(),
+        size: dec("0.5695"),
+        ..Default::default()
+    }];
+    let pending = PendingOrders {
+        legs: vec![PendingLeg {
+            symbol: "ETH".to_string(),
+            order_id: "initial".to_string(),
+            exchange_order_id: None,
+            target: dec("2.4524"),
+            filled: Decimal::ZERO,
+            side: OrderSide::Long,
+            submitted_qty: dec("2.4524"),
+            limit_price: None,
+            reference_price: None,
+            submit_ts_ms: 0,
+            ack_ts_ms: None,
+            decision_ts_ms: 0,
+            submit_reference_price: None,
+            submit_mid: None,
+            submit_bid: None,
+            submit_ask: None,
+            client_order_id: None,
+            reduce_only: false,
+            post_only: false,
+        }],
+        direction: PositionDirection::ShortSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    };
+    let price_map = HashMap::from([(
+        "ETH".to_string(),
+        SymbolSnapshot {
+            price: dec("1879"),
+            min_order: Some(dec("0.0001")),
+            min_tick: Some(dec("0.0001")),
+            size_decimals: Some(4),
+            funding_rate: Decimal::ZERO,
+            bid_price: None,
+            ask_price: None,
+            bid_size: Decimal::ZERO,
+            ask_size: Decimal::ZERO,
+            exchange_ts: None,
+        },
+    )]);
+
+    let first = engine
+        .reissue_partial_legs(ReissuePartialLegsRequest {
+            pending: &pending,
+            filled_qtys: &HashMap::from([("initial".to_string(), dec("0.5695"))]),
+            price_map: &price_map,
+            reduce_only: false,
+            use_market: false,
+            retry_count: 1,
+            use_amend: false,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.legs.iter().map(|leg| leg.target).sum::<Decimal>(),
+        dec("2.4524")
+    );
+
+    let second = engine
+        .reissue_partial_legs(ReissuePartialLegsRequest {
+            pending: &first,
+            filled_qtys: &HashMap::new(),
+            price_map: &price_map,
+            reduce_only: false,
+            use_market: false,
+            retry_count: 2,
+            use_amend: false,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second.legs.iter().map(|leg| leg.target).sum::<Decimal>(),
+        dec("2.4524"),
+        "retries must preserve the original symbol target"
+    );
+    assert!(connector
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.1 == dec("1.8829")));
 }
 
 // bot-strategy#471: with `use_amend=true` and a venue that supports a
