@@ -96,16 +96,31 @@ fi
 
 TARGET_BINARY="$SIDECAR_ROOT/bin/lighter-ratelimit"
 TARGET_MANIFEST="$SIDECAR_ROOT/manifest.json"
+ACTIVE_MANIFEST="$SIDECAR_ROOT/active-manifest.json"
 TARGET_UNIT="$SYSTEMD_DIR/$SERVICE"
 install -d -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 "$SIDECAR_ROOT/bin" "$SYSTEMD_DIR"
 
 binary_changed=true
 unit_changed=true
+activation_required=true
 if [ -f "$TARGET_BINARY" ] && cmp -s "$BINARY" "$TARGET_BINARY"; then
   binary_changed=false
 fi
 if [ -f "$TARGET_UNIT" ] && cmp -s "$UNIT" "$TARGET_UNIT"; then
   unit_changed=false
+fi
+if [ -f "$ACTIVE_MANIFEST" ] &&
+   "$JQ_BIN" -e \
+     --arg source_sha "$EXPECTED_SOURCE_SHA" \
+     --arg deployment_source_sha "$("$JQ_BIN" -r .deployment_source_sha "$MANIFEST")" \
+     --arg binary_sha256 "$BINARY_SHA256" \
+     --arg unit_sha256 "$UNIT_SHA256" '
+       .source_sha == $source_sha and
+       .deployment_source_sha == $deployment_source_sha and
+       .binary_sha256 == $binary_sha256 and
+       .unit_sha256 == $unit_sha256
+     ' "$ACTIVE_MANIFEST" >/dev/null; then
+  activation_required=false
 fi
 
 install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 "$BINARY" "$TARGET_BINARY"
@@ -118,12 +133,13 @@ test "$(stat -c %U:%G:%a "$TARGET_UNIT")" = "$INSTALL_OWNER:$INSTALL_GROUP:644"
 echo "$BINARY_SHA256  $TARGET_BINARY" | sha256sum -c -
 echo "$UNIT_SHA256  $TARGET_UNIT" | sha256sum -c -
 
-if [ "$unit_changed" = true ]; then
+if [ "$unit_changed" = true ] || [ "$activation_required" = true ]; then
   "$SYSTEMCTL" daemon-reload
 fi
 "$SYSTEMCTL" enable "$SERVICE"
 if "$SYSTEMCTL" is-active --quiet "$SERVICE"; then
-  if [ "$binary_changed" = true ] || [ "$unit_changed" = true ]; then
+  if [ "$binary_changed" = true ] || [ "$unit_changed" = true ] ||
+     [ "$activation_required" = true ]; then
     "$SYSTEMCTL" restart "$SERVICE"
   fi
 else
@@ -145,4 +161,6 @@ if [[ " $LOADED_BEFORE " != *" $BOT_SERVICE "* ]]; then
   exit 1
 fi
 
-echo "Robinhood sidecar ready (binary_changed=$binary_changed, unit_changed=$unit_changed, source=$EXPECTED_SOURCE_SHA)"
+install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 "$MANIFEST" "$ACTIVE_MANIFEST"
+test "$(stat -c %U:%G:%a "$ACTIVE_MANIFEST")" = "$INSTALL_OWNER:$INSTALL_GROUP:644"
+echo "Robinhood sidecar ready (binary_changed=$binary_changed, unit_changed=$unit_changed, activation_required=$activation_required, source=$EXPECTED_SOURCE_SHA)"

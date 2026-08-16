@@ -126,21 +126,26 @@ run_bootstrap() {
 run_bootstrap
 cmp "$BUNDLE/lighter-ratelimit" "$SIDECAR_ROOT/bin/lighter-ratelimit"
 cmp "$BUNDLE/lighter-ratelimit.service" "$SYSTEMD_DIR/lighter-ratelimit.service"
+cmp "$BUNDLE/manifest.json" "$SIDECAR_ROOT/active-manifest.json"
 test "$(grep -c '^start lighter-ratelimit.service$' "$WORK/systemctl.log")" -eq 1
 
 # An identical deployment is idempotent: no start or restart.
 run_bootstrap
 test "$(grep -Ec '^(start|restart) lighter-ratelimit.service$' "$WORK/systemctl.log")" -eq 1
 
-# A changed binary with matching provenance restarts the already-active sidecar.
+# Simulate interruption after updated files were installed but before the
+# process was restarted and the active-release marker advanced.
 printf '#!/usr/bin/env bash\nexit 1\n' > "$BUNDLE/lighter-ratelimit"
 chmod 755 "$BUNDLE/lighter-ratelimit"
 BINARY_SHA=$(sha256sum "$BUNDLE/lighter-ratelimit" | awk '{print $1}')
 printf '%s  lighter-ratelimit\n' "$BINARY_SHA" > "$BUNDLE/lighter-ratelimit.sha256"
 jq --arg sha "$BINARY_SHA" '.binary_sha256 = $sha' "$BUNDLE/manifest.json" > "$WORK/manifest.next"
 mv "$WORK/manifest.next" "$BUNDLE/manifest.json"
+cp "$BUNDLE/lighter-ratelimit" "$SIDECAR_ROOT/bin/lighter-ratelimit"
+cp "$BUNDLE/manifest.json" "$SIDECAR_ROOT/manifest.json"
 run_bootstrap
 test "$(grep -c '^restart lighter-ratelimit.service$' "$WORK/systemctl.log")" -eq 1
+cmp "$BUNDLE/manifest.json" "$SIDECAR_ROOT/active-manifest.json"
 
 # A bundle built from a different dex-connector source fails before mutation.
 jq '.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
