@@ -34,7 +34,7 @@ use std::{
     env, fs,
     fs::OpenOptions,
     io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -104,6 +104,89 @@ fn observation_evidence_path(runtime_state_path: &Path) -> Result<PathBuf> {
         .parent()
         .context("Arcus runtime_state_path has no parent")?;
     Ok(parent.join("live-tick-observation-evidence.json"))
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !matches!(
+                    normalized.components().next_back(),
+                    None | Some(std::path::Component::RootDir)
+                        | Some(std::path::Component::Prefix(_))
+                ) {
+                    normalized.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Canonicalize the longest existing prefix, preserving not-yet-created
+/// suffixes so aliases through symlinked parents and `..` are still detected.
+fn resolve_path_for_collision_check(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut pending_components: Vec<&std::ffi::OsStr> = Vec::new();
+    let canonical_ancestor = loop {
+        match fs::canonicalize(ancestor) {
+            Ok(canonical) => break canonical,
+            Err(_) => match (ancestor.file_name(), ancestor.parent()) {
+                (Some(name), Some(next)) => {
+                    pending_components.push(name);
+                    ancestor = next;
+                }
+                _ => return lexically_normalize(path),
+            },
+        }
+    };
+    let mut combined = canonical_ancestor;
+    for component in pending_components.into_iter().rev() {
+        combined.push(component);
+    }
+    lexically_normalize(&combined)
+}
+
+fn paths_alias(left: &Path, right: &Path) -> bool {
+    if resolve_path_for_collision_check(left) == resolve_path_for_collision_check(right) {
+        return true;
+    }
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+fn validate_plan_output_path(runtime_state_path: &Path, out_path: &Path) -> Result<()> {
+    let absolute_out = if out_path.is_absolute() {
+        out_path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve the current directory for PLAN_JSON_OUT")?
+            .join(out_path)
+    };
+    let evidence_path = observation_evidence_path(runtime_state_path)?;
+    let parent = runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    let file_name = runtime_state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Arcus runtime_state_path has no valid file name")?;
+    let lock_path = parent.join(format!(".{file_name}.lock"));
+    if paths_alias(&absolute_out, runtime_state_path)
+        || paths_alias(&absolute_out, &evidence_path)
+        || paths_alias(&absolute_out, &lock_path)
+    {
+        bail!(
+            "PLAN_JSON_OUT {} must not alias the Arcus runtime checkpoint, checkpoint lock, or observation evidence",
+            absolute_out.display()
+        );
+    }
+    Ok(())
 }
 
 /// Atomically persist the recorder boundary shared with rollback verification.
@@ -266,6 +349,11 @@ fn bootstrap(config_path: &str, samples_path: &str) -> Result<()> {
 
 async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
     let config = parse_config(Path::new(config_path))?;
+    if let Some(out_path) = out_path {
+        // Validate before taking the lock or modifying checkpoint/evidence.
+        // A later plan write must never truncate either durable state file.
+        validate_plan_output_path(&config.runtime_state_path, Path::new(out_path))?;
+    }
     let _lock = lock_runtime_checkpoint(&config.runtime_state_path)?;
     let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
     let mut runtime = store.load_or_create(&config.runtime)?;
@@ -483,5 +571,36 @@ runtime_state_path: relative/path.json
             path,
             PathBuf::from("/var/lib/arcus/live-tick-observation-evidence.json")
         );
+    }
+
+    #[test]
+    fn plan_output_rejects_checkpoint_and_observation_evidence_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_path = dir.path().join("runtime.json");
+        let evidence_path = observation_evidence_path(&runtime_path).unwrap();
+        let lock_path = dir.path().join(".runtime.json.lock");
+
+        assert!(validate_plan_output_path(&runtime_path, &runtime_path).is_err());
+        assert!(validate_plan_output_path(&runtime_path, &evidence_path).is_err());
+        assert!(validate_plan_output_path(&runtime_path, &lock_path).is_err());
+
+        fs::write(&runtime_path, b"checkpoint").unwrap();
+        let hard_link = dir.path().join("checkpoint-hard-link.json");
+        fs::hard_link(&runtime_path, &hard_link).unwrap();
+        assert!(validate_plan_output_path(&runtime_path, &hard_link).is_err());
+    }
+
+    #[test]
+    fn plan_output_rejects_an_observation_evidence_alias_through_a_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&state_dir, &alias_dir).unwrap();
+        let runtime_path = state_dir.join("runtime.json");
+        let aliased_output = alias_dir.join("live-tick-observation-evidence.json");
+
+        let error = validate_plan_output_path(&runtime_path, &aliased_output).unwrap_err();
+        assert!(error.to_string().contains("must not alias"));
     }
 }
