@@ -70,10 +70,11 @@ advancement but rejects:
   sticky or newly-required risk-halt loss, same-day daily baseline resets,
   invalid UTC rollover baselines, or loss of the last equity mark;
 - a backup that was not neutral with no active attempt, ledger regression,
-  changed archived history, or more than one new acceptance attempt;
+  changed archived history, more than one new acceptance attempt, or an
+  acceptance that exceeds the preserved UTC-day swap allowance;
 - an unresolved/non-reconciled acceptance attempt, or one not bound to the
-  preserved pending plan, its configured-slippage buy floor, and its exact
-  reconciled wallet-balance delta;
+  preserved pending plan, its configured sell ceiling and slippage buy floor,
+  and its exact reconciled wallet-balance delta;
 - inventory/regime/rotation/open-quantity/execution-key changes that do not
   exactly equal applying that one reconciled fill to the backup position.
 

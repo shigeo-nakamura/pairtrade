@@ -938,6 +938,25 @@ fn require_acceptance_plan_matches_config(
     {
         bail!("Arcus acceptance plan direction does not match the configured pair");
     }
+    let sell_amount = parse_raw_amount("plan sell amount", &plan.sell_amount_raw)?;
+    let maximum_sell = config
+        .executor
+        .maximum_sell_amount_raw
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&plan.sell_symbol))
+        .map(|(_, raw)| raw)
+        .with_context(|| {
+            format!(
+                "Arcus acceptance has no maximum sell amount for {}",
+                plan.sell_symbol
+            )
+        })?;
+    let maximum_sell = parse_raw_amount("maximum sell amount", maximum_sell)?;
+    if sell_amount > maximum_sell {
+        bail!(
+            "Arcus acceptance sell amount {sell_amount} exceeds configured maximum {maximum_sell}"
+        );
+    }
     for (symbol, address, quantity, raw) in [
         (
             plan.sell_symbol.as_str(),
@@ -1146,6 +1165,22 @@ fn require_acceptance_ledger_and_position_continuity(
             let attempt = current.ledger.history.last().expect("length checked above");
             if attempt.sequence != baseline.ledger.next_sequence {
                 bail!("Arcus acceptance attempt has an unexpected sequence");
+            }
+            // The live executor checks the archived-attempt count for the
+            // UTC day immediately before it prepares a new attempt. Rebuild
+            // that same point-in-time guard from the immutable backup and
+            // the acceptance attempt's preparation day; using verification
+            // time here would incorrectly reset the allowance after UTC
+            // midnight.
+            let acceptance_day = attempt.prepared_at.date_naive();
+            let completed_before_acceptance = baseline
+                .ledger
+                .history
+                .iter()
+                .filter(|archived| archived.updated_at.date_naive() == acceptance_day)
+                .count();
+            if completed_before_acceptance >= config.executor.max_swaps_per_utc_day as usize {
+                bail!("Arcus acceptance attempt exceeds the configured UTC daily swap cap");
             }
             let plan_bytes = current
                 .pending_plan_bytes
@@ -3118,6 +3153,73 @@ runtime:
         assert!(error
             .to_string()
             .contains("undercuts the pending plan's approved buy floor"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_attempt_above_the_sell_ceiling() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "99999999999999999",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds configured maximum"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_attempt_above_the_daily_swap_cap() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config_with_daily_cap(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+            1,
+        );
+        persist_initial_operator_state(&config);
+        let mut plan = rotation_plan("entry_signal");
+        plan.quote_received_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let prior_attempt = reconciled_entry_attempt(&config, &plan, 1);
+        ArcusSpotExecutionLedgerStore::new(&ledger_path)
+            .persist(&ArcusSpotExecutionLedger {
+                schema_version: 2,
+                next_sequence: 2,
+                active: None,
+                history: vec![prior_attempt.clone()],
+            })
+            .unwrap();
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+        let acceptance_attempt = reconciled_entry_attempt(&config, &plan, 2);
+        ArcusSpotExecutionLedgerStore::new(&ledger_path)
+            .persist(&ArcusSpotExecutionLedger {
+                schema_version: 2,
+                next_sequence: 3,
+                active: None,
+                history: vec![prior_attempt, acceptance_attempt.clone()],
+            })
+            .unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["last_live_execution_idempotency_key"] =
+                json!(acceptance_attempt.idempotency_key);
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("UTC daily swap cap"));
     }
 
     #[test]
