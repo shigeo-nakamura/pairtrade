@@ -126,6 +126,9 @@ jobs:
           IMAGE_REF=$(docker image inspect --format '{{index .RepoDigests 0}}' "${AL2023_IMAGE}")
           test -n "${IMAGE_REF}"
           echo "image_ref=${IMAGE_REF}" >> "${GITHUB_OUTPUT}"
+          IMAGE_CACHE_KEY=${IMAGE_REF##*@sha256:}
+          test -n "${IMAGE_CACHE_KEY}"
+          echo "image_cache_key=${IMAGE_CACHE_KEY}" >> "${GITHUB_OUTPUT}"
 
       - name: Cache cargo (native arm64, Arcus live)
         uses: actions/cache@v5
@@ -136,10 +139,9 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ steps.build_image.outputs.image_cache_key }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ steps.build_image.outputs.image_cache_key }}-
 
       - name: Build Arcus Spot executor in AL2023 (native arm64)
         run: |
