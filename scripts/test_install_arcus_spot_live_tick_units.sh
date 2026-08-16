@@ -24,8 +24,14 @@ cat > "$WORK/systemctl" <<'EOF'
 set -eu
 printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
 case "$1" in
-  is-active) printf '%s\n' active ;;
-  is-enabled) printf '%s\n' enabled ;;
+  is-active) printf '%s\n' inactive ;;
+  is-enabled)
+    if [ -e "$FAKE_SYSTEMD_DIR/$2" ]; then
+      printf '%s\n' disabled
+    else
+      printf '%s\n' not-found
+    fi
+    ;;
   daemon-reload)
     if [ "${FAIL_DAEMON_RELOAD:-false}" = true ]; then
       exit 1
@@ -44,12 +50,15 @@ run_installer() {
   PROVENANCE_DIR="$PROVENANCE" \
   SYSTEMCTL="$WORK/systemctl" \
   SYSTEMCTL_LOG="$WORK/systemctl.log" \
+  FAKE_SYSTEMD_DIR="$SYSTEMD" \
   SYSTEMD_ANALYZE=/bin/true \
   INSTALL_OWNER="$TEST_OWNER" \
   INSTALL_GROUP="$TEST_GROUP" \
     bash "$REPO_ROOT/scripts/install_arcus_spot_live_tick_units.sh" "$SOURCE" "$1"
 }
 
+# Regression: a fresh host reports not-found before the timer definition exists
+# and disabled afterward. That semantic disabled state must count as preserved.
 run_installer first
 cmp "$SOURCE/arcus-spot-live-tick.service" "$SYSTEMD/arcus-spot-live-tick.service"
 cmp "$SOURCE/arcus-spot-live-tick.timer" "$SYSTEMD/arcus-spot-live-tick.timer"
@@ -78,6 +87,7 @@ if SYSTEMD_DIR="$SYSTEMD" \
    PROVENANCE_DIR="$PROVENANCE" \
    SYSTEMCTL="$WORK/systemctl" \
    SYSTEMCTL_LOG="$WORK/systemctl.log" \
+   FAKE_SYSTEMD_DIR="$SYSTEMD" \
    SYSTEMD_ANALYZE=/bin/true \
    INSTALL_OWNER="$TEST_OWNER" \
    INSTALL_GROUP="$TEST_GROUP" \

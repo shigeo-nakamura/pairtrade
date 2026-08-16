@@ -88,8 +88,20 @@ for file in "${required[@]}"; do
 done
 mv "$release_stage" "$release_dir"
 
+normalize_enabled_state() {
+  # Before a first install, systemd reports an absent unit as `not-found`.
+  # Installing its definitions without enabling it correctly changes that raw
+  # answer to `disabled`; both mean the timer will not start at boot. Compare
+  # that semantic state while preserving every other is-enabled distinction.
+  case "$1" in
+    not-found) printf '%s\n' disabled ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 active_before=$("$SYSTEMCTL" is-active "$TIMER" 2>&1 || true)
-enabled_before=$("$SYSTEMCTL" is-enabled "$TIMER" 2>&1 || true)
+enabled_before_raw=$("$SYSTEMCTL" is-enabled "$TIMER" 2>&1 || true)
+enabled_before=$(normalize_enabled_state "$enabled_before_raw")
 
 service_stage="$SYSTEMD_DIR/.$SERVICE.$$.new"
 timer_stage="$SYSTEMD_DIR/.$TIMER.$$.new"
@@ -165,9 +177,10 @@ cmp -s "$SOURCE_DIR/$SERVICE" "$SYSTEMD_DIR/$SERVICE"
 cmp -s "$SOURCE_DIR/$TIMER" "$SYSTEMD_DIR/$TIMER"
 
 active_after=$("$SYSTEMCTL" is-active "$TIMER" 2>&1 || true)
-enabled_after=$("$SYSTEMCTL" is-enabled "$TIMER" 2>&1 || true)
+enabled_after_raw=$("$SYSTEMCTL" is-enabled "$TIMER" 2>&1 || true)
+enabled_after=$(normalize_enabled_state "$enabled_after_raw")
 if [ "$active_after" != "$active_before" ] || [ "$enabled_after" != "$enabled_before" ]; then
-  echo "timer lifecycle state changed unexpectedly" >&2
+  echo "timer lifecycle state changed unexpectedly (active: $active_before -> $active_after; enabled: $enabled_before_raw -> $enabled_after_raw)" >&2
   exit 1
 fi
 
