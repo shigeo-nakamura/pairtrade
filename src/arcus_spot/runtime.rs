@@ -330,6 +330,32 @@ impl ArcusSpotRuntime {
         &self.state
     }
 
+    /// Re-evaluate the neutral-regime entry direction for one prospective
+    /// relative-log-price sample without mutating the runtime. Rollback
+    /// continuity verification uses this to prove that an archived entry
+    /// fill was preceded by the same signal crossing the live planner uses.
+    #[cfg(feature = "arcus-spot-live")]
+    pub fn entry_direction_for_signal_sample(
+        &self,
+        relative_log_price: f64,
+    ) -> Option<ArcusSpotDirection> {
+        if self.state.regime != ArcusSpotRegime::Neutral || self.state.risk_halt.is_some() {
+            return None;
+        }
+        let score = z_score(
+            &self.state.relative_log_price_history,
+            relative_log_price,
+            self.config.min_signal_samples,
+        )?;
+        if score >= self.config.entry_z_score {
+            Some(ArcusSpotDirection::TokenAToTokenB)
+        } else if score <= -self.config.entry_z_score {
+            Some(ArcusSpotDirection::TokenBToTokenA)
+        } else {
+            None
+        }
+    }
+
     /// Reject a plan whose trigger/direction can't possibly be committed
     /// against the runtime's *current* regime, before it is ever signed or
     /// submitted.

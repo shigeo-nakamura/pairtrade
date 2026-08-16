@@ -51,6 +51,7 @@ mode-0700 directory through a hidden staging directory plus atomic rename.
 Every copied file and the manifest are mode 0600 and fsynced. The manifest
 records:
 
+- the UTC capture time that opens the approved one-tick verification window;
 - canonical approved-config digest;
 - byte length and SHA-256 of checkpoint, ledger and optional pending plan;
 - non-secret continuity summaries (runtime sequence/history/watermark,
@@ -64,8 +65,9 @@ stopped, before and after a binary-only rollback.
 advancement but rejects:
 
 - runtime sequence or last-observation regression, more than one observation
-  advance, or corruption/removal/reordering of retained signal-history samples
-  (a full window may shift by exactly one sample for the approved tick);
+  advance, a watermark outside the backup-to-verification window, or
+  corruption/removal/reordering of retained signal-history samples (a full
+  window may shift by exactly one sample for the approved tick);
 - cumulative-equity baseline changes, mismatched first equity baselines,
   sticky or newly-required risk-halt loss, same-day daily baseline resets,
   invalid UTC rollover baselines, or loss of the last equity mark;
@@ -74,7 +76,8 @@ advancement but rejects:
   acceptance that exceeds the preserved UTC-day swap allowance;
 - an unresolved/non-reconciled acceptance attempt, or one not bound to the
   preserved pending plan, its configured sell ceiling and slippage buy floor,
-  and its exact reconciled wallet-balance delta;
+  its exact reconciled wallet-balance delta, a genuine entry-signal crossing,
+  and attempt chronology following the accepted observation;
 - inventory/regime/rotation/open-quantity/execution-key changes that do not
   exactly equal applying that one reconciled fill to the backup position.
 

@@ -359,7 +359,7 @@ fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<Pa
     Ok(parent.join("live-tick-pending-plan.json"))
 }
 
-const STATE_BACKUP_SCHEMA_VERSION: u32 = 1;
+const STATE_BACKUP_SCHEMA_VERSION: u32 = 2;
 const STATE_BACKUP_MANIFEST: &str = "manifest.json";
 const STATE_BACKUP_CHECKPOINT: &str = "runtime_state.json";
 const STATE_BACKUP_LEDGER: &str = "ledger.json";
@@ -399,6 +399,7 @@ struct ArcusSpotLedgerStateSummary {
 #[serde(deny_unknown_fields)]
 struct ArcusSpotStateBackupManifest {
     schema_version: u32,
+    captured_at: DateTime<Utc>,
     config_sha256: String,
     runtime_checkpoint: ArcusSpotStateBackupFile,
     execution_ledger: ArcusSpotStateBackupFile,
@@ -518,9 +519,11 @@ fn capture_arcus_state(config: &ArcusSpotExecuteOnceConfig) -> Result<ArcusSpotS
 fn manifest_for_state(
     config: &ArcusSpotExecuteOnceConfig,
     state: &ArcusSpotStateImage,
+    captured_at: DateTime<Utc>,
 ) -> Result<ArcusSpotStateBackupManifest> {
     Ok(ArcusSpotStateBackupManifest {
         schema_version: STATE_BACKUP_SCHEMA_VERSION,
+        captured_at,
         config_sha256: auto_execute_config_digest(config)?,
         runtime_checkpoint: state_backup_file(&state.checkpoint_bytes),
         execution_ledger: state_backup_file(&state.ledger_bytes),
@@ -550,6 +553,23 @@ fn create_arcus_state_backup(
     config: &ArcusSpotExecuteOnceConfig,
     backup_dir: &Path,
 ) -> Result<ArcusSpotStateBackupManifest> {
+    create_arcus_state_backup_with_capture(config, backup_dir, None)
+}
+
+#[cfg(test)]
+fn create_arcus_state_backup_at(
+    config: &ArcusSpotExecuteOnceConfig,
+    backup_dir: &Path,
+    captured_at: DateTime<Utc>,
+) -> Result<ArcusSpotStateBackupManifest> {
+    create_arcus_state_backup_with_capture(config, backup_dir, Some(captured_at))
+}
+
+fn create_arcus_state_backup_with_capture(
+    config: &ArcusSpotExecuteOnceConfig,
+    backup_dir: &Path,
+    captured_at: Option<DateTime<Utc>>,
+) -> Result<ArcusSpotStateBackupManifest> {
     if !backup_dir.is_absolute() {
         bail!("Arcus state backup directory must be absolute");
     }
@@ -578,7 +598,7 @@ fn create_arcus_state_backup(
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
     let state = capture_arcus_state(config)?;
-    let manifest = manifest_for_state(config, &state)?;
+    let manifest = manifest_for_state(config, &state, captured_at.unwrap_or_else(Utc::now))?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock precedes Unix epoch")?
@@ -1107,11 +1127,26 @@ fn position_state_matches(left: &ArcusSpotRuntimeState, right: &ArcusSpotRuntime
         && left.last_live_execution_idempotency_key == right.last_live_execution_idempotency_key
 }
 
+fn acceptance_signal_sample(
+    baseline: &ArcusSpotRuntimeState,
+    current: &ArcusSpotRuntimeState,
+) -> Result<f64> {
+    if current.relative_log_price_history == baseline.relative_log_price_history {
+        bail!("Arcus acceptance attempt has no newly appended signal sample");
+    }
+    current
+        .relative_log_price_history
+        .last()
+        .copied()
+        .context("Arcus acceptance attempt has no signal sample")
+}
+
 fn require_acceptance_ledger_and_position_continuity(
     config: &ArcusSpotExecuteOnceConfig,
     baseline: &ArcusSpotStateImage,
     current: &ArcusSpotStateImage,
     runtime_sequence_advance: u64,
+    acceptance_not_after: DateTime<Utc>,
 ) -> Result<()> {
     let baseline_runtime = baseline.runtime.state();
     let current_runtime = current.runtime.state();
@@ -1149,14 +1184,14 @@ fn require_acceptance_ledger_and_position_continuity(
             if runtime_sequence_advance != 1 {
                 bail!("Arcus ledger advanced without the single approved observation");
             }
-            match (
+            let accepted_observation_at = match (
                 baseline_runtime.last_observation_at,
                 current_runtime.last_observation_at,
             ) {
-                (Some(baseline_at), Some(current_at)) if current_at > baseline_at => {}
-                (None, Some(_)) => {}
+                (Some(baseline_at), Some(current_at)) if current_at > baseline_at => current_at,
+                (None, Some(current_at)) => current_at,
                 _ => bail!("Arcus acceptance attempt has no newly accepted observation"),
-            }
+            };
             if current.ledger.active.is_some()
                 || current.ledger.history.len() != baseline.ledger.history.len() + 1
             {
@@ -1166,13 +1201,23 @@ fn require_acceptance_ledger_and_position_continuity(
             if attempt.sequence != baseline.ledger.next_sequence {
                 bail!("Arcus acceptance attempt has an unexpected sequence");
             }
+            let dispatched_at = attempt
+                .dispatched_at
+                .context("reconciled Arcus acceptance attempt omitted its dispatch time")?;
+            if attempt.prepared_at < accepted_observation_at
+                || attempt.prepared_at > acceptance_not_after
+                || dispatched_at < attempt.prepared_at
+                || dispatched_at > attempt.updated_at
+                || attempt.updated_at > acceptance_not_after
+            {
+                bail!("Arcus acceptance attempt chronology is outside the approved tick window");
+            }
             // The live executor checks the archived-attempt count for the
             // UTC day immediately before it prepares a new attempt. Rebuild
             // that same point-in-time guard from the immutable backup and
-            // the acceptance attempt's preparation day; using verification
-            // time here would incorrectly reset the allowance after UTC
-            // midnight.
-            let acceptance_day = attempt.prepared_at.date_naive();
+            // the accepted observation day. Candidate-written ledger times
+            // are chronology-bound above but do not define the allowance.
+            let acceptance_day = accepted_observation_at.date_naive();
             let completed_before_acceptance = baseline
                 .ledger
                 .history
@@ -1188,6 +1233,17 @@ fn require_acceptance_ledger_and_position_continuity(
                 .context("Arcus reconciled acceptance attempt has no pending runtime plan")?;
             let plan: ArcusSpotRotationPlan = serde_json::from_slice(plan_bytes)
                 .context("invalid Arcus acceptance pending runtime plan")?;
+            let signal_sample = acceptance_signal_sample(baseline_runtime, current_runtime)?;
+            let signal_runtime =
+                ArcusSpotRuntime::from_state(config.runtime.clone(), baseline_runtime.clone())
+                    .map_err(anyhow::Error::msg)
+                    .context("failed to reconstruct the Arcus acceptance signal baseline")?;
+            let signal_direction = signal_runtime
+                .entry_direction_for_signal_sample(signal_sample)
+                .context("Arcus acceptance attempt has no valid entry signal")?;
+            if signal_direction != plan.direction {
+                bail!("Arcus acceptance entry signal direction does not match its pending plan");
+            }
             let (actual_buy_quantity, filled_at) =
                 reconciled_fill_for_continuity(config, &plan, attempt)?;
             let mut expected_pre_fill = current_runtime.clone();
@@ -1268,6 +1324,8 @@ fn require_arcus_state_continuity(
     config: &ArcusSpotExecuteOnceConfig,
     baseline: &ArcusSpotStateImage,
     current: &ArcusSpotStateImage,
+    acceptance_not_before: DateTime<Utc>,
+    acceptance_not_after: DateTime<Utc>,
 ) -> Result<()> {
     let baseline_runtime = baseline.runtime.state();
     let current_runtime = current.runtime.state();
@@ -1287,6 +1345,14 @@ fn require_arcus_state_continuity(
         current_runtime,
         sequence_advance,
     )?;
+    if sequence_advance == 1 {
+        let accepted_at = current_runtime
+            .last_observation_at
+            .context("Arcus runtime advanced without a last observation watermark")?;
+        if accepted_at < acceptance_not_before || accepted_at > acceptance_not_after {
+            bail!("Arcus runtime last observation is outside the approved tick window");
+        }
+    }
     match (
         baseline_runtime.last_observation_at,
         current_runtime.last_observation_at,
@@ -1302,7 +1368,13 @@ fn require_arcus_state_continuity(
         }
         _ => {}
     }
-    require_acceptance_ledger_and_position_continuity(config, baseline, current, sequence_advance)
+    require_acceptance_ledger_and_position_continuity(
+        config,
+        baseline,
+        current,
+        sequence_advance,
+        acceptance_not_after,
+    )
 }
 
 fn verify_arcus_state_backup(
@@ -1314,6 +1386,7 @@ fn verify_arcus_state_backup(
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
     let current = capture_arcus_state(config)?;
+    let verified_at = Utc::now();
     if exact {
         require_file_matches_manifest(
             &current.checkpoint_bytes,
@@ -1333,7 +1406,13 @@ fn verify_arcus_state_backup(
             _ => bail!("live pending-plan presence changed since the backup"),
         }
     } else {
-        require_arcus_state_continuity(config, &baseline, &current)?;
+        require_arcus_state_continuity(
+            config,
+            &baseline,
+            &current,
+            manifest.captured_at,
+            verified_at,
+        )?;
     }
     Ok(ArcusSpotStateVerificationReport {
         status: "verified",
@@ -2258,6 +2337,16 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    fn create_arcus_state_backup(
+        config: &ArcusSpotExecuteOnceConfig,
+        backup_dir: &Path,
+    ) -> Result<ArcusSpotStateBackupManifest> {
+        let captured_at = DateTime::parse_from_rfc3339("2026-08-15T23:58:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        super::create_arcus_state_backup_at(config, backup_dir, captured_at)
+    }
+
     #[test]
     fn usage_exposes_explicit_resume_command() {
         assert!(usage().contains("resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX"));
@@ -2606,6 +2695,17 @@ runtime:
         );
     }
 
+    fn prepare_signal_ready_acceptance_baseline(config: &ArcusSpotExecuteOnceConfig) {
+        let history: Vec<f64> = (0..32)
+            .map(|index| if index % 2 == 0 { -0.01 } else { 0.01 })
+            .collect();
+        rewrite_checkpoint_state(&config.runtime_state_path, |state| {
+            state["sequence"] = json!(32);
+            state["relative_log_price_history"] = json!(history);
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+        });
+    }
+
     fn rewrite_checkpoint_state(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -2694,9 +2794,18 @@ runtime:
         ArcusSpotExecutionLedgerStore::new(ledger_path)
             .persist(&ledger)
             .unwrap();
+        let baseline = ArcusSpotRuntimeCheckpointStore::new(runtime_path.to_path_buf())
+            .load_existing(&config.runtime)
+            .unwrap();
+        let next_sequence = baseline.state().sequence + 1;
+        let mut next_history = baseline.state().relative_log_price_history.clone();
+        next_history.push(0.125);
+        if next_history.len() > config.runtime.signal_window_samples {
+            next_history.remove(0);
+        }
         rewrite_checkpoint_state(runtime_path, |state| {
-            state["sequence"] = json!(1);
-            state["relative_log_price_history"] = json!([0.125]);
+            state["sequence"] = json!(next_sequence);
+            state["relative_log_price_history"] = json!(next_history);
             state["last_observation_at"] = json!("2026-08-16T12:00:01Z");
             state["initial_equity_usd"] = json!("300");
             state["daily_baseline_day"] = json!("2026-08-16");
@@ -3094,6 +3203,7 @@ runtime:
             "100000000000000000",
         );
         persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
 
@@ -3116,6 +3226,7 @@ runtime:
             "100000000000000000",
         );
         persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
         rewrite_checkpoint_state(&runtime_path, |state| {
@@ -3141,6 +3252,7 @@ runtime:
             "100000000000000000",
         );
         persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
         let store = ArcusSpotExecutionLedgerStore::new(&ledger_path);
@@ -3167,6 +3279,7 @@ runtime:
             "99999999999999999",
         );
         persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
 
@@ -3188,6 +3301,7 @@ runtime:
             1,
         );
         persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
         let mut plan = rotation_plan("entry_signal");
         plan.quote_received_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
             .unwrap()
@@ -3220,6 +3334,84 @@ runtime:
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
         assert!(error.to_string().contains("UTC daily swap cap"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_entry_without_a_signal_crossing() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            *state["relative_log_price_history"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap() = json!(0.0);
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("no valid entry signal"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_backdated_acceptance_attempt() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+        let store = ArcusSpotExecutionLedgerStore::new(&ledger_path);
+        let mut ledger = store.load_existing().unwrap();
+        ledger.history[0].prepared_at = DateTime::parse_from_rfc3339("2026-08-16T11:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.persist(&ledger).unwrap();
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("chronology"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_future_observation_watermark() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(1);
+            state["last_observation_at"] = json!("2099-01-01T00:00:00Z");
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("approved tick window"));
     }
 
     #[test]
