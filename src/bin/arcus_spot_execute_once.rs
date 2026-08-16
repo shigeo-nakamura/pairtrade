@@ -1180,6 +1180,7 @@ fn reconciled_fill_for_continuity(
     config: &ArcusSpotExecuteOnceConfig,
     plan: &ArcusSpotRotationPlan,
     attempt: &ArcusSpotExecutionAttempt,
+    evaluation_time: DateTime<Utc>,
 ) -> Result<(Decimal, DateTime<Utc>)> {
     require_acceptance_plan_matches_config(config, plan)?;
     if attempt.phase != ArcusSpotExecutionPhase::Reconciled {
@@ -1325,8 +1326,7 @@ fn reconciled_fill_for_continuity(
     let filled_at = attempt
         .dispatched_at
         .context("reconciled Arcus acceptance attempt omitted its dispatch time")?;
-    let planning_age_ms = attempt
-        .prepared_at
+    let planning_age_ms = evaluation_time
         .signed_duration_since(plan.quote_received_at)
         .num_milliseconds();
     let max_quote_age_ms = config.runtime.max_quote_age_secs.saturating_mul(1_000);
@@ -1372,14 +1372,11 @@ fn runtime_state_matches_replay(
     replayed_without_floats == persisted_without_floats
 }
 
-fn acceptance_signal_sample(
-    baseline: &ArcusSpotRuntimeState,
-    current: &ArcusSpotRuntimeState,
-) -> Result<f64> {
-    if current.relative_log_price_history == baseline.relative_log_price_history {
-        bail!("Arcus acceptance attempt has no newly appended signal sample");
-    }
-    current
+/// Read the sample from the runtime produced by the preserved recorder replay.
+/// Do not infer whether a sample was appended by comparing final history bytes:
+/// a bounded rolling window is strategy state, not the authoritative evidence.
+fn acceptance_signal_sample(replayed: &ArcusSpotRuntimeState) -> Result<f64> {
+    replayed
         .relative_log_price_history
         .last()
         .copied()
@@ -1769,7 +1766,7 @@ fn require_acceptance_ledger_and_position_continuity(
                 );
             }
 
-            let signal_sample = acceptance_signal_sample(baseline_runtime, current_runtime)?;
+            let signal_sample = acceptance_signal_sample(replayed_runtime.state())?;
             let signal_runtime =
                 ArcusSpotRuntime::from_state(config.runtime.clone(), baseline_runtime.clone())
                     .map_err(anyhow::Error::msg)
@@ -1790,7 +1787,7 @@ fn require_acceptance_ledger_and_position_continuity(
                 token_a_reference_price_usd,
             )?;
             let (actual_buy_quantity, filled_at) =
-                reconciled_fill_for_continuity(config, &plan, attempt)?;
+                reconciled_fill_for_continuity(config, &plan, attempt, evidence.evaluation_time)?;
             replayed_runtime
                 .validate_plan_consistent_with_state(&plan)
                 .map_err(anyhow::Error::msg)
@@ -4198,6 +4195,25 @@ runtime:
     }
 
     #[test]
+    fn acceptance_signal_sample_comes_from_the_independent_replay() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let mut replayed_state = ArcusSpotRuntime::new(config.runtime)
+            .unwrap()
+            .state()
+            .clone();
+        replayed_state.relative_log_price_history = vec![0.125; 96];
+
+        assert_eq!(acceptance_signal_sample(&replayed_state).unwrap(), 0.125);
+    }
+
+    #[test]
     fn continuity_verification_rejects_position_unrelated_to_the_reconciled_attempt() {
         let dir = tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.json");
@@ -4358,7 +4374,9 @@ runtime:
 
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
-        assert!(error.to_string().contains("no valid entry signal"));
+        assert!(error
+            .to_string()
+            .contains("position state does not match the reconciled acceptance attempt"));
     }
 
     #[test]
@@ -4462,7 +4480,8 @@ runtime:
         plan.venue = "other".to_string();
         let attempt = reconciled_entry_attempt(&config, &plan, 1);
 
-        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
 
         assert!(error.to_string().contains("venue=arcus"));
     }
@@ -4481,7 +4500,8 @@ runtime:
         let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
         attempt.tx_hash = Some(format!("0x{}", "0".repeat(64)));
 
-        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
 
         assert!(error.to_string().contains("must not be zero"));
     }
@@ -4526,7 +4546,8 @@ runtime:
         attempt.pre_balances.sell_balance_raw = "90000000000000000".to_string();
         attempt.post_balances.as_mut().unwrap().sell_balance_raw = "40000000000000000".to_string();
 
-        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
 
         assert!(error.to_string().contains("post-swap sell balance"));
     }
@@ -4546,7 +4567,8 @@ runtime:
         attempt.pre_balances.buy_balance_raw = "10000000000000000".to_string();
         attempt.post_balances.as_mut().unwrap().buy_balance_raw = "60000000000000000".to_string();
 
-        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
 
         assert!(error.to_string().contains("pre-swap buy balance"));
     }
@@ -4565,7 +4587,8 @@ runtime:
         let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
         attempt.pre_balances.gas_balance_wei = "999999999999999".to_string();
 
-        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
 
         assert!(error.to_string().contains("pre-swap gas balance"));
     }
@@ -4587,9 +4610,33 @@ runtime:
             .with_timezone(&Utc);
         let attempt = reconciled_entry_attempt(&config, &plan, 1);
 
-        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
 
         assert!(error.to_string().contains("strategy planning"));
+    }
+
+    #[test]
+    fn continuity_verification_measures_quote_freshness_at_evaluation_time() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let mut config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        config.runtime.max_quote_age_secs = 1;
+        let mut plan = rotation_plan("entry_signal");
+        plan.quote_received_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let attempt = reconciled_entry_attempt(&config, &plan, 1);
+        let evaluation_time = DateTime::parse_from_rfc3339("2026-08-16T12:00:00.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        reconciled_fill_for_continuity(&config, &plan, &attempt, evaluation_time).unwrap();
     }
 
     #[test]

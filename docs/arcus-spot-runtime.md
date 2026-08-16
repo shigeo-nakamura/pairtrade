@@ -235,12 +235,15 @@ checkpoint has moved on -- otherwise an entry could be submitted based on
 a signal state a newer tick has already superseded (Codex P1 follow-up,
 pairtrade#186).
 
-For every accepted observation, including `Observe`, `live-tick` durably
-writes a schema-1 evidence sidecar at mode 0600 to
+For every accepted observation, including `Observe`, both `live-tick` and
+`arcus-spot-propose-plan propose` durably write a schema-1 evidence sidecar at
+mode 0600 to
 `<runtime_state_path's directory>/live-tick-observation-evidence.json`. It
 contains the exact recorder snapshot and `step_at` evaluation time, so the
 post-rollback continuity verifier can independently replay no-swap signal,
-reference-price, equity and risk state from the pre-start checkpoint.
+reference-price, equity and risk state from the pre-start checkpoint. Keeping
+this boundary current for both checkpoint writers also prevents a successful
+proposal from making state backup/verification fail on a stale watermark.
 
 Before dispatching a rotation, `live-tick` also writes a schema-1 recovery
 envelope, at mode 0600, to

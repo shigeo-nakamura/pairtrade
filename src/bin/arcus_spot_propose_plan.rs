@@ -25,8 +25,11 @@ use debot::arcus_spot::{
     replay_jsonl, ArcusSpotDecision, ArcusSpotExecutionLedgerStore, ArcusSpotRuntime,
     ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode,
 };
-use dex_connector::{ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig};
-use serde::Deserialize;
+use dex_connector::{
+    ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig,
+    ArcusSpotRecorderSnapshot,
+};
+use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     fs::OpenOptions,
@@ -76,6 +79,82 @@ struct ArcusSpotProposeConfig {
     router: ArcusSpotConfig,
     runtime: ArcusSpotRuntimeConfig,
     runtime_state_path: PathBuf,
+}
+
+const LIVE_TICK_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotObservationEvidence {
+    schema_version: u32,
+    evaluation_time: chrono::DateTime<Utc>,
+    snapshot: ArcusSpotRecorderSnapshot,
+}
+
+fn observation_evidence_path(runtime_state_path: &Path) -> Result<PathBuf> {
+    let parent = runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(parent.join("live-tick-observation-evidence.json"))
+}
+
+/// Atomically persist the recorder boundary shared with rollback verification.
+/// This mirrors the checkpoint store's temp-file/rename/fsync sequence so a
+/// reader holding the same namespace lock never sees a partial document.
+fn write_observation_evidence(
+    config: &ArcusSpotProposeConfig,
+    snapshot: ArcusSpotRecorderSnapshot,
+    evaluation_time: chrono::DateTime<Utc>,
+) -> Result<()> {
+    let path = observation_evidence_path(&config.runtime_state_path)?;
+    let evidence = ArcusSpotObservationEvidence {
+        schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+        evaluation_time,
+        snapshot,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&evidence)
+        .context("failed to serialize Arcus observation evidence")?;
+    bytes.push(b'\n');
+
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("observation-evidence"),
+        std::process::id(),
+        stamp,
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+            .with_context(|| format!("failed to create {}", temp.display()))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, &path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                temp.display(),
+            )
+        })?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn usage() -> &'static str {
@@ -195,7 +274,16 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
         .context("invalid Arcus recorder configuration")?;
 
     let snapshot = recorder.collect_once().await;
-    let event = runtime.step_at(&snapshot, Utc::now());
+    let previous_observation_at = runtime.state().last_observation_at;
+    let evaluation_time = Utc::now();
+    let event = runtime.step_at(&snapshot, evaluation_time);
+
+    // `propose` and `live-tick` are both checkpoint writers. Keep the shared
+    // recovery boundary coherent for either writer so a successful proposal
+    // cannot leave state-backup/state-verify-* rejecting a stale sidecar.
+    if runtime.state().last_observation_at != previous_observation_at {
+        write_observation_evidence(&config, snapshot.clone(), evaluation_time)?;
+    }
 
     // step_at mutates sequence/signal-window/risk state on every call, even
     // when it decides not to rotate. Persisting unconditionally -- not just
@@ -368,5 +456,14 @@ runtime_state_path: relative/path.json
             Ok(_) => panic!("expected a relative-path rejection"),
             Err(error) => assert!(error.to_string().contains("must be absolute")),
         }
+    }
+
+    #[test]
+    fn observation_evidence_is_stored_next_to_the_runtime_checkpoint() {
+        let path = observation_evidence_path(Path::new("/var/lib/arcus/runtime.json")).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/var/lib/arcus/live-tick-observation-evidence.json")
+        );
     }
 }

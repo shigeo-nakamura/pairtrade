@@ -26,11 +26,13 @@ instead the manifest binds its canonical SHA-256 digest.
 | Namespace lock | `/var/lib/debot-arcus/spot-execute-once/.runtime_state.json.lock` | mode-0600 process lock shared by live-tick, execute/resume, proposer and state tooling |
 
 Checkpoint and ledger stores already use create-new temporary files, file
-`fsync`, atomic rename and parent-directory `fsync`. `live-tick` now writes the
-pending recovery and observation evidence while holding the same checkpoint
-namespace lock, so a backup observes a lock-consistent boundary. Backup schema
-3 hashes and copies both optional sidecars and rejects observation evidence
-whose snapshot watermark does not match the checkpoint.
+`fsync`, atomic rename and parent-directory `fsync`. `live-tick` writes the
+pending recovery and observation evidence while holding the checkpoint
+namespace lock; `arcus-spot-propose-plan propose` writes the same observation
+evidence whenever it advances that shared checkpoint. A backup therefore
+observes a lock-consistent boundary. Backup schema 3 hashes and copies both
+optional sidecars and rejects observation evidence whose snapshot watermark
+does not match the checkpoint.
 
 The state tool uses strict `load_existing` reads. A missing file is an error;
 it is never accepted as first-run state. Ledger inspection does not run the
