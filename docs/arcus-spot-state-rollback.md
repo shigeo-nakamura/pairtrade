@@ -76,10 +76,13 @@ advancement but rejects:
   acceptance that exceeds the preserved UTC-day swap allowance;
 - an unresolved/non-reconciled acceptance attempt, or one not bound to the
   preserved pending plan, its configured sell ceiling and slippage buy floor,
-  its exact reconciled wallet-balance delta, a genuine entry-signal crossing,
-  the supported entry direction, configured all-in-cost and strategy
-  rotation/imbalance caps, and attempt chronology following the accepted
-  observation;
+  its exact reconciled wallet-balance delta and both configured raw inventory
+  floors, a genuine entry-signal crossing, the supported entry direction, a
+  non-negative route cost, configured all-in-cost and strategy
+  notional/rotation/imbalance caps, and attempt chronology following the
+  accepted observation. Notional is recomputed from the accepted tick's
+  checkpointed reference prices after those prices are cross-checked against
+  both its signal sample and equity mark;
 - inventory/regime/rotation/open-quantity/execution-key changes that do not
   exactly equal applying that one reconciled fill to the backup position.
 

@@ -154,6 +154,14 @@ pub struct ArcusSpotRuntimeState {
     pub inventory: ArcusSpotInventory,
     pub regime: ArcusSpotRegime,
     pub relative_log_price_history: Vec<f64>,
+    /// Reference prices from the last structurally valid observation. These
+    /// make the absolute scale behind the relative-log-price signal durable,
+    /// so restart/rollback acceptance can independently reapply configured
+    /// USD-notional sizing instead of trusting a pending plan's quantities.
+    #[serde(default)]
+    pub last_token_a_reference_price_usd: Option<Decimal>,
+    #[serde(default)]
+    pub last_token_b_reference_price_usd: Option<Decimal>,
     /// `collection_finished_at` of the last snapshot `step_at` genuinely
     /// advanced on (not one it recognized as a repeat of this same field,
     /// and not one it rejected as structurally invalid before validating
@@ -208,6 +216,8 @@ impl ArcusSpotRuntimeState {
             inventory,
             regime: ArcusSpotRegime::Neutral,
             relative_log_price_history: Vec::new(),
+            last_token_a_reference_price_usd: None,
+            last_token_b_reference_price_usd: None,
             last_observation_at: None,
             last_rotation_at: None,
             rotated_quantity: None,
@@ -300,6 +310,18 @@ impl ArcusSpotRuntime {
             .any(|value| !value.is_finite())
         {
             return Err("restored Arcus price history contains a non-finite value".to_string());
+        }
+        match (
+            state.last_token_a_reference_price_usd,
+            state.last_token_b_reference_price_usd,
+        ) {
+            (None, None) => {}
+            (Some(token_a), Some(token_b))
+                if token_a > Decimal::ZERO && token_b > Decimal::ZERO => {}
+            (Some(_), Some(_)) => {
+                return Err("restored Arcus reference prices must be positive".to_string())
+            }
+            _ => return Err("restored Arcus reference prices must be present together".to_string()),
         }
         match state.regime {
             ArcusSpotRegime::Neutral if state.rotated_quantity.is_some() => {
@@ -606,6 +628,8 @@ impl ArcusSpotRuntime {
         // reason (e.g. RouteUnavailable) -- advance the watermark now,
         // not conditioned on anything past this point.
         self.state.last_observation_at = Some(snapshot.collection_finished_at);
+        self.state.last_token_a_reference_price_usd = Some(price.token_a_price_usd);
+        self.state.last_token_b_reference_price_usd = Some(price.token_b_price_usd);
 
         let equity_before = match inventory_before
             .checked_value_usd(price.token_a_price_usd, price.token_b_price_usd)

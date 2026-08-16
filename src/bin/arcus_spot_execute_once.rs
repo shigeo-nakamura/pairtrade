@@ -1063,6 +1063,38 @@ fn reconciled_fill_for_continuity(
     let pre_buy = parse_raw_amount("pre buy balance", &attempt.pre_balances.buy_balance_raw)?;
     let post_sell = parse_raw_amount("post sell balance", &post.sell_balance_raw)?;
     let post_buy = parse_raw_amount("post buy balance", &post.buy_balance_raw)?;
+    let sell_floor = config
+        .executor
+        .inventory_floor_raw
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&plan.sell_symbol))
+        .map(|(_, raw)| raw)
+        .with_context(|| {
+            format!(
+                "Arcus acceptance has no inventory floor for {}",
+                plan.sell_symbol
+            )
+        })?;
+    let buy_floor = config
+        .executor
+        .inventory_floor_raw
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&plan.buy_symbol))
+        .map(|(_, raw)| raw)
+        .with_context(|| {
+            format!(
+                "Arcus acceptance has no inventory floor for {}",
+                plan.buy_symbol
+            )
+        })?;
+    let sell_floor = parse_raw_amount("sell inventory floor", sell_floor)?;
+    let buy_floor = parse_raw_amount("buy inventory floor", buy_floor)?;
+    if post_sell < sell_floor {
+        bail!("Arcus acceptance post-swap sell balance is below its configured floor");
+    }
+    if pre_buy < buy_floor {
+        bail!("Arcus acceptance pre-swap buy balance is below its configured floor");
+    }
     let sold_raw = pre_sell
         .checked_sub(post_sell)
         .context("reconciled Arcus acceptance sell balance increased")?;
@@ -1141,11 +1173,48 @@ fn acceptance_signal_sample(
         .context("Arcus acceptance attempt has no signal sample")
 }
 
+fn acceptance_reference_prices(
+    baseline: &ArcusSpotRuntimeState,
+    current: &ArcusSpotRuntimeState,
+    signal_sample: f64,
+) -> Result<(Decimal, Decimal)> {
+    let token_a = current
+        .last_token_a_reference_price_usd
+        .context("Arcus acceptance attempt omitted its token A reference price")?;
+    let token_b = current
+        .last_token_b_reference_price_usd
+        .context("Arcus acceptance attempt omitted its token B reference price")?;
+    if token_a <= Decimal::ZERO || token_b <= Decimal::ZERO {
+        bail!("Arcus acceptance reference prices must be positive");
+    }
+    let token_a_f64 = token_a
+        .to_string()
+        .parse::<f64>()
+        .context("Arcus acceptance token A reference price exceeds f64 range")?;
+    let token_b_f64 = token_b
+        .to_string()
+        .parse::<f64>()
+        .context("Arcus acceptance token B reference price exceeds f64 range")?;
+    let recorded_signal = (token_a_f64 / token_b_f64).ln();
+    if !recorded_signal.is_finite() || (recorded_signal - signal_sample).abs() > 1e-12 {
+        bail!("Arcus acceptance reference prices do not match its accepted signal sample");
+    }
+    let marked_equity = baseline
+        .inventory
+        .checked_value_usd(token_a, token_b)
+        .context("Arcus acceptance reference-price valuation exceeds Decimal range")?;
+    if current.last_equity_usd != Some(marked_equity) {
+        bail!("Arcus acceptance reference prices do not match its accepted equity mark");
+    }
+    Ok((token_a, token_b))
+}
+
 fn require_acceptance_entry_within_strategy_limits(
     config: &ArcusSpotExecuteOnceConfig,
     baseline: &ArcusSpotRuntimeState,
     plan: &ArcusSpotRotationPlan,
     signal_sample: f64,
+    sell_reference_price_usd: Decimal,
 ) -> Result<()> {
     if plan.trigger != ArcusSpotRotationTrigger::EntrySignal {
         bail!("Arcus acceptance from a neutral backup must be an entry signal");
@@ -1156,6 +1225,9 @@ fn require_acceptance_entry_within_strategy_limits(
     // direction that live-tick could never have proposed.
     if plan.direction != ArcusSpotDirection::TokenAToTokenB {
         bail!("Arcus acceptance reverse-direction entries are not supported by the planner");
+    }
+    if plan.optimistic_round_trip_loss_bps < Decimal::ZERO {
+        bail!("Arcus acceptance optimistic round-trip loss must not be negative");
     }
     let all_in_cost = plan
         .optimistic_round_trip_loss_bps
@@ -1174,6 +1246,38 @@ fn require_acceptance_entry_within_strategy_limits(
             all_in_cost,
             config.runtime.max_all_in_round_trip_cost_bps
         );
+    }
+    let sell_decimals = config
+        .router
+        .trusted_token_decimals
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&plan.sell_symbol))
+        .map(|(_, decimals)| *decimals)
+        .with_context(|| {
+            format!(
+                "Arcus acceptance has no decimals pin for {}",
+                plan.sell_symbol
+            )
+        })?;
+    let raw_scale = 10_i128
+        .checked_pow(sell_decimals)
+        .context("Arcus acceptance token decimals exceed Decimal range")?;
+    let raw_scale = Decimal::try_from_i128_with_scale(raw_scale, 0)
+        .context("Arcus acceptance token decimals exceed Decimal range")?;
+    let expected_sell_raw = config
+        .runtime
+        .notional_usd
+        .checked_div(sell_reference_price_usd)
+        .and_then(|quantity| quantity.checked_mul(raw_scale))
+        .context("Arcus acceptance configured notional exceeds Decimal range")?
+        .trunc();
+    if parse_raw_amount("plan sell amount", &plan.sell_amount_raw)?
+        != parse_raw_amount(
+            "configured-notional sell amount",
+            &expected_sell_raw.to_string(),
+        )?
+    {
+        bail!("Arcus acceptance sell amount does not match the configured USD notional");
     }
     let sellable = baseline
         .inventory
@@ -1363,11 +1467,14 @@ fn require_acceptance_ledger_and_position_continuity(
             if signal_direction != plan.direction {
                 bail!("Arcus acceptance entry signal direction does not match its pending plan");
             }
+            let (token_a_reference_price_usd, _) =
+                acceptance_reference_prices(baseline_runtime, current_runtime, signal_sample)?;
             require_acceptance_entry_within_strategy_limits(
                 config,
                 baseline_runtime,
                 &plan,
                 signal_sample,
+                token_a_reference_price_usd,
             )?;
             let (actual_buy_quantity, filled_at) =
                 reconciled_fill_for_continuity(config, &plan, attempt)?;
@@ -2932,10 +3039,12 @@ runtime:
             state["sequence"] = json!(next_sequence);
             state["relative_log_price_history"] = json!(next_history);
             state["last_observation_at"] = json!("2026-08-16T12:00:01Z");
-            state["initial_equity_usd"] = json!("300");
+            state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            state["initial_equity_usd"] = json!("98.2399008827070608");
             state["daily_baseline_day"] = json!("2026-08-16");
-            state["daily_baseline_equity_usd"] = json!("300");
-            state["last_equity_usd"] = json!("300");
+            state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["last_equity_usd"] = json!("98.2399008827070608");
             state["inventory"] = json!({"token_a": "0.30", "token_b": "0.21"});
             state["regime"] = json!("rotated_a_to_b");
             state["last_rotation_at"] = json!("2026-08-16T12:00:02Z");
@@ -3535,10 +3644,103 @@ runtime:
             runtime.state(),
             &plan,
             -0.125,
+            Decimal::from(200),
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("reverse-direction"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_negative_route_cost() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let runtime = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
+        let mut plan = rotation_plan("entry_signal");
+        plan.optimistic_round_trip_loss_bps = Decimal::NEGATIVE_ONE;
+        plan.all_in_round_trip_cost_bps = Decimal::from(19);
+
+        let error = require_acceptance_entry_within_strategy_limits(
+            &config,
+            runtime.state(),
+            &plan,
+            0.125,
+            Decimal::from(200),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must not be negative"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_entry_above_the_configured_notional() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let runtime = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
+        let plan = rotation_plan("entry_signal");
+
+        let error = require_acceptance_entry_within_strategy_limits(
+            &config,
+            runtime.state(),
+            &plan,
+            0.125,
+            Decimal::from(250),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("configured USD notional"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_post_sell_balance_below_the_raw_floor() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
+        attempt.pre_balances.sell_balance_raw = "90000000000000000".to_string();
+        attempt.post_balances.as_mut().unwrap().sell_balance_raw = "40000000000000000".to_string();
+
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+
+        assert!(error.to_string().contains("post-swap sell balance"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_pre_buy_balance_below_the_raw_floor() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
+        attempt.pre_balances.buy_balance_raw = "10000000000000000".to_string();
+        attempt.post_balances.as_mut().unwrap().buy_balance_raw = "60000000000000000".to_string();
+
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+
+        assert!(error.to_string().contains("pre-swap buy balance"));
     }
 
     #[test]
