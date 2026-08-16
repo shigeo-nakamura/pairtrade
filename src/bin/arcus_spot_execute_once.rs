@@ -359,6 +359,54 @@ fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<Pa
     Ok(parent.join("live-tick-pending-plan.json"))
 }
 
+const LIVE_TICK_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Atomic recovery document written by `live-tick`. Keeping the raw recorder
+/// snapshot beside the resulting plan lets continuity verification replay the
+/// planner from the pre-tick checkpoint instead of trusting strategy fields
+/// (especially the round-trip loss) written by a rollback candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotLiveTickEvidence {
+    schema_version: u32,
+    evaluation_time: DateTime<Utc>,
+    snapshot: ArcusSpotRecorderSnapshot,
+    plan: ArcusSpotRotationPlan,
+}
+
+fn validate_live_tick_evidence_schema(evidence: &ArcusSpotLiveTickEvidence) -> Result<()> {
+    if evidence.schema_version != LIVE_TICK_EVIDENCE_SCHEMA_VERSION {
+        bail!(
+            "unsupported Arcus live-tick evidence schema {}; expected {}",
+            evidence.schema_version,
+            LIVE_TICK_EVIDENCE_SCHEMA_VERSION
+        );
+    }
+    Ok(())
+}
+
+/// Recovery commands also accept legacy standalone plan JSON supplied by an
+/// operator. Newly generated live-tick recovery files use the evidence
+/// envelope above, while continuity acceptance deliberately requires it.
+fn plan_from_document(bytes: &[u8], label: &str) -> Result<ArcusSpotRotationPlan> {
+    if let Ok(evidence) = serde_json::from_slice::<ArcusSpotLiveTickEvidence>(bytes) {
+        validate_live_tick_evidence_schema(&evidence)?;
+        return Ok(evidence.plan);
+    }
+    serde_json::from_slice::<ArcusSpotRotationPlan>(bytes)
+        .with_context(|| format!("invalid {label}"))
+}
+
+fn live_tick_evidence_from_document(
+    bytes: &[u8],
+    label: &str,
+) -> Result<ArcusSpotLiveTickEvidence> {
+    let evidence: ArcusSpotLiveTickEvidence = serde_json::from_slice(bytes)
+        .with_context(|| format!("invalid {label}: recorder evidence is required"))?;
+    validate_live_tick_evidence_schema(&evidence)?;
+    Ok(evidence)
+}
+
 const STATE_BACKUP_SCHEMA_VERSION: u32 = 2;
 const STATE_BACKUP_MANIFEST: &str = "manifest.json";
 const STATE_BACKUP_CHECKPOINT: &str = "runtime_state.json";
@@ -485,8 +533,7 @@ fn read_optional_private_plan(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
             let bytes = read_private_regular_file(path, "Arcus pending plan")?;
-            serde_json::from_slice::<ArcusSpotRotationPlan>(&bytes)
-                .with_context(|| format!("invalid Arcus pending plan {}", path.display()))?;
+            plan_from_document(&bytes, &format!("Arcus pending plan {}", path.display()))?;
             Ok(Some(bytes))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -711,8 +758,7 @@ fn load_arcus_state_backup(
         Some(expected) => {
             let bytes = read_private_regular_file(&pending_plan_path, "backup pending plan")?;
             require_file_matches_manifest(&bytes, expected, "backup pending plan")?;
-            serde_json::from_slice::<ArcusSpotRotationPlan>(&bytes)
-                .context("invalid backup pending plan")?;
+            plan_from_document(&bytes, "backup pending plan")?;
             Some(bytes)
         }
         None => {
@@ -1191,6 +1237,26 @@ fn position_state_matches(left: &ArcusSpotRuntimeState, right: &ArcusSpotRuntime
         && left.last_live_execution_idempotency_key == right.last_live_execution_idempotency_key
 }
 
+fn runtime_state_matches_replay(
+    replayed: &ArcusSpotRuntimeState,
+    persisted: &ArcusSpotRuntimeState,
+) -> bool {
+    if replayed.relative_log_price_history.len() != persisted.relative_log_price_history.len()
+        || replayed
+            .relative_log_price_history
+            .iter()
+            .zip(&persisted.relative_log_price_history)
+            .any(|(left, right)| (left - right).abs() > 1e-12)
+    {
+        return false;
+    }
+    let mut replayed_without_floats = replayed.clone();
+    let mut persisted_without_floats = persisted.clone();
+    replayed_without_floats.relative_log_price_history.clear();
+    persisted_without_floats.relative_log_price_history.clear();
+    replayed_without_floats == persisted_without_floats
+}
+
 fn acceptance_signal_sample(
     baseline: &ArcusSpotRuntimeState,
     current: &ArcusSpotRuntimeState,
@@ -1510,9 +1576,52 @@ fn require_acceptance_ledger_and_position_continuity(
                 .pending_plan_bytes
                 .as_deref()
                 .context("Arcus reconciled acceptance attempt has no pending runtime plan")?;
-            let plan: ArcusSpotRotationPlan = serde_json::from_slice(plan_bytes)
-                .context("invalid Arcus acceptance pending runtime plan")?;
+            let evidence = live_tick_evidence_from_document(
+                plan_bytes,
+                "Arcus acceptance pending runtime plan",
+            )?;
+            let plan = evidence.plan.clone();
+            if evidence.snapshot.collection_finished_at != accepted_observation_at {
+                bail!("Arcus acceptance recorder evidence does not match the accepted observation");
+            }
+            if evidence.evaluation_time < accepted_observation_at
+                || evidence.evaluation_time > attempt.prepared_at
+            {
+                bail!("Arcus acceptance recorder evaluation is outside the approved tick window");
+            }
             require_acceptance_quote_belongs_to_observation(&plan, accepted_observation_at)?;
+
+            // Re-run the exact planner from the immutable pre-rollback
+            // checkpoint and the raw recorder snapshot captured by
+            // live-tick. This independently derives route linkage/loss,
+            // quote freshness, signal, sizing, and inventory projections;
+            // a rollback candidate cannot gain acceptance by merely
+            // writing a self-consistent but understated nonnegative cost
+            // into its pending plan.
+            let mut replayed_runtime =
+                ArcusSpotRuntime::from_state(config.runtime.clone(), baseline_runtime.clone())
+                    .map_err(anyhow::Error::msg)
+                    .context("failed to reconstruct the Arcus acceptance replay baseline")?;
+            let replayed_event =
+                replayed_runtime.step_at(&evidence.snapshot, evidence.evaluation_time);
+            let replayed_plan = match &replayed_event.decision {
+                ArcusSpotDecision::WouldRotate { plan } => plan,
+                ArcusSpotDecision::Observe { hold } => bail!(
+                    "Arcus acceptance recorder evidence did not reproduce a live rotation plan: \
+                     {}",
+                    hold.detail
+                ),
+                ArcusSpotDecision::SimulatedFill { .. } => bail!(
+                    "Arcus acceptance recorder evidence unexpectedly produced a simulated fill"
+                ),
+            };
+            if replayed_plan != &plan {
+                bail!(
+                    "Arcus acceptance pending plan does not match its independently replayed \
+                     recorder evidence"
+                );
+            }
+
             let signal_sample = acceptance_signal_sample(baseline_runtime, current_runtime)?;
             let signal_runtime =
                 ArcusSpotRuntime::from_state(config.runtime.clone(), baseline_runtime.clone())
@@ -1535,22 +1644,11 @@ fn require_acceptance_ledger_and_position_continuity(
             )?;
             let (actual_buy_quantity, filled_at) =
                 reconciled_fill_for_continuity(config, &plan, attempt)?;
-            let mut expected_pre_fill = current_runtime.clone();
-            expected_pre_fill.inventory = baseline_runtime.inventory;
-            expected_pre_fill.regime = baseline_runtime.regime;
-            expected_pre_fill.last_rotation_at = baseline_runtime.last_rotation_at;
-            expected_pre_fill.rotated_quantity = baseline_runtime.rotated_quantity;
-            expected_pre_fill.last_live_execution_idempotency_key =
-                baseline_runtime.last_live_execution_idempotency_key.clone();
-            let mut expected =
-                ArcusSpotRuntime::from_state(config.runtime.clone(), expected_pre_fill)
-                    .map_err(anyhow::Error::msg)
-                    .context("failed to reconstruct the Arcus acceptance pre-fill state")?;
-            expected
+            replayed_runtime
                 .validate_plan_consistent_with_state(&plan)
                 .map_err(anyhow::Error::msg)
                 .context("Arcus acceptance plan is inconsistent with the backup position")?;
-            let applied = expected
+            let applied = replayed_runtime
                 .apply_confirmed_live_fill_once(
                     &plan,
                     plan.sell_quantity,
@@ -1560,7 +1658,8 @@ fn require_acceptance_ledger_and_position_continuity(
                 )
                 .map_err(anyhow::Error::msg)
                 .context("failed to derive the Arcus acceptance position transition")?;
-            if !applied || !position_state_matches(expected.state(), current_runtime) {
+            if !applied || !runtime_state_matches_replay(replayed_runtime.state(), current_runtime)
+            {
                 bail!("Arcus position state does not match the reconciled acceptance attempt");
             }
         }
@@ -1757,7 +1856,7 @@ arcus-spot-propose-plan alike -- is covered) rejects a snapshot whose
 collection_finished_at is not strictly newer than the last one it actually
 advanced on: re-consuming or reordering an observation would artificially
 reweight the z-score history. Before dispatching, it durably writes the
-plan it built to
+plan plus its recorder snapshot and evaluation time to
 <runtime_state_path's directory>/live-tick-pending-plan.json (mode 0600);
 if the process exits after Submitted but before confirmation, recover with
 auto-resume CONFIG_YAML <that path>.
@@ -2027,8 +2126,7 @@ fn load_config_and_plan(
     let config_bytes = read_private_regular_file(config_path, "config")?;
     let plan_bytes = read_private_regular_file(plan_path, "plan")?;
     let config = parse_config(&config_bytes, config_path)?;
-    let plan: ArcusSpotRotationPlan = serde_json::from_slice(&plan_bytes)
-        .with_context(|| format!("invalid plan {}", plan_path.display()))?;
+    let plan = plan_from_document(&plan_bytes, &format!("plan {}", plan_path.display()))?;
     Ok((config, plan))
 }
 
@@ -2511,7 +2609,8 @@ async fn main() -> Result<()> {
             // arcus-spot-propose-plan (or another live-tick) writing the
             // same checkpoint (Codex P2 follow-up, pairtrade#186; see
             // ArcusSpotRuntimeState::last_observation_at's doc comment).
-            let event = runtime.step_at(&snapshot, Utc::now());
+            let evaluation_time = Utc::now();
+            let event = runtime.step_at(&snapshot, evaluation_time);
             // Captured now, under the lock, so dispatch below can bind the
             // plan to the exact observation it was computed from -- see
             // its use after the lock is re-acquired.
@@ -2530,7 +2629,8 @@ async fn main() -> Result<()> {
                 }
             };
             let plan_config_digest = approval_digest(&config, &plan)?;
-            // Durably record the plan before dispatching it: unlike
+            // Durably record the plan and the recorder evidence from which
+            // it was derived before dispatching it: unlike
             // execute/auto-execute, live-tick builds this plan itself
             // rather than receiving it as an argument the caller already
             // holds a copy of, so without this write, a crash or exit
@@ -2538,8 +2638,14 @@ async fn main() -> Result<()> {
             // `auto-resume` to recover with (Codex P2 follow-up,
             // pairtrade#186).
             let pending_plan_path = live_tick_pending_plan_path(&config)?;
-            let plan_bytes = serde_json::to_vec_pretty(&plan)
-                .context("failed to serialize Arcus live-tick plan")?;
+            let evidence = ArcusSpotLiveTickEvidence {
+                schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+                evaluation_time,
+                snapshot,
+                plan: plan.clone(),
+            };
+            let plan_bytes = serde_json::to_vec_pretty(&evidence)
+                .context("failed to serialize Arcus live-tick evidence")?;
             write_private_regular_file_atomic(&pending_plan_path, &plan_bytes)?;
             // Keep checkpoint + pending-plan backup capture coherent: the
             // pending plan is part of Submitted-crash recovery, so publish
@@ -2995,6 +3101,121 @@ runtime:
         });
     }
 
+    fn accepted_entry_snapshot(at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
+        serde_json::from_value(json!({
+            "schema_version": 3,
+            "mode": "public_indicative_read_only",
+            "chain_id": 4663,
+            "collection_started_at": at,
+            "collection_finished_at": at,
+            "indexer_stats": {
+                "status": "error",
+                "error": {"stage": "indexer_stats", "classification": "http", "retryable": false, "message": "x"}
+            },
+            "token_metadata": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {
+                            "chainId": 4663,
+                            "symbol": "NVDA",
+                            "name": "NVIDIA",
+                            "address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                            "decimals": 18,
+                            "verified": true
+                        },
+                        {
+                            "chainId": 4663,
+                            "symbol": "AMD",
+                            "name": "AMD",
+                            "address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                            "decimals": 18,
+                            "verified": true
+                        }
+                    ],
+                    "requested_at": at,
+                    "received_at": at,
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "reference_overview": {
+                "status": "success",
+                "observation": {
+                    "payload": [
+                        {
+                            "ticker": "NVDA",
+                            "contractAddress": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                            "name": "NVIDIA",
+                            "category": "stock",
+                            "quote": {"price": "200"}
+                        },
+                        {
+                            "ticker": "AMD",
+                            "contractAddress": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                            "name": "AMD",
+                            "category": "stock",
+                            "quote": {"price": "176.49938051691913"}
+                        }
+                    ],
+                    "requested_at": at,
+                    "received_at": at,
+                    "latency_ms": 10,
+                    "attempts": 1
+                }
+            },
+            "round_trips": [{
+                "pair": {"sell_symbol": "NVDA", "buy_symbol": "AMD"},
+                "notional_usd": "10",
+                "sell_reference_price_usd": "200",
+                "buy_reference_price_usd": "176.49938051691913",
+                "requested_sell_amount": "50000000000000000",
+                "forward": {
+                    "chain_id": 4663,
+                    "sell_symbol": "NVDA",
+                    "buy_symbol": "AMD",
+                    "sell_token": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                    "buy_token": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                    "sell_amount": "50000000000000000",
+                    "response": {
+                        "payload": {
+                            "recommended": "arcus",
+                            "all": [{"venue": "arcus", "buyAmount": "50000000000000000", "sellAmount": "50000000000000000", "fees": []}],
+                            "errors": []
+                        },
+                        "requested_at": at,
+                        "received_at": at,
+                        "latency_ms": 10,
+                        "attempts": 1
+                    }
+                },
+                "reverse": {
+                    "chain_id": 4663,
+                    "sell_symbol": "AMD",
+                    "buy_symbol": "NVDA",
+                    "sell_token": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+                    "buy_token": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+                    "sell_amount": "50000000000000000",
+                    "response": {
+                        "payload": {
+                            "recommended": "arcus",
+                            "all": [{"venue": "arcus", "buyAmount": "49617500000000000", "sellAmount": "50000000000000000", "fees": []}],
+                            "errors": []
+                        },
+                        "requested_at": at,
+                        "received_at": at,
+                        "latency_ms": 10,
+                        "attempts": 1
+                    }
+                },
+                "optimistic_return_amount": "49617500000000000",
+                "optimistic_round_trip_loss_bps": "76.5",
+                "errors": []
+            }]
+        }))
+        .unwrap()
+    }
+
     fn rewrite_checkpoint_state(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -3012,6 +3233,15 @@ runtime:
         let at = DateTime::parse_from_rfc3339("2026-08-16T12:00:02Z")
             .unwrap()
             .with_timezone(&Utc);
+        reconciled_entry_attempt_at(config, plan, sequence, at)
+    }
+
+    fn reconciled_entry_attempt_at(
+        config: &ArcusSpotExecuteOnceConfig,
+        plan: &ArcusSpotRotationPlan,
+        sequence: u64,
+        at: DateTime<Utc>,
+    ) -> ArcusSpotExecutionAttempt {
         let payload_hash = format!("sha256:{}", "a".repeat(64));
         ArcusSpotExecutionAttempt {
             sequence,
@@ -3063,51 +3293,63 @@ runtime:
         ledger_path: &Path,
         runtime_path: &Path,
     ) -> ArcusSpotExecutionAttempt {
-        let mut plan = rotation_plan("entry_signal");
-        plan.quote_received_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
+        let accepted_at = Utc::now();
+        let snapshot = accepted_entry_snapshot(accepted_at);
+        let baseline = ArcusSpotRuntimeCheckpointStore::new(runtime_path.to_path_buf())
+            .load_existing(&config.runtime)
+            .unwrap();
+
+        // Build the authentic plan under the ordinary approved limits. A
+        // few negative tests deliberately tighten one limit in `config`;
+        // they still need the same candidate artifact so the verifier can
+        // demonstrate that replaying under the supplied config rejects it.
+        let mut planning_config = config.runtime.clone();
+        planning_config.max_rotation_fraction = Decimal::new(25, 2);
+        planning_config.max_all_in_round_trip_cost_bps = Decimal::from(120);
+        planning_config.max_inventory_imbalance_fraction = Decimal::new(75, 2);
+        let mut planner =
+            ArcusSpotRuntime::from_state(planning_config, baseline.state().clone()).unwrap();
+        let event = planner.step_at(&snapshot, accepted_at);
+        let plan = match event.decision {
+            ArcusSpotDecision::WouldRotate { plan } => plan,
+            other => panic!("acceptance fixture did not produce a rotation plan: {other:?}"),
+        };
+        let evidence = ArcusSpotLiveTickEvidence {
+            schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+            evaluation_time: accepted_at,
+            snapshot: snapshot.clone(),
+            plan: plan.clone(),
+        };
+        let plan_bytes = serde_json::to_vec_pretty(&evidence).unwrap();
         write_private_regular_file_atomic(
             &live_tick_pending_plan_path(config).unwrap(),
             &plan_bytes,
         )
         .unwrap();
-        let attempt = reconciled_entry_attempt(config, &plan, 1);
-        let ledger = ArcusSpotExecutionLedger {
-            schema_version: 2,
-            next_sequence: 2,
-            active: None,
-            history: vec![attempt.clone()],
-        };
+
+        let ledger_store = ArcusSpotExecutionLedgerStore::new(ledger_path);
+        let mut ledger = ledger_store.load_existing().unwrap();
+        let attempt = reconciled_entry_attempt_at(config, &plan, ledger.next_sequence, accepted_at);
+        ledger.next_sequence += 1;
+        ledger.history.push(attempt.clone());
         ArcusSpotExecutionLedgerStore::new(ledger_path)
             .persist(&ledger)
             .unwrap();
-        let baseline = ArcusSpotRuntimeCheckpointStore::new(runtime_path.to_path_buf())
-            .load_existing(&config.runtime)
+
+        let mut runtime = baseline;
+        runtime.step_at(&snapshot, accepted_at);
+        runtime
+            .apply_confirmed_live_fill_once(
+                &plan,
+                plan.sell_quantity,
+                plan.buy_quantity,
+                accepted_at,
+                &attempt.idempotency_key,
+            )
             .unwrap();
-        let next_sequence = baseline.state().sequence + 1;
-        let mut next_history = baseline.state().relative_log_price_history.clone();
-        next_history.push(0.125);
-        if next_history.len() > config.runtime.signal_window_samples {
-            next_history.remove(0);
-        }
-        rewrite_checkpoint_state(runtime_path, |state| {
-            state["sequence"] = json!(next_sequence);
-            state["relative_log_price_history"] = json!(next_history);
-            state["last_observation_at"] = json!("2026-08-16T12:00:01Z");
-            state["last_token_a_reference_price_usd"] = json!("200");
-            state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
-            state["initial_equity_usd"] = json!("98.2399008827070608");
-            state["daily_baseline_day"] = json!("2026-08-16");
-            state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
-            state["last_equity_usd"] = json!("98.2399008827070608");
-            state["inventory"] = json!({"token_a": "0.30", "token_b": "0.21"});
-            state["regime"] = json!("rotated_a_to_b");
-            state["last_rotation_at"] = json!("2026-08-16T12:00:02Z");
-            state["rotated_quantity"] = json!("0.05");
-            state["last_live_execution_idempotency_key"] = json!(attempt.idempotency_key.clone());
-        });
+        ArcusSpotRuntimeCheckpointStore::new(runtime_path.to_path_buf())
+            .persist(&runtime)
+            .unwrap();
         attempt
     }
 
@@ -3701,19 +3943,6 @@ runtime:
             .unwrap();
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
-        let acceptance_attempt = reconciled_entry_attempt(&config, &plan, 2);
-        ArcusSpotExecutionLedgerStore::new(&ledger_path)
-            .persist(&ArcusSpotExecutionLedger {
-                schema_version: 2,
-                next_sequence: 3,
-                active: None,
-                history: vec![prior_attempt, acceptance_attempt.clone()],
-            })
-            .unwrap();
-        rewrite_checkpoint_state(&runtime_path, |state| {
-            state["last_live_execution_idempotency_key"] =
-                json!(acceptance_attempt.idempotency_key);
-        });
 
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
@@ -3826,6 +4055,40 @@ runtime:
         .unwrap_err();
 
         assert!(error.to_string().contains("must not be negative"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_understated_nonnegative_route_cost() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+
+        let pending_path = live_tick_pending_plan_path(&config).unwrap();
+        let bytes = read_private_regular_file(&pending_path, "test pending plan").unwrap();
+        let mut evidence = live_tick_evidence_from_document(&bytes, "test pending plan").unwrap();
+        evidence.plan.optimistic_round_trip_loss_bps = Decimal::ONE;
+        evidence.plan.all_in_round_trip_cost_bps = Decimal::from(21);
+        write_private_regular_file_atomic(
+            &pending_path,
+            &serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match its independently replayed recorder evidence"));
     }
 
     #[test]
@@ -4007,7 +4270,7 @@ runtime:
 
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
-        assert!(error.to_string().contains("per-action rotation cap"));
+        assert!(error.to_string().contains("per-action cap"), "{error:#}");
     }
 
     #[test]
@@ -4029,7 +4292,10 @@ runtime:
 
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
-        assert!(error.to_string().contains("all-in cost"));
+        assert!(
+            error.to_string().contains("all-in round-trip cost"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -4051,7 +4317,10 @@ runtime:
 
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
-        assert!(error.to_string().contains("imbalance cap"));
+        assert!(
+            error.to_string().contains("inventory imbalance"),
+            "{error:#}"
+        );
     }
 
     #[test]

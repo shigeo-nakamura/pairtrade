@@ -21,13 +21,13 @@ instead the manifest binds its canonical SHA-256 digest.
 |---|---|---|
 | Runtime checkpoint | `/var/lib/debot-arcus/spot-execute-once/runtime_state.json` | schema 1; exact runtime config plus signal history, last token A/B reference prices, inventory, regime, risk state and last committed execution key |
 | Execution ledger | `/var/lib/debot-arcus/spot-execute-once/ledger.json` | schema 2; monotonic attempt sequence, immutable archive and any active recovery state |
-| Recovery plan | `/var/lib/debot-arcus/spot-execute-once/live-tick-pending-plan.json` | optional; exact plan needed by `auto-resume` after an interrupted live-tick submission |
+| Recovery evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-pending-plan.json` | optional schema-1 envelope: exact plan, recorder snapshot and evaluation time needed by `auto-resume` and continuity verification |
 | Namespace lock | `/var/lib/debot-arcus/spot-execute-once/.runtime_state.json.lock` | mode-0600 process lock shared by live-tick, execute/resume, proposer and state tooling |
 
 Checkpoint and ledger stores already use create-new temporary files, file
-`fsync`, atomic rename and parent-directory `fsync`. `live-tick` now writes its
-pending recovery plan while holding the same checkpoint namespace lock, so a
-backup observes either the previous complete boundary or the next complete
+`fsync`, atomic rename and parent-directory `fsync`. `live-tick` now writes the
+pending recovery evidence while holding the same checkpoint namespace lock, so
+a backup observes either the previous complete boundary or the next complete
 boundary, never a checkpoint from one tick and a plan from another.
 
 The state tool uses strict `load_existing` reads. A missing file is an error;
@@ -75,7 +75,11 @@ advancement but rejects:
   changed archived history, more than one new acceptance attempt, or an
   acceptance that exceeds the preserved UTC-day swap allowance;
 - an unresolved/non-reconciled acceptance attempt, or one not bound to the
-  preserved pending plan, its configured sell ceiling and slippage buy floor,
+  preserved pending plan and recorder evidence. The verifier reruns `step_at`
+  from the backup checkpoint with that snapshot/evaluation time and requires
+  an exact plan match, independently recomputing route linkage/loss, quote
+  freshness, signal, sizing and inventory projection before checking the
+  configured sell ceiling and slippage buy floor,
   its exact reconciled wallet-balance delta, both configured raw inventory
   floors and minimum gas balance, a genuine entry-signal crossing, the
   supported entry direction, runtime quote freshness, a non-negative route

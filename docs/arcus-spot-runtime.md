@@ -235,8 +235,17 @@ checkpoint has moved on -- otherwise an entry could be submitted based on
 a signal state a newer tick has already superseded (Codex P1 follow-up,
 pairtrade#186).
 
-Before dispatching, `live-tick` durably writes the plan it built, at mode
-0600, to `<runtime_state_path's directory>/live-tick-pending-plan.json`.
+Before dispatching, `live-tick` durably writes a schema-1 recovery envelope,
+at mode 0600, to
+`<runtime_state_path's directory>/live-tick-pending-plan.json`. The envelope
+contains the plan, the exact recorder snapshot that produced it, and the
+`step_at` evaluation time. `auto-resume` accepts this envelope and extracts
+the plan; standalone operator-supplied plan JSON remains supported by the
+other execution/recovery commands. The preserved snapshot also lets the
+post-rollback continuity verifier recompute route linkage/loss and the full
+plan from the pre-start checkpoint instead of trusting strategy fields
+reported by the candidate binary.
+
 If the process exits after the swap is `Submitted` but before it is
 confirmed, recover with:
 
