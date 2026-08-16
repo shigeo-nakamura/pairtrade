@@ -12,6 +12,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+GAP_EVENT_THRESHOLD_SECS = 30
+
 
 def open_text(path: Path):
     if path.suffix == ".gz":
@@ -47,8 +49,22 @@ def timestamp_in_datetime_range(timestamp_ms: int) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dumps", nargs="+", type=Path)
-    parser.add_argument("--symbols", nargs="+", default=["BTC", "ETH", "SOL"])
+    parser.add_argument(
+        "--symbols",
+        action="append",
+        metavar="SYMBOL[,SYMBOL...]",
+        help="comma-separated symbols; repeatable (default: BTC,ETH,SOL)",
+    )
     args = parser.parse_args()
+    symbol_groups = args.symbols or ["BTC,ETH,SOL"]
+    args.symbols = [
+        symbol.strip()
+        for group in symbol_groups
+        for symbol in group.split(",")
+        if symbol.strip()
+    ]
+    if not args.symbols:
+        parser.error("--symbols must include at least one symbol")
 
     frames = 0
     invalid_json = 0
@@ -125,8 +141,10 @@ def main() -> int:
                     delta = (timestamp - previous_ts) / 1000
                     if delta > 0:
                         gaps.append(delta)
-                        if delta > 30:
+                        if delta > GAP_EVENT_THRESHOLD_SECS:
                             gap_events.append((delta, previous_ts, timestamp))
+                            for symbol in list(run_start):
+                                reset_run(symbol)
                     else:
                         non_monotonic += 1
                 previous_ts = timestamp
