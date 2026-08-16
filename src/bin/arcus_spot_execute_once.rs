@@ -22,7 +22,10 @@ use dex_connector::{
     ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig,
     ArcusSpotRecorderSnapshot,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH};
+use ed25519_dalek::{
+    Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH,
+    SIGNATURE_LENGTH,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -124,8 +127,7 @@ fn open_regular_file_no_follow(path: &Path, label: &str) -> Result<(File, fs::Me
             );
         }
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to open {label} {}", path.display()));
+            return Err(err).with_context(|| format!("failed to open {label} {}", path.display()));
         }
     };
     let metadata = file
@@ -141,8 +143,7 @@ fn open_regular_file_no_follow(path: &Path, label: &str) -> Result<(File, fs::Me
 }
 
 fn auto_execute_policy_from_file(path: &Path) -> Result<ArcusSpotAutoExecutePolicy> {
-    let (mut file, metadata) =
-        open_regular_file_no_follow(path, "auto-execute policy file")?;
+    let (mut file, metadata) = open_regular_file_no_follow(path, "auto-execute policy file")?;
     if metadata.permissions().mode() & 0o022 != 0 {
         bail!(
             "auto-execute policy file {} must not be group- or other-writable",
@@ -242,8 +243,7 @@ fn approval_public_key_from_admin_file() -> Result<VerifyingKey> {
 }
 
 fn approval_public_key_from_file(path: &Path) -> Result<VerifyingKey> {
-    let (mut file, metadata) =
-        open_regular_file_no_follow(path, "approval public key file")?;
+    let (mut file, metadata) = open_regular_file_no_follow(path, "approval public key file")?;
     if metadata.permissions().mode() & 0o022 != 0 {
         bail!(
             "approval public key file {} must not be group- or other-writable",
@@ -524,8 +524,7 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     // ledger_path or runtime_state_path happened to resolve there, that
     // write would destroy the checkpoint or ledger outright and the
     // subsequent fresh load would fail (Codex P2 follow-up, pairtrade#186).
-    let pending_plan_path =
-        resolve_path_for_collision_check(&live_tick_pending_plan_path(config)?);
+    let pending_plan_path = resolve_path_for_collision_check(&live_tick_pending_plan_path(config)?);
     if pending_plan_path == ledger_path || pending_plan_path == runtime_state_path {
         bail!(
             "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick pending-plan path {}",
@@ -558,8 +557,7 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
 }
 
 fn parse_approval_public_key(hex_key: &str) -> Result<VerifyingKey> {
-    let bytes = hex::decode(hex_key.trim())
-        .context("approval_public_key must be hex-encoded")?;
+    let bytes = hex::decode(hex_key.trim()).context("approval_public_key must be hex-encoded")?;
     let bytes: [u8; PUBLIC_KEY_LENGTH] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("approval_public_key must be {PUBLIC_KEY_LENGTH} bytes"))?;
@@ -672,7 +670,11 @@ fn require_approval_signature(
     approval_signature_hex: &str,
 ) -> Result<String> {
     let computed_digest = approval_digest(config, plan)?;
-    verify_approval_signature(&computed_digest, approval_public_key, approval_signature_hex)?;
+    verify_approval_signature(
+        &computed_digest,
+        approval_public_key,
+        approval_signature_hex,
+    )?;
     Ok(computed_digest)
 }
 
@@ -689,7 +691,9 @@ fn verify_approval_signature(
     let signature = Signature::from_bytes(&signature_bytes);
     public_key
         .verify_strict(digest.as_bytes(), &signature)
-        .context("approval signature does not verify against approval_public_key for this exact config+plan")
+        .context(
+        "approval signature does not verify against approval_public_key for this exact config+plan",
+    )
 }
 
 // Argon2id parameters (OWASP-recommended minimum as of this writing: 19 MiB
@@ -826,7 +830,10 @@ fn decrypt_signing_key(encrypted: &EncryptedApprovalKey, passphrase: &[u8]) -> R
         bail!("unsupported approval key file kdf {:?}", encrypted.kdf);
     }
     if encrypted.cipher != "aes-256-gcm" {
-        bail!("unsupported approval key file cipher {:?}", encrypted.cipher);
+        bail!(
+            "unsupported approval key file cipher {:?}",
+            encrypted.cipher
+        );
     }
     let salt: [u8; KDF_SALT_LEN] = hex_decode_exact(&encrypted.kdf_salt_hex, "kdf_salt_hex")?;
     let nonce_bytes: [u8; AES_GCM_NONCE_LEN] = hex_decode_exact(&encrypted.nonce_hex, "nonce_hex")?;
@@ -912,8 +919,12 @@ async fn main() -> Result<()> {
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
             let approval_public_key = approval_public_key_from_admin_file()?;
-            let plan_config_digest =
-                require_approval_signature(&config, &plan, &approval_public_key, approval_signature)?;
+            let plan_config_digest = require_approval_signature(
+                &config,
+                &plan,
+                &approval_public_key,
+                approval_signature,
+            )?;
             // executor_from_config acquires the exclusive ledger lock
             // (inside ArcusSpotLiveExecutor::new); the runtime-checkpoint
             // consistency check must happen only *after* that, and must
@@ -929,7 +940,8 @@ async fn main() -> Result<()> {
             // (Codex P1 follow-up, pairtrade#181, refining an earlier
             // fix in the same area).
             let mut executor = executor_from_config(&config).await?;
-            let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            let runtime_store =
+                ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let runtime = runtime_store.load_or_create(&config.runtime)?;
             runtime
                 .validate_plan_consistent_with_state(&plan)
@@ -975,7 +987,8 @@ async fn main() -> Result<()> {
             require_config_within_auto_execute_policy(&config, &policy)?;
             let plan_config_digest = approval_digest(&config, &plan)?;
             let mut executor = executor_from_config(&config).await?;
-            let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            let runtime_store =
+                ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let runtime = runtime_store.load_or_create(&config.runtime)?;
             runtime
                 .validate_plan_consistent_with_state(&plan)
@@ -1129,7 +1142,8 @@ async fn main() -> Result<()> {
             // (acquired inside executor_from_config) was held, so another
             // overlapping invocation could have advanced the checkpoint in
             // between.
-            let runtime_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            let runtime_store =
+                ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let fresh_runtime = runtime_store.load_or_create(&config.runtime)?;
             // validate_plan_consistent_with_state only checks regime/
             // trigger/direction/open-quantity structural consistency, not
@@ -1173,8 +1187,12 @@ async fn main() -> Result<()> {
             let (config, plan) =
                 load_config_and_plan(Path::new(config_path), Path::new(plan_path))?;
             let approval_public_key = approval_public_key_from_admin_file()?;
-            let plan_config_digest =
-                require_approval_signature(&config, &plan, &approval_public_key, approval_signature)?;
+            let plan_config_digest = require_approval_signature(
+                &config,
+                &plan,
+                &approval_public_key,
+                approval_signature,
+            )?;
             let mut executor = executor_from_config(&config).await?;
             let attempt = executor.resume_status_and_reconcile().await?;
             let attempt = finalize_reconciled_attempt(
@@ -1285,8 +1303,7 @@ cumulative_loss_limit_usd: "10"
     fn encrypted_approval_key_round_trips_with_the_correct_passphrase() {
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let encrypted = encrypt_signing_key(&signing_key, b"correct horse battery staple").unwrap();
-        let decrypted =
-            decrypt_signing_key(&encrypted, b"correct horse battery staple").unwrap();
+        let decrypted = decrypt_signing_key(&encrypted, b"correct horse battery staple").unwrap();
         assert_eq!(decrypted.to_bytes(), signing_key.to_bytes());
     }
 
@@ -1388,7 +1405,9 @@ cumulative_loss_limit_usd: "10"
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
         let error = approval_public_key_from_file(&path).unwrap_err();
-        assert!(error.to_string().contains("owned by this process's own uid"));
+        assert!(error
+            .to_string()
+            .contains("owned by this process's own uid"));
     }
 
     #[test]
@@ -1683,7 +1702,6 @@ runtime:
         assert!(error.to_string().contains("live-tick pending-plan path"));
     }
 
-
     fn rotation_plan(trigger: &str) -> ArcusSpotRotationPlan {
         serde_json::from_value(serde_json::json!({
             "direction": "token_a_to_token_b",
@@ -1744,7 +1762,8 @@ runtime:
 
     #[test]
     fn auto_execute_policy_accepts_a_config_matching_the_approved_digest() {
-        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let config =
+            execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
         let policy = auto_execute_policy_for(&config);
         require_config_within_auto_execute_policy(&config, &policy).unwrap();
     }
@@ -1754,9 +1773,14 @@ runtime:
         // Without this, the executor identity could point ledger_path at a
         // fresh, empty file to silently reset the daily swap count and
         // prior attempt history that the real ledger accumulates.
-        let approved = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let approved =
+            execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
         let policy = auto_execute_policy_for(&approved);
-        let config = execute_once_config("/tmp/attacker-chosen/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let config = execute_once_config(
+            "/tmp/attacker-chosen/ledger.json",
+            "/var/lib/x/runtime.json",
+            "1000",
+        );
         let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
         assert!(error
             .to_string()
@@ -1765,9 +1789,14 @@ runtime:
 
     #[test]
     fn auto_execute_policy_rejects_a_redirected_runtime_state_path() {
-        let approved = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let approved =
+            execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
         let policy = auto_execute_policy_for(&approved);
-        let config = execute_once_config("/var/lib/x/ledger.json", "/tmp/attacker-chosen/runtime.json", "1000");
+        let config = execute_once_config(
+            "/var/lib/x/ledger.json",
+            "/tmp/attacker-chosen/runtime.json",
+            "1000",
+        );
         let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
         assert!(error
             .to_string()
@@ -1776,9 +1805,14 @@ runtime:
 
     #[test]
     fn auto_execute_policy_rejects_a_sell_ceiling_raised_past_the_administrator_approved_value() {
-        let approved = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let approved =
+            execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
         let policy = auto_execute_policy_for(&approved);
-        let config = execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "999999999999");
+        let config = execute_once_config(
+            "/var/lib/x/ledger.json",
+            "/var/lib/x/runtime.json",
+            "999999999999",
+        );
         let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
         assert!(error
             .to_string()
@@ -1793,11 +1827,19 @@ runtime:
         // change to any other field -- like max_swaps_per_utc_day here --
         // would have passed silently. Digest-binding the whole config
         // closes that regardless of which field changes.
-        let approved =
-            execute_once_config_with_daily_cap("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000", 10);
+        let approved = execute_once_config_with_daily_cap(
+            "/var/lib/x/ledger.json",
+            "/var/lib/x/runtime.json",
+            "1000",
+            10,
+        );
         let policy = auto_execute_policy_for(&approved);
-        let config =
-            execute_once_config_with_daily_cap("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000", 999);
+        let config = execute_once_config_with_daily_cap(
+            "/var/lib/x/ledger.json",
+            "/var/lib/x/runtime.json",
+            "1000",
+            999,
+        );
         let error = require_config_within_auto_execute_policy(&config, &policy).unwrap_err();
         assert!(error
             .to_string()

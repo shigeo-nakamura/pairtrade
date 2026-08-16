@@ -10,6 +10,7 @@ use std::str::FromStr;
 
 const SUPPORTED_RECORDER_SCHEMA_VERSION: u32 = 3;
 const PUBLIC_RECORDER_MODE: &str = "public_indicative_read_only";
+const SIGNAL_FLAT_EPSILON: f64 = 1e-12;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -570,7 +571,7 @@ impl ArcusSpotRuntime {
                     z_score: None,
                     risk_before: None,
                     decision: ArcusSpotDecision::Observe { hold },
-                })
+                });
             }
         };
         // price_context validated schema/mode/chain/timestamps (and
@@ -647,6 +648,9 @@ impl ArcusSpotRuntime {
                     })
                 }
             };
+        let informative_signal_samples =
+            informative_signal_sample_count(&self.state.relative_log_price_history);
+        let total_signal_samples = self.state.relative_log_price_history.len();
         let z_score = z_score(
             &self.state.relative_log_price_history,
             relative_log_price,
@@ -730,12 +734,10 @@ impl ArcusSpotRuntime {
                 None => ArcusSpotHold::new(
                     ArcusSpotHoldCode::Warmup,
                     format!(
-                        "need {} prior samples; have {}",
+                        "signal not ready: need {} informative prior samples; have {} across {} total prior observations",
                         self.config.min_signal_samples,
-                        self.state
-                            .relative_log_price_history
-                            .len()
-                            .saturating_sub(1)
+                        informative_signal_samples,
+                        total_signal_samples,
                     ),
                 ),
             };
@@ -2139,8 +2141,32 @@ fn relative_log_price(price_a: Decimal, price_b: Decimal) -> Result<f64, String>
     Ok(value)
 }
 
+/// Counts observations that add a meaningfully different price ratio to the
+/// signal window. Closed markets can emit the exact same reference prices on
+/// every scheduled collection; treating all of those repeats as independent
+/// samples lets a 96-element window collapse to one value and makes the
+/// second post-reopen tick look like an extreme outlier. Requiring the normal
+/// minimum sample count in price *changes* keeps entry fail-closed until the
+/// market has supplied enough fresh information again, while the raw rolling
+/// window remains time-based and continues to age out pre-close observations.
+fn informative_signal_sample_count(history: &[f64]) -> usize {
+    let Some(first) = history.first() else {
+        return 0;
+    };
+    let mut count = 1;
+    let mut last_informative = *first;
+    for value in &history[1..] {
+        if (*value - last_informative).abs() > SIGNAL_FLAT_EPSILON {
+            count += 1;
+            last_informative = *value;
+        }
+    }
+    count
+}
+
 fn z_score(history: &[f64], current: f64, minimum_samples: usize) -> Option<f64> {
-    if history.len() < minimum_samples {
+    if history.len() < minimum_samples || informative_signal_sample_count(history) < minimum_samples
+    {
         return None;
     }
     let mean = history.iter().sum::<f64>() / history.len() as f64;
@@ -2153,7 +2179,7 @@ fn z_score(history: &[f64], current: f64, minimum_samples: usize) -> Option<f64>
         .sum::<f64>()
         / history.len() as f64;
     let standard_deviation = variance.sqrt();
-    if !standard_deviation.is_finite() || standard_deviation <= 1e-12 {
+    if !standard_deviation.is_finite() || standard_deviation <= SIGNAL_FLAT_EPSILON {
         return None;
     }
     let score = (current - mean) / standard_deviation;
@@ -2599,6 +2625,111 @@ mod tests {
         let score = z_score(&history, 1.5, 2).unwrap();
         assert!(score > 5.0);
         assert_eq!(history, [1.0, 1.1]);
+    }
+
+    #[test]
+    fn closed_market_flat_window_blocks_first_and_second_reopen_ticks() {
+        let mut cfg = config();
+        cfg.signal_window_samples = 96;
+        cfg.min_signal_samples = 32;
+        cfg.entry_z_score = 2.5;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+
+        // This is the live checkpoint shape observed after a closed market:
+        // every scheduled collection contributed the exact same ratio.
+        let flat_price = (200.0_f64 / 100.0_f64).ln();
+        runtime.state.relative_log_price_history = vec![flat_price; 96];
+
+        let first_time = event_time();
+        let first = runtime.step_at(
+            &snapshot_with_route_unavailable(first_time, "201", "100"),
+            first_time,
+        );
+        assert_eq!(first.z_score, None);
+        assert!(matches!(
+            first.decision,
+            ArcusSpotDecision::Observe { hold }
+                if hold.code == ArcusSpotHoldCode::RouteUnavailable
+        ));
+        assert_eq!(
+            informative_signal_sample_count(&runtime.state.relative_log_price_history),
+            2
+        );
+
+        let second_time = first_time + Duration::seconds(1);
+        let second = runtime.step_at(
+            &snapshot_with_route_unavailable(second_time, "202", "100"),
+            second_time,
+        );
+        assert_eq!(second.z_score, None);
+        assert!(matches!(
+            second.decision,
+            ArcusSpotDecision::Observe { hold }
+                if hold.code == ArcusSpotHoldCode::RouteUnavailable
+        ));
+        assert_eq!(
+            informative_signal_sample_count(&runtime.state.relative_log_price_history),
+            3
+        );
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn normal_low_volatility_history_remains_eligible_for_scoring() {
+        // The total move is only 0.0032 bps in log-price terms, but every
+        // sample adds real information above the numerical flatness floor.
+        let history = (0..32)
+            .map(|index| 2.0 + f64::from(index) * 1e-8)
+            .collect::<Vec<_>>();
+        assert_eq!(informative_signal_sample_count(&history), 32);
+
+        let score = z_score(&history, 2.0 + 32.0e-8, 32)
+            .expect("normal low-volatility history must remain scoreable");
+        assert!(score.is_finite());
+        assert!(score > 0.0);
+    }
+
+    #[test]
+    fn informative_history_guard_preserves_mean_reversion_exit() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let current = (200.0_f64 / 100.0_f64).ln();
+        runtime.state.relative_log_price_history = vec![current - 0.01, current + 0.01];
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(49, 3));
+        runtime.state.last_rotation_at = Some(event_time() - Duration::seconds(1));
+
+        let event = runtime.step_at(&snapshot_with_valid_row(event_time()), event_time());
+        assert!(event
+            .z_score
+            .is_some_and(|score| score.abs() < f64::EPSILON));
+        match event.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MeanReversionExit);
+            }
+            other => panic!("expected mean-reversion exit, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn flat_history_guard_preserves_max_hold_exit_without_a_z_score() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let flat_price = (200.0_f64 / 100.0_f64).ln();
+        runtime.state.relative_log_price_history = vec![flat_price; 3];
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(49, 3));
+        runtime.state.last_rotation_at =
+            Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
+
+        let event = runtime.step_at(&snapshot_with_valid_row(event_time()), event_time());
+        assert_eq!(event.z_score, None);
+        match event.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
+            }
+            other => panic!("expected max-hold exit with a flat history, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
     }
 
     #[test]
@@ -3277,7 +3408,8 @@ mod tests {
             ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::InvalidSnapshot
         ));
         assert_eq!(
-            runtime.state().last_observation_at, None,
+            runtime.state().last_observation_at,
+            None,
             "an invalid snapshot must not advance the watermark"
         );
 
