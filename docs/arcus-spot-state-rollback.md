@@ -63,7 +63,9 @@ stopped, before and after a binary-only rollback.
 `state-verify-continuity` is the post-start check. It allows normal tick/fill
 advancement but rejects:
 
-- runtime sequence, signal-history length or last-observation regression;
+- runtime sequence or last-observation regression, more than one observation
+  advance, or corruption/removal/reordering of retained signal-history samples
+  (a full window may shift by exactly one sample for the approved tick);
 - ledger `next_sequence` regression;
 - a missing/changed archived attempt or lost active attempt identity;
 - loss of the last committed execution idempotency key;

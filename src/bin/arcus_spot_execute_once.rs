@@ -756,20 +756,62 @@ fn same_execution_identity(
         && sticky_terminal_phase_preserved
 }
 
+fn require_signal_history_continuity(
+    baseline: &[f64],
+    current: &[f64],
+    sequence_advance: u64,
+    signal_window_samples: usize,
+) -> Result<()> {
+    if baseline.len() > signal_window_samples || current.len() > signal_window_samples {
+        bail!("Arcus runtime signal history exceeds the configured window");
+    }
+    match sequence_advance {
+        0 => {
+            if current != baseline {
+                bail!("Arcus runtime signal history changed without a new observation");
+            }
+        }
+        1 => {
+            // A structurally valid tick increments sequence before resolving
+            // prices, so it may leave the history untouched. If it appends a
+            // sample, every retained baseline value must remain byte-for-byte
+            // equal and in order; a full window drops exactly its oldest value.
+            if current == baseline {
+                return Ok(());
+            }
+            let expected_len = baseline.len().saturating_add(1).min(signal_window_samples);
+            let dropped = baseline
+                .len()
+                .saturating_add(1)
+                .saturating_sub(expected_len);
+            let retained = &baseline[dropped..];
+            if current.len() != expected_len || !current.starts_with(retained) {
+                bail!("Arcus runtime retained signal history changed across restart/rollback");
+            }
+        }
+        _ => {
+            bail!("Arcus runtime advanced by {sequence_advance} observations; expected at most one")
+        }
+    }
+    Ok(())
+}
+
 fn require_arcus_state_continuity(
     baseline: &ArcusSpotStateImage,
     current: &ArcusSpotStateImage,
+    signal_window_samples: usize,
 ) -> Result<()> {
     let baseline_runtime = baseline.runtime.state();
     let current_runtime = current.runtime.state();
     if current_runtime.sequence < baseline_runtime.sequence {
         bail!("Arcus runtime sequence regressed across restart/rollback");
     }
-    if current_runtime.relative_log_price_history.len()
-        < baseline_runtime.relative_log_price_history.len()
-    {
-        bail!("Arcus runtime signal history shrank across restart/rollback");
-    }
+    require_signal_history_continuity(
+        &baseline_runtime.relative_log_price_history,
+        &current_runtime.relative_log_price_history,
+        current_runtime.sequence - baseline_runtime.sequence,
+        signal_window_samples,
+    )?;
     match (
         baseline_runtime.last_observation_at,
         current_runtime.last_observation_at,
@@ -869,7 +911,7 @@ fn verify_arcus_state_backup(
             _ => bail!("live pending-plan presence changed since the backup"),
         }
     } else {
-        require_arcus_state_continuity(&baseline, &current)?;
+        require_arcus_state_continuity(&baseline, &current, config.runtime.signal_window_samples)?;
     }
     Ok(ArcusSpotStateVerificationReport {
         status: "verified",
@@ -2246,6 +2288,70 @@ runtime:
             .contains("does not match backup manifest"));
         assert_eq!(continuity.mode, "continuity");
         assert_eq!(continuity.runtime.sequence, 1);
+    }
+
+    #[test]
+    fn continuity_verification_rejects_rewritten_signal_history() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-rollback");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["relative_log_price_history"] = json!([0.125, 0.25]);
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["relative_log_price_history"] = json!([9.0, 10.0]);
+            state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("retained signal history changed"));
+    }
+
+    #[test]
+    fn continuity_verification_accepts_one_sample_full_window_shift() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let baseline_history: Vec<f64> = (0..96).map(|sample| f64::from(sample) / 100.0).collect();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["relative_log_price_history"] = json!(baseline_history.clone());
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        let mut shifted_history = baseline_history[1..].to_vec();
+        shifted_history.push(1.25);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["relative_log_price_history"] = json!(shifted_history);
+            state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+        });
+
+        let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
+
+        assert_eq!(report.mode, "continuity");
+        assert_eq!(report.runtime.sequence, 8);
     }
 
     #[test]
