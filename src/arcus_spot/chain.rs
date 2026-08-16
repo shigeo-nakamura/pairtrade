@@ -4,8 +4,8 @@ use chrono::Utc;
 use dex_connector::ArcusSpotEip2612PermitContext;
 use ethers::{
     contract::abigen,
-    providers::{Http, Middleware, Provider},
-    types::{Address, BlockId, H256, U256},
+    providers::{Http, Middleware, Provider, ProviderError, RpcError},
+    types::{Address, Bytes, TransactionRequest, H256, U256},
 };
 use serde::{Deserialize, Serialize};
 use std::{str::FromStr, sync::Arc, time::Duration};
@@ -160,6 +160,25 @@ struct RawBalanceReads {
     sell_balance: U256,
     buy_balance: U256,
     gas_balance: U256,
+}
+
+/// EIP-1898 selector used only by post-confirmation reconciliation. ethers
+/// 2.0.14's `BlockId::Hash` serializes `blockHash`, but cannot express the
+/// `requireCanonical` field, so these reads deliberately use raw JSON-RPC.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CanonicalBlockSelector {
+    block_hash: H256,
+    require_canonical: bool,
+}
+
+impl CanonicalBlockSelector {
+    fn new(block_hash: H256) -> Self {
+        Self {
+            block_hash,
+            require_canonical: true,
+        }
+    }
 }
 
 /// Distinguishes "this provider might just be unreachable right now, try
@@ -568,7 +587,7 @@ impl ArcusSpotChainClient {
         let chain_id = self.config.chain_id;
         let (raw, _provider) = self
             .try_providers(|provider| {
-                read_balances_from_provider(provider, chain_id, taker, sell_token, buy_token, None)
+                read_latest_balances_from_provider(provider, chain_id, taker, sell_token, buy_token)
             })
             .await?;
         let RawBalanceReads {
@@ -633,29 +652,23 @@ impl ArcusSpotChainClient {
                 };
                 // A single RPC URL commonly load-balances across a pool
                 // of backend nodes: the receipt lookup above and the
-                // balance reads below are separate requests that can
-                // land on *different* backends behind that one URL, so
-                // confirming the receipt exists is not, by itself, proof
-                // the balance reads will see it too. Pin every balance
-                // read to the receipt's own block *hash*, not just its
-                // height: nodes behind one URL can disagree about which
-                // block occupies a given height during a reorg, and a
-                // plain height-based BlockId would let a balance read
-                // silently resolve against a different block than the
-                // one that actually contains the confirmed transaction. A
-                // hash uniquely identifies one block regardless of height
-                // collisions across forks, so a node that reorged away
-                // from it errors instead of substituting a different one.
+                // balance reads below are separate requests that can land
+                // on different backends. EIP-1898's requireCanonical=true
+                // makes every backend reject a retained-but-orphaned block
+                // hash instead of returning stale fork state. Such an RPC
+                // error is Transient for this provider attempt, so a later
+                // configured provider can still prove and serve the same
+                // canonical block.
                 let receipt_block_hash = receipt
                     .block_hash
                     .context("Arcus confirmed-transaction receipt is missing its block hash")?;
-                read_balances_from_provider(
+                read_canonical_balances_from_provider(
                     provider,
                     chain_id,
                     taker,
                     sell_token,
                     buy_token,
-                    Some(BlockId::Hash(receipt_block_hash)),
+                    receipt_block_hash,
                 )
                 .await
             })
@@ -671,24 +684,15 @@ impl ArcusSpotChainClient {
     }
 }
 
-/// `pinned_block`: `None` reads "latest" (fine for preflight/status
-/// reads, where there is no specific transaction that must already be
-/// visible). Reconciliation passes `Some(receipt_block)` instead: a
-/// single configured RPC URL commonly load-balances across a pool of
-/// backend nodes, so confirming the *receipt* is present on whichever
-/// backend answered that specific request is not enough -- a *different*
-/// backend behind the same URL can answer the very next request and
-/// still be lagging. Reading every balance at the receipt's own block
-/// makes a backend that hasn't indexed that block error out instead of
-/// silently substituting its own, possibly-earlier "latest" (Codex P1
-/// follow-up, pairtrade#182, round 7).
-async fn read_balances_from_provider(
+/// Current-state reads used by preflight/status. Reconciliation has a
+/// separate raw-RPC path below because it must express EIP-1898's
+/// `requireCanonical`, which ethers 2.0.14's typed `BlockId` omits.
+async fn read_latest_balances_from_provider(
     provider: Arc<Provider<Http>>,
     expected_chain_id: u64,
     taker: Address,
     sell_token: Address,
     buy_token: Address,
-    pinned_block: Option<BlockId>,
 ) -> Result<RawBalanceReads, ProviderAttemptError> {
     // Sequential and fatal-on-mismatch for the same reason as in
     // `preflight`: a wrong-but-successfully-fetched chain id must never be
@@ -706,16 +710,12 @@ async fn read_balances_from_provider(
 
     let sell_contract = ArcusSpotErc20::new(sell_token, provider.clone());
     let buy_contract = ArcusSpotErc20::new(buy_token, provider.clone());
-    let mut sell_balance_call = sell_contract.balance_of(taker);
-    let mut buy_balance_call = buy_contract.balance_of(taker);
-    if let Some(block) = pinned_block {
-        sell_balance_call = sell_balance_call.block(block);
-        buy_balance_call = buy_balance_call.block(block);
-    }
+    let sell_balance_call = sell_contract.balance_of(taker);
+    let buy_balance_call = buy_contract.balance_of(taker);
     let (sell_balance_result, buy_balance_result, gas_balance_result) = tokio::join!(
         sell_balance_call.call(),
         buy_balance_call.call(),
-        provider.get_balance(taker, pinned_block),
+        provider.get_balance(taker, None),
     );
     // Same "classify, let any Fatal finding outrank a sibling's Transport
     // error" shape as preflight's balance/allowance batch (Codex P2
@@ -761,6 +761,170 @@ async fn read_balances_from_provider(
         buy_balance: expect_ok(buy_balance_outcome),
         gas_balance: expect_ok(gas_balance_outcome),
     })
+}
+
+/// Read the two ERC-20 balances and native gas balance at one exact,
+/// canonical block. Only transport failures and JSON-RPC responses saying
+/// that the requested block is unknown/non-canonical are retryable against
+/// the next configured provider. Reverts and decode failures are Fatal,
+/// matching the typed contract-call behavior used by current-state reads.
+async fn read_canonical_balances_from_provider(
+    provider: Arc<Provider<Http>>,
+    expected_chain_id: u64,
+    taker: Address,
+    sell_token: Address,
+    buy_token: Address,
+    block_hash: H256,
+) -> Result<RawBalanceReads, ProviderAttemptError> {
+    let chain_id = provider
+        .get_chainid()
+        .await
+        .context("Arcus chainId read failed")?;
+    if chain_id != U256::from(expected_chain_id) {
+        return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+            "Arcus RPC chainId changed during balance reconciliation"
+        )));
+    }
+
+    let selector = CanonicalBlockSelector::new(block_hash);
+    let sell_params = canonical_balance_of_params(sell_token, taker, selector);
+    let buy_params = canonical_balance_of_params(buy_token, taker, selector);
+    let gas_params = (taker, selector);
+    let (sell_result, buy_result, gas_result) = tokio::join!(
+        provider.request::<_, Bytes>("eth_call", sell_params),
+        provider.request::<_, Bytes>("eth_call", buy_params),
+        provider.request::<_, U256>("eth_getBalance", gas_params),
+    );
+
+    let sell_outcome = decode_canonical_erc20_balance("sell", sell_result);
+    let buy_outcome = decode_canonical_erc20_balance("buy", buy_result);
+    let gas_outcome = match gas_result {
+        Ok(value) => ContractCallOutcome::Ok(value),
+        Err(error) => classify_canonical_provider_error("gas", error),
+    };
+
+    for (label, outcome) in [
+        ("sell", &sell_outcome),
+        ("buy", &buy_outcome),
+        ("gas", &gas_outcome),
+    ] {
+        if let ContractCallOutcome::NonTransport(error) = outcome {
+            return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
+                "Arcus canonical {label} balance read returned an unexpected response: {error}"
+            )));
+        }
+    }
+
+    if [&sell_outcome, &buy_outcome, &gas_outcome]
+        .into_iter()
+        .any(|outcome| matches!(outcome, ContractCallOutcome::Transport(_)))
+    {
+        return Err(ProviderAttemptError::Transient(anyhow::anyhow!(
+            "Arcus canonical balance read failed (RPC)"
+        )));
+    }
+
+    Ok(RawBalanceReads {
+        sell_balance: expect_ok(sell_outcome),
+        buy_balance: expect_ok(buy_outcome),
+        gas_balance: expect_ok(gas_outcome),
+    })
+}
+
+fn canonical_balance_of_params(
+    token: Address,
+    owner: Address,
+    selector: CanonicalBlockSelector,
+) -> (TransactionRequest, CanonicalBlockSelector) {
+    // balanceOf(address) = 4-byte selector + one left-padded 32-byte word.
+    let mut calldata = [0_u8; 36];
+    calldata[..4].copy_from_slice(&[0x70, 0xa0, 0x82, 0x31]);
+    calldata[16..].copy_from_slice(owner.as_bytes());
+    (
+        TransactionRequest::new()
+            .to(token)
+            .data(Bytes::from(calldata.to_vec())),
+        selector,
+    )
+}
+
+fn decode_canonical_erc20_balance(
+    label: &str,
+    result: std::result::Result<Bytes, ethers::providers::ProviderError>,
+) -> ContractCallOutcome<U256> {
+    match result {
+        Ok(bytes) if bytes.len() == 32 => {
+            ContractCallOutcome::Ok(U256::from_big_endian(bytes.as_ref()))
+        }
+        Ok(_) => ContractCallOutcome::NonTransport(anyhow::anyhow!(
+            "Arcus canonical {label} balance response must be exactly one ABI uint256"
+        )),
+        Err(error) => classify_canonical_provider_error(label, error),
+    }
+}
+
+/// Classify raw EIP-1898 request failures without carrying the provider
+/// error's Display/source into logs or returned context: HTTP errors often
+/// embed credential-bearing RPC URLs. A JSON-RPC error proves that the node
+/// answered, so it is Fatal unless it specifically says that the requested
+/// block is unknown/non-canonical. Serde/result decoding failures are also
+/// Fatal because another provider must not hide an incompatible response.
+fn classify_canonical_provider_error<T>(
+    label: &str,
+    error: ProviderError,
+) -> ContractCallOutcome<T> {
+    if let Some(response) = error.as_error_response() {
+        if is_retryable_canonical_block_error(response.code, &response.message) {
+            return ContractCallOutcome::Transport(anyhow::anyhow!(
+                "Arcus canonical {label} balance block is unavailable"
+            ));
+        }
+        return ContractCallOutcome::NonTransport(anyhow::anyhow!(
+            "Arcus canonical {label} balance RPC returned a non-retryable response"
+        ));
+    }
+
+    if matches!(error, ProviderError::HTTPError(_)) {
+        return ContractCallOutcome::Transport(anyhow::anyhow!(
+            "Arcus canonical {label} balance transport failed"
+        ));
+    }
+
+    if error.as_serde_error().is_some() {
+        return ContractCallOutcome::NonTransport(anyhow::anyhow!(
+            "Arcus canonical {label} balance response could not be decoded"
+        ));
+    }
+
+    ContractCallOutcome::NonTransport(anyhow::anyhow!(
+        "Arcus canonical {label} balance provider returned an unexpected error"
+    ))
+}
+
+fn is_retryable_canonical_block_error(code: i64, message: &str) -> bool {
+    let message = message.trim().to_ascii_lowercase();
+    // EIP-1898 recommends these generic JSON-RPC errors when the requested
+    // hash is absent or fails requireCanonical. Match the code/message pair,
+    // not either component alone: -32000 is also widely used for execution
+    // reverts, which must remain Fatal.
+    if matches!(
+        (code, message.as_str()),
+        (-32001, "resource not found") | (-32000, "invalid input")
+    ) {
+        return true;
+    }
+    [
+        "not canonical",
+        "non-canonical",
+        "noncanonical",
+        "unknown block",
+        "block not found",
+        "header not found",
+        "cannot find block",
+        "could not find block",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 // Split into one function per field (rather than one combined check) so
@@ -834,6 +998,174 @@ fn parse_amount(label: &str, raw: &str) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethers::types::TransactionReceipt;
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
+
+    enum RpcReply {
+        Result(Value),
+        Error { code: i64, message: &'static str },
+        Disconnect,
+    }
+
+    struct TestRpcServer {
+        url: String,
+        requests: Arc<Mutex<Vec<Value>>>,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for TestRpcServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn spawn_rpc_server<F>(handler: F) -> TestRpcServer
+    where
+        F: Fn(&Value) -> RpcReply + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded_requests = requests.clone();
+        let handler = Arc::new(handler);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let handler = handler.clone();
+                let recorded_requests = recorded_requests.clone();
+                tokio::spawn(async move {
+                    let request = read_json_rpc_request(&mut stream).await;
+                    recorded_requests.lock().unwrap().push(request.clone());
+                    let id = request.get("id").cloned().unwrap_or(Value::Null);
+                    let response = match handler(&request) {
+                        RpcReply::Result(result) => {
+                            json!({"jsonrpc": "2.0", "id": id, "result": result})
+                        }
+                        RpcReply::Error { code, message } => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {"code": code, "message": message}
+                        }),
+                        RpcReply::Disconnect => return,
+                    };
+                    let body = serde_json::to_vec(&response).unwrap();
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                });
+            }
+        });
+        TestRpcServer {
+            url: format!("http://{address}"),
+            requests,
+            task,
+        }
+    }
+
+    async fn read_json_rpc_request(stream: &mut tokio::net::TcpStream) -> Value {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "HTTP request ended before its headers");
+            bytes.extend_from_slice(&buffer[..read]);
+        };
+        let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        while bytes.len() < header_end + content_length {
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "HTTP request ended before its JSON body");
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap()
+    }
+
+    fn rpc_config(urls: Vec<String>) -> ArcusSpotChainConfig {
+        ArcusSpotChainConfig {
+            rpc_urls: urls,
+            chain_id: 4663,
+            request_interval_ms: 1,
+        }
+    }
+
+    fn test_addresses() -> (Address, Address, Address) {
+        (
+            Address::from_str("0x7600000000000000000000000000000000000001").unwrap(),
+            Address::from_str("0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC").unwrap(),
+            Address::from_str("0x86923f96303D656E4aa86D9d42D1e57ad2023fdC").unwrap(),
+        )
+    }
+
+    fn receipt_json(block_hash: H256) -> Value {
+        let receipt = TransactionReceipt {
+            block_hash: Some(block_hash),
+            ..Default::default()
+        };
+        serde_json::to_value(receipt).unwrap()
+    }
+
+    fn abi_u256(value: u64) -> Value {
+        json!(format!("0x{value:064x}"))
+    }
+
+    fn successful_reconciliation_reply(
+        request: &Value,
+        block_hash: H256,
+        sell_token: Address,
+        buy_token: Address,
+        sell_balance: u64,
+        buy_balance: u64,
+        gas_balance: u64,
+    ) -> RpcReply {
+        match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" => {
+                let to = request["params"][0]["to"].as_str().unwrap();
+                if to.eq_ignore_ascii_case(&format!("{sell_token:#x}")) {
+                    RpcReply::Result(abi_u256(sell_balance))
+                } else if to.eq_ignore_ascii_case(&format!("{buy_token:#x}")) {
+                    RpcReply::Result(abi_u256(buy_balance))
+                } else {
+                    RpcReply::Error {
+                        code: -32602,
+                        message: "unexpected token",
+                    }
+                }
+            }
+            "eth_getBalance" => RpcReply::Result(json!(format!("0x{gas_balance:x}"))),
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        }
+    }
+
+    fn request_snapshot(server: &TestRpcServer) -> Vec<Value> {
+        server.requests.lock().unwrap().clone()
+    }
 
     fn request() -> ArcusSpotChainPreflightRequest {
         ArcusSpotChainPreflightRequest {
@@ -868,6 +1200,508 @@ mod tests {
         let values = request().validate().unwrap();
         assert!(enforce_buy_floor(U256::from(1), &values).is_err());
         assert!(enforce_gas_floor(U256::from(1), &values).is_err());
+    }
+
+    #[tokio::test]
+    async fn canonical_reconciliation_uses_exact_eip1898_read_only_params() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x11);
+        let block_hash = H256::from_low_u64_be(0x22);
+        let server = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 1_499, 500, 100,
+            )
+        })
+        .await;
+        let client = ArcusSpotChainClient::new(rpc_config(vec![server.url.clone()])).unwrap();
+
+        let balances = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap();
+
+        // Reconciliation returns exact on-chain balances; inventory floors
+        // belong to preflight and are not silently reapplied or rounded here.
+        assert_eq!(balances.sell_balance_raw, "1499");
+        assert_eq!(balances.buy_balance_raw, "500");
+        assert_eq!(balances.gas_balance_wei, "100");
+
+        let requests = request_snapshot(&server);
+        assert_eq!(requests.len(), 5);
+        assert!(requests.iter().all(|request| matches!(
+            request["method"].as_str().unwrap(),
+            "eth_chainId" | "eth_getTransactionReceipt" | "eth_call" | "eth_getBalance"
+        )));
+        assert!(!requests
+            .iter()
+            .any(|request| request["method"].as_str().unwrap().starts_with("eth_send")));
+
+        let receipt_request = requests
+            .iter()
+            .find(|request| request["method"] == "eth_getTransactionReceipt")
+            .unwrap();
+        assert_eq!(receipt_request["params"], json!([format!("{tx_hash:#x}")]));
+
+        let canonical_selector = json!({
+            "blockHash": format!("{block_hash:#x}"),
+            "requireCanonical": true
+        });
+        let mut expected_calldata = [0_u8; 36];
+        expected_calldata[..4].copy_from_slice(&[0x70, 0xa0, 0x82, 0x31]);
+        expected_calldata[16..].copy_from_slice(taker.as_bytes());
+        let expected_data = format!("0x{}", hex::encode(expected_calldata));
+        let eth_calls = requests
+            .iter()
+            .filter(|request| request["method"] == "eth_call")
+            .collect::<Vec<_>>();
+        assert_eq!(eth_calls.len(), 2);
+        for request in eth_calls {
+            assert_eq!(request["params"][1], canonical_selector);
+            assert_eq!(request["params"][0]["data"], expected_data);
+            assert_eq!(request["params"][0].as_object().unwrap().len(), 2);
+        }
+        let call_targets = requests
+            .iter()
+            .filter(|request| request["method"] == "eth_call")
+            .map(|request| request["params"][0]["to"].as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            call_targets,
+            std::collections::BTreeSet::from([
+                format!("{sell_token:#x}"),
+                format!("{buy_token:#x}")
+            ])
+        );
+        let gas_request = requests
+            .iter()
+            .find(|request| request["method"] == "eth_getBalance")
+            .unwrap();
+        assert_eq!(
+            gas_request["params"],
+            json!([format!("{taker:#x}"), canonical_selector])
+        );
+    }
+
+    #[tokio::test]
+    async fn noncanonical_block_errors_fall_back_to_the_next_provider() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x33);
+        let block_hash = H256::from_low_u64_be(0x44);
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" | "eth_getBalance" => RpcReply::Error {
+                code: -32000,
+                message: "block is not canonical",
+            },
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 4_000, 2_985, 123,
+            )
+        })
+        .await;
+        let client = ArcusSpotChainClient::new(rpc_config(vec![
+            format!("{}/v3/super-secret-api-key", first.url),
+            second.url.clone(),
+        ]))
+        .unwrap();
+
+        let balances = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap();
+        assert_eq!(balances.sell_balance_raw, "4000");
+        assert_eq!(balances.buy_balance_raw, "2985");
+        assert_eq!(request_snapshot(&first).len(), 5);
+        assert_eq!(request_snapshot(&second).len(), 5);
+    }
+
+    #[test]
+    fn canonical_block_error_taxonomy_is_narrow() {
+        assert!(is_retryable_canonical_block_error(
+            -32000,
+            "unknown block 0x1234"
+        ));
+        assert!(is_retryable_canonical_block_error(
+            -32000,
+            "header not found"
+        ));
+        assert!(is_retryable_canonical_block_error(
+            -32001,
+            "Resource not found"
+        ));
+        assert!(is_retryable_canonical_block_error(-32000, "Invalid input"));
+        assert!(!is_retryable_canonical_block_error(
+            -32000,
+            "execution reverted: token paused"
+        ));
+        assert!(!is_retryable_canonical_block_error(
+            -32602,
+            "invalid params"
+        ));
+        assert!(!is_retryable_canonical_block_error(
+            -32001,
+            "execution reverted"
+        ));
+        assert!(!is_retryable_canonical_block_error(
+            -32000,
+            "resource not found"
+        ));
+    }
+
+    #[tokio::test]
+    async fn standard_eip1898_block_errors_fall_back() {
+        for (case, code, message) in [
+            ("missing", -32001, "Resource not found"),
+            ("noncanonical", -32000, "Invalid input"),
+        ] {
+            let (taker, sell_token, buy_token) = test_addresses();
+            let tx_hash = H256::from_low_u64_be(if case == "missing" { 0x4f } else { 0x50 });
+            let block_hash = H256::from_low_u64_be(if case == "missing" { 0x51 } else { 0x52 });
+            let first =
+                spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+                    "eth_chainId" => RpcReply::Result(json!("0x1237")),
+                    "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+                    "eth_call" | "eth_getBalance" => RpcReply::Error { code, message },
+                    _ => RpcReply::Error {
+                        code: -32601,
+                        message: "unexpected method",
+                    },
+                })
+                .await;
+            let second = spawn_rpc_server(move |request| {
+                successful_reconciliation_reply(
+                    request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+                )
+            })
+            .await;
+            let client =
+                ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                    .unwrap();
+
+            let balances = client
+                .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+                .await
+                .unwrap_or_else(|error| panic!("{case} EIP-1898 error must fall back: {error:#}"));
+            assert_eq!(balances.sell_balance_raw, "4000", "case={case}");
+            assert_eq!(request_snapshot(&second).len(), 5, "case={case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_contract_revert_is_fatal_without_fallback() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x45);
+        let block_hash = H256::from_low_u64_be(0x46);
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" if request["params"][0]["to"] == format!("{sell_token:#x}") => {
+                RpcReply::Error {
+                    code: 3,
+                    message: "execution reverted: token paused",
+                }
+            }
+            "eth_call" => RpcReply::Result(abi_u256(2_985)),
+            "eth_getBalance" => RpcReply::Result(json!("0x64")),
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+            )
+        })
+        .await;
+        let client =
+            ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                .unwrap();
+
+        let error = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("non-retryable response"));
+        assert!(request_snapshot(&second).is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_rpc_result_decode_error_is_fatal_without_fallback() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x47);
+        let block_hash = H256::from_low_u64_be(0x48);
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" if request["params"][0]["to"] == format!("{sell_token:#x}") => {
+                RpcReply::Result(json!({"unexpected": "object"}))
+            }
+            "eth_call" => RpcReply::Result(abi_u256(2_985)),
+            "eth_getBalance" => RpcReply::Result(json!("0x64")),
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+            )
+        })
+        .await;
+        let client =
+            ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                .unwrap();
+
+        let error = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("could not be decoded"));
+        assert!(request_snapshot(&second).is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_gas_rpc_error_is_fatal_without_fallback() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x4b);
+        let block_hash = H256::from_low_u64_be(0x4c);
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" if request["params"][0]["to"] == format!("{sell_token:#x}") => {
+                RpcReply::Result(abi_u256(4_000))
+            }
+            "eth_call" => RpcReply::Result(abi_u256(2_985)),
+            "eth_getBalance" => RpcReply::Error {
+                code: -32602,
+                message: "invalid balance params",
+            },
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+            )
+        })
+        .await;
+        let client =
+            ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                .unwrap();
+
+        let error = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("canonical gas balance"));
+        assert!(format!("{error:#}").contains("non-retryable response"));
+        assert!(request_snapshot(&second).is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_gas_decode_error_is_fatal_without_fallback() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x4d);
+        let block_hash = H256::from_low_u64_be(0x4e);
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" if request["params"][0]["to"] == format!("{sell_token:#x}") => {
+                RpcReply::Result(abi_u256(4_000))
+            }
+            "eth_call" => RpcReply::Result(abi_u256(2_985)),
+            "eth_getBalance" => RpcReply::Result(json!({"unexpected": "object"})),
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+            )
+        })
+        .await;
+        let client =
+            ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                .unwrap();
+
+        let error = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("canonical gas balance"));
+        assert!(format!("{error:#}").contains("could not be decoded"));
+        assert!(request_snapshot(&second).is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_http_transport_failure_falls_back() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x49);
+        let block_hash = H256::from_low_u64_be(0x4a);
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" => RpcReply::Disconnect,
+            "eth_getBalance" => RpcReply::Result(json!("0x64")),
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+            )
+        })
+        .await;
+        let client =
+            ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                .unwrap();
+
+        let balances = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap();
+        assert_eq!(balances.sell_balance_raw, "4000");
+        assert_eq!(request_snapshot(&second).len(), 5);
+    }
+
+    #[tokio::test]
+    async fn all_noncanonical_errors_are_retryable_and_redact_rpc_urls() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x55);
+        let block_hash = H256::from_low_u64_be(0x66);
+        let server = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" | "eth_getBalance" => RpcReply::Error {
+                code: -32000,
+                message: "orphaned block is not canonical",
+            },
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let client = ArcusSpotChainClient::new(rpc_config(vec![format!(
+            "{}/private/super-secret-token?key=also-secret",
+            server.url
+        )]))
+        .unwrap();
+
+        let error = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("canonical balance read failed (RPC)"));
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(!rendered.contains("also-secret"));
+    }
+
+    #[tokio::test]
+    async fn malformed_canonical_balance_is_fatal_without_fallback() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x77);
+        let block_hash = H256::from_low_u64_be(0x88);
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" if request["params"][0]["to"] == format!("{sell_token:#x}") => {
+                RpcReply::Result(json!("0x01"))
+            }
+            "eth_call" => RpcReply::Result(abi_u256(2_985)),
+            "eth_getBalance" => RpcReply::Result(json!("0x64")),
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+            )
+        })
+        .await;
+        let client =
+            ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                .unwrap();
+
+        let error = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("exactly one ABI uint256"));
+        assert!(request_snapshot(&second).is_empty());
+    }
+
+    #[tokio::test]
+    async fn preflight_token_floor_violation_remains_fatal_without_fallback() {
+        let (_taker, sell_token, buy_token) = test_addresses();
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getBalance" => RpcReply::Result(json!("0x64")),
+            "eth_call" => {
+                let to = request["params"][0]["to"].as_str().unwrap();
+                let data = request["params"][0]["data"].as_str().unwrap();
+                if data.starts_with("0xdd62ed3e") {
+                    RpcReply::Result(abi_u256(1_000))
+                } else if to.eq_ignore_ascii_case(&format!("{sell_token:#x}")) {
+                    RpcReply::Result(abi_u256(1_499))
+                } else if to.eq_ignore_ascii_case(&format!("{buy_token:#x}")) {
+                    RpcReply::Result(abi_u256(500))
+                } else {
+                    RpcReply::Error {
+                        code: -32602,
+                        message: "unexpected token",
+                    }
+                }
+            }
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request,
+                H256::from_low_u64_be(0x99),
+                sell_token,
+                buy_token,
+                2_000,
+                500,
+                100,
+            )
+        })
+        .await;
+        let client =
+            ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                .unwrap();
+
+        let error = client.preflight(&request()).await.unwrap_err();
+        assert!(error.to_string().contains("below floor"));
+        assert!(request_snapshot(&second).is_empty());
     }
 
     #[test]
