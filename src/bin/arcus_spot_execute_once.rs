@@ -812,6 +812,16 @@ fn require_arcus_state_continuity(
         current_runtime.sequence - baseline_runtime.sequence,
         signal_window_samples,
     )?;
+    if baseline_runtime.initial_equity_usd.is_some()
+        && current_runtime.initial_equity_usd != baseline_runtime.initial_equity_usd
+    {
+        bail!("Arcus runtime cumulative equity baseline changed across restart/rollback");
+    }
+    if baseline_runtime.risk_halt.is_some()
+        && current_runtime.risk_halt != baseline_runtime.risk_halt
+    {
+        bail!("Arcus runtime lost or changed its sticky risk halt across restart/rollback");
+    }
     match (
         baseline_runtime.last_observation_at,
         current_runtime.last_observation_at,
@@ -2352,6 +2362,64 @@ runtime:
 
         assert_eq!(report.mode, "continuity");
         assert_eq!(report.runtime.sequence, 8);
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_cumulative_equity_baseline_reset() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-rollback");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["initial_equity_usd"] = json!("300");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["initial_equity_usd"] = serde_json::Value::Null;
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cumulative equity baseline changed"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_sticky_risk_halt_reset() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-rollback");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["risk_halt"] = json!({
+                "kind": "daily_loss",
+                "engaged_at": "2026-08-16T12:00:00Z",
+                "equity_usd": "297",
+                "loss_usd": "3",
+                "limit_usd": "2",
+            });
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["risk_halt"] = serde_json::Value::Null;
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("sticky risk halt"));
     }
 
     #[test]
