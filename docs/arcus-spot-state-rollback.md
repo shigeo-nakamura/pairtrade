@@ -254,7 +254,28 @@ binary SHA before continuing.
    the preserved pending plan. Never replace the ledger/checkpoint from the
    backup to make the active attempt disappear.
 
-3. When the tick completes with no unresolved attempt, prove continuity:
+3. With no unresolved attempt, require the one-shot itself to have completed
+   successfully before accepting any continuity result. Read the two values
+   explicitly and also reject systemd's failed state:
+
+   ```bash
+   SERVICE_RESULT_AFTER="$(sudo systemctl show arcus-spot-live-tick.service -p Result --value)"
+   SERVICE_STATUS_AFTER="$(sudo systemctl show arcus-spot-live-tick.service -p ExecMainStatus --value)"
+   if [ "$SERVICE_RESULT_AFTER" != "success" ] || [ "$SERVICE_STATUS_AFTER" != "0" ]; then
+     echo "one-tick acceptance did not complete successfully; keep timer disabled" >&2
+     exit 1
+   fi
+   if sudo systemctl is-failed --quiet arcus-spot-live-tick.service; then
+     echo "one-tick acceptance unit is failed; keep timer disabled" >&2
+     exit 1
+   fi
+   ```
+
+   A failed candidate that made no state transition is not an accepted
+   rollback; do not use continuity's valid zero-advance result to restore its
+   timer.
+
+4. When the tick succeeds with no unresolved attempt, prove continuity:
 
    ```bash
    sudo /usr/local/share/arcus-spot-execute-once/releases/<known-good-verifier-release>/arcus-spot-execute-once state-verify-continuity \
@@ -262,7 +283,7 @@ binary SHA before continuing.
      /var/lib/debot-arcus/spot-state-backups/<YYYYMMDDTHHMMSSZ>-pre-rollback
    ```
 
-4. Only after the continuity report is saved may the timer be restored. Use
+5. Only after the continuity report is saved may the timer be restored. Use
    the two values recorded before the stop; enabled state and active state are
    independent. Apply exactly one row from this table:
 

@@ -1430,6 +1430,10 @@ fn require_acceptance_ledger_and_position_continuity(
             if current.pending_plan_bytes != baseline.pending_plan_bytes {
                 bail!("Arcus pending recovery plan changed without an acceptance attempt");
             }
+            if runtime_sequence_advance == 1 {
+                let signal_sample = acceptance_signal_sample(baseline_runtime, current_runtime)?;
+                acceptance_reference_prices(baseline_runtime, current_runtime, signal_sample)?;
+            }
             if !position_state_matches(baseline_runtime, current_runtime) {
                 bail!("Arcus position state changed without a reconciled acceptance attempt");
             }
@@ -3162,6 +3166,12 @@ runtime:
             state["sequence"] = json!(1);
             state["relative_log_price_history"] = json!([0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+            state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            state["initial_equity_usd"] = json!("98.2399008827070608");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["last_equity_usd"] = json!("98.2399008827070608");
         });
 
         let exact_error = verify_arcus_state_backup(&config, &backup_dir, true).unwrap_err();
@@ -3230,6 +3240,12 @@ runtime:
             state["sequence"] = json!(8);
             state["relative_log_price_history"] = json!(shifted_history);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+            state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_token_b_reference_price_usd"] = json!("57.300959372038022");
+            state["initial_equity_usd"] = json!("79.16815349952608352");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("79.16815349952608352");
+            state["last_equity_usd"] = json!("79.16815349952608352");
         });
 
         let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
@@ -3319,19 +3335,23 @@ runtime:
         persist_initial_operator_state(&config);
         rewrite_checkpoint_state(&runtime_path, |state| {
             state["sequence"] = json!(7);
+            state["relative_log_price_history"] = json!([0.0]);
             state["last_observation_at"] = json!("2026-08-15T23:59:00Z");
-            state["initial_equity_usd"] = json!("300");
+            state["initial_equity_usd"] = json!("98.2399008827070608");
             state["daily_baseline_day"] = json!("2026-08-15");
-            state["daily_baseline_equity_usd"] = json!("300");
-            state["last_equity_usd"] = json!("299");
+            state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["last_equity_usd"] = json!("98.2399008827070608");
         });
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         rewrite_checkpoint_state(&runtime_path, |state| {
             state["sequence"] = json!(8);
+            state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T00:00:01Z");
+            state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             state["daily_baseline_day"] = json!("2026-08-16");
-            state["daily_baseline_equity_usd"] = json!("298");
-            state["last_equity_usd"] = json!("298");
+            state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["last_equity_usd"] = json!("98.2399008827070608");
         });
 
         let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
@@ -3382,6 +3402,7 @@ runtime:
         persist_initial_operator_state(&config);
         rewrite_checkpoint_state(&runtime_path, |state| {
             state["sequence"] = json!(7);
+            state["relative_log_price_history"] = json!([0.0]);
             state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
             state["initial_equity_usd"] = json!("300");
             state["daily_baseline_day"] = json!("2026-08-16");
@@ -3391,8 +3412,11 @@ runtime:
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         rewrite_checkpoint_state(&runtime_path, |state| {
             state["sequence"] = json!(8);
+            state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
-            state["last_equity_usd"] = json!("297");
+            state["last_token_a_reference_price_usd"] = json!("600");
+            state["last_token_b_reference_price_usd"] = json!("529.49814155075739");
+            state["last_equity_usd"] = json!("294.7197026481211824");
         });
 
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
@@ -3405,13 +3429,49 @@ runtime:
             state["risk_halt"] = json!({
                 "kind": "daily_loss",
                 "engaged_at": "2026-08-16T12:01:01Z",
-                "equity_usd": "297",
-                "loss_usd": "3",
+                "equity_usd": "294.7197026481211824",
+                "loss_usd": "5.2802973518788176",
                 "limit_usd": "2",
             });
         });
         let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
         assert_eq!(report.mode, "continuity");
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_false_equity_mark_without_a_swap() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["relative_log_price_history"] = json!([0.0]);
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+            state["initial_equity_usd"] = json!("90");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("90");
+            state["last_equity_usd"] = json!("90");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["relative_log_price_history"] = json!([0.0, 0.125]);
+            state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+            state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            state["last_equity_usd"] = json!("95");
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("accepted equity mark"));
     }
 
     #[test]
