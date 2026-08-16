@@ -168,6 +168,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -278,9 +280,9 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Build debot in AL2023 (native arm64)
         id: build_debot
@@ -320,7 +322,7 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('debot/Cargo.lock') }}
 
       - name: Verify dynamic links in AL2023
         run: |

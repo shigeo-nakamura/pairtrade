@@ -79,10 +79,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Run Arcus Spot executor tests
         working-directory: debot
@@ -136,10 +136,10 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ steps.source_ids.outputs.dex_connector_sha }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Build Arcus Spot executor in AL2023 (native arm64)
         run: |
