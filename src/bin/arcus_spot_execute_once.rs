@@ -1032,6 +1032,11 @@ fn reconciled_fill_for_continuity(
     {
         bail!("Arcus acceptance attempt does not match the configured chain/taker");
     }
+    if !plan.venue.eq_ignore_ascii_case("arcus")
+        || !attempt.intent.venue.eq_ignore_ascii_case("arcus")
+    {
+        bail!("Arcus acceptance requires venue=arcus in both plan and intent");
+    }
     let plan_config_digest = approval_digest(config, plan)?;
     if attempt.intent.plan_config_digest != plan_config_digest
         || !attempt.intent.venue.eq_ignore_ascii_case(&plan.venue)
@@ -3694,6 +3699,25 @@ runtime:
         .unwrap_err();
 
         assert!(error.to_string().contains("must not be negative"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_non_arcus_plan_and_intent() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let mut plan = rotation_plan("entry_signal");
+        plan.venue = "other".to_string();
+        let attempt = reconciled_entry_attempt(&config, &plan, 1);
+
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+
+        assert!(error.to_string().contains("venue=arcus"));
     }
 
     #[test]

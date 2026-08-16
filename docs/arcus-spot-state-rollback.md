@@ -117,11 +117,18 @@ in UTC.
    If either condition is false, wait for normal reconciliation/exit. Do not
    delete or edit a checkpoint, ledger or pending plan to force the gate.
 
-3. Identify two explicit immutable releases: the currently installed release
-   and the rollback candidate. Compare each `manifest.json` with its binary and
-   checksum. Do not select by `ls | tail`, mtime, a glob, or an unresolved
-   symlink. The rollback candidate must support the on-disk checkpoint schema
-   1 and ledger schema 2; otherwise use a forward fix.
+3. Identify three explicit immutable releases: the currently installed
+   release, the rollback candidate, and a known-good verifier release. The
+   verifier may be the current release, but it must be distinct from the
+   rollback candidate and must contain the current `state-backup`,
+   `state-verify-exact`, and `state-verify-continuity` checks. Compare each
+   `manifest.json` with its binary and checksum and record the verifier's fully
+   resolved release directory outside the host. Do not select by `ls | tail`,
+   mtime, a glob, or an unresolved symlink. The rollback candidate must support
+   the on-disk checkpoint schema 1 and ledger schema 2; otherwise use a forward
+   fix. Every state backup or verification below runs the manifest-verified
+   verifier binary from its immutable release directory, never the mutable
+   `/usr/local/bin` path or the rollback candidate under test.
 
 ## Approved stop / exact backup / binary rollback
 
@@ -177,10 +184,10 @@ authorized by merely merging this code or by a read-only audit.
 
    ```bash
    sudo install -d -o root -g root -m 0700 /var/lib/debot-arcus/spot-state-backups
-   sudo /usr/local/bin/arcus-spot-execute-once state-backup \
+   sudo /usr/local/share/arcus-spot-execute-once/releases/<known-good-verifier-release>/arcus-spot-execute-once state-backup \
      /etc/arcus-spot/config.yaml \
      /var/lib/debot-arcus/spot-state-backups/<YYYYMMDDTHHMMSSZ>-pre-rollback
-   sudo /usr/local/bin/arcus-spot-execute-once state-verify-exact \
+   sudo /usr/local/share/arcus-spot-execute-once/releases/<known-good-verifier-release>/arcus-spot-execute-once state-verify-exact \
      /etc/arcus-spot/config.yaml \
      /var/lib/debot-arcus/spot-state-backups/<YYYYMMDDTHHMMSSZ>-pre-rollback
    ```
@@ -214,16 +221,14 @@ authorized by merely merging this code or by a read-only audit.
 5. While the timer is still stopped, prove the rollback did not touch state:
 
    ```bash
-   sudo /usr/local/bin/arcus-spot-execute-once state-verify-exact \
+   sudo /usr/local/share/arcus-spot-execute-once/releases/<known-good-verifier-release>/arcus-spot-execute-once state-verify-exact \
      /etc/arcus-spot/config.yaml \
      /var/lib/debot-arcus/spot-state-backups/<YYYYMMDDTHHMMSSZ>-pre-rollback
    ```
 
-   This command must be supported by the selected rollback release. If a
-   legacy release predates the command, invoke the state-capable, known-good
-   current binary directly from its explicit immutable release directory for
-   this verification; do not start the legacy binary until the exact check
-   passes. Verify that diagnostic binary against its own manifest first.
+   Do not substitute `/usr/local/bin/arcus-spot-execute-once` here: it now
+   names the rollback candidate and cannot be trusted to certify itself. Do
+   not start the candidate until this independent exact check passes.
 
 At this point binary rollback and byte-exact state preservation are proven
 without invoking the executor. It is safe to stop here and leave the timer
@@ -252,7 +257,7 @@ binary SHA before continuing.
 3. When the tick completes with no unresolved attempt, prove continuity:
 
    ```bash
-   sudo /usr/local/bin/arcus-spot-execute-once state-verify-continuity \
+   sudo /usr/local/share/arcus-spot-execute-once/releases/<known-good-verifier-release>/arcus-spot-execute-once state-verify-continuity \
      /etc/arcus-spot/config.yaml \
      /var/lib/debot-arcus/spot-state-backups/<YYYYMMDDTHHMMSSZ>-pre-rollback
    ```
