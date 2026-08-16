@@ -1,0 +1,237 @@
+name: Deploy Arcus Spot executor
+
+# bot-strategy#785: manual-only aarch64 build + immutable S3 release + atomic
+# SSM install. This workflow never changes service/timer state and never
+# invokes the executable it installs.
+on:
+  workflow_dispatch:
+    inputs:
+      dex_connector_ref:
+        description: "Dex-connector ref/tag (default: the pinned env ref)"
+        required: false
+        type: string
+
+concurrency:
+  group: arcus-spot-executor-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+  RUST_TOOLCHAIN: 1.94.1
+  DEX_CONNECTOR_REF: v4.7.10
+  ARCUS_S3_PREFIX: arcus-spot-execute-once
+  ARCUS_INSTANCE_ID: i-0cb942c2950be020f
+  INSTALL_PATH: /usr/local/bin/arcus-spot-execute-once
+  PROVENANCE_DIR: /usr/local/share/arcus-spot-execute-once
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    timeout-minutes: 300
+    environment: debot
+    steps:
+      - name: Checkout pairtrade
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Checkout pinned dex-connector
+        uses: actions/checkout@v5
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Record source identities
+        id: source_ids
+        run: |
+          PAIRTRADE_SHA=$(git -C debot rev-parse HEAD)
+          DEX_CONNECTOR_SHA=$(git -C dex-connector rev-parse HEAD)
+          test "${PAIRTRADE_SHA}" = "${GITHUB_SHA}"
+          echo "pairtrade_sha=${PAIRTRADE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "dex_connector_sha=${DEX_CONNECTOR_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Resolve build image
+        id: build_image
+        run: |
+          docker pull --platform linux/arm64 "${AL2023_IMAGE}"
+          IMAGE_REF=$(docker image inspect --format '{{index .RepoDigests 0}}' "${AL2023_IMAGE}")
+          test -n "${IMAGE_REF}"
+          echo "image_ref=${IMAGE_REF}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache cargo (linux/arm64, Arcus live)
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            debot/target
+          key: ${{ runner.os }}-cargo-arm64-arcus-live-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ hashFiles('debot/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arm64-arcus-live-${{ steps.source_ids.outputs.dex_connector_sha }}-
+            ${{ runner.os }}-cargo-arm64-arcus-live-
+
+      - name: Test and build Arcus Spot executor (linux/arm64)
+        run: |
+          mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/workspace/.cache/cargo \
+            -e RUSTUP_HOME=/workspace/.cache/rustup \
+            -e CARGO_INCREMENTAL=0 \
+            "${{ steps.build_image.outputs.image_ref }}" \
+            /bin/bash -lc "set -euo pipefail; \
+              dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; \
+              if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then \
+                curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN}; \
+              else \
+                /workspace/.cache/cargo/bin/rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal; \
+                /workspace/.cache/cargo/bin/rustup default ${RUST_TOOLCHAIN}; \
+              fi; \
+              export PATH=/workspace/.cache/cargo/bin:\$PATH; \
+              rustc -V; cargo -V; cd debot; \
+              cargo test --release --locked --no-default-features --features arcus-spot-live --lib arcus_spot; \
+              cargo test --release --locked --no-default-features --features arcus-spot-live --bin arcus-spot-execute-once; \
+              cargo build --release --locked --no-default-features --features arcus-spot-live --bin arcus-spot-execute-once; \
+              chown -R \${HOST_UID}:\${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+
+      - name: Package immutable release
+        id: package
+        env:
+          PAIRTRADE_SHA: ${{ steps.source_ids.outputs.pairtrade_sha }}
+          DEX_CONNECTOR_SHA: ${{ steps.source_ids.outputs.dex_connector_sha }}
+          DEX_CONNECTOR_INPUT_REF: ${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+          BUILD_IMAGE_REF: ${{ steps.build_image.outputs.image_ref }}
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
+          BINARY=debot/target/release/arcus-spot-execute-once
+          file "${BINARY}"
+          file "${BINARY}" | grep -q 'ARM aarch64'
+          mkdir -p dist
+          cp "${BINARY}" dist/arcus-spot-execute-once
+          chmod 755 dist/arcus-spot-execute-once
+          BINARY_SHA256=$(sha256sum dist/arcus-spot-execute-once | cut -d ' ' -f1)
+          CARGO_LOCK_SHA256=$(sha256sum debot/Cargo.lock | cut -d ' ' -f1)
+          (cd dist && sha256sum arcus-spot-execute-once > arcus-spot-execute-once.sha256)
+          jq -n \
+            --arg pairtrade_sha "${PAIRTRADE_SHA}" \
+            --arg dex_connector_ref "${DEX_CONNECTOR_INPUT_REF}" \
+            --arg dex_connector_sha "${DEX_CONNECTOR_SHA}" \
+            --arg cargo_lock_sha256 "${CARGO_LOCK_SHA256}" \
+            --arg binary_sha256 "${BINARY_SHA256}" \
+            --arg rust_toolchain "${RUST_TOOLCHAIN}" \
+            --arg build_image "${BUILD_IMAGE_REF}" \
+            --arg github_run_id "${GITHUB_RUN_ID}" \
+            --arg github_run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            '{schema_version: 1, artifact: "arcus-spot-execute-once", architecture: "aarch64", pairtrade_sha: $pairtrade_sha, dex_connector_ref: $dex_connector_ref, dex_connector_sha: $dex_connector_sha, cargo_lock_sha256: $cargo_lock_sha256, binary_sha256: $binary_sha256, rust_toolchain: $rust_toolchain, build_image: $build_image, github_run_id: $github_run_id, github_run_attempt: $github_run_attempt}' \
+            > dist/manifest.json
+          RELEASE_ID="${BINARY_SHA256}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RELEASE_KEY="${ARCUS_S3_PREFIX}/releases/${PAIRTRADE_SHA}/${DEX_CONNECTOR_SHA}/${BINARY_SHA256}/runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "binary_sha256=${BINARY_SHA256}" >> "${GITHUB_OUTPUT}"
+          echo "release_id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
+          echo "release_key=${RELEASE_KEY}" >> "${GITHUB_OUTPUT}"
+          jq . dist/manifest.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload immutable release to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          RELEASE_KEY: ${{ steps.package.outputs.release_key }}
+        run: |
+          aws s3 cp --only-show-errors dist/arcus-spot-execute-once "s3://${S3_BUCKET}/${RELEASE_KEY}/arcus-spot-execute-once"
+          aws s3 cp --only-show-errors dist/arcus-spot-execute-once.sha256 "s3://${S3_BUCKET}/${RELEASE_KEY}/arcus-spot-execute-once.sha256"
+          aws s3 cp --only-show-errors dist/manifest.json "s3://${S3_BUCKET}/${RELEASE_KEY}/manifest.json"
+
+      - name: Install via SSM (no start, restart, or invocation)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          RELEASE_KEY: ${{ steps.package.outputs.release_key }}
+          RELEASE_ID: ${{ steps.package.outputs.release_id }}
+          BINARY_SHA256: ${{ steps.package.outputs.binary_sha256 }}
+        run: |
+          cat > /tmp/ssm-params.json <<'JSON'
+          {
+            "commands": [
+              "set -eu",
+              "test \"$(uname -m)\" = aarch64",
+              "id -u arcus >/dev/null 2>&1",
+              "ARCUS_STAGE=$(mktemp -d /tmp/arcus-spot-execute-once.XXXXXX)",
+              "ARCUS_INSTALL_STAGE=__INSTALL_PATH__.new",
+              "ARCUS_RELEASE_STAGE=__PROVENANCE_DIR__/releases/.__RELEASE_ID__.new",
+              "ARCUS_RELEASE_DIR=__PROVENANCE_DIR__/releases/__RELEASE_ID__",
+              "trap 'rm -rf \"$ARCUS_STAGE\" || true; sudo rm -f \"$ARCUS_INSTALL_STAGE\" || true; if [ -n \"$ARCUS_RELEASE_STAGE\" ]; then sudo rm -rf \"$ARCUS_RELEASE_STAGE\" || true; fi' EXIT",
+              "aws s3 cp --only-show-errors s3://__S3_BUCKET__/__RELEASE_KEY__/arcus-spot-execute-once \"$ARCUS_STAGE/arcus-spot-execute-once\"",
+              "aws s3 cp --only-show-errors s3://__S3_BUCKET__/__RELEASE_KEY__/arcus-spot-execute-once.sha256 \"$ARCUS_STAGE/arcus-spot-execute-once.sha256\"",
+              "aws s3 cp --only-show-errors s3://__S3_BUCKET__/__RELEASE_KEY__/manifest.json \"$ARCUS_STAGE/manifest.json\"",
+              "(cd \"$ARCUS_STAGE\" && sha256sum -c arcus-spot-execute-once.sha256)",
+              "echo \"__BINARY_SHA256__  $ARCUS_STAGE/arcus-spot-execute-once\" | sha256sum -c -",
+              "sudo install -o root -g root -m 0755 \"$ARCUS_STAGE/arcus-spot-execute-once\" \"$ARCUS_INSTALL_STAGE\"",
+              "echo \"__BINARY_SHA256__  $ARCUS_INSTALL_STAGE\" | sudo sha256sum -c -",
+              "test \"$(stat -c %U:%G:%a \"$ARCUS_INSTALL_STAGE\")\" = root:root:755",
+              "sudo install -d -o root -g root -m 0755 __PROVENANCE_DIR__/releases",
+              "test ! -e \"$ARCUS_RELEASE_STAGE\"",
+              "test ! -e \"$ARCUS_RELEASE_DIR\"",
+              "sudo install -d -o root -g root -m 0755 \"$ARCUS_RELEASE_STAGE\"",
+              "sudo install -o root -g root -m 0755 \"$ARCUS_STAGE/arcus-spot-execute-once\" \"$ARCUS_RELEASE_STAGE/arcus-spot-execute-once\"",
+              "sudo install -o root -g root -m 0644 \"$ARCUS_STAGE/manifest.json\" \"$ARCUS_RELEASE_STAGE/manifest.json\"",
+              "sudo install -o root -g root -m 0644 \"$ARCUS_STAGE/arcus-spot-execute-once.sha256\" \"$ARCUS_RELEASE_STAGE/arcus-spot-execute-once.sha256\"",
+              "(cd \"$ARCUS_RELEASE_STAGE\" && sha256sum -c arcus-spot-execute-once.sha256)",
+              "test \"$(stat -c %U:%G:%a \"$ARCUS_RELEASE_STAGE/arcus-spot-execute-once\")\" = root:root:755",
+              "sudo mv \"$ARCUS_RELEASE_STAGE\" \"$ARCUS_RELEASE_DIR\"",
+              "ARCUS_RELEASE_STAGE=",
+              "sudo mv -f \"$ARCUS_INSTALL_STAGE\" __INSTALL_PATH__"
+            ],
+            "executionTimeout": ["600"]
+          }
+          JSON
+          sed -i "s|__S3_BUCKET__|${S3_BUCKET}|g; s|__RELEASE_KEY__|${RELEASE_KEY}|g; s|__RELEASE_ID__|${RELEASE_ID}|g; s|__BINARY_SHA256__|${BINARY_SHA256}|g; s|__INSTALL_PATH__|${INSTALL_PATH}|g; s|__PROVENANCE_DIR__|${PROVENANCE_DIR}|g" /tmp/ssm-params.json
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${ARCUS_INSTANCE_ID}" \
+            --document-name AWS-RunShellScript \
+            --comment "Install Arcus Spot executor; no invocation (bot-strategy#785)" \
+            --parameters file:///tmp/ssm-params.json \
+            --timeout-seconds 120 \
+            --query Command.CommandId --output text)
+          deadline=$(( $(date +%s) + 900 ))
+          while :; do
+            STATUS=$(aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --query Status --output text 2>/dev/null || echo Pending)
+            case "${STATUS}" in
+              Success)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --output text
+                exit 0 ;;
+              Cancelled|Cancelling|TimedOut|Failed)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --output text || true
+                echo "##[error]SSM install finished with status ${STATUS}"
+                exit 1 ;;
+              Pending|InProgress|Delayed) ;;
+              *) echo "Unexpected SSM status: ${STATUS}" ;;
+            esac
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${ARCUS_INSTANCE_ID}" --output text || true
+              echo "##[error]SSM install polling timed out (last status: ${STATUS})"
+              exit 1
+            fi
+            sleep 15
+          done
