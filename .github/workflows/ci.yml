@@ -242,14 +242,17 @@ jobs:
         id: build_image
         run: |
           docker pull --platform linux/arm64 "${AL2023_IMAGE}"
-          docker image inspect --format='AL2023_IMAGE_RESOLVED={{index .RepoDigests 0}}' "${AL2023_IMAGE}" >> "${GITHUB_ENV}"
+          AL2023_IMAGE_RESOLVED=$(docker image inspect --format="{{index .RepoDigests 0}}" "${AL2023_IMAGE}")
+          echo "AL2023_IMAGE_RESOLVED=${AL2023_IMAGE_RESOLVED}" >> "${GITHUB_ENV}"
+          BUILD_IMAGE_CACHE_KEY=$(printf "%s" "${AL2023_IMAGE_RESOLVED}" | sha256sum)
+          echo "cache_key=${BUILD_IMAGE_CACHE_KEY%% *}" >> "${GITHUB_OUTPUT}"
 
       - name: Cache libsigner (native arm64)
         id: cache_libsigner
         uses: actions/cache@v5
         with:
           path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('lighter-go/go.sum') }}
 
       - name: Build libsigner in AL2023 (native arm64)
         if: steps.cache_libsigner.outputs.cache-hit != 'true'
@@ -268,7 +271,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('lighter-go/go.sum') }}
 
       - name: Cache cargo (native arm64)
         id: cache_cargo
@@ -280,9 +283,9 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-
 
       - name: Build debot in AL2023 (native arm64)
         id: build_debot
@@ -322,7 +325,7 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('debot/Cargo.lock') }}
 
       - name: Verify dynamic links in AL2023
         run: |
