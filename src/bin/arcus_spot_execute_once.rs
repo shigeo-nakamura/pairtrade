@@ -1196,6 +1196,16 @@ fn acceptance_signal_sample(
         .context("Arcus acceptance attempt has no signal sample")
 }
 
+fn require_acceptance_quote_belongs_to_observation(
+    plan: &ArcusSpotRotationPlan,
+    accepted_observation_at: DateTime<Utc>,
+) -> Result<()> {
+    if plan.quote_received_at > accepted_observation_at {
+        bail!("Arcus acceptance quote was received after its accepted observation");
+    }
+    Ok(())
+}
+
 fn acceptance_reference_prices(
     baseline: &ArcusSpotRuntimeState,
     current: &ArcusSpotRuntimeState,
@@ -1493,6 +1503,7 @@ fn require_acceptance_ledger_and_position_continuity(
                 .context("Arcus reconciled acceptance attempt has no pending runtime plan")?;
             let plan: ArcusSpotRotationPlan = serde_json::from_slice(plan_bytes)
                 .context("invalid Arcus acceptance pending runtime plan")?;
+            require_acceptance_quote_belongs_to_observation(&plan, accepted_observation_at)?;
             let signal_sample = acceptance_signal_sample(baseline_runtime, current_runtime)?;
             let signal_runtime =
                 ArcusSpotRuntime::from_state(config.runtime.clone(), baseline_runtime.clone())
@@ -3931,6 +3942,22 @@ runtime:
         let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
 
         assert!(error.to_string().contains("strategy planning"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_quote_after_the_accepted_observation() {
+        let mut plan = rotation_plan("entry_signal");
+        plan.quote_received_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:02Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let accepted_observation_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let error = require_acceptance_quote_belongs_to_observation(&plan, accepted_observation_at)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("after its accepted observation"));
     }
 
     #[test]

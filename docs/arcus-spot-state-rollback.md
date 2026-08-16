@@ -19,7 +19,7 @@ instead the manifest binds its canonical SHA-256 digest.
 
 | Artifact | Current path | Format / role |
 |---|---|---|
-| Runtime checkpoint | `/var/lib/debot-arcus/spot-execute-once/runtime_state.json` | schema 1; exact runtime config plus signal history, inventory, regime, risk state and last committed execution key |
+| Runtime checkpoint | `/var/lib/debot-arcus/spot-execute-once/runtime_state.json` | schema 1; exact runtime config plus signal history, last token A/B reference prices, inventory, regime, risk state and last committed execution key |
 | Execution ledger | `/var/lib/debot-arcus/spot-execute-once/ledger.json` | schema 2; monotonic attempt sequence, immutable archive and any active recovery state |
 | Recovery plan | `/var/lib/debot-arcus/spot-execute-once/live-tick-pending-plan.json` | optional; exact plan needed by `auto-resume` after an interrupted live-tick submission |
 | Namespace lock | `/var/lib/debot-arcus/spot-execute-once/.runtime_state.json.lock` | mode-0600 process lock shared by live-tick, execute/resume, proposer and state tooling |
@@ -125,8 +125,15 @@ in UTC.
    `manifest.json` with its binary and checksum and record the verifier's fully
    resolved release directory outside the host. Do not select by `ls | tail`,
    mtime, a glob, or an unresolved symlink. The rollback candidate must support
-   the on-disk checkpoint schema 1 and ledger schema 2; otherwise use a forward
-   fix. Every state backup or verification below runs the manifest-verified
+   the on-disk checkpoint schema 1 and ledger schema 2 **and must deserialize
+   and re-persist both `last_token_a_reference_price_usd` and
+   `last_token_b_reference_price_usd` without dropping them**. Schema-number
+   compatibility alone is insufficient: an older schema-1 binary that predates
+   those fields is not an eligible live rollback candidate because continuity
+   cannot independently verify its accepted price/equity/notional state. If
+   the candidate release's source/provenance cannot demonstrate that
+   capability, use a forward fix. Every state backup or verification below
+   runs the manifest-verified
    verifier binary from its immutable release directory, never the mutable
    `/usr/local/bin` path or the rollback candidate under test.
 
@@ -338,7 +345,8 @@ instance must not be restarted.
   explicit approval, current on-chain balance reconciliation and a new backup
   of the damaged state before replacement.
 - Binary rollback must be forward-compatible with checkpoint schema 1 and
-  ledger schema 2. If compatibility is uncertain, forward-fix the binary.
+  ledger schema 2 and must preserve both checkpointed reference-price fields.
+  If any part of that capability is uncertain, forward-fix the binary.
 
 Evidence to attach to bot-strategy #758 consists of the selected release
 manifests/SHA-256 values, pre-rollback backup manifest, exact verification
