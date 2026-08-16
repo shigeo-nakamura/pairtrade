@@ -76,13 +76,14 @@ advancement but rejects:
   acceptance that exceeds the preserved UTC-day swap allowance;
 - an unresolved/non-reconciled acceptance attempt, or one not bound to the
   preserved pending plan, its configured sell ceiling and slippage buy floor,
-  its exact reconciled wallet-balance delta and both configured raw inventory
-  floors, a genuine entry-signal crossing, the supported entry direction, a
-  non-negative route cost, configured all-in-cost and strategy
-  notional/rotation/imbalance caps, and attempt chronology following the
-  accepted observation. Notional is recomputed from the accepted tick's
-  checkpointed reference prices after those prices are cross-checked against
-  both its signal sample and equity mark;
+  its exact reconciled wallet-balance delta, both configured raw inventory
+  floors and minimum gas balance, a genuine entry-signal crossing, the
+  supported entry direction, runtime quote freshness, a non-negative route
+  cost, configured all-in-cost and strategy notional/rotation/imbalance caps,
+  and attempt chronology following the accepted observation. Notional is
+  recomputed from the accepted tick's checkpointed reference prices after
+  those prices are cross-checked against both its signal sample and equity
+  mark;
 - inventory/regime/rotation/open-quantity/execution-key changes that do not
   exactly equal applying that one reconciled fill to the backup position.
 
@@ -141,10 +142,12 @@ authorized by merely merging this code or by a read-only audit.
    as `masked`, `activating`, `deactivating` or `failed` requires diagnosis;
    do not normalize it as part of this procedure.
 
-   Stop only the timer, then poll for at most 120 seconds for any in-flight
-   oneshot to become naturally inactive:
+   Temporarily disable the timer first so an EC2 restart cannot reactivate it
+   before exact verification, then stop it and poll for at most 120 seconds
+   for any in-flight oneshot to become naturally inactive:
 
    ```bash
+   sudo systemctl disable arcus-spot-live-tick.timer
    sudo systemctl stop arcus-spot-live-tick.timer
    for attempt in $(seq 1 60); do
      service_state="$(sudo systemctl show arcus-spot-live-tick.service \
@@ -289,7 +292,10 @@ acceptance above. Preserve `TIMER_ENABLED_BEFORE` and `TIMER_ACTIVE_BEFORE`
 outside the instance across the stop/start, and restore both values with the
 same table rather than assuming the timer should be enabled and active. This
 variant requires its own explicit approval and is not performed by CI or this
-PR.
+PR. Immediately before the EC2 stop, require
+`systemctl is-enabled arcus-spot-live-tick.timer` to report `disabled`; an
+`enabled` result means the temporary-disable step did not take effect and the
+instance must not be restarted.
 
 ## Failure and restore policy
 

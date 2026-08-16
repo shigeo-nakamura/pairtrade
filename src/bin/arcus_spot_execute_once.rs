@@ -1061,6 +1061,7 @@ fn reconciled_fill_for_continuity(
         .context("reconciled Arcus acceptance attempt omitted post balances")?;
     let pre_sell = parse_raw_amount("pre sell balance", &attempt.pre_balances.sell_balance_raw)?;
     let pre_buy = parse_raw_amount("pre buy balance", &attempt.pre_balances.buy_balance_raw)?;
+    let pre_gas = parse_raw_amount("pre gas balance", &attempt.pre_balances.gas_balance_wei)?;
     let post_sell = parse_raw_amount("post sell balance", &post.sell_balance_raw)?;
     let post_buy = parse_raw_amount("post buy balance", &post.buy_balance_raw)?;
     let sell_floor = config
@@ -1089,11 +1090,18 @@ fn reconciled_fill_for_continuity(
         })?;
     let sell_floor = parse_raw_amount("sell inventory floor", sell_floor)?;
     let buy_floor = parse_raw_amount("buy inventory floor", buy_floor)?;
+    let gas_floor = parse_raw_amount(
+        "minimum gas balance",
+        &config.executor.minimum_gas_balance_wei,
+    )?;
     if post_sell < sell_floor {
         bail!("Arcus acceptance post-swap sell balance is below its configured floor");
     }
     if pre_buy < buy_floor {
         bail!("Arcus acceptance pre-swap buy balance is below its configured floor");
+    }
+    if pre_gas < gas_floor {
+        bail!("Arcus acceptance pre-swap gas balance is below its configured minimum");
     }
     let sold_raw = pre_sell
         .checked_sub(post_sell)
@@ -1142,10 +1150,20 @@ fn reconciled_fill_for_continuity(
     let filled_at = attempt
         .dispatched_at
         .context("reconciled Arcus acceptance attempt omitted its dispatch time")?;
+    let planning_age_ms = attempt
+        .prepared_at
+        .signed_duration_since(plan.quote_received_at)
+        .num_milliseconds();
+    let max_quote_age_ms = config.runtime.max_quote_age_secs.saturating_mul(1_000);
+    if planning_age_ms < 0 || planning_age_ms > max_quote_age_ms {
+        bail!("Arcus acceptance quote was stale or future-dated at strategy planning");
+    }
     let plan_age = filled_at.signed_duration_since(plan.quote_received_at);
-    if plan_age.num_seconds() < 0
-        || plan_age.num_seconds() > config.executor.max_plan_age_secs as i64
-    {
+    let plan_age_ms = plan_age.num_milliseconds();
+    let max_plan_age_ms = i64::try_from(config.executor.max_plan_age_secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000);
+    if plan_age_ms < 0 || plan_age_ms > max_plan_age_ms {
         bail!("Arcus acceptance plan was stale or future-dated at dispatch");
     }
     Ok((actual_buy_quantity, filled_at))
@@ -3741,6 +3759,47 @@ runtime:
         let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
 
         assert!(error.to_string().contains("pre-swap buy balance"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_pre_swap_gas_balance_below_the_minimum() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
+        attempt.pre_balances.gas_balance_wei = "999999999999999".to_string();
+
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+
+        assert!(error.to_string().contains("pre-swap gas balance"));
+    }
+
+    #[test]
+    fn continuity_verification_reapplies_the_runtime_quote_freshness_limit() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let mut config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        config.runtime.max_quote_age_secs = 1;
+        let mut plan = rotation_plan("entry_signal");
+        plan.quote_received_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let attempt = reconciled_entry_attempt(&config, &plan, 1);
+
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+
+        assert!(error.to_string().contains("strategy planning"));
     }
 
     #[test]
