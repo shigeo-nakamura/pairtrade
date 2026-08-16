@@ -110,18 +110,47 @@ in UTC.
 These steps mutate service scheduling and the installed binary. They are not
 authorized by merely merging this code or by a read-only audit.
 
-1. Stop scheduling first, then wait for the oneshot to be inactive. Capture
-   the pre-stop enabled/active state so it can be restored exactly:
+1. Before changing scheduling, run both queries below and record their literal
+   outputs outside the host as `TIMER_ENABLED_BEFORE` and
+   `TIMER_ACTIVE_BEFORE`:
+
+   ```bash
+   sudo systemctl is-enabled arcus-spot-live-tick.timer
+   sudo systemctl is-active arcus-spot-live-tick.timer
+   ```
+
+   Continue only when the enabled value is exactly `enabled` or `disabled` and
+   the active value is exactly `active` or `inactive`. A different value such
+   as `masked`, `activating`, `deactivating` or `failed` requires diagnosis;
+   do not normalize it as part of this procedure.
+
+   Stop only the timer, then poll for at most 120 seconds for any in-flight
+   oneshot to become naturally inactive:
 
    ```bash
    sudo systemctl stop arcus-spot-live-tick.timer
-   sudo systemctl stop arcus-spot-live-tick.service
+   for attempt in $(seq 1 60); do
+     service_state="$(sudo systemctl show arcus-spot-live-tick.service \
+       -p ActiveState --value)"
+     if [ "$service_state" = "inactive" ]; then
+       break
+     fi
+     if [ "$attempt" -eq 60 ]; then
+       echo "oneshot did not become inactive within 120 seconds; abort" >&2
+       exit 1
+     fi
+     sleep 2
+   done
    sudo systemctl is-active arcus-spot-live-tick.timer
-   sudo systemctl is-active arcus-spot-live-tick.service
+   sudo systemctl show arcus-spot-live-tick.service \
+     -p ActiveState -p SubState -p Result -p ExecMainStatus
    ```
 
-   Both should report `inactive`. If the service does not stop cleanly, abort;
-   do not kill it while it may be between dispatch and ledger persistence.
+   The timer and service must both report `inactive` before continuing. This
+   procedure must never run `systemctl stop` or `systemctl kill` against the
+   service: if the bounded wait expires, leave the timer stopped and diagnose
+   the still-running oneshot without signalling it. It may be between dispatch
+   and ledger persistence.
 
 2. Create a root-owned backup parent once, then choose an explicit UTC-stamped
    destination (replace the placeholder before running):
@@ -208,9 +237,29 @@ binary SHA before continuing.
      /var/lib/debot-arcus/spot-state-backups/<YYYYMMDDTHHMMSSZ>-pre-rollback
    ```
 
-4. Only after the continuity report is saved may the timer be returned to its
-   pre-window enabled state. Observe the next natural timer result and Health
-   Watch signal before closing the acceptance window.
+4. Only after the continuity report is saved may the timer be restored. Use
+   the two values recorded before the stop; enabled state and active state are
+   independent. Apply exactly one row from this table:
+
+   | `TIMER_ENABLED_BEFORE` | `TIMER_ACTIVE_BEFORE` | Restore action |
+   |---|---|---|
+   | `enabled` | `active` | `sudo systemctl enable arcus-spot-live-tick.timer` then `sudo systemctl start arcus-spot-live-tick.timer` |
+   | `enabled` | `inactive` | `sudo systemctl enable arcus-spot-live-tick.timer`; do not start it |
+   | `disabled` | `active` | `sudo systemctl disable arcus-spot-live-tick.timer` then `sudo systemctl start arcus-spot-live-tick.timer` |
+   | `disabled` | `inactive` | `sudo systemctl disable arcus-spot-live-tick.timer`; do not start it |
+
+   Re-run both queries and require their outputs to match the recorded values
+   exactly:
+
+   ```bash
+   sudo systemctl is-enabled arcus-spot-live-tick.timer
+   sudo systemctl is-active arcus-spot-live-tick.timer
+   ```
+
+   If the active state was restored to `active`, observe the next natural timer
+   result and Health Watch signal before closing the acceptance window. Never
+   enable or start the timer merely because that is the expected production
+   default.
 
 ## EC2 stop/start variant
 
@@ -219,8 +268,11 @@ stop/start. That is a separate production mutation from a systemd stop/start.
 Use the same stopped-timer exact backup before stopping the instance. After SSM
 returns, verify the Elastic IP association and instance ID read-only, run
 `state-verify-exact` before starting any unit, then follow the one-tick
-acceptance above. This variant requires its own explicit approval and is not
-performed by CI or this PR.
+acceptance above. Preserve `TIMER_ENABLED_BEFORE` and `TIMER_ACTIVE_BEFORE`
+outside the instance across the stop/start, and restore both values with the
+same table rather than assuming the timer should be enabled and active. This
+variant requires its own explicit approval and is not performed by CI or this
+PR.
 
 ## Failure and restore policy
 
@@ -242,6 +294,7 @@ performed by CI or this PR.
 Evidence to attach to bot-strategy #758 consists of the selected release
 manifests/SHA-256 values, pre-rollback backup manifest, exact verification
 before and after binary replacement, service result/journal for the approved
-one tick, post-start continuity report, timer restoration state, and (for the
-EC2 variant) EIP association before/after. Never attach config contents, RPC
-credentials, signing material or KMS-sensitive output.
+one tick, post-start continuity report, both pre-stop timer values and both
+post-restore timer values, and (for the EC2 variant) EIP association
+before/after. Never attach config contents, RPC credentials, signing material
+or KMS-sensitive output.
