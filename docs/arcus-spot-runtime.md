@@ -273,6 +273,36 @@ residual risk is accepted without further mitigation. Revisit alongside the
 `auto-execute` signature-skip decision before any inventory scale-up beyond
 what is currently approved on #772.
 
+## Traceable executor deployment
+
+`.github/workflows/deploy-arcus-spot-executor.yml` is the manual-only aarch64
+build and install path for `arcus-spot-execute-once`. The same binary contains
+the `live-tick` subcommand, so a deploy covers both the approved one-shot flow
+and the timer-invoked probe flow without deploying a second executable.
+
+The workflow is accepted only from `master`/`main`. It checks out the pinned
+`DEX_CONNECTOR_REF` (or the explicitly supplied dispatch override), uses
+`Cargo.lock`, runs the Arcus live library and binary tests inside an arm64
+Amazon Linux 2023 container, and records the exact pairtrade commit,
+dex-connector commit, Rust toolchain, resolved container image, lockfile hash,
+and binary SHA-256 in a manifest. The binary, checksum, and manifest are stored
+under the existing least-privilege S3 prefix at an immutable
+content-addressed key:
+
+    arcus-spot-execute-once/releases/<pairtrade-sha>/<dex-sha>/<binary-sha256>/
+
+The SSM install downloads that exact key, verifies both its uploaded checksum
+and the workflow's expected SHA-256, then atomically replaces
+`/usr/local/bin/arcus-spot-execute-once`. Executables and provenance are
+root-owned; the `arcus` service identity remains the unprivileged caller and
+owns only its writable state directories. The workflow never starts or
+restarts a service/timer and never invokes the installed binary. Scheduling
+and manual one-shot approval therefore remain separate operator actions.
+
+`arcus-spot-runtime` is deliberately excluded. It remains the deterministic
+archive replay CLI below; if it later gains a distinct live-daemon role, add a
+separate artifact and lifecycle only when that runtime contract exists.
+
 ## Deterministic replay
 
 Build with the pinned Arcus connector feature and replay the recorder archive:
