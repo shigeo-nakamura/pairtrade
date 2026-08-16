@@ -28,7 +28,6 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  id-token: write
   contents: read
 
 env:
@@ -94,7 +93,6 @@ jobs:
     # may publish or deploy.
     if: github.event_name != 'workflow_dispatch' || inputs.target == 'build-only' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     timeout-minutes: 60
-    environment: debot
     outputs:
       binary_sha256: ${{ steps.package.outputs.binary_sha256 }}
     steps:
@@ -197,15 +195,43 @@ jobs:
             chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
           fi
 
+      - name: Upload verified deploy bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperliquid-observer-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            dist/debot
+            dist/debot.sha256
+            dist/manifest.json
+            debot/scripts/debot-pair-hyperliquid-observe.sh
+            debot/scripts/archive_observer_journal.sh
+            debot/deploy/debot-pair-hyperliquid-observe.service
+            debot/deploy/archive-hyperliquid-observer-journal.service
+            debot/deploy/archive-hyperliquid-observer-journal.timer
+
+  deploy:
+    name: Deploy verified Hyperliquid observer
+    needs: build
+    if: inputs.target == 'deploy' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    environment: debot
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download verified deploy bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: hyperliquid-observer-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Configure AWS credentials
-        if: github.event_name != 'workflow_dispatch' || inputs.target == 'deploy'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Upload artifacts to S3
-        if: github.event_name != 'workflow_dispatch' || inputs.target == 'deploy'
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
         run: |
@@ -221,11 +247,10 @@ jobs:
           aws s3 cp debot/deploy/archive-hyperliquid-observer-journal.timer "s3://${S3_BUCKET}/deploy/archive-hyperliquid-observer-journal.timer"
 
       - name: Deploy via SSM (no observer start)
-        if: github.event_name != 'workflow_dispatch' || inputs.target == 'deploy'
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
-          BINARY_SHA256: ${{ steps.package.outputs.binary_sha256 }}
+          BINARY_SHA256: ${{ needs.build.outputs.binary_sha256 }}
         run: |
           cat > /tmp/ssm-params.json <<'JSON'
           {
