@@ -28,6 +28,14 @@ on:
         description: "Dex-connector ref/tag (optional)"
         required: false
         type: string
+      target:
+        description: "build or deployment target"
+        required: true
+        default: build-only
+        type: choice
+        options:
+          - build-only
+          - deploy
 
 concurrency:
   group: debot-ci-${{ github.ref }}
@@ -43,6 +51,7 @@ env:
   DEX_CONNECTOR_REF: v4.7.10
   LIGHTER_GO_REF: v1.0.2
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+  RUST_TOOLCHAIN: 1.94.1
 
 jobs:
   # bot-strategy#269: the trading bot must be restarted manually only.
@@ -159,6 +168,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -188,31 +199,29 @@ jobs:
         run: cargo test --bin arcus-spot-runtime --no-default-features --features arcus-spot-sdk --locked
 
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     # CI ships new binary + configs but no longer restarts the service
     # (pairtrade#9). Operators restart debot-pair-btceth manually when
     # convenient, so the SSM step finishes in seconds and does not need
     # to cover the 2h graceful-shutdown window.
     #
-    # bot-strategy#343 added aws-sdk-s3 to the dep tree which inflated
-    # the QEMU emulated arm64 cargo build past the original 60min cap;
-    # bumped to 180 to leave headroom for future SDK-sized additions.
-    timeout-minutes: 180
+    # Native ARM64 keeps the AL2023 artifact contract without full-system
+    # QEMU. The 60-minute cap includes packaging and optional deployment,
+    # while the release build itself is measured against the 30-minute bound.
+    timeout-minutes: 60
     needs: [resolve-ref, build-test, lint-no-bot-restart]
-    if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
     env:
       DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+    outputs:
+      debot_sha256: ${{ steps.package.outputs.debot_sha256 }}
+      libsigner_sha256: ${{ steps.package.outputs.libsigner_sha256 }}
     steps:
       - name: Checkout debot
         uses: actions/checkout@v5
         with:
           path: debot
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
 
       - name: Checkout dex-connector
         uses: actions/checkout@v5
@@ -229,14 +238,20 @@ jobs:
           ref: ${{ env.LIGHTER_GO_REF }}
           path: lighter-go
 
-      - name: Cache libsigner (linux/arm64)
+      - name: Resolve build image
+        id: build_image
+        run: |
+          docker pull --platform linux/arm64 "${AL2023_IMAGE}"
+          docker image inspect --format='AL2023_IMAGE_RESOLVED={{index .RepoDigests 0}}' "${AL2023_IMAGE}" >> "${GITHUB_ENV}"
+
+      - name: Cache libsigner (native arm64)
         id: cache_libsigner
         uses: actions/cache@v5
         with:
           path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
 
-      - name: Build libsigner (linux/arm64)
+      - name: Build libsigner in AL2023 (native arm64)
         if: steps.cache_libsigner.outputs.cache-hit != 'true'
         run: |
           mkdir -p lighter-go/build
@@ -245,17 +260,17 @@ jobs:
             -w /go/src/sdk \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
-            ${AL2023_IMAGE} \
-            /bin/bash -lc "dnf -y install golang gcc && CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib && chown -R ${HOST_UID}:${HOST_GID} /go/src/sdk/build"
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; grep VERSION_ID /etc/os-release; dnf -y install golang gcc; CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib; chown -R \${HOST_UID}:\${HOST_GID} /go/src/sdk/build"
 
-      - name: Save libsigner cache (linux/arm64)
+      - name: Save libsigner cache (native arm64)
         if: steps.cache_libsigner.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
 
-      - name: Cache cargo (linux/arm64)
+      - name: Cache cargo (native arm64)
         id: cache_cargo
         uses: actions/cache@v5
         with:
@@ -265,11 +280,11 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-arm64-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-
 
-      - name: Build debot (linux/arm64)
+      - name: Build debot in AL2023 (native arm64)
         id: build_debot
         run: |
           mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
@@ -283,8 +298,8 @@ jobs:
             -e CARGO_INCREMENTAL=0 \
             -e LIGHTER_GO_PATH=/workspace/lighter-go/build \
             -e LD_LIBRARY_PATH=/workspace/lighter-go/build \
-            ${AL2023_IMAGE} \
-            /bin/bash -lc "set -euo pipefail; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked; chown -R ${HOST_UID}:${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; grep VERSION_ID /etc/os-release; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN}; else /workspace/.cache/cargo/bin/rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal; /workspace/.cache/cargo/bin/rustup default ${RUST_TOOLCHAIN}; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot; cargo build --release --locked; chown -R \${HOST_UID}:\${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
 
       - name: Fix cargo cache permissions
         if: steps.build_debot.outcome == 'success'
@@ -297,7 +312,7 @@ jobs:
             chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
           fi
 
-      - name: Save cargo cache (linux/arm64)
+      - name: Save cargo cache (native arm64)
         if: steps.build_debot.outcome == 'success' && steps.cache_cargo.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
@@ -307,13 +322,44 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('debot/Cargo.lock') }}
+
+      - name: Verify dynamic links in AL2023
+        run: |
+          docker run --rm --platform linux/arm64 -v "${{ github.workspace }}/debot/target/release/debot:/artifacts/debot:ro" -v "${{ github.workspace }}/lighter-go/build/libsigner.so:/artifacts/libsigner.so:ro" -e LD_LIBRARY_PATH=/artifacts ${AL2023_IMAGE_RESOLVED} /bin/bash -lc "set -euo pipefail; if ldd /artifacts/debot | grep -q 'not found'; then exit 1; fi; ldd /artifacts/debot; if ldd /artifacts/libsigner.so | grep -q 'not found'; then exit 1; fi; ldd /artifacts/libsigner.so"
 
       - name: Package artifacts
+        id: package
         run: |
+          set -euo pipefail
           mkdir -p dist/bin dist/lib dist/scripts dist/configs
-          cp debot/target/release/debot dist/bin/debot
-          cp lighter-go/build/libsigner.so dist/lib/libsigner.so
+          file debot/target/release/debot | grep -q aarch64
+          file lighter-go/build/libsigner.so | grep -q aarch64
+          install -m 0755 debot/target/release/debot dist/bin/debot
+          install -m 0644 lighter-go/build/libsigner.so dist/lib/libsigner.so
+          test "$(stat -c %a dist/bin/debot)" = 755
+          test "$(stat -c %a dist/lib/libsigner.so)" = 644
+          DEBOT_SHA256=$(sha256sum dist/bin/debot | cut -d " " -f1)
+          LIBSIGNER_SHA256=$(sha256sum dist/lib/libsigner.so | cut -d " " -f1)
+          CARGO_LOCK_SHA256=$(sha256sum debot/Cargo.lock | cut -d " " -f1)
+          DEX_CONNECTOR_SHA=$(git -C dex-connector rev-parse HEAD)
+          (cd dist && sha256sum bin/debot lib/libsigner.so > checksums.sha256)
+          jq -n \
+            --arg pairtrade_sha "${GITHUB_SHA}" \
+            --arg dex_connector_ref "${DEX_CONNECTOR_REF}" \
+            --arg dex_connector_sha "${DEX_CONNECTOR_SHA}" \
+            --arg cargo_lock_sha256 "${CARGO_LOCK_SHA256}" \
+            --arg debot_sha256 "${DEBOT_SHA256}" \
+            --arg libsigner_sha256 "${LIBSIGNER_SHA256}" \
+            --arg rust_toolchain "${RUST_TOOLCHAIN}" \
+            --arg build_image "${AL2023_IMAGE_RESOLVED}" \
+            --arg github_run_id "${GITHUB_RUN_ID}" \
+            --arg github_run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            '{schema_version: 1, architecture: "aarch64", pairtrade_sha: $pairtrade_sha, dex_connector_ref: $dex_connector_ref, dex_connector_sha: $dex_connector_sha, cargo_lock_sha256: $cargo_lock_sha256, rust_toolchain: $rust_toolchain, build_image: $build_image, github_run_id: $github_run_id, github_run_attempt: $github_run_attempt, artifacts: {debot: {path: "bin/debot", sha256: $debot_sha256, mode: "0755"}, libsigner: {path: "lib/libsigner.so", sha256: $libsigner_sha256, mode: "0644"}}}' > dist/manifest.json
+          echo "debot_sha256=${DEBOT_SHA256}" >> "${GITHUB_OUTPUT}"
+          echo "libsigner_sha256=${LIBSIGNER_SHA256}" >> "${GITHUB_OUTPUT}"
+          (cd dist && sha256sum -c checksums.sha256)
+          jq . dist/manifest.json
           rsync -a \
             --exclude "venv/" \
             --exclude "__pycache__/" \
@@ -323,17 +369,21 @@ jobs:
           rsync -a debot/configs/ dist/configs/
 
       - name: Configure AWS credentials
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Upload artifacts to S3
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
         run: |
           aws s3 cp dist/bin/debot "s3://${S3_BUCKET}/debot/debot"
           aws s3 cp dist/lib/libsigner.so "s3://${S3_BUCKET}/debot/libsigner.so"
+          aws s3 cp dist/checksums.sha256 "s3://${S3_BUCKET}/debot/checksums.sha256"
+          aws s3 cp dist/manifest.json "s3://${S3_BUCKET}/debot/manifest.json"
           aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot/scripts/" \
             --exclude "venv/*" \
             --exclude "venv/**" \
@@ -349,18 +399,30 @@ jobs:
           aws s3 cp debot/deploy/debot-pair-robinhood-lighter.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
 
       - name: Deploy via SSM (no restart)
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
+          DEBOT_SHA256: ${{ steps.package.outputs.debot_sha256 }}
+          LIBSIGNER_SHA256: ${{ steps.package.outputs.libsigner_sha256 }}
         run: |
           cat > /tmp/ssm-params.json <<'JSON'
           {
             "commands": [
+              "set -e",
               "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/lib __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
               "aws s3 cp s3://__S3_BUCKET__/debot/debot __INSTALL_DIR__/bin/debot",
-              "sudo chmod 755 __INSTALL_DIR__/bin/debot",
               "aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so __INSTALL_DIR__/lib/libsigner.so",
-              "sudo chmod 644 __INSTALL_DIR__/lib/libsigner.so",
+              "aws s3 cp s3://__S3_BUCKET__/debot/checksums.sha256 __INSTALL_DIR__/checksums.sha256",
+              "aws s3 cp s3://__S3_BUCKET__/debot/manifest.json __INSTALL_DIR__/manifest.json",
+              "sudo chown root:root __INSTALL_DIR__/bin/debot __INSTALL_DIR__/lib/libsigner.so __INSTALL_DIR__/checksums.sha256 __INSTALL_DIR__/manifest.json",
+              "sudo chmod 755 __INSTALL_DIR__/bin/debot",
+              "sudo chmod 644 __INSTALL_DIR__/lib/libsigner.so __INSTALL_DIR__/checksums.sha256 __INSTALL_DIR__/manifest.json",
+              "echo __DEBOT_SHA256__ __INSTALL_DIR__/bin/debot | sudo sha256sum -c - || exit 1",
+              "echo __LIBSIGNER_SHA256__ __INSTALL_DIR__/lib/libsigner.so | sudo sha256sum -c - || exit 1",
+              "cd __INSTALL_DIR__ && sudo sha256sum -c checksums.sha256 || exit 1",
+              "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/bin/debot) = root:root:755 || exit 1",
+              "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/lib/libsigner.so) = root:root:644 || exit 1",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
@@ -369,7 +431,7 @@ jobs:
             ]
           }
           JSON
-          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g" /tmp/ssm-params.json
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__DEBOT_SHA256__|${DEBOT_SHA256}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g" /tmp/ssm-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
@@ -413,6 +475,7 @@ jobs:
           done
 
       - name: Restart canary (bot-strategy#376)
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         # Canary is the only debot-pair-* unit allowed to auto-restart on every
         # deploy — that is its design purpose (always run the latest binary so
         # regressions surface via main-vs-canary trade-rate divergence). Main
@@ -462,7 +525,7 @@ jobs:
     name: Deploy binary to Robinhood Lighter host
     needs: deploy
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
     environment: debot
     env:
       AWS_REGION: ap-northeast-1
@@ -470,6 +533,7 @@ jobs:
       INSTANCE_ID: ${{ vars.ROBINHOOD_LIGHTER_INSTANCE_ID }}
     steps:
       - name: Configure AWS credentials
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
@@ -478,13 +542,15 @@ jobs:
       - name: Deploy binary and runtime artifacts via SSM (no start/restart)
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          DEBOT_SHA256: ${{ needs.deploy.outputs.debot_sha256 }}
+          LIBSIGNER_SHA256: ${{ needs.deploy.outputs.libsigner_sha256 }}
         run: |
           test -n "${INSTANCE_ID}"
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
             --comment "Deploy Robinhood Lighter pairtrade artifacts; no start or restart" \
-            --parameters commands="sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/bin ${INSTALL_DIR}/lib ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 cp s3://${S3_BUCKET}/debot/debot ${INSTALL_DIR}/bin/debot,sudo chmod 755 ${INSTALL_DIR}/bin/debot,aws s3 cp s3://${S3_BUCKET}/debot/libsigner.so ${INSTALL_DIR}/lib/libsigner.so,sudo chmod 644 ${INSTALL_DIR}/lib/libsigner.so,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
+            --parameters commands="set -e,sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/bin ${INSTALL_DIR}/lib ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 cp s3://${S3_BUCKET}/debot/debot ${INSTALL_DIR}/bin/debot,aws s3 cp s3://${S3_BUCKET}/debot/libsigner.so ${INSTALL_DIR}/lib/libsigner.so,aws s3 cp s3://${S3_BUCKET}/debot/checksums.sha256 ${INSTALL_DIR}/checksums.sha256,aws s3 cp s3://${S3_BUCKET}/debot/manifest.json ${INSTALL_DIR}/manifest.json,sudo chown root:root ${INSTALL_DIR}/bin/debot ${INSTALL_DIR}/lib/libsigner.so ${INSTALL_DIR}/checksums.sha256 ${INSTALL_DIR}/manifest.json,sudo chmod 755 ${INSTALL_DIR}/bin/debot,sudo chmod 644 ${INSTALL_DIR}/lib/libsigner.so ${INSTALL_DIR}/checksums.sha256 ${INSTALL_DIR}/manifest.json,echo ${DEBOT_SHA256} ${INSTALL_DIR}/bin/debot | sudo sha256sum -c - || exit 1,echo ${LIBSIGNER_SHA256} ${INSTALL_DIR}/lib/libsigner.so | sudo sha256sum -c - || exit 1,cd ${INSTALL_DIR} && sudo sha256sum -c checksums.sha256 || exit 1,stat -c %U:%G:%a ${INSTALL_DIR}/bin/debot | grep -qx root:root:755 || exit 1,stat -c %U:%G:%a ${INSTALL_DIR}/lib/libsigner.so | grep -qx root:root:644 || exit 1,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
             --query Command.CommandId --output text)
           aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}"
           aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
