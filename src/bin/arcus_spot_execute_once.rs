@@ -30,7 +30,7 @@ use ed25519_dalek::{
     Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH,
     SIGNATURE_LENGTH,
 };
-use ethers::types::U256;
+use ethers::types::{H256, U256};
 use rand::RngCore;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -1031,6 +1031,15 @@ fn reconciled_fill_for_continuity(
         || attempt.tx_hash.is_none()
     {
         bail!("Arcus acceptance attempt does not match the configured chain/taker");
+    }
+    let tx_hash = attempt
+        .tx_hash
+        .as_deref()
+        .context("reconciled Arcus acceptance attempt omitted its transaction hash")?;
+    let tx_hash =
+        H256::from_str(tx_hash.trim()).context("invalid Arcus acceptance transaction hash")?;
+    if tx_hash == H256::zero() {
+        bail!("Arcus acceptance transaction hash must not be zero");
     }
     if !plan.venue.eq_ignore_ascii_case("arcus")
         || !attempt.intent.venue.eq_ignore_ascii_case("arcus")
@@ -3836,6 +3845,25 @@ runtime:
         let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
 
         assert!(error.to_string().contains("venue=arcus"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_zero_transaction_hash() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
+        attempt.tx_hash = Some(format!("0x{}", "0".repeat(64)));
+
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt).unwrap_err();
+
+        assert!(error.to_string().contains("must not be zero"));
     }
 
     #[test]
