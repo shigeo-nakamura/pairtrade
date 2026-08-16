@@ -873,9 +873,7 @@ mod tests {
     #[test]
     fn raw_inconsistent_with_its_decimal_quantity_is_rejected() {
         // 1000 raw units at 18 decimals is 0.000000000000001, not 1.
-        assert!(
-            require_raw_matches_decimal_quantity("sell", "1000", Decimal::ONE, 18).is_err()
-        );
+        assert!(require_raw_matches_decimal_quantity("sell", "1000", Decimal::ONE, 18).is_err());
     }
 
     #[test]

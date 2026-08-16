@@ -106,8 +106,8 @@ resume take on runtime_state_path, so they cannot race against each other."
 }
 
 fn parse_config(path: &Path) -> Result<ArcusSpotProposeConfig> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read config {}", path.display()))?;
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read config {}", path.display()))?;
     let mut config: ArcusSpotProposeConfig = serde_yaml::from_slice(&bytes)
         .with_context(|| format!("invalid config {}", path.display()))?;
     if !config.runtime_state_path.is_absolute() {
@@ -155,10 +155,9 @@ fn bootstrap(config_path: &str, samples_path: &str) -> Result<()> {
             config.runtime_state_path.display()
         );
     }
-    let mut runtime =
-        ArcusSpotRuntime::new(config.runtime.clone()).map_err(anyhow::Error::msg)?;
-    let file = fs::File::open(samples_path)
-        .with_context(|| format!("failed to open {samples_path}"))?;
+    let mut runtime = ArcusSpotRuntime::new(config.runtime.clone()).map_err(anyhow::Error::msg)?;
+    let file =
+        fs::File::open(samples_path).with_context(|| format!("failed to open {samples_path}"))?;
     let summary = replay_jsonl(&mut runtime, io::BufReader::new(file), io::sink())
         .context("failed to replay the warm-up archive")?;
     let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
@@ -214,8 +213,7 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
     match &event.decision {
         ArcusSpotDecision::WouldRotate { plan } => {
             if let Some(out_path) = out_path {
-                let bytes =
-                    serde_json::to_vec_pretty(plan).context("failed to serialize plan")?;
+                let bytes = serde_json::to_vec_pretty(plan).context("failed to serialize plan")?;
                 write_private_plan_file(Path::new(out_path), &bytes)
                     .with_context(|| format!("failed to write plan to {out_path}"))?;
                 eprintln!(
@@ -321,7 +319,10 @@ runtime_state_path: /tmp/does-not-matter-runtime.json
 "#;
         let config: ArcusSpotProposeConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.runtime.pair.sell_symbol, "NVDA");
-        assert_eq!(config.runtime_state_path, PathBuf::from("/tmp/does-not-matter-runtime.json"));
+        assert_eq!(
+            config.runtime_state_path,
+            PathBuf::from("/tmp/does-not-matter-runtime.json")
+        );
     }
 
     #[test]

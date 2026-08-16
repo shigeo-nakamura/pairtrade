@@ -244,9 +244,13 @@ impl ArcusSpotChainClient {
             .iter()
             .map(|rpc_url| {
                 Provider::<Http>::try_from(rpc_url.trim())
-                    .with_context(|| format!("could not construct Arcus RPC provider for {rpc_url}"))
+                    .with_context(|| {
+                        format!("could not construct Arcus RPC provider for {rpc_url}")
+                    })
                     .map(|provider| {
-                        Arc::new(provider.interval(Duration::from_millis(config.request_interval_ms)))
+                        Arc::new(
+                            provider.interval(Duration::from_millis(config.request_interval_ms)),
+                        )
                     })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -642,9 +646,9 @@ impl ArcusSpotChainClient {
                 // hash uniquely identifies one block regardless of height
                 // collisions across forks, so a node that reorged away
                 // from it errors instead of substituting a different one.
-                let receipt_block_hash = receipt.block_hash.context(
-                    "Arcus confirmed-transaction receipt is missing its block hash",
-                )?;
+                let receipt_block_hash = receipt
+                    .block_hash
+                    .context("Arcus confirmed-transaction receipt is missing its block hash")?;
                 read_balances_from_provider(
                     provider,
                     chain_id,
@@ -738,7 +742,11 @@ async fn read_balances_from_provider(
     }
 
     let mut transient_error: Option<anyhow::Error> = None;
-    for outcome in [&sell_balance_outcome, &buy_balance_outcome, &gas_balance_outcome] {
+    for outcome in [
+        &sell_balance_outcome,
+        &buy_balance_outcome,
+        &gas_balance_outcome,
+    ] {
         if let ContractCallOutcome::Transport(_) = outcome {
             transient_error
                 .get_or_insert_with(|| anyhow::anyhow!("Arcus balance read failed (transport)"));
@@ -791,7 +799,6 @@ fn enforce_gas_floor(gas_balance: U256, request: &ValidatedPreflightRequest) -> 
     }
     Ok(())
 }
-
 
 fn balance_snapshot(
     _taker: Address,
