@@ -79,6 +79,12 @@ def main() -> int:
         if current is None or candidate[0] > current[0]:
             longest[symbol] = candidate
 
+    def reset_run(symbol: str) -> None:
+        finish_run(symbol)
+        run_price.pop(symbol, None)
+        run_start.pop(symbol, None)
+        run_last.pop(symbol, None)
+
     previous_ts = None
     for path in args.dumps:
         with open_text(path) as src:
@@ -87,8 +93,12 @@ def main() -> int:
                     row = json.loads(line)
                     timestamp = int(row["timestamp"])
                     prices = row["prices"]
+                    if not isinstance(prices, dict):
+                        raise TypeError("prices must be an object")
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     invalid_json += 1
+                    for symbol in list(run_start):
+                        reset_run(symbol)
                     continue
 
                 frames += 1
@@ -110,10 +120,7 @@ def main() -> int:
                         missing_symbol[symbol] += 1
                         if len(missing_symbol_examples[symbol]) < 5:
                             missing_symbol_examples[symbol].append(timestamp)
-                        finish_run(symbol)
-                        run_price.pop(symbol, None)
-                        run_start.pop(symbol, None)
-                        run_last.pop(symbol, None)
+                        reset_run(symbol)
                         continue
                     try:
                         price = str(book["price"])
@@ -125,10 +132,7 @@ def main() -> int:
                         invalid_book[symbol] += 1
                         if len(invalid_book_examples[symbol]) < 5:
                             invalid_book_examples[symbol].append(timestamp)
-                        finish_run(symbol)
-                        run_price.pop(symbol, None)
-                        run_start.pop(symbol, None)
-                        run_last.pop(symbol, None)
+                        reset_run(symbol)
                         continue
 
                     if bid > ask:
