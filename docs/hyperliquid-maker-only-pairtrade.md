@@ -141,6 +141,22 @@ fully isolated from the trading services:
 - State: `/opt/debot-hl/` — `market_data_hyperliquid_pairs.jsonl`,
   `history_archive/`, `pairtrade_history_hyperliquid.json`, and the derived
   sibling `risk_state.json`.
+- Journal retention is not an analysis archive. The
+  `archive-hyperliquid-observer-journal.timer` persists each UTC day's
+  `[METRICS]`, `[ENTRY]`, `[EXIT]`, warning, and error lines to
+  `s3://debot-dashboard/debot/observer-journal/frankfurt/` at 00:45 UTC.
+  Fetch and summarize an evaluation window with:
+
+  ```bash
+  scripts/fetch_observer_journal.sh frankfurt \
+    debot-pair-hyperliquid-observe \
+    '2026-08-15 00:00:00' '2026-08-29 00:00:00' \
+    /tmp/hyperliquid-observer.log
+  scripts/observer_duty_cycle.py /tmp/hyperliquid-observer.log
+  ```
+
+  Inspect `/tmp/hyperliquid-observer.log.manifests.jsonl` before using a
+  readout; every requested day should exist with `complete_day=true`.
 - Stop / rollback:
 
   ```bash

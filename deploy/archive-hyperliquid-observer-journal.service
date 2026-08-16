@@ -1,0 +1,13 @@
+[Unit]
+Description=Archive Hyperliquid observer metrics and errors to S3 (bot-strategy#745)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/debot
+Environment=HOST_TAG=frankfurt
+Environment=SERVICE=debot-pair-hyperliquid-observe
+ExecStart=/opt/debot/scripts/archive_observer_journal.sh
+StandardOutput=journal
+StandardError=journal
