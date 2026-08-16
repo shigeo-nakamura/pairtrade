@@ -66,9 +66,9 @@ advancement but rejects:
 - runtime sequence or last-observation regression, more than one observation
   advance, or corruption/removal/reordering of retained signal-history samples
   (a full window may shift by exactly one sample for the approved tick);
-- cumulative-equity baseline changes, sticky risk-halt removal, same-day daily
-  baseline resets, invalid UTC rollover baselines, or loss of the last equity
-  mark;
+- cumulative-equity baseline changes, mismatched first equity baselines,
+  sticky or newly-required risk-halt loss, same-day daily baseline resets,
+  invalid UTC rollover baselines, or loss of the last equity mark;
 - a backup that was not neutral with no active attempt, ledger regression,
   changed archived history, or more than one new acceptance attempt;
 - an unresolved/non-reconciled acceptance attempt, or one not bound to the

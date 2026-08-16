@@ -16,7 +16,7 @@ use debot::arcus_spot::{
     ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
     ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig,
     ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotRegime,
-    ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntime,
+    ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntime,
     ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent,
     ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
@@ -769,7 +769,18 @@ fn require_rollover_matches_observation(
     Ok(())
 }
 
+fn positive_loss_from_mark(reference: Option<Decimal>, equity: Option<Decimal>) -> Result<Decimal> {
+    match reference.zip(equity) {
+        Some((reference, equity)) => Ok(reference
+            .checked_sub(equity)
+            .context("Arcus risk loss calculation exceeds Decimal range")?
+            .max(Decimal::ZERO)),
+        None => Ok(Decimal::ZERO),
+    }
+}
+
 fn require_risk_state_continuity(
+    config: &ArcusSpotRuntimeConfig,
     baseline: &ArcusSpotRuntimeState,
     current: &ArcusSpotRuntimeState,
     sequence_advance: u64,
@@ -795,14 +806,17 @@ fn require_risk_state_continuity(
         {
             bail!("Arcus runtime risk state changed without a new observation");
         }
-        return Ok(());
     }
     match (baseline_daily, current_daily) {
         (None, None) => {}
         (None, Some((current_day, current_equity))) => {
             require_rollover_matches_observation(current_day, current)?;
-            if current.last_equity_usd != Some(current_equity) {
-                bail!("Arcus runtime initialized mismatched daily and last equity marks");
+            if current.initial_equity_usd != Some(current_equity)
+                || current.last_equity_usd != Some(current_equity)
+            {
+                bail!(
+                    "Arcus runtime initialized mismatched cumulative, daily, and last equity marks"
+                );
             }
         }
         (Some(_), None) => {
@@ -820,6 +834,62 @@ fn require_risk_state_continuity(
                 require_rollover_matches_observation(current_day, current)?;
                 if current.last_equity_usd != Some(current_equity) {
                     bail!("Arcus runtime UTC rollover baseline does not match its equity mark");
+                }
+            }
+        }
+    }
+    if baseline.risk_halt.is_none() {
+        let daily_reference = match (baseline_daily, current_daily) {
+            (Some((baseline_day, baseline_equity)), Some((current_day, _)))
+                if baseline_day == current_day =>
+            {
+                Some(baseline_equity)
+            }
+            (Some((_, baseline_equity)), Some(_)) => {
+                baseline.last_equity_usd.or(Some(baseline_equity))
+            }
+            _ => None,
+        };
+        let daily_loss = positive_loss_from_mark(daily_reference, current.last_equity_usd)?;
+        let cumulative_loss =
+            positive_loss_from_mark(current.initial_equity_usd, current.last_equity_usd)?;
+        let expected = if daily_loss >= config.daily_loss_limit_usd {
+            Some((
+                ArcusSpotRiskHaltKind::DailyLoss,
+                daily_loss,
+                config.daily_loss_limit_usd,
+            ))
+        } else if cumulative_loss >= config.cumulative_loss_limit_usd {
+            Some((
+                ArcusSpotRiskHaltKind::CumulativeLoss,
+                cumulative_loss,
+                config.cumulative_loss_limit_usd,
+            ))
+        } else {
+            None
+        };
+        match (expected, current.risk_halt.as_ref()) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                bail!("Arcus runtime engaged an unexpected risk halt across restart/rollback")
+            }
+            (Some(_), None) => {
+                bail!("Arcus runtime omitted a newly triggered loss halt across restart/rollback")
+            }
+            (Some((kind, loss, limit)), Some(halt)) => {
+                let current_day = current_daily
+                    .map(|(day, _)| day)
+                    .context("Arcus runtime engaged a risk halt without a daily baseline")?;
+                let current_equity = current
+                    .last_equity_usd
+                    .context("Arcus runtime engaged a risk halt without a last equity mark")?;
+                if halt.kind != kind
+                    || halt.equity_usd != current_equity
+                    || halt.loss_usd != loss
+                    || halt.limit_usd != limit
+                    || halt.engaged_at.date_naive() != current_day
+                {
+                    bail!("Arcus runtime newly triggered loss halt does not match its risk mark");
                 }
             }
         }
@@ -1165,7 +1235,12 @@ fn require_arcus_state_continuity(
         sequence_advance,
         config.runtime.signal_window_samples,
     )?;
-    require_risk_state_continuity(baseline_runtime, current_runtime, sequence_advance)?;
+    require_risk_state_continuity(
+        &config.runtime,
+        baseline_runtime,
+        current_runtime,
+        sequence_advance,
+    )?;
     match (
         baseline_runtime.last_observation_at,
         current_runtime.last_observation_at,
@@ -2849,6 +2924,81 @@ runtime:
 
         let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
 
+        assert_eq!(report.mode, "continuity");
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_mismatched_first_cumulative_baseline() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(1);
+            state["last_observation_at"] = json!("2026-08-16T12:00:01Z");
+            state["initial_equity_usd"] = json!("250");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("300");
+            state["last_equity_usd"] = json!("300");
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("mismatched cumulative, daily, and last equity marks"));
+    }
+
+    #[test]
+    fn continuity_verification_requires_a_newly_triggered_loss_halt() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+            state["initial_equity_usd"] = json!("300");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("300");
+            state["last_equity_usd"] = json!("300");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+            state["last_equity_usd"] = json!("297");
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("omitted a newly triggered loss halt"));
+
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["risk_halt"] = json!({
+                "kind": "daily_loss",
+                "engaged_at": "2026-08-16T12:01:01Z",
+                "equity_usd": "297",
+                "loss_usd": "3",
+                "limit_usd": "2",
+            });
+        });
+        let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
         assert_eq!(report.mode, "continuity");
     }
 
