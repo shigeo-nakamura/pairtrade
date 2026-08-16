@@ -28,6 +28,14 @@ on:
         description: "Dex-connector ref/tag (optional)"
         required: false
         type: string
+      target:
+        description: "build or deployment target"
+        required: true
+        default: build-only
+        type: choice
+        options:
+          - build-only
+          - deploy
 
 concurrency:
   group: debot-ci-${{ github.ref }}
@@ -43,6 +51,7 @@ env:
   DEX_CONNECTOR_REF: v4.7.10
   LIGHTER_GO_REF: v1.0.2
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+  RUST_TOOLCHAIN: 1.94.1
 
 jobs:
   # bot-strategy#269: the trading bot must be restarted manually only.
@@ -188,18 +197,18 @@ jobs:
         run: cargo test --bin arcus-spot-runtime --no-default-features --features arcus-spot-sdk --locked
 
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     # CI ships new binary + configs but no longer restarts the service
     # (pairtrade#9). Operators restart debot-pair-btceth manually when
     # convenient, so the SSM step finishes in seconds and does not need
     # to cover the 2h graceful-shutdown window.
     #
-    # bot-strategy#343 added aws-sdk-s3 to the dep tree which inflated
-    # the QEMU emulated arm64 cargo build past the original 60min cap;
-    # bumped to 180 to leave headroom for future SDK-sized additions.
-    timeout-minutes: 180
+    # Native ARM64 keeps the AL2023 artifact contract without full-system
+    # QEMU. The 60-minute cap includes packaging and optional deployment,
+    # while the release build itself is measured against the 30-minute bound.
+    timeout-minutes: 60
     needs: [resolve-ref, build-test, lint-no-bot-restart]
-    if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    if: needs.resolve-ref.outputs.should_deploy == 'true' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     environment: debot
     env:
       DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
@@ -208,11 +217,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           path: debot
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
 
       - name: Checkout dex-connector
         uses: actions/checkout@v5
@@ -229,14 +233,20 @@ jobs:
           ref: ${{ env.LIGHTER_GO_REF }}
           path: lighter-go
 
-      - name: Cache libsigner (linux/arm64)
+      - name: Resolve build image
+        id: build_image
+        run: |
+          docker pull --platform linux/arm64 "${AL2023_IMAGE}"
+          docker image inspect --format='AL2023_IMAGE_RESOLVED={{index .RepoDigests 0}}' "${AL2023_IMAGE}" >> "${GITHUB_ENV}"
+
+      - name: Cache libsigner (native arm64)
         id: cache_libsigner
         uses: actions/cache@v5
         with:
           path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
 
-      - name: Build libsigner (linux/arm64)
+      - name: Build libsigner in AL2023 (native arm64)
         if: steps.cache_libsigner.outputs.cache-hit != 'true'
         run: |
           mkdir -p lighter-go/build
@@ -245,17 +255,17 @@ jobs:
             -w /go/src/sdk \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
-            ${AL2023_IMAGE} \
-            /bin/bash -lc "dnf -y install golang gcc && CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib && chown -R ${HOST_UID}:${HOST_GID} /go/src/sdk/build"
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; grep VERSION_ID /etc/os-release; dnf -y install golang gcc; CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib; chown -R \${HOST_UID}:\${HOST_GID} /go/src/sdk/build"
 
-      - name: Save libsigner cache (linux/arm64)
+      - name: Save libsigner cache (native arm64)
         if: steps.cache_libsigner.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
 
-      - name: Cache cargo (linux/arm64)
+      - name: Cache cargo (native arm64)
         id: cache_cargo
         uses: actions/cache@v5
         with:
@@ -265,11 +275,11 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-arm64-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-
 
-      - name: Build debot (linux/arm64)
+      - name: Build debot in AL2023 (native arm64)
         id: build_debot
         run: |
           mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
@@ -283,8 +293,8 @@ jobs:
             -e CARGO_INCREMENTAL=0 \
             -e LIGHTER_GO_PATH=/workspace/lighter-go/build \
             -e LD_LIBRARY_PATH=/workspace/lighter-go/build \
-            ${AL2023_IMAGE} \
-            /bin/bash -lc "set -euo pipefail; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked; chown -R ${HOST_UID}:${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; grep VERSION_ID /etc/os-release; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN}; else /workspace/.cache/cargo/bin/rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal; /workspace/.cache/cargo/bin/rustup default ${RUST_TOOLCHAIN}; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot; cargo build --release --locked; chown -R \${HOST_UID}:\${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
 
       - name: Fix cargo cache permissions
         if: steps.build_debot.outcome == 'success'
@@ -297,7 +307,7 @@ jobs:
             chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
           fi
 
-      - name: Save cargo cache (linux/arm64)
+      - name: Save cargo cache (native arm64)
         if: steps.build_debot.outcome == 'success' && steps.cache_cargo.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
@@ -307,11 +317,18 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ hashFiles('debot/Cargo.lock') }}
+
+      - name: Verify dynamic links in AL2023
+        run: |
+          docker run --rm --platform linux/arm64 -v "${{ github.workspace }}/debot/target/release/debot:/artifacts/debot:ro" -v "${{ github.workspace }}/lighter-go/build/libsigner.so:/artifacts/libsigner.so:ro" -e LD_LIBRARY_PATH=/artifacts ${AL2023_IMAGE_RESOLVED} /bin/bash -lc "set -euo pipefail; if ldd /artifacts/debot | grep -q 'not found'; then exit 1; fi; ldd /artifacts/debot; if ldd /artifacts/libsigner.so | grep -q 'not found'; then exit 1; fi; ldd /artifacts/libsigner.so"
 
       - name: Package artifacts
         run: |
           mkdir -p dist/bin dist/lib dist/scripts dist/configs
+          file debot/target/release/debot | grep -q aarch64
+          file lighter-go/build/libsigner.so | grep -q aarch64
+          sha256sum debot/target/release/debot lighter-go/build/libsigner.so
           cp debot/target/release/debot dist/bin/debot
           cp lighter-go/build/libsigner.so dist/lib/libsigner.so
           rsync -a \
@@ -323,12 +340,14 @@ jobs:
           rsync -a debot/configs/ dist/configs/
 
       - name: Configure AWS credentials
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Upload artifacts to S3
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
         run: |
@@ -349,6 +368,7 @@ jobs:
           aws s3 cp debot/deploy/debot-pair-robinhood-lighter.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
 
       - name: Deploy via SSM (no restart)
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
@@ -413,6 +433,7 @@ jobs:
           done
 
       - name: Restart canary (bot-strategy#376)
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         # Canary is the only debot-pair-* unit allowed to auto-restart on every
         # deploy — that is its design purpose (always run the latest binary so
         # regressions surface via main-vs-canary trade-rate divergence). Main
@@ -462,7 +483,7 @@ jobs:
     name: Deploy binary to Robinhood Lighter host
     needs: deploy
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
     environment: debot
     env:
       AWS_REGION: ap-northeast-1
@@ -470,6 +491,7 @@ jobs:
       INSTANCE_ID: ${{ vars.ROBINHOOD_LIGHTER_INSTANCE_ID }}
     steps:
       - name: Configure AWS credentials
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}

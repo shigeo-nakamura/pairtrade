@@ -21,6 +21,14 @@ on:
         description: "Dex-connector ref/tag (default: the pinned env ref)"
         required: false
         type: string
+      target:
+        description: "build or deployment target"
+        required: true
+        default: build-only
+        type: choice
+        options:
+          - build-only
+          - deploy
 
 concurrency:
   group: arcus-spot-executor-deploy
@@ -41,10 +49,52 @@ env:
   PROVENANCE_DIR: /usr/local/share/arcus-spot-execute-once
 
 jobs:
-  build-deploy:
+  test:
+    name: Test Arcus Spot executor (x86_64)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
-    timeout-minutes: 300
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pairtrade
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Checkout pinned dex-connector
+        uses: actions/checkout@v5
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo tests
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            debot/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}-${{ hashFiles('debot/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-
+
+      - name: Run Arcus Spot executor tests
+        working-directory: debot
+        run: |
+          cargo test --release --locked --no-default-features --features arcus-spot-live --lib arcus_spot
+          cargo test --release --locked --no-default-features --features arcus-spot-live --bin arcus-spot-execute-once
+
+  build-deploy:
+    name: Build Arcus Spot executor (native arm64)
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
     environment: debot
     steps:
       - name: Checkout pairtrade
@@ -69,11 +119,6 @@ jobs:
           echo "pairtrade_sha=${PAIRTRADE_SHA}" >> "${GITHUB_OUTPUT}"
           echo "dex_connector_sha=${DEX_CONNECTOR_SHA}" >> "${GITHUB_OUTPUT}"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
       - name: Resolve build image
         id: build_image
         run: |
@@ -82,7 +127,7 @@ jobs:
           test -n "${IMAGE_REF}"
           echo "image_ref=${IMAGE_REF}" >> "${GITHUB_OUTPUT}"
 
-      - name: Cache cargo (linux/arm64, Arcus live)
+      - name: Cache cargo (native arm64, Arcus live)
         uses: actions/cache@v5
         with:
           path: |
@@ -91,12 +136,12 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-cargo-arm64-arcus-live-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-arm64-arcus-live-${{ steps.source_ids.outputs.dex_connector_sha }}-
-            ${{ runner.os }}-cargo-arm64-arcus-live-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ steps.source_ids.outputs.dex_connector_sha }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-
 
-      - name: Test and build Arcus Spot executor (linux/arm64)
+      - name: Build Arcus Spot executor in AL2023 (native arm64)
         run: |
           mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
           docker run --rm --platform linux/arm64 \
@@ -109,6 +154,10 @@ jobs:
             -e CARGO_INCREMENTAL=0 \
             "${{ steps.build_image.outputs.image_ref }}" \
             /bin/bash -lc "set -euo pipefail; \
+              uname -m | grep -qx aarch64; \
+              grep -q Amazon /etc/os-release; \
+              grep -q 2023 /etc/os-release; \
+              grep VERSION_ID /etc/os-release; \
               dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; \
               if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then \
                 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN}; \
@@ -118,10 +167,12 @@ jobs:
               fi; \
               export PATH=/workspace/.cache/cargo/bin:\$PATH; \
               rustc -V; cargo -V; cd debot; \
-              cargo test --release --locked --no-default-features --features arcus-spot-live --lib arcus_spot; \
-              cargo test --release --locked --no-default-features --features arcus-spot-live --bin arcus-spot-execute-once; \
               cargo build --release --locked --no-default-features --features arcus-spot-live --bin arcus-spot-execute-once; \
               chown -R \${HOST_UID}:\${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+
+      - name: Verify dynamic links in AL2023
+        run: |
+          docker run --rm --platform linux/arm64 -v "${{ github.workspace }}/debot/target/release/arcus-spot-execute-once:/artifact:ro" "${{ steps.build_image.outputs.image_ref }}" /bin/bash -lc "set -euo pipefail; if ldd /artifact | grep -q 'not found'; then exit 1; fi; ldd /artifact"
 
       - name: Package immutable release
         id: package
@@ -161,12 +212,14 @@ jobs:
           jq . dist/manifest.json
 
       - name: Configure AWS credentials
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Upload immutable release to S3
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           RELEASE_KEY: ${{ steps.package.outputs.release_key }}
@@ -176,6 +229,7 @@ jobs:
           aws s3 cp --only-show-errors dist/manifest.json "s3://${S3_BUCKET}/${RELEASE_KEY}/manifest.json"
 
       - name: Install via SSM (no start, restart, or invocation)
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           RELEASE_KEY: ${{ steps.package.outputs.release_key }}
@@ -198,6 +252,7 @@ jobs:
               "aws s3 cp --only-show-errors s3://__S3_BUCKET__/__RELEASE_KEY__/manifest.json \"$ARCUS_STAGE/manifest.json\"",
               "(cd \"$ARCUS_STAGE\" && sha256sum -c arcus-spot-execute-once.sha256)",
               "echo \"__BINARY_SHA256__  $ARCUS_STAGE/arcus-spot-execute-once\" | sha256sum -c -",
+              "LDD_OUTPUT=$(ldd \"$ARCUS_STAGE/arcus-spot-execute-once\"); echo \"$LDD_OUTPUT\"; if echo \"$LDD_OUTPUT\" | grep -q not.found; then exit 1; fi",
               "sudo install -o root -g root -m 0755 \"$ARCUS_STAGE/arcus-spot-execute-once\" \"$ARCUS_INSTALL_STAGE\"",
               "echo \"__BINARY_SHA256__  $ARCUS_INSTALL_STAGE\" | sudo sha256sum -c -",
               "test \"$(stat -c %U:%G:%a \"$ARCUS_INSTALL_STAGE\")\" = root:root:755",
