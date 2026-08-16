@@ -308,6 +308,16 @@ owns only its writable state directories. The workflow never starts or
 restarts a service/timer and never invokes the installed binary. Scheduling
 and manual one-shot approval therefore remain separate operator actions.
 
+The unattended probe's current unit definitions are source-controlled as
+`deploy/arcus-spot-live-tick.service` and
+`deploy/arcus-spot-live-tick.timer`. The separate
+`deploy-arcus-spot-live-tick.yml` workflow validates and installs those
+definitions from an immutable, checksummed release. It may reload systemd only
+when their contents change, but it preserves and verifies the timer's observed
+active/enabled state; it never enables, disables, starts, stops, or restarts
+the timer/service and never invokes the executor. A new host therefore remains
+inactive until an operator makes a separate, explicit activation decision.
+
 `arcus-spot-runtime` is deliberately excluded. It remains the deterministic
 archive replay CLI below; if it later gains a distinct live-daemon role, add a
 separate artifact and lifecycle only when that runtime contract exists.

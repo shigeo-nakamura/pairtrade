@@ -1,0 +1,12 @@
+[Unit]
+Description=Run arcus-spot-live-tick every 15 minutes (matches the archival recorder cadence the signal window's calibration assumes)
+
+[Timer]
+OnCalendar=*-*-* *:02,17,32,47:00 UTC
+AccuracySec=15s
+RandomizedDelaySec=20s
+Persistent=true
+Unit=arcus-spot-live-tick.service
+
+[Install]
+WantedBy=timers.target

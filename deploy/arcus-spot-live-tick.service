@@ -1,0 +1,17 @@
+[Unit]
+Description=Arcus Spot live-tick (one strategy-signal evaluation, dispatches only on WouldRotate)
+Documentation=https://github.com/shigeo-nakamura/pairtrade/blob/master/docs/arcus-spot-runtime.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=arcus
+Group=arcus
+ExecStart=/usr/local/bin/arcus-spot-execute-once live-tick /etc/arcus-spot/config.yaml
+# KMS calls need AWS creds; this host's instance profile already grants them
+# (same as the one-swap acceptance test). No secret is embedded here.
+TimeoutStartSec=90
+# A single slow/failed tick must not cascade into a restart storm; the
+# timer's own cadence is the retry mechanism.
+Restart=no

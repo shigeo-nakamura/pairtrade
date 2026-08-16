@@ -1,0 +1,193 @@
+name: Deploy Arcus Spot live-tick lifecycle
+
+# bot-strategy#758: source-controlled unit installation only. This workflow
+# never enables, disables, starts, stops, or restarts the timer/service and
+# never invokes the executor. It preserves the lifecycle state it observes.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/deploy-arcus-spot-live-tick.yml"
+      - "deploy/arcus-spot-live-tick.service"
+      - "deploy/arcus-spot-live-tick.timer"
+      - "scripts/install_arcus_spot_live_tick_units.sh"
+      - "scripts/test_install_arcus_spot_live_tick_units.sh"
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/deploy-arcus-spot-live-tick.yml"
+      - "deploy/arcus-spot-live-tick.service"
+      - "deploy/arcus-spot-live-tick.timer"
+      - "scripts/install_arcus_spot_live_tick_units.sh"
+      - "scripts/test_install_arcus_spot_live_tick_units.sh"
+  workflow_dispatch:
+
+concurrency:
+  group: arcus-spot-live-tick-lifecycle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  ARCUS_INSTANCE_ID: i-0cb942c2950be020f
+  ARCUS_S3_PREFIX: arcus-spot-execute-once/lifecycle
+  PROVENANCE_DIR: /usr/local/share/arcus-spot-live-tick
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pairtrade
+        uses: actions/checkout@v5
+
+      - name: Validate lifecycle artifacts
+        run: |
+          bash -n scripts/install_arcus_spot_live_tick_units.sh
+          bash -n scripts/test_install_arcus_spot_live_tick_units.sh
+          bash scripts/test_install_arcus_spot_live_tick_units.sh
+          sudo install -m 0755 /bin/true /usr/local/bin/arcus-spot-execute-once
+          systemd-analyze verify \
+            deploy/arcus-spot-live-tick.service \
+            deploy/arcus-spot-live-tick.timer
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+    environment: debot
+    steps:
+      - name: Checkout pairtrade
+        uses: actions/checkout@v5
+
+      - name: Package immutable lifecycle release
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 0644 deploy/arcus-spot-live-tick.service dist/arcus-spot-live-tick.service
+          install -m 0644 deploy/arcus-spot-live-tick.timer dist/arcus-spot-live-tick.timer
+          install -m 0755 scripts/install_arcus_spot_live_tick_units.sh dist/install_arcus_spot_live_tick_units.sh
+          SERVICE_SHA256=$(sha256sum dist/arcus-spot-live-tick.service | cut -d ' ' -f1)
+          TIMER_SHA256=$(sha256sum dist/arcus-spot-live-tick.timer | cut -d ' ' -f1)
+          INSTALLER_SHA256=$(sha256sum dist/install_arcus_spot_live_tick_units.sh | cut -d ' ' -f1)
+          BUNDLE_SHA256=$(printf '%s\n%s\n%s\n' "$SERVICE_SHA256" "$TIMER_SHA256" "$INSTALLER_SHA256" | sha256sum | cut -d ' ' -f1)
+          jq -n \
+            --arg pairtrade_sha "$GITHUB_SHA" \
+            --arg service_sha256 "$SERVICE_SHA256" \
+            --arg timer_sha256 "$TIMER_SHA256" \
+            --arg installer_sha256 "$INSTALLER_SHA256" \
+            --arg bundle_sha256 "$BUNDLE_SHA256" \
+            --arg github_run_id "$GITHUB_RUN_ID" \
+            --arg github_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{schema_version: 1, artifact: "arcus-spot-live-tick-lifecycle", pairtrade_sha: $pairtrade_sha, service_sha256: $service_sha256, timer_sha256: $timer_sha256, installer_sha256: $installer_sha256, bundle_sha256: $bundle_sha256, github_run_id: $github_run_id, github_run_attempt: $github_run_attempt}' \
+            > dist/manifest.json
+          (cd dist && sha256sum \
+            arcus-spot-live-tick.service \
+            arcus-spot-live-tick.timer \
+            install_arcus_spot_live_tick_units.sh \
+            manifest.json > release.sha256)
+          RELEASE_SHA256=$(sha256sum dist/release.sha256 | cut -d ' ' -f1)
+          RELEASE_ID="${BUNDLE_SHA256}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RELEASE_KEY="${ARCUS_S3_PREFIX}/releases/${GITHUB_SHA}/${BUNDLE_SHA256}/runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "release_sha256=$RELEASE_SHA256" >> "$GITHUB_OUTPUT"
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "release_key=$RELEASE_KEY" >> "$GITHUB_OUTPUT"
+          jq . dist/manifest.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload immutable lifecycle release
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          RELEASE_KEY: ${{ steps.package.outputs.release_key }}
+        run: |
+          set -euo pipefail
+          for file in \
+            arcus-spot-live-tick.service \
+            arcus-spot-live-tick.timer \
+            install_arcus_spot_live_tick_units.sh \
+            manifest.json \
+            release.sha256; do
+            aws s3 cp --only-show-errors "dist/$file" "s3://${S3_BUCKET}/${RELEASE_KEY}/$file"
+          done
+
+      - name: Install definitions via SSM (preserve lifecycle state)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          RELEASE_KEY: ${{ steps.package.outputs.release_key }}
+          RELEASE_ID: ${{ steps.package.outputs.release_id }}
+          RELEASE_SHA256: ${{ steps.package.outputs.release_sha256 }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/ssm-params.json <<'JSON'
+          {
+            "commands": [
+              "set -eu",
+              "ARCUS_STAGE=$(mktemp -d /tmp/arcus-spot-live-tick.XXXXXX)",
+              "trap 'rm -rf \"$ARCUS_STAGE\"' EXIT",
+              "for file in arcus-spot-live-tick.service arcus-spot-live-tick.timer install_arcus_spot_live_tick_units.sh manifest.json release.sha256; do aws s3 cp --only-show-errors s3://__S3_BUCKET__/__RELEASE_KEY__/$file \"$ARCUS_STAGE/$file\"; done",
+              "echo \"__RELEASE_SHA256__  $ARCUS_STAGE/release.sha256\" | sha256sum -c -",
+              "chmod 0755 \"$ARCUS_STAGE/install_arcus_spot_live_tick_units.sh\"",
+              "sudo env PROVENANCE_DIR=__PROVENANCE_DIR__ bash \"$ARCUS_STAGE/install_arcus_spot_live_tick_units.sh\" \"$ARCUS_STAGE\" __RELEASE_ID__"
+            ],
+            "executionTimeout": ["300"]
+          }
+          JSON
+          sed -i \
+            -e "s|__S3_BUCKET__|${S3_BUCKET}|g" \
+            -e "s|__RELEASE_KEY__|${RELEASE_KEY}|g" \
+            -e "s|__RELEASE_SHA256__|${RELEASE_SHA256}|g" \
+            -e "s|__PROVENANCE_DIR__|${PROVENANCE_DIR}|g" \
+            -e "s|__RELEASE_ID__|${RELEASE_ID}|g" \
+            /tmp/ssm-params.json
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$ARCUS_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Install Arcus live-tick unit definitions without lifecycle changes (bot-strategy#758)" \
+            --parameters file:///tmp/ssm-params.json \
+            --timeout-seconds 120 \
+            --query Command.CommandId --output text)
+          deadline=$(( $(date +%s) + 900 ))
+          while :; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$ARCUS_INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$ARCUS_INSTANCE_ID" \
+                  --output text
+                exit 0
+                ;;
+              Cancelled|Cancelling|TimedOut|Failed)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$ARCUS_INSTANCE_ID" \
+                  --output text || true
+                echo "::error::SSM lifecycle install finished with status $STATUS"
+                exit 1
+                ;;
+              Pending|InProgress|Delayed) ;;
+              *) echo "Unexpected SSM status: $STATUS" ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$ARCUS_INSTANCE_ID" \
+                --output text || true
+              echo "::error::SSM lifecycle install polling timed out (last status: $STATUS)"
+              exit 1
+            fi
+            sleep 15
+          done
