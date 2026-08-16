@@ -36,6 +36,14 @@ def utc_stamp(timestamp_ms: int | None) -> str:
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).isoformat()
 
 
+def timestamp_in_datetime_range(timestamp_ms: int) -> bool:
+    try:
+        datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return False
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dumps", nargs="+", type=Path)
@@ -93,10 +101,18 @@ def main() -> int:
                 try:
                     row = json.loads(line)
                     timestamp = int(row["timestamp"])
+                    if not timestamp_in_datetime_range(timestamp):
+                        raise ValueError("timestamp is outside the datetime range")
                     prices = row["prices"]
                     if not isinstance(prices, dict):
                         raise TypeError("prices must be an object")
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    OverflowError,
+                    json.JSONDecodeError,
+                ):
                     invalid_json += 1
                     for symbol in list(run_start):
                         reset_run(symbol)

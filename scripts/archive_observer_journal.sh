@@ -90,6 +90,7 @@ counts = {
 }
 first = None
 last = None
+metric_stamps = []
 
 with open(raw_path, encoding="utf-8", errors="replace") as src, open(
     log_path, "w", encoding="utf-8"
@@ -103,21 +104,35 @@ with open(raw_path, encoding="utf-8", errors="replace") as src, open(
             continue
         dst.write(line)
         counts["selected_lines"] += 1
-        counts["metrics_lines"] += "[METRICS]" in line
+        is_metrics = "[METRICS]" in line
+        counts["metrics_lines"] += is_metrics
         counts["entry_lines"] += "[ENTRY]" in line
         counts["exit_lines"] += "[EXIT]" in line or "[CLOSE]" in line
         counts["warning_lines"] += "[WARN]" in line
         counts["error_lines"] += "[ERROR]" in line
         first = stamp if first is None else min(first, stamp)
         last = stamp if last is None else max(last, stamp)
+        if is_metrics:
+            metric_stamps.append(stamp)
 
-# METRICS normally arrive every five minutes. A selected event in the first
-# and last ten minutes is therefore a simple, auditable completeness guard.
+# METRICS normally arrive every five minutes. Require metrics near both day
+# boundaries and reject any gap longer than two expected intervals.
+metric_stamps.sort()
+first_metrics = metric_stamps[0] if metric_stamps else None
+last_metrics = metric_stamps[-1] if metric_stamps else None
+metrics_gaps = [
+    (current - previous).total_seconds()
+    for previous, current in zip(metric_stamps, metric_stamps[1:])
+]
+max_metrics_gap_secs = max(metrics_gaps) if metrics_gaps else None
+metrics_gap_limit_secs = 10 * 60
 complete = bool(
-    first
-    and last
-    and first <= day + timedelta(minutes=10)
-    and last >= day_end - timedelta(minutes=10)
+    first_metrics
+    and last_metrics
+    and first_metrics <= day + timedelta(minutes=10)
+    and last_metrics >= day_end - timedelta(minutes=10)
+    and max_metrics_gap_secs is not None
+    and max_metrics_gap_secs <= metrics_gap_limit_secs
 )
 manifest = {
     "date_utc": date_s,
@@ -125,6 +140,10 @@ manifest = {
     "service": service,
     "first_selected_event_utc": first.isoformat() if first else None,
     "last_selected_event_utc": last.isoformat() if last else None,
+    "first_metrics_event_utc": first_metrics.isoformat() if first_metrics else None,
+    "last_metrics_event_utc": last_metrics.isoformat() if last_metrics else None,
+    "max_metrics_gap_secs": max_metrics_gap_secs,
+    "metrics_gap_limit_secs": metrics_gap_limit_secs,
     "complete_day": complete,
     **counts,
 }
@@ -149,6 +168,6 @@ echo "[archive_observer_journal]   $MANIFEST_KEY"
 
 COMPLETE_DAY=$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["complete_day"]).lower())' "$WORK/manifest.json")
 if [ "$COMPLETE_DAY" != true ] && [ "$ALLOW_PARTIAL_DAY" != true ]; then
-    echo "ERROR: selected journal does not cover the full UTC day; artifacts were uploaded with complete_day=false" >&2
+    echo "ERROR: journal fails the full-day metrics cadence check; artifacts were uploaded with complete_day=false" >&2
     exit 1
 fi
