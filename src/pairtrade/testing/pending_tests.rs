@@ -1,3 +1,4 @@
+use super::config::PairSpec;
 use super::engine::placement::ReissuePartialLegsRequest;
 use super::pnl_log::PnlLogger;
 use super::state::{PendingLeg, PendingOrders};
@@ -17,6 +18,13 @@ use std::time::Instant;
 
 fn dec(value: &str) -> Decimal {
     Decimal::from_str(value).unwrap()
+}
+
+fn set_btc_eth_universe(engine: &mut PairTradeEngine) {
+    engine.cfg.universe = vec![PairSpec {
+        base: "BTC".to_string(),
+        quote: "ETH".to_string(),
+    }];
 }
 
 /// Per-call record captured by the test-only `DummyConnector`:
@@ -44,6 +52,7 @@ pub(in crate::pairtrade) struct DummyConnector {
     positions_calls: AtomicUsize,
     close_all_calls: AtomicUsize,
     cancel_all_calls: AtomicUsize,
+    cancel_all_symbols: Mutex<Vec<Option<String>>>,
     /// bot-strategy#487: positions get_positions returns, and the venue
     /// min order size get_ticker advertises, so the startup force-close
     /// dust filter can be exercised. `close_all_positions` clears the
@@ -392,8 +401,9 @@ impl DexConnector for DummyConnector {
         Ok(())
     }
 
-    async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
+    async fn cancel_all_orders(&self, symbol: Option<String>) -> Result<(), DexError> {
         self.cancel_all_calls.fetch_add(1, Ordering::SeqCst);
+        self.cancel_all_symbols.lock().unwrap().push(symbol);
         Ok(())
     }
 
@@ -2379,6 +2389,79 @@ async fn force_close_on_startup_dry_run_skips_connector_calls() {
     );
 }
 
+/// bot-strategy#799: startup cleanup belongs only to the configured pair
+/// universe. An unrelated HYPE position on a shared account must abort
+/// startup before either account-wide cancellation or a close request can
+/// mutate the external actor's state.
+#[tokio::test]
+async fn force_close_on_startup_rejects_unexpected_position_without_mutation() {
+    let connector = Arc::new(DummyConnector::default());
+    *connector.positions_to_return.lock().unwrap() = vec![PositionSnapshot {
+        symbol: "HYPE".to_string(),
+        size: dec("76.627"),
+        sign: -1,
+        entry_price: Some(dec("57.01")),
+    }];
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    set_btc_eth_universe(&mut engine);
+    engine.cfg.dry_run = false;
+    engine.cfg.startup_force_close_wait_secs = 0;
+    engine.cfg.startup_force_close_attempts = 1;
+
+    let err = engine.force_close_on_startup().await.unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("unexpected positions"), "{message}");
+    assert!(message.contains("HYPE"), "{message}");
+    assert_eq!(
+        connector.cancel_all_calls.load(Ordering::SeqCst),
+        0,
+        "unexpected position must abort before order cancellation"
+    );
+    assert_eq!(
+        connector.close_all_calls.load(Ordering::SeqCst),
+        0,
+        "unexpected position must never be closed"
+    );
+    assert_eq!(
+        connector.positions_to_return.lock().unwrap().len(),
+        1,
+        "the external position must remain untouched"
+    );
+}
+
+/// Codex review PR #194: after preflight and close attempts, startup must
+/// fail closed when the final exchange snapshot is unavailable.
+#[tokio::test]
+async fn force_close_on_startup_rejects_unavailable_final_snapshot() {
+    let connector = Arc::new(DummyConnector::default());
+    *connector.positions_to_return.lock().unwrap() = vec![PositionSnapshot {
+        symbol: "BTC".to_string(),
+        size: dec("0.25"),
+        sign: 1,
+        entry_price: Some(dec("100000")),
+    }];
+    // Call 1 is the preflight and call 2 is the only close attempt. The final
+    // verification read (call 3) then fails.
+    *connector.positions_fail_after_calls.lock().unwrap() = Some(2);
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    set_btc_eth_universe(&mut engine);
+    engine.cfg.dry_run = false;
+    engine.cfg.startup_force_close_wait_secs = 0;
+    engine.cfg.startup_force_close_attempts = 1;
+
+    let err = engine.force_close_on_startup().await.unwrap_err();
+
+    let message = err.to_string();
+    assert!(
+        message.contains("could not verify final positions"),
+        "{message}"
+    );
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 1);
+}
+
 /// bot-strategy#487: a position below the venue min order size (0.00001
 /// BTC vs Extended's 0.0001 min) can never be submitted to
 /// `close_all_positions` — the connector rejects sub-min sizes — so the
@@ -2396,6 +2479,7 @@ async fn force_close_on_startup_skips_sub_min_dust() {
     *connector.min_order_to_return.lock().unwrap() = Some(dec("0.0001"));
 
     let mut engine = PairTradeEngine::test_instance(connector.clone());
+    set_btc_eth_universe(&mut engine);
     engine.cfg.dry_run = false;
     engine.cfg.startup_force_close_wait_secs = 0;
     engine.cfg.startup_force_close_attempts = 1;
@@ -2423,6 +2507,7 @@ async fn force_close_on_startup_closes_above_min_position() {
     *connector.min_order_to_return.lock().unwrap() = Some(dec("0.0001"));
 
     let mut engine = PairTradeEngine::test_instance(connector.clone());
+    set_btc_eth_universe(&mut engine);
     engine.cfg.dry_run = false;
     engine.cfg.startup_force_close_wait_secs = 0;
     engine.cfg.startup_force_close_attempts = 1;
@@ -2432,6 +2517,11 @@ async fn force_close_on_startup_closes_above_min_position() {
     assert!(
         connector.close_all_calls.load(Ordering::SeqCst) >= 1,
         "an above-min position must be submitted to close_all_positions"
+    );
+    assert_eq!(
+        *connector.cancel_all_symbols.lock().unwrap(),
+        vec![Some("BTC".to_string()), Some("ETH".to_string())],
+        "startup cancellation must be scoped to configured symbols"
     );
 }
 
@@ -2462,6 +2552,7 @@ async fn force_close_on_startup_closes_real_leg_despite_dust() {
     *connector.min_order_to_return.lock().unwrap() = Some(dec("0.0001"));
 
     let mut engine = PairTradeEngine::test_instance(connector.clone());
+    set_btc_eth_universe(&mut engine);
     engine.cfg.dry_run = false;
     engine.cfg.startup_force_close_wait_secs = 0;
     engine.cfg.startup_force_close_attempts = 1;
