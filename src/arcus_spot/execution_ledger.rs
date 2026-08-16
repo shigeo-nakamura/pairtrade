@@ -543,22 +543,47 @@ impl ArcusSpotExecutionLedgerStore {
         &self,
         lock_namespace: &Path,
     ) -> Result<ArcusSpotExecutionLedgerLock> {
+        self.acquire_lock(lock_namespace, true)
+    }
+
+    /// Claim an already-provisioned executor lock without creating any file.
+    /// Operator read-only inspection may run as root; allowing that path to
+    /// create a missing lock would leave a root-owned mode-0600 file that the
+    /// `arcus` service identity could not open on its next tick.
+    pub fn acquire_existing_exclusive_lock(
+        &self,
+        lock_namespace: &Path,
+    ) -> Result<ArcusSpotExecutionLedgerLock> {
+        self.acquire_lock(lock_namespace, false)
+    }
+
+    fn acquire_lock(
+        &self,
+        lock_namespace: &Path,
+        create: bool,
+    ) -> Result<ArcusSpotExecutionLedgerLock> {
         let parent = lock_namespace
             .parent()
             .context("Arcus execution lock namespace has no parent")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+        if create {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
         let file_name = lock_namespace
             .file_name()
             .and_then(|name| name.to_str())
             .context("Arcus execution lock namespace has no valid file name")?;
         let lock_path = parent.join(format!(".{file_name}.lock"));
-        let file = OpenOptions::new()
-            .create(true)
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        if create {
+            options.create(true);
+        }
+        let file = options
             .open(&lock_path)
             .with_context(|| format!("failed to open Arcus ledger lock {}", lock_path.display()))?;
         let metadata = file.metadata().with_context(|| {
@@ -588,6 +613,25 @@ impl ArcusSpotExecutionLedgerStore {
             self.persist(&ledger)?;
             return Ok(ledger);
         }
+        let mut ledger = self.load_existing()?;
+        if ledger.recover_after_restart(now) {
+            self.persist(&ledger)?;
+        }
+        Ok(ledger)
+    }
+
+    /// Load and validate an existing ledger without first-run creation or
+    /// restart recovery. In particular, a `Dispatching` attempt stays
+    /// byte-for-byte untouched rather than being rewritten to `Unknown`.
+    /// This is the read-only primitive used by state backup and rollback
+    /// verification tooling.
+    pub fn load_existing(&self) -> Result<ArcusSpotExecutionLedger> {
+        if !self.path.exists() {
+            bail!(
+                "Arcus execution ledger {} does not exist",
+                self.path.display()
+            );
+        }
         let metadata = fs::symlink_metadata(&self.path)
             .with_context(|| format!("failed to inspect {}", self.path.display()))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -604,12 +648,9 @@ impl ArcusSpotExecutionLedgerStore {
         }
         let bytes = fs::read(&self.path)
             .with_context(|| format!("failed to read {}", self.path.display()))?;
-        let mut ledger: ArcusSpotExecutionLedger = serde_json::from_slice(&bytes)
+        let ledger: ArcusSpotExecutionLedger = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid ledger {}", self.path.display()))?;
         ledger.validate()?;
-        if ledger.recover_after_restart(now) {
-            self.persist(&ledger)?;
-        }
         Ok(ledger)
     }
 
@@ -931,6 +972,23 @@ mod tests {
     }
 
     #[test]
+    fn existing_lock_acquisition_does_not_create_a_missing_lock() {
+        let dir = tempdir().unwrap();
+        let namespace = dir.path().join("runtime-state.json");
+        let lock_path = dir.path().join(".runtime-state.json.lock");
+        let store = ArcusSpotExecutionLedgerStore::new(dir.path().join("ledger.json"));
+
+        assert!(store.acquire_existing_exclusive_lock(&namespace).is_err());
+        assert!(!lock_path.exists());
+
+        let initial = store.acquire_exclusive_lock(&namespace).unwrap();
+        drop(initial);
+        let existing = store.acquire_existing_exclusive_lock(&namespace).unwrap();
+        drop(existing);
+        assert!(lock_path.exists());
+    }
+
+    #[test]
     fn store_round_trip_preserves_and_recovers_state() {
         let dir = tempdir().unwrap();
         let store = ArcusSpotExecutionLedgerStore::new(dir.path().join("ledger.json"));
@@ -958,6 +1016,46 @@ mod tests {
             fs::metadata(store.path()).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+    #[test]
+    fn load_existing_is_read_only_and_does_not_apply_restart_recovery() {
+        let dir = tempdir().unwrap();
+        let store = ArcusSpotExecutionLedgerStore::new(dir.path().join("ledger.json"));
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.mark_dispatching(now).unwrap();
+        store.persist(&ledger).unwrap();
+        let before = fs::read(store.path()).unwrap();
+
+        let inspected = store.load_existing().unwrap();
+
+        assert_eq!(
+            inspected.active.as_ref().unwrap().phase,
+            ArcusSpotExecutionPhase::Dispatching
+        );
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn load_existing_refuses_missing_ledger_without_creating_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let store = ArcusSpotExecutionLedgerStore::new(path.clone());
+
+        let error = store.load_existing().unwrap_err();
+
+        assert!(error.to_string().contains("does not exist"));
+        assert!(!path.exists());
     }
     #[test]
     fn store_rejects_group_readable_ledger() {

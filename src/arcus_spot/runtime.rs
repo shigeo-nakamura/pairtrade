@@ -154,6 +154,14 @@ pub struct ArcusSpotRuntimeState {
     pub inventory: ArcusSpotInventory,
     pub regime: ArcusSpotRegime,
     pub relative_log_price_history: Vec<f64>,
+    /// Reference prices from the last structurally valid observation. These
+    /// make the absolute scale behind the relative-log-price signal durable,
+    /// so restart/rollback acceptance can independently reapply configured
+    /// USD-notional sizing instead of trusting a pending plan's quantities.
+    #[serde(default)]
+    pub last_token_a_reference_price_usd: Option<Decimal>,
+    #[serde(default)]
+    pub last_token_b_reference_price_usd: Option<Decimal>,
     /// `collection_finished_at` of the last snapshot `step_at` genuinely
     /// advanced on (not one it recognized as a repeat of this same field,
     /// and not one it rejected as structurally invalid before validating
@@ -208,6 +216,8 @@ impl ArcusSpotRuntimeState {
             inventory,
             regime: ArcusSpotRegime::Neutral,
             relative_log_price_history: Vec::new(),
+            last_token_a_reference_price_usd: None,
+            last_token_b_reference_price_usd: None,
             last_observation_at: None,
             last_rotation_at: None,
             rotated_quantity: None,
@@ -301,6 +311,18 @@ impl ArcusSpotRuntime {
         {
             return Err("restored Arcus price history contains a non-finite value".to_string());
         }
+        match (
+            state.last_token_a_reference_price_usd,
+            state.last_token_b_reference_price_usd,
+        ) {
+            (None, None) => {}
+            (Some(token_a), Some(token_b))
+                if token_a > Decimal::ZERO && token_b > Decimal::ZERO => {}
+            (Some(_), Some(_)) => {
+                return Err("restored Arcus reference prices must be positive".to_string())
+            }
+            _ => return Err("restored Arcus reference prices must be present together".to_string()),
+        }
         match state.regime {
             ArcusSpotRegime::Neutral if state.rotated_quantity.is_some() => {
                 return Err("neutral restored Arcus state has a rotated quantity".to_string())
@@ -328,6 +350,32 @@ impl ArcusSpotRuntime {
 
     pub fn state(&self) -> &ArcusSpotRuntimeState {
         &self.state
+    }
+
+    /// Re-evaluate the neutral-regime entry direction for one prospective
+    /// relative-log-price sample without mutating the runtime. Rollback
+    /// continuity verification uses this to prove that an archived entry
+    /// fill was preceded by the same signal crossing the live planner uses.
+    #[cfg(feature = "arcus-spot-live")]
+    pub fn entry_direction_for_signal_sample(
+        &self,
+        relative_log_price: f64,
+    ) -> Option<ArcusSpotDirection> {
+        if self.state.regime != ArcusSpotRegime::Neutral || self.state.risk_halt.is_some() {
+            return None;
+        }
+        let score = z_score(
+            &self.state.relative_log_price_history,
+            relative_log_price,
+            self.config.min_signal_samples,
+        )?;
+        if score >= self.config.entry_z_score {
+            Some(ArcusSpotDirection::TokenAToTokenB)
+        } else if score <= -self.config.entry_z_score {
+            Some(ArcusSpotDirection::TokenBToTokenA)
+        } else {
+            None
+        }
     }
 
     /// Reject a plan whose trigger/direction can't possibly be committed
@@ -580,6 +628,8 @@ impl ArcusSpotRuntime {
         // reason (e.g. RouteUnavailable) -- advance the watermark now,
         // not conditioned on anything past this point.
         self.state.last_observation_at = Some(snapshot.collection_finished_at);
+        self.state.last_token_a_reference_price_usd = Some(price.token_a_price_usd);
+        self.state.last_token_b_reference_price_usd = Some(price.token_b_price_usd);
 
         let equity_before = match inventory_before
             .checked_value_usd(price.token_a_price_usd, price.token_b_price_usd)

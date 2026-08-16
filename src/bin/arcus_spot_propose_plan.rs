@@ -25,13 +25,16 @@ use debot::arcus_spot::{
     replay_jsonl, ArcusSpotDecision, ArcusSpotExecutionLedgerStore, ArcusSpotRuntime,
     ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode,
 };
-use dex_connector::{ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig};
-use serde::Deserialize;
+use dex_connector::{
+    ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig,
+    ArcusSpotRecorderSnapshot,
+};
+use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     fs::OpenOptions,
     io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -78,6 +81,189 @@ struct ArcusSpotProposeConfig {
     runtime_state_path: PathBuf,
 }
 
+const OBSERVATION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotObservationEvidence {
+    schema_version: u32,
+    evaluation_time: chrono::DateTime<Utc>,
+    snapshot: ArcusSpotRecorderSnapshot,
+    resulting_runtime: ArcusSpotObservationBoundary,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotObservationBoundary {
+    sequence: u64,
+    last_observation_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn observation_evidence_path(runtime_state_path: &Path) -> Result<PathBuf> {
+    let parent = runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(parent.join("live-tick-observation-evidence.json"))
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !matches!(
+                    normalized.components().next_back(),
+                    None | Some(std::path::Component::RootDir)
+                        | Some(std::path::Component::Prefix(_))
+                ) {
+                    normalized.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Canonicalize the longest existing prefix, preserving not-yet-created
+/// suffixes so aliases through symlinked parents and `..` are still detected.
+fn resolve_path_for_collision_check(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut pending_components: Vec<&std::ffi::OsStr> = Vec::new();
+    let canonical_ancestor = loop {
+        match fs::canonicalize(ancestor) {
+            Ok(canonical) => break canonical,
+            Err(_) => match (ancestor.file_name(), ancestor.parent()) {
+                (Some(name), Some(next)) => {
+                    pending_components.push(name);
+                    ancestor = next;
+                }
+                _ => return lexically_normalize(path),
+            },
+        }
+    };
+    let mut combined = canonical_ancestor;
+    for component in pending_components.into_iter().rev() {
+        combined.push(component);
+    }
+    lexically_normalize(&combined)
+}
+
+fn paths_alias(left: &Path, right: &Path) -> bool {
+    if resolve_path_for_collision_check(left) == resolve_path_for_collision_check(right) {
+        return true;
+    }
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+fn validate_runtime_state_path(runtime_state_path: &Path) -> Result<()> {
+    if !runtime_state_path.is_absolute() {
+        bail!("Arcus runtime_state_path must be absolute");
+    }
+    let evidence_path = observation_evidence_path(runtime_state_path)?;
+    if paths_alias(runtime_state_path, &evidence_path) {
+        bail!(
+            "Arcus runtime_state_path must not alias the derived observation evidence path {}",
+            evidence_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_plan_output_path(runtime_state_path: &Path, out_path: &Path) -> Result<()> {
+    let absolute_out = if out_path.is_absolute() {
+        out_path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve the current directory for PLAN_JSON_OUT")?
+            .join(out_path)
+    };
+    let evidence_path = observation_evidence_path(runtime_state_path)?;
+    let parent = runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    let file_name = runtime_state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Arcus runtime_state_path has no valid file name")?;
+    let lock_path = parent.join(format!(".{file_name}.lock"));
+    if paths_alias(&absolute_out, runtime_state_path)
+        || paths_alias(&absolute_out, &evidence_path)
+        || paths_alias(&absolute_out, &lock_path)
+    {
+        bail!(
+            "PLAN_JSON_OUT {} must not alias the Arcus runtime checkpoint, checkpoint lock, or observation evidence",
+            absolute_out.display()
+        );
+    }
+    Ok(())
+}
+
+/// Atomically persist the recorder boundary shared with rollback verification.
+/// This mirrors the checkpoint store's temp-file/rename/fsync sequence so a
+/// reader holding the same namespace lock never sees a partial document.
+fn write_observation_evidence(
+    config: &ArcusSpotProposeConfig,
+    snapshot: ArcusSpotRecorderSnapshot,
+    evaluation_time: chrono::DateTime<Utc>,
+    resulting_runtime: ArcusSpotObservationBoundary,
+) -> Result<()> {
+    let path = observation_evidence_path(&config.runtime_state_path)?;
+    let evidence = ArcusSpotObservationEvidence {
+        schema_version: OBSERVATION_EVIDENCE_SCHEMA_VERSION,
+        evaluation_time,
+        snapshot,
+        resulting_runtime,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&evidence)
+        .context("failed to serialize Arcus observation evidence")?;
+    bytes.push(b'\n');
+
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("observation-evidence"),
+        std::process::id(),
+        stamp,
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+            .with_context(|| format!("failed to create {}", temp.display()))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, &path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                temp.display(),
+            )
+        })?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 fn usage() -> &'static str {
     "usage:
   arcus-spot-propose-plan bootstrap CONFIG_YAML SAMPLES_JSONL
@@ -110,9 +296,7 @@ fn parse_config(path: &Path) -> Result<ArcusSpotProposeConfig> {
         fs::read(path).with_context(|| format!("failed to read config {}", path.display()))?;
     let mut config: ArcusSpotProposeConfig = serde_yaml::from_slice(&bytes)
         .with_context(|| format!("invalid config {}", path.display()))?;
-    if !config.runtime_state_path.is_absolute() {
-        bail!("Arcus runtime_state_path must be absolute");
-    }
+    validate_runtime_state_path(&config.runtime_state_path)?;
     config.runtime.normalize();
     config
         .runtime
@@ -177,6 +361,11 @@ fn bootstrap(config_path: &str, samples_path: &str) -> Result<()> {
 
 async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
     let config = parse_config(Path::new(config_path))?;
+    if let Some(out_path) = out_path {
+        // Validate before taking the lock or modifying checkpoint/evidence.
+        // A later plan write must never truncate either durable state file.
+        validate_plan_output_path(&config.runtime_state_path, Path::new(out_path))?;
+    }
     let _lock = lock_runtime_checkpoint(&config.runtime_state_path)?;
     let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
     let mut runtime = store.load_or_create(&config.runtime)?;
@@ -195,7 +384,24 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
         .context("invalid Arcus recorder configuration")?;
 
     let snapshot = recorder.collect_once().await;
-    let event = runtime.step_at(&snapshot, Utc::now());
+    let previous_sequence = runtime.state().sequence;
+    let evaluation_time = Utc::now();
+    let event = runtime.step_at(&snapshot, evaluation_time);
+
+    // `propose` and `live-tick` are both checkpoint writers. Keep the shared
+    // recovery boundary coherent for either writer so a successful proposal
+    // cannot leave state-backup/state-verify-* rejecting a stale sidecar.
+    if runtime.state().sequence != previous_sequence {
+        write_observation_evidence(
+            &config,
+            snapshot.clone(),
+            evaluation_time,
+            ArcusSpotObservationBoundary {
+                sequence: runtime.state().sequence,
+                last_observation_at: runtime.state().last_observation_at,
+            },
+        )?;
+    }
 
     // step_at mutates sequence/signal-window/risk state on every call, even
     // when it decides not to rotate. Persisting unconditionally -- not just
@@ -368,5 +574,56 @@ runtime_state_path: relative/path.json
             Ok(_) => panic!("expected a relative-path rejection"),
             Err(error) => assert!(error.to_string().contains("must be absolute")),
         }
+    }
+
+    #[test]
+    fn observation_evidence_is_stored_next_to_the_runtime_checkpoint() {
+        let path = observation_evidence_path(Path::new("/var/lib/arcus/runtime.json")).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/var/lib/arcus/live-tick-observation-evidence.json")
+        );
+    }
+
+    #[test]
+    fn plan_output_rejects_checkpoint_and_observation_evidence_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_path = dir.path().join("runtime.json");
+        let evidence_path = observation_evidence_path(&runtime_path).unwrap();
+        let lock_path = dir.path().join(".runtime.json.lock");
+
+        assert!(validate_plan_output_path(&runtime_path, &runtime_path).is_err());
+        assert!(validate_plan_output_path(&runtime_path, &evidence_path).is_err());
+        assert!(validate_plan_output_path(&runtime_path, &lock_path).is_err());
+
+        fs::write(&runtime_path, b"checkpoint").unwrap();
+        let hard_link = dir.path().join("checkpoint-hard-link.json");
+        fs::hard_link(&runtime_path, &hard_link).unwrap();
+        assert!(validate_plan_output_path(&runtime_path, &hard_link).is_err());
+    }
+
+    #[test]
+    fn plan_output_rejects_an_observation_evidence_alias_through_a_symlinked_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&state_dir, &alias_dir).unwrap();
+        let runtime_path = state_dir.join("runtime.json");
+        let aliased_output = alias_dir.join("live-tick-observation-evidence.json");
+
+        let error = validate_plan_output_path(&runtime_path, &aliased_output).unwrap_err();
+        assert!(error.to_string().contains("must not alias"));
+    }
+
+    #[test]
+    fn runtime_checkpoint_rejects_the_derived_observation_evidence_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_path = dir.path().join("live-tick-observation-evidence.json");
+
+        let error = validate_runtime_state_path(&runtime_path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must not alias the derived observation evidence"));
     }
 }

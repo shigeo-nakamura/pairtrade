@@ -235,8 +235,34 @@ checkpoint has moved on -- otherwise an entry could be submitted based on
 a signal state a newer tick has already superseded (Codex P1 follow-up,
 pairtrade#186).
 
-Before dispatching, `live-tick` durably writes the plan it built, at mode
-0600, to `<runtime_state_path's directory>/live-tick-pending-plan.json`.
+For every sequence-advancing observation, including structurally invalid
+`Observe` ticks that cannot advance `last_observation_at`, both `live-tick` and
+`arcus-spot-propose-plan propose` durably write a schema-2 evidence sidecar at
+mode 0600 to
+`<runtime_state_path's directory>/live-tick-observation-evidence.json`. It
+contains the exact recorder snapshot, `step_at` evaluation time, and resulting
+runtime sequence/watermark, so the post-rollback continuity verifier can
+independently replay no-swap signal, invalid-snapshot, reference-price, equity
+and risk state from the pre-start checkpoint. Schema-1 sidecars remain readable
+as an unchanged backup baseline during a rolling upgrade, but continuity
+requires schema 2 for any current sequence advance. Evidence is atomically
+published before its checkpoint; if checkpoint publication fails, state tooling
+recognizes only
+an exactly one-sequence-newer schema-2 sidecar as an orphan and omits it from
+the captured boundary. All other evidence/checkpoint mismatches remain errors.
+
+Before dispatching a rotation, `live-tick` also writes a schema-1 recovery
+envelope, at mode 0600, to
+`<runtime_state_path's directory>/live-tick-pending-plan.json`. The envelope
+contains the plan, the exact recorder snapshot that produced it, and the
+`step_at` evaluation time. `auto-resume` accepts this envelope and extracts
+the plan; standalone operator-supplied plan JSON remains supported by the
+other execution/recovery commands. The preserved snapshot also lets the
+post-rollback continuity verifier recompute route linkage/loss and the full
+plan from the pre-start checkpoint instead of trusting strategy fields
+reported by the candidate binary. Config validation prevents either derived
+sidecar path from aliasing the checkpoint or ledger.
+
 If the process exits after the swap is `Submitted` but before it is
 confirmed, recover with:
 
@@ -274,6 +300,13 @@ residual risk is accepted without further mitigation. Revisit alongside the
 what is currently approved on #772.
 
 ## Traceable executor deployment
+
+The operator procedure for checkpoint/ledger backup, byte-exact binary
+rollback verification, and separately approved post-start continuity evidence
+is documented in [Arcus Spot live-tick state preservation and binary
+rollback](arcus-spot-state-rollback.md). The state tooling is offline and has
+no restore operation; starting the live-tick service remains an explicitly
+approved action because one tick can submit a swap.
 
 `.github/workflows/deploy-arcus-spot-executor.yml` is the aarch64 build and
 install path for `arcus-spot-execute-once`. It runs automatically when Arcus

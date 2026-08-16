@@ -62,6 +62,20 @@ impl ArcusSpotRuntimeCheckpointStore {
         if !self.path.exists() {
             return ArcusSpotRuntime::new(config.clone()).map_err(anyhow::Error::msg);
         }
+        self.load_existing(config)
+    }
+
+    /// Load and validate an already-persisted checkpoint without creating
+    /// or modifying anything. Operator backup/rollback checks must never
+    /// turn a missing checkpoint into a successful first-run state: absence
+    /// is precisely the reset condition those checks are meant to detect.
+    pub fn load_existing(&self, config: &ArcusSpotRuntimeConfig) -> Result<ArcusSpotRuntime> {
+        if !self.path.exists() {
+            bail!(
+                "Arcus runtime checkpoint {} does not exist",
+                self.path.display()
+            );
+        }
         let bytes = read_private_regular_file(&self.path, "runtime checkpoint")?;
         let checkpoint: ArcusSpotRuntimeCheckpoint = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid runtime checkpoint {}", self.path.display()))?;
@@ -204,5 +218,20 @@ mod tests {
                 assert!(error.to_string().contains("does not match approved config"))
             }
         }
+    }
+
+    #[test]
+    fn load_existing_refuses_missing_checkpoint_without_creating_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime.json");
+        let store = ArcusSpotRuntimeCheckpointStore::new(path.clone());
+
+        let error = match store.load_existing(&live_runtime_config()) {
+            Ok(_) => panic!("expected missing checkpoint error"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("does not exist"));
+        assert!(!path.exists());
     }
 }
