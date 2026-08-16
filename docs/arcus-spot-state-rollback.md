@@ -72,7 +72,8 @@ advancement but rejects:
 - a backup that was not neutral with no active attempt, ledger regression,
   changed archived history, or more than one new acceptance attempt;
 - an unresolved/non-reconciled acceptance attempt, or one not bound to the
-  preserved pending plan and its exact reconciled wallet-balance delta;
+  preserved pending plan, its configured-slippage buy floor, and its exact
+  reconciled wallet-balance delta;
 - inventory/regime/rotation/open-quantity/execution-key changes that do not
   exactly equal applying that one reconciled fill to the backup position.
 

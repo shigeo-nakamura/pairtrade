@@ -1033,17 +1033,28 @@ fn reconciled_fill_for_continuity(
     if sold_raw != parse_raw_amount("intent sell amount", &attempt.intent.sell_amount_raw)? {
         bail!("Arcus acceptance sell delta does not match its intent");
     }
-    if bought_raw
-        < parse_raw_amount(
-            "intent minimum buy amount",
-            &attempt.intent.minimum_buy_amount_raw,
-        )?
-    {
-        bail!("Arcus acceptance buy delta is below its signed minimum");
-    }
     let planned_buy_raw = parse_raw_amount("plan buy amount", &plan.buy_amount_raw)?;
     if planned_buy_raw.is_zero() || plan.buy_quantity <= Decimal::ZERO {
         bail!("Arcus acceptance pending plan has an invalid buy quantity");
+    }
+    let intent_minimum = parse_raw_amount(
+        "intent minimum buy amount",
+        &attempt.intent.minimum_buy_amount_raw,
+    )?;
+    let retained_bps = 10_000_u32
+        .checked_sub(config.executor.slippage_bps)
+        .context("Arcus acceptance slippage exceeds 10000 bps")?;
+    let approved_minimum = planned_buy_raw
+        .checked_mul(U256::from(retained_bps))
+        .context("Arcus acceptance approved minimum calculation overflow")?
+        .checked_add(U256::from(9_999_u32))
+        .context("Arcus acceptance approved minimum rounding overflow")?
+        / U256::from(10_000_u32);
+    if intent_minimum < approved_minimum {
+        bail!("Arcus acceptance signed minimum undercuts the pending plan's approved buy floor");
+    }
+    if bought_raw < intent_minimum {
+        bail!("Arcus acceptance buy delta is below its signed minimum");
     }
     let bought_decimal = Decimal::from_str(&bought_raw.to_string())
         .context("Arcus acceptance buy amount exceeds Decimal range")?;
@@ -2598,7 +2609,7 @@ runtime:
                 sell_token: plan.sell_token_address.clone(),
                 buy_token: plan.buy_token_address.clone(),
                 sell_amount_raw: plan.sell_amount_raw.clone(),
-                minimum_buy_amount_raw: "40000000000000000".to_string(),
+                minimum_buy_amount_raw: "49750000000000000".to_string(),
                 plan_config_digest: approval_digest(config, plan).unwrap(),
             },
             pre_balances: ArcusSpotBalanceSnapshot {
@@ -3081,6 +3092,32 @@ runtime:
         assert!(error
             .to_string()
             .contains("position state does not match the reconciled acceptance attempt"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_attempt_below_the_plan_buy_floor() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+        let store = ArcusSpotExecutionLedgerStore::new(&ledger_path);
+        let mut ledger = store.load_existing().unwrap();
+        ledger.history[0].intent.minimum_buy_amount_raw = "1".to_string();
+        store.persist(&ledger).unwrap();
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("undercuts the pending plan's approved buy floor"));
     }
 
     #[test]
