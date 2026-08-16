@@ -22,13 +22,15 @@ instead the manifest binds its canonical SHA-256 digest.
 | Runtime checkpoint | `/var/lib/debot-arcus/spot-execute-once/runtime_state.json` | schema 1; exact runtime config plus signal history, last token A/B reference prices, inventory, regime, risk state and last committed execution key |
 | Execution ledger | `/var/lib/debot-arcus/spot-execute-once/ledger.json` | schema 2; monotonic attempt sequence, immutable archive and any active recovery state |
 | Recovery evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-pending-plan.json` | optional schema-1 envelope: exact plan, recorder snapshot and evaluation time needed by `auto-resume` and continuity verification |
+| Observation evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-observation-evidence.json` | optional schema-1 sidecar: latest accepted recorder snapshot and evaluation time, including no-swap ticks |
 | Namespace lock | `/var/lib/debot-arcus/spot-execute-once/.runtime_state.json.lock` | mode-0600 process lock shared by live-tick, execute/resume, proposer and state tooling |
 
 Checkpoint and ledger stores already use create-new temporary files, file
 `fsync`, atomic rename and parent-directory `fsync`. `live-tick` now writes the
-pending recovery evidence while holding the same checkpoint namespace lock, so
-a backup observes either the previous complete boundary or the next complete
-boundary, never a checkpoint from one tick and a plan from another.
+pending recovery and observation evidence while holding the same checkpoint
+namespace lock, so a backup observes a lock-consistent boundary. Backup schema
+3 hashes and copies both optional sidecars and rejects observation evidence
+whose snapshot watermark does not match the checkpoint.
 
 The state tool uses strict `load_existing` reads. A missing file is an error;
 it is never accepted as first-run state. Ledger inspection does not run the
@@ -46,14 +48,16 @@ arcus-spot-execute-once state-verify-continuity CONFIG_YAML BACKUP_DIR
 
 `state-backup` requires an absolute, nonexistent destination whose parent
 already exists. It takes the existing executor lock, canonically validates the
-checkpoint and ledger, validates the optional pending plan, and publishes a
-mode-0700 directory through a hidden staging directory plus atomic rename.
+checkpoint and ledger, validates the optional recovery/observation evidence,
+and publishes a mode-0700 directory through a hidden staging directory plus
+atomic rename.
 Every copied file and the manifest are mode 0600 and fsynced. The manifest
 records:
 
 - the UTC capture time that opens the approved one-tick verification window;
 - canonical approved-config digest;
-- byte length and SHA-256 of checkpoint, ledger and optional pending plan;
+- byte length and SHA-256 of checkpoint, ledger and both optional evidence
+  sidecars;
 - non-secret continuity summaries (runtime sequence/history/watermark,
   inventory/regime/open quantity, ledger next sequence/archive/active phase).
 
@@ -67,7 +71,9 @@ advancement but rejects:
 - runtime sequence or last-observation regression, more than one observation
   advance, a watermark outside the backup-to-verification window, or
   corruption/removal/reordering of retained signal-history samples (a full
-  window may shift by exactly one sample for the approved tick);
+  window may shift by exactly one sample for the approved tick). A successful
+  no-swap advance must independently replay to `Observe` from its preserved
+  recorder snapshot/evaluation time and exactly reproduce checkpoint state;
 - cumulative-equity baseline changes, mismatched first equity baselines,
   sticky or newly-required risk-halt loss, same-day daily baseline resets,
   UTC rollover days outside the backup-to-verification window, invalid
@@ -120,7 +126,7 @@ in UTC.
    - `runtime.regime: "neutral"`
 
    If either condition is false, wait for normal reconciliation/exit. Do not
-   delete or edit a checkpoint, ledger or pending plan to force the gate.
+   delete or edit a checkpoint, ledger or evidence sidecar to force the gate.
 
 3. Identify three explicit immutable releases: the currently installed
    release, the rollback candidate, and a known-good verifier release. The
@@ -135,8 +141,12 @@ in UTC.
    `last_token_b_reference_price_usd` without dropping them**. Schema-number
    compatibility alone is insufficient: an older schema-1 binary that predates
    those fields is not an eligible live rollback candidate because continuity
-   cannot independently verify its accepted price/equity/notional state. If
-   the candidate release's source/provenance cannot demonstrate that
+   cannot independently verify its accepted price/equity/notional state. The
+   candidate must also write schema-1
+   `live-tick-observation-evidence.json` for every accepted observation before
+   persisting its checkpoint; a binary that only writes the rotation-plan
+   sidecar cannot certify no-swap state. If the candidate release's
+   source/provenance cannot demonstrate that
    capability, use a forward fix. Every state backup or verification below
    runs the manifest-verified
    verifier binary from its immutable release directory, never the mutable
@@ -350,7 +360,8 @@ instance must not be restarted.
   explicit approval, current on-chain balance reconciliation and a new backup
   of the damaged state before replacement.
 - Binary rollback must be forward-compatible with checkpoint schema 1 and
-  ledger schema 2 and must preserve both checkpointed reference-price fields.
+  ledger schema 2, preserve both checkpointed reference-price fields, and
+  write the schema-1 accepted-observation evidence sidecar on every tick.
   If any part of that capability is uncertain, forward-fix the binary.
 
 Evidence to attach to bot-strategy #758 consists of the selected release

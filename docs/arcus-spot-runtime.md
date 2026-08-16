@@ -235,8 +235,15 @@ checkpoint has moved on -- otherwise an entry could be submitted based on
 a signal state a newer tick has already superseded (Codex P1 follow-up,
 pairtrade#186).
 
-Before dispatching, `live-tick` durably writes a schema-1 recovery envelope,
-at mode 0600, to
+For every accepted observation, including `Observe`, `live-tick` durably
+writes a schema-1 evidence sidecar at mode 0600 to
+`<runtime_state_path's directory>/live-tick-observation-evidence.json`. It
+contains the exact recorder snapshot and `step_at` evaluation time, so the
+post-rollback continuity verifier can independently replay no-swap signal,
+reference-price, equity and risk state from the pre-start checkpoint.
+
+Before dispatching a rotation, `live-tick` also writes a schema-1 recovery
+envelope, at mode 0600, to
 `<runtime_state_path's directory>/live-tick-pending-plan.json`. The envelope
 contains the plan, the exact recorder snapshot that produced it, and the
 `step_at` evaluation time. `auto-resume` accepts this envelope and extracts
@@ -244,7 +251,8 @@ the plan; standalone operator-supplied plan JSON remains supported by the
 other execution/recovery commands. The preserved snapshot also lets the
 post-rollback continuity verifier recompute route linkage/loss and the full
 plan from the pre-start checkpoint instead of trusting strategy fields
-reported by the candidate binary.
+reported by the candidate binary. Config validation prevents either derived
+sidecar path from aliasing the checkpoint or ledger.
 
 If the process exits after the swap is `Submitted` but before it is
 confirmed, recover with:

@@ -359,6 +359,14 @@ fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<Pa
     Ok(parent.join("live-tick-pending-plan.json"))
 }
 
+fn live_tick_observation_evidence_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
+    let parent = config
+        .runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(parent.join("live-tick-observation-evidence.json"))
+}
+
 const LIVE_TICK_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
 /// Atomic recovery document written by `live-tick`. Keeping the raw recorder
@@ -372,6 +380,14 @@ struct ArcusSpotLiveTickEvidence {
     evaluation_time: DateTime<Utc>,
     snapshot: ArcusSpotRecorderSnapshot,
     plan: ArcusSpotRotationPlan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotLiveTickObservationEvidence {
+    schema_version: u32,
+    evaluation_time: DateTime<Utc>,
+    snapshot: ArcusSpotRecorderSnapshot,
 }
 
 fn validate_live_tick_evidence_schema(evidence: &ArcusSpotLiveTickEvidence) -> Result<()> {
@@ -407,11 +423,28 @@ fn live_tick_evidence_from_document(
     Ok(evidence)
 }
 
-const STATE_BACKUP_SCHEMA_VERSION: u32 = 2;
+fn observation_evidence_from_document(
+    bytes: &[u8],
+    label: &str,
+) -> Result<ArcusSpotLiveTickObservationEvidence> {
+    let evidence: ArcusSpotLiveTickObservationEvidence =
+        serde_json::from_slice(bytes).with_context(|| format!("invalid {label}"))?;
+    if evidence.schema_version != LIVE_TICK_EVIDENCE_SCHEMA_VERSION {
+        bail!(
+            "unsupported Arcus live-tick observation evidence schema {}; expected {}",
+            evidence.schema_version,
+            LIVE_TICK_EVIDENCE_SCHEMA_VERSION
+        );
+    }
+    Ok(evidence)
+}
+
+const STATE_BACKUP_SCHEMA_VERSION: u32 = 3;
 const STATE_BACKUP_MANIFEST: &str = "manifest.json";
 const STATE_BACKUP_CHECKPOINT: &str = "runtime_state.json";
 const STATE_BACKUP_LEDGER: &str = "ledger.json";
 const STATE_BACKUP_PENDING_PLAN: &str = "live-tick-pending-plan.json";
+const STATE_BACKUP_OBSERVATION_EVIDENCE: &str = "live-tick-observation-evidence.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -452,6 +485,7 @@ struct ArcusSpotStateBackupManifest {
     runtime_checkpoint: ArcusSpotStateBackupFile,
     execution_ledger: ArcusSpotStateBackupFile,
     pending_plan: Option<ArcusSpotStateBackupFile>,
+    observation_evidence: Option<ArcusSpotStateBackupFile>,
     runtime: ArcusSpotRuntimeStateSummary,
     ledger: ArcusSpotLedgerStateSummary,
 }
@@ -460,6 +494,7 @@ struct ArcusSpotStateImage {
     checkpoint_bytes: Vec<u8>,
     ledger_bytes: Vec<u8>,
     pending_plan_bytes: Option<Vec<u8>>,
+    observation_evidence_bytes: Option<Vec<u8>>,
     runtime: ArcusSpotRuntime,
     ledger: ArcusSpotExecutionLedger,
 }
@@ -472,6 +507,7 @@ struct ArcusSpotStateVerificationReport {
     runtime_checkpoint_sha256: String,
     execution_ledger_sha256: String,
     pending_plan_sha256: Option<String>,
+    observation_evidence_sha256: Option<String>,
     runtime: ArcusSpotRuntimeStateSummary,
     ledger: ArcusSpotLedgerStateSummary,
 }
@@ -542,9 +578,30 @@ fn read_optional_private_plan(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-/// Capture the three files that form the live-tick recovery boundary. The
+fn read_optional_private_observation_evidence(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let bytes = read_private_regular_file(path, "Arcus observation evidence")?;
+            observation_evidence_from_document(
+                &bytes,
+                &format!("Arcus observation evidence {}", path.display()),
+            )?;
+            Ok(Some(bytes))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect Arcus observation evidence {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// Capture the files that form the live-tick recovery boundary. The
 /// caller must hold the runtime checkpoint namespace lock so checkpoint,
-/// ledger and pending-plan reads cannot interleave with a legitimate writer.
+/// ledger, pending-plan and observation-evidence reads cannot interleave with
+/// a legitimate writer.
 fn capture_arcus_state(config: &ArcusSpotExecuteOnceConfig) -> Result<ArcusSpotStateImage> {
     let checkpoint_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
@@ -554,10 +611,19 @@ fn capture_arcus_state(config: &ArcusSpotExecuteOnceConfig) -> Result<ArcusSpotS
         read_private_regular_file(&config.runtime_state_path, "Arcus runtime checkpoint")?;
     let ledger_bytes = read_private_regular_file(&config.ledger_path, "Arcus execution ledger")?;
     let pending_plan_bytes = read_optional_private_plan(&live_tick_pending_plan_path(config)?)?;
+    let observation_evidence_bytes =
+        read_optional_private_observation_evidence(&live_tick_observation_evidence_path(config)?)?;
+    if let Some(bytes) = &observation_evidence_bytes {
+        let evidence = observation_evidence_from_document(bytes, "Arcus observation evidence")?;
+        if runtime.state().last_observation_at != Some(evidence.snapshot.collection_finished_at) {
+            bail!("Arcus observation evidence does not match the runtime watermark");
+        }
+    }
     Ok(ArcusSpotStateImage {
         checkpoint_bytes,
         ledger_bytes,
         pending_plan_bytes,
+        observation_evidence_bytes,
         runtime,
         ledger,
     })
@@ -575,6 +641,10 @@ fn manifest_for_state(
         runtime_checkpoint: state_backup_file(&state.checkpoint_bytes),
         execution_ledger: state_backup_file(&state.ledger_bytes),
         pending_plan: state.pending_plan_bytes.as_deref().map(state_backup_file),
+        observation_evidence: state
+            .observation_evidence_bytes
+            .as_deref()
+            .map(state_backup_file),
         runtime: runtime_state_summary(&state.runtime),
         ledger: ledger_state_summary(&state.ledger),
     })
@@ -666,6 +736,9 @@ fn create_arcus_state_backup_with_capture(
         write_new_private_file(&staging.join(STATE_BACKUP_LEDGER), &state.ledger_bytes)?;
         if let Some(bytes) = &state.pending_plan_bytes {
             write_new_private_file(&staging.join(STATE_BACKUP_PENDING_PLAN), bytes)?;
+        }
+        if let Some(bytes) = &state.observation_evidence_bytes {
+            write_new_private_file(&staging.join(STATE_BACKUP_OBSERVATION_EVIDENCE), bytes)?;
         }
         let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
             .context("failed to serialize Arcus state backup manifest")?;
@@ -768,9 +841,33 @@ fn load_arcus_state_backup(
             None
         }
     };
+    let observation_evidence_path = backup_dir.join(STATE_BACKUP_OBSERVATION_EVIDENCE);
+    let observation_evidence_bytes = match &manifest.observation_evidence {
+        Some(expected) => {
+            let bytes = read_private_regular_file(
+                &observation_evidence_path,
+                "backup observation evidence",
+            )?;
+            require_file_matches_manifest(&bytes, expected, "backup observation evidence")?;
+            observation_evidence_from_document(&bytes, "backup observation evidence")?;
+            Some(bytes)
+        }
+        None => {
+            if fs::symlink_metadata(&observation_evidence_path).is_ok() {
+                bail!("backup has an unrecorded observation-evidence file");
+            }
+            None
+        }
+    };
     let runtime = ArcusSpotRuntimeCheckpointStore::new(checkpoint_path)
         .load_existing(&config.runtime)
         .context("backup runtime checkpoint failed canonical validation")?;
+    if let Some(bytes) = &observation_evidence_bytes {
+        let evidence = observation_evidence_from_document(bytes, "backup observation evidence")?;
+        if runtime.state().last_observation_at != Some(evidence.snapshot.collection_finished_at) {
+            bail!("backup observation evidence does not match its runtime watermark");
+        }
+    }
     let ledger = ArcusSpotExecutionLedgerStore::new(ledger_path)
         .load_existing()
         .context("backup execution ledger failed canonical validation")?;
@@ -786,6 +883,7 @@ fn load_arcus_state_backup(
             checkpoint_bytes,
             ledger_bytes,
             pending_plan_bytes,
+            observation_evidence_bytes,
             runtime,
             ledger,
         },
@@ -1502,6 +1600,7 @@ fn require_acceptance_ledger_and_position_continuity(
     baseline: &ArcusSpotStateImage,
     current: &ArcusSpotStateImage,
     runtime_sequence_advance: u64,
+    acceptance_not_before: DateTime<Utc>,
     acceptance_not_after: DateTime<Utc>,
 ) -> Result<()> {
     let baseline_runtime = baseline.runtime.state();
@@ -1532,19 +1631,36 @@ fn require_acceptance_ledger_and_position_continuity(
             if current.pending_plan_bytes != baseline.pending_plan_bytes {
                 bail!("Arcus pending recovery plan changed without an acceptance attempt");
             }
-            if runtime_sequence_advance == 1 {
-                // A full rolling window can append the same value it drops,
-                // leaving its final bytes identical even though the accepted
-                // observation genuinely advanced. The current tail is still
-                // the accepted price ratio in both that case and an ordinary
-                // append; signal-history continuity above already constrains
-                // every retained element and the one-step sequence advance.
-                let signal_sample = current_runtime
-                    .relative_log_price_history
-                    .last()
-                    .copied()
-                    .context("Arcus accepted observation has no signal sample")?;
-                acceptance_reference_prices(baseline_runtime, current_runtime, signal_sample)?;
+            if runtime_sequence_advance == 0 {
+                if current.observation_evidence_bytes != baseline.observation_evidence_bytes {
+                    bail!("Arcus observation evidence changed without a new observation");
+                }
+            } else {
+                let bytes = current
+                    .observation_evidence_bytes
+                    .as_deref()
+                    .context("Arcus accepted no-swap observation has no recorder evidence")?;
+                let evidence = observation_evidence_from_document(
+                    bytes,
+                    "Arcus accepted no-swap observation evidence",
+                )?;
+                if evidence.evaluation_time < acceptance_not_before
+                    || evidence.evaluation_time > acceptance_not_after
+                    || evidence.evaluation_time < evidence.snapshot.collection_finished_at
+                {
+                    bail!("Arcus no-swap recorder evaluation is outside the approved tick window");
+                }
+                let mut replayed =
+                    ArcusSpotRuntime::from_state(config.runtime.clone(), baseline_runtime.clone())
+                        .map_err(anyhow::Error::msg)
+                        .context("failed to reconstruct the Arcus no-swap replay baseline")?;
+                let replayed_event = replayed.step_at(&evidence.snapshot, evidence.evaluation_time);
+                if !matches!(replayed_event.decision, ArcusSpotDecision::Observe { .. }) {
+                    bail!("Arcus no-swap recorder evidence reproduced a rotation decision");
+                }
+                if !runtime_state_matches_replay(replayed.state(), current_runtime) {
+                    bail!("Arcus no-swap runtime state does not match its recorder evidence");
+                }
             }
             if !position_state_matches(baseline_runtime, current_runtime) {
                 bail!("Arcus position state changed without a reconciled acceptance attempt");
@@ -1597,6 +1713,20 @@ fn require_acceptance_ledger_and_position_continuity(
                 plan_bytes,
                 "Arcus acceptance pending runtime plan",
             )?;
+            let observation_bytes = current
+                .observation_evidence_bytes
+                .as_deref()
+                .context("Arcus acceptance attempt has no shared observation evidence")?;
+            let observation_evidence = observation_evidence_from_document(
+                observation_bytes,
+                "Arcus acceptance observation evidence",
+            )?;
+            if observation_evidence.evaluation_time != evidence.evaluation_time
+                || serde_json::to_value(&observation_evidence.snapshot)?
+                    != serde_json::to_value(&evidence.snapshot)?
+            {
+                bail!("Arcus acceptance plan and observation evidence do not match");
+            }
             let plan = evidence.plan.clone();
             if evidence.snapshot.collection_finished_at != accepted_observation_at {
                 bail!("Arcus acceptance recorder evidence does not match the accepted observation");
@@ -1780,6 +1910,7 @@ fn require_arcus_state_continuity(
         baseline,
         current,
         sequence_advance,
+        acceptance_not_before,
         acceptance_not_after,
     )
 }
@@ -1812,6 +1943,16 @@ fn verify_arcus_state_backup(
             (None, None) => {}
             _ => bail!("live pending-plan presence changed since the backup"),
         }
+        match (
+            &manifest.observation_evidence,
+            &current.observation_evidence_bytes,
+        ) {
+            (Some(expected), Some(bytes)) => {
+                require_file_matches_manifest(bytes, expected, "live observation evidence")?
+            }
+            (None, None) => {}
+            _ => bail!("live observation-evidence presence changed since the backup"),
+        }
     } else {
         require_arcus_state_continuity(
             config,
@@ -1828,6 +1969,10 @@ fn verify_arcus_state_backup(
         runtime_checkpoint_sha256: sha256_prefixed(&current.checkpoint_bytes),
         execution_ledger_sha256: sha256_prefixed(&current.ledger_bytes),
         pending_plan_sha256: current.pending_plan_bytes.as_deref().map(sha256_prefixed),
+        observation_evidence_sha256: current
+            .observation_evidence_bytes
+            .as_deref()
+            .map(sha256_prefixed),
         runtime: runtime_state_summary(&current.runtime),
         ledger: ledger_state_summary(&current.ledger),
     })
@@ -1854,7 +1999,7 @@ cannot submit a swap. state-backup takes the same exclusive checkpoint lock
 as live-tick, requires an already-existing valid checkpoint and ledger, and
 publishes a mode-0700 backup directory atomically with mode-0600 copies and a
 SHA-256/config-bound manifest. state-verify-exact proves byte identity while
-the timer remains stopped (including the recovery pending plan, if present).
+the timer remains stopped (including recovery/observation evidence, if present).
 state-verify-continuity is the post-start check: it permits normal checkpoint
 and ledger advancement but refuses sequence/history regression, lost attempts,
 or a position-state change without a corresponding ledger change. Neither
@@ -1874,9 +2019,11 @@ tracked in the checkpointed state so every writer of it -- live-tick and
 arcus-spot-propose-plan alike -- is covered) rejects a snapshot whose
 collection_finished_at is not strictly newer than the last one it actually
 advanced on: re-consuming or reordering an observation would artificially
-reweight the z-score history. Before dispatching, it durably writes the
-plan plus its recorder snapshot and evaluation time to
-<runtime_state_path's directory>/live-tick-pending-plan.json (mode 0600);
+reweight the z-score history. Every accepted observation is durably bound to
+its recorder snapshot and evaluation time in
+<runtime_state_path's directory>/live-tick-observation-evidence.json. Before
+dispatching, it also writes the plan-bearing recovery envelope to
+<runtime_state_path's directory>/live-tick-pending-plan.json (both mode 0600);
 if the process exits after Submitted but before confirmation, recover with
 auto-resume CONFIG_YAML <that path>.
 
@@ -2025,6 +2172,17 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
         bail!(
             "Arcus ledger_path/runtime_state_path must not resolve to the derived live-tick pending-plan path {}",
             pending_plan_path.display()
+        );
+    }
+    let observation_evidence_path =
+        resolve_path_for_collision_check(&live_tick_observation_evidence_path(config)?);
+    if observation_evidence_path == ledger_path
+        || observation_evidence_path == runtime_state_path
+        || observation_evidence_path == pending_plan_path
+    {
+        bail!(
+            "Arcus durable state paths must not resolve to the derived live-tick observation-evidence path {}",
+            observation_evidence_path.display()
         );
     }
     config.runtime.normalize();
@@ -2620,6 +2778,7 @@ async fn main() -> Result<()> {
                 ledger_store_for_checkpoint.acquire_exclusive_lock(&config.runtime_state_path)?;
 
             let mut runtime = store.load_or_create(&config.runtime)?;
+            let previous_observation_at = runtime.state().last_observation_at;
             // step_at itself rejects a snapshot whose collection_finished_at
             // is not strictly newer than the last one it genuinely advanced
             // on -- tracked in the checkpointed state, under this same
@@ -2634,6 +2793,19 @@ async fn main() -> Result<()> {
             // plan to the exact observation it was computed from -- see
             // its use after the lock is re-acquired.
             let plan_observation_at = runtime.state().last_observation_at;
+            if plan_observation_at != previous_observation_at {
+                let observation_evidence = ArcusSpotLiveTickObservationEvidence {
+                    schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+                    evaluation_time,
+                    snapshot: snapshot.clone(),
+                };
+                let bytes = serde_json::to_vec_pretty(&observation_evidence)
+                    .context("failed to serialize Arcus live-tick observation evidence")?;
+                write_private_regular_file_atomic(
+                    &live_tick_observation_evidence_path(&config)?,
+                    &bytes,
+                )?;
+            }
             // Persisted unconditionally, independent of the decision below:
             // the accumulated price-history window is exactly what next
             // tick's signal depends on, and losing a tick's contribution
@@ -3235,6 +3407,38 @@ runtime:
         .unwrap()
     }
 
+    fn no_swap_snapshot(
+        at: DateTime<Utc>,
+        token_a_price: &str,
+        token_b_price: &str,
+    ) -> ArcusSpotRecorderSnapshot {
+        let mut value = serde_json::to_value(accepted_entry_snapshot(at)).unwrap();
+        let overview = value["reference_overview"]["observation"]["payload"]
+            .as_array_mut()
+            .unwrap();
+        overview[0]["quote"]["price"] = json!(token_a_price);
+        overview[1]["quote"]["price"] = json!(token_b_price);
+        value["round_trips"] = json!([]);
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn persist_observation_evidence(
+        config: &ArcusSpotExecuteOnceConfig,
+        snapshot: ArcusSpotRecorderSnapshot,
+        evaluation_time: DateTime<Utc>,
+    ) {
+        let evidence = ArcusSpotLiveTickObservationEvidence {
+            schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+            evaluation_time,
+            snapshot,
+        };
+        write_private_regular_file_atomic(
+            &live_tick_observation_evidence_path(config).unwrap(),
+            &serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn rewrite_checkpoint_state(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -3345,6 +3549,7 @@ runtime:
             &plan_bytes,
         )
         .unwrap();
+        persist_observation_evidence(config, snapshot.clone(), accepted_at);
 
         let ledger_store = ArcusSpotExecutionLedgerStore::new(ledger_path);
         let mut ledger = ledger_store.load_existing().unwrap();
@@ -3464,6 +3669,14 @@ runtime:
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
             state["last_equity_usd"] = json!("98.2399008827070608");
         });
+        let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        persist_observation_evidence(
+            &config,
+            no_swap_snapshot(accepted_at, "200", "176.49938051691913"),
+            accepted_at,
+        );
 
         let exact_error = verify_arcus_state_backup(&config, &backup_dir, true).unwrap_err();
         let continuity = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
@@ -3538,6 +3751,14 @@ runtime:
             state["daily_baseline_equity_usd"] = json!("79.16815349952608352");
             state["last_equity_usd"] = json!("79.16815349952608352");
         });
+        let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        persist_observation_evidence(
+            &config,
+            no_swap_snapshot(accepted_at, "200", "57.300959372038022"),
+            accepted_at,
+        );
 
         let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
 
@@ -3575,6 +3796,14 @@ runtime:
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
             state["last_equity_usd"] = json!("98.2399008827070608");
         });
+        let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        persist_observation_evidence(
+            &config,
+            no_swap_snapshot(accepted_at, "200", "176.49938051691913"),
+            accepted_at,
+        );
 
         let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
 
@@ -3681,6 +3910,14 @@ runtime:
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
             state["last_equity_usd"] = json!("98.2399008827070608");
         });
+        let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T00:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        persist_observation_evidence(
+            &config,
+            no_swap_snapshot(accepted_at, "200", "176.49938051691913"),
+            accepted_at,
+        );
 
         let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
 
@@ -3786,6 +4023,17 @@ runtime:
             state["last_token_b_reference_price_usd"] = json!("529.49814155075739");
             state["last_equity_usd"] = json!("294.7197026481211824");
         });
+        let observed_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let evaluated_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        persist_observation_evidence(
+            &config,
+            no_swap_snapshot(observed_at, "600", "529.49814155075739"),
+            evaluated_at,
+        );
 
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
@@ -3836,10 +4084,60 @@ runtime:
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             state["last_equity_usd"] = json!("95");
         });
+        let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        persist_observation_evidence(
+            &config,
+            no_swap_snapshot(accepted_at, "200", "176.49938051691913"),
+            accepted_at,
+        );
 
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
-        assert!(error.to_string().contains("accepted equity mark"));
+        assert!(error
+            .to_string()
+            .contains("does not match its recorder evidence"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_self_consistent_forged_no_swap_state() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(1);
+            state["relative_log_price_history"] = json!([0.2]);
+            state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+            state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_token_b_reference_price_usd"] = json!("163.7461506155964");
+            state["initial_equity_usd"] = json!("96.199384098495424");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("96.199384098495424");
+            state["last_equity_usd"] = json!("96.199384098495424");
+        });
+        let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        persist_observation_evidence(
+            &config,
+            no_swap_snapshot(accepted_at, "200", "176.49938051691913"),
+            accepted_at,
+        );
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match its recorder evidence"));
     }
 
     #[test]
@@ -4579,7 +4877,7 @@ runtime:
     }
 
     #[test]
-    fn state_backup_includes_and_exactly_verifies_a_pending_recovery_plan() {
+    fn state_backup_includes_and_exactly_verifies_both_evidence_sidecars() {
         let dir = tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.json");
         let runtime_path = dir.path().join("runtime.json");
@@ -4591,6 +4889,17 @@ runtime:
             "100000000000000000",
         );
         persist_initial_operator_state(&config);
+        let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let snapshot = no_swap_snapshot(accepted_at, "200", "176.49938051691913");
+        let runtime_store = ArcusSpotRuntimeCheckpointStore::new(runtime_path.clone());
+        let mut runtime = runtime_store.load_existing(&config.runtime).unwrap();
+        runtime.step_at(&snapshot, accepted_at);
+        runtime_store.persist(&runtime).unwrap();
+        persist_observation_evidence(&config, snapshot, accepted_at);
+        let observation_bytes =
+            fs::read(live_tick_observation_evidence_path(&config).unwrap()).unwrap();
         let plan_bytes = serde_json::to_vec_pretty(&rotation_plan("entry_signal")).unwrap();
         write_private_regular_file_atomic(&pending_path, &plan_bytes).unwrap();
 
@@ -4602,8 +4911,16 @@ runtime:
             sha256_prefixed(&plan_bytes)
         );
         assert_eq!(
+            manifest.observation_evidence.unwrap().sha256,
+            sha256_prefixed(&observation_bytes)
+        );
+        assert_eq!(
             fs::read(backup_dir.join(STATE_BACKUP_PENDING_PLAN)).unwrap(),
             plan_bytes
+        );
+        assert_eq!(
+            fs::read(backup_dir.join(STATE_BACKUP_OBSERVATION_EVIDENCE)).unwrap(),
+            observation_bytes
         );
     }
 
@@ -4632,6 +4949,19 @@ runtime:
         );
         let error = validate_config(&mut config).unwrap_err();
         assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    #[test]
+    fn config_rejects_a_ledger_path_colliding_with_observation_evidence() {
+        let mut config = execute_once_config(
+            "/var/lib/x/live-tick-observation-evidence.json",
+            "/var/lib/x/runtime.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("live-tick observation-evidence path"));
     }
 
     #[test]
