@@ -77,8 +77,9 @@ advancement but rejects:
 - an unresolved/non-reconciled acceptance attempt, or one not bound to the
   preserved pending plan, its configured sell ceiling and slippage buy floor,
   its exact reconciled wallet-balance delta, a genuine entry-signal crossing,
-  the supported entry direction, the strategy rotation-fraction cap, and
-  attempt chronology following the accepted observation;
+  the supported entry direction, configured all-in-cost and strategy
+  rotation/imbalance caps, and attempt chronology following the accepted
+  observation;
 - inventory/regime/rotation/open-quantity/execution-key changes that do not
   exactly equal applying that one reconciled fill to the backup position.
 

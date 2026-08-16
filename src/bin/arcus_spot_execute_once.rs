@@ -1145,6 +1145,7 @@ fn require_acceptance_entry_within_strategy_limits(
     config: &ArcusSpotExecuteOnceConfig,
     baseline: &ArcusSpotRuntimeState,
     plan: &ArcusSpotRotationPlan,
+    signal_sample: f64,
 ) -> Result<()> {
     if plan.trigger != ArcusSpotRotationTrigger::EntrySignal {
         bail!("Arcus acceptance from a neutral backup must be an entry signal");
@@ -1155,6 +1156,24 @@ fn require_acceptance_entry_within_strategy_limits(
     // direction that live-tick could never have proposed.
     if plan.direction != ArcusSpotDirection::TokenAToTokenB {
         bail!("Arcus acceptance reverse-direction entries are not supported by the planner");
+    }
+    let all_in_cost = plan
+        .optimistic_round_trip_loss_bps
+        .checked_add(config.runtime.gas_buffer_bps)
+        .and_then(|cost| cost.checked_add(config.runtime.settlement_buffer_bps))
+        .context("Arcus acceptance all-in cost exceeds Decimal range")?;
+    if plan.gas_buffer_bps != config.runtime.gas_buffer_bps
+        || plan.settlement_buffer_bps != config.runtime.settlement_buffer_bps
+        || plan.all_in_round_trip_cost_bps != all_in_cost
+    {
+        bail!("Arcus acceptance all-in cost does not match the configured buffer arithmetic");
+    }
+    if all_in_cost > config.runtime.max_all_in_round_trip_cost_bps {
+        bail!(
+            "Arcus acceptance all-in cost {} exceeds configured maximum {}",
+            all_in_cost,
+            config.runtime.max_all_in_round_trip_cost_bps
+        );
     }
     let sellable = baseline
         .inventory
@@ -1170,6 +1189,81 @@ fn require_acceptance_entry_within_strategy_limits(
             plan.sell_quantity,
             maximum_rotation
         );
+    }
+    let predicted_inventory = ArcusSpotInventory {
+        token_a: baseline
+            .inventory
+            .token_a
+            .checked_sub(plan.sell_quantity)
+            .context("Arcus acceptance predicted token A inventory underflow")?,
+        token_b: baseline
+            .inventory
+            .token_b
+            .checked_add(plan.buy_quantity)
+            .context("Arcus acceptance predicted token B inventory overflow")?,
+    };
+    if plan.predicted_inventory != predicted_inventory {
+        bail!("Arcus acceptance predicted inventory does not match the backup and plan quantities");
+    }
+    // The price scale cancels from the USD imbalance fraction. Recover the
+    // A/B ratio from the accepted relative-log-price sample and compare both
+    // the planner-recorded value and configured hard cap. The tolerance only
+    // covers the runtime's Decimal -> f64 -> ln/exp round trip.
+    let price_ratio = signal_sample.exp();
+    let token_a = predicted_inventory
+        .token_a
+        .to_string()
+        .parse::<f64>()
+        .context("Arcus acceptance token A inventory exceeds f64 range")?;
+    let token_b = predicted_inventory
+        .token_b
+        .to_string()
+        .parse::<f64>()
+        .context("Arcus acceptance token B inventory exceeds f64 range")?;
+    let value_a = token_a * price_ratio;
+    let total = value_a + token_b;
+    if !price_ratio.is_finite()
+        || price_ratio <= 0.0
+        || !value_a.is_finite()
+        || !total.is_finite()
+        || total <= 0.0
+    {
+        bail!("Arcus acceptance inventory imbalance cannot be reconstructed");
+    }
+    let imbalance = (value_a - token_b).abs() / total;
+    let recorded_imbalance = plan
+        .predicted_inventory_imbalance_fraction
+        .to_string()
+        .parse::<f64>()
+        .context("Arcus acceptance recorded imbalance exceeds f64 range")?;
+    let maximum_imbalance = config
+        .runtime
+        .max_inventory_imbalance_fraction
+        .to_string()
+        .parse::<f64>()
+        .context("Arcus acceptance configured imbalance exceeds f64 range")?;
+    if (recorded_imbalance - imbalance).abs() > 1e-9 {
+        bail!("Arcus acceptance recorded inventory imbalance does not match its accepted price");
+    }
+    if imbalance > maximum_imbalance {
+        bail!("Arcus acceptance predicted inventory exceeds the configured imbalance cap");
+    }
+    Ok(())
+}
+
+fn require_acceptance_daily_swap_capacity(
+    config: &ArcusSpotExecuteOnceConfig,
+    baseline: &ArcusSpotExecutionLedger,
+    attempt: &ArcusSpotExecutionAttempt,
+) -> Result<()> {
+    let execution_day = attempt.prepared_at.date_naive();
+    let completed_before_acceptance = baseline
+        .history
+        .iter()
+        .filter(|archived| archived.updated_at.date_naive() == execution_day)
+        .count();
+    if completed_before_acceptance >= config.executor.max_swaps_per_utc_day as usize {
+        bail!("Arcus acceptance attempt exceeds the configured UTC daily swap cap");
     }
     Ok(())
 }
@@ -1248,25 +1342,16 @@ fn require_acceptance_ledger_and_position_continuity(
             // The live executor checks the archived-attempt count for the
             // UTC day immediately before it prepares a new attempt. Rebuild
             // that same point-in-time guard from the immutable backup and
-            // the accepted observation day. Candidate-written ledger times
-            // are chronology-bound above but do not define the allowance.
-            let acceptance_day = accepted_observation_at.date_naive();
-            let completed_before_acceptance = baseline
-                .ledger
-                .history
-                .iter()
-                .filter(|archived| archived.updated_at.date_naive() == acceptance_day)
-                .count();
-            if completed_before_acceptance >= config.executor.max_swaps_per_utc_day as usize {
-                bail!("Arcus acceptance attempt exceeds the configured UTC daily swap cap");
-            }
+            // the preparation day. The chronology checks above bind this
+            // durable timestamp to the accepted tick, and it is the closest
+            // persisted equivalent of validate_plan's Utc::now() day.
+            require_acceptance_daily_swap_capacity(config, &baseline.ledger, attempt)?;
             let plan_bytes = current
                 .pending_plan_bytes
                 .as_deref()
                 .context("Arcus reconciled acceptance attempt has no pending runtime plan")?;
             let plan: ArcusSpotRotationPlan = serde_json::from_slice(plan_bytes)
                 .context("invalid Arcus acceptance pending runtime plan")?;
-            require_acceptance_entry_within_strategy_limits(config, baseline_runtime, &plan)?;
             let signal_sample = acceptance_signal_sample(baseline_runtime, current_runtime)?;
             let signal_runtime =
                 ArcusSpotRuntime::from_state(config.runtime.clone(), baseline_runtime.clone())
@@ -1278,6 +1363,12 @@ fn require_acceptance_ledger_and_position_continuity(
             if signal_direction != plan.direction {
                 bail!("Arcus acceptance entry signal direction does not match its pending plan");
             }
+            require_acceptance_entry_within_strategy_limits(
+                config,
+                baseline_runtime,
+                &plan,
+                signal_sample,
+            )?;
             let (actual_buy_quantity, filled_at) =
                 reconciled_fill_for_continuity(config, &plan, attempt)?;
             let mut expected_pre_fill = current_runtime.clone();
@@ -3371,6 +3462,33 @@ runtime:
     }
 
     #[test]
+    fn continuity_daily_cap_uses_the_preparation_day_across_midnight() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config_with_daily_cap(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+            1,
+        );
+        let plan = rotation_plan("entry_signal");
+        let prior_attempt = reconciled_entry_attempt(&config, &plan, 1);
+        let baseline = ArcusSpotExecutionLedger {
+            schema_version: 2,
+            next_sequence: 2,
+            active: None,
+            history: vec![prior_attempt],
+        };
+        let mut acceptance_attempt = reconciled_entry_attempt(&config, &plan, 2);
+        acceptance_attempt.prepared_at = DateTime::parse_from_rfc3339("2026-08-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        require_acceptance_daily_swap_capacity(&config, &baseline, &acceptance_attempt).unwrap();
+    }
+
+    #[test]
     fn continuity_verification_rejects_an_entry_without_a_signal_crossing() {
         let dir = tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.json");
@@ -3412,9 +3530,13 @@ runtime:
         let mut plan = rotation_plan("entry_signal");
         plan.direction = ArcusSpotDirection::TokenBToTokenA;
 
-        let error =
-            require_acceptance_entry_within_strategy_limits(&config, runtime.state(), &plan)
-                .unwrap_err();
+        let error = require_acceptance_entry_within_strategy_limits(
+            &config,
+            runtime.state(),
+            &plan,
+            -0.125,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("reverse-direction"));
     }
@@ -3439,6 +3561,50 @@ runtime:
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
         assert!(error.to_string().contains("per-action rotation cap"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_entry_above_the_all_in_cost_limit() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let mut config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        config.runtime.max_all_in_round_trip_cost_bps = Decimal::from(90);
+        persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("all-in cost"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_entry_above_the_inventory_imbalance_cap() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let mut config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        config.runtime.max_inventory_imbalance_fraction = Decimal::new(2, 1);
+        persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("imbalance cap"));
     }
 
     #[test]
@@ -3844,7 +4010,7 @@ runtime:
             "settlement_buffer_bps": "10",
             "all_in_round_trip_cost_bps": "96.5",
             "predicted_inventory": {"token_a": "0.30", "token_b": "0.21"},
-            "predicted_inventory_imbalance_fraction": "0.1",
+            "predicted_inventory_imbalance_fraction": "0.23628662061830083",
         }))
         .unwrap()
     }
