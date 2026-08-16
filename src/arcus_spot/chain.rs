@@ -874,7 +874,7 @@ fn classify_canonical_provider_error<T>(
     error: ProviderError,
 ) -> ContractCallOutcome<T> {
     if let Some(response) = error.as_error_response() {
-        if is_retryable_canonical_block_error(&response.message) {
+        if is_retryable_canonical_block_error(response.code, &response.message) {
             return ContractCallOutcome::Transport(anyhow::anyhow!(
                 "Arcus canonical {label} balance block is unavailable"
             ));
@@ -901,8 +901,18 @@ fn classify_canonical_provider_error<T>(
     ))
 }
 
-fn is_retryable_canonical_block_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
+fn is_retryable_canonical_block_error(code: i64, message: &str) -> bool {
+    let message = message.trim().to_ascii_lowercase();
+    // EIP-1898 recommends these generic JSON-RPC errors when the requested
+    // hash is absent or fails requireCanonical. Match the code/message pair,
+    // not either component alone: -32000 is also widely used for execution
+    // reverts, which must remain Fatal.
+    if matches!(
+        (code, message.as_str()),
+        (-32001, "resource not found") | (-32000, "invalid input")
+    ) {
+        return true;
+    }
     [
         "not canonical",
         "non-canonical",
@@ -1314,12 +1324,74 @@ mod tests {
 
     #[test]
     fn canonical_block_error_taxonomy_is_narrow() {
-        assert!(is_retryable_canonical_block_error("unknown block 0x1234"));
-        assert!(is_retryable_canonical_block_error("header not found"));
+        assert!(is_retryable_canonical_block_error(
+            -32000,
+            "unknown block 0x1234"
+        ));
+        assert!(is_retryable_canonical_block_error(
+            -32000,
+            "header not found"
+        ));
+        assert!(is_retryable_canonical_block_error(
+            -32001,
+            "Resource not found"
+        ));
+        assert!(is_retryable_canonical_block_error(-32000, "Invalid input"));
         assert!(!is_retryable_canonical_block_error(
+            -32000,
             "execution reverted: token paused"
         ));
-        assert!(!is_retryable_canonical_block_error("invalid params"));
+        assert!(!is_retryable_canonical_block_error(
+            -32602,
+            "invalid params"
+        ));
+        assert!(!is_retryable_canonical_block_error(
+            -32001,
+            "execution reverted"
+        ));
+        assert!(!is_retryable_canonical_block_error(
+            -32000,
+            "resource not found"
+        ));
+    }
+
+    #[tokio::test]
+    async fn standard_eip1898_block_errors_fall_back() {
+        for (case, code, message) in [
+            ("missing", -32001, "Resource not found"),
+            ("noncanonical", -32000, "Invalid input"),
+        ] {
+            let (taker, sell_token, buy_token) = test_addresses();
+            let tx_hash = H256::from_low_u64_be(if case == "missing" { 0x4f } else { 0x50 });
+            let block_hash = H256::from_low_u64_be(if case == "missing" { 0x51 } else { 0x52 });
+            let first =
+                spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+                    "eth_chainId" => RpcReply::Result(json!("0x1237")),
+                    "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+                    "eth_call" | "eth_getBalance" => RpcReply::Error { code, message },
+                    _ => RpcReply::Error {
+                        code: -32601,
+                        message: "unexpected method",
+                    },
+                })
+                .await;
+            let second = spawn_rpc_server(move |request| {
+                successful_reconciliation_reply(
+                    request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+                )
+            })
+            .await;
+            let client =
+                ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                    .unwrap();
+
+            let balances = client
+                .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+                .await
+                .unwrap_or_else(|error| panic!("{case} EIP-1898 error must fall back: {error:#}"));
+            assert_eq!(balances.sell_balance_raw, "4000", "case={case}");
+            assert_eq!(request_snapshot(&second).len(), 5, "case={case}");
+        }
     }
 
     #[tokio::test]
