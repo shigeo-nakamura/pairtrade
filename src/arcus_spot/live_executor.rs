@@ -1,8 +1,8 @@
 use super::{
-    ArcusSpotChainClient, ArcusSpotChainPreflightRequest, ArcusSpotDirection,
-    ArcusSpotExecutionAttempt, ArcusSpotExecutionIntent, ArcusSpotExecutionLedger,
-    ArcusSpotExecutionLedgerLock, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
-    ArcusSpotRotationPlan,
+    ArcusSpotBalanceSnapshot, ArcusSpotChainClient, ArcusSpotChainPreflightRequest,
+    ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionIntent,
+    ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock, ArcusSpotExecutionLedgerStore,
+    ArcusSpotExecutionPhase, ArcusSpotRotationPlan,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -544,24 +544,19 @@ where
             .context("Arcus confirmed attempt is missing its transaction hash")?
             .parse::<H256>()
             .context("Arcus confirmed attempt has an invalid transaction hash")?;
-        // Deliberately not the fallback-capable `balances()`: a secondary
-        // provider that hasn't yet indexed this specific confirmed swap
-        // would return the pre-swap balance as an apparently valid
-        // snapshot, and reconcile_balances would misread that as a
-        // genuine reconciliation failure and permanently mark the attempt
-        // Unknown (Codex P1 follow-up, pairtrade#182). The primary-only
-        // read additionally requires the confirmed tx's own receipt to be
-        // present before trusting its balances, since the primary itself
-        // could be a node recovering from an outage and still catching up
-        // (Codex P1 follow-up, pairtrade#182, round 6).
+        // Deliberately not the current-state `balances()`: reconciliation
+        // requires the confirmed transaction's receipt on each attempted
+        // provider and pins all three reads to that receipt block with
+        // EIP-1898 requireCanonical=true. A lagging or reorged provider
+        // therefore errors and falls back instead of returning a stale
+        // pre-swap snapshot that reconcile_balances would turn into sticky
+        // Unknown (pairtrade#182, bot-strategy#779).
         let post = self
             .chain
             .balances_requiring_primary_provider(taker, sell_token, buy_token, confirmed_tx_hash)
             .await
-            .context("Arcus post-submit balance read failed")?;
-        let mutation = self.ledger.reconcile_balances(post, Utc::now());
-        self.store.persist(&self.ledger)?;
-        mutation
+            .context("Arcus post-submit balance read failed");
+        persist_reconciliation_read(&mut self.ledger, &self.store, post)
     }
 
     fn validate_plan_age(&self, plan: &ArcusSpotRotationPlan) -> Result<()> {
@@ -599,6 +594,20 @@ where
             _ => Ok(()),
         }
     }
+}
+
+/// Keep canonical-read failure handling visibly ahead of every ledger or
+/// filesystem mutation. A rejected EIP-1898 selector must leave a Confirmed
+/// attempt retryable, not convert it into sticky Unknown with a fake delta.
+fn persist_reconciliation_read(
+    ledger: &mut ArcusSpotExecutionLedger,
+    store: &ArcusSpotExecutionLedgerStore,
+    post: Result<ArcusSpotBalanceSnapshot>,
+) -> Result<()> {
+    let post = post?;
+    let mutation = ledger.reconcile_balances(post, Utc::now());
+    store.persist(ledger)?;
+    mutation
 }
 
 fn require_fresh_quote_matches_approved_plan(
@@ -756,6 +765,63 @@ fn require_plan_direction_matches_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dex_connector::ArcusSpotSwapStatus;
+    use tempfile::tempdir;
+
+    fn execution_intent() -> ArcusSpotExecutionIntent {
+        ArcusSpotExecutionIntent {
+            venue: "arcus".to_string(),
+            sell_symbol: "NVDA".to_string(),
+            buy_symbol: "AMD".to_string(),
+            sell_token: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            buy_token: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string(),
+            sell_amount_raw: "1000".to_string(),
+            minimum_buy_amount_raw: "980".to_string(),
+            plan_config_digest: format!("sha256:{}", "c".repeat(64)),
+        }
+    }
+
+    fn execution_balances(sell: &str, buy: &str, at: DateTime<Utc>) -> ArcusSpotBalanceSnapshot {
+        let intent = execution_intent();
+        ArcusSpotBalanceSnapshot {
+            observed_at: at,
+            sell_token: intent.sell_token,
+            buy_token: intent.buy_token,
+            sell_balance_raw: sell.to_string(),
+            buy_balance_raw: buy.to_string(),
+            gas_balance_wei: "1000000000000000".to_string(),
+        }
+    }
+
+    fn confirmed_ledger(now: DateTime<Utc>) -> ArcusSpotExecutionLedger {
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001",
+                format!("sha256:{}", "a".repeat(64)),
+                execution_intent(),
+                execution_balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.mark_dispatching(now).unwrap();
+        ledger
+            .record_submit_status(
+                &ArcusSpotSwapStatus {
+                    venue: "arcus".to_string(),
+                    status: "confirmed".to_string(),
+                    tx_hash: format!("{:#x}", H256::from_low_u64_be(1)),
+                    reason: None,
+                    error_code: None,
+                    swap: None,
+                    extra: Default::default(),
+                },
+                now,
+            )
+            .unwrap();
+        ledger
+    }
 
     fn config() -> ArcusSpotLiveExecutorConfig {
         ArcusSpotLiveExecutorConfig {
@@ -807,6 +873,33 @@ mod tests {
         let plan = plan_with_buy_amount("1000");
         require_fresh_quote_matches_approved_plan(&plan, U256::from(995_u64), 50).unwrap();
         assert!(require_fresh_quote_matches_approved_plan(&plan, U256::from(994_u64), 50).is_err());
+    }
+
+    #[test]
+    fn noncanonical_read_error_mutates_neither_ledger_nor_durable_file() {
+        let now = Utc::now();
+        let directory = tempdir().unwrap();
+        let store = ArcusSpotExecutionLedgerStore::new(directory.path().join("ledger.json"));
+        let mut ledger = confirmed_ledger(now);
+        store.persist(&ledger).unwrap();
+        let before_ledger = ledger.clone();
+        let before_file = std::fs::read(store.path()).unwrap();
+
+        let error = persist_reconciliation_read(
+            &mut ledger,
+            &store,
+            Err(anyhow!("block is not canonical")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not canonical"));
+        assert_eq!(ledger, before_ledger);
+        assert_eq!(std::fs::read(store.path()).unwrap(), before_file);
+        assert_eq!(
+            ledger.active.as_ref().unwrap().phase,
+            ArcusSpotExecutionPhase::Confirmed
+        );
+        assert!(ledger.active.as_ref().unwrap().post_balances.is_none());
     }
 
     #[test]
