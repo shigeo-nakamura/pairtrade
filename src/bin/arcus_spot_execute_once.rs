@@ -10,15 +10,18 @@ use aes_gcm::{
 };
 use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use debot::arcus_spot::{
     build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision,
-    ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore,
-    ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner,
-    ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotRegime, ArcusSpotRotationPlan,
-    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
-    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode,
+    ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
+    ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig,
+    ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotRegime,
+    ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntime,
+    ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent,
+    ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
+#[cfg(test)]
+use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent};
 use dex_connector::{
     ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig,
     ArcusSpotRecorderSnapshot,
@@ -27,6 +30,7 @@ use ed25519_dalek::{
     Signature, Signer, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH,
     SIGNATURE_LENGTH,
 };
+use ethers::types::U256;
 use rand::RngCore;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -37,6 +41,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -721,39 +726,386 @@ fn load_arcus_state_backup(
     ))
 }
 
-fn same_execution_identity(
-    baseline: &ArcusSpotExecutionAttempt,
-    current: &ArcusSpotExecutionAttempt,
-) -> bool {
-    let sticky_terminal_phase_preserved = !matches!(
-        baseline.phase,
-        ArcusSpotExecutionPhase::Rejected
-            | ArcusSpotExecutionPhase::Failed
-            | ArcusSpotExecutionPhase::Unknown
-            | ArcusSpotExecutionPhase::OperatorHold
-            | ArcusSpotExecutionPhase::Reconciled
-    ) || current.phase == baseline.phase;
-    baseline.sequence == current.sequence
-        && baseline.idempotency_key == current.idempotency_key
-        && baseline.payload_hash == current.payload_hash
-        && baseline.chain_id == current.chain_id
-        && baseline.taker == current.taker
-        && baseline.prepared_at == current.prepared_at
-        && baseline.intent == current.intent
-        && baseline.pre_balances == current.pre_balances
-        && current.updated_at >= baseline.updated_at
-        && baseline
-            .dispatched_at
-            .is_none_or(|dispatched_at| current.dispatched_at == Some(dispatched_at))
-        && baseline
-            .tx_hash
-            .as_ref()
-            .is_none_or(|tx_hash| current.tx_hash.as_ref() == Some(tx_hash))
-        && baseline
-            .post_balances
-            .as_ref()
-            .is_none_or(|post| current.post_balances.as_ref() == Some(post))
-        && sticky_terminal_phase_preserved
+fn daily_risk_baseline(
+    state: &ArcusSpotRuntimeState,
+    label: &str,
+) -> Result<Option<(NaiveDate, Decimal)>> {
+    match (
+        state.daily_baseline_day.as_deref(),
+        state.daily_baseline_equity_usd,
+    ) {
+        (None, None) => {
+            if state.initial_equity_usd.is_some()
+                || state.last_equity_usd.is_some()
+                || state.risk_halt.is_some()
+            {
+                bail!("{label} Arcus risk state has values without a daily baseline");
+            }
+            Ok(None)
+        }
+        (Some(day), Some(equity)) => {
+            if state.initial_equity_usd.is_none() || state.last_equity_usd.is_none() {
+                bail!("{label} Arcus risk state has an incomplete equity baseline");
+            }
+            let day = NaiveDate::parse_from_str(day, "%Y-%m-%d")
+                .with_context(|| format!("{label} Arcus daily baseline day is invalid"))?;
+            Ok(Some((day, equity)))
+        }
+        _ => bail!("{label} Arcus risk state has mismatched daily baseline fields"),
+    }
+}
+
+fn require_rollover_matches_observation(
+    day: NaiveDate,
+    current: &ArcusSpotRuntimeState,
+) -> Result<()> {
+    let observation_day = current
+        .last_observation_at
+        .context("Arcus daily baseline advanced without a last observation")?
+        .date_naive();
+    if day != observation_day && Some(day) != observation_day.succ_opt() {
+        bail!("Arcus daily baseline rollover does not match the accepted observation");
+    }
+    Ok(())
+}
+
+fn require_risk_state_continuity(
+    baseline: &ArcusSpotRuntimeState,
+    current: &ArcusSpotRuntimeState,
+    sequence_advance: u64,
+) -> Result<()> {
+    let baseline_daily = daily_risk_baseline(baseline, "backup")?;
+    if baseline.initial_equity_usd.is_some()
+        && current.initial_equity_usd != baseline.initial_equity_usd
+    {
+        bail!("Arcus runtime cumulative equity baseline changed across restart/rollback");
+    }
+    if baseline.risk_halt.is_some() && current.risk_halt != baseline.risk_halt {
+        bail!("Arcus runtime lost or changed its sticky risk halt across restart/rollback");
+    }
+    if baseline.last_equity_usd.is_some() && current.last_equity_usd.is_none() {
+        bail!("Arcus runtime lost its last equity mark across restart/rollback");
+    }
+    let current_daily = daily_risk_baseline(current, "current")?;
+    if sequence_advance == 0 {
+        if current.initial_equity_usd != baseline.initial_equity_usd
+            || current_daily != baseline_daily
+            || current.last_equity_usd != baseline.last_equity_usd
+            || current.risk_halt != baseline.risk_halt
+        {
+            bail!("Arcus runtime risk state changed without a new observation");
+        }
+        return Ok(());
+    }
+    match (baseline_daily, current_daily) {
+        (None, None) => {}
+        (None, Some((current_day, current_equity))) => {
+            require_rollover_matches_observation(current_day, current)?;
+            if current.last_equity_usd != Some(current_equity) {
+                bail!("Arcus runtime initialized mismatched daily and last equity marks");
+            }
+        }
+        (Some(_), None) => {
+            bail!("Arcus runtime lost its daily loss baseline across restart/rollback")
+        }
+        (Some((baseline_day, baseline_equity)), Some((current_day, current_equity))) => {
+            if current_day == baseline_day {
+                if current_equity != baseline_equity {
+                    bail!("Arcus runtime daily equity baseline changed without a UTC rollover");
+                }
+            } else {
+                if current_day < baseline_day {
+                    bail!("Arcus runtime daily baseline day regressed across restart/rollback");
+                }
+                require_rollover_matches_observation(current_day, current)?;
+                if current.last_equity_usd != Some(current_equity) {
+                    bail!("Arcus runtime UTC rollover baseline does not match its equity mark");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_raw_amount(label: &str, raw: &str) -> Result<U256> {
+    U256::from_dec_str(raw.trim()).with_context(|| format!("invalid Arcus {label}"))
+}
+
+fn quantity_to_raw_for_continuity(quantity: Decimal, decimals: u32) -> Result<String> {
+    if quantity < Decimal::ZERO {
+        bail!("Arcus acceptance plan quantity must not be negative");
+    }
+    let raw_scale = 10_i128
+        .checked_pow(decimals)
+        .context("Arcus acceptance token decimals exceed Decimal range")?;
+    let scale = Decimal::try_from_i128_with_scale(raw_scale, 0)
+        .context("Arcus acceptance token decimals exceed Decimal range")?;
+    let raw = quantity
+        .checked_mul(scale)
+        .context("Arcus acceptance plan quantity exceeds Decimal range")?;
+    if raw.fract() != Decimal::ZERO {
+        bail!("Arcus acceptance plan quantity has a fractional raw unit");
+    }
+    Ok(raw.trunc().to_string())
+}
+
+fn require_acceptance_plan_matches_config(
+    config: &ArcusSpotExecuteOnceConfig,
+    plan: &ArcusSpotRotationPlan,
+) -> Result<()> {
+    let (expected_sell, expected_buy) = match plan.direction {
+        ArcusSpotDirection::TokenAToTokenB => (
+            config.runtime.pair.sell_symbol.as_str(),
+            config.runtime.pair.buy_symbol.as_str(),
+        ),
+        ArcusSpotDirection::TokenBToTokenA => (
+            config.runtime.pair.buy_symbol.as_str(),
+            config.runtime.pair.sell_symbol.as_str(),
+        ),
+    };
+    if !plan.sell_symbol.eq_ignore_ascii_case(expected_sell)
+        || !plan.buy_symbol.eq_ignore_ascii_case(expected_buy)
+    {
+        bail!("Arcus acceptance plan direction does not match the configured pair");
+    }
+    for (symbol, address, quantity, raw) in [
+        (
+            plan.sell_symbol.as_str(),
+            plan.sell_token_address.as_str(),
+            plan.sell_quantity,
+            plan.sell_amount_raw.as_str(),
+        ),
+        (
+            plan.buy_symbol.as_str(),
+            plan.buy_token_address.as_str(),
+            plan.buy_quantity,
+            plan.buy_amount_raw.as_str(),
+        ),
+    ] {
+        let trusted_address = config
+            .router
+            .trusted_token_addresses
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
+            .map(|(_, address)| address)
+            .with_context(|| format!("Arcus acceptance has no address pin for {symbol}"))?;
+        if !address.eq_ignore_ascii_case(trusted_address) {
+            bail!("Arcus acceptance plan token address does not match its configured pin");
+        }
+        let decimals = config
+            .router
+            .trusted_token_decimals
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
+            .map(|(_, decimals)| *decimals)
+            .with_context(|| format!("Arcus acceptance has no decimals pin for {symbol}"))?;
+        if quantity_to_raw_for_continuity(quantity, decimals)? != raw {
+            bail!("Arcus acceptance plan raw amount does not match its decimal quantity");
+        }
+    }
+    Ok(())
+}
+
+fn reconciled_fill_for_continuity(
+    config: &ArcusSpotExecuteOnceConfig,
+    plan: &ArcusSpotRotationPlan,
+    attempt: &ArcusSpotExecutionAttempt,
+) -> Result<(Decimal, DateTime<Utc>)> {
+    require_acceptance_plan_matches_config(config, plan)?;
+    if attempt.phase != ArcusSpotExecutionPhase::Reconciled {
+        bail!("Arcus acceptance attempt did not finish reconciled");
+    }
+    if attempt.chain_id != config.runtime.chain_id
+        || attempt.chain_id != config.chain.chain_id
+        || attempt.chain_id != config.router.chain_id
+        || !attempt.taker.eq_ignore_ascii_case(&config.executor.taker)
+        || attempt.tx_hash.is_none()
+    {
+        bail!("Arcus acceptance attempt does not match the configured chain/taker");
+    }
+    let plan_config_digest = approval_digest(config, plan)?;
+    if attempt.intent.plan_config_digest != plan_config_digest
+        || !attempt.intent.venue.eq_ignore_ascii_case(&plan.venue)
+        || !attempt
+            .intent
+            .sell_symbol
+            .eq_ignore_ascii_case(&plan.sell_symbol)
+        || !attempt
+            .intent
+            .buy_symbol
+            .eq_ignore_ascii_case(&plan.buy_symbol)
+        || !attempt
+            .intent
+            .sell_token
+            .eq_ignore_ascii_case(&plan.sell_token_address)
+        || !attempt
+            .intent
+            .buy_token
+            .eq_ignore_ascii_case(&plan.buy_token_address)
+        || attempt.intent.sell_amount_raw != plan.sell_amount_raw
+    {
+        bail!("Arcus acceptance attempt does not match its pending runtime plan");
+    }
+    let post = attempt
+        .post_balances
+        .as_ref()
+        .context("reconciled Arcus acceptance attempt omitted post balances")?;
+    let pre_sell = parse_raw_amount("pre sell balance", &attempt.pre_balances.sell_balance_raw)?;
+    let pre_buy = parse_raw_amount("pre buy balance", &attempt.pre_balances.buy_balance_raw)?;
+    let post_sell = parse_raw_amount("post sell balance", &post.sell_balance_raw)?;
+    let post_buy = parse_raw_amount("post buy balance", &post.buy_balance_raw)?;
+    let sold_raw = pre_sell
+        .checked_sub(post_sell)
+        .context("reconciled Arcus acceptance sell balance increased")?;
+    let bought_raw = post_buy
+        .checked_sub(pre_buy)
+        .context("reconciled Arcus acceptance buy balance decreased")?;
+    if sold_raw != parse_raw_amount("intent sell amount", &attempt.intent.sell_amount_raw)? {
+        bail!("Arcus acceptance sell delta does not match its intent");
+    }
+    if bought_raw
+        < parse_raw_amount(
+            "intent minimum buy amount",
+            &attempt.intent.minimum_buy_amount_raw,
+        )?
+    {
+        bail!("Arcus acceptance buy delta is below its signed minimum");
+    }
+    let planned_buy_raw = parse_raw_amount("plan buy amount", &plan.buy_amount_raw)?;
+    if planned_buy_raw.is_zero() || plan.buy_quantity <= Decimal::ZERO {
+        bail!("Arcus acceptance pending plan has an invalid buy quantity");
+    }
+    let bought_decimal = Decimal::from_str(&bought_raw.to_string())
+        .context("Arcus acceptance buy amount exceeds Decimal range")?;
+    let planned_buy_decimal = Decimal::from_str(&planned_buy_raw.to_string())
+        .context("Arcus acceptance planned buy amount exceeds Decimal range")?;
+    let actual_buy_quantity = plan
+        .buy_quantity
+        .checked_mul(bought_decimal)
+        .and_then(|value| value.checked_div(planned_buy_decimal))
+        .context("Arcus acceptance buy quantity exceeds Decimal range")?;
+    if plan.sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
+        bail!("Arcus acceptance runtime quantities must be positive");
+    }
+    let filled_at = attempt
+        .dispatched_at
+        .context("reconciled Arcus acceptance attempt omitted its dispatch time")?;
+    let plan_age = filled_at.signed_duration_since(plan.quote_received_at);
+    if plan_age.num_seconds() < 0
+        || plan_age.num_seconds() > config.executor.max_plan_age_secs as i64
+    {
+        bail!("Arcus acceptance plan was stale or future-dated at dispatch");
+    }
+    Ok((actual_buy_quantity, filled_at))
+}
+
+fn position_state_matches(left: &ArcusSpotRuntimeState, right: &ArcusSpotRuntimeState) -> bool {
+    left.inventory == right.inventory
+        && left.regime == right.regime
+        && left.last_rotation_at == right.last_rotation_at
+        && left.rotated_quantity == right.rotated_quantity
+        && left.last_live_execution_idempotency_key == right.last_live_execution_idempotency_key
+}
+
+fn require_acceptance_ledger_and_position_continuity(
+    config: &ArcusSpotExecuteOnceConfig,
+    baseline: &ArcusSpotStateImage,
+    current: &ArcusSpotStateImage,
+    runtime_sequence_advance: u64,
+) -> Result<()> {
+    let baseline_runtime = baseline.runtime.state();
+    let current_runtime = current.runtime.state();
+    if baseline.ledger.active.is_some() || baseline_runtime.regime != ArcusSpotRegime::Neutral {
+        bail!("Arcus continuity backup is not the required neutral/no-active acceptance baseline");
+    }
+    let ledger_advance = current
+        .ledger
+        .next_sequence
+        .checked_sub(baseline.ledger.next_sequence)
+        .context("Arcus ledger next_sequence regressed across restart/rollback")?;
+    if ledger_advance > 1 {
+        bail!("Arcus ledger advanced by more than one acceptance attempt");
+    }
+    if current.ledger.history.len() < baseline.ledger.history.len()
+        || current.ledger.history[..baseline.ledger.history.len()] != baseline.ledger.history
+    {
+        bail!("Arcus ledger lost or changed archived attempts across restart/rollback");
+    }
+    match ledger_advance {
+        0 => {
+            if current.ledger.active.is_some()
+                || current.ledger.history.len() != baseline.ledger.history.len()
+            {
+                bail!("Arcus ledger changed without advancing its attempt sequence");
+            }
+            if current.pending_plan_bytes != baseline.pending_plan_bytes {
+                bail!("Arcus pending recovery plan changed without an acceptance attempt");
+            }
+            if !position_state_matches(baseline_runtime, current_runtime) {
+                bail!("Arcus position state changed without a reconciled acceptance attempt");
+            }
+        }
+        1 => {
+            if runtime_sequence_advance != 1 {
+                bail!("Arcus ledger advanced without the single approved observation");
+            }
+            match (
+                baseline_runtime.last_observation_at,
+                current_runtime.last_observation_at,
+            ) {
+                (Some(baseline_at), Some(current_at)) if current_at > baseline_at => {}
+                (None, Some(_)) => {}
+                _ => bail!("Arcus acceptance attempt has no newly accepted observation"),
+            }
+            if current.ledger.active.is_some()
+                || current.ledger.history.len() != baseline.ledger.history.len() + 1
+            {
+                bail!("Arcus acceptance attempt is unresolved or was not archived exactly once");
+            }
+            let attempt = current.ledger.history.last().expect("length checked above");
+            if attempt.sequence != baseline.ledger.next_sequence {
+                bail!("Arcus acceptance attempt has an unexpected sequence");
+            }
+            let plan_bytes = current
+                .pending_plan_bytes
+                .as_deref()
+                .context("Arcus reconciled acceptance attempt has no pending runtime plan")?;
+            let plan: ArcusSpotRotationPlan = serde_json::from_slice(plan_bytes)
+                .context("invalid Arcus acceptance pending runtime plan")?;
+            let (actual_buy_quantity, filled_at) =
+                reconciled_fill_for_continuity(config, &plan, attempt)?;
+            let mut expected_pre_fill = current_runtime.clone();
+            expected_pre_fill.inventory = baseline_runtime.inventory;
+            expected_pre_fill.regime = baseline_runtime.regime;
+            expected_pre_fill.last_rotation_at = baseline_runtime.last_rotation_at;
+            expected_pre_fill.rotated_quantity = baseline_runtime.rotated_quantity;
+            expected_pre_fill.last_live_execution_idempotency_key =
+                baseline_runtime.last_live_execution_idempotency_key.clone();
+            let mut expected =
+                ArcusSpotRuntime::from_state(config.runtime.clone(), expected_pre_fill)
+                    .map_err(anyhow::Error::msg)
+                    .context("failed to reconstruct the Arcus acceptance pre-fill state")?;
+            expected
+                .validate_plan_consistent_with_state(&plan)
+                .map_err(anyhow::Error::msg)
+                .context("Arcus acceptance plan is inconsistent with the backup position")?;
+            let applied = expected
+                .apply_confirmed_live_fill_once(
+                    &plan,
+                    plan.sell_quantity,
+                    actual_buy_quantity,
+                    filled_at,
+                    &attempt.idempotency_key,
+                )
+                .map_err(anyhow::Error::msg)
+                .context("failed to derive the Arcus acceptance position transition")?;
+            if !applied || !position_state_matches(expected.state(), current_runtime) {
+                bail!("Arcus position state does not match the reconciled acceptance attempt");
+            }
+        }
+        _ => unreachable!("ledger advance bounded above"),
+    }
+    Ok(())
 }
 
 fn require_signal_history_continuity(
@@ -797,35 +1149,30 @@ fn require_signal_history_continuity(
 }
 
 fn require_arcus_state_continuity(
+    config: &ArcusSpotExecuteOnceConfig,
     baseline: &ArcusSpotStateImage,
     current: &ArcusSpotStateImage,
-    signal_window_samples: usize,
 ) -> Result<()> {
     let baseline_runtime = baseline.runtime.state();
     let current_runtime = current.runtime.state();
-    if current_runtime.sequence < baseline_runtime.sequence {
-        bail!("Arcus runtime sequence regressed across restart/rollback");
-    }
+    let sequence_advance = current_runtime
+        .sequence
+        .checked_sub(baseline_runtime.sequence)
+        .context("Arcus runtime sequence regressed across restart/rollback")?;
     require_signal_history_continuity(
         &baseline_runtime.relative_log_price_history,
         &current_runtime.relative_log_price_history,
-        current_runtime.sequence - baseline_runtime.sequence,
-        signal_window_samples,
+        sequence_advance,
+        config.runtime.signal_window_samples,
     )?;
-    if baseline_runtime.initial_equity_usd.is_some()
-        && current_runtime.initial_equity_usd != baseline_runtime.initial_equity_usd
-    {
-        bail!("Arcus runtime cumulative equity baseline changed across restart/rollback");
-    }
-    if baseline_runtime.risk_halt.is_some()
-        && current_runtime.risk_halt != baseline_runtime.risk_halt
-    {
-        bail!("Arcus runtime lost or changed its sticky risk halt across restart/rollback");
-    }
+    require_risk_state_continuity(baseline_runtime, current_runtime, sequence_advance)?;
     match (
         baseline_runtime.last_observation_at,
         current_runtime.last_observation_at,
     ) {
+        (baseline_at, current_at) if sequence_advance == 0 && current_at != baseline_at => {
+            bail!("Arcus runtime last observation changed without a new observation")
+        }
         (Some(baseline_at), Some(current_at)) if current_at < baseline_at => {
             bail!("Arcus runtime last observation regressed across restart/rollback")
         }
@@ -834,63 +1181,7 @@ fn require_arcus_state_continuity(
         }
         _ => {}
     }
-    if current.ledger.next_sequence < baseline.ledger.next_sequence {
-        bail!("Arcus ledger next_sequence regressed across restart/rollback");
-    }
-    for attempt in &baseline.ledger.history {
-        if !current
-            .ledger
-            .history
-            .iter()
-            .any(|candidate| candidate == attempt)
-        {
-            bail!(
-                "Arcus ledger lost or changed archived attempt sequence {}",
-                attempt.sequence
-            );
-        }
-    }
-    if let Some(active) = &baseline.ledger.active {
-        let continued = current
-            .ledger
-            .history
-            .iter()
-            .chain(current.ledger.active.iter())
-            .any(|candidate| same_execution_identity(active, candidate));
-        if !continued {
-            bail!(
-                "Arcus ledger lost active attempt sequence {} across restart/rollback",
-                active.sequence
-            );
-        }
-    }
-    if let Some(baseline_key) = &baseline_runtime.last_live_execution_idempotency_key {
-        let current_key = current_runtime
-            .last_live_execution_idempotency_key
-            .as_ref()
-            .context("Arcus runtime lost its last execution idempotency key")?;
-        if current_key != baseline_key
-            && !current
-                .ledger
-                .history
-                .iter()
-                .chain(current.ledger.active.iter())
-                .any(|attempt| attempt.idempotency_key == *current_key)
-        {
-            bail!("Arcus runtime advanced to an idempotency key absent from the ledger");
-        }
-    }
-    if current.ledger_bytes == baseline.ledger_bytes
-        && (current_runtime.inventory != baseline_runtime.inventory
-            || current_runtime.regime != baseline_runtime.regime
-            || current_runtime.last_rotation_at != baseline_runtime.last_rotation_at
-            || current_runtime.rotated_quantity != baseline_runtime.rotated_quantity
-            || current_runtime.last_live_execution_idempotency_key
-                != baseline_runtime.last_live_execution_idempotency_key)
-    {
-        bail!("Arcus position state changed without a corresponding ledger change");
-    }
-    Ok(())
+    require_acceptance_ledger_and_position_continuity(config, baseline, current, sequence_advance)
 }
 
 fn verify_arcus_state_backup(
@@ -921,7 +1212,7 @@ fn verify_arcus_state_backup(
             _ => bail!("live pending-plan presence changed since the backup"),
         }
     } else {
-        require_arcus_state_continuity(&baseline, &current, config.runtime.signal_window_samples)?;
+        require_arcus_state_continuity(config, &baseline, &current)?;
     }
     Ok(ArcusSpotStateVerificationReport {
         status: "verified",
@@ -2203,6 +2494,102 @@ runtime:
         write_private_regular_file_atomic(path, &bytes).unwrap();
     }
 
+    fn reconciled_entry_attempt(
+        config: &ArcusSpotExecuteOnceConfig,
+        plan: &ArcusSpotRotationPlan,
+        sequence: u64,
+    ) -> ArcusSpotExecutionAttempt {
+        let at = DateTime::parse_from_rfc3339("2026-08-16T12:00:02Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let payload_hash = format!("sha256:{}", "a".repeat(64));
+        ArcusSpotExecutionAttempt {
+            sequence,
+            idempotency_key: format!(
+                "arcus-spot-{sequence:020}-{}",
+                &payload_hash["sha256:".len()..][..16]
+            ),
+            payload_hash,
+            chain_id: config.runtime.chain_id,
+            taker: config.executor.taker.clone(),
+            prepared_at: at,
+            dispatched_at: Some(at),
+            updated_at: at,
+            phase: ArcusSpotExecutionPhase::Reconciled,
+            intent: ArcusSpotExecutionIntent {
+                venue: plan.venue.clone(),
+                sell_symbol: plan.sell_symbol.clone(),
+                buy_symbol: plan.buy_symbol.clone(),
+                sell_token: plan.sell_token_address.clone(),
+                buy_token: plan.buy_token_address.clone(),
+                sell_amount_raw: plan.sell_amount_raw.clone(),
+                minimum_buy_amount_raw: "40000000000000000".to_string(),
+                plan_config_digest: approval_digest(config, plan).unwrap(),
+            },
+            pre_balances: ArcusSpotBalanceSnapshot {
+                observed_at: at,
+                sell_token: plan.sell_token_address.clone(),
+                buy_token: plan.buy_token_address.clone(),
+                sell_balance_raw: "1000000000000000000".to_string(),
+                buy_balance_raw: "100000000000000000".to_string(),
+                gas_balance_wei: "1000000000000000".to_string(),
+            },
+            post_balances: Some(ArcusSpotBalanceSnapshot {
+                observed_at: at,
+                sell_token: plan.sell_token_address.clone(),
+                buy_token: plan.buy_token_address.clone(),
+                sell_balance_raw: "900000000000000000".to_string(),
+                buy_balance_raw: "150000000000000000".to_string(),
+                gas_balance_wei: "1000000000000000".to_string(),
+            }),
+            tx_hash: Some(format!("0x{sequence:064x}")),
+            router_status: Some("confirmed".to_string()),
+            detail: None,
+        }
+    }
+
+    fn persist_reconciled_entry_transition(
+        config: &ArcusSpotExecuteOnceConfig,
+        ledger_path: &Path,
+        runtime_path: &Path,
+    ) -> ArcusSpotExecutionAttempt {
+        let mut plan = rotation_plan("entry_signal");
+        plan.quote_received_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
+        write_private_regular_file_atomic(
+            &live_tick_pending_plan_path(config).unwrap(),
+            &plan_bytes,
+        )
+        .unwrap();
+        let attempt = reconciled_entry_attempt(config, &plan, 1);
+        let ledger = ArcusSpotExecutionLedger {
+            schema_version: 2,
+            next_sequence: 2,
+            active: None,
+            history: vec![attempt.clone()],
+        };
+        ArcusSpotExecutionLedgerStore::new(ledger_path)
+            .persist(&ledger)
+            .unwrap();
+        rewrite_checkpoint_state(runtime_path, |state| {
+            state["sequence"] = json!(1);
+            state["relative_log_price_history"] = json!([0.125]);
+            state["last_observation_at"] = json!("2026-08-16T12:00:01Z");
+            state["initial_equity_usd"] = json!("300");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("300");
+            state["last_equity_usd"] = json!("300");
+            state["inventory"] = json!({"token_a": "0.25", "token_b": "0.21"});
+            state["regime"] = json!("rotated_a_to_b");
+            state["last_rotation_at"] = json!("2026-08-16T12:00:02Z");
+            state["rotated_quantity"] = json!("0.05");
+            state["last_live_execution_idempotency_key"] = json!(attempt.idempotency_key.clone());
+        });
+        attempt
+    }
+
     #[test]
     fn state_backup_and_exact_verification_are_private_and_atomic() {
         let dir = tempdir().unwrap();
@@ -2365,6 +2752,188 @@ runtime:
     }
 
     #[test]
+    fn continuity_verification_rejects_a_same_day_loss_baseline_reset() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-rollback");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+            state["initial_equity_usd"] = json!("300");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("300");
+            state["last_equity_usd"] = json!("299");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+            state["daily_baseline_equity_usd"] = json!("250");
+            state["last_equity_usd"] = json!("250");
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("daily equity baseline changed without a UTC rollover"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_last_equity_mark_reset() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-rollback");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+            state["initial_equity_usd"] = json!("300");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("300");
+            state["last_equity_usd"] = json!("299");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+            state["last_equity_usd"] = serde_json::Value::Null;
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("lost its last equity mark"));
+    }
+
+    #[test]
+    fn continuity_verification_accepts_a_matching_utc_day_rollover() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["last_observation_at"] = json!("2026-08-15T23:59:00Z");
+            state["initial_equity_usd"] = json!("300");
+            state["daily_baseline_day"] = json!("2026-08-15");
+            state["daily_baseline_equity_usd"] = json!("300");
+            state["last_equity_usd"] = json!("299");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["last_observation_at"] = json!("2026-08-16T00:00:01Z");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("298");
+            state["last_equity_usd"] = json!("298");
+        });
+
+        let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
+
+        assert_eq!(report.mode, "continuity");
+    }
+
+    #[test]
+    fn continuity_verification_rejects_multiple_acceptance_attempts() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        let plan = rotation_plan("entry_signal");
+        let ledger = ArcusSpotExecutionLedger {
+            schema_version: 2,
+            next_sequence: 3,
+            active: None,
+            history: vec![
+                reconciled_entry_attempt(&config, &plan, 1),
+                reconciled_entry_attempt(&config, &plan, 2),
+            ],
+        };
+        ArcusSpotExecutionLedgerStore::new(&ledger_path)
+            .persist(&ledger)
+            .unwrap();
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("more than one acceptance attempt"));
+    }
+
+    #[test]
+    fn continuity_verification_accepts_one_reconciled_entry_transition() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+
+        let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
+
+        assert_eq!(report.mode, "continuity");
+        assert_eq!(report.ledger.next_sequence, 2);
+        assert_eq!(report.runtime.regime, ArcusSpotRegime::RotatedAToB);
+    }
+
+    #[test]
+    fn continuity_verification_rejects_position_unrelated_to_the_reconciled_attempt() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["inventory"] = json!({"token_a": "0.26", "token_b": "0.21"});
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("position state does not match the reconciled acceptance attempt"));
+    }
+
+    #[test]
     fn continuity_verification_rejects_a_cumulative_equity_baseline_reset() {
         let dir = tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.json");
@@ -2378,6 +2947,9 @@ runtime:
         persist_initial_operator_state(&config);
         rewrite_checkpoint_state(&runtime_path, |state| {
             state["initial_equity_usd"] = json!("300");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("300");
+            state["last_equity_usd"] = json!("300");
         });
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         rewrite_checkpoint_state(&runtime_path, |state| {
@@ -2404,6 +2976,10 @@ runtime:
         );
         persist_initial_operator_state(&config);
         rewrite_checkpoint_state(&runtime_path, |state| {
+            state["initial_equity_usd"] = json!("300");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("300");
+            state["last_equity_usd"] = json!("297");
             state["risk_halt"] = json!({
                 "kind": "daily_loss",
                 "engaged_at": "2026-08-16T12:00:00Z",
