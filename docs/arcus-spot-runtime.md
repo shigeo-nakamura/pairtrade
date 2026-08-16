@@ -289,12 +289,17 @@ and binary SHA-256 in a manifest. The binary, checksum, and manifest are stored
 under the existing least-privilege S3 prefix at an immutable
 content-addressed key:
 
-    arcus-spot-execute-once/releases/<pairtrade-sha>/<dex-sha>/<binary-sha256>/
+    arcus-spot-execute-once/releases/<pairtrade-sha>/<dex-sha>/<binary-sha256>/runs/<run-id>-<attempt>/
 
 The SSM install downloads that exact key, verifies both its uploaded checksum
-and the workflow's expected SHA-256, then atomically replaces
-`/usr/local/bin/arcus-spot-execute-once`. Executables and provenance are
-root-owned; the `arcus` service identity remains the unprivileged caller and
+and the workflow's expected SHA-256, and stages a complete root-owned release
+under `/usr/local/share/arcus-spot-execute-once/releases/`. The run ID and
+attempt make each manifest key immutable even when identical sources reproduce
+the same binary. Only after the staged executable and provenance pass every
+check does the workflow atomically replace
+`/usr/local/bin/arcus-spot-execute-once`; that rename is the final install
+operation, so any earlier failure leaves the timer-visible executable
+unchanged. The `arcus` service identity remains the unprivileged caller and
 owns only its writable state directories. The workflow never starts or
 restarts a service/timer and never invokes the installed binary. Scheduling
 and manual one-shot approval therefore remain separate operator actions.

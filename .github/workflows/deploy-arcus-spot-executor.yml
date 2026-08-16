@@ -142,8 +142,10 @@ jobs:
             --arg github_run_attempt "${GITHUB_RUN_ATTEMPT}" \
             '{schema_version: 1, artifact: "arcus-spot-execute-once", architecture: "aarch64", pairtrade_sha: $pairtrade_sha, dex_connector_ref: $dex_connector_ref, dex_connector_sha: $dex_connector_sha, cargo_lock_sha256: $cargo_lock_sha256, binary_sha256: $binary_sha256, rust_toolchain: $rust_toolchain, build_image: $build_image, github_run_id: $github_run_id, github_run_attempt: $github_run_attempt}' \
             > dist/manifest.json
-          RELEASE_KEY="${ARCUS_S3_PREFIX}/releases/${PAIRTRADE_SHA}/${DEX_CONNECTOR_SHA}/${BINARY_SHA256}"
+          RELEASE_ID="${BINARY_SHA256}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RELEASE_KEY="${ARCUS_S3_PREFIX}/releases/${PAIRTRADE_SHA}/${DEX_CONNECTOR_SHA}/${BINARY_SHA256}/runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "binary_sha256=${BINARY_SHA256}" >> "${GITHUB_OUTPUT}"
+          echo "release_id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
           echo "release_key=${RELEASE_KEY}" >> "${GITHUB_OUTPUT}"
           jq . dist/manifest.json
 
@@ -166,6 +168,7 @@ jobs:
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           RELEASE_KEY: ${{ steps.package.outputs.release_key }}
+          RELEASE_ID: ${{ steps.package.outputs.release_id }}
           BINARY_SHA256: ${{ steps.package.outputs.binary_sha256 }}
         run: |
           cat > /tmp/ssm-params.json <<'JSON'
@@ -175,26 +178,35 @@ jobs:
               "test \"$(uname -m)\" = aarch64",
               "id -u arcus >/dev/null 2>&1",
               "ARCUS_STAGE=$(mktemp -d /tmp/arcus-spot-execute-once.XXXXXX)",
-              "trap 'rm -rf \"$ARCUS_STAGE\"' EXIT",
+              "ARCUS_INSTALL_STAGE=__INSTALL_PATH__.new",
+              "ARCUS_RELEASE_STAGE=__PROVENANCE_DIR__/releases/.__RELEASE_ID__.new",
+              "ARCUS_RELEASE_DIR=__PROVENANCE_DIR__/releases/__RELEASE_ID__",
+              "trap 'rm -rf \"$ARCUS_STAGE\" || true; sudo rm -f \"$ARCUS_INSTALL_STAGE\" || true; if [ -n \"$ARCUS_RELEASE_STAGE\" ]; then sudo rm -rf \"$ARCUS_RELEASE_STAGE\" || true; fi' EXIT",
               "aws s3 cp --only-show-errors s3://__S3_BUCKET__/__RELEASE_KEY__/arcus-spot-execute-once \"$ARCUS_STAGE/arcus-spot-execute-once\"",
               "aws s3 cp --only-show-errors s3://__S3_BUCKET__/__RELEASE_KEY__/arcus-spot-execute-once.sha256 \"$ARCUS_STAGE/arcus-spot-execute-once.sha256\"",
               "aws s3 cp --only-show-errors s3://__S3_BUCKET__/__RELEASE_KEY__/manifest.json \"$ARCUS_STAGE/manifest.json\"",
               "(cd \"$ARCUS_STAGE\" && sha256sum -c arcus-spot-execute-once.sha256)",
               "echo \"__BINARY_SHA256__  $ARCUS_STAGE/arcus-spot-execute-once\" | sha256sum -c -",
-              "sudo install -o root -g root -m 0755 \"$ARCUS_STAGE/arcus-spot-execute-once\" __INSTALL_PATH__.new",
-              "sudo mv -f __INSTALL_PATH__.new __INSTALL_PATH__",
-              "sudo install -d -o root -g root -m 0755 __PROVENANCE_DIR__",
-              "sudo install -o root -g root -m 0644 \"$ARCUS_STAGE/manifest.json\" __PROVENANCE_DIR__/manifest.json",
-              "sudo install -o root -g root -m 0644 \"$ARCUS_STAGE/arcus-spot-execute-once.sha256\" __PROVENANCE_DIR__/arcus-spot-execute-once.sha256",
-              "echo \"__BINARY_SHA256__  __INSTALL_PATH__\" | sudo sha256sum -c -",
-              "test \"$(stat -c %U:%G:%a __INSTALL_PATH__)\" = root:root:755",
-              "stat -c 'installed=%n owner=%U:%G mode=%a bytes=%s' __INSTALL_PATH__",
-              "echo 'Installed only; service/timer state unchanged and binary not invoked.'"
+              "sudo install -o root -g root -m 0755 \"$ARCUS_STAGE/arcus-spot-execute-once\" \"$ARCUS_INSTALL_STAGE\"",
+              "echo \"__BINARY_SHA256__  $ARCUS_INSTALL_STAGE\" | sudo sha256sum -c -",
+              "test \"$(stat -c %U:%G:%a \"$ARCUS_INSTALL_STAGE\")\" = root:root:755",
+              "sudo install -d -o root -g root -m 0755 __PROVENANCE_DIR__/releases",
+              "test ! -e \"$ARCUS_RELEASE_STAGE\"",
+              "test ! -e \"$ARCUS_RELEASE_DIR\"",
+              "sudo install -d -o root -g root -m 0755 \"$ARCUS_RELEASE_STAGE\"",
+              "sudo install -o root -g root -m 0755 \"$ARCUS_STAGE/arcus-spot-execute-once\" \"$ARCUS_RELEASE_STAGE/arcus-spot-execute-once\"",
+              "sudo install -o root -g root -m 0644 \"$ARCUS_STAGE/manifest.json\" \"$ARCUS_RELEASE_STAGE/manifest.json\"",
+              "sudo install -o root -g root -m 0644 \"$ARCUS_STAGE/arcus-spot-execute-once.sha256\" \"$ARCUS_RELEASE_STAGE/arcus-spot-execute-once.sha256\"",
+              "(cd \"$ARCUS_RELEASE_STAGE\" && sha256sum -c arcus-spot-execute-once.sha256)",
+              "test \"$(stat -c %U:%G:%a \"$ARCUS_RELEASE_STAGE/arcus-spot-execute-once\")\" = root:root:755",
+              "sudo mv \"$ARCUS_RELEASE_STAGE\" \"$ARCUS_RELEASE_DIR\"",
+              "ARCUS_RELEASE_STAGE=",
+              "sudo mv -f \"$ARCUS_INSTALL_STAGE\" __INSTALL_PATH__"
             ],
             "executionTimeout": ["600"]
           }
           JSON
-          sed -i "s|__S3_BUCKET__|${S3_BUCKET}|g; s|__RELEASE_KEY__|${RELEASE_KEY}|g; s|__BINARY_SHA256__|${BINARY_SHA256}|g; s|__INSTALL_PATH__|${INSTALL_PATH}|g; s|__PROVENANCE_DIR__|${PROVENANCE_DIR}|g" /tmp/ssm-params.json
+          sed -i "s|__S3_BUCKET__|${S3_BUCKET}|g; s|__RELEASE_KEY__|${RELEASE_KEY}|g; s|__RELEASE_ID__|${RELEASE_ID}|g; s|__BINARY_SHA256__|${BINARY_SHA256}|g; s|__INSTALL_PATH__|${INSTALL_PATH}|g; s|__PROVENANCE_DIR__|${PROVENANCE_DIR}|g" /tmp/ssm-params.json
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${ARCUS_INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
