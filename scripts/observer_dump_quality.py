@@ -134,19 +134,22 @@ def main() -> int:
                         reset_run(symbol)
                     continue
 
+                delta = None
+                if previous_ts is not None:
+                    delta = (timestamp - previous_ts) / 1000
+                    if delta <= 0:
+                        non_monotonic += 1
+                        continue
+
                 frames += 1
                 first_ts = timestamp if first_ts is None else min(first_ts, timestamp)
                 last_ts = timestamp if last_ts is None else max(last_ts, timestamp)
-                if previous_ts is not None:
-                    delta = (timestamp - previous_ts) / 1000
-                    if delta > 0:
-                        gaps.append(delta)
-                        if delta > GAP_EVENT_THRESHOLD_SECS:
-                            gap_events.append((delta, previous_ts, timestamp))
-                            for symbol in list(run_start):
-                                reset_run(symbol)
-                    else:
-                        non_monotonic += 1
+                if delta is not None:
+                    gaps.append(delta)
+                    if delta > GAP_EVENT_THRESHOLD_SECS:
+                        gap_events.append((delta, previous_ts, timestamp))
+                        for symbol in list(run_start):
+                            reset_run(symbol)
                 previous_ts = timestamp
 
                 for symbol in args.symbols:
@@ -169,6 +172,8 @@ def main() -> int:
                             for value in (price_value, bid, ask, bid_size, ask_size)
                         ):
                             raise ValueError("book values must be finite")
+                        if price_value <= 0 or bid <= 0 or ask <= 0:
+                            raise ValueError("book prices must be positive")
                     except (KeyError, TypeError, ValueError):
                         invalid_book[symbol] += 1
                         if len(invalid_book_examples[symbol]) < 5:
