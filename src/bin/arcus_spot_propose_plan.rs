@@ -160,6 +160,20 @@ fn paths_alias(left: &Path, right: &Path) -> bool {
     }
 }
 
+fn validate_runtime_state_path(runtime_state_path: &Path) -> Result<()> {
+    if !runtime_state_path.is_absolute() {
+        bail!("Arcus runtime_state_path must be absolute");
+    }
+    let evidence_path = observation_evidence_path(runtime_state_path)?;
+    if paths_alias(runtime_state_path, &evidence_path) {
+        bail!(
+            "Arcus runtime_state_path must not alias the derived observation evidence path {}",
+            evidence_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn validate_plan_output_path(runtime_state_path: &Path, out_path: &Path) -> Result<()> {
     let absolute_out = if out_path.is_absolute() {
         out_path.to_path_buf()
@@ -282,9 +296,7 @@ fn parse_config(path: &Path) -> Result<ArcusSpotProposeConfig> {
         fs::read(path).with_context(|| format!("failed to read config {}", path.display()))?;
     let mut config: ArcusSpotProposeConfig = serde_yaml::from_slice(&bytes)
         .with_context(|| format!("invalid config {}", path.display()))?;
-    if !config.runtime_state_path.is_absolute() {
-        bail!("Arcus runtime_state_path must be absolute");
-    }
+    validate_runtime_state_path(&config.runtime_state_path)?;
     config.runtime.normalize();
     config
         .runtime
@@ -602,5 +614,16 @@ runtime_state_path: relative/path.json
 
         let error = validate_plan_output_path(&runtime_path, &aliased_output).unwrap_err();
         assert!(error.to_string().contains("must not alias"));
+    }
+
+    #[test]
+    fn runtime_checkpoint_rejects_the_derived_observation_evidence_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_path = dir.path().join("live-tick-observation-evidence.json");
+
+        let error = validate_runtime_state_path(&runtime_path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must not alias the derived observation evidence"));
     }
 }
