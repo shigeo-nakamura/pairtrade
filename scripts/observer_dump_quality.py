@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 import statistics
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -124,10 +125,16 @@ def main() -> int:
                         continue
                     try:
                         price = str(book["price"])
+                        price_value = float(price)
                         bid = float(book["bid_price"])
                         ask = float(book["ask_price"])
                         bid_size = float(book["bid_size"])
                         ask_size = float(book["ask_size"])
+                        if not all(
+                            math.isfinite(value)
+                            for value in (price_value, bid, ask, bid_size, ask_size)
+                        ):
+                            raise ValueError("book values must be finite")
                     except (KeyError, TypeError, ValueError):
                         invalid_book[symbol] += 1
                         if len(invalid_book_examples[symbol]) < 5:

@@ -69,6 +69,7 @@ PYEOF
 JOURNAL_PREFIX="s3://${S3_BUCKET}/${S3_PREFIX}/${HOST_TAG}/${SERVICE}/journal"
 MANIFEST_PREFIX="s3://${S3_BUCKET}/${S3_PREFIX}/${HOST_TAG}/${SERVICE}/manifest"
 MISSING_DAYS=0
+MISSING_MANIFESTS=0
 
 echo "[fetch_observer_journal] host=$HOST_TAG service=$SERVICE"
 echo "[fetch_observer_journal]   window: $SINCE -> $UNTIL"
@@ -78,7 +79,10 @@ for day in $DATES; do
         echo "[fetch_observer_journal]   WARN: missing journal day $day"
         MISSING_DAYS=$((MISSING_DAYS + 1))
     fi
-    aws s3 cp --no-progress "$MANIFEST_PREFIX/$day.json" "$WORK/manifest/$day.json" 2>/dev/null || true
+    if ! aws s3 cp --no-progress "$MANIFEST_PREFIX/$day.json" "$WORK/manifest/$day.json" 2>/dev/null; then
+        echo "[fetch_observer_journal]   WARN: missing manifest day $day"
+        MISSING_MANIFESTS=$((MISSING_MANIFESTS + 1))
+    fi
 done
 
 python3 - "$WORK/journal" "$OUT_FILE" "$SINCE_TS" "$UNTIL_TS" <<'PYEOF'
@@ -126,4 +130,7 @@ PYEOF
 
 if [ "$MISSING_DAYS" -gt 0 ]; then
     echo "[fetch_observer_journal]   WARN: $MISSING_DAYS requested day(s) missing"
+fi
+if [ "$MISSING_MANIFESTS" -gt 0 ]; then
+    echo "[fetch_observer_journal]   WARN: $MISSING_MANIFESTS requested day manifest(s) missing"
 fi
