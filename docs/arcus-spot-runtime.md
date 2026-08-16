@@ -275,6 +275,13 @@ what is currently approved on #772.
 
 ## Traceable executor deployment
 
+The operator procedure for checkpoint/ledger backup, byte-exact binary
+rollback verification, and separately approved post-start continuity evidence
+is documented in [Arcus Spot live-tick state preservation and binary
+rollback](arcus-spot-state-rollback.md). The state tooling is offline and has
+no restore operation; starting the live-tick service remains an explicitly
+approved action because one tick can submit a swap.
+
 `.github/workflows/deploy-arcus-spot-executor.yml` is the aarch64 build and
 install path for `arcus-spot-execute-once`. It runs automatically when Arcus
 executor/runtime source, Cargo inputs, the build script, or the workflow itself

@@ -10,12 +10,13 @@ use aes_gcm::{
 };
 use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use debot::arcus_spot::{
     build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision,
-    ArcusSpotExecutionAttempt, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
-    ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig,
-    ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntimeCheckpointStore,
+    ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore,
+    ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner,
+    ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotRegime, ArcusSpotRotationPlan,
+    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
     ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode,
 };
 use dex_connector::{
@@ -27,6 +28,7 @@ use ed25519_dalek::{
     SIGNATURE_LENGTH,
 };
 use rand::RngCore;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -352,17 +354,561 @@ fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<Pa
     Ok(parent.join("live-tick-pending-plan.json"))
 }
 
+const STATE_BACKUP_SCHEMA_VERSION: u32 = 1;
+const STATE_BACKUP_MANIFEST: &str = "manifest.json";
+const STATE_BACKUP_CHECKPOINT: &str = "runtime_state.json";
+const STATE_BACKUP_LEDGER: &str = "ledger.json";
+const STATE_BACKUP_PENDING_PLAN: &str = "live-tick-pending-plan.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotStateBackupFile {
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotRuntimeStateSummary {
+    sequence: u64,
+    relative_log_price_history_len: usize,
+    last_observation_at: Option<DateTime<Utc>>,
+    inventory: ArcusSpotInventory,
+    regime: ArcusSpotRegime,
+    last_rotation_at: Option<DateTime<Utc>>,
+    rotated_quantity: Option<Decimal>,
+    last_live_execution_idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotLedgerStateSummary {
+    next_sequence: u64,
+    history_len: usize,
+    active_sequence: Option<u64>,
+    active_phase: Option<ArcusSpotExecutionPhase>,
+    active_idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotStateBackupManifest {
+    schema_version: u32,
+    config_sha256: String,
+    runtime_checkpoint: ArcusSpotStateBackupFile,
+    execution_ledger: ArcusSpotStateBackupFile,
+    pending_plan: Option<ArcusSpotStateBackupFile>,
+    runtime: ArcusSpotRuntimeStateSummary,
+    ledger: ArcusSpotLedgerStateSummary,
+}
+
+struct ArcusSpotStateImage {
+    checkpoint_bytes: Vec<u8>,
+    ledger_bytes: Vec<u8>,
+    pending_plan_bytes: Option<Vec<u8>>,
+    runtime: ArcusSpotRuntime,
+    ledger: ArcusSpotExecutionLedger,
+}
+
+#[derive(Debug, Serialize)]
+struct ArcusSpotStateVerificationReport {
+    status: &'static str,
+    mode: &'static str,
+    config_sha256: String,
+    runtime_checkpoint_sha256: String,
+    execution_ledger_sha256: String,
+    pending_plan_sha256: Option<String>,
+    runtime: ArcusSpotRuntimeStateSummary,
+    ledger: ArcusSpotLedgerStateSummary,
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn state_backup_file(bytes: &[u8]) -> ArcusSpotStateBackupFile {
+    ArcusSpotStateBackupFile {
+        sha256: sha256_prefixed(bytes),
+        size_bytes: bytes.len() as u64,
+    }
+}
+
+fn runtime_state_summary(runtime: &ArcusSpotRuntime) -> ArcusSpotRuntimeStateSummary {
+    let state = runtime.state();
+    ArcusSpotRuntimeStateSummary {
+        sequence: state.sequence,
+        relative_log_price_history_len: state.relative_log_price_history.len(),
+        last_observation_at: state.last_observation_at,
+        inventory: state.inventory,
+        regime: state.regime,
+        last_rotation_at: state.last_rotation_at,
+        rotated_quantity: state.rotated_quantity,
+        last_live_execution_idempotency_key: state.last_live_execution_idempotency_key.clone(),
+    }
+}
+
+fn ledger_state_summary(ledger: &ArcusSpotExecutionLedger) -> ArcusSpotLedgerStateSummary {
+    ArcusSpotLedgerStateSummary {
+        next_sequence: ledger.next_sequence,
+        history_len: ledger.history.len(),
+        active_sequence: ledger.active.as_ref().map(|attempt| attempt.sequence),
+        active_phase: ledger.active.as_ref().map(|attempt| attempt.phase),
+        active_idempotency_key: ledger
+            .active
+            .as_ref()
+            .map(|attempt| attempt.idempotency_key.clone()),
+    }
+}
+
+fn require_private_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("{label} {} must be a non-symlink directory", path.display());
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!(
+            "{label} {} must not be readable or writable by group/other",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn read_optional_private_plan(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let bytes = read_private_regular_file(path, "Arcus pending plan")?;
+            serde_json::from_slice::<ArcusSpotRotationPlan>(&bytes)
+                .with_context(|| format!("invalid Arcus pending plan {}", path.display()))?;
+            Ok(Some(bytes))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect Arcus pending plan {}", path.display())),
+    }
+}
+
+/// Capture the three files that form the live-tick recovery boundary. The
+/// caller must hold the runtime checkpoint namespace lock so checkpoint,
+/// ledger and pending-plan reads cannot interleave with a legitimate writer.
+fn capture_arcus_state(config: &ArcusSpotExecuteOnceConfig) -> Result<ArcusSpotStateImage> {
+    let checkpoint_store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    let runtime = checkpoint_store.load_existing(&config.runtime)?;
+    let ledger = ledger_store.load_existing()?;
+    let checkpoint_bytes =
+        read_private_regular_file(&config.runtime_state_path, "Arcus runtime checkpoint")?;
+    let ledger_bytes = read_private_regular_file(&config.ledger_path, "Arcus execution ledger")?;
+    let pending_plan_bytes = read_optional_private_plan(&live_tick_pending_plan_path(config)?)?;
+    Ok(ArcusSpotStateImage {
+        checkpoint_bytes,
+        ledger_bytes,
+        pending_plan_bytes,
+        runtime,
+        ledger,
+    })
+}
+
+fn manifest_for_state(
+    config: &ArcusSpotExecuteOnceConfig,
+    state: &ArcusSpotStateImage,
+) -> Result<ArcusSpotStateBackupManifest> {
+    Ok(ArcusSpotStateBackupManifest {
+        schema_version: STATE_BACKUP_SCHEMA_VERSION,
+        config_sha256: auto_execute_config_digest(config)?,
+        runtime_checkpoint: state_backup_file(&state.checkpoint_bytes),
+        execution_ledger: state_backup_file(&state.ledger_bytes),
+        pending_plan: state.pending_plan_bytes.as_deref().map(state_backup_file),
+        runtime: runtime_state_summary(&state.runtime),
+        ledger: ledger_state_summary(&state.ledger),
+    })
+}
+
+fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync {}", path.display()))
+}
+
+/// Create a complete immutable backup directory using a hidden staging
+/// directory and final rename. The live checkpoint/ledger are only read;
+/// nothing here is a restore operation.
+fn create_arcus_state_backup(
+    config: &ArcusSpotExecuteOnceConfig,
+    backup_dir: &Path,
+) -> Result<ArcusSpotStateBackupManifest> {
+    if !backup_dir.is_absolute() {
+        bail!("Arcus state backup directory must be absolute");
+    }
+    if fs::symlink_metadata(backup_dir).is_ok() {
+        bail!(
+            "Arcus state backup destination {} already exists",
+            backup_dir.display()
+        );
+    }
+    let parent = backup_dir
+        .parent()
+        .context("Arcus state backup directory has no parent")?;
+    let backup_name = backup_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Arcus state backup directory has no valid file name")?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("failed to inspect backup parent {}", parent.display()))?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        bail!(
+            "Arcus state backup parent {} must be a non-symlink directory",
+            parent.display()
+        );
+    }
+
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+    let state = capture_arcus_state(config)?;
+    let manifest = manifest_for_state(config, &state)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_nanos();
+    let staging = parent.join(format!(
+        ".{backup_name}.tmp.{}.{}",
+        std::process::id(),
+        stamp
+    ));
+    let result = (|| -> Result<()> {
+        fs::create_dir(&staging)
+            .with_context(|| format!("failed to create {}", staging.display()))?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
+        write_new_private_file(
+            &staging.join(STATE_BACKUP_CHECKPOINT),
+            &state.checkpoint_bytes,
+        )?;
+        write_new_private_file(&staging.join(STATE_BACKUP_LEDGER), &state.ledger_bytes)?;
+        if let Some(bytes) = &state.pending_plan_bytes {
+            write_new_private_file(&staging.join(STATE_BACKUP_PENDING_PLAN), bytes)?;
+        }
+        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .context("failed to serialize Arcus state backup manifest")?;
+        manifest_bytes.push(b'\n');
+        write_new_private_file(&staging.join(STATE_BACKUP_MANIFEST), &manifest_bytes)?;
+        File::open(&staging)?.sync_all()?;
+        if fs::symlink_metadata(backup_dir).is_ok() {
+            bail!(
+                "Arcus state backup destination {} appeared while staging",
+                backup_dir.display()
+            );
+        }
+        fs::rename(&staging, backup_dir).with_context(|| {
+            format!(
+                "failed to atomically publish Arcus state backup {}",
+                backup_dir.display()
+            )
+        })?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result?;
+    Ok(manifest)
+}
+
+fn require_file_matches_manifest(
+    bytes: &[u8],
+    expected: &ArcusSpotStateBackupFile,
+    label: &str,
+) -> Result<()> {
+    let actual = state_backup_file(bytes);
+    if actual != *expected {
+        bail!(
+            "{label} does not match backup manifest (expected {} / {} bytes, got {} / {} bytes)",
+            expected.sha256,
+            expected.size_bytes,
+            actual.sha256,
+            actual.size_bytes
+        );
+    }
+    Ok(())
+}
+
+fn load_arcus_state_backup(
+    config: &ArcusSpotExecuteOnceConfig,
+    backup_dir: &Path,
+) -> Result<(ArcusSpotStateBackupManifest, ArcusSpotStateImage)> {
+    require_private_directory(backup_dir, "Arcus state backup directory")?;
+    let manifest_bytes =
+        read_private_regular_file(&backup_dir.join(STATE_BACKUP_MANIFEST), "backup manifest")?;
+    let manifest: ArcusSpotStateBackupManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| {
+            format!(
+                "invalid Arcus state backup manifest {}",
+                backup_dir.join(STATE_BACKUP_MANIFEST).display()
+            )
+        })?;
+    if manifest.schema_version != STATE_BACKUP_SCHEMA_VERSION {
+        bail!(
+            "unsupported Arcus state backup schema {}; expected {}",
+            manifest.schema_version,
+            STATE_BACKUP_SCHEMA_VERSION
+        );
+    }
+    let config_sha256 = auto_execute_config_digest(config)?;
+    if manifest.config_sha256 != config_sha256 {
+        bail!("Arcus state backup config does not match the supplied config");
+    }
+
+    let checkpoint_path = backup_dir.join(STATE_BACKUP_CHECKPOINT);
+    let ledger_path = backup_dir.join(STATE_BACKUP_LEDGER);
+    let checkpoint_bytes =
+        read_private_regular_file(&checkpoint_path, "backup runtime checkpoint")?;
+    let ledger_bytes = read_private_regular_file(&ledger_path, "backup execution ledger")?;
+    require_file_matches_manifest(
+        &checkpoint_bytes,
+        &manifest.runtime_checkpoint,
+        "backup runtime checkpoint",
+    )?;
+    require_file_matches_manifest(
+        &ledger_bytes,
+        &manifest.execution_ledger,
+        "backup execution ledger",
+    )?;
+    let pending_plan_path = backup_dir.join(STATE_BACKUP_PENDING_PLAN);
+    let pending_plan_bytes = match &manifest.pending_plan {
+        Some(expected) => {
+            let bytes = read_private_regular_file(&pending_plan_path, "backup pending plan")?;
+            require_file_matches_manifest(&bytes, expected, "backup pending plan")?;
+            serde_json::from_slice::<ArcusSpotRotationPlan>(&bytes)
+                .context("invalid backup pending plan")?;
+            Some(bytes)
+        }
+        None => {
+            if fs::symlink_metadata(&pending_plan_path).is_ok() {
+                bail!("backup has an unrecorded pending-plan file");
+            }
+            None
+        }
+    };
+    let runtime = ArcusSpotRuntimeCheckpointStore::new(checkpoint_path)
+        .load_existing(&config.runtime)
+        .context("backup runtime checkpoint failed canonical validation")?;
+    let ledger = ArcusSpotExecutionLedgerStore::new(ledger_path)
+        .load_existing()
+        .context("backup execution ledger failed canonical validation")?;
+    if manifest.runtime != runtime_state_summary(&runtime) {
+        bail!("backup runtime summary does not match its checkpoint");
+    }
+    if manifest.ledger != ledger_state_summary(&ledger) {
+        bail!("backup ledger summary does not match its ledger");
+    }
+    Ok((
+        manifest,
+        ArcusSpotStateImage {
+            checkpoint_bytes,
+            ledger_bytes,
+            pending_plan_bytes,
+            runtime,
+            ledger,
+        },
+    ))
+}
+
+fn same_execution_identity(
+    baseline: &ArcusSpotExecutionAttempt,
+    current: &ArcusSpotExecutionAttempt,
+) -> bool {
+    let sticky_terminal_phase_preserved = !matches!(
+        baseline.phase,
+        ArcusSpotExecutionPhase::Rejected
+            | ArcusSpotExecutionPhase::Failed
+            | ArcusSpotExecutionPhase::Unknown
+            | ArcusSpotExecutionPhase::OperatorHold
+            | ArcusSpotExecutionPhase::Reconciled
+    ) || current.phase == baseline.phase;
+    baseline.sequence == current.sequence
+        && baseline.idempotency_key == current.idempotency_key
+        && baseline.payload_hash == current.payload_hash
+        && baseline.chain_id == current.chain_id
+        && baseline.taker == current.taker
+        && baseline.prepared_at == current.prepared_at
+        && baseline.intent == current.intent
+        && baseline.pre_balances == current.pre_balances
+        && current.updated_at >= baseline.updated_at
+        && baseline
+            .dispatched_at
+            .is_none_or(|dispatched_at| current.dispatched_at == Some(dispatched_at))
+        && baseline
+            .tx_hash
+            .as_ref()
+            .is_none_or(|tx_hash| current.tx_hash.as_ref() == Some(tx_hash))
+        && baseline
+            .post_balances
+            .as_ref()
+            .is_none_or(|post| current.post_balances.as_ref() == Some(post))
+        && sticky_terminal_phase_preserved
+}
+
+fn require_arcus_state_continuity(
+    baseline: &ArcusSpotStateImage,
+    current: &ArcusSpotStateImage,
+) -> Result<()> {
+    let baseline_runtime = baseline.runtime.state();
+    let current_runtime = current.runtime.state();
+    if current_runtime.sequence < baseline_runtime.sequence {
+        bail!("Arcus runtime sequence regressed across restart/rollback");
+    }
+    if current_runtime.relative_log_price_history.len()
+        < baseline_runtime.relative_log_price_history.len()
+    {
+        bail!("Arcus runtime signal history shrank across restart/rollback");
+    }
+    match (
+        baseline_runtime.last_observation_at,
+        current_runtime.last_observation_at,
+    ) {
+        (Some(baseline_at), Some(current_at)) if current_at < baseline_at => {
+            bail!("Arcus runtime last observation regressed across restart/rollback")
+        }
+        (Some(_), None) => {
+            bail!("Arcus runtime lost its last observation across restart/rollback")
+        }
+        _ => {}
+    }
+    if current.ledger.next_sequence < baseline.ledger.next_sequence {
+        bail!("Arcus ledger next_sequence regressed across restart/rollback");
+    }
+    for attempt in &baseline.ledger.history {
+        if !current
+            .ledger
+            .history
+            .iter()
+            .any(|candidate| candidate == attempt)
+        {
+            bail!(
+                "Arcus ledger lost or changed archived attempt sequence {}",
+                attempt.sequence
+            );
+        }
+    }
+    if let Some(active) = &baseline.ledger.active {
+        let continued = current
+            .ledger
+            .history
+            .iter()
+            .chain(current.ledger.active.iter())
+            .any(|candidate| same_execution_identity(active, candidate));
+        if !continued {
+            bail!(
+                "Arcus ledger lost active attempt sequence {} across restart/rollback",
+                active.sequence
+            );
+        }
+    }
+    if let Some(baseline_key) = &baseline_runtime.last_live_execution_idempotency_key {
+        let current_key = current_runtime
+            .last_live_execution_idempotency_key
+            .as_ref()
+            .context("Arcus runtime lost its last execution idempotency key")?;
+        if current_key != baseline_key
+            && !current
+                .ledger
+                .history
+                .iter()
+                .chain(current.ledger.active.iter())
+                .any(|attempt| attempt.idempotency_key == *current_key)
+        {
+            bail!("Arcus runtime advanced to an idempotency key absent from the ledger");
+        }
+    }
+    if current.ledger_bytes == baseline.ledger_bytes
+        && (current_runtime.inventory != baseline_runtime.inventory
+            || current_runtime.regime != baseline_runtime.regime
+            || current_runtime.last_rotation_at != baseline_runtime.last_rotation_at
+            || current_runtime.rotated_quantity != baseline_runtime.rotated_quantity
+            || current_runtime.last_live_execution_idempotency_key
+                != baseline_runtime.last_live_execution_idempotency_key)
+    {
+        bail!("Arcus position state changed without a corresponding ledger change");
+    }
+    Ok(())
+}
+
+fn verify_arcus_state_backup(
+    config: &ArcusSpotExecuteOnceConfig,
+    backup_dir: &Path,
+    exact: bool,
+) -> Result<ArcusSpotStateVerificationReport> {
+    let (manifest, baseline) = load_arcus_state_backup(config, backup_dir)?;
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+    let current = capture_arcus_state(config)?;
+    if exact {
+        require_file_matches_manifest(
+            &current.checkpoint_bytes,
+            &manifest.runtime_checkpoint,
+            "live runtime checkpoint",
+        )?;
+        require_file_matches_manifest(
+            &current.ledger_bytes,
+            &manifest.execution_ledger,
+            "live execution ledger",
+        )?;
+        match (&manifest.pending_plan, &current.pending_plan_bytes) {
+            (Some(expected), Some(bytes)) => {
+                require_file_matches_manifest(bytes, expected, "live pending plan")?
+            }
+            (None, None) => {}
+            _ => bail!("live pending-plan presence changed since the backup"),
+        }
+    } else {
+        require_arcus_state_continuity(&baseline, &current)?;
+    }
+    Ok(ArcusSpotStateVerificationReport {
+        status: "verified",
+        mode: if exact { "exact" } else { "continuity" },
+        config_sha256: manifest.config_sha256,
+        runtime_checkpoint_sha256: sha256_prefixed(&current.checkpoint_bytes),
+        execution_ledger_sha256: sha256_prefixed(&current.ledger_bytes),
+        pending_plan_sha256: current.pending_plan_bytes.as_deref().map(sha256_prefixed),
+        runtime: runtime_state_summary(&current.runtime),
+        ledger: ledger_state_summary(&current.ledger),
+    })
+}
+
 fn usage() -> &'static str {
     "usage:
   arcus-spot-execute-once keygen PRIVATE_KEY_FILE
   arcus-spot-execute-once hash CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once hash-config CONFIG_YAML
+  arcus-spot-execute-once state-backup CONFIG_YAML BACKUP_DIR
+  arcus-spot-execute-once state-verify-exact CONFIG_YAML BACKUP_DIR
+  arcus-spot-execute-once state-verify-continuity CONFIG_YAML BACKUP_DIR
   arcus-spot-execute-once sign-approval DIGEST PRIVATE_KEY_FILE
   arcus-spot-execute-once execute CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
   arcus-spot-execute-once auto-execute CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
   arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once live-tick CONFIG_YAML
+
+state-backup and state-verify-* are offline operator commands. They never
+construct an RPC/router client, KMS signer, approval policy, or executor and
+cannot submit a swap. state-backup takes the same exclusive checkpoint lock
+as live-tick, requires an already-existing valid checkpoint and ledger, and
+publishes a mode-0700 backup directory atomically with mode-0600 copies and a
+SHA-256/config-bound manifest. state-verify-exact proves byte identity while
+the timer remains stopped (including the recovery pending plan, if present).
+state-verify-continuity is the post-start check: it permits normal checkpoint
+and ledger advancement but refuses sequence/history regression, lost attempts,
+or a position-state change without a corresponding ledger change. Neither
+command restores or deletes live state.
 
 live-tick is the unattended-probe entry point: it fetches exactly one live
 snapshot itself (the same public, read-only recorder client
@@ -909,6 +1455,34 @@ async fn main() -> Result<()> {
             println!("{}", auto_execute_config_digest(&config)?);
             Ok(())
         }
+        [command, config_path, backup_dir] if command == "state-backup" => {
+            let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
+            let config = parse_config(&config_bytes, Path::new(config_path))?;
+            let manifest = create_arcus_state_backup(&config, Path::new(backup_dir))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&manifest)
+                    .context("failed to serialize Arcus state backup result")?
+            );
+            Ok(())
+        }
+        [command, config_path, backup_dir]
+            if command == "state-verify-exact" || command == "state-verify-continuity" =>
+        {
+            let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
+            let config = parse_config(&config_bytes, Path::new(config_path))?;
+            let report = verify_arcus_state_backup(
+                &config,
+                Path::new(backup_dir),
+                command == "state-verify-exact",
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .context("failed to serialize Arcus state verification report")?
+            );
+            Ok(())
+        }
         [command, digest, key_path] if command == "sign-approval" => {
             let signing_key = read_ed25519_signing_key(Path::new(key_path))?;
             let signature = signing_key.sign(digest.as_bytes());
@@ -1116,11 +1690,10 @@ async fn main() -> Result<()> {
             // because this run happened not to rotate would silently widen
             // gaps in the very history the entry/exit z-score needs.
             store.persist(&runtime)?;
-            drop(checkpoint_lock);
-
             let plan = match event.decision.clone() {
                 ArcusSpotDecision::WouldRotate { plan } => plan,
                 ArcusSpotDecision::Observe { .. } | ArcusSpotDecision::SimulatedFill { .. } => {
+                    drop(checkpoint_lock);
                     return write_live_tick_event(&event);
                 }
             };
@@ -1136,6 +1709,13 @@ async fn main() -> Result<()> {
             let plan_bytes = serde_json::to_vec_pretty(&plan)
                 .context("failed to serialize Arcus live-tick plan")?;
             write_private_regular_file_atomic(&pending_plan_path, &plan_bytes)?;
+            // Keep checkpoint + pending-plan backup capture coherent: the
+            // pending plan is part of Submitted-crash recovery, so publish
+            // it while the same checkpoint namespace lock is still held.
+            // Backup/verify takes this lock too and therefore observes
+            // either the old complete state or this new complete state,
+            // never a checkpoint from one tick with a plan from another.
+            drop(checkpoint_lock);
             let mut executor = executor_from_config(&config).await?;
             // Re-read fresh, same reasoning as `execute`'s own comment
             // above: the plan above was computed before the ledger lock
@@ -1224,6 +1804,9 @@ mod tests {
         assert!(usage().contains("live-tick CONFIG_YAML"));
         assert!(!usage().contains("live-tick CONFIG_YAML RECORDER_SNAPSHOT_JSON"));
         assert!(usage().contains("hash-config CONFIG_YAML"));
+        assert!(usage().contains("state-backup CONFIG_YAML BACKUP_DIR"));
+        assert!(usage().contains("state-verify-exact CONFIG_YAML BACKUP_DIR"));
+        assert!(usage().contains("state-verify-continuity CONFIG_YAML BACKUP_DIR"));
     }
 
     fn live_runtime_config() -> ArcusSpotRuntimeConfig {
@@ -1541,6 +2124,238 @@ runtime:
 "#
         ))
         .unwrap()
+    }
+
+    fn persist_initial_operator_state(config: &ArcusSpotExecuteOnceConfig) {
+        let runtime = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&runtime)
+            .unwrap();
+        ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .persist(&ArcusSpotExecutionLedger::default())
+            .unwrap();
+        let store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        drop(
+            store
+                .acquire_exclusive_lock(&config.runtime_state_path)
+                .unwrap(),
+        );
+    }
+
+    fn rewrite_checkpoint_state(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        edit(&mut value["state"]);
+        let mut bytes = serde_json::to_vec_pretty(&value).unwrap();
+        bytes.push(b'\n');
+        write_private_regular_file_atomic(path, &bytes).unwrap();
+    }
+
+    #[test]
+    fn state_backup_and_exact_verification_are_private_and_atomic() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("pre-rollback");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+
+        let manifest = create_arcus_state_backup(&config, &backup_dir).unwrap();
+        let report = verify_arcus_state_backup(&config, &backup_dir, true).unwrap();
+
+        assert_eq!(manifest.schema_version, STATE_BACKUP_SCHEMA_VERSION);
+        assert_eq!(report.status, "verified");
+        assert_eq!(report.mode, "exact");
+        assert_eq!(
+            fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for name in [
+            STATE_BACKUP_MANIFEST,
+            STATE_BACKUP_CHECKPOINT,
+            STATE_BACKUP_LEDGER,
+        ] {
+            assert_eq!(
+                fs::metadata(backup_dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let error = create_arcus_state_backup(&config, &backup_dir).unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn state_backup_refuses_to_race_an_executor_lock() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("blocked-backup");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let ledger_before = fs::read(&ledger_path).unwrap();
+        let runtime_before = fs::read(&runtime_path).unwrap();
+        let store = ArcusSpotExecutionLedgerStore::new(ledger_path.clone());
+        let _held = store.acquire_exclusive_lock(&runtime_path).unwrap();
+
+        let error = create_arcus_state_backup(&config, &backup_dir).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("another Arcus executor already holds"));
+        assert!(!backup_dir.exists());
+        assert_eq!(fs::read(ledger_path).unwrap(), ledger_before);
+        assert_eq!(fs::read(runtime_path).unwrap(), runtime_before);
+    }
+
+    #[test]
+    fn exact_verification_detects_a_valid_advance_that_continuity_accepts() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(1);
+            state["relative_log_price_history"] = json!([0.125]);
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+        });
+
+        let exact_error = verify_arcus_state_backup(&config, &backup_dir, true).unwrap_err();
+        let continuity = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
+
+        assert!(exact_error
+            .to_string()
+            .contains("does not match backup manifest"));
+        assert_eq!(continuity.mode, "continuity");
+        assert_eq!(continuity.runtime.sequence, 1);
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_checkpoint_reset() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-rollback");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["relative_log_price_history"] = json!([0.125, 0.25]);
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+
+        let fresh = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
+        ArcusSpotRuntimeCheckpointStore::new(runtime_path)
+            .persist(&fresh)
+            .unwrap();
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("runtime sequence regressed"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_ledger_sequence_reset() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-rollback");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let ledger_store = ArcusSpotExecutionLedgerStore::new(ledger_path);
+        let mut advanced = ArcusSpotExecutionLedger::default();
+        advanced.next_sequence = 7;
+        ledger_store.persist(&advanced).unwrap();
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+
+        ledger_store
+            .persist(&ArcusSpotExecutionLedger::default())
+            .unwrap();
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("ledger next_sequence regressed"));
+    }
+
+    #[test]
+    fn state_verification_rejects_a_tampered_backup_before_comparison() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("tampered-backup");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(backup_dir.join(STATE_BACKUP_LEDGER))
+            .unwrap()
+            .write_all(b" \n")
+            .unwrap();
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, true).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("backup execution ledger does not match backup manifest"));
+    }
+
+    #[test]
+    fn state_backup_includes_and_exactly_verifies_a_pending_recovery_plan() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let pending_path = dir.path().join(STATE_BACKUP_PENDING_PLAN);
+        let backup_dir = dir.path().join("with-pending-plan");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let plan_bytes = serde_json::to_vec_pretty(&rotation_plan("entry_signal")).unwrap();
+        write_private_regular_file_atomic(&pending_path, &plan_bytes).unwrap();
+
+        let manifest = create_arcus_state_backup(&config, &backup_dir).unwrap();
+        verify_arcus_state_backup(&config, &backup_dir, true).unwrap();
+
+        assert_eq!(
+            manifest.pending_plan.unwrap().sha256,
+            sha256_prefixed(&plan_bytes)
+        );
+        assert_eq!(
+            fs::read(backup_dir.join(STATE_BACKUP_PENDING_PLAN)).unwrap(),
+            plan_bytes
+        );
     }
 
     #[test]
