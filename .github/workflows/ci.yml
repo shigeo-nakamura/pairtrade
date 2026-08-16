@@ -212,6 +212,9 @@ jobs:
     environment: debot
     env:
       DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+    outputs:
+      debot_sha256: ${{ steps.package.outputs.debot_sha256 }}
+      libsigner_sha256: ${{ steps.package.outputs.libsigner_sha256 }}
     steps:
       - name: Checkout debot
         uses: actions/checkout@v5
@@ -324,13 +327,37 @@ jobs:
           docker run --rm --platform linux/arm64 -v "${{ github.workspace }}/debot/target/release/debot:/artifacts/debot:ro" -v "${{ github.workspace }}/lighter-go/build/libsigner.so:/artifacts/libsigner.so:ro" -e LD_LIBRARY_PATH=/artifacts ${AL2023_IMAGE_RESOLVED} /bin/bash -lc "set -euo pipefail; if ldd /artifacts/debot | grep -q 'not found'; then exit 1; fi; ldd /artifacts/debot; if ldd /artifacts/libsigner.so | grep -q 'not found'; then exit 1; fi; ldd /artifacts/libsigner.so"
 
       - name: Package artifacts
+        id: package
         run: |
+          set -euo pipefail
           mkdir -p dist/bin dist/lib dist/scripts dist/configs
           file debot/target/release/debot | grep -q aarch64
           file lighter-go/build/libsigner.so | grep -q aarch64
-          sha256sum debot/target/release/debot lighter-go/build/libsigner.so
-          cp debot/target/release/debot dist/bin/debot
-          cp lighter-go/build/libsigner.so dist/lib/libsigner.so
+          install -m 0755 debot/target/release/debot dist/bin/debot
+          install -m 0644 lighter-go/build/libsigner.so dist/lib/libsigner.so
+          test "$(stat -c %a dist/bin/debot)" = 755
+          test "$(stat -c %a dist/lib/libsigner.so)" = 644
+          DEBOT_SHA256=$(sha256sum dist/bin/debot | cut -d " " -f1)
+          LIBSIGNER_SHA256=$(sha256sum dist/lib/libsigner.so | cut -d " " -f1)
+          CARGO_LOCK_SHA256=$(sha256sum debot/Cargo.lock | cut -d " " -f1)
+          DEX_CONNECTOR_SHA=$(git -C dex-connector rev-parse HEAD)
+          (cd dist && sha256sum bin/debot lib/libsigner.so > checksums.sha256)
+          jq -n \
+            --arg pairtrade_sha "${GITHUB_SHA}" \
+            --arg dex_connector_ref "${DEX_CONNECTOR_REF}" \
+            --arg dex_connector_sha "${DEX_CONNECTOR_SHA}" \
+            --arg cargo_lock_sha256 "${CARGO_LOCK_SHA256}" \
+            --arg debot_sha256 "${DEBOT_SHA256}" \
+            --arg libsigner_sha256 "${LIBSIGNER_SHA256}" \
+            --arg rust_toolchain "${RUST_TOOLCHAIN}" \
+            --arg build_image "${AL2023_IMAGE_RESOLVED}" \
+            --arg github_run_id "${GITHUB_RUN_ID}" \
+            --arg github_run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            '{schema_version: 1, architecture: "aarch64", pairtrade_sha: $pairtrade_sha, dex_connector_ref: $dex_connector_ref, dex_connector_sha: $dex_connector_sha, cargo_lock_sha256: $cargo_lock_sha256, rust_toolchain: $rust_toolchain, build_image: $build_image, github_run_id: $github_run_id, github_run_attempt: $github_run_attempt, artifacts: {debot: {path: "bin/debot", sha256: $debot_sha256, mode: "0755"}, libsigner: {path: "lib/libsigner.so", sha256: $libsigner_sha256, mode: "0644"}}}' > dist/manifest.json
+          echo "debot_sha256=${DEBOT_SHA256}" >> "${GITHUB_OUTPUT}"
+          echo "libsigner_sha256=${LIBSIGNER_SHA256}" >> "${GITHUB_OUTPUT}"
+          (cd dist && sha256sum -c checksums.sha256)
+          jq . dist/manifest.json
           rsync -a \
             --exclude "venv/" \
             --exclude "__pycache__/" \
@@ -353,6 +380,8 @@ jobs:
         run: |
           aws s3 cp dist/bin/debot "s3://${S3_BUCKET}/debot/debot"
           aws s3 cp dist/lib/libsigner.so "s3://${S3_BUCKET}/debot/libsigner.so"
+          aws s3 cp dist/checksums.sha256 "s3://${S3_BUCKET}/debot/checksums.sha256"
+          aws s3 cp dist/manifest.json "s3://${S3_BUCKET}/debot/manifest.json"
           aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot/scripts/" \
             --exclude "venv/*" \
             --exclude "venv/**" \
@@ -372,15 +401,25 @@ jobs:
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
+          DEBOT_SHA256: ${{ steps.package.outputs.debot_sha256 }}
+          LIBSIGNER_SHA256: ${{ steps.package.outputs.libsigner_sha256 }}
         run: |
           cat > /tmp/ssm-params.json <<'JSON'
           {
             "commands": [
               "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/lib __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
               "aws s3 cp s3://__S3_BUCKET__/debot/debot __INSTALL_DIR__/bin/debot",
-              "sudo chmod 755 __INSTALL_DIR__/bin/debot",
               "aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so __INSTALL_DIR__/lib/libsigner.so",
-              "sudo chmod 644 __INSTALL_DIR__/lib/libsigner.so",
+              "aws s3 cp s3://__S3_BUCKET__/debot/checksums.sha256 __INSTALL_DIR__/checksums.sha256",
+              "aws s3 cp s3://__S3_BUCKET__/debot/manifest.json __INSTALL_DIR__/manifest.json",
+              "sudo chown root:root __INSTALL_DIR__/bin/debot __INSTALL_DIR__/lib/libsigner.so __INSTALL_DIR__/checksums.sha256 __INSTALL_DIR__/manifest.json",
+              "sudo chmod 755 __INSTALL_DIR__/bin/debot",
+              "sudo chmod 644 __INSTALL_DIR__/lib/libsigner.so __INSTALL_DIR__/checksums.sha256 __INSTALL_DIR__/manifest.json",
+              "echo __DEBOT_SHA256__ __INSTALL_DIR__/bin/debot | sudo sha256sum -c -",
+              "echo __LIBSIGNER_SHA256__ __INSTALL_DIR__/lib/libsigner.so | sudo sha256sum -c -",
+              "cd __INSTALL_DIR__ && sudo sha256sum -c checksums.sha256",
+              "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/bin/debot) = root:root:755",
+              "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/lib/libsigner.so) = root:root:644",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
@@ -389,7 +428,7 @@ jobs:
             ]
           }
           JSON
-          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g" /tmp/ssm-params.json
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__DEBOT_SHA256__|${DEBOT_SHA256}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g" /tmp/ssm-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
@@ -500,13 +539,15 @@ jobs:
       - name: Deploy binary and runtime artifacts via SSM (no start/restart)
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          DEBOT_SHA256: ${{ needs.deploy.outputs.debot_sha256 }}
+          LIBSIGNER_SHA256: ${{ needs.deploy.outputs.libsigner_sha256 }}
         run: |
           test -n "${INSTANCE_ID}"
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
             --comment "Deploy Robinhood Lighter pairtrade artifacts; no start or restart" \
-            --parameters commands="sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/bin ${INSTALL_DIR}/lib ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 cp s3://${S3_BUCKET}/debot/debot ${INSTALL_DIR}/bin/debot,sudo chmod 755 ${INSTALL_DIR}/bin/debot,aws s3 cp s3://${S3_BUCKET}/debot/libsigner.so ${INSTALL_DIR}/lib/libsigner.so,sudo chmod 644 ${INSTALL_DIR}/lib/libsigner.so,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
+            --parameters commands="sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/bin ${INSTALL_DIR}/lib ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 cp s3://${S3_BUCKET}/debot/debot ${INSTALL_DIR}/bin/debot,aws s3 cp s3://${S3_BUCKET}/debot/libsigner.so ${INSTALL_DIR}/lib/libsigner.so,aws s3 cp s3://${S3_BUCKET}/debot/checksums.sha256 ${INSTALL_DIR}/checksums.sha256,aws s3 cp s3://${S3_BUCKET}/debot/manifest.json ${INSTALL_DIR}/manifest.json,sudo chown root:root ${INSTALL_DIR}/bin/debot ${INSTALL_DIR}/lib/libsigner.so ${INSTALL_DIR}/checksums.sha256 ${INSTALL_DIR}/manifest.json,sudo chmod 755 ${INSTALL_DIR}/bin/debot,sudo chmod 644 ${INSTALL_DIR}/lib/libsigner.so ${INSTALL_DIR}/checksums.sha256 ${INSTALL_DIR}/manifest.json,echo ${DEBOT_SHA256} ${INSTALL_DIR}/bin/debot | sudo sha256sum -c -,echo ${LIBSIGNER_SHA256} ${INSTALL_DIR}/lib/libsigner.so | sudo sha256sum -c -,cd ${INSTALL_DIR} && sudo sha256sum -c checksums.sha256,stat -c %U:%G:%a ${INSTALL_DIR}/bin/debot | grep -qx root:root:755,stat -c %U:%G:%a ${INSTALL_DIR}/lib/libsigner.so | grep -qx root:root:644,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
             --query Command.CommandId --output text)
           aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}"
           aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
