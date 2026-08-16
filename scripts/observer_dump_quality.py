@@ -125,6 +125,10 @@ def main() -> int:
                         invalid_book[symbol] += 1
                         if len(invalid_book_examples[symbol]) < 5:
                             invalid_book_examples[symbol].append(timestamp)
+                        finish_run(symbol)
+                        run_price.pop(symbol, None)
+                        run_start.pop(symbol, None)
+                        run_last.pop(symbol, None)
                         continue
 
                     if bid > ask:
