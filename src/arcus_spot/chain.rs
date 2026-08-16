@@ -803,7 +803,11 @@ async fn read_canonical_balances_from_provider(
         Err(error) => classify_canonical_provider_error("gas", error),
     };
 
-    for (label, outcome) in [("sell", &sell_outcome), ("buy", &buy_outcome)] {
+    for (label, outcome) in [
+        ("sell", &sell_outcome),
+        ("buy", &buy_outcome),
+        ("gas", &gas_outcome),
+    ] {
         if let ContractCallOutcome::NonTransport(error) = outcome {
             return Err(ProviderAttemptError::Fatal(anyhow::anyhow!(
                 "Arcus canonical {label} balance read returned an unexpected response: {error}"
@@ -1391,6 +1395,85 @@ mod tests {
             .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
             .await
             .unwrap_err();
+        assert!(format!("{error:#}").contains("could not be decoded"));
+        assert!(request_snapshot(&second).is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_gas_rpc_error_is_fatal_without_fallback() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x4b);
+        let block_hash = H256::from_low_u64_be(0x4c);
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" if request["params"][0]["to"] == format!("{sell_token:#x}") => {
+                RpcReply::Result(abi_u256(4_000))
+            }
+            "eth_call" => RpcReply::Result(abi_u256(2_985)),
+            "eth_getBalance" => RpcReply::Error {
+                code: -32602,
+                message: "invalid balance params",
+            },
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+            )
+        })
+        .await;
+        let client =
+            ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                .unwrap();
+
+        let error = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("canonical gas balance"));
+        assert!(format!("{error:#}").contains("non-retryable response"));
+        assert!(request_snapshot(&second).is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_gas_decode_error_is_fatal_without_fallback() {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let tx_hash = H256::from_low_u64_be(0x4d);
+        let block_hash = H256::from_low_u64_be(0x4e);
+        let first = spawn_rpc_server(move |request| match request["method"].as_str().unwrap() {
+            "eth_chainId" => RpcReply::Result(json!("0x1237")),
+            "eth_getTransactionReceipt" => RpcReply::Result(receipt_json(block_hash)),
+            "eth_call" if request["params"][0]["to"] == format!("{sell_token:#x}") => {
+                RpcReply::Result(abi_u256(4_000))
+            }
+            "eth_call" => RpcReply::Result(abi_u256(2_985)),
+            "eth_getBalance" => RpcReply::Result(json!({"unexpected": "object"})),
+            _ => RpcReply::Error {
+                code: -32601,
+                message: "unexpected method",
+            },
+        })
+        .await;
+        let second = spawn_rpc_server(move |request| {
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 4_000, 2_985, 100,
+            )
+        })
+        .await;
+        let client =
+            ArcusSpotChainClient::new(rpc_config(vec![first.url.clone(), second.url.clone()]))
+                .unwrap();
+
+        let error = client
+            .balances_requiring_primary_provider(taker, sell_token, buy_token, tx_hash)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("canonical gas balance"));
         assert!(format!("{error:#}").contains("could not be decoded"));
         assert!(request_snapshot(&second).is_empty());
     }
