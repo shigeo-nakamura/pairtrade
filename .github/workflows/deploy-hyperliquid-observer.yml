@@ -57,7 +57,7 @@ jobs:
           repository: shigeo-nakamura/dex-connector
           ref: ${{ github.event.inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
           path: dex-connector
-          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+          token: ${{ github.token }}
 
       - name: Resolve tested dex-connector source
         id: dex_source
@@ -109,7 +109,7 @@ jobs:
           repository: shigeo-nakamura/dex-connector
           ref: ${{ needs.test.outputs.dex_connector_sha }}
           path: dex-connector
-          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+          token: ${{ github.token }}
 
       # No lighter-go / libsigner checkout or build: the hyperliquid-sdk
       # feature has no Go signer dependency.
