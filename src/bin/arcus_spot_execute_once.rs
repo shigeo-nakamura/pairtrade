@@ -1431,7 +1431,17 @@ fn require_acceptance_ledger_and_position_continuity(
                 bail!("Arcus pending recovery plan changed without an acceptance attempt");
             }
             if runtime_sequence_advance == 1 {
-                let signal_sample = acceptance_signal_sample(baseline_runtime, current_runtime)?;
+                // A full rolling window can append the same value it drops,
+                // leaving its final bytes identical even though the accepted
+                // observation genuinely advanced. The current tail is still
+                // the accepted price ratio in both that case and an ordinary
+                // append; signal-history continuity above already constrains
+                // every retained element and the one-step sequence advance.
+                let signal_sample = current_runtime
+                    .relative_log_price_history
+                    .last()
+                    .copied()
+                    .context("Arcus accepted observation has no signal sample")?;
                 acceptance_reference_prices(baseline_runtime, current_runtime, signal_sample)?;
             }
             if !position_state_matches(baseline_runtime, current_runtime) {
@@ -3246,6 +3256,43 @@ runtime:
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("79.16815349952608352");
             state["last_equity_usd"] = json!("79.16815349952608352");
+        });
+
+        let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
+
+        assert_eq!(report.mode, "continuity");
+        assert_eq!(report.runtime.sequence, 8);
+    }
+
+    #[test]
+    fn continuity_verification_accepts_an_identical_full_window_rotation_without_a_swap() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let unchanged_full_window = vec![0.125; config.runtime.signal_window_samples];
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["relative_log_price_history"] = json!(unchanged_full_window.clone());
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["relative_log_price_history"] = json!(unchanged_full_window);
+            state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+            state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            state["initial_equity_usd"] = json!("98.2399008827070608");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["last_equity_usd"] = json!("98.2399008827070608");
         });
 
         let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
