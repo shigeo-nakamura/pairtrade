@@ -14,6 +14,14 @@ on:
         description: "Dex-connector ref/tag (default: the pinned env ref)"
         required: false
         type: string
+      target:
+        description: "build only or deploy the verified artifact"
+        required: true
+        default: build-only
+        type: choice
+        options:
+          - build-only
+          - deploy
 
 concurrency:
   group: debot-hl-observer
@@ -29,31 +37,19 @@ env:
   # Keep in sync with ci.yml's pin; hyperliquid-sdk landed in v4.7.5.
   DEX_CONNECTOR_REF: v4.7.6
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+  RUST_TOOLCHAIN: 1.94.1
 
 jobs:
-  build-deploy:
+  test:
+    name: Test Hyperliquid observer (x86_64)
     runs-on: ubuntu-latest
-    # Protected-ref guard (same as ci.yml's deploy job): this ships a binary
-    # to the production host, so a workflow_dispatch against a feature branch
-    # or tag must not deploy.
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
-    # QEMU-emulated arm64 like ci.yml's deploy job, but the first hl-feature
-    # build has no cache to warm-start from and was observed to exceed 180
-    # minutes (run 29632538074 hit the timeout with the build still going,
-    # which also skipped the cache save). 300 covers a cold build; warm
-    # builds stay well under it.
-    timeout-minutes: 300
-    environment: debot
+    outputs:
+      dex_connector_sha: ${{ steps.dex_source.outputs.dex_connector_sha }}
     steps:
       - name: Checkout debot
         uses: actions/checkout@v5
         with:
           path: debot
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
 
       - name: Checkout dex-connector
         uses: actions/checkout@v5
@@ -63,11 +59,67 @@ jobs:
           path: dex-connector
           token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
 
+      - name: Resolve tested dex-connector source
+        id: dex_source
+        run: |
+          DEX_CONNECTOR_SHA=$(git -C "${GITHUB_WORKSPACE}/dex-connector" rev-parse HEAD)
+          echo "dex_connector_sha=${DEX_CONNECTOR_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo tests
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            debot/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-hl-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('debot/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-test-hl-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Run Hyperliquid observer tests
+        run: |
+          cargo test --manifest-path debot/Cargo.toml --locked --no-default-features --features hyperliquid-sdk --lib
+          cargo test --manifest-path debot/Cargo.toml --locked --no-default-features --features hyperliquid-sdk --bin debot
+
+  build:
+    name: Build Hyperliquid observer (native arm64)
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    # A feature branch may benchmark build-only, but only a protected branch
+    # may publish or deploy.
+    if: github.event_name != 'workflow_dispatch' || inputs.target == 'build-only' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    timeout-minutes: 60
+    environment: debot
+    outputs:
+      binary_sha256: ${{ steps.package.outputs.binary_sha256 }}
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Checkout dex-connector
+        uses: actions/checkout@v5
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ needs.test.outputs.dex_connector_sha }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
       # No lighter-go / libsigner checkout or build: the hyperliquid-sdk
       # feature has no Go signer dependency.
 
-      - name: Cache cargo (linux/arm64, hyperliquid feature set)
-        id: cache_cargo
+      - name: Resolve build image
+        run: |
+          docker pull --platform linux/arm64 "${AL2023_IMAGE}"
+          docker image inspect --format="AL2023_IMAGE_RESOLVED={{index .RepoDigests 0}}" "${AL2023_IMAGE}" >> "${GITHUB_ENV}"
+
+      - name: Cache cargo (native arm64, hyperliquid feature set)
         uses: actions/cache@v5
         with:
           path: |
@@ -78,12 +130,11 @@ jobs:
             debot/target
           # Distinct from ci.yml's cargo-arm64-* keys: the feature set
           # changes what target/ contains.
-          key: ${{ runner.os }}-cargo-arm64-hl-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-hl-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-arm64-hl-
-            ${{ runner.os }}-cargo-arm64-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-hl-${{ env.RUST_TOOLCHAIN }}-
 
-      - name: Build debot (linux/arm64, --features hyperliquid-sdk)
+      - name: Build debot in AL2023 (native arm64, hyperliquid-sdk)
         id: build_debot
         run: |
           mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
@@ -95,14 +146,41 @@ jobs:
             -e CARGO_HOME=/workspace/.cache/cargo \
             -e RUSTUP_HOME=/workspace/.cache/rustup \
             -e CARGO_INCREMENTAL=0 \
-            ${AL2023_IMAGE} \
-            /bin/bash -lc "set -euo pipefail; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --no-default-features --features hyperliquid-sdk; chown -R ${HOST_UID}:${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN}; else /workspace/.cache/cargo/bin/rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal; /workspace/.cache/cargo/bin/rustup default ${RUST_TOOLCHAIN}; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --no-default-features --features hyperliquid-sdk; chown -R ${HOST_UID}:${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
 
-      - name: Record binary SHA
+      - name: Verify and package artifact
+        id: package
         run: |
-          sha256sum debot/target/release/debot
-          echo "pairtrade SHA: ${{ github.sha }}"
-          git -C dex-connector rev-parse HEAD | sed 's/^/dex-connector SHA: /'
+          set -euo pipefail
+          BINARY=debot/target/release/debot
+          file "${BINARY}"
+          file "${BINARY}" | grep -q aarch64
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}/${BINARY}:/artifacts/debot:ro" \
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; if ldd /artifacts/debot | grep -q not.found; then exit 1; fi; ldd /artifacts/debot"
+
+          mkdir -p dist
+          install -m 0755 "${BINARY}" dist/debot
+          test "$(stat -c %a dist/debot)" = 755
+          BINARY_SHA256=$(sha256sum dist/debot | cut -d " " -f1)
+          CARGO_LOCK_SHA256=$(sha256sum debot/Cargo.lock | cut -d " " -f1)
+          DEX_CONNECTOR_SHA=$(git -C dex-connector rev-parse HEAD)
+          (cd dist && sha256sum debot > debot.sha256)
+          jq -n \
+            --arg source_sha "${GITHUB_SHA}" \
+            --arg dex_connector_sha "${DEX_CONNECTOR_SHA}" \
+            --arg binary_sha256 "${BINARY_SHA256}" \
+            --arg cargo_lock_sha256 "${CARGO_LOCK_SHA256}" \
+            --arg rust_toolchain "${RUST_TOOLCHAIN}" \
+            --arg build_image "${AL2023_IMAGE_RESOLVED}" \
+            --arg github_run_id "${GITHUB_RUN_ID}" \
+            --arg github_run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            '{schema_version: 1, artifact: "debot-hyperliquid-observer", architecture: "aarch64", feature_set: "hyperliquid-sdk", source_sha: $source_sha, dex_connector_sha: $dex_connector_sha, cargo_lock_sha256: $cargo_lock_sha256, binary_sha256: $binary_sha256, mode: "0755", rust_toolchain: $rust_toolchain, build_image: $build_image, github_run_id: $github_run_id, github_run_attempt: $github_run_attempt}' > dist/manifest.json
+          echo "binary_sha256=${BINARY_SHA256}" >> "${GITHUB_OUTPUT}"
+          (cd dist && sha256sum -c debot.sha256)
+          jq . dist/manifest.json
 
       - name: Fix cargo cache permissions
         if: steps.build_debot.outcome == 'success'
@@ -115,29 +193,21 @@ jobs:
             chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
           fi
 
-      - name: Save cargo cache (linux/arm64, hyperliquid feature set)
-        if: steps.build_debot.outcome == 'success' && steps.cache_cargo.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: |
-            .cache/cargo/registry
-            .cache/cargo/git
-            .cache/cargo/bin
-            .cache/rustup
-            debot/target
-          key: ${{ runner.os }}-cargo-arm64-hl-${{ hashFiles('debot/Cargo.lock') }}
-
       - name: Configure AWS credentials
+        if: github.event_name != 'workflow_dispatch' || inputs.target == 'deploy'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Upload artifacts to S3
+        if: github.event_name != 'workflow_dispatch' || inputs.target == 'deploy'
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
         run: |
-          aws s3 cp debot/target/release/debot "s3://${S3_BUCKET}/debot-hl/debot"
+          aws s3 cp dist/debot "s3://${S3_BUCKET}/debot-hl/debot"
+          aws s3 cp dist/debot.sha256 "s3://${S3_BUCKET}/debot-hl/debot.sha256"
+          aws s3 cp dist/manifest.json "s3://${S3_BUCKET}/debot-hl/manifest.json"
           # Self-contained deploy: ship the wrapper + unit too so a dispatch
           # run does not depend on a prior ci.yml scripts sync.
           aws s3 cp debot/scripts/debot-pair-hyperliquid-observe.sh "s3://${S3_BUCKET}/debot/scripts/debot-pair-hyperliquid-observe.sh"
@@ -147,16 +217,26 @@ jobs:
           aws s3 cp debot/deploy/archive-hyperliquid-observer-journal.timer "s3://${S3_BUCKET}/deploy/archive-hyperliquid-observer-journal.timer"
 
       - name: Deploy via SSM (no observer start)
+        if: github.event_name != 'workflow_dispatch' || inputs.target == 'deploy'
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
+          BINARY_SHA256: ${{ steps.package.outputs.binary_sha256 }}
         run: |
           cat > /tmp/ssm-params.json <<'JSON'
           {
             "commands": [
+              "set -e",
               "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/history_archive",
-              "aws s3 cp s3://__S3_BUCKET__/debot-hl/debot __INSTALL_DIR__/bin/debot",
-              "sudo chmod 755 __INSTALL_DIR__/bin/debot",
+              "aws s3 cp s3://__S3_BUCKET__/debot-hl/debot /tmp/debot-hl",
+              "aws s3 cp s3://__S3_BUCKET__/debot-hl/debot.sha256 /tmp/debot-hl.sha256",
+              "aws s3 cp s3://__S3_BUCKET__/debot-hl/manifest.json /tmp/debot-hl-manifest.json",
+              "echo __BINARY_SHA256__ /tmp/debot-hl | sha256sum -c - || exit 1",
+              "sed 's|  debot$|  debot-hl|' /tmp/debot-hl.sha256 | (cd /tmp && sha256sum -c -) || exit 1",
+              "sudo install -o root -g root -m 0755 /tmp/debot-hl __INSTALL_DIR__/bin/debot",
+              "sudo install -o root -g root -m 0644 /tmp/debot-hl-manifest.json __INSTALL_DIR__/manifest.json",
+              "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/bin/debot) = root:root:755 || exit 1",
+              "echo __BINARY_SHA256__ __INSTALL_DIR__/bin/debot | sudo sha256sum -c - || exit 1",
               "aws s3 cp s3://__S3_BUCKET__/debot/scripts/debot-pair-hyperliquid-observe.sh /opt/debot/scripts/debot-pair-hyperliquid-observe.sh",
               "sudo chmod 755 /opt/debot/scripts/debot-pair-hyperliquid-observe.sh",
               "aws s3 cp s3://__S3_BUCKET__/debot/scripts/archive_observer_journal.sh /opt/debot/scripts/archive_observer_journal.sh",
@@ -166,7 +246,7 @@ jobs:
             ]
           }
           JSON
-          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g" /tmp/ssm-params.json
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__BINARY_SHA256__|${BINARY_SHA256}|g" /tmp/ssm-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
