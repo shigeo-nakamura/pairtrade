@@ -22,7 +22,7 @@ instead the manifest binds its canonical SHA-256 digest.
 | Runtime checkpoint | `/var/lib/debot-arcus/spot-execute-once/runtime_state.json` | schema 1; exact runtime config plus signal history, last token A/B reference prices, inventory, regime, risk state and last committed execution key |
 | Execution ledger | `/var/lib/debot-arcus/spot-execute-once/ledger.json` | schema 2; monotonic attempt sequence, immutable archive and any active recovery state |
 | Recovery evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-pending-plan.json` | optional schema-1 envelope: exact plan, recorder snapshot and evaluation time needed by `auto-resume` and continuity verification |
-| Observation evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-observation-evidence.json` | optional schema-1 sidecar: latest accepted recorder snapshot and evaluation time, including no-swap ticks |
+| Observation evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-observation-evidence.json` | optional schema-2 sidecar: latest sequence-advancing recorder snapshot, evaluation time and resulting runtime sequence/watermark; schema 1 remains readable |
 | Namespace lock | `/var/lib/debot-arcus/spot-execute-once/.runtime_state.json.lock` | mode-0600 process lock shared by live-tick, execute/resume, proposer and state tooling |
 
 Checkpoint and ledger stores already use create-new temporary files, file
@@ -31,8 +31,11 @@ pending recovery and observation evidence while holding the checkpoint
 namespace lock; `arcus-spot-propose-plan propose` writes the same observation
 evidence whenever it advances that shared checkpoint. A backup therefore
 observes a lock-consistent boundary. Backup schema 3 hashes and copies both
-optional sidecars and rejects observation evidence whose snapshot watermark
-does not match the checkpoint.
+optional sidecars and rejects observation evidence whose schema-1 snapshot
+watermark or schema-2 result boundary does not match the checkpoint. If evidence
+publication succeeded but checkpoint publication failed, state tooling safely
+omits only an exactly one-sequence-newer schema-2 orphan; every other mismatch
+remains a hard error.
 
 The state tool uses strict `load_existing` reads. A missing file is an error;
 it is never accepted as first-run state. Ledger inspection does not run the
@@ -144,10 +147,12 @@ in UTC.
    compatibility alone is insufficient: an older schema-1 binary that predates
    those fields is not an eligible live rollback candidate because continuity
    cannot independently verify its accepted price/equity/notional state. The
-   candidate must also write schema-1
-   `live-tick-observation-evidence.json` for every accepted observation before
-   persisting its checkpoint; a binary that only writes the rotation-plan
-   sidecar cannot certify no-swap state. If the candidate release's
+   candidate must also write schema-2
+   `live-tick-observation-evidence.json` for every sequence-advancing
+   observation before persisting its checkpoint, including structurally invalid
+   ticks, and bind the resulting runtime sequence/watermark; a binary that only
+   writes the rotation-plan sidecar cannot certify no-swap state. If the
+   candidate release's
    source/provenance cannot demonstrate that
    capability, use a forward fix. Every state backup or verification below
    runs the manifest-verified
@@ -363,7 +368,8 @@ instance must not be restarted.
   of the damaged state before replacement.
 - Binary rollback must be forward-compatible with checkpoint schema 1 and
   ledger schema 2, preserve both checkpointed reference-price fields, and
-  write the schema-1 accepted-observation evidence sidecar on every tick.
+  write the schema-2 sequence/watermark-bound observation evidence sidecar on
+  every sequence-advancing tick, including structurally invalid observations.
   If any part of that capability is uncertain, forward-fix the binary.
 
 Evidence to attach to bot-strategy #758 consists of the selected release

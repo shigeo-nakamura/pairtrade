@@ -235,15 +235,19 @@ checkpoint has moved on -- otherwise an entry could be submitted based on
 a signal state a newer tick has already superseded (Codex P1 follow-up,
 pairtrade#186).
 
-For every accepted observation, including `Observe`, both `live-tick` and
-`arcus-spot-propose-plan propose` durably write a schema-1 evidence sidecar at
+For every sequence-advancing observation, including structurally invalid
+`Observe` ticks that cannot advance `last_observation_at`, both `live-tick` and
+`arcus-spot-propose-plan propose` durably write a schema-2 evidence sidecar at
 mode 0600 to
 `<runtime_state_path's directory>/live-tick-observation-evidence.json`. It
-contains the exact recorder snapshot and `step_at` evaluation time, so the
-post-rollback continuity verifier can independently replay no-swap signal,
-reference-price, equity and risk state from the pre-start checkpoint. Keeping
-this boundary current for both checkpoint writers also prevents a successful
-proposal from making state backup/verification fail on a stale watermark.
+contains the exact recorder snapshot, `step_at` evaluation time, and resulting
+runtime sequence/watermark, so the post-rollback continuity verifier can
+independently replay no-swap signal, invalid-snapshot, reference-price, equity
+and risk state from the pre-start checkpoint. Schema-1 sidecars remain readable
+during a rolling upgrade. Evidence is atomically published before its
+checkpoint; if the checkpoint publication fails, state tooling recognizes only
+an exactly one-sequence-newer schema-2 sidecar as an orphan and omits it from
+the captured boundary. All other evidence/checkpoint mismatches remain errors.
 
 Before dispatching a rotation, `live-tick` also writes a schema-1 recovery
 envelope, at mode 0600, to

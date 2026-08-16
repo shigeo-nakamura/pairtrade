@@ -81,7 +81,7 @@ struct ArcusSpotProposeConfig {
     runtime_state_path: PathBuf,
 }
 
-const LIVE_TICK_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+const OBSERVATION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +89,14 @@ struct ArcusSpotObservationEvidence {
     schema_version: u32,
     evaluation_time: chrono::DateTime<Utc>,
     snapshot: ArcusSpotRecorderSnapshot,
+    resulting_runtime: ArcusSpotObservationBoundary,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotObservationBoundary {
+    sequence: u64,
+    last_observation_at: Option<chrono::DateTime<Utc>>,
 }
 
 fn observation_evidence_path(runtime_state_path: &Path) -> Result<PathBuf> {
@@ -105,12 +113,14 @@ fn write_observation_evidence(
     config: &ArcusSpotProposeConfig,
     snapshot: ArcusSpotRecorderSnapshot,
     evaluation_time: chrono::DateTime<Utc>,
+    resulting_runtime: ArcusSpotObservationBoundary,
 ) -> Result<()> {
     let path = observation_evidence_path(&config.runtime_state_path)?;
     let evidence = ArcusSpotObservationEvidence {
-        schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+        schema_version: OBSERVATION_EVIDENCE_SCHEMA_VERSION,
         evaluation_time,
         snapshot,
+        resulting_runtime,
     };
     let mut bytes = serde_json::to_vec_pretty(&evidence)
         .context("failed to serialize Arcus observation evidence")?;
@@ -274,15 +284,23 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
         .context("invalid Arcus recorder configuration")?;
 
     let snapshot = recorder.collect_once().await;
-    let previous_observation_at = runtime.state().last_observation_at;
+    let previous_sequence = runtime.state().sequence;
     let evaluation_time = Utc::now();
     let event = runtime.step_at(&snapshot, evaluation_time);
 
     // `propose` and `live-tick` are both checkpoint writers. Keep the shared
     // recovery boundary coherent for either writer so a successful proposal
     // cannot leave state-backup/state-verify-* rejecting a stale sidecar.
-    if runtime.state().last_observation_at != previous_observation_at {
-        write_observation_evidence(&config, snapshot.clone(), evaluation_time)?;
+    if runtime.state().sequence != previous_sequence {
+        write_observation_evidence(
+            &config,
+            snapshot.clone(),
+            evaluation_time,
+            ArcusSpotObservationBoundary {
+                sequence: runtime.state().sequence,
+                last_observation_at: runtime.state().last_observation_at,
+            },
+        )?;
     }
 
     // step_at mutates sequence/signal-window/risk state on every call, even

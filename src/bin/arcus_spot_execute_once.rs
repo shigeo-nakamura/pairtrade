@@ -21,7 +21,7 @@ use debot::arcus_spot::{
     ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
-use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent};
+use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
 use dex_connector::{
     ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig,
     ArcusSpotRecorderSnapshot,
@@ -368,6 +368,7 @@ fn live_tick_observation_evidence_path(config: &ArcusSpotExecuteOnceConfig) -> R
 }
 
 const LIVE_TICK_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+const OBSERVATION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
 /// Atomic recovery document written by `live-tick`. Keeping the raw recorder
 /// snapshot beside the resulting plan lets continuity verification replay the
@@ -388,6 +389,18 @@ struct ArcusSpotLiveTickObservationEvidence {
     schema_version: u32,
     evaluation_time: DateTime<Utc>,
     snapshot: ArcusSpotRecorderSnapshot,
+    /// Schema 2 binds the sidecar to the checkpoint state produced by the
+    /// same `step_at` call. Schema-1 files omit this field and remain readable
+    /// for rolling upgrades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resulting_runtime: Option<ArcusSpotObservationBoundary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ArcusSpotObservationBoundary {
+    sequence: u64,
+    last_observation_at: Option<DateTime<Utc>>,
 }
 
 fn validate_live_tick_evidence_schema(evidence: &ArcusSpotLiveTickEvidence) -> Result<()> {
@@ -429,14 +442,55 @@ fn observation_evidence_from_document(
 ) -> Result<ArcusSpotLiveTickObservationEvidence> {
     let evidence: ArcusSpotLiveTickObservationEvidence =
         serde_json::from_slice(bytes).with_context(|| format!("invalid {label}"))?;
-    if evidence.schema_version != LIVE_TICK_EVIDENCE_SCHEMA_VERSION {
-        bail!(
-            "unsupported Arcus live-tick observation evidence schema {}; expected {}",
-            evidence.schema_version,
-            LIVE_TICK_EVIDENCE_SCHEMA_VERSION
-        );
+    match (evidence.schema_version, &evidence.resulting_runtime) {
+        (LIVE_TICK_EVIDENCE_SCHEMA_VERSION, None)
+        | (OBSERVATION_EVIDENCE_SCHEMA_VERSION, Some(_)) => {}
+        (LIVE_TICK_EVIDENCE_SCHEMA_VERSION, Some(_)) => {
+            bail!("Arcus observation evidence schema 1 must not contain a runtime boundary")
+        }
+        (OBSERVATION_EVIDENCE_SCHEMA_VERSION, None) => {
+            bail!("Arcus observation evidence schema 2 requires a runtime boundary")
+        }
+        (version, _) => bail!(
+            "unsupported Arcus live-tick observation evidence schema {version}; expected 1 or {}",
+            OBSERVATION_EVIDENCE_SCHEMA_VERSION
+        ),
     }
     Ok(evidence)
+}
+
+fn observation_evidence_matches_runtime(
+    evidence: &ArcusSpotLiveTickObservationEvidence,
+    runtime: &ArcusSpotRuntimeState,
+) -> bool {
+    match &evidence.resulting_runtime {
+        Some(boundary) => {
+            boundary.sequence == runtime.sequence
+                && boundary.last_observation_at == runtime.last_observation_at
+        }
+        None => runtime.last_observation_at == Some(evidence.snapshot.collection_finished_at),
+    }
+}
+
+/// Evidence is published before its checkpoint. If the checkpoint write then
+/// fails or the process exits, exactly one newer schema-2 boundary can remain.
+/// Treat only that narrowly identified case as an ignorable orphan; every
+/// other mismatch remains a hard error.
+fn observation_evidence_is_newer_orphan(
+    evidence: &ArcusSpotLiveTickObservationEvidence,
+    runtime: &ArcusSpotRuntimeState,
+) -> bool {
+    let Some(boundary) = &evidence.resulting_runtime else {
+        return false;
+    };
+    if runtime.sequence.checked_add(1) != Some(boundary.sequence) {
+        return false;
+    }
+    match (runtime.last_observation_at, boundary.last_observation_at) {
+        (Some(current), Some(boundary)) => boundary >= current,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
 }
 
 const STATE_BACKUP_SCHEMA_VERSION: u32 = 3;
@@ -611,14 +665,26 @@ fn capture_arcus_state(config: &ArcusSpotExecuteOnceConfig) -> Result<ArcusSpotS
         read_private_regular_file(&config.runtime_state_path, "Arcus runtime checkpoint")?;
     let ledger_bytes = read_private_regular_file(&config.ledger_path, "Arcus execution ledger")?;
     let pending_plan_bytes = read_optional_private_plan(&live_tick_pending_plan_path(config)?)?;
-    let observation_evidence_bytes =
-        read_optional_private_observation_evidence(&live_tick_observation_evidence_path(config)?)?;
-    if let Some(bytes) = &observation_evidence_bytes {
-        let evidence = observation_evidence_from_document(bytes, "Arcus observation evidence")?;
-        if runtime.state().last_observation_at != Some(evidence.snapshot.collection_finished_at) {
-            bail!("Arcus observation evidence does not match the runtime watermark");
+    let observation_evidence_bytes = match read_optional_private_observation_evidence(
+        &live_tick_observation_evidence_path(config)?,
+    )? {
+        Some(bytes) => {
+            let evidence =
+                observation_evidence_from_document(&bytes, "Arcus observation evidence")?;
+            if observation_evidence_matches_runtime(&evidence, runtime.state()) {
+                Some(bytes)
+            } else if observation_evidence_is_newer_orphan(&evidence, runtime.state()) {
+                // The writer publishes evidence first. A crash before the
+                // checkpoint rename leaves the sidecar one sequence ahead;
+                // omit it from the captured boundary instead of requiring a
+                // new trade-capable tick or manual deletion to recover.
+                None
+            } else {
+                bail!("Arcus observation evidence does not match the runtime boundary");
+            }
         }
-    }
+        None => None,
+    };
     Ok(ArcusSpotStateImage {
         checkpoint_bytes,
         ledger_bytes,
@@ -864,8 +930,8 @@ fn load_arcus_state_backup(
         .context("backup runtime checkpoint failed canonical validation")?;
     if let Some(bytes) = &observation_evidence_bytes {
         let evidence = observation_evidence_from_document(bytes, "backup observation evidence")?;
-        if runtime.state().last_observation_at != Some(evidence.snapshot.collection_finished_at) {
-            bail!("backup observation evidence does not match its runtime watermark");
+        if !observation_evidence_matches_runtime(&evidence, runtime.state()) {
+            bail!("backup observation evidence does not match its runtime boundary");
         }
     }
     let ledger = ArcusSpotExecutionLedgerStore::new(ledger_path)
@@ -1643,7 +1709,6 @@ fn require_acceptance_ledger_and_position_continuity(
                 )?;
                 if evidence.evaluation_time < acceptance_not_before
                     || evidence.evaluation_time > acceptance_not_after
-                    || evidence.evaluation_time < evidence.snapshot.collection_finished_at
                 {
                     bail!("Arcus no-swap recorder evaluation is outside the approved tick window");
                 }
@@ -1828,10 +1893,11 @@ fn require_signal_history_continuity(
             }
         }
         1 => {
-            // A structurally valid tick increments sequence before resolving
-            // prices, so it may leave the history untouched. If it appends a
-            // sample, every retained baseline value must remain byte-for-byte
-            // equal and in order; a full window drops exactly its oldest value.
+            // A newer tick increments sequence before validating the snapshot,
+            // so a structurally invalid observation may leave the history
+            // untouched. If it appends a sample, every retained baseline value
+            // must remain byte-for-byte equal and in order; a full window drops
+            // exactly its oldest value.
             if current == baseline {
                 return Ok(());
             }
@@ -1879,10 +1945,12 @@ fn require_arcus_state_continuity(
         acceptance_not_before,
         acceptance_not_after,
     )?;
-    if sequence_advance == 1 {
+    if sequence_advance == 1
+        && current_runtime.last_observation_at != baseline_runtime.last_observation_at
+    {
         let accepted_at = current_runtime
             .last_observation_at
-            .context("Arcus runtime advanced without a last observation watermark")?;
+            .context("Arcus runtime advanced its observation watermark to an empty value")?;
         if accepted_at < acceptance_not_before || accepted_at > acceptance_not_after {
             bail!("Arcus runtime last observation is outside the approved tick window");
         }
@@ -2775,7 +2843,7 @@ async fn main() -> Result<()> {
                 ledger_store_for_checkpoint.acquire_exclusive_lock(&config.runtime_state_path)?;
 
             let mut runtime = store.load_or_create(&config.runtime)?;
-            let previous_observation_at = runtime.state().last_observation_at;
+            let previous_sequence = runtime.state().sequence;
             // step_at itself rejects a snapshot whose collection_finished_at
             // is not strictly newer than the last one it genuinely advanced
             // on -- tracked in the checkpointed state, under this same
@@ -2790,11 +2858,15 @@ async fn main() -> Result<()> {
             // plan to the exact observation it was computed from -- see
             // its use after the lock is re-acquired.
             let plan_observation_at = runtime.state().last_observation_at;
-            if plan_observation_at != previous_observation_at {
+            if runtime.state().sequence != previous_sequence {
                 let observation_evidence = ArcusSpotLiveTickObservationEvidence {
-                    schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+                    schema_version: OBSERVATION_EVIDENCE_SCHEMA_VERSION,
                     evaluation_time,
                     snapshot: snapshot.clone(),
+                    resulting_runtime: Some(ArcusSpotObservationBoundary {
+                        sequence: runtime.state().sequence,
+                        last_observation_at: runtime.state().last_observation_at,
+                    }),
                 };
                 let bytes = serde_json::to_vec_pretty(&observation_evidence)
                     .context("failed to serialize Arcus live-tick observation evidence")?;
@@ -3419,15 +3491,28 @@ runtime:
         serde_json::from_value(value).unwrap()
     }
 
+    fn structurally_invalid_snapshot(at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
+        let mut value = serde_json::to_value(accepted_entry_snapshot(at)).unwrap();
+        value["schema_version"] = json!(999);
+        serde_json::from_value(value).unwrap()
+    }
+
     fn persist_observation_evidence(
         config: &ArcusSpotExecuteOnceConfig,
         snapshot: ArcusSpotRecorderSnapshot,
         evaluation_time: DateTime<Utc>,
     ) {
+        let runtime = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .load_existing(&config.runtime)
+            .unwrap();
         let evidence = ArcusSpotLiveTickObservationEvidence {
-            schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+            schema_version: OBSERVATION_EVIDENCE_SCHEMA_VERSION,
             evaluation_time,
             snapshot,
+            resulting_runtime: Some(ArcusSpotObservationBoundary {
+                sequence: runtime.state().sequence,
+                last_observation_at: runtime.state().last_observation_at,
+            }),
         };
         write_private_regular_file_atomic(
             &live_tick_observation_evidence_path(config).unwrap(),
@@ -3546,8 +3631,6 @@ runtime:
             &plan_bytes,
         )
         .unwrap();
-        persist_observation_evidence(config, snapshot.clone(), accepted_at);
-
         let ledger_store = ArcusSpotExecutionLedgerStore::new(ledger_path);
         let mut ledger = ledger_store.load_existing().unwrap();
         let attempt = reconciled_entry_attempt_at(config, &plan, ledger.next_sequence, accepted_at);
@@ -3571,6 +3654,7 @@ runtime:
         ArcusSpotRuntimeCheckpointStore::new(runtime_path.to_path_buf())
             .persist(&runtime)
             .unwrap();
+        persist_observation_evidence(config, snapshot, accepted_at);
         attempt
     }
 
@@ -3806,6 +3890,151 @@ runtime:
 
         assert_eq!(report.mode, "continuity");
         assert_eq!(report.runtime.sequence, 8);
+    }
+
+    #[test]
+    fn continuity_verification_accepts_an_evidenced_sequence_only_invalid_tick() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+
+        let evaluation_time = Utc::now();
+        let snapshot = structurally_invalid_snapshot(evaluation_time);
+        let store = ArcusSpotRuntimeCheckpointStore::new(runtime_path);
+        let mut runtime = store.load_existing(&config.runtime).unwrap();
+        let event = runtime.step_at(&snapshot, evaluation_time);
+        assert!(matches!(
+            event.decision,
+            ArcusSpotDecision::Observe {
+                hold: ArcusSpotHold {
+                    code: debot::arcus_spot::ArcusSpotHoldCode::InvalidSnapshot,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(runtime.state().sequence, 1);
+        assert_eq!(runtime.state().last_observation_at, None);
+        store.persist(&runtime).unwrap();
+        persist_observation_evidence(&config, snapshot, evaluation_time);
+
+        let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
+        assert_eq!(report.mode, "continuity");
+        assert_eq!(report.runtime.sequence, 1);
+        assert_eq!(report.runtime.last_observation_at, None);
+    }
+
+    #[test]
+    fn state_backup_ignores_a_one_sequence_newer_orphaned_evidence_sidecar() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("after-crash");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let evaluation_time = Utc::now();
+        let evidence = ArcusSpotLiveTickObservationEvidence {
+            schema_version: OBSERVATION_EVIDENCE_SCHEMA_VERSION,
+            evaluation_time,
+            snapshot: structurally_invalid_snapshot(evaluation_time),
+            resulting_runtime: Some(ArcusSpotObservationBoundary {
+                sequence: 1,
+                last_observation_at: None,
+            }),
+        };
+        write_private_regular_file_atomic(
+            &live_tick_observation_evidence_path(&config).unwrap(),
+            &serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+
+        let manifest = create_arcus_state_backup(&config, &backup_dir).unwrap();
+        assert!(manifest.observation_evidence.is_none());
+        assert!(!backup_dir.join(STATE_BACKUP_OBSERVATION_EVIDENCE).exists());
+
+        let report = verify_arcus_state_backup(&config, &backup_dir, true).unwrap();
+        assert_eq!(report.mode, "exact");
+        assert!(report.observation_evidence_sha256.is_none());
+    }
+
+    #[test]
+    fn state_backup_rejects_a_nonadjacent_observation_evidence_boundary() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("mismatched-evidence");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let evaluation_time = Utc::now();
+        let evidence = ArcusSpotLiveTickObservationEvidence {
+            schema_version: OBSERVATION_EVIDENCE_SCHEMA_VERSION,
+            evaluation_time,
+            snapshot: structurally_invalid_snapshot(evaluation_time),
+            resulting_runtime: Some(ArcusSpotObservationBoundary {
+                sequence: 2,
+                last_observation_at: None,
+            }),
+        };
+        write_private_regular_file_atomic(
+            &live_tick_observation_evidence_path(&config).unwrap(),
+            &serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+
+        let error = create_arcus_state_backup(&config, &backup_dir).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("observation evidence does not match the runtime boundary"));
+        assert!(!backup_dir.exists());
+    }
+
+    #[test]
+    fn state_backup_accepts_a_coherent_legacy_schema_one_observation_sidecar() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("legacy-evidence");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let observed_at = Utc::now();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(1);
+            state["last_observation_at"] = json!(observed_at);
+        });
+        let evidence = ArcusSpotLiveTickObservationEvidence {
+            schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+            evaluation_time: observed_at,
+            snapshot: no_swap_snapshot(observed_at, "200", "176.49938051691913"),
+            resulting_runtime: None,
+        };
+        write_private_regular_file_atomic(
+            &live_tick_observation_evidence_path(&config).unwrap(),
+            &serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+
+        let manifest = create_arcus_state_backup(&config, &backup_dir).unwrap();
+        assert!(manifest.observation_evidence.is_some());
+        verify_arcus_state_backup(&config, &backup_dir, true).unwrap();
     }
 
     #[test]
