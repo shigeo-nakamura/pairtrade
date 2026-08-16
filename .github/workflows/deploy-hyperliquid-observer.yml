@@ -115,9 +115,13 @@ jobs:
       # feature has no Go signer dependency.
 
       - name: Resolve build image
+        id: build_image
         run: |
           docker pull --platform linux/arm64 "${AL2023_IMAGE}"
-          docker image inspect --format="AL2023_IMAGE_RESOLVED={{index .RepoDigests 0}}" "${AL2023_IMAGE}" >> "${GITHUB_ENV}"
+          AL2023_IMAGE_RESOLVED=$(docker image inspect --format="{{index .RepoDigests 0}}" "${AL2023_IMAGE}")
+          echo "AL2023_IMAGE_RESOLVED=${AL2023_IMAGE_RESOLVED}" >> "${GITHUB_ENV}"
+          BUILD_IMAGE_CACHE_KEY=$(printf "%s" "${AL2023_IMAGE_RESOLVED}" | sha256sum)
+          echo "cache_key=${BUILD_IMAGE_CACHE_KEY%% *}" >> "${GITHUB_OUTPUT}"
 
       - name: Cache cargo (native arm64, hyperliquid feature set)
         uses: actions/cache@v5
@@ -130,9 +134,9 @@ jobs:
             debot/target
           # Distinct from ci.yml's cargo-arm64-* keys: the feature set
           # changes what target/ contains.
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-hl-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-hl-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-hl-${{ env.RUST_TOOLCHAIN }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-hl-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-
 
       - name: Build debot in AL2023 (native arm64, hyperliquid-sdk)
         id: build_debot
