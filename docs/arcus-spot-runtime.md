@@ -275,13 +275,17 @@ what is currently approved on #772.
 
 ## Traceable executor deployment
 
-`.github/workflows/deploy-arcus-spot-executor.yml` is the manual-only aarch64
-build and install path for `arcus-spot-execute-once`. The same binary contains
-the `live-tick` subcommand, so a deploy covers both the approved one-shot flow
-and the timer-invoked probe flow without deploying a second executable.
+`.github/workflows/deploy-arcus-spot-executor.yml` is the aarch64 build and
+install path for `arcus-spot-execute-once`. It runs automatically when Arcus
+executor/runtime source, Cargo inputs, the build script, or the workflow itself
+changes on `master`, and it also retains an explicit `workflow_dispatch` entry
+point. Unrelated pairtrade-only changes do not trigger the arm64 build. The same
+binary contains the `live-tick` subcommand, so a deploy covers both the approved
+one-shot flow and the timer-invoked probe flow without deploying a second
+executable.
 
 The workflow is accepted only from `master`/`main`. It checks out the pinned
-`DEX_CONNECTOR_REF` (or the explicitly supplied dispatch override), uses
+`DEX_CONNECTOR_REF` (or the explicitly supplied manual-dispatch override), uses
 `Cargo.lock`, runs the Arcus live library and binary tests inside an arm64
 Amazon Linux 2023 container, and records the exact pairtrade commit,
 dex-connector commit, Rust toolchain, resolved container image, lockfile hash,

@@ -1,9 +1,20 @@
 name: Deploy Arcus Spot executor
 
-# bot-strategy#785: manual-only aarch64 build + immutable S3 release + atomic
-# SSM install. This workflow never changes service/timer state and never
-# invokes the executable it installs.
+# bot-strategy#785: automatic-on-change and manual aarch64 build + immutable
+# S3 release + atomic SSM install. This workflow never changes service/timer
+# state and never invokes the executable it installs.
 on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/deploy-arcus-spot-executor.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/lib.rs"
+      - "src/arcus_spot/**"
+      - "src/bin/arcus_spot_execute_once.rs"
   workflow_dispatch:
     inputs:
       dex_connector_ref:
