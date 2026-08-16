@@ -47,6 +47,7 @@ jobs:
           bash -n scripts/install_arcus_spot_live_tick_units.sh
           bash -n scripts/test_install_arcus_spot_live_tick_units.sh
           bash scripts/test_install_arcus_spot_live_tick_units.sh
+          sudo install -m 0755 /bin/true /usr/local/bin/arcus-spot-execute-once
           systemd-analyze verify \
             deploy/arcus-spot-live-tick.service \
             deploy/arcus-spot-live-tick.timer
