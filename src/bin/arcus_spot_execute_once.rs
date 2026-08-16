@@ -1141,6 +1141,39 @@ fn acceptance_signal_sample(
         .context("Arcus acceptance attempt has no signal sample")
 }
 
+fn require_acceptance_entry_within_strategy_limits(
+    config: &ArcusSpotExecuteOnceConfig,
+    baseline: &ArcusSpotRuntimeState,
+    plan: &ArcusSpotRotationPlan,
+) -> Result<()> {
+    if plan.trigger != ArcusSpotRotationTrigger::EntrySignal {
+        bail!("Arcus acceptance from a neutral backup must be an entry signal");
+    }
+    // The current recorder row verifies only the A-to-B-to-A round trip.
+    // build_plan therefore refuses a fresh B-to-A entry until a separately
+    // verified B-to-A-to-B quote exists; continuity must not certify a
+    // direction that live-tick could never have proposed.
+    if plan.direction != ArcusSpotDirection::TokenAToTokenB {
+        bail!("Arcus acceptance reverse-direction entries are not supported by the planner");
+    }
+    let sellable = baseline
+        .inventory
+        .token_a
+        .checked_sub(config.runtime.inventory_floors.token_a)
+        .context("Arcus acceptance backup inventory is below its token A floor")?;
+    let maximum_rotation = sellable
+        .checked_mul(config.runtime.max_rotation_fraction)
+        .context("Arcus acceptance rotation cap exceeds Decimal range")?;
+    if plan.sell_quantity > maximum_rotation {
+        bail!(
+            "Arcus acceptance sell quantity {} exceeds strategy per-action rotation cap {}",
+            plan.sell_quantity,
+            maximum_rotation
+        );
+    }
+    Ok(())
+}
+
 fn require_acceptance_ledger_and_position_continuity(
     config: &ArcusSpotExecuteOnceConfig,
     baseline: &ArcusSpotStateImage,
@@ -1233,6 +1266,7 @@ fn require_acceptance_ledger_and_position_continuity(
                 .context("Arcus reconciled acceptance attempt has no pending runtime plan")?;
             let plan: ArcusSpotRotationPlan = serde_json::from_slice(plan_bytes)
                 .context("invalid Arcus acceptance pending runtime plan")?;
+            require_acceptance_entry_within_strategy_limits(config, baseline_runtime, &plan)?;
             let signal_sample = acceptance_signal_sample(baseline_runtime, current_runtime)?;
             let signal_runtime =
                 ArcusSpotRuntime::from_state(config.runtime.clone(), baseline_runtime.clone())
@@ -2759,7 +2793,7 @@ runtime:
                 observed_at: at,
                 sell_token: plan.sell_token_address.clone(),
                 buy_token: plan.buy_token_address.clone(),
-                sell_balance_raw: "900000000000000000".to_string(),
+                sell_balance_raw: "950000000000000000".to_string(),
                 buy_balance_raw: "150000000000000000".to_string(),
                 gas_balance_wei: "1000000000000000".to_string(),
             }),
@@ -2811,7 +2845,7 @@ runtime:
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("300");
             state["last_equity_usd"] = json!("300");
-            state["inventory"] = json!({"token_a": "0.25", "token_b": "0.21"});
+            state["inventory"] = json!({"token_a": "0.30", "token_b": "0.21"});
             state["regime"] = json!("rotated_a_to_b");
             state["last_rotation_at"] = json!("2026-08-16T12:00:02Z");
             state["rotated_quantity"] = json!("0.05");
@@ -3276,7 +3310,7 @@ runtime:
         let config = execute_once_config(
             ledger_path.to_str().unwrap(),
             runtime_path.to_str().unwrap(),
-            "99999999999999999",
+            "49999999999999999",
         );
         persist_initial_operator_state(&config);
         prepare_signal_ready_acceptance_baseline(&config);
@@ -3362,6 +3396,49 @@ runtime:
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
 
         assert!(error.to_string().contains("no valid entry signal"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_reverse_direction_entry() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let runtime = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
+        let mut plan = rotation_plan("entry_signal");
+        plan.direction = ArcusSpotDirection::TokenBToTokenA;
+
+        let error =
+            require_acceptance_entry_within_strategy_limits(&config, runtime.state(), &plan)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("reverse-direction"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_entry_above_the_rotation_fraction_cap() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let mut config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        config.runtime.max_rotation_fraction = Decimal::new(1, 1);
+        persist_initial_operator_state(&config);
+        prepare_signal_ready_acceptance_baseline(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        persist_reconciled_entry_transition(&config, &ledger_path, &runtime_path);
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error.to_string().contains("per-action rotation cap"));
     }
 
     #[test]
@@ -3756,9 +3833,9 @@ runtime:
             "buy_symbol": "AMD",
             "sell_token_address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
             "buy_token_address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
-            "sell_quantity": "0.1",
+            "sell_quantity": "0.05",
             "buy_quantity": "0.05",
-            "sell_amount_raw": "100000000000000000",
+            "sell_amount_raw": "50000000000000000",
             "buy_amount_raw": "50000000000000000",
             "venue": "arcus",
             "quote_received_at": "2026-08-14T00:00:00Z",
@@ -3766,7 +3843,7 @@ runtime:
             "gas_buffer_bps": "10",
             "settlement_buffer_bps": "10",
             "all_in_round_trip_cost_bps": "96.5",
-            "predicted_inventory": {"token_a": "0.25", "token_b": "0.21"},
+            "predicted_inventory": {"token_a": "0.30", "token_b": "0.21"},
             "predicted_inventory_imbalance_fraction": "0.1",
         }))
         .unwrap()
