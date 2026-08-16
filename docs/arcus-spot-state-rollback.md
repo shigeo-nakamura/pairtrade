@@ -70,7 +70,8 @@ advancement but rejects:
   window may shift by exactly one sample for the approved tick);
 - cumulative-equity baseline changes, mismatched first equity baselines,
   sticky or newly-required risk-halt loss, same-day daily baseline resets,
-  invalid UTC rollover baselines, or loss of the last equity mark;
+  UTC rollover days outside the backup-to-verification window, invalid
+  rollover baselines, or loss of the last equity mark;
 - a backup that was not neutral with no active attempt, ledger regression,
   changed archived history, more than one new acceptance attempt, or an
   acceptance that exceeds the preserved UTC-day swap allowance;

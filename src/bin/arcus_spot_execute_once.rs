@@ -824,6 +824,8 @@ fn daily_risk_baseline(
 fn require_rollover_matches_observation(
     day: NaiveDate,
     current: &ArcusSpotRuntimeState,
+    acceptance_not_before: DateTime<Utc>,
+    acceptance_not_after: DateTime<Utc>,
 ) -> Result<()> {
     let observation_day = current
         .last_observation_at
@@ -831,6 +833,9 @@ fn require_rollover_matches_observation(
         .date_naive();
     if day != observation_day && Some(day) != observation_day.succ_opt() {
         bail!("Arcus daily baseline rollover does not match the accepted observation");
+    }
+    if day < acceptance_not_before.date_naive() || day > acceptance_not_after.date_naive() {
+        bail!("Arcus daily baseline rollover is outside the approved tick window");
     }
     Ok(())
 }
@@ -850,6 +855,8 @@ fn require_risk_state_continuity(
     baseline: &ArcusSpotRuntimeState,
     current: &ArcusSpotRuntimeState,
     sequence_advance: u64,
+    acceptance_not_before: DateTime<Utc>,
+    acceptance_not_after: DateTime<Utc>,
 ) -> Result<()> {
     let baseline_daily = daily_risk_baseline(baseline, "backup")?;
     if baseline.initial_equity_usd.is_some()
@@ -876,7 +883,12 @@ fn require_risk_state_continuity(
     match (baseline_daily, current_daily) {
         (None, None) => {}
         (None, Some((current_day, current_equity))) => {
-            require_rollover_matches_observation(current_day, current)?;
+            require_rollover_matches_observation(
+                current_day,
+                current,
+                acceptance_not_before,
+                acceptance_not_after,
+            )?;
             if current.initial_equity_usd != Some(current_equity)
                 || current.last_equity_usd != Some(current_equity)
             {
@@ -897,7 +909,12 @@ fn require_risk_state_continuity(
                 if current_day < baseline_day {
                     bail!("Arcus runtime daily baseline day regressed across restart/rollback");
                 }
-                require_rollover_matches_observation(current_day, current)?;
+                require_rollover_matches_observation(
+                    current_day,
+                    current,
+                    acceptance_not_before,
+                    acceptance_not_after,
+                )?;
                 if current.last_equity_usd != Some(current_equity) {
                     bail!("Arcus runtime UTC rollover baseline does not match its equity mark");
                 }
@@ -1732,6 +1749,8 @@ fn require_arcus_state_continuity(
         baseline_runtime,
         current_runtime,
         sequence_advance,
+        acceptance_not_before,
+        acceptance_not_after,
     )?;
     if sequence_advance == 1 {
         let accepted_at = current_runtime
@@ -3666,6 +3685,46 @@ runtime:
         let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
 
         assert_eq!(report.mode, "continuity");
+    }
+
+    #[test]
+    fn continuity_verification_rejects_a_future_day_baseline_reset() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["relative_log_price_history"] = json!([0.0]);
+            state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
+            state["initial_equity_usd"] = json!("98.2399008827070608");
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["last_equity_usd"] = json!("98.2399008827070608");
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["relative_log_price_history"] = json!([0.0, 0.125]);
+            state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
+            state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            state["daily_baseline_day"] = json!("2026-08-17");
+            state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["last_equity_usd"] = json!("98.2399008827070608");
+        });
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("rollover is outside the approved tick window"));
     }
 
     #[test]
