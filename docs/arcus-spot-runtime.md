@@ -244,8 +244,10 @@ contains the exact recorder snapshot, `step_at` evaluation time, and resulting
 runtime sequence/watermark, so the post-rollback continuity verifier can
 independently replay no-swap signal, invalid-snapshot, reference-price, equity
 and risk state from the pre-start checkpoint. Schema-1 sidecars remain readable
-during a rolling upgrade. Evidence is atomically published before its
-checkpoint; if the checkpoint publication fails, state tooling recognizes only
+as an unchanged backup baseline during a rolling upgrade, but continuity
+requires schema 2 for any current sequence advance. Evidence is atomically
+published before its checkpoint; if checkpoint publication fails, state tooling
+recognizes only
 an exactly one-sequence-newer schema-2 sidecar as an orphan and omits it from
 the captured boundary. All other evidence/checkpoint mismatches remain errors.
 

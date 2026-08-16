@@ -22,7 +22,7 @@ instead the manifest binds its canonical SHA-256 digest.
 | Runtime checkpoint | `/var/lib/debot-arcus/spot-execute-once/runtime_state.json` | schema 1; exact runtime config plus signal history, last token A/B reference prices, inventory, regime, risk state and last committed execution key |
 | Execution ledger | `/var/lib/debot-arcus/spot-execute-once/ledger.json` | schema 2; monotonic attempt sequence, immutable archive and any active recovery state |
 | Recovery evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-pending-plan.json` | optional schema-1 envelope: exact plan, recorder snapshot and evaluation time needed by `auto-resume` and continuity verification |
-| Observation evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-observation-evidence.json` | optional schema-2 sidecar: latest sequence-advancing recorder snapshot, evaluation time and resulting runtime sequence/watermark; schema 1 remains readable |
+| Observation evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-observation-evidence.json` | optional schema-2 sidecar: latest sequence-advancing recorder snapshot, evaluation time and resulting runtime sequence/watermark; schema 1 remains readable only as an unchanged backup baseline |
 | Namespace lock | `/var/lib/debot-arcus/spot-execute-once/.runtime_state.json.lock` | mode-0600 process lock shared by live-tick, execute/resume, proposer and state tooling |
 
 Checkpoint and ledger stores already use create-new temporary files, file
@@ -77,8 +77,9 @@ advancement but rejects:
   advance, a watermark outside the backup-to-verification window, or
   corruption/removal/reordering of retained signal-history samples (a full
   window may shift by exactly one sample for the approved tick). A successful
-  no-swap advance must independently replay to `Observe` from its preserved
-  recorder snapshot/evaluation time and exactly reproduce checkpoint state;
+  no-swap advance must provide schema-2 result-bound evidence, independently
+  replay to `Observe` from its preserved recorder snapshot/evaluation time and
+  exactly reproduce checkpoint state;
 - cumulative-equity baseline changes, mismatched first equity baselines,
   sticky or newly-required risk-halt loss, same-day daily baseline resets,
   UTC rollover days outside the backup-to-verification window, invalid
@@ -86,8 +87,9 @@ advancement but rejects:
 - a backup that was not neutral with no active attempt, ledger regression,
   changed archived history, more than one new acceptance attempt, or an
   acceptance that exceeds the preserved UTC-day swap allowance;
-- an unresolved/non-reconciled acceptance attempt, or one not bound to the
-  preserved pending plan and recorder evidence. The verifier reruns `step_at`
+- an unresolved/non-reconciled acceptance attempt, one without a confirmed
+  router status, or one not bound to the preserved pending plan and schema-2
+  recorder evidence. The verifier reruns `step_at`
   from the backup checkpoint with that snapshot/evaluation time and requires
   an exact plan match, independently recomputing route linkage/loss, quote
   freshness, signal, sizing and inventory projection before checking the

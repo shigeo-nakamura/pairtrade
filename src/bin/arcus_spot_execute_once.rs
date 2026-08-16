@@ -472,6 +472,18 @@ fn observation_evidence_matches_runtime(
     }
 }
 
+fn require_current_observation_evidence_schema(
+    evidence: &ArcusSpotLiveTickObservationEvidence,
+) -> Result<()> {
+    if evidence.schema_version != OBSERVATION_EVIDENCE_SCHEMA_VERSION {
+        bail!(
+            "Arcus current sequence-advancing observation evidence must use schema {}",
+            OBSERVATION_EVIDENCE_SCHEMA_VERSION
+        );
+    }
+    Ok(())
+}
+
 /// Evidence is published before its checkpoint. If the checkpoint write then
 /// fails or the process exits, exactly one newer schema-2 boundary can remain.
 /// Treat only that narrowly identified case as an ignorable orphan; every
@@ -1252,6 +1264,13 @@ fn reconciled_fill_for_continuity(
     if attempt.phase != ArcusSpotExecutionPhase::Reconciled {
         bail!("Arcus acceptance attempt did not finish reconciled");
     }
+    if !attempt
+        .router_status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("confirmed"))
+    {
+        bail!("Arcus acceptance attempt has no confirmed router status");
+    }
     if attempt.chain_id != config.runtime.chain_id
         || attempt.chain_id != config.chain.chain_id
         || attempt.chain_id != config.router.chain_id
@@ -1707,6 +1726,7 @@ fn require_acceptance_ledger_and_position_continuity(
                     bytes,
                     "Arcus accepted no-swap observation evidence",
                 )?;
+                require_current_observation_evidence_schema(&evidence)?;
                 if evidence.evaluation_time < acceptance_not_before
                     || evidence.evaluation_time > acceptance_not_after
                 {
@@ -1783,6 +1803,7 @@ fn require_acceptance_ledger_and_position_continuity(
                 observation_bytes,
                 "Arcus acceptance observation evidence",
             )?;
+            require_current_observation_evidence_schema(&observation_evidence)?;
             if observation_evidence.evaluation_time != evidence.evaluation_time
                 || serde_json::to_value(&observation_evidence.snapshot)?
                     != serde_json::to_value(&evidence.snapshot)?
@@ -4038,6 +4059,45 @@ runtime:
     }
 
     #[test]
+    fn continuity_verification_rejects_legacy_evidence_for_the_current_tick() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+
+        let evaluation_time = Utc::now();
+        let snapshot = no_swap_snapshot(evaluation_time, "200", "176.49938051691913");
+        let store = ArcusSpotRuntimeCheckpointStore::new(runtime_path);
+        let mut runtime = store.load_existing(&config.runtime).unwrap();
+        let event = runtime.step_at(&snapshot, evaluation_time);
+        assert!(matches!(event.decision, ArcusSpotDecision::Observe { .. }));
+        store.persist(&runtime).unwrap();
+        let evidence = ArcusSpotLiveTickObservationEvidence {
+            schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+            evaluation_time,
+            snapshot,
+            resulting_runtime: None,
+        };
+        write_private_regular_file_atomic(
+            &live_tick_observation_evidence_path(&config).unwrap(),
+            &serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+
+        let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("current sequence-advancing observation evidence must use schema 2"));
+    }
+
+    #[test]
     fn continuity_verification_rejects_a_same_day_loss_baseline_reset() {
         let dir = tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.json");
@@ -4713,6 +4773,28 @@ runtime:
             .unwrap_err();
 
         assert!(error.to_string().contains("venue=arcus"));
+    }
+
+    #[test]
+    fn continuity_verification_rejects_an_unconfirmed_router_status() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        for router_status in [None, Some("submitted".to_string())] {
+            let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
+            attempt.router_status = router_status;
+
+            let error =
+                reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+                    .unwrap_err();
+            assert!(error.to_string().contains("no confirmed router status"));
+        }
     }
 
     #[test]
