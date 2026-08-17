@@ -105,6 +105,11 @@ pub(in crate::pairtrade) struct PairTradeYaml {
     pub(super) spread_trend_max_slope_sigma: Option<f64>,
     pub(super) beta_divergence_max: Option<f64>,
     pub(super) beta_min: Option<f64>,
+    /// Entry-side-only floor applied to `|beta|` when sizing leg B's
+    /// notional (bot-strategy#798). 0.0 (default) disables — leg B stays
+    /// exactly `notional_a * |beta|` as before. Does not affect `beta_min`
+    /// (entry eligibility) or the z-score/spread calculation, only sizing.
+    pub(super) sizing_beta_floor: Option<f64>,
     pub(super) hedge_ratio_max_deviation: Option<f64>,
     pub(super) circuit_breaker_tier1_losses: Option<u32>,
     pub(super) circuit_breaker_tier1_cooldown_secs: Option<u64>,

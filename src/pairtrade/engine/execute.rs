@@ -452,6 +452,7 @@ impl PairTradeEngine {
                     depth_s_min,
                     depth_s_max,
                     entry_z_base,
+                    sizing_beta_floor,
                 ) = {
                     let pp = self.pair_params_for(inst_idx, &pair_key);
                     (
@@ -461,6 +462,7 @@ impl PairTradeEngine {
                         pp.depth_size_min,
                         pp.depth_size_max,
                         pp.entry_z_base,
+                        pp.sizing_beta_floor,
                     )
                 };
                 // bot-strategy#515: concentrate capital on deeper entries.
@@ -498,6 +500,7 @@ impl PairTradeEngine {
                         &plan.p1,
                         &plan.p2,
                         notional_scale,
+                        sizing_beta_floor,
                     )
                     .context("hedged_sizes")?;
                 let price_a = price_map

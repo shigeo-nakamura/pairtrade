@@ -27,6 +27,11 @@ pub struct PairParams {
     pub spread_trend_max_slope_sigma: f64,
     pub beta_divergence_max: f64,
     pub beta_min: f64,
+    /// Entry-side-only floor applied to `|beta|` when sizing leg B's
+    /// notional (bot-strategy#798). 0.0 disables (legacy behavior: leg B
+    /// notional = leg_A_notional * |beta|, unbounded below). Does not
+    /// affect `beta_min` (entry eligibility) or z-score/spread math.
+    pub sizing_beta_floor: f64,
     pub hedge_ratio_max_deviation: f64,
     pub lookback_hours_short: u64,
     pub lookback_hours_long: u64,
@@ -205,6 +210,7 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         ),
         beta_divergence_max: env_parse("BETA_DIVERGENCE_MAX", DEFAULT_BETA_DIVERGENCE_MAX),
         beta_min: env_parse("BETA_MIN", 0.0),
+        sizing_beta_floor: env_parse("SIZING_BETA_FLOOR", 0.0),
         hedge_ratio_max_deviation: env_parse("HEDGE_RATIO_MAX_DEVIATION", 1.0),
         lookback_hours_short: env_parse(
             "PAIR_SELECTION_LOOKBACK_HOURS_SHORT",
@@ -336,6 +342,7 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
             .beta_divergence_max
             .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
         beta_min: yaml.beta_min.unwrap_or(0.0),
+        sizing_beta_floor: yaml.sizing_beta_floor.unwrap_or(0.0),
         hedge_ratio_max_deviation: yaml.hedge_ratio_max_deviation.unwrap_or(1.0),
         lookback_hours_short: yaml
             .pair_selection_lookback_hours_short
