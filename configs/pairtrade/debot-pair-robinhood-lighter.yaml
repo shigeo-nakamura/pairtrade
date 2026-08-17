@@ -79,6 +79,16 @@ spread_velocity_max_sigma_per_min: 0.15
 spread_trend_max_slope_sigma: 1.0
 beta_divergence_max: 0.30
 beta_min: 0.30
+# bot-strategy#798 / pairtrade#206: entry-side-only floor on |beta| used for
+# leg-B (ETH) sizing. beta_min above only gates entry eligibility on the
+# *absolute* value and beta_divergence_max only guards estimate *stability*
+# (beta_s vs beta_l) — neither stops a stable-but-low beta from producing a
+# dollar-notional-asymmetric pair. Live 2026-08-17 case: beta=0.48 sized
+# ~$8,000 short BTC against only ~$3,800 long ETH; a +0.5%/+0.48% parallel
+# rally in both legs then cost -$22.55, dominated by the larger unhedged BTC
+# leg, independent of spread convergence. 0.6 catches the worst observed
+# cases (0.44-0.58 range seen live) while leaving near-1 betas untouched.
+sizing_beta_floor: 0.6
 hedge_ratio_max_deviation: 0.20
 entry_vol_lookback_hours: 2
 vol_spike_mult: 3.0
