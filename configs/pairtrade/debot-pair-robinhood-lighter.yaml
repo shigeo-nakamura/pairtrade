@@ -50,8 +50,15 @@ entry_z_score_min: 0.8
 entry_z_score_max: 1.5
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
-force_close_time_secs: 7200
-shutdown_grace_secs: 7260
+# bot-strategy#798: halved from 7200 (canary value) on 2026-08-17. Journal
+# review 08-14..08-17 showed most exits hit force_close rather than
+# exit_z/stop_loss, i.e. the $2,000 was routinely locked for the full 2h
+# even when a fresh entry_z=1.0 signal was available — the dominant
+# frequency constraint for the points-farming objective. Halving trades
+# fewer fully-converged mean-reversion exits for more round trips on the
+# same capital. Revisit at the 2026-08-22 mid-window checkpoint.
+force_close_time_secs: 3600
+shutdown_grace_secs: 3660
 
 # Post-stop cool-down (#316). 600 s blocks immediate re-entry after a
 # stop_loss_z exit on the same direction — Round 4 BT sweep on 5/3-5/8
