@@ -21,3 +21,5 @@ jobs:
         run: python3 scripts/test_canary_diff_report.py -v
       - name: Run round_performance_report.py unit tests
         run: python3 scripts/test_round_performance_report.py -v
+      - name: Run Robinhood sidecar bootstrap tests
+        run: bash scripts/test_bootstrap_robinhood_sidecar.sh
