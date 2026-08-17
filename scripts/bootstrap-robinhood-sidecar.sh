@@ -8,6 +8,7 @@ AWS_BIN=${AWS_BIN:-aws}
 FILE_BIN=${FILE_BIN:-file}
 JQ_BIN=${JQ_BIN:-jq}
 LDD_BIN=${LDD_BIN:-ldd}
+PYTHON_BIN=${PYTHON_BIN:-python3}
 SYSTEMCTL=${SYSTEMCTL:-systemctl}
 SYSTEMD_ANALYZE=${SYSTEMD_ANALYZE:-systemd-analyze}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
@@ -15,6 +16,29 @@ SIDECAR_ROOT=${SIDECAR_ROOT:-/opt/lighter-ratelimit}
 SOCKET_PATH=${SOCKET_PATH:-/run/lighter-ratelimit/lighter-ratelimit.sock}
 INSTALL_OWNER=${INSTALL_OWNER:-root}
 INSTALL_GROUP=${INSTALL_GROUP:-root}
+
+probe_socket() {
+  "$PYTHON_BIN" - "$SOCKET_PATH" <<'PY'
+import json
+import socket
+import sys
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.settimeout(1.0)
+    client.connect(sys.argv[1])
+    client.sendall(b'{"weight":0,"tag":"bootstrap-health","policy":"shed"}\n')
+    response = b""
+    while not response.endswith(b"\n"):
+        chunk = client.recv(4096)
+        if not chunk:
+            raise RuntimeError("sidecar closed the readiness connection")
+        response += chunk
+
+payload = json.loads(response)
+if payload.get("granted") is not True:
+    raise RuntimeError(f"sidecar readiness request was rejected: {payload}")
+PY
+}
 
 if [ "$#" -ne 2 ]; then
   echo "usage: $0 S3_BUCKET PAIRTRADE_INSTALL_DIR" >&2
@@ -140,18 +164,24 @@ fi
 if "$SYSTEMCTL" is-active --quiet "$SERVICE"; then
   if [ "$binary_changed" = true ] || [ "$unit_changed" = true ] ||
      [ "$activation_required" = true ]; then
+    rm -f -- "$SOCKET_PATH"
     "$SYSTEMCTL" restart "$SERVICE"
   fi
 else
+  rm -f -- "$SOCKET_PATH"
   "$SYSTEMCTL" start "$SERVICE"
 fi
 
+ready=false
 for _ in {1..10}; do
-  if "$SYSTEMCTL" is-active --quiet "$SERVICE" && [ -S "$SOCKET_PATH" ]; then
+  if "$SYSTEMCTL" is-active --quiet "$SERVICE" &&
+     [ -S "$SOCKET_PATH" ] && probe_socket; then
+    ready=true
     break
   fi
   sleep 1
 done
+test "$ready" = true
 "$SYSTEMCTL" is-active --quiet "$SERVICE"
 "$SYSTEMCTL" is-enabled --quiet "$SERVICE"
 test -S "$SOCKET_PATH"

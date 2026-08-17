@@ -3,7 +3,15 @@ set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
-trap 'rm -rf -- "$WORK"' EXIT
+cleanup() {
+  if [ -f "$WORK/fake-sidecar-server.pids" ]; then
+    while read -r pid; do
+      kill "$pid" 2>/dev/null || true
+    done < "$WORK/fake-sidecar-server.pids"
+  fi
+  rm -rf -- "$WORK"
+}
+trap cleanup EXIT
 
 BUNDLE="$WORK/bundle"
 PAIRTRADE_DIR="$WORK/pairtrade"
@@ -11,6 +19,27 @@ SYSTEMD_DIR="$WORK/systemd"
 SIDECAR_ROOT="$WORK/sidecar"
 SOCKET_PATH="$WORK/lighter-ratelimit.sock"
 mkdir -p "$BUNDLE" "$PAIRTRADE_DIR" "$SYSTEMD_DIR" "$SIDECAR_ROOT"
+
+cat > "$WORK/fake-sidecar-server.py" <<'PY'
+import socket
+import sys
+
+path = sys.argv[1]
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path)
+srv.listen(5)
+while True:
+    conn, _ = srv.accept()
+    with conn:
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        conn.sendall(b'{"granted": true}\n')
+PY
+: > "$WORK/fake-sidecar-server.log"
 
 SOURCE_SHA=43e405cc811c318034b17bab9c3dd2b387a6f897
 DEPLOYMENT_SOURCE_SHA=4b7e859a6e80224e1744fe6e0d609b8b1e1348ff
@@ -86,13 +115,13 @@ case "$1" in
   start|restart)
     : > "$SYSTEMCTL_STATE"
     rm -f "$FAKE_SOCKET"
-    python3 - "$FAKE_SOCKET" <<'PY'
-import socket
-import sys
-s = socket.socket(socket.AF_UNIX)
-s.bind(sys.argv[1])
-s.close()
-PY
+    python3 "$FAKE_SIDECAR_SERVER" "$FAKE_SOCKET" >>"$FAKE_SIDECAR_LOG" 2>&1 &
+    echo "$!" >> "$FAKE_SIDECAR_PIDS_FILE"
+    disown
+    for _ in {1..50}; do
+      [ -S "$FAKE_SOCKET" ] && break
+      sleep 0.1
+    done
     ;;
   show)
     printf 'debot-pair-robinhood-lighter.service network.target\n'
@@ -105,6 +134,8 @@ chmod +x "$WORK/aws" "$WORK/file" "$WORK/ldd" "$WORK/systemd-analyze" "$WORK/sys
 
 TEST_OWNER=$(id -un)
 TEST_GROUP=$(id -gn)
+FAKE_SIDECAR_PIDS_FILE="$WORK/fake-sidecar-server.pids"
+: > "$FAKE_SIDECAR_PIDS_FILE"
 run_bootstrap() {
   FAKE_BUNDLE="$BUNDLE" \
   AWS_BIN="$WORK/aws" \
@@ -114,6 +145,9 @@ run_bootstrap() {
   SYSTEMCTL_LOG="$WORK/systemctl.log" \
   SYSTEMCTL_STATE="$WORK/systemctl.state" \
   FAKE_SOCKET="$SOCKET_PATH" \
+  FAKE_SIDECAR_SERVER="$WORK/fake-sidecar-server.py" \
+  FAKE_SIDECAR_LOG="$WORK/fake-sidecar-server.log" \
+  FAKE_SIDECAR_PIDS_FILE="$FAKE_SIDECAR_PIDS_FILE" \
   SYSTEMD_ANALYZE="$WORK/systemd-analyze" \
   SYSTEMD_DIR="$SYSTEMD_DIR" \
   SIDECAR_ROOT="$SIDECAR_ROOT" \
