@@ -164,6 +164,7 @@ impl PairTradeEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::pairtrade) fn hedged_sizes(
         &self,
         inst_idx: usize,
