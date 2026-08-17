@@ -14,9 +14,10 @@ Environment=STATUS_S3_KEY_PREFIX=debot/status/robinhood-lighter
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5
-# Allow the 7,260s strategy grace to expire, then leave three minutes for
-# the final reduce-only exchange close and orderly process shutdown.
-TimeoutStopSec=7440
+# Allow the 3,660s strategy grace to expire (bot-strategy#798, force_close
+# halved 7200->3600 on 2026-08-17), then leave three minutes for the final
+# reduce-only exchange close and orderly process shutdown.
+TimeoutStopSec=3840
 StandardOutput=journal
 StandardError=journal
 
