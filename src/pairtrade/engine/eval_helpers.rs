@@ -67,9 +67,10 @@ impl PairTradeEngine {
                 key
             );
             // Exit fallback (no recorded sizes): unwind at base hedge ratio.
-            // bot-strategy#461's notional shrink is entry-side only — we
-            // must not apply it here or we'd leave a residual position.
-            return self.hedged_sizes(inst_idx, pair, beta, p1, p2, 1.0);
+            // bot-strategy#461's notional shrink and bot-strategy#798's
+            // sizing_beta_floor are entry-side only — we must not apply
+            // either here or we'd leave a residual position.
+            return self.hedged_sizes(inst_idx, pair, beta, p1, p2, 1.0, 0.0);
         }
 
         Ok((qty_a, qty_b))
@@ -171,9 +172,18 @@ impl PairTradeEngine {
         p1: &SymbolSnapshot,
         p2: &SymbolSnapshot,
         notional_scale: f64,
+        sizing_beta_floor: f64,
     ) -> Result<(Decimal, Decimal)> {
         let inst = &self.instances[inst_idx];
         let equity = inst.equity_reference_usd;
-        sizing::hedged_sizes(&self.cfg, equity, beta, p1, p2, notional_scale)
+        sizing::hedged_sizes(
+            &self.cfg,
+            equity,
+            beta,
+            p1,
+            p2,
+            notional_scale,
+            sizing_beta_floor,
+        )
     }
 }

@@ -44,6 +44,19 @@ pub(super) fn beta_gap_notional_scale(beta_gap: f64, scale_param: f64, floor_par
     raw.clamp(floor, 1.0)
 }
 
+/// Resolve the beta used for leg-B sizing only (bot-strategy#798). Leg B's
+/// notional is `leg_A_notional * sizing_beta`, so a low-but-stable `|beta|`
+/// (passes `beta_min` and `beta_divergence_max` cleanly — this is not about
+/// estimate instability) still produces a dollar-notional-asymmetric pair:
+/// the oversized, less-hedged leg then carries directional exposure to any
+/// move common to both legs, regardless of whether the spread itself
+/// converges. `floor <= 0.0` disables (returns `|beta|` unchanged, the
+/// legacy behavior). This floor is sizing-only — it must not be used for
+/// `beta_min` (entry eligibility) or z-score/spread math.
+pub(super) fn resolve_sizing_beta(beta: f64, floor: f64) -> f64 {
+    beta.abs().max(floor.max(0.0))
+}
+
 /// Defensive ceiling on the combined notional scale passed into
 /// `hedged_sizes`. Depth sizing (bot-strategy#515) legitimately pushes the
 /// scale above 1.0, so the old `clamp(0.0, 1.0)` no longer applies; this
@@ -82,6 +95,7 @@ pub(super) fn hedged_sizes(
     p1: &SymbolSnapshot,
     p2: &SymbolSnapshot,
     notional_scale: f64,
+    sizing_beta_floor: f64,
 ) -> Result<(Decimal, Decimal)> {
     // `equity` is the per-instance fixed `equity_reference_usd` so each
     // variant sizes against its own declared capital. Live equity is no
@@ -94,8 +108,9 @@ pub(super) fn hedged_sizes(
     // (caller supplies the resolved product, default 1.0).
     let scale = notional_scale.clamp(0.0, MAX_NOTIONAL_SCALE);
     let mut leg_notional = (base_leg * scale).max(10.0);
+    let sizing_beta = resolve_sizing_beta(beta, sizing_beta_floor);
     let notional_cap = equity * cfg.max_leverage * cfg.risk.max_notional_headroom;
-    if let Some(capped) = cap_leg_notional(leg_notional, beta, notional_cap) {
+    if let Some(capped) = cap_leg_notional(leg_notional, sizing_beta, notional_cap) {
         log::warn!(
             "[RISK_NOTIONAL_CAP] leg_notional {:.2} → {:.2} (cap={:.2}, equity={:.2}, max_leverage={:.2}, headroom={:.3}, |beta|={:.4})",
             leg_notional,
@@ -104,7 +119,7 @@ pub(super) fn hedged_sizes(
             equity,
             cfg.max_leverage,
             cfg.risk.max_notional_headroom,
-            beta.abs()
+            sizing_beta
         );
         leg_notional = capped;
     }
@@ -125,12 +140,12 @@ pub(super) fn hedged_sizes(
         qty
     };
     // Compute qty_b from the actual notional of leg A (after min_order adjustment)
-    // so that the hedge ratio matches beta: notional_b = notional_a * beta
+    // so that the hedge ratio matches beta: notional_b = notional_a * sizing_beta
     let actual_notional_a = qty_a * p1.price;
     let qty_b = if p2.price == Decimal::ZERO {
         Decimal::ZERO
     } else {
-        let beta_dec = Decimal::from_f64(beta.abs()).unwrap_or(Decimal::ONE);
+        let beta_dec = Decimal::from_f64(sizing_beta).unwrap_or(Decimal::ONE);
         let mut qty = (actual_notional_a * beta_dec) / p2.price;
         if let Some(decimals) = p2.size_decimals {
             qty = qty.round_dp(decimals);
@@ -216,6 +231,33 @@ mod tests {
     fn beta_gap_notional_scale_negative_gap_is_zero() {
         // Defensive: beta_gap should never be negative, but clamp to 0.
         assert_eq!(beta_gap_notional_scale(-0.5, 1.0, 0.5), 1.0);
+    }
+
+    #[test]
+    fn resolve_sizing_beta_disabled_returns_raw_beta() {
+        // floor <= 0.0 → legacy behavior, |beta| unchanged.
+        assert_eq!(resolve_sizing_beta(0.48, 0.0), 0.48);
+        assert_eq!(resolve_sizing_beta(-0.48, 0.0), 0.48);
+    }
+
+    #[test]
+    fn resolve_sizing_beta_floors_low_beta() {
+        // bot-strategy#798 trade #8: beta=0.48, floor=0.6 → 0.6 used for sizing.
+        assert_eq!(resolve_sizing_beta(0.48, 0.6), 0.6);
+        assert_eq!(resolve_sizing_beta(-0.48, 0.6), 0.6);
+    }
+
+    #[test]
+    fn resolve_sizing_beta_no_op_above_floor() {
+        // beta already above the floor → floor is a no-op.
+        assert_eq!(resolve_sizing_beta(1.05, 0.6), 1.05);
+    }
+
+    #[test]
+    fn resolve_sizing_beta_negative_floor_disabled() {
+        // Defensive: a misconfigured negative floor must not raise beta above
+        // its own absolute value.
+        assert_eq!(resolve_sizing_beta(0.48, -1.0), 0.48);
     }
 
     #[test]
