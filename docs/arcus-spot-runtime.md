@@ -25,8 +25,51 @@ It then enforces:
 - a per-rotation fraction of inventory above the floor;
 - a maximum post-rotation USD inventory imbalance;
 - optimistic round-trip loss plus explicit gas and settlement buffers;
-- sticky daily and cumulative mark-to-market loss halts;
+- sticky daily and cumulative loss halts, measured against the strategy
+  rather than the market (see below);
 - maximum hold and mean-reversion exit behavior.
+
+### What the loss stops measure
+
+`daily_loss_limit_usd` and `cumulative_loss_limit_usd` ask "how much has
+*rotating* cost", not "how much is the inventory worth".
+
+Each stop records the basket held when its baseline was taken -- the day's
+opening inventory, and the inventory at probe start -- and re-prices that
+basket at every tick. The gap between that buy-and-hold counterfactual and
+actual equity is what rotating added or destroyed. While the bot has not
+traded, the two are the same basket at the same prices, so the measured loss
+is exactly zero no matter what prices did.
+
+These stops were originally marked against fixed dollar baselines, which
+conflated the two questions. This bot pre-funds both legs and has no native
+short on Spot, so it carries their beta whether or not it ever trades: on
+2026-08-18 a 4.1% NVDA/AMD down day moved probe equity $100.58 -> $96.46 and
+engaged the $2 daily halt without a single swap having been made
+(bot-strategy#813). Halting on that was never protective — stopping rotation
+does not shed inventory, so the exposure is identical halted or not, and
+shedding it is an operator decision.
+
+The beta itself is still reported, as `inventory_drawdown_usd` on every risk
+mark; it is simply never compared against a limit.
+
+Two consequences worth knowing:
+
+- **Path independence.** Prices move the benchmark and actual equity
+  together, so only a rotation can move the difference. An earlier guard
+  compared the rollover tick against the previous day's closing mark, so
+  that an intraday gain could not mask an overnight decline; that failure
+  mode is structural to equity marks and does not exist here, so the guard
+  is gone.
+- **No drawdown control.** `daily_loss_limit_usd` is a loss limit, so a day
+  that gives back part of a gain but ends net positive does not halt. If a
+  peak-to-trough drawdown stop is wanted, it is a separate limit and is not
+  implemented.
+
+A checkpoint written before the baskets existed carries none; the next tick
+seeds them and the stops are unmeasurable (reported as zero) until it does.
+`state-verify-continuity` re-derives the same measure independently, so the
+runtime and the verifier agree about when a halt was required.
 
 The log-price ratio signal is evaluated against prior samples only. The current
 sample is appended after z-score calculation, avoiding same-tick look-ahead.

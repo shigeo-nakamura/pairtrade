@@ -1098,20 +1098,38 @@ fn require_risk_state_continuity(
         }
     }
     if baseline.risk_halt.is_none() {
-        let daily_reference = match (baseline_daily, current_daily) {
-            (Some((baseline_day, baseline_equity)), Some((current_day, _)))
-                if baseline_day == current_day =>
-            {
-                Some(baseline_equity)
+        // Re-derived here rather than read off the runtime, so a checkpoint
+        // cannot assert its own innocence -- but it has to re-derive the
+        // *same* measure the runtime halts on, or the two disagree and every
+        // ordinary down day makes verification demand a halt the runtime was
+        // right not to engage. Both sides therefore price the baseline
+        // baskets at the marks the current state was last valued on
+        // (bot-strategy#813).
+        let prices = current
+            .last_token_a_reference_price_usd
+            .zip(current.last_token_b_reference_price_usd);
+        // Absent baskets (a checkpoint predating them) or absent marks leave
+        // the expectation unassessable, which `positive_loss_from_mark`
+        // already renders as no expected loss. Requiring a halt the runtime
+        // had no information to engage would fail every such checkpoint.
+        let benchmark = |basket: Option<ArcusSpotInventory>| -> Result<Option<Decimal>> {
+            match basket.zip(prices) {
+                Some((basket, (price_a, price_b))) => {
+                    Ok(Some(basket.checked_value_usd(price_a, price_b).context(
+                        "Arcus risk basket valuation exceeds Decimal range",
+                    )?))
+                }
+                None => Ok(None),
             }
-            (Some((_, baseline_equity)), Some(_)) => {
-                baseline.last_equity_usd.or(Some(baseline_equity))
-            }
-            _ => None,
         };
-        let daily_loss = positive_loss_from_mark(daily_reference, current.last_equity_usd)?;
-        let cumulative_loss =
-            positive_loss_from_mark(current.initial_equity_usd, current.last_equity_usd)?;
+        let daily_loss = positive_loss_from_mark(
+            benchmark(current.daily_baseline_inventory)?,
+            current.last_equity_usd,
+        )?;
+        let cumulative_loss = positive_loss_from_mark(
+            benchmark(current.initial_baseline_inventory)?,
+            current.last_equity_usd,
+        )?;
         let expected = if daily_loss >= config.daily_loss_limit_usd {
             Some((
                 ArcusSpotRiskHaltKind::DailyLoss,
@@ -3847,8 +3865,10 @@ runtime:
             state["last_token_a_reference_price_usd"] = json!("200");
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             state["initial_equity_usd"] = json!("98.2399008827070608");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("98.2399008827070608");
         });
         let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:00Z")
@@ -3929,8 +3949,10 @@ runtime:
             state["last_token_a_reference_price_usd"] = json!("200");
             state["last_token_b_reference_price_usd"] = json!("57.300959372038022");
             state["initial_equity_usd"] = json!("79.16815349952608352");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("79.16815349952608352");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("79.16815349952608352");
         });
         let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
@@ -3974,8 +3996,10 @@ runtime:
             state["last_token_a_reference_price_usd"] = json!("200");
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             state["initial_equity_usd"] = json!("98.2399008827070608");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("98.2399008827070608");
         });
         let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
@@ -4193,8 +4217,10 @@ runtime:
             state["sequence"] = json!(7);
             state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
             state["initial_equity_usd"] = json!("300");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("300");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("299");
         });
         create_arcus_state_backup(&config, &backup_dir).unwrap();
@@ -4202,6 +4228,7 @@ runtime:
             state["sequence"] = json!(8);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["daily_baseline_equity_usd"] = json!("250");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("250");
         });
 
@@ -4228,8 +4255,10 @@ runtime:
             state["sequence"] = json!(7);
             state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
             state["initial_equity_usd"] = json!("300");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("300");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("299");
         });
         create_arcus_state_backup(&config, &backup_dir).unwrap();
@@ -4261,8 +4290,10 @@ runtime:
             state["relative_log_price_history"] = json!([0.0]);
             state["last_observation_at"] = json!("2026-08-15T23:59:00Z");
             state["initial_equity_usd"] = json!("98.2399008827070608");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-15");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("98.2399008827070608");
         });
         create_arcus_state_backup(&config, &backup_dir).unwrap();
@@ -4274,6 +4305,7 @@ runtime:
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("98.2399008827070608");
         });
         let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T00:00:01Z")
@@ -4307,8 +4339,10 @@ runtime:
             state["relative_log_price_history"] = json!([0.0]);
             state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
             state["initial_equity_usd"] = json!("98.2399008827070608");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("98.2399008827070608");
         });
         create_arcus_state_backup(&config, &backup_dir).unwrap();
@@ -4320,6 +4354,7 @@ runtime:
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             state["daily_baseline_day"] = json!("2026-08-17");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("98.2399008827070608");
         });
 
@@ -4347,8 +4382,10 @@ runtime:
             state["sequence"] = json!(1);
             state["last_observation_at"] = json!("2026-08-16T12:00:01Z");
             state["initial_equity_usd"] = json!("250");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("300");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("300");
         });
 
@@ -4379,6 +4416,16 @@ runtime:
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("300");
             state["last_equity_usd"] = json!("300");
+            // Baskets one hundredth of token A larger than the inventory
+            // actually held: an earlier rotation gave that up and got
+            // nothing back. Priced at this state's marks (600 /
+            // 529.49814155075739) the baskets are worth 300.7197… against
+            // an actual 294.7197…, a $6 attributed loss past the $2 daily
+            // limit. Stated as a basket difference rather than the price
+            // move this fixture used before #813, because a price move is
+            // exactly what must no longer require a halt.
+            state["initial_baseline_inventory"] = json!({"token_a": "0.36", "token_b": "0.16"});
+            state["daily_baseline_inventory"] = json!({"token_a": "0.36", "token_b": "0.16"});
         });
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         rewrite_checkpoint_state(&runtime_path, |state| {
@@ -4412,7 +4459,7 @@ runtime:
                 "kind": "daily_loss",
                 "engaged_at": "2026-08-16T12:01:01Z",
                 "equity_usd": "294.7197026481211824",
-                "loss_usd": "5.2802973518788176",
+                "loss_usd": "6.0000000000000000",
                 "limit_usd": "2",
             });
         });
@@ -4437,8 +4484,10 @@ runtime:
             state["relative_log_price_history"] = json!([0.0]);
             state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
             state["initial_equity_usd"] = json!("90");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("90");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("90");
         });
         create_arcus_state_backup(&config, &backup_dir).unwrap();
@@ -4448,7 +4497,13 @@ runtime:
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
-            state["last_equity_usd"] = json!("95");
+            // Inflated rather than deflated (it was "95" before #813): the
+            // basket is genuinely worth 98.2399… at these marks, so a mark
+            // *below* it now reads as a real attributed loss and trips the
+            // halt expectation before the replay ever runs. Overstating
+            // equity is the adversarial direction anyway -- it is how a
+            // loss would be hidden -- and the replay must still catch it.
+            state["last_equity_usd"] = json!("105");
         });
         let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
             .unwrap()
@@ -4486,8 +4541,10 @@ runtime:
             state["last_token_a_reference_price_usd"] = json!("200");
             state["last_token_b_reference_price_usd"] = json!("163.7461506155964");
             state["initial_equity_usd"] = json!("96.199384098495424");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("96.199384098495424");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("96.199384098495424");
         });
         let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
@@ -5182,13 +5239,16 @@ runtime:
         persist_initial_operator_state(&config);
         rewrite_checkpoint_state(&runtime_path, |state| {
             state["initial_equity_usd"] = json!("300");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("300");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("300");
         });
         create_arcus_state_backup(&config, &backup_dir).unwrap();
         rewrite_checkpoint_state(&runtime_path, |state| {
             state["initial_equity_usd"] = serde_json::Value::Null;
+            state["initial_baseline_inventory"] = state["inventory"].clone();
         });
 
         let error = verify_arcus_state_backup(&config, &backup_dir, false).unwrap_err();
@@ -5212,8 +5272,10 @@ runtime:
         persist_initial_operator_state(&config);
         rewrite_checkpoint_state(&runtime_path, |state| {
             state["initial_equity_usd"] = json!("300");
+            state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("300");
+            state["daily_baseline_inventory"] = state["inventory"].clone();
             state["last_equity_usd"] = json!("297");
             state["risk_halt"] = json!({
                 "kind": "daily_loss",

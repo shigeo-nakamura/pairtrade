@@ -88,8 +88,16 @@ pub struct ArcusSpotRiskHalt {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ArcusSpotRiskMark {
     pub equity_usd: Decimal,
+    /// Loss attributable to rotating, for the current UTC day: how far
+    /// actual equity sits below the day's opening basket re-priced at this
+    /// tick. Zero while the bot has not traded, whatever prices did.
     pub daily_loss_usd: Decimal,
+    /// The same measure taken against the basket held at probe start.
     pub cumulative_loss_usd: Decimal,
+    /// How much the starting basket itself is down on price alone. Reported
+    /// for visibility and never compared against a limit — see `risk_mark`.
+    #[serde(default)]
+    pub inventory_drawdown_usd: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -191,8 +199,37 @@ pub struct ArcusSpotRuntimeState {
     /// keep the regime rotated instead of being declared closed early.
     pub rotated_quantity: Option<Decimal>,
     pub initial_equity_usd: Option<Decimal>,
+    /// Inventory held when `initial_equity_usd` was first marked, i.e. the
+    /// basket the cumulative loss stop measures the strategy against.
+    ///
+    /// Both loss stops ask "how much has *rotating* cost us", not "how much
+    /// is the inventory worth". Marking equity against a fixed dollar
+    /// baseline conflates the two: this bot pre-funds both legs and has no
+    /// native short on Spot, so it carries their beta whether or not it ever
+    /// trades, and a routine adverse day in the underlying names drains a
+    /// budget meant to catch the *strategy* losing money. bot-strategy#813
+    /// was filed after a $2 daily stop halted the probe on a 4.1% NVDA/AMD
+    /// down day without a single swap having been made.
+    ///
+    /// Re-marking this basket at each tick's prices instead gives a
+    /// buy-and-hold counterfactual: hold what we started with, do nothing.
+    /// The gap between that and actual equity is exactly what rotating
+    /// added or destroyed, and it is identically zero while the bot has not
+    /// traded, at any price. Halting on beta was never protective anyway --
+    /// stopping rotation does not shed inventory, so the exposure is the
+    /// same halted or not, and shedding it is an operator decision.
+    ///
+    /// `None` on a checkpoint written before this field existed; seeded on
+    /// the next tick (see `update_risk_baselines`).
+    #[serde(default)]
+    pub initial_baseline_inventory: Option<ArcusSpotInventory>,
     pub daily_baseline_day: Option<String>,
     pub daily_baseline_equity_usd: Option<Decimal>,
+    /// Inventory held at the day's opening mark -- the daily counterpart of
+    /// `initial_baseline_inventory`, and what `daily_loss_usd` is measured
+    /// against. `None` on a pre-existing checkpoint; seeded on the next tick.
+    #[serde(default)]
+    pub daily_baseline_inventory: Option<ArcusSpotInventory>,
     /// Equity as of the most recently evaluated snapshot, updated on every
     /// tick regardless of day boundary. `daily_baseline_equity_usd` is
     /// fixed at the day's *opening* mark, so on the first tick of a new
@@ -222,8 +259,10 @@ impl ArcusSpotRuntimeState {
             last_rotation_at: None,
             rotated_quantity: None,
             initial_equity_usd: None,
+            initial_baseline_inventory: None,
             daily_baseline_day: None,
             daily_baseline_equity_usd: None,
+            daily_baseline_inventory: None,
             last_equity_usd: None,
             risk_halt: None,
             #[cfg(feature = "arcus-spot-live")]
@@ -655,19 +694,18 @@ impl ArcusSpotRuntime {
                 })
             }
         };
-        // Marked against the *prior* daily baseline before it can be reset
-        // below: on the first snapshot of a new UTC day, resetting the
-        // baseline first would compare the day's opening equity against
-        // itself (zero loss) and silently absorb whatever was lost
-        // overnight, since that drop happened continuously and was never
-        // assessed against any baseline. Assessing this mark first lets an
-        // overnight loss that breached the still-active prior baseline
-        // engage the halt before the new day's baseline is established.
-        // risk_mark_before_rollover (rather than plain risk_mark) uses the
-        // prior day's actual last mark on that specific tick, not its
-        // opening baseline — see `last_equity_usd`'s doc comment.
-        let risk_before = self.risk_mark_before_rollover(evaluation_time, equity_before);
-        self.update_risk_baselines(evaluation_time, equity_before);
+        // Marked against the *prior* daily basket before it can be reset
+        // below: on the first snapshot of a new UTC day, resetting first
+        // would measure the outgoing day's rotations against the basket
+        // they already produced, reporting zero and letting whatever they
+        // cost go unassessed. Marking first keeps the outgoing day's basket
+        // as the reference for one last tick.
+        let risk_before = self.risk_mark(
+            equity_before,
+            price.token_a_price_usd,
+            price.token_b_price_usd,
+        );
+        self.update_risk_baselines(evaluation_time, equity_before, inventory_before);
         self.state.last_equity_usd = Some(equity_before);
         self.engage_risk_halt(evaluation_time, risk_before);
 
@@ -876,16 +914,18 @@ impl ArcusSpotRuntime {
             .inventory
             .checked_value_usd(context.token_a_price_usd, context.token_b_price_usd)
             .unwrap_or(equity_before);
-        // Overwrites the pre-fill mark set earlier in this tick: when a
-        // ReplaySimulation fill changes marked equity on the last snapshot
-        // of a UTC day, the next day's rollover check (see
-        // `risk_mark_before_rollover`) must compare against this tick's
-        // actual post-fill close, not its opening value, or a
-        // gain-producing fill followed by a large overnight decline could
-        // hide the decline and reset the daily baseline without engaging
-        // the halt.
+        // Overwrites the pre-fill mark set earlier in this tick so
+        // `last_equity_usd` records this tick's actual post-fill close.
         self.state.last_equity_usd = Some(equity_after);
-        let risk_after = self.risk_mark(equity_after);
+        // Re-marked after the fill, against the same (still un-reset) daily
+        // basket: this is the tick where a value-destroying rotation
+        // actually shows up, since only a rotation can move equity away
+        // from the re-priced benchmark.
+        let risk_after = self.risk_mark(
+            equity_after,
+            context.token_a_price_usd,
+            context.token_b_price_usd,
+        );
         self.engage_risk_halt(evaluation_time, risk_after);
         self.event(RuntimeEventInput {
             sequence,
@@ -909,7 +949,7 @@ impl ArcusSpotRuntime {
                 self.state
                     .inventory
                     .checked_value_usd(price_a, price_b)
-                    .map(|equity| self.risk_mark(equity))
+                    .map(|equity| self.risk_mark(equity, price_a, price_b))
             });
         ArcusSpotRuntimeEvent {
             sequence: input.sequence,
@@ -1574,51 +1614,87 @@ impl ArcusSpotRuntime {
         })
     }
 
-    fn update_risk_baselines(&mut self, at: DateTime<Utc>, equity_usd: Decimal) {
+    fn update_risk_baselines(
+        &mut self,
+        at: DateTime<Utc>,
+        equity_usd: Decimal,
+        inventory: ArcusSpotInventory,
+    ) {
         if self.state.initial_equity_usd.is_none() {
             self.state.initial_equity_usd = Some(equity_usd);
+        }
+        if self.state.initial_baseline_inventory.is_none() {
+            self.state.initial_baseline_inventory = Some(inventory);
         }
         let day = at.format("%Y-%m-%d").to_string();
         if self.state.daily_baseline_day.as_deref() != Some(day.as_str()) {
             self.state.daily_baseline_day = Some(day);
             self.state.daily_baseline_equity_usd = Some(equity_usd);
+            self.state.daily_baseline_inventory = Some(inventory);
+        } else if self.state.daily_baseline_inventory.is_none() {
+            // A checkpoint written before the baskets existed, loaded
+            // part-way through a UTC day. Adopt this tick's inventory as the
+            // day's basket rather than leaving the daily stop unmeasurable
+            // until midnight. The approximation only misprices rotations
+            // that already happened earlier today, and it self-corrects at
+            // the next rollover. `daily_baseline_equity_usd` is deliberately
+            // left alone: it still means "the day's opening equity mark",
+            // which the state-continuity checks read, and it no longer
+            // feeds the loss stops at all.
+            self.state.daily_baseline_inventory = Some(inventory);
         }
     }
 
-    fn risk_mark(&self, equity_usd: Decimal) -> ArcusSpotRiskMark {
-        ArcusSpotRiskMark {
-            equity_usd,
-            daily_loss_usd: positive_loss(self.state.daily_baseline_equity_usd, equity_usd),
-            cumulative_loss_usd: positive_loss(self.state.initial_equity_usd, equity_usd),
-        }
+    /// What a basket would be worth at these prices — the buy-and-hold
+    /// counterfactual the loss stops measure the strategy against.
+    fn benchmark_equity_usd(
+        basket: Option<ArcusSpotInventory>,
+        token_a_price_usd: Decimal,
+        token_b_price_usd: Decimal,
+    ) -> Option<Decimal> {
+        basket.and_then(|basket| basket.checked_value_usd(token_a_price_usd, token_b_price_usd))
     }
 
-    /// Like `risk_mark`, but for the one-time assessment taken *before*
-    /// `update_risk_baselines` resets the daily baseline on the first tick
-    /// of a new UTC day. On that specific tick, `daily_baseline_equity_usd`
-    /// still holds the *outgoing* day's opening mark rather than its
-    /// closing one, which can under-report (or entirely miss) a loss that
-    /// occurred after an intraday gain — see `last_equity_usd`'s doc
-    /// comment. Falls back to `daily_baseline_equity_usd` when no prior
-    /// mark exists yet (e.g. the very first tick ever).
-    fn risk_mark_before_rollover(
+    /// Marks both loss stops against the baseline baskets re-priced at this
+    /// tick, so they measure what rotating cost rather than what the market
+    /// did (bot-strategy#813; see `initial_baseline_inventory`).
+    ///
+    /// A useful consequence: the result no longer depends on the price
+    /// *path*. The old equity-based marks did, which is why assessing the
+    /// outgoing day needed a separate pre-rollover variant that referenced
+    /// the previous close — an intraday gain followed by an overnight
+    /// decline would otherwise net out and hide the decline. Re-pricing the
+    /// basket removes that failure mode at the source: prices move the
+    /// benchmark and actual equity by the same amount, so only a rotation
+    /// can move the difference between them. Assessing before
+    /// `update_risk_baselines` still matters, and the caller still does it,
+    /// but only so the outgoing day's basket is the one being measured.
+    fn risk_mark(
         &self,
-        at: DateTime<Utc>,
         equity_usd: Decimal,
+        token_a_price_usd: Decimal,
+        token_b_price_usd: Decimal,
     ) -> ArcusSpotRiskMark {
-        let day = at.format("%Y-%m-%d").to_string();
-        let is_new_day = self.state.daily_baseline_day.as_deref() != Some(day.as_str());
-        let daily_reference = if is_new_day {
-            self.state
-                .last_equity_usd
-                .or(self.state.daily_baseline_equity_usd)
-        } else {
-            self.state.daily_baseline_equity_usd
-        };
+        let daily_benchmark = Self::benchmark_equity_usd(
+            self.state.daily_baseline_inventory,
+            token_a_price_usd,
+            token_b_price_usd,
+        );
+        let cumulative_benchmark = Self::benchmark_equity_usd(
+            self.state.initial_baseline_inventory,
+            token_a_price_usd,
+            token_b_price_usd,
+        );
         ArcusSpotRiskMark {
             equity_usd,
-            daily_loss_usd: positive_loss(daily_reference, equity_usd),
-            cumulative_loss_usd: positive_loss(self.state.initial_equity_usd, equity_usd),
+            daily_loss_usd: positive_loss(daily_benchmark, equity_usd),
+            cumulative_loss_usd: positive_loss(cumulative_benchmark, equity_usd),
+            // Reported, never halted on. This is the beta the bot carries by
+            // construction; halting cannot shed it, so the number exists to
+            // be watched by whoever *can* (see #772's market-beta metric).
+            inventory_drawdown_usd: cumulative_benchmark
+                .map(|benchmark| positive_loss(self.state.initial_equity_usd, benchmark))
+                .unwrap_or(Decimal::ZERO),
         }
     }
 
@@ -2607,8 +2683,9 @@ mod tests {
     #[test]
     fn loss_halt_is_sticky() {
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
-        runtime.update_risk_baselines(event_time(), Decimal::from(300));
-        let mark = runtime.risk_mark(Decimal::from(297));
+        let baseline_inventory = runtime.state.inventory;
+        runtime.update_risk_baselines(event_time(), Decimal::from(300), baseline_inventory);
+        let mark = runtime.risk_mark(Decimal::from(297), Decimal::from(200), Decimal::from(100));
         runtime.engage_risk_halt(event_time(), mark);
         let halt = runtime.state.risk_halt.clone().unwrap();
         assert_eq!(halt.kind, ArcusSpotRiskHaltKind::DailyLoss);
@@ -2619,6 +2696,7 @@ mod tests {
                 equity_usd: Decimal::from(100),
                 daily_loss_usd: Decimal::from(200),
                 cumulative_loss_usd: Decimal::from(200),
+                inventory_drawdown_usd: Decimal::ZERO,
             },
         );
         assert_eq!(runtime.state.risk_halt.unwrap(), halt);
@@ -3203,11 +3281,20 @@ mod tests {
     fn risk_halt_engages_even_when_the_route_is_unavailable() {
         // The recorder row is entirely absent (round_trips is empty), so
         // snapshot_context() fails with RouteUnavailable. Token metadata and
-        // reference prices are otherwise valid, so equity can still be
-        // marked; the halt must still engage here rather than only on a
-        // later snapshot where a route happens to be available again.
+        // reference prices are otherwise valid, so the marks can still be
+        // taken; a loss already on the books must engage the halt here
+        // rather than only on a later snapshot where a route happens to be
+        // available again.
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
-        runtime.update_risk_baselines(event_time(), Decimal::from(300));
+        let baseline_inventory = runtime.state.inventory;
+        runtime.update_risk_baselines(event_time(), Decimal::from(300), baseline_inventory);
+        // An earlier rotation destroyed value: the basket now holds 0.97 of
+        // token A where the baseline basket holds 1.0. At the snapshot's
+        // prices (150/50) that benchmark is worth 200 and the actual
+        // inventory 195.5, a $4.50 attributed loss against the $2 limit.
+        // Stated as an inventory difference rather than a price move on
+        // purpose -- a price move is precisely what must *not* halt.
+        runtime.state.inventory.token_a = Decimal::new(97, 2);
         let snapshot = snapshot_with_route_unavailable(event_time(), "150", "50");
         let event = runtime.step_at(&snapshot, event_time());
         match event.decision {
@@ -3218,7 +3305,7 @@ mod tests {
         }
         assert!(
             runtime.state().risk_halt.is_some(),
-            "loss during a route outage must still engage the halt"
+            "an attributed loss during a route outage must still engage the halt"
         );
     }
 
@@ -3251,35 +3338,125 @@ mod tests {
         assert_eq!(halt.kind, ArcusSpotRiskHaltKind::DailyLoss);
     }
 
+    /// The bot-strategy#813 case, and the whole point of the change: on
+    /// 2026-08-18 a 4.1% NVDA/AMD down day drove the live probe's equity
+    /// from $100.58 to $96.46 and engaged a $2 daily-loss halt, having
+    /// never made a single swap. Holding the basket is not a strategy loss.
     #[test]
-    fn overnight_loss_after_an_intraday_gain_is_caught_against_the_last_mark() {
-        // Day 1 opens at $300 (baseline), rises to $310 intraday, then day
-        // 2 opens at $305 — a real $5 drop from the $310 peak, but still a
-        // $5 *gain* over day 1's own $300 opening baseline. Comparing the
-        // rollover tick against that stale opening baseline (as a plain
-        // risk_mark() would) reports zero loss and silently absorbs the
-        // drop; it must instead be compared against day 1's actual last
-        // mark ($310) (bot-strategy#755 review round13).
+    fn a_price_collapse_without_trading_is_not_a_loss_at_any_magnitude() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let day = event_time();
+        runtime.step_at(&snapshot_with_valid_row(day), day);
+        assert_eq!(runtime.state().risk_halt, None);
+
+        // Halve both legs. Equity goes $300 -> $150, twenty-five times the
+        // $2 daily limit and fifteen times the $10 cumulative one.
+        let later = day + Duration::seconds(1);
+        let crashed = snapshot_with_valid_row_at_prices(later, "100", "50");
+        let event = runtime.step_at(&crashed, later);
+
+        let risk = event.risk_before.expect("prices were markable");
+        assert_eq!(risk.daily_loss_usd, Decimal::ZERO);
+        assert_eq!(risk.cumulative_loss_usd, Decimal::ZERO);
+        // The beta is not hidden, just not halted on.
+        assert_eq!(risk.inventory_drawdown_usd, Decimal::from(150));
+        assert_eq!(
+            runtime.state().risk_halt,
+            None,
+            "market beta on an untraded basket must never engage a halt",
+        );
+    }
+
+    /// A checkpoint written before the baseline baskets existed must not
+    /// halt on the stale equity baselines it still carries, and must adopt
+    /// baskets on its first tick so the stops work from then on.
+    #[test]
+    fn a_checkpoint_without_baseline_baskets_seeds_them_without_halting() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let day = event_time();
+        runtime.step_at(&snapshot_with_valid_row(day), day);
+        // Exactly the shape a pre-#813 checkpoint deserializes into: equity
+        // baselines present, baskets absent, and a price collapse since.
+        runtime.state.initial_baseline_inventory = None;
+        runtime.state.daily_baseline_inventory = None;
+
+        let later = day + Duration::seconds(1);
+        let crashed = snapshot_with_valid_row_at_prices(later, "100", "50");
+        runtime.step_at(&crashed, later);
+
+        assert_eq!(
+            runtime.state().risk_halt,
+            None,
+            "an upgraded checkpoint must not halt on its stale equity baselines",
+        );
+        assert_eq!(
+            runtime.state().daily_baseline_inventory,
+            Some(runtime.state().inventory),
+        );
+        assert_eq!(
+            runtime.state().initial_baseline_inventory,
+            Some(runtime.state().inventory),
+        );
+    }
+
+    #[test]
+    fn a_day_that_gives_back_part_of_a_gain_is_not_a_daily_loss() {
+        // Deliberate behaviour change from bot-strategy#755 review round13,
+        // which compared the rollover tick against the previous day's *last
+        // mark* so that a $310 peak falling to $305 registered as a $5 loss
+        // even though the day was $5 up on its own opening. That guard
+        // existed because equity marks are path-dependent; attributed marks
+        // are not, and `daily_loss_limit_usd` is a loss limit, not a
+        // drawdown limit. A day that ends net positive is not a loss, so no
+        // halt engages here. A genuine peak-to-trough drawdown control would
+        // be a separate limit, deliberately not introduced here.
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
         let day1 = event_time();
         runtime.step_at(&snapshot_with_valid_row(day1), day1);
         assert_eq!(runtime.state().risk_halt, None);
 
-        // Intraday rise to $310: 200*1.05 + 100*1 = 310.
+        // Rotations take the basket to $310: 200*1.05 + 100*1.
         runtime.state.inventory.token_a = Decimal::new(105, 2);
         let day1_later = day1 + Duration::hours(6);
         runtime.step_at(&snapshot_with_valid_row(day1_later), day1_later);
         assert_eq!(runtime.state().risk_halt, None);
 
-        // Day 2 opens at $305: 200*1.025 + 100*1 = 305.
+        // Day 2 opens at $305, still $5 above the $300 basket it started
+        // from: 200*1.025 + 100*1.
         runtime.state.inventory.token_a = Decimal::new(1025, 3);
         let day2 = day1 + Duration::days(1);
         runtime.step_at(&snapshot_with_valid_row(day2), day2);
 
-        let halt =
-            runtime.state().risk_halt.clone().expect(
-                "a $5 overnight drop from yesterday's peak must engage the daily-loss halt",
-            );
+        assert_eq!(
+            runtime.state().risk_halt,
+            None,
+            "a net-positive day must not engage a daily-*loss* halt",
+        );
+    }
+
+    #[test]
+    fn an_attributed_loss_is_assessed_before_the_daily_basket_resets() {
+        // The ordering guard that does survive: the outgoing day's loss is
+        // marked against the outgoing day's basket, on the rollover tick,
+        // before `update_risk_baselines` adopts a new one. Reset first and
+        // the day's damage would be measured against the basket it already
+        // produced, reporting zero forever.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let day1 = event_time();
+        runtime.step_at(&snapshot_with_valid_row(day1), day1);
+        assert_eq!(runtime.state().risk_halt, None);
+
+        // Rotations destroy $3 of the $300 basket, under the $2 limit only
+        // until the rollover tick marks it: 200*0.985 + 100*1 = 297.
+        runtime.state.inventory.token_a = Decimal::new(985, 3);
+        let day2 = day1 + Duration::days(1);
+        runtime.step_at(&snapshot_with_valid_row(day2), day2);
+
+        let halt = runtime
+            .state()
+            .risk_halt
+            .clone()
+            .expect("the outgoing day's attributed loss must engage the halt at rollover");
         assert_eq!(halt.kind, ArcusSpotRiskHaltKind::DailyLoss);
     }
 
@@ -3479,6 +3656,14 @@ mod tests {
     }
 
     fn snapshot_with_valid_row(collected_at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
+        snapshot_with_valid_row_at_prices(collected_at, "200", "100")
+    }
+
+    fn snapshot_with_valid_row_at_prices(
+        collected_at: DateTime<Utc>,
+        token_a_price: &str,
+        token_b_price: &str,
+    ) -> ArcusSpotRecorderSnapshot {
         let row = round_trip_row(
             "49000000000000000",
             "49000000000000000",
@@ -3532,14 +3717,14 @@ mod tests {
                             "contractAddress": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
                             "name": "NVIDIA",
                             "category": "stock",
-                            "quote": {"price": "200"}
+                            "quote": {"price": token_a_price}
                         },
                         {
                             "ticker": "AMD",
                             "contractAddress": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
                             "name": "AMD",
                             "category": "stock",
-                            "quote": {"price": "100"}
+                            "quote": {"price": token_b_price}
                         }
                     ],
                     "requested_at": collected_at,
@@ -3690,13 +3875,15 @@ mod tests {
         runtime.state.regime = ArcusSpotRegime::RotatedAToB;
         runtime.state.last_rotation_at =
             Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
-        runtime.update_risk_baselines(event_time(), Decimal::from(300));
+        let baseline_inventory = runtime.state.inventory;
+        runtime.update_risk_baselines(event_time(), Decimal::from(300), baseline_inventory);
         runtime.engage_risk_halt(
             event_time(),
             ArcusSpotRiskMark {
                 equity_usd: Decimal::from(100),
                 daily_loss_usd: Decimal::from(200),
                 cumulative_loss_usd: Decimal::from(200),
+                inventory_drawdown_usd: Decimal::ZERO,
             },
         );
         assert!(runtime.state.risk_halt.is_some());
@@ -4012,13 +4199,15 @@ mod tests {
     #[test]
     fn risk_halted_neutral_regime_still_blocks_new_entries() {
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
-        runtime.update_risk_baselines(event_time(), Decimal::from(300));
+        let baseline_inventory = runtime.state.inventory;
+        runtime.update_risk_baselines(event_time(), Decimal::from(300), baseline_inventory);
         runtime.engage_risk_halt(
             event_time(),
             ArcusSpotRiskMark {
                 equity_usd: Decimal::from(100),
                 daily_loss_usd: Decimal::from(200),
                 cumulative_loss_usd: Decimal::from(200),
+                inventory_drawdown_usd: Decimal::ZERO,
             },
         );
         assert!(runtime.state.risk_halt.is_some());
@@ -4192,8 +4381,9 @@ mod tests {
                 runtime.state.inventory,
             )
             .unwrap();
-        runtime.update_risk_baselines(event_time(), Decimal::from(300));
-        let mark = runtime.risk_mark(Decimal::from(297));
+        let baseline_inventory = runtime.state.inventory;
+        runtime.update_risk_baselines(event_time(), Decimal::from(300), baseline_inventory);
+        let mark = runtime.risk_mark(Decimal::from(297), Decimal::from(200), Decimal::from(100));
         runtime.engage_risk_halt(event_time(), mark);
         assert!(runtime.validate_plan_consistent_with_state(&plan).is_err());
     }
