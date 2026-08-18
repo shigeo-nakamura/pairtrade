@@ -167,6 +167,56 @@ Any change to CONFIG_YAML -- intentional or not -- requires recomputing and
 redeploying this digest, or `auto-execute`/`auto-resume`/`live-tick` refuse
 to run against it.
 
+## Changing `runtime:` under a live checkpoint
+
+Re-approving the digest above is necessary but not sufficient. The runtime
+checkpoint at `runtime_state_path` stores the `runtime:` config it was
+written under alongside the state itself, and every load compares the two.
+This is a **state-coherence** check, not a second authorization check --
+authorization already happened, at the signature (`execute`/`resume`) or the
+policy digest (`auto-execute`/`auto-resume`/`live-tick`), and the runtime
+always executes against that authenticated config rather than the
+checkpoint's stored copy. What is left to decide here is only whether the
+accumulated state still describes the new config. (The checkpoint never was
+a barrier against the executor identity in the first place -- that identity
+can delete it outright, an accepted limitation recorded under "the executor
+identity can reset its own state" below.)
+
+So the comparison is by field, not byte-for-byte (bot-strategy#809):
+
+- **State-invalidating** -- `mode`, `chain_id`, `pair`, `initial_inventory`,
+  `signal_window_samples`. Changing any of these makes the stored signal
+  window, regime, inventory, or risk baselines describe something other than
+  what they now claim to, so the load fails and names the field. Clear it
+  deliberately: stop the timer, take a `state-backup` (see
+  `docs/arcus-spot-state-rollback.md`), remove the checkpoint file, and let
+  the next tick start a fresh window. Expect to re-serve the full
+  `min_signal_samples` warmup before entries resume.
+- **State-preserving** -- every other field, including `notional_usd`,
+  `inventory_floors`, `max_rotation_fraction`, `min_signal_samples`,
+  `entry_z_score`/`exit_z_score`, the age/hold limits, the cost buffers, and
+  the loss limits. These re-aim future decisions without changing what any
+  stored value means, so the state carries over untouched and the next
+  `persist` writes the new config through. The load prints one
+  `[arcus-checkpoint] ...` line to stderr (so it lands in the journal)
+  naming the changed fields and the state it kept -- an adopted change to a
+  live, KMS-signing bot is never silent.
+
+Before this split, retuning one forward-looking cap cost the entire
+accumulated window; on the live probe that meant days of warmup to move
+`max_rotation_fraction`, which is what #809 was filed about.
+
+Raising `inventory_floors` above the currently tracked inventory is still
+refused, by `ArcusSpotRuntime::from_state`'s own floor check rather than
+here, with a message that names that as the problem.
+
+One consequence to plan for: `state-verify-exact`/`state-verify-continuity`
+compare a backup's whole-config digest against the config supplied to them,
+so **state backups taken before a retune no longer verify against the
+retuned config**. Take a fresh `state-backup` once the change is live, and
+keep the pre-change backup only as a rollback target for the pre-change
+config.
+
 ## auto-resume: signatureless recovery
 
     arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
