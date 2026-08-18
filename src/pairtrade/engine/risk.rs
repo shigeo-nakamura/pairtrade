@@ -256,7 +256,7 @@ impl PairTradeEngine {
             Option<serde_json::Value>,
         )> = Vec::new();
         for (inst_idx, inst) in self.instances.iter_mut().enumerate() {
-            // Per-instance leverage (bot-strategy#810): threshold is
+            // Per-instance leverage (bot-strategy#814): threshold is
             // configured in 1x-equivalent (market-move) units and scaled by
             // this instance's `max_leverage` at comparison time so a
             // per-arm leverage change doesn't silently relax or tighten the

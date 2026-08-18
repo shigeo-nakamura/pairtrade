@@ -16,7 +16,7 @@ pub struct StrategyConfig {
     pub stop_loss_z: f64,
     pub max_loss_r_mult: f64,
     pub equity_reference_usd: f64,
-    /// Per-strategy leverage (bot-strategy#810). Resolved from YAML
+    /// Per-strategy leverage (bot-strategy#814). Resolved from YAML
     /// `max_leverage` or `MAX_LEVERAGE_<ID>` env var; falls back to the
     /// top-level resolved `PairTradeConfig::max_leverage` when neither is
     /// set. Drives sizing and the leverage-neutralized risk gates via
@@ -112,7 +112,7 @@ pub(super) fn resolve_strategies(
                         ),
                     },
                 };
-                // Per-strategy leverage env override (bot-strategy#810), same
+                // Per-strategy leverage env override (bot-strategy#814), same
                 // precedence and hard-fail-on-parse-error rationale as
                 // `EQUITY_REFERENCE_USD_<ID>` above: leverage drives both
                 // position sizing and the risk-gate effective thresholds, so
@@ -125,7 +125,7 @@ pub(super) fn resolve_strategies(
                         Ok(parsed) => parsed,
                         Err(e) => panic!(
                             "[CONFIG] trading-critical env {}={:?} failed to parse ({}); refusing to start. \
-                             Fix the env var or unset it explicitly. (bot-strategy#810)",
+                             Fix the env var or unset it explicitly. (bot-strategy#814)",
                             leverage_env_key, value, e
                         ),
                     },

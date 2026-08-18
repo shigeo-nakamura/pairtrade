@@ -100,7 +100,7 @@ pub(super) fn hedged_sizes(
     sizing_beta_floor: f64,
 ) -> Result<(Decimal, Decimal)> {
     // `equity` is the per-instance fixed `equity_reference_usd` and
-    // `max_leverage` the per-instance resolved leverage (bot-strategy#810;
+    // `max_leverage` the per-instance resolved leverage (bot-strategy#814;
     // both default to a legacy single-instance value equal to the shared
     // top-level scalars), so each variant sizes against its own declared
     // capital and leverage. Live equity is no longer mixed in here — see

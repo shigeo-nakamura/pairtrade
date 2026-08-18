@@ -319,7 +319,7 @@ strategies:
     let _ = std::fs::remove_file(&path);
 }
 
-// bot-strategy#810: per-strategy max_leverage, mirroring
+// bot-strategy#814: per-strategy max_leverage, mirroring
 // per_strategy_equity_env_override above (YAML per-arm value, env override
 // takes precedence, unset arm falls back to top-level).
 #[test]
