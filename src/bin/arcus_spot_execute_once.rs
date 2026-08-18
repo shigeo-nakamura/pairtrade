@@ -2006,11 +2006,30 @@ fn verify_arcus_state_backup(
     backup_dir: &Path,
     exact: bool,
 ) -> Result<ArcusSpotStateVerificationReport> {
+    verify_arcus_state_backup_at(config, backup_dir, exact, Utc::now())
+}
+
+/// `verify_arcus_state_backup` with the verification clock supplied rather
+/// than read from the system, mirroring `create_arcus_state_backup_at` on the
+/// capture side.
+///
+/// `verified_at` is the upper bound of the acceptance window every continuity
+/// check is judged against, so a fixture that pins its capture time but lets
+/// this end run on the wall clock describes a window that widens every day it
+/// is not run. Two tests asserting rejection *past* that bound silently
+/// stopped testing anything once real time overtook their hardcoded dates
+/// (bot-strategy#810); pinning both ends keeps the scenario the fixture
+/// describes fixed.
+fn verify_arcus_state_backup_at(
+    config: &ArcusSpotExecuteOnceConfig,
+    backup_dir: &Path,
+    exact: bool,
+    verified_at: DateTime<Utc>,
+) -> Result<ArcusSpotStateVerificationReport> {
     let (manifest, baseline) = load_arcus_state_backup(config, backup_dir)?;
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
     let current = capture_arcus_state(config)?;
-    let verified_at = Utc::now();
     if exact {
         require_file_matches_manifest(
             &current.checkpoint_bytes,
@@ -3013,6 +3032,23 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    /// The instant these fixtures treat as "now".
+    ///
+    /// Every timestamp in this module is part of one hand-built scenario
+    /// (backup captured 2026-08-15T23:58:00Z, observations through
+    /// 2026-08-16T12:01:00Z), and the relationships between them are what the
+    /// continuity assertions are about. Reading the real clock for any single
+    /// one of them puts that timestamp an ever-growing distance from the rest,
+    /// so a scenario that held when it was written quietly stops describing
+    /// what its assertions claim -- which is exactly how bot-strategy#810
+    /// happened. Anchor every fixture clock here instead; it sits just after
+    /// the last fixture observation so a live tick reads as freshly accepted.
+    fn fixture_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-16T12:05:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     fn create_arcus_state_backup(
         config: &ArcusSpotExecuteOnceConfig,
         backup_dir: &Path,
@@ -3021,6 +3057,50 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         super::create_arcus_state_backup_at(config, backup_dir, captured_at)
+    }
+
+    /// Shadows the production entry point so every test in this module is
+    /// verified against `fixture_now` rather than the wall clock. See
+    /// `verify_arcus_state_backup_at`.
+    fn verify_arcus_state_backup(
+        config: &ArcusSpotExecuteOnceConfig,
+        backup_dir: &Path,
+        exact: bool,
+    ) -> Result<ArcusSpotStateVerificationReport> {
+        super::verify_arcus_state_backup_at(config, backup_dir, exact, fixture_now())
+    }
+
+    /// Keeps bot-strategy#810 from recurring.
+    ///
+    /// Its whole failure mode was silent: one fixture timestamp read the wall
+    /// clock while the rest were hardcoded, so the scenario drifted apart over
+    /// days until two tests asserted rejections that could no longer happen --
+    /// and they kept "failing for the wrong reason" rather than pointing at
+    /// the clock. Nothing structural stopped that, so this does: fixtures in
+    /// this module get their time from `fixture_now`, never from the system.
+    ///
+    /// If a test genuinely needs the real clock, it needs its own deliberate
+    /// justification -- move that call behind a named helper here and exempt
+    /// the helper explicitly, rather than reintroducing a bare `Utc::now()`.
+    #[test]
+    fn test_fixtures_never_read_the_wall_clock() {
+        let source = include_str!("arcus_spot_execute_once.rs");
+        let tests_module = source
+            .split_once("\nmod tests {")
+            .expect("this file has a tests module")
+            .1;
+        // Split so this scanner's own source line is not a match for itself.
+        let needle = concat!("Utc::", "now()");
+        let offenders = tests_module
+            .lines()
+            .filter(|line| line.contains(needle))
+            .filter(|line| !line.trim_start().starts_with("///"))
+            .collect::<Vec<_>>();
+        assert!(
+            offenders.is_empty(),
+            "test fixtures must anchor time to fixture_now(), not the wall clock \
+             (bot-strategy#810); offending lines: {offenders:#?}",
+        );
     }
 
     #[test]
@@ -3619,7 +3699,7 @@ runtime:
         ledger_path: &Path,
         runtime_path: &Path,
     ) -> ArcusSpotExecutionAttempt {
-        let accepted_at = Utc::now();
+        let accepted_at = fixture_now();
         let snapshot = accepted_entry_snapshot(accepted_at);
         let baseline = ArcusSpotRuntimeCheckpointStore::new(runtime_path.to_path_buf())
             .load_existing(&config.runtime)
@@ -3927,7 +4007,7 @@ runtime:
         persist_initial_operator_state(&config);
         create_arcus_state_backup(&config, &backup_dir).unwrap();
 
-        let evaluation_time = Utc::now();
+        let evaluation_time = fixture_now();
         let snapshot = structurally_invalid_snapshot(evaluation_time);
         let store = ArcusSpotRuntimeCheckpointStore::new(runtime_path);
         let mut runtime = store.load_existing(&config.runtime).unwrap();
@@ -3964,7 +4044,7 @@ runtime:
             "100000000000000000",
         );
         persist_initial_operator_state(&config);
-        let evaluation_time = Utc::now();
+        let evaluation_time = fixture_now();
         let evidence = ArcusSpotLiveTickObservationEvidence {
             schema_version: OBSERVATION_EVIDENCE_SCHEMA_VERSION,
             evaluation_time,
@@ -4001,7 +4081,7 @@ runtime:
             "100000000000000000",
         );
         persist_initial_operator_state(&config);
-        let evaluation_time = Utc::now();
+        let evaluation_time = fixture_now();
         let evidence = ArcusSpotLiveTickObservationEvidence {
             schema_version: OBSERVATION_EVIDENCE_SCHEMA_VERSION,
             evaluation_time,
@@ -4036,7 +4116,7 @@ runtime:
             "100000000000000000",
         );
         persist_initial_operator_state(&config);
-        let observed_at = Utc::now();
+        let observed_at = fixture_now();
         rewrite_checkpoint_state(&runtime_path, |state| {
             state["sequence"] = json!(1);
             state["last_observation_at"] = json!(observed_at);
@@ -4072,7 +4152,7 @@ runtime:
         persist_initial_operator_state(&config);
         create_arcus_state_backup(&config, &backup_dir).unwrap();
 
-        let evaluation_time = Utc::now();
+        let evaluation_time = fixture_now();
         let snapshot = no_swap_snapshot(evaluation_time, "200", "176.49938051691913");
         let store = ArcusSpotRuntimeCheckpointStore::new(runtime_path);
         let mut runtime = store.load_existing(&config.runtime).unwrap();
@@ -5644,7 +5724,7 @@ runtime:
         )
         .unwrap();
 
-        let event = runtime.step_at(&snapshot, Utc::now());
+        let event = runtime.step_at(&snapshot, fixture_now());
         assert!(matches!(event.decision, ArcusSpotDecision::Observe { .. }));
         store.persist(&runtime).unwrap();
 
