@@ -121,6 +121,7 @@ impl PairTradeEngine {
                 capital_guard_stable_since_generation: 0,
                 equity_initialized: false,
                 equity_reference_usd: DEFAULT_EQUITY_USD,
+                max_leverage: 1.0,
                 states: HashMap::new(),
                 pnl_logger: None,
                 status_reporter: None,

@@ -1047,6 +1047,10 @@ async fn session_dd_gated_until_equity_initialized() {
     // Match the live config that produced the incident.
     engine.cfg.risk.max_session_loss_bps = 500;
     engine.cfg.max_leverage = 10.0;
+    // bot-strategy#810: leverage now resolves per-instance at construction
+    // time, so the instance's cached value must be updated to match the
+    // scenario this test documents (500 bps × 10x = 5000 bps effective).
+    engine.instances[0].max_leverage = 10.0;
     // Redirect risk-state persistence to a temp dir so the test does
     // not litter the working directory if a trip ever does fire.
     let dir = TempDir::new().unwrap();

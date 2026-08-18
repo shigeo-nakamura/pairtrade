@@ -16,6 +16,12 @@ pub struct StrategyConfig {
     pub stop_loss_z: f64,
     pub max_loss_r_mult: f64,
     pub equity_reference_usd: f64,
+    /// Per-strategy leverage (bot-strategy#810). Resolved from YAML
+    /// `max_leverage` or `MAX_LEVERAGE_<ID>` env var; falls back to the
+    /// top-level resolved `PairTradeConfig::max_leverage` when neither is
+    /// set. Drives sizing and the leverage-neutralized risk gates via
+    /// `StrategyInstance::max_leverage`.
+    pub max_leverage: f64,
     // Per-strategy PairParams overrides. `None` = inherit from top-level
     // resolved value; `Some` wins over the top-level scalar at instance build
     // time (see `StrategyConfig::apply_pair_param_overrides`).
@@ -106,6 +112,24 @@ pub(super) fn resolve_strategies(
                         ),
                     },
                 };
+                // Per-strategy leverage env override (bot-strategy#810), same
+                // precedence and hard-fail-on-parse-error rationale as
+                // `EQUITY_REFERENCE_USD_<ID>` above: leverage drives both
+                // position sizing and the risk-gate effective thresholds, so
+                // a silently-ignored bad value could size or halt-gate at
+                // the wrong leverage instead of refusing to start.
+                let leverage_env_key = format!("MAX_LEVERAGE_{}", id.to_ascii_uppercase());
+                let max_leverage = match env::var(&leverage_env_key) {
+                    Err(_) => s.max_leverage.unwrap_or(cfg.max_leverage),
+                    Ok(value) => match value.parse::<f64>() {
+                        Ok(parsed) => parsed,
+                        Err(e) => panic!(
+                            "[CONFIG] trading-critical env {}={:?} failed to parse ({}); refusing to start. \
+                             Fix the env var or unset it explicitly. (bot-strategy#810)",
+                            leverage_env_key, value, e
+                        ),
+                    },
+                };
                 StrategyConfig {
                     id,
                     agent_name: s.agent_name.clone().or_else(|| cfg.agent_name.clone()),
@@ -117,6 +141,7 @@ pub(super) fn resolve_strategies(
                         .max_loss_r_mult
                         .unwrap_or(cfg.default_pair_params.max_loss_r_mult),
                     equity_reference_usd,
+                    max_leverage,
                     force_close_time_secs: s.force_close_time_secs,
                     mtf_windows: s.mtf_windows.clone(),
                     mtf_z_min: s.mtf_z_min,
@@ -151,6 +176,7 @@ pub(super) fn resolve_strategies(
             stop_loss_z: cfg.default_pair_params.stop_loss_z,
             max_loss_r_mult: cfg.default_pair_params.max_loss_r_mult,
             equity_reference_usd: cfg.equity_reference_usd,
+            max_leverage: cfg.max_leverage,
             force_close_time_secs: None,
             mtf_windows: None,
             mtf_z_min: None,

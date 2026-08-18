@@ -175,6 +175,7 @@ impl PairTradeEngine {
                 capital_guard_stable_since_generation: 0,
                 equity_initialized: false,
                 equity_reference_usd: strategy.equity_reference_usd,
+                max_leverage: strategy.max_leverage,
                 states,
                 pnl_logger,
                 status_reporter,
@@ -237,7 +238,7 @@ impl PairTradeEngine {
                 let effective = EffectiveConfig::from_resolved(
                     strategy,
                     &inst.default_pair_params,
-                    cfg.max_leverage,
+                    strategy.max_leverage,
                     cfg.dry_run,
                     cfg.ineligible_close_defer_cap_secs,
                     cfg.ineligible_close_defer_spread_bps,

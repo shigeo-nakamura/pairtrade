@@ -177,9 +177,11 @@ impl PairTradeEngine {
     ) -> Result<(Decimal, Decimal)> {
         let inst = &self.instances[inst_idx];
         let equity = inst.equity_reference_usd;
+        let max_leverage = inst.max_leverage;
         sizing::hedged_sizes(
             &self.cfg,
             equity,
+            max_leverage,
             beta,
             p1,
             p2,

@@ -473,6 +473,7 @@ impl Harness {
             capital_guard_stable_since_generation: 0,
             equity_initialized: false,
             equity_reference_usd: DEFAULT_EQUITY_USD,
+            max_leverage: self.engine.cfg.max_leverage,
             states,
             pnl_logger: None,
             status_reporter: None,
