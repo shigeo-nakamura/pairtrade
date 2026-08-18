@@ -180,4 +180,23 @@ impl PairTradeEngine {
             last_warm_start_key: None,
         }
     }
+
+    /// Set leverage for a test engine, keeping `cfg.max_leverage` (the
+    /// legacy top-level scalar / env-override target) and every
+    /// `instances[].max_leverage` (the value sizing/risk gates actually
+    /// read, resolved once at construction — bot-strategy#814) in sync.
+    ///
+    /// Mutating only `engine.cfg.max_leverage` after construction is a trap:
+    /// `StrategyInstance::max_leverage` was already resolved when the
+    /// instance was built and does not observe later changes to `cfg`, so
+    /// sizing/risk-gate assertions would silently keep using the old
+    /// leverage while looking like the test updated it (PR #213 review).
+    /// Always go through this helper in tests instead of setting either
+    /// field directly.
+    pub(in crate::pairtrade) fn set_max_leverage_for_test(&mut self, leverage: f64) {
+        self.cfg.max_leverage = leverage;
+        for inst in &mut self.instances {
+            inst.max_leverage = leverage;
+        }
+    }
 }

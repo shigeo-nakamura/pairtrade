@@ -38,10 +38,18 @@
 # --round-json loads the expected round config from a committed file
 # (configs/pairtrade/round.json) and asserts the running effective gauges match
 # EVERY field it declares (per-variant force_close / exit_z / stop_loss_z /
-# frozen_beta / equity_reference_usd, plus top-level max_leverage) — the
+# frozen_beta / equity_reference_usd / max_leverage, plus a top-level
+# max_leverage fallback for variants that don't declare their own — the
 # blocking preflight for the round-eval harness (#3 in bot-strategy#580). A
 # field absent from round.json is skipped; a declared field with no matching
 # gauge is reported as drift. Requires python3.
+#
+# max_leverage is per-variant since bot-strategy#814 (pairtrade StrategyConfig
+# now resolves it per strategy, not from a single process-wide scalar): a
+# variant's `variants.<id>.max_leverage` in round.json wins, otherwise the
+# top-level `max_leverage` applies to every variant — same resolution order
+# as the running process (YAML strategies[].max_leverage / MAX_LEVERAGE_<ID>
+# env, else the top-level YAML value).
 #
 # Env equivalents: SERVICE, CONFIG, METRICS_URL, EXPECT_FP, EXPECT_FC_<VARIANT>.
 #
@@ -59,6 +67,7 @@ declare -A EXPECT_EXITZ=()
 declare -A EXPECT_SLZ=()
 declare -A EXPECT_FROZEN=()
 declare -A EXPECT_EQUITY=()
+declare -A EXPECT_MAXLEV_VARIANT=()
 EXPECT_MAXLEV=""
 EXPECT_INELIG_CAP=""
 EXPECT_INELIG_SPREAD=""
@@ -95,13 +104,24 @@ if [ -n "$ROUND_JSON" ]; then
   # Assert EVERY field committed in round.json (#580 review): a round that
   # changes only one of these must not silently pass the preflight. An empty
   # cell ('') means "not declared for this variant" → that field is skipped.
-  while IFS=$'\t' read -r kind v fc ez slz fz eq; do
+  #
+  # Field separator is '|', not a tab: bash's `read` treats a run of IFS
+  # *whitespace* characters (which includes tab, regardless of what IFS is
+  # currently set to) as a single delimiter, so an empty cell adjacent to a
+  # tab silently swallowed it and shifted every field after it left by one
+  # (bot-strategy#814 review — caught because it broke this PR's new
+  # `max_leverage` cell whenever `use_frozen_beta_exit_z` was undeclared, the
+  # common case; the pre-existing `equity_reference_usd` cell had the same
+  # bug). '|' is not IFS whitespace, so adjacent delimiters correctly yield
+  # an empty field instead of collapsing.
+  while IFS='|' read -r kind v fc ez slz fz eq mlev; do
     if [ "$kind" = "maxlev" ]; then EXPECT_MAXLEV="$v"; continue; fi
     if [ "$kind" = "ineligcap" ]; then EXPECT_INELIG_CAP="$v"; continue; fi
     if [ "$kind" = "ineligspread" ]; then EXPECT_INELIG_SPREAD="$v"; continue; fi
     if [ "$kind" = "ineligstale" ]; then EXPECT_INELIG_STALE="$v"; continue; fi
     EXPECT_FC["$v"]="$fc"; EXPECT_EXITZ["$v"]="$ez"; EXPECT_SLZ["$v"]="$slz"
     EXPECT_FROZEN["$v"]="$fz"; EXPECT_EQUITY["$v"]="$eq"
+    [ -n "$mlev" ] && EXPECT_MAXLEV_VARIANT["$v"]="$mlev"
   done < <(python3 - "$ROUND_JSON" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -109,17 +129,18 @@ def cell(p, k):
     v = p.get(k)
     return "" if v is None else v
 if d.get("max_leverage") is not None:
-    print(f'maxlev\t{d["max_leverage"]}\t\t\t\t\t')
+    print(f'maxlev|{d["max_leverage"]}|||||')
 if d.get("ineligible_close_defer_cap_secs") is not None:
-    print(f'ineligcap\t{d["ineligible_close_defer_cap_secs"]}\t\t\t\t\t')
+    print(f'ineligcap|{d["ineligible_close_defer_cap_secs"]}|||||')
 if d.get("ineligible_close_defer_spread_bps") is not None:
-    print(f'ineligspread\t{d["ineligible_close_defer_spread_bps"]}\t\t\t\t\t')
+    print(f'ineligspread|{d["ineligible_close_defer_spread_bps"]}|||||')
 if d.get("ineligible_close_defer_stale_secs") is not None:
-    print(f'ineligstale\t{d["ineligible_close_defer_stale_secs"]}\t\t\t\t\t')
+    print(f'ineligstale|{d["ineligible_close_defer_stale_secs"]}|||||')
 for v, p in d.get("variants", {}).items():
     fz = "" if p.get("use_frozen_beta_exit_z") is None else (1 if p["use_frozen_beta_exit_z"] else 0)
-    print(f'var\t{v.lower()}\t{cell(p,"force_close_secs")}\t{cell(p,"exit_z")}\t'
-          f'{cell(p,"stop_loss_z")}\t{fz}\t{cell(p,"equity_reference_usd")}')
+    print(f'var|{v.lower()}|{cell(p,"force_close_secs")}|{cell(p,"exit_z")}|'
+          f'{cell(p,"stop_loss_z")}|{fz}|{cell(p,"equity_reference_usd")}|'
+          f'{cell(p,"max_leverage")}')
 PY
 )
 fi
@@ -199,7 +220,8 @@ else
   # dropped/renamed (a config-not-loaded symptom). A declared variant with no
   # gauges is drift; every committed field is asserted for the rest.
   declared_variants=$(printf '%s\n' "${!EXPECT_FC[@]}" "${!EXPECT_EXITZ[@]}" \
-    "${!EXPECT_SLZ[@]}" "${!EXPECT_FROZEN[@]}" "${!EXPECT_EQUITY[@]}" | sort -u | grep -v '^$' || true)
+    "${!EXPECT_SLZ[@]}" "${!EXPECT_FROZEN[@]}" "${!EXPECT_EQUITY[@]}" \
+    "${!EXPECT_MAXLEV_VARIANT[@]}" | sort -u | grep -v '^$' || true)
   observed_variants=$(echo "$metrics" | grep '^pairtrade_effective_force_close_secs{' \
     | sed -n 's/.*variant="\([^"]*\)".*/\1/p' | sort -u)
   all_variants=$(printf '%s\n%s\n' "$declared_variants" "$observed_variants" | sort -u | grep -v '^$' || true)
@@ -228,7 +250,11 @@ else
     assert_num "$variant" exit_z "${EXPECT_EXITZ[$variant]:-}" "$ez"
     assert_num "$variant" stop_loss_z "${EXPECT_SLZ[$variant]:-}" "$slz"
     assert_num "$variant" equity_reference_usd "${EXPECT_EQUITY[$variant]:-}" "$eq"
-    assert_num "$variant" max_leverage "$EXPECT_MAXLEV" "$mlev"
+    # Per-variant max_leverage (bot-strategy#814) wins when round.json declares
+    # one for this variant; otherwise fall back to the top-level max_leverage,
+    # matching the running process's own YAML/env override -> top-level order.
+    want_mlev="${EXPECT_MAXLEV_VARIANT[$variant]:-$EXPECT_MAXLEV}"
+    assert_num "$variant" max_leverage "$want_mlev" "$mlev"
     assert_num "$variant" ineligible_close_defer_cap_secs "$EXPECT_INELIG_CAP" "$inelig_cap"
     assert_num "$variant" ineligible_close_defer_spread_bps "$EXPECT_INELIG_SPREAD" "$inelig_spread"
     assert_num "$variant" ineligible_close_defer_stale_secs "$EXPECT_INELIG_STALE" "$inelig_stale"
