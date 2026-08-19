@@ -1,5 +1,9 @@
 #!/bin/bash
-# Dedicated single-instance Robinhood Chain Lighter pairtrade launcher (#790).
+# Robinhood Chain Lighter launcher — two-arm split (bot-strategy#798,
+# 2026-08-18). freq reuses the original sub-account (unsuffixed env vars,
+# falls back naturally via pairtrade::config::lighter_env). b gets its own
+# sub-account, credentials re-exported with the _B suffix (lighter_env ->
+# id.to_uppercase().replace('-','_')) so they don't collide with freq's.
 set -eu
 
 ENV_DIR="${DEBOT_ENV_DIR:-/opt/debot/scripts}"
@@ -10,6 +14,18 @@ source "$ENV_DIR/debot_secrets_common.env"
 source "$ENV_DIR/debot.env"
 source "$ENV_DIR/debot-pair-robinhood-lighter.env"
 set +a
+
+# b-arm sub-account credentials: read KEY=VALUE lines directly (no `source`,
+# so they never land in unsuffixed vars and clobber freq's) and re-export
+# with the _B suffix.
+while IFS='=' read -r _key _val; do
+  case "$_key" in
+    LIGHTER_PUBLIC_API_KEY|LIGHTER_PRIVATE_API_KEY|LIGHTER_API_KEY_INDEX|LIGHTER_ACCOUNT_INDEX|LIGHTER_PLAIN_PUBLIC_API_KEY|LIGHTER_PLAIN_PRIVATE_API_KEY|LIGHTER_EVM_WALLET_PRIVATE_KEY)
+      export "${_key}_B=$_val"
+      ;;
+  esac
+done < <(grep -v '^[[:space:]]*#' "$ENV_DIR/debot-pair-robinhood-lighter-b.env" | grep '=')
+unset _key _val
 
 # Set after debot.env so generic values cannot route this bot to another venue.
 export REST_ENDPOINT=https://api.rh.lighter.xyz

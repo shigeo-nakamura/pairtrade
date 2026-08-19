@@ -1,8 +1,11 @@
 # Robinhood Chain Lighter launch configuration (#790/#794).
-# One BTC/ETH strategy only. Parameters clone the Frankfurt canary to favor
-# frequent positions for points/airdrop farming, at a fixed $2,000 equity
-# reference. Launch remains DRY_RUN until the read-side soak and explicit live
-# gate are complete.
+# Two-arm split (bot-strategy#798, 2026-08-18): `freq` (original profile,
+# tighter stop/faster force_close) and `b` (Frankfurt-B clone: wider stop,
+# slower force_close), each on its own Lighter sub-account. Top-level
+# scalars below are the shared defaults / legacy fallback; the `strategies:`
+# block at the end overrides per-arm values. Launch remains DRY_RUN-flagged
+# in-file but the live process currently runs with dry_run=false — see
+# runbook before touching this file.
 
 dex_name: lighter
 rest_endpoint: https://api.rh.lighter.xyz
@@ -39,26 +42,25 @@ metrics_window_length: 240
 warm_start_mode: relaxed
 warm_start_min_bars: 60
 
-# Preserve the Frankfurt canary multi-timeframe entry gate.
+# Preserve the Frankfurt canary multi-timeframe entry gate (freq arm default;
+# b arm overrides below).
 mtf_windows: [15]
 mtf_z_min: 0.5
 
-# Frankfurt canary parameters. The lower entry threshold is intentionally more
-# permissive than the production arm so the bot opens positions more often.
+# Frankfurt canary parameters (freq arm default; b arm overrides below).
 entry_z_score_base: 1.0
 entry_z_score_min: 0.8
 entry_z_score_max: 1.5
 exit_z_score: 0.2
 stop_loss_z_score: 4.0
-# bot-strategy#798: halved from 7200 (canary value) on 2026-08-17. Journal
-# review 08-14..08-17 showed most exits hit force_close rather than
-# exit_z/stop_loss, i.e. the $2,000 was routinely locked for the full 2h
-# even when a fresh entry_z=1.0 signal was available — the dominant
-# frequency constraint for the points-farming objective. Halving trades
-# fewer fully-converged mean-reversion exits for more round trips on the
-# same capital. Revisit at the 2026-08-22 mid-window checkpoint.
+# bot-strategy#798: halved from 7200 (canary value) on 2026-08-17 for the
+# freq arm. Journal review 08-14..08-17 showed most exits hit force_close
+# rather than exit_z/stop_loss — the dominant frequency constraint for the
+# points-farming objective. b arm overrides this back up to 10800 (see
+# strategies: block) to test whether more patience changes the force_close
+# loss asymmetry (bot-strategy#798 mid-window/final readout).
 force_close_time_secs: 3600
-shutdown_grace_secs: 3660
+shutdown_grace_secs: 10860
 
 # Post-stop cool-down (#316). 600 s blocks immediate re-entry after a
 # stop_loss_z exit on the same direction — Round 4 BT sweep on 5/3-5/8
@@ -67,12 +69,11 @@ shutdown_grace_secs: 3660
 # re-entry pathology observed on 2026-05-04 regime shift.
 stop_loss_cooldown_secs: 600
 
-# Risk
+# Risk (top-level fallback; per-arm equity_usd_reference / max_leverage set
+# in strategies: below, bot-strategy#814).
 risk_pct_per_trade: 0.40
-# Fixed reference matches the initial deposited collateral. Live equity drift
-# is intentionally not mixed into thresholds or sizing within the launch month.
 equity_usd_reference: 2000
-max_leverage: 20  # Points-farming profile; typical per-leg notional is about $8,000.
+max_leverage: 20  # Fallback only — both arms override this below.
 max_loss_r_mult: 1.0
 
 # Execution
@@ -123,23 +124,47 @@ circuit_breaker_tier1_cooldown_secs: 600
 circuit_breaker_tier2_losses: 8
 circuit_breaker_tier2_cooldown_secs: 3600
 
-# Risk gates (bot-strategy#185). All bps fields are now leverage-invariant:
-# the bot multiplies them by max_leverage internally. Keep the products below
-# stable when leverage changes so the effective equity drawdown limits stay fixed.
-# Typical 100–500 bps. See #185 leverage-neutralization amendment.
+# Risk gates (bot-strategy#185). All bps fields are 1x-equivalent (market-
+# move) and multiplied by EACH ARM'S OWN resolved max_leverage at comparison
+# time (bot-strategy#814 made leverage per-instance) — the halt fires at the
+# same underlying market move on both arms even though freq (30x) and b
+# (50x) now run different leverage. Equity-% consequence naturally scales
+# with each arm's own leverage: freq's effective daily/session gates are
+# 75bps×30=2250bps (22.5%) / 50bps×30=1500bps (15%); b's are
+# 75bps×50=3750bps (37.5%) / 50bps×50=2500bps (25%). This is the intended
+# behavior of the leverage-neutralization design, not a miscalibration —
+# but b's 25% session-DD tolerance is wide for a real-money $4,000 account;
+# revisit if that's more slack than desired.
 risk:
-  # 75 bps at 20x is a 15% equity daily drawdown gate. Action `block`
-  # refuses new entries while existing positions exit normally, auto-resume
-  # at next UTC midnight.
   max_daily_loss_bps: 75
   max_daily_loss_action: block
   daily_reset_utc_hour: 0
   # Phase 3-1: rolling-peak session DD. Sticky halt + auto-flatten of the
   # breaching instance, cleared only by `sudo touch /opt/debot-robinhood-lighter/RISK_ACK`.
-  # 50 bps at 20x preserves the canary-equivalent 10% equity rolling-peak
-  # drawdown gate while normal execution noise can keep the farming loop active.
   max_session_loss_bps: 50
   session_dd_lookback_secs: 2592000  # 30 d
   session_dd_sample_secs: 3600       # 1 h
-  # Per-leg cap: $2,000 reference × 20x leverage × 0.25 = $10,000.
+  # Per-leg cap: reference equity × the arm's own max_leverage × 0.25.
   max_notional_headroom: 0.25
+
+# Two-arm split (bot-strategy#798, 2026-08-18; leverage split bot-strategy#814,
+# 2026-08-19). Field values not listed per-arm inherit the top-level scalar
+# above.
+strategies:
+  - id: freq
+    agent_name: debot-pair-robinhood-lighter-freq
+    equity_usd_reference: 2000
+    max_leverage: 30
+  - id: b
+    agent_name: debot-pair-robinhood-lighter-b
+    entry_z_score_base: 1.5
+    entry_z_score_min: 1.0
+    entry_z_score_max: 2.0
+    exit_z_score: 0.2
+    stop_loss_z_score: 8.0
+    force_close_time_secs: 10800
+    max_loss_r_mult: 1.0
+    equity_usd_reference: 4000
+    max_leverage: 50
+    mtf_windows: [15]
+    mtf_z_min: 0.5
