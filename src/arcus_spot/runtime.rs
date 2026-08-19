@@ -391,6 +391,21 @@ impl ArcusSpotRuntime {
         &self.state
     }
 
+    /// The risk mark implied by the state as it stands, valued at the marks
+    /// of the last observation it processed. `None` before any observation
+    /// has supplied reference prices.
+    ///
+    /// For asking what a persisted checkpoint currently owes without waiting
+    /// for, or fabricating, a fresh tick. Deliberately routed through the
+    /// same `risk_mark` the halt itself uses, so the answer cannot drift
+    /// from the rule.
+    pub fn last_risk_mark(&self) -> Option<ArcusSpotRiskMark> {
+        let price_a = self.state.last_token_a_reference_price_usd?;
+        let price_b = self.state.last_token_b_reference_price_usd?;
+        let equity = self.state.inventory.checked_value_usd(price_a, price_b)?;
+        Some(self.risk_mark(equity, price_a, price_b))
+    }
+
     /// Re-evaluate the neutral-regime entry direction for one prospective
     /// relative-log-price sample without mutating the runtime. Rollback
     /// continuity verification uses this to prove that an archived entry
@@ -705,9 +720,15 @@ impl ArcusSpotRuntime {
             price.token_a_price_usd,
             price.token_b_price_usd,
         );
+        // Engaged before the baselines move, so that on a rollover tick the
+        // halt already exists when `update_risk_baselines` decides whether
+        // to rebase the basket this mark was taken against. Reversed, the
+        // basket is gone by the time anything can tell a halt now stands on
+        // it. `engage_risk_halt` reads only the config limits and this mark,
+        // so nothing here depends on the baselines being current.
+        self.engage_risk_halt(evaluation_time, risk_before);
         self.update_risk_baselines(evaluation_time, equity_before, inventory_before);
         self.state.last_equity_usd = Some(equity_before);
-        self.engage_risk_halt(evaluation_time, risk_before);
 
         // Computed and appended to the signal window from `price` (token
         // metadata + reference prices only) before the route-availability
@@ -1627,32 +1648,73 @@ impl ArcusSpotRuntime {
             self.state.initial_baseline_inventory = Some(inventory);
         }
         let day = at.format("%Y-%m-%d").to_string();
-        if self.state.daily_baseline_day.as_deref() != Some(day.as_str()) {
+        let rolling_over = self.state.daily_baseline_day.as_deref() != Some(day.as_str());
+        if rolling_over {
             self.state.daily_baseline_day = Some(day);
             self.state.daily_baseline_equity_usd = Some(equity_usd);
-            self.state.daily_baseline_inventory = Some(inventory);
-        } else if self.state.daily_baseline_inventory.is_none() {
-            // A checkpoint written before the baskets existed, loaded
-            // part-way through a UTC day. Adopt this tick's inventory as the
-            // day's basket rather than leaving the daily stop unmeasurable
-            // until midnight. The approximation only misprices rotations
-            // that already happened earlier today, and it self-corrects at
-            // the next rollover. `daily_baseline_equity_usd` is deliberately
-            // left alone: it still means "the day's opening equity mark",
-            // which the state-continuity checks read, and it no longer
-            // feeds the loss stops at all.
+        }
+        // The basket is the *evidence of what is owed*, not just a per-day
+        // convenience, so a rollover must not overwrite it while a halt
+        // stands on it. It used to: the caller engages the halt from a mark
+        // taken against the outgoing day's basket, and this then rebased
+        // that basket to the current -- still impaired -- inventory in the
+        // same tick, so everything re-deriving the loss from the persisted
+        // state read back ~0. `require_risk_state_continuity` then rejected
+        // the very checkpoint where the halt correctly fired, as an
+        // "unexpected risk halt" (review of pairtrade#211).
+        //
+        // Freezing only the basket, not the day or the equity mark, is
+        // deliberate: those two keep their ordinary meaning for the
+        // rollover-matching and continuity checks that read them, while the
+        // basket goes on answering "down against what?" for as long as the
+        // answer still matters. It unfreezes on the first rollover after the
+        // halt is lifted.
+        let basket_missing = self.state.daily_baseline_inventory.is_none();
+        if basket_missing || (rolling_over && self.state.risk_halt.is_none()) {
+            // `basket_missing` also covers a checkpoint written before the
+            // baskets existed and loaded part-way through a day -- including
+            // one loaded while halted, which must still get a basket or its
+            // daily stop stays unmeasurable forever. Adopting this tick's
+            // inventory only misprices rotations that already happened
+            // earlier today, and self-corrects at the next rollover.
+            // `daily_baseline_equity_usd` is deliberately left alone: it
+            // still means "the day's opening equity mark", which the
+            // state-continuity checks read, and it no longer feeds the loss
+            // stops at all.
             self.state.daily_baseline_inventory = Some(inventory);
         }
     }
 
     /// What a basket would be worth at these prices — the buy-and-hold
     /// counterfactual the loss stops measure the strategy against.
+    ///
+    /// `None` only when there is no basket recorded yet, which genuinely
+    /// means "not measurable" and is read downstream as no loss. A basket
+    /// that exists but cannot be valued is a different thing and must not
+    /// collapse into the same answer: silently reporting no loss is the one
+    /// outcome a risk metric may never produce by accident. It returns
+    /// `Decimal::MAX` instead, which reads downstream as an unbounded loss
+    /// and halts. Unreachable at any realistic size -- the live basket is
+    /// ~0.2 tokens at ~$200 against a 96-bit type -- so the point is the
+    /// direction it fails in, not the case arising.
+    ///
+    /// `require_risk_state_continuity` re-derives this independently and
+    /// treats the same condition as a hard error. The two stop differently
+    /// because that is what each *can* do -- a runtime mid-tick cannot
+    /// return an error, a verifier cannot halt -- but neither continues
+    /// silently, which is the property that matters (review of
+    /// pairtrade#211).
     fn benchmark_equity_usd(
         basket: Option<ArcusSpotInventory>,
         token_a_price_usd: Decimal,
         token_b_price_usd: Decimal,
     ) -> Option<Decimal> {
-        basket.and_then(|basket| basket.checked_value_usd(token_a_price_usd, token_b_price_usd))
+        let basket = basket?;
+        Some(
+            basket
+                .checked_value_usd(token_a_price_usd, token_b_price_usd)
+                .unwrap_or(Decimal::MAX),
+        )
     }
 
     /// Marks both loss stops against the baseline baskets re-priced at this
@@ -3431,6 +3493,83 @@ mod tests {
             runtime.state().risk_halt,
             None,
             "a net-positive day must not engage a daily-*loss* halt",
+        );
+    }
+
+    /// The review finding on this PR, driven through `step_at` rather than a
+    /// hand-built state — which is the point, since the bug only existed on
+    /// the real rollover path.
+    ///
+    /// A rotation destroys $3 during day 1; the day-2 rollover tick engages
+    /// the halt against day 1's basket and used to rebase that basket onto
+    /// the still-impaired inventory in the same tick. Anything re-deriving
+    /// the loss afterwards then read ~0 — including
+    /// `require_risk_state_continuity`, which rejected the checkpoint as
+    /// having engaged an "unexpected" halt.
+    #[test]
+    fn a_rollover_halt_keeps_the_basket_its_loss_was_measured_against() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let day1 = event_time();
+        runtime.step_at(&snapshot_with_valid_row(day1), day1);
+        let day1_basket = runtime.state().daily_baseline_inventory.unwrap();
+
+        // 200*0.985 + 100*1 = 297 against a $300 basket.
+        runtime.state.inventory.token_a = Decimal::new(985, 3);
+        let day2 = day1 + Duration::days(1);
+        runtime.step_at(&snapshot_with_valid_row(day2), day2);
+
+        assert!(runtime.state().risk_halt.is_some(), "the halt must engage");
+        assert_eq!(
+            runtime.state().daily_baseline_inventory,
+            Some(day1_basket),
+            "the basket the halt was measured against must survive the rollover",
+        );
+        // The day itself still rolls: the rollover-matching and continuity
+        // checks read it, and the halt records its own engagement date.
+        assert_eq!(
+            runtime.state().daily_baseline_day,
+            Some(day2.format("%Y-%m-%d").to_string()),
+        );
+        // Which is what keeps the loss visible to anything re-deriving it
+        // from the persisted state.
+        let mark = runtime.last_risk_mark().expect("prices were marked");
+        assert_eq!(mark.daily_loss_usd, Decimal::from(3));
+    }
+
+    #[test]
+    fn a_halted_checkpoint_without_baskets_still_gets_them_seeded() {
+        // Freezing must not mean never seeding: a checkpoint predating the
+        // baskets, loaded while already halted, is exactly the live host's
+        // shape, and its daily stop would otherwise stay unmeasurable
+        // forever.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let day1 = event_time();
+        runtime.step_at(&snapshot_with_valid_row(day1), day1);
+        runtime.state.risk_halt = Some(ArcusSpotRiskHalt {
+            kind: ArcusSpotRiskHaltKind::DailyLoss,
+            engaged_at: day1,
+            equity_usd: Decimal::from(300),
+            loss_usd: Decimal::from(2),
+            limit_usd: Decimal::from(2),
+        });
+        runtime.state.daily_baseline_inventory = None;
+        runtime.state.initial_baseline_inventory = None;
+
+        let day2 = day1 + Duration::days(1);
+        runtime.step_at(&snapshot_with_valid_row(day2), day2);
+
+        assert_eq!(
+            runtime.state().daily_baseline_inventory,
+            Some(runtime.state().inventory),
+        );
+        assert_eq!(
+            runtime.state().initial_baseline_inventory,
+            Some(runtime.state().inventory),
+        );
+        assert_eq!(
+            runtime.last_risk_mark().unwrap().daily_loss_usd,
+            Decimal::ZERO,
+            "a beta-only halt owes nothing once its baskets exist",
         );
     }
 

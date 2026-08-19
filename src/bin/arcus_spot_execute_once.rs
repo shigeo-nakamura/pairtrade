@@ -4322,6 +4322,70 @@ runtime:
         assert_eq!(report.mode, "continuity");
     }
 
+    /// The review finding on pairtrade#211: a halt engaged on a rollover
+    /// tick used to be rejected here as "unexpected", because the basket its
+    /// loss was measured against had already been rebased in that same tick
+    /// and the re-derivation below then read back ~0. No test combined a
+    /// genuine rollover with a genuine halt, so nothing caught it.
+    #[test]
+    fn continuity_verification_accepts_a_loss_halt_engaged_on_a_rollover() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let backup_dir = dir.path().join("before-start");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(7);
+            state["relative_log_price_history"] = json!([0.0]);
+            state["last_observation_at"] = json!("2026-08-15T23:59:00Z");
+            state["initial_equity_usd"] = json!("300");
+            state["daily_baseline_day"] = json!("2026-08-15");
+            state["daily_baseline_equity_usd"] = json!("300");
+            state["last_equity_usd"] = json!("300");
+            // A rotation on 2026-08-15 gave up a hundredth of token A for
+            // nothing, so the day's basket sits above the inventory held.
+            state["initial_baseline_inventory"] = json!({"token_a": "0.36", "token_b": "0.16"});
+            state["daily_baseline_inventory"] = json!({"token_a": "0.36", "token_b": "0.16"});
+        });
+        create_arcus_state_backup(&config, &backup_dir).unwrap();
+        rewrite_checkpoint_state(&runtime_path, |state| {
+            state["sequence"] = json!(8);
+            state["relative_log_price_history"] = json!([0.0, 0.125]);
+            state["last_observation_at"] = json!("2026-08-16T00:00:01Z");
+            state["last_token_a_reference_price_usd"] = json!("600");
+            state["last_token_b_reference_price_usd"] = json!("529.49814155075739");
+            // The day and its equity mark roll, as they always did...
+            state["daily_baseline_day"] = json!("2026-08-16");
+            state["daily_baseline_equity_usd"] = json!("294.7197026481211824");
+            state["last_equity_usd"] = json!("294.7197026481211824");
+            // ...but the basket does not, because a halt now stands on it.
+            state["risk_halt"] = json!({
+                "kind": "daily_loss",
+                "engaged_at": "2026-08-16T00:00:01Z",
+                "equity_usd": "294.7197026481211824",
+                "loss_usd": "6.0000000000000000",
+                "limit_usd": "2",
+            });
+        });
+        let accepted_at = DateTime::parse_from_rfc3339("2026-08-16T00:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        persist_observation_evidence(
+            &config,
+            no_swap_snapshot(accepted_at, "600", "529.49814155075739"),
+            accepted_at,
+        );
+
+        let report = verify_arcus_state_backup(&config, &backup_dir, false).unwrap();
+
+        assert_eq!(report.mode, "continuity");
+    }
+
     #[test]
     fn continuity_verification_rejects_a_future_day_baseline_reset() {
         let dir = tempdir().unwrap();

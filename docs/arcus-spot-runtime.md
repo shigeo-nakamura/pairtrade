@@ -66,8 +66,17 @@ Two consequences worth knowing:
   peak-to-trough drawdown stop is wanted, it is a separate limit and is not
   implemented.
 
+While a halt stands, the daily basket stops rolling at UTC midnight. It is
+the evidence of what is still owed, not a per-day convenience, so rebasing
+it onto the still-impaired inventory would report the loss as settled
+without anything having been remediated. The day and its equity mark roll
+as usual -- the rollover and continuity checks read those -- and the basket
+unfreezes on the first rollover after the halt is lifted.
+
 A checkpoint written before the baskets existed carries none; the next tick
 seeds them and the stops are unmeasurable (reported as zero) until it does.
+Seeding happens even while halted, or such a checkpoint could never become
+measurable again.
 `state-verify-continuity` re-derives the same measure independently, so the
 runtime and the verifier agree about when a halt was required.
 
