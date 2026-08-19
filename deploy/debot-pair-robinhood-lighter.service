@@ -14,10 +14,11 @@ Environment=STATUS_S3_KEY_PREFIX=debot/status/robinhood-lighter
 Restart=on-failure
 RestartSec=30
 StartLimitBurst=5
-# Allow the 3,660s strategy grace to expire (bot-strategy#798, force_close
-# halved 7200->3600 on 2026-08-17), then leave three minutes for the final
-# reduce-only exchange close and orderly process shutdown.
-TimeoutStopSec=3840
+# Two-arm split (bot-strategy#798): b arm's force_close_time_secs=10800 (3h)
+# is now the longest grace window. shutdown_grace_secs in the yaml is
+# 10860 (10800 + 60s buffer); leave three more minutes for the final
+# reduce-only exchange close and orderly process shutdown across both arms.
+TimeoutStopSec=11040
 StandardOutput=journal
 StandardError=journal
 

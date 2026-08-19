@@ -2,6 +2,19 @@ use super::risk::resolve_risk_config;
 use super::schema::RiskYaml;
 use super::*;
 
+/// Guards every test below that reads a config YAML while mutating process
+/// env vars (`std::env::set_var`/`remove_var`). Env vars are process-global,
+/// not thread-local, and `cargo test` runs tests in parallel by default —
+/// without this, two tests racing on the same var name (e.g. two different
+/// config files both declaring a strategy `id: b`, so both tests touch
+/// `EQUITY_REFERENCE_USD_B`) can observe each other's transient value and
+/// fail nondeterministically (bot-strategy#814 PR review: this is exactly
+/// how `robinhood_lighter_two_arm_config_parses` and
+/// `per_strategy_equity_env_override` collided in CI). Every test that
+/// calls `std::env::set_var` or `remove_var` must hold this lock for its
+/// full duration.
+static ENV_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn risk_config_defaults_when_block_absent() {
     let cfg = resolve_risk_config(None).unwrap();
@@ -17,6 +30,7 @@ fn risk_config_defaults_when_block_absent() {
 
 #[test]
 fn hyperliquid_observer_config_parses() {
+    let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let vars = [
         "DEX_NAME",
         "DRY_RUN",
@@ -60,8 +74,70 @@ fn hyperliquid_observer_config_parses() {
     }
 }
 
+// bot-strategy#814: smoke-tests the committed Robinhood two-arm config
+// against the real schema, so a hand-edited YAML that would panic the live
+// process on boot (deny_unknown_fields, bad field names, etc.) fails CI
+// instead. Mirrors hyperliquid_observer_config_parses above.
+#[test]
+fn robinhood_lighter_two_arm_config_parses() {
+    let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let vars = [
+        "DEX_NAME",
+        "DRY_RUN",
+        "FEE_BPS",
+        "REST_ENDPOINT",
+        "MAX_LEVERAGE",
+        "MAX_LEVERAGE_FREQ",
+        "MAX_LEVERAGE_B",
+        "EQUITY_REFERENCE_USD_FREQ",
+        "EQUITY_REFERENCE_USD_B",
+    ];
+    let saved: Vec<_> = vars
+        .iter()
+        .map(|name| ((*name).to_string(), std::env::var(name).ok()))
+        .collect();
+    for name in vars {
+        std::env::remove_var(name);
+    }
+
+    let cfg =
+        PairTradeConfig::from_yaml_path("configs/pairtrade/debot-pair-robinhood-lighter.yaml")
+            .expect("robinhood lighter yaml load");
+
+    assert_eq!(cfg.dex_name, "lighter");
+    assert_eq!(cfg.strategies.len(), 2);
+    let freq = &cfg.strategies[0];
+    assert_eq!(freq.id, "freq");
+    assert_eq!(
+        freq.agent_name.as_deref(),
+        Some("debot-pair-robinhood-lighter-freq")
+    );
+    assert!((freq.equity_reference_usd - 2000.0).abs() < 1e-9);
+    assert!((freq.max_leverage - 30.0).abs() < 1e-9);
+    let b = &cfg.strategies[1];
+    assert_eq!(b.id, "b");
+    assert_eq!(
+        b.agent_name.as_deref(),
+        Some("debot-pair-robinhood-lighter-b")
+    );
+    assert!((b.equity_reference_usd - 4000.0).abs() < 1e-9);
+    assert!((b.max_leverage - 50.0).abs() < 1e-9);
+    assert_eq!(b.force_close_time_secs, Some(10800));
+    assert_eq!(b.stop_loss_z, 8.0);
+    // Top-level max_leverage is only a fallback both arms override.
+    assert!((cfg.max_leverage - 20.0).abs() < 1e-9);
+
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
 #[test]
 fn eligibility_margin_grace_yaml_resolves_defaults_and_validates_bounds() {
+    let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let env_names = ["ELIGIBILITY_MARGIN_GRACE_SECS", "ELIGIBILITY_BETA_GAP_EXIT"];
     let saved: Vec<_> = env_names
         .iter()
@@ -213,6 +289,7 @@ fn risk_config_still_rejects_phase3_flatten_action() {
 
 #[test]
 fn history_archive_env_overrides_yaml() {
+    let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use std::io::Write;
     let dir = std::env::temp_dir();
     let path = dir.join("pairtrade_history_archive_env.yaml");
@@ -257,6 +334,7 @@ history_archive_retention_days: 12
 
 #[test]
 fn per_strategy_equity_env_override() {
+    let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use std::io::Write;
     let dir = std::env::temp_dir();
     let path = dir.join("pairtrade_per_strategy_equity_env.yaml");
@@ -324,6 +402,7 @@ strategies:
 // takes precedence, unset arm falls back to top-level).
 #[test]
 fn per_strategy_leverage_yaml_and_env_override() {
+    let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use std::io::Write;
     let dir = std::env::temp_dir();
     let path = dir.join("pairtrade_per_strategy_leverage.yaml");
