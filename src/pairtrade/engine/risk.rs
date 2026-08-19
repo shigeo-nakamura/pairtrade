@@ -59,7 +59,7 @@ impl PairTradeEngine {
             session_start_equity: inst.session_start_equity,
             session_start_ts: inst.session_start_ts,
             max_daily_loss_bps: threshold_bps,
-            effective_max_daily_loss_bps: threshold_bps as f64 * self.cfg.max_leverage,
+            effective_max_daily_loss_bps: threshold_bps as f64 * inst.max_leverage,
             risk_halted: inst.daily_loss_halted,
         })
     }
@@ -124,7 +124,7 @@ impl PairTradeEngine {
             peak_equity: peak,
             dd_bps,
             max_session_loss_bps: threshold_bps,
-            effective_max_session_loss_bps: threshold_bps as f64 * self.cfg.max_leverage,
+            effective_max_session_loss_bps: threshold_bps as f64 * inst.max_leverage,
             lookback_secs: self.cfg.risk.session_dd_lookback_secs,
             sample_count: inst.equity_samples.len(),
             session_halted: inst.session_halted,
@@ -243,12 +243,6 @@ impl PairTradeEngine {
         }
         let reset_hour = self.cfg.risk.daily_reset_utc_hour;
         let threshold_bps = self.cfg.risk.max_daily_loss_bps;
-        let leverage = self.cfg.max_leverage;
-        // Threshold is configured in 1x-equivalent (market-move) units and
-        // scaled by max_leverage at comparison time so a `max_leverage`
-        // change doesn't silently relax the gate. See
-        // `daily_loss_blocks` for the full rationale.
-        let effective_threshold_bps = threshold_bps as f64 * leverage;
         let now_ts = self.current_now_ts();
         let current_day = session_day(now_ts, reset_hour);
         let mut dirty = false;
@@ -262,6 +256,14 @@ impl PairTradeEngine {
             Option<serde_json::Value>,
         )> = Vec::new();
         for (inst_idx, inst) in self.instances.iter_mut().enumerate() {
+            // Per-instance leverage (bot-strategy#814): threshold is
+            // configured in 1x-equivalent (market-move) units and scaled by
+            // this instance's `max_leverage` at comparison time so a
+            // per-arm leverage change doesn't silently relax or tighten the
+            // gate for a different arm. See `daily_loss_blocks` for the
+            // full rationale.
+            let leverage = inst.max_leverage;
+            let effective_threshold_bps = threshold_bps as f64 * leverage;
             let prior_day = if inst.session_start_ts > 0 {
                 Some(session_day(inst.session_start_ts, reset_hour))
             } else {
@@ -374,7 +376,7 @@ impl PairTradeEngine {
             inst.realized_pnl_today,
             inst.session_start_equity,
             self.cfg.risk.max_daily_loss_bps,
-            self.cfg.max_leverage,
+            inst.max_leverage,
         )
     }
 
@@ -1719,7 +1721,7 @@ impl PairTradeEngine {
         // ~linearly with leverage, so the multiplied threshold tracks
         // observed dd_bps consistently. See bot-strategy#185 leverage-
         // neutralization amendment.
-        let leverage = self.cfg.max_leverage;
+        let leverage = inst.max_leverage;
         let effective_threshold_bps = threshold_bps as f64 * leverage;
         if !session_dd_breaches_threshold(dd_bps, threshold_bps, leverage) {
             return false;

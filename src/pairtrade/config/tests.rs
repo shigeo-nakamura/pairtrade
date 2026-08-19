@@ -319,6 +319,67 @@ strategies:
     let _ = std::fs::remove_file(&path);
 }
 
+// bot-strategy#814: per-strategy max_leverage, mirroring
+// per_strategy_equity_env_override above (YAML per-arm value, env override
+// takes precedence, unset arm falls back to top-level).
+#[test]
+fn per_strategy_leverage_yaml_and_env_override() {
+    use std::io::Write;
+    let dir = std::env::temp_dir();
+    let path = dir.join("pairtrade_per_strategy_leverage.yaml");
+    let yaml = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+max_leverage: 20
+strategies:
+  - id: a
+    max_leverage: 30
+  - id: b
+    max_leverage: 50
+  - id: c
+"#;
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(yaml.as_bytes())
+        .unwrap();
+
+    let prev_a = std::env::var("MAX_LEVERAGE_A").ok();
+    std::env::set_var("MAX_LEVERAGE_A", "40");
+    std::env::remove_var("MAX_LEVERAGE_B");
+    std::env::remove_var("MAX_LEVERAGE_C");
+
+    let cfg = PairTradeConfig::from_yaml_path(&path).expect("yaml load");
+    let by_id = |id: &str| {
+        cfg.strategies
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("missing strategy {id}"))
+            .max_leverage
+    };
+    assert!(
+        (by_id("a") - 40.0).abs() < 1e-9,
+        "A: env override wins over yaml per-strategy value"
+    );
+    assert!(
+        (by_id("b") - 50.0).abs() < 1e-9,
+        "B: no env override, yaml per-strategy value applies"
+    );
+    assert!(
+        (by_id("c") - 20.0).abs() < 1e-9,
+        "C: no override anywhere, inherits top-level max_leverage"
+    );
+
+    match prev_a {
+        Some(v) => std::env::set_var("MAX_LEVERAGE_A", v),
+        None => std::env::remove_var("MAX_LEVERAGE_A"),
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn per_strategy_entry_z_override_resolves() {
     use std::io::Write;
@@ -489,6 +550,7 @@ fn strategy_config_for_overlay_test() -> StrategyConfig {
         stop_loss_z: 6.5,
         max_loss_r_mult: 2.5,
         equity_reference_usd: 100.0,
+        max_leverage: 1.0,
         force_close_time_secs: None,
         mtf_windows: None,
         mtf_z_min: None,

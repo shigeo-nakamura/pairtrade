@@ -152,7 +152,7 @@ impl PairTradeEngine {
             .set(inst.equity_reference_usd);
         prom::MAX_LEVERAGE_CONFIG
             .with_label_values(&[instance])
-            .set(self.cfg.max_leverage);
+            .set(inst.max_leverage);
         // Snapshot age — mtime of the on-disk history file. Bounded I/O
         // (single stat per tick per instance) is acceptable here; the
         // alternative is plumbing the writer's last-write timestamp

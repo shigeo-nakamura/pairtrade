@@ -10,18 +10,23 @@ use crate::pairtrade::defaults::*;
 
 ///
 /// `max_daily_loss_bps` and `max_session_loss_bps` are stored as the raw
-/// 1x-equivalent values from YAML; the comparison sites multiply by
-/// `PairTradeConfig::max_leverage` at evaluation time so the gates stay
-/// leverage-invariant (bot-strategy#185 amendment).
+/// 1x-equivalent values from YAML; the comparison sites multiply by the
+/// strategy's resolved leverage at evaluation time so the gates stay
+/// leverage-invariant (bot-strategy#185 amendment). That multiplier is
+/// `StrategyInstance::max_leverage` (per-instance, bot-strategy#814), not
+/// the top-level `PairTradeConfig::max_leverage` scalar this doc used to
+/// name — the top-level value is now only the fallback a strategy resolves
+/// to when it doesn't declare its own `max_leverage` override.
 #[derive(Debug, Clone)]
 pub struct RiskConfig {
     /// 1x-equivalent (market-move) bps; effective threshold at runtime is
-    /// this × `PairTradeConfig::max_leverage`.
+    /// this × the strategy's resolved leverage (`StrategyInstance::max_leverage`).
     pub max_daily_loss_bps: u32,
     pub max_daily_loss_action: DailyLossAction,
     pub daily_reset_utc_hour: u32,
     /// Phase 3-1: 1x-equivalent (market-move) bps; effective threshold at
-    /// runtime is this × `PairTradeConfig::max_leverage`. 0 = disabled.
+    /// runtime is this × the strategy's resolved leverage
+    /// (`StrategyInstance::max_leverage`). 0 = disabled.
     pub max_session_loss_bps: u32,
     /// Phase 3-1: rolling peak window in seconds.
     pub session_dd_lookback_secs: u64,
@@ -36,8 +41,10 @@ pub struct RiskConfig {
     pub session_dd_capital_settle_secs: u64,
     /// Phase 3-4: per-leg notional cap multiplier. 0.0 = disabled.
     /// Resolved cap = `equity_reference_usd × max_leverage × headroom`
-    /// at sizing time, so the dollar threshold tracks per-instance
-    /// equity and per-host leverage automatically.
+    /// at sizing time, using the strategy's own resolved equity and
+    /// leverage (`StrategyInstance::equity_reference_usd` /
+    /// `max_leverage`, bot-strategy#814), so the dollar threshold tracks
+    /// per-instance equity and per-instance leverage automatically.
     pub max_notional_headroom: f64,
 }
 

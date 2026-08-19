@@ -108,6 +108,13 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// is no longer mixed into the threshold/sizing math. See
     /// bot-strategy#222.
     pub(in crate::pairtrade) equity_reference_usd: f64,
+    /// Per-strategy leverage override (bot-strategy#814). Resolved from the
+    /// YAML `strategies[].max_leverage` (or `MAX_LEVERAGE_<ID>` env var);
+    /// `None` in either inherits the top-level `PairTradeConfig::max_leverage`.
+    /// Drives sizing (`hedged_sizes`) and the leverage-neutralized risk
+    /// gates (daily/session DD, market-move thresholds) so A/B/C variants
+    /// can run at different leverage against a shared process.
+    pub(in crate::pairtrade) max_leverage: f64,
     pub(in crate::pairtrade) states: HashMap<String, PairState>,
     pub(in crate::pairtrade) pnl_logger: Option<PnlLogger>,
     pub(in crate::pairtrade) status_reporter: Option<StatusReporter>,

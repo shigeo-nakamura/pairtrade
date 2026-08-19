@@ -262,6 +262,11 @@ pub(in crate::pairtrade) struct StrategyYaml {
     pub(super) stop_loss_z_score: Option<f64>,
     pub(super) max_loss_r_mult: Option<f64>,
     pub(super) equity_usd_reference: Option<f64>,
+    /// Per-strategy leverage override (bot-strategy#814). `None` inherits
+    /// the top-level `max_leverage`. Also overridable per-instance via
+    /// `MAX_LEVERAGE_<ID>` (id uppercased), mirroring
+    /// `EQUITY_REFERENCE_USD_<ID>` — see `resolve_strategies`.
+    pub(super) max_leverage: Option<f64>,
     // Per-strategy PairParams overrides (None = inherit from top-level)
     pub(super) force_close_time_secs: Option<u64>,
     pub(super) mtf_windows: Option<Vec<usize>>,

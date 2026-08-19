@@ -88,20 +88,24 @@ pub(super) fn depth_size_mult(
     (s_min + slope * depth).clamp(s_min, s_max)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn hedged_sizes(
     cfg: &PairTradeConfig,
     equity: f64,
+    max_leverage: f64,
     beta: f64,
     p1: &SymbolSnapshot,
     p2: &SymbolSnapshot,
     notional_scale: f64,
     sizing_beta_floor: f64,
 ) -> Result<(Decimal, Decimal)> {
-    // `equity` is the per-instance fixed `equity_reference_usd` so each
-    // variant sizes against its own declared capital. Live equity is no
-    // longer mixed in here — see StrategyInstance.equity_reference_usd
-    // and bot-strategy#222.
-    let total_risk = equity * cfg.risk_pct_per_trade * cfg.max_leverage;
+    // `equity` is the per-instance fixed `equity_reference_usd` and
+    // `max_leverage` the per-instance resolved leverage (bot-strategy#814;
+    // both default to a legacy single-instance value equal to the shared
+    // top-level scalars), so each variant sizes against its own declared
+    // capital and leverage. Live equity is no longer mixed in here — see
+    // StrategyInstance.equity_reference_usd and bot-strategy#222.
+    let total_risk = equity * cfg.risk_pct_per_trade * max_leverage;
     let base_leg = (total_risk / 2.0).max(10.0);
     // Combined per-entry scale: beta-gap shrink (#461, ≤ 1.0) × depth
     // sizing (#515, may exceed 1.0). Applied before the notional cap
@@ -109,7 +113,7 @@ pub(super) fn hedged_sizes(
     let scale = notional_scale.clamp(0.0, MAX_NOTIONAL_SCALE);
     let mut leg_notional = (base_leg * scale).max(10.0);
     let sizing_beta = resolve_sizing_beta(beta, sizing_beta_floor);
-    let notional_cap = equity * cfg.max_leverage * cfg.risk.max_notional_headroom;
+    let notional_cap = equity * max_leverage * cfg.risk.max_notional_headroom;
     if let Some(capped) = cap_leg_notional(leg_notional, sizing_beta, notional_cap) {
         log::warn!(
             "[RISK_NOTIONAL_CAP] leg_notional {:.2} → {:.2} (cap={:.2}, equity={:.2}, max_leverage={:.2}, headroom={:.3}, |beta|={:.4})",
@@ -117,7 +121,7 @@ pub(super) fn hedged_sizes(
             capped,
             notional_cap,
             equity,
-            cfg.max_leverage,
+            max_leverage,
             cfg.risk.max_notional_headroom,
             sizing_beta
         );

@@ -1046,7 +1046,11 @@ async fn session_dd_gated_until_equity_initialized() {
     let mut engine = PairTradeEngine::test_instance(connector);
     // Match the live config that produced the incident.
     engine.cfg.risk.max_session_loss_bps = 500;
-    engine.cfg.max_leverage = 10.0;
+    // 500 bps × 10x = 5000 bps effective (bot-strategy#814: keeps
+    // cfg.max_leverage and every instance's resolved max_leverage in sync —
+    // see set_max_leverage_for_test's doc comment for why setting only one
+    // of them is a trap).
+    engine.set_max_leverage_for_test(10.0);
     // Redirect risk-state persistence to a temp dir so the test does
     // not litter the working directory if a trip ever does fire.
     let dir = TempDir::new().unwrap();

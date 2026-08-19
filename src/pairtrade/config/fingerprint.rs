@@ -227,6 +227,7 @@ mod tests {
             stop_loss_z: 6.0,
             max_loss_r_mult: 2.0,
             equity_reference_usd: 1000.0,
+            max_leverage: 5.0,
             force_close_time_secs: Some(10800),
             mtf_windows: None,
             mtf_z_min: None,
