@@ -71,14 +71,49 @@ the evidence of what is still owed, not a per-day convenience, so rebasing
 it onto the still-impaired inventory would report the loss as settled
 without anything having been remediated. The day and its equity mark roll
 as usual -- the rollover and continuity checks read those -- and the basket
-unfreezes on the first rollover after the halt is lifted.
+unfreezes on the first rollover after the halt is lifted. Lifting a halt
+does not rebase it either: a halt lifted at a partially-remediated loss
+should re-engage promptly if the rest of the day's budget goes too.
 
 A checkpoint written before the baskets existed carries none; the next tick
 seeds them and the stops are unmeasurable (reported as zero) until it does.
 Seeding happens even while halted, or such a checkpoint could never become
 measurable again.
+
 `state-verify-continuity` re-derives the same measure independently, so the
 runtime and the verifier agree about when a halt was required.
+
+### Lifting an engaged halt
+
+    arcus-spot-execute-once clear-risk-halt CONFIG_YAML
+
+A halt is sticky: nothing in the runtime ever lifts one, because no later
+tick is evidence that whatever caused it was dealt with. Until
+bot-strategy#813 there was no sanctioned way to lift one at all, which left
+a halted bot permanently stopped short of hand-editing checkpoint state.
+
+This command is that way, and only that: it takes the same
+administrator-approved config digest `auto-execute`/`live-tick` require
+(resuming re-enables exactly the dispatch path that gate governs), takes the
+same exclusive checkpoint lock a dispatching tick takes, and prints what it
+cleared alongside the marks at the moment of clearing, so the disarming of a
+risk control leaves a record in the journal.
+
+It **refuses while the halt's own condition still holds** -- a check that
+lives on `ArcusSpotRuntime::clear_risk_halt` itself, not in this command, so
+no other caller can reach past it. Clearing while it holds would be worse
+than useless — the next tick re-engages immediately, and an operator
+watching only the exit status would read an ongoing breach as handled. Repeating the command would walk straight past the limit. A halt is
+liftable only once nothing is actually owed, which is exactly the case a
+beta-driven halt from before the measurement change falls into.
+
+It deliberately does *not* require the offline Ed25519 approval signature:
+requiring more to resume dispatching than to dispatch would be theatre while
+`auto-execute` itself runs signatureless.
+
+Take a fresh `state-backup` afterwards — backups from before the clear no
+longer verify, since continuity checks treat a lost halt as a real state
+change.
 
 The log-price ratio signal is evaluated against prior samples only. The current
 sample is appended after z-score calculation, avoiding same-tick look-ahead.

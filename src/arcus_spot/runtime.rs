@@ -393,17 +393,64 @@ impl ArcusSpotRuntime {
 
     /// The risk mark implied by the state as it stands, valued at the marks
     /// of the last observation it processed. `None` before any observation
-    /// has supplied reference prices.
+    /// has supplied reference prices, or if the valuation overflows.
     ///
-    /// For asking what a persisted checkpoint currently owes without waiting
-    /// for, or fabricating, a fresh tick. Deliberately routed through the
-    /// same `risk_mark` the halt itself uses, so the answer cannot drift
-    /// from the rule.
+    /// For an operator asking "does the condition that halted this bot still
+    /// hold" without waiting for, or fabricating, a fresh tick. Deliberately
+    /// routed through the same `risk_mark` the halt itself uses so the answer
+    /// cannot drift from the rule.
     pub fn last_risk_mark(&self) -> Option<ArcusSpotRiskMark> {
         let price_a = self.state.last_token_a_reference_price_usd?;
         let price_b = self.state.last_token_b_reference_price_usd?;
         let equity = self.state.inventory.checked_value_usd(price_a, price_b)?;
         Some(self.risk_mark(equity, price_a, price_b))
+    }
+
+    /// Disarm an engaged risk halt, returning what was cleared.
+    ///
+    /// Never called by the runtime itself: a halt is sticky by design, and
+    /// nothing about a later tick is evidence that whatever caused it was
+    /// handled. Only an operator, through the explicit `clear-risk-halt`
+    /// command, decides that.
+    ///
+    /// Refuses while the halt's own condition still holds, so this cannot
+    /// become a way to trade *through* a live breach rather than resume
+    /// after one: the next tick would re-engage, a clean result would read
+    /// as handled, and repeating would walk straight past the limit. The
+    /// check lives here rather than in the calling command so that every
+    /// caller gets it -- a future tool or test reaching for this method
+    /// would otherwise have been able to lift a halt unconditionally
+    /// (review of pairtrade#212).
+    ///
+    /// The daily basket is deliberately left frozen on success. Clearing
+    /// says the halt need not stand, not that the day's budget is refilled:
+    /// a halt lifted at a partially-remediated loss should re-engage
+    /// promptly if the rest of the budget goes too. It unfreezes at the next
+    /// rollover, now that no halt stands on it.
+    pub fn clear_risk_halt(&mut self) -> Result<ArcusSpotRiskHalt, String> {
+        let halt = self
+            .state
+            .risk_halt
+            .clone()
+            .ok_or_else(|| "Arcus runtime has no engaged risk halt to clear".to_string())?;
+        let mark = self.last_risk_mark().ok_or_else(|| {
+            "Arcus runtime has no reference prices to re-check the halt condition against"
+                .to_string()
+        })?;
+        if mark.daily_loss_usd >= self.config.daily_loss_limit_usd
+            || mark.cumulative_loss_usd >= self.config.cumulative_loss_limit_usd
+        {
+            return Err(format!(
+                "Arcus risk halt condition still holds (daily {} / limit {}, cumulative {} / \
+                 limit {}); it would re-engage on the next tick",
+                mark.daily_loss_usd,
+                self.config.daily_loss_limit_usd,
+                mark.cumulative_loss_usd,
+                self.config.cumulative_loss_limit_usd,
+            ));
+        }
+        self.state.risk_halt = None;
+        Ok(halt)
     }
 
     /// Re-evaluate the neutral-regime entry direction for one prospective
@@ -1658,10 +1705,12 @@ impl ArcusSpotRuntime {
         // stands on it. It used to: the caller engages the halt from a mark
         // taken against the outgoing day's basket, and this then rebased
         // that basket to the current -- still impaired -- inventory in the
-        // same tick, so everything re-deriving the loss from the persisted
-        // state read back ~0. `require_risk_state_continuity` then rejected
-        // the very checkpoint where the halt correctly fired, as an
-        // "unexpected risk halt" (review of pairtrade#211).
+        // same tick. Everything that later re-derived the loss from the
+        // persisted state read back ~0, so `clear-risk-halt` would lift an
+        // unremediated halt for no better reason than a day boundary having
+        // passed, and `require_risk_state_continuity` would reject the very
+        // checkpoint where the halt correctly fired (review of
+        // pairtrade#211/#212).
         //
         // Freezing only the basket, not the day or the equity mark, is
         // deliberate: those two keep their ordinary meaning for the
@@ -1677,32 +1726,28 @@ impl ArcusSpotRuntime {
             // daily stop stays unmeasurable forever. Adopting this tick's
             // inventory only misprices rotations that already happened
             // earlier today, and self-corrects at the next rollover.
-            // `daily_baseline_equity_usd` is deliberately left alone: it
-            // still means "the day's opening equity mark", which the
-            // state-continuity checks read, and it no longer feeds the loss
-            // stops at all.
             self.state.daily_baseline_inventory = Some(inventory);
         }
     }
 
     /// What a basket would be worth at these prices — the buy-and-hold
     /// counterfactual the loss stops measure the strategy against.
-    ///
     /// `None` only when there is no basket recorded yet, which genuinely
-    /// means "not measurable" and is read downstream as no loss. A basket
-    /// that exists but cannot be valued is a different thing and must not
-    /// collapse into the same answer: silently reporting no loss is the one
-    /// outcome a risk metric may never produce by accident. It returns
-    /// `Decimal::MAX` instead, which reads downstream as an unbounded loss
-    /// and halts. Unreachable at any realistic size -- the live basket is
-    /// ~0.2 tokens at ~$200 against a 96-bit type -- so the point is the
-    /// direction it fails in, not the case arising.
+    /// means "not measurable" and is read downstream as no loss.
+    ///
+    /// A basket that exists but cannot be valued is a different thing and
+    /// must not collapse into the same answer: silently reporting no loss is
+    /// the one outcome a risk metric may never produce by accident. It
+    /// returns `Decimal::MAX` instead, which reads downstream as an
+    /// unbounded loss and halts. Unreachable at any realistic size -- the
+    /// live basket is ~0.2 tokens at ~$200 against a 96-bit type -- so the
+    /// point is the direction it fails in, not the case arising.
     ///
     /// `require_risk_state_continuity` re-derives this independently and
     /// treats the same condition as a hard error. The two stop differently
-    /// because that is what each *can* do -- a runtime mid-tick cannot
-    /// return an error, a verifier cannot halt -- but neither continues
-    /// silently, which is the property that matters (review of
+    /// because that is what each *can* do -- a runtime mid-tick has no way
+    /// to return an error, and a verifier has no way to halt -- but both
+    /// refuse to continue, which is the property that matters (review of
     /// pairtrade#211).
     fn benchmark_equity_usd(
         basket: Option<ArcusSpotInventory>,
@@ -3496,16 +3541,16 @@ mod tests {
         );
     }
 
-    /// The review finding on this PR, driven through `step_at` rather than a
-    /// hand-built state — which is the point, since the bug only existed on
-    /// the real rollover path.
+    /// The review finding on pairtrade#211/#212, driven through `step_at`
+    /// rather than a hand-built state — which is the whole point, since the
+    /// bypass only existed on the real rollover path and every guard test
+    /// had built its halt by hand.
     ///
     /// A rotation destroys $3 during day 1; the day-2 rollover tick engages
-    /// the halt against day 1's basket and used to rebase that basket onto
-    /// the still-impaired inventory in the same tick. Anything re-deriving
-    /// the loss afterwards then read ~0 — including
-    /// `require_risk_state_continuity`, which rejected the checkpoint as
-    /// having engaged an "unexpected" halt.
+    /// the halt against day 1's basket and, in that same tick, used to rebase
+    /// that basket onto the still-impaired inventory. Everything that later
+    /// re-derived the loss then read ~0, so the halt could be lifted having
+    /// remediated nothing.
     #[test]
     fn a_rollover_halt_keeps_the_basket_its_loss_was_measured_against() {
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
@@ -3530,18 +3575,43 @@ mod tests {
             runtime.state().daily_baseline_day,
             Some(day2.format("%Y-%m-%d").to_string()),
         );
-        // Which is what keeps the loss visible to anything re-deriving it
-        // from the persisted state.
+
+        // Which is what keeps the loss visible to anything re-deriving it.
         let mark = runtime.last_risk_mark().expect("prices were marked");
         assert_eq!(mark.daily_loss_usd, Decimal::from(3));
+        assert!(runtime.clear_risk_halt().is_err(), "nothing was remediated");
     }
 
     #[test]
-    fn a_halted_checkpoint_without_baskets_still_gets_them_seeded() {
-        // Freezing must not mean never seeding: a checkpoint predating the
-        // baskets, loaded while already halted, is exactly the live host's
-        // shape, and its daily stop would otherwise stay unmeasurable
-        // forever.
+    fn a_frozen_basket_unfreezes_once_the_halt_is_lifted() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let day1 = event_time();
+        runtime.step_at(&snapshot_with_valid_row(day1), day1);
+        runtime.state.inventory.token_a = Decimal::new(985, 3);
+        let day2 = day1 + Duration::days(1);
+        runtime.step_at(&snapshot_with_valid_row(day2), day2);
+        assert!(runtime.state().risk_halt.is_some());
+
+        // Remediate: the rotation is reversed, so nothing is owed against
+        // day 1's basket any more and the halt becomes liftable.
+        runtime.state.inventory.token_a = Decimal::ONE;
+        runtime.clear_risk_halt().expect("nothing is owed now");
+
+        // Still frozen for the rest of this day -- lifting a halt does not
+        // refill the day's budget -- and rebased on the next rollover.
+        let day3 = day1 + Duration::days(2);
+        runtime.step_at(&snapshot_with_valid_row(day3), day3);
+        assert_eq!(
+            runtime.state().daily_baseline_inventory,
+            Some(runtime.state().inventory),
+        );
+    }
+
+    #[test]
+    fn a_halted_legacy_checkpoint_still_gets_its_baskets_seeded() {
+        // The live host's exact shape when #211 lands: already halted, and
+        // carrying no baskets. Freezing must not mean never seeding, or its
+        // daily stop stays unmeasurable forever and the halt unliftable.
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
         let day1 = event_time();
         runtime.step_at(&snapshot_with_valid_row(day1), day1);
@@ -3566,11 +3636,28 @@ mod tests {
             runtime.state().initial_baseline_inventory,
             Some(runtime.state().inventory),
         );
-        assert_eq!(
-            runtime.last_risk_mark().unwrap().daily_loss_usd,
-            Decimal::ZERO,
-            "a beta-only halt owes nothing once its baskets exist",
+        runtime
+            .clear_risk_halt()
+            .expect("a beta-only halt owes nothing once baskets exist");
+    }
+
+    #[test]
+    fn clearing_a_halt_is_refused_while_its_condition_still_holds() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let day = event_time();
+        runtime.step_at(&snapshot_with_valid_row(day), day);
+        runtime.state.inventory.token_a = Decimal::new(985, 3);
+        let later = day + Duration::hours(1);
+        runtime.step_at(&snapshot_with_valid_row(later), later);
+
+        let error = runtime
+            .clear_risk_halt()
+            .expect_err("a live breach must not be clearable");
+        assert!(
+            error.contains("would re-engage on the next tick"),
+            "{error}",
         );
+        assert!(runtime.state().risk_halt.is_some(), "and stays engaged");
     }
 
     #[test]

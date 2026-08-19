@@ -2115,6 +2115,7 @@ fn usage() -> &'static str {
   arcus-spot-execute-once resume CONFIG_YAML PLAN_JSON APPROVAL_SIGNATURE_HEX
   arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once live-tick CONFIG_YAML
+  arcus-spot-execute-once clear-risk-halt CONFIG_YAML
 
 state-backup and state-verify-* are offline operator commands. They never
 construct an RPC/router client, KMS signer, approval policy, or executor and
@@ -2685,6 +2686,66 @@ async fn main() -> Result<()> {
             println!("{}", auto_execute_config_digest(&config)?);
             Ok(())
         }
+        [command, config_path] if command == "clear-risk-halt" => {
+            // The only way an engaged halt is ever lifted. A halt is sticky
+            // on purpose -- no later tick is evidence that whatever caused
+            // it was dealt with -- so lifting it is an operator judgement,
+            // taken deliberately, never a thing the runtime talks itself
+            // into (bot-strategy#813).
+            let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
+            let config = parse_config(&config_bytes, Path::new(config_path))?;
+            // Same administrator-approval gate as auto-execute/live-tick:
+            // resuming a halted bot re-enables exactly the dispatch path
+            // that gate governs, so it is held to the same standard. Not the
+            // offline Ed25519 signature, deliberately -- requiring more to
+            // *resume* dispatching than to dispatch would be theatre.
+            let policy = auto_execute_policy_from_admin_file()?;
+            require_config_within_auto_execute_policy(&config, &policy)?;
+
+            let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+            let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+            // Same exclusive lock a dispatching tick takes, so this
+            // read-modify-write cannot interleave with one committing a fill.
+            let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+
+            let mut runtime = store.load_existing(&config.runtime)?;
+            // Captured before clearing, purely so the record below can show
+            // what the marks were at that moment. The refusal itself lives
+            // in `clear_risk_halt`, so it cannot be bypassed by reaching for
+            // the runtime directly.
+            let mark = runtime.last_risk_mark().context(
+                "Arcus runtime has no reference prices to re-check the halt condition against",
+            )?;
+            let halt = runtime.clear_risk_halt().map_err(anyhow::Error::msg)?;
+            store.persist(&runtime)?;
+            // Printed rather than merely done: this is the audit record of a
+            // risk control being disarmed, and it lands in the journal.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "cleared": {
+                        "kind": halt.kind,
+                        "engaged_at": halt.engaged_at,
+                        "equity_usd": halt.equity_usd.to_string(),
+                        "loss_usd": halt.loss_usd.to_string(),
+                        "limit_usd": halt.limit_usd.to_string(),
+                    },
+                    "mark_at_clear": {
+                        "equity_usd": mark.equity_usd.to_string(),
+                        "daily_loss_usd": mark.daily_loss_usd.to_string(),
+                        "cumulative_loss_usd": mark.cumulative_loss_usd.to_string(),
+                        "inventory_drawdown_usd": mark.inventory_drawdown_usd.to_string(),
+                    },
+                    "runtime_state_path": config.runtime_state_path,
+                }))?
+            );
+            eprintln!(
+                "[arcus-risk] cleared a {:?} halt engaged at {}; take a fresh state-backup, as \
+                 backups from before this no longer verify",
+                halt.kind, halt.engaged_at,
+            );
+            Ok(())
+        }
         [command, config_path, backup_dir] if command == "state-backup" => {
             let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
             let config = parse_config(&config_bytes, Path::new(config_path))?;
@@ -3134,6 +3195,7 @@ mod tests {
         assert!(usage().contains("state-backup CONFIG_YAML BACKUP_DIR"));
         assert!(usage().contains("state-verify-exact CONFIG_YAML BACKUP_DIR"));
         assert!(usage().contains("state-verify-continuity CONFIG_YAML BACKUP_DIR"));
+        assert!(usage().contains("clear-risk-halt CONFIG_YAML"));
     }
 
     fn live_runtime_config() -> ArcusSpotRuntimeConfig {
