@@ -40,6 +40,7 @@ env:
   DEX_CONNECTOR_REF: v4.7.2
   LIGHTER_GO_REF: v1.0.2
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+  RUST_TOOLCHAIN: 1.94.1
 
 jobs:
   # Mirrors ci.yml's own resolve-ref job: default to the latest dex-connector
@@ -143,15 +144,16 @@ jobs:
       - name: Cargo test (robinhood_dipgrid only)
         run: cargo test --bin robinhood_dipgrid --locked
 
+  # Native ARM64 runner, matching ci.yml's current deploy job (bot-strategy#805
+  # migrated it off QEMU). An earlier version of this workflow copied the
+  # since-superseded QEMU+ubuntu-latest pattern and genuinely timed out at
+  # both 60min and 180min on a cold cache -- ci.yml's own comment now bounds
+  # its equivalent native-arm64 release build at ~30min, which is what
+  # motivated re-deriving this job from the current ci.yml instead.
   build-arm64:
     needs: [resolve-ref, check-native]
-    runs-on: ubuntu-latest
-    # ci.yml's own deploy job needed to raise this from an original 60min
-    # cap to 180 because the QEMU-emulated arm64 cargo build (full debot
-    # lib graph, incl. aws-sdk-s3) is slow on a cold cache. This binary
-    # pulls in the same lib graph via DexConnectorBox, so it hits the same
-    # wall — confirmed by a real 60min timeout on the first run here.
-    timeout-minutes: 180
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
     env:
       DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
     steps:
@@ -159,11 +161,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           path: debot
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
 
       - name: Checkout dex-connector
         uses: actions/checkout@v5
@@ -180,14 +177,23 @@ jobs:
           ref: ${{ env.LIGHTER_GO_REF }}
           path: lighter-go
 
-      - name: Cache libsigner (linux/arm64)
+      - name: Resolve build image
+        id: build_image
+        run: |
+          docker pull --platform linux/arm64 "${AL2023_IMAGE}"
+          AL2023_IMAGE_RESOLVED=$(docker image inspect --format="{{index .RepoDigests 0}}" "${AL2023_IMAGE}")
+          echo "AL2023_IMAGE_RESOLVED=${AL2023_IMAGE_RESOLVED}" >> "${GITHUB_ENV}"
+          BUILD_IMAGE_CACHE_KEY=$(printf "%s" "${AL2023_IMAGE_RESOLVED}" | sha256sum)
+          echo "cache_key=${BUILD_IMAGE_CACHE_KEY%% *}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache libsigner (native arm64)
         id: cache_libsigner
         uses: actions/cache@v5
         with:
           path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('lighter-go/go.sum') }}
 
-      - name: Build libsigner (linux/arm64)
+      - name: Build libsigner in AL2023 (native arm64)
         if: steps.cache_libsigner.outputs.cache-hit != 'true'
         run: |
           mkdir -p lighter-go/build
@@ -196,17 +202,17 @@ jobs:
             -w /go/src/sdk \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
-            ${AL2023_IMAGE} \
-            /bin/bash -lc "dnf -y install golang gcc && CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib && chown -R ${HOST_UID}:${HOST_GID} /go/src/sdk/build"
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; dnf -y install golang gcc; CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib; chown -R \${HOST_UID}:\${HOST_GID} /go/src/sdk/build"
 
-      - name: Save libsigner cache (linux/arm64)
+      - name: Save libsigner cache (native arm64)
         if: steps.cache_libsigner.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('lighter-go/go.sum') }}
 
-      - name: Cache cargo (linux/arm64)
+      - name: Cache cargo (native arm64, dipgrid)
         id: cache_cargo
         uses: actions/cache@v5
         with:
@@ -216,12 +222,16 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-cargo-arm64-dipgrid-${{ hashFiles('debot/Cargo.lock') }}
+          # Distinct suffix from ci.yml's cargo-lighter-* keys: this builds
+          # only the robinhood_dipgrid bin target, not the full debot binary,
+          # so target/ contents differ. restore-keys still falls back to
+          # ci.yml's own warm cache for the shared dependency graph.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-dipgrid-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-arm64-dipgrid-
-            ${{ runner.os }}-cargo-arm64-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-dipgrid-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-lighter-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-
 
-      - name: Build robinhood_dipgrid (linux/arm64)
+      - name: Build robinhood_dipgrid in AL2023 (native arm64)
         id: build_dipgrid
         run: |
           mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
@@ -235,8 +245,8 @@ jobs:
             -e CARGO_INCREMENTAL=0 \
             -e LIGHTER_GO_PATH=/workspace/lighter-go/build \
             -e LD_LIBRARY_PATH=/workspace/lighter-go/build \
-            ${AL2023_IMAGE} \
-            /bin/bash -lc "set -euo pipefail; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --bin robinhood_dipgrid; chown -R ${HOST_UID}:${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN}; else /workspace/.cache/cargo/bin/rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal; /workspace/.cache/cargo/bin/rustup default ${RUST_TOOLCHAIN}; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --bin robinhood_dipgrid; chown -R \${HOST_UID}:\${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
 
       - name: Fix cargo cache permissions
         if: steps.build_dipgrid.outcome == 'success'
@@ -249,7 +259,7 @@ jobs:
             chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
           fi
 
-      - name: Save cargo cache (linux/arm64)
+      - name: Save cargo cache (native arm64, dipgrid)
         if: steps.build_dipgrid.outcome == 'success' && steps.cache_cargo.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
@@ -259,13 +269,18 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-cargo-arm64-dipgrid-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-dipgrid-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('debot/Cargo.lock') }}
+
+      - name: Verify dynamic links in AL2023
+        run: |
+          docker run --rm --platform linux/arm64 -v "${{ github.workspace }}/debot/target/release/robinhood_dipgrid:/artifacts/robinhood_dipgrid:ro" -v "${{ github.workspace }}/lighter-go/build/libsigner.so:/artifacts/libsigner.so:ro" -e LD_LIBRARY_PATH=/artifacts ${AL2023_IMAGE_RESOLVED} /bin/bash -lc "set -euo pipefail; if ldd /artifacts/robinhood_dipgrid | grep -q 'not found'; then exit 1; fi; ldd /artifacts/robinhood_dipgrid"
 
       - name: Package artifact
         run: |
           mkdir -p dist/bin dist/lib
-          cp debot/target/release/robinhood_dipgrid dist/bin/robinhood_dipgrid
-          cp lighter-go/build/libsigner.so dist/lib/libsigner.so
+          file debot/target/release/robinhood_dipgrid | grep -q aarch64
+          install -m 0755 debot/target/release/robinhood_dipgrid dist/bin/robinhood_dipgrid
+          install -m 0644 lighter-go/build/libsigner.so dist/lib/libsigner.so
 
       # No AWS/SSM upload step on purpose (see header comment). Grab the
       # artifact from this run and push it to the Tokyo host by hand, the
