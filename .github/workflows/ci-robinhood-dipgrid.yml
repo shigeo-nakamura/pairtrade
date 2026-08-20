@@ -1,0 +1,228 @@
+name: Robinhood dip-grid build (bot-strategy#816)
+
+# Build-only CI for src/bin/robinhood_dipgrid.rs — the prototype bot from
+# pairtrade#217. Deliberately does NOT deploy anywhere: the strategy is
+# still pre-DRY_RUN-soak (see the module doc comment in the binary itself
+# for known gaps), so no AWS credentials/SSM access are granted here.
+# Robinhood Chain Lighter (Tokyo) deploys have always been manual SSM
+# pushes (see #798) — this workflow only produces a downloadable ARM64
+# artifact for that same manual path, it does not automate it.
+#
+# The main ci.yml's build-test job already runs `cargo check/test
+# --all-targets` on every src/** push (native x86_64), which covers this
+# binary too. What's unique here is the ARM64 cross-compile (Tokyo's
+# actual host architecture) and a ready-to-copy artifact.
+
+on:
+  push:
+    paths:
+      - "src/bin/robinhood_dipgrid.rs"
+      - "src/trade/**"
+      - "src/lib.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci-robinhood-dipgrid.yml"
+  workflow_dispatch:
+    inputs:
+      dex_connector_ref:
+        description: "Dex-connector ref/tag override (optional)"
+        required: false
+        type: string
+
+concurrency:
+  group: robinhood-dipgrid-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DEX_CONNECTOR_REF: v4.7.2
+  LIGHTER_GO_REF: v1.0.2
+  AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+
+jobs:
+  check-native:
+    runs-on: ubuntu-latest
+    env:
+      DEX_CONNECTOR_REF: ${{ github.event.inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+      LIGHTER_GO_PATH: ${{ github.workspace }}/lighter-go
+      LD_LIBRARY_PATH: ${{ github.workspace }}/lighter-go
+    defaults:
+      run:
+        working-directory: debot
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Checkout dex-connector
+        uses: actions/checkout@v5
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ env.DEX_CONNECTOR_REF }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Checkout lighter-go
+        uses: actions/checkout@v5
+        with:
+          repository: elliottech/lighter-go
+          ref: ${{ env.LIGHTER_GO_REF }}
+          path: lighter-go
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.23.x"
+          cache: true
+          cache-dependency-path: lighter-go/go.sum
+
+      - name: Build libsigner
+        run: go build -buildmode=c-shared -trimpath -o libsigner.so ./sharedlib
+        working-directory: ${{ github.workspace }}/lighter-go
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            debot -> target
+
+      - name: Cargo check (robinhood_dipgrid only)
+        run: cargo check --bin robinhood_dipgrid --locked
+
+      - name: Cargo test (robinhood_dipgrid only)
+        run: cargo test --bin robinhood_dipgrid --locked
+
+  build-arm64:
+    needs: check-native
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DEX_CONNECTOR_REF: ${{ github.event.inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Checkout dex-connector
+        uses: actions/checkout@v5
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ env.DEX_CONNECTOR_REF }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Checkout lighter-go
+        uses: actions/checkout@v5
+        with:
+          repository: elliottech/lighter-go
+          ref: ${{ env.LIGHTER_GO_REF }}
+          path: lighter-go
+
+      - name: Cache libsigner (linux/arm64)
+        id: cache_libsigner
+        uses: actions/cache@v5
+        with:
+          path: lighter-go/build/libsigner.so
+          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+
+      - name: Build libsigner (linux/arm64)
+        if: steps.cache_libsigner.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p lighter-go/build
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}/lighter-go:/go/src/sdk" \
+            -w /go/src/sdk \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            ${AL2023_IMAGE} \
+            /bin/bash -lc "dnf -y install golang gcc && CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib && chown -R ${HOST_UID}:${HOST_GID} /go/src/sdk/build"
+
+      - name: Save libsigner cache (linux/arm64)
+        if: steps.cache_libsigner.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: lighter-go/build/libsigner.so
+          key: ${{ runner.os }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ hashFiles('lighter-go/go.sum') }}
+
+      - name: Cache cargo (linux/arm64)
+        id: cache_cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            debot/target
+          key: ${{ runner.os }}-cargo-arm64-dipgrid-${{ hashFiles('debot/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arm64-dipgrid-
+            ${{ runner.os }}-cargo-arm64-
+
+      - name: Build robinhood_dipgrid (linux/arm64)
+        id: build_dipgrid
+        run: |
+          mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/workspace/.cache/cargo \
+            -e RUSTUP_HOME=/workspace/.cache/rustup \
+            -e CARGO_INCREMENTAL=0 \
+            -e LIGHTER_GO_PATH=/workspace/lighter-go/build \
+            -e LD_LIBRARY_PATH=/workspace/lighter-go/build \
+            ${AL2023_IMAGE} \
+            /bin/bash -lc "set -euo pipefail; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --bin robinhood_dipgrid; chown -R ${HOST_UID}:${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+
+      - name: Fix cargo cache permissions
+        if: steps.build_dipgrid.outcome == 'success'
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
+            sudo chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
+          else
+            chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
+            chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
+          fi
+
+      - name: Save cargo cache (linux/arm64)
+        if: steps.build_dipgrid.outcome == 'success' && steps.cache_cargo.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            debot/target
+          key: ${{ runner.os }}-cargo-arm64-dipgrid-${{ hashFiles('debot/Cargo.lock') }}
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist/bin dist/lib
+          cp debot/target/release/robinhood_dipgrid dist/bin/robinhood_dipgrid
+          cp lighter-go/build/libsigner.so dist/lib/libsigner.so
+
+      # No AWS/SSM upload step on purpose (see header comment). Grab the
+      # artifact from this run and push it to the Tokyo host by hand, the
+      # same way freq/b were originally deployed (see bot-strategy#798).
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: robinhood-dipgrid-arm64-${{ github.sha }}
+          path: dist/
+          retention-days: 14
