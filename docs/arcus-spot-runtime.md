@@ -177,8 +177,10 @@ With `arcus-spot-live`, the library provides:
   it itself. `auto-execute` (see below) intentionally skips this signature
   requirement -- a narrow, explicit exception, not a change to `execute`/
   `resume` themselves;
-- hard coordinator caps of at most 60-second-old plans, 100 bps slippage, ten
-  reconciled swaps per UTC day, and deployer-pinned raw sell maxima;
+- hard coordinator caps of at most 60-second-old plans, 100 bps slippage,
+  twenty reconciled swaps per UTC day (ten round trips -- raised from ten in
+  bot-strategy#823, since the cap rather than the signal was deciding how
+  much the bot traded), and deployer-pinned raw sell maxima;
 - exactly one submit attempt, sticky `UNKNOWN` on ambiguous delivery, safe
   status GETs, and exact pre/post wallet-balance reconciliation;
 - a runtime commit seam that refuses fills inconsistent with the genuine
