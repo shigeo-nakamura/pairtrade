@@ -42,10 +42,55 @@ env:
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
 
 jobs:
+  # Mirrors ci.yml's own resolve-ref job: default to the latest dex-connector
+  # tag unless a workflow_dispatch input overrides it. Keeps this workflow
+  # tracking the same target as the main CI instead of drifting on its own
+  # separate hardcoded pin.
+  resolve-ref:
+    runs-on: ubuntu-latest
+    outputs:
+      dex_connector_ref: ${{ steps.resolve.outputs.dex_connector_ref }}
+    steps:
+      - name: Resolve dex-connector ref
+        id: resolve
+        env:
+          DEFAULT_REF: ${{ env.DEX_CONNECTOR_REF }}
+          INPUT_REF: ${{ github.event.inputs.dex_connector_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          default_ref = os.environ.get("DEFAULT_REF", "").strip()
+          input_ref = (os.environ.get("INPUT_REF") or "").strip()
+          token = os.environ.get("GH_TOKEN", "")
+
+          ref = input_ref or default_ref
+          if not input_ref:
+              try:
+                  req = urllib.request.Request(
+                      "https://api.github.com/repos/shigeo-nakamura/dex-connector/tags?per_page=1",
+                      headers={
+                          "Accept": "application/vnd.github+json",
+                          "Authorization": f"Bearer {token}",
+                      },
+                  )
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      data = json.load(resp)
+                  if data and "name" in data[0]:
+                      ref = data[0]["name"]
+              except Exception:
+                  pass
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"dex_connector_ref={ref}\n")
+          PY
+
   check-native:
+    needs: resolve-ref
     runs-on: ubuntu-latest
     env:
-      DEX_CONNECTOR_REF: ${{ github.event.inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
       LIGHTER_GO_PATH: ${{ github.workspace }}/lighter-go
       LD_LIBRARY_PATH: ${{ github.workspace }}/lighter-go
     defaults:
@@ -99,11 +144,11 @@ jobs:
         run: cargo test --bin robinhood_dipgrid --locked
 
   build-arm64:
-    needs: check-native
+    needs: [resolve-ref, check-native]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      DEX_CONNECTOR_REF: ${{ github.event.inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
     steps:
       - name: Checkout debot
         uses: actions/checkout@v5
