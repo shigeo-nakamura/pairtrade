@@ -19,6 +19,20 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt::Display, path::Path, str::FromStr};
 
 const ARCUS_VENUE: &str = "arcus";
+
+/// Whether a plan routes through Arcus itself, the only venue this executor
+/// may dispatch to (`allowWrapped=false`, direct routing only, per the
+/// approved envelope on bot-strategy#772).
+///
+/// Exposed so callers can ask *before* dispatching. The router recommends
+/// whichever venue prices best and that is frequently not Arcus, so a plan
+/// this executor must refuse is an ordinary market outcome rather than a
+/// fault -- see the caller in `live-tick` (bot-strategy#817). `validate_plan`
+/// still enforces it independently, since `execute`/`auto-execute` take a
+/// caller-supplied plan that never passed through that check.
+pub fn is_direct_arcus_route(plan: &ArcusSpotRotationPlan) -> bool {
+    plan.venue.eq_ignore_ascii_case(ARCUS_VENUE)
+}
 const CANONICAL_PERMIT2: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const HARD_MAX_DAILY_SWAPS: u32 = 10;
 const HARD_MAX_SLIPPAGE_BPS: u32 = 100;
@@ -480,7 +494,7 @@ where
             bail!("Arcus execution ledger has an active attempt");
         }
         self.validate_plan_age(plan)?;
-        if !plan.venue.eq_ignore_ascii_case(ARCUS_VENUE) {
+        if !is_direct_arcus_route(plan) {
             bail!("initial live execution requires a direct Arcus strategy plan");
         }
         if plan.sell_symbol.eq_ignore_ascii_case(&plan.buy_symbol) {

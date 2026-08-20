@@ -115,6 +115,38 @@ Take a fresh `state-backup` afterwards — backups from before the clear no
 longer verify, since continuity checks treat a lost halt as a real state
 change.
 
+### Routes this executor may not take
+
+Only a direct Arcus route is dispatchable (`allowWrapped=false`, per the
+approved envelope on bot-strategy#772). The router, though, recommends
+whichever venue prices best, and that is frequently not Arcus: over one
+sample of the recorder archive on 2026-08-19, Rialto won about two thirds of
+the routes and Arcus about one third, with Arcus quoting fine and simply
+being outbid (by ~0.37% on the tick inspected).
+
+So a would-rotate plan the executor must refuse is an ordinary market
+outcome, not a fault. `live-tick` checks `is_direct_arcus_route` before
+building or writing anything, logs one `[arcus-route] ...` line naming the
+venue, and exits successfully; `validate_plan` still enforces the same
+predicate independently, for the caller-supplied plans `execute`/
+`auto-execute` take.
+
+Each decline appends one line to `declined-routes.jsonl`, next to the
+runtime checkpoint: when, which way, how strong the signal was, at what size
+and marks. Counting declines does not say what they were worth — if the
+declined signals were the weak ones the surviving third flatters the
+strategy, and if they were the strong ones it understates it — so the record
+carries enough to price the counterfactual offline against the recorder
+archive, rather than putting a shadow position tracker inside a signing bot
+(bot-strategy#818, owner chose to keep the constraint and measure its cost).
+A failed write is reported and ignored: this file is analysis, not safety.
+
+This used to fail the unit instead. On 2026-08-19 twelve consecutive ticks
+exited non-zero while the bot was behaving exactly as designed
+(bot-strategy#817), which is the same signal a real fault would have had to
+stand out from. The economics of the constraint -- roughly two thirds of
+entry opportunities declined -- are tracked separately.
+
 The log-price ratio signal is evaluated against prior samples only. The current
 sample is appended after z-score calculation, avoiding same-tick look-ahead.
 This is a runtime/replay seam, not evidence that NVDA/AMD is economically
