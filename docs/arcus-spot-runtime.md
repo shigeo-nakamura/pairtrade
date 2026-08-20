@@ -115,6 +115,28 @@ Take a fresh `state-backup` afterwards — backups from before the clear no
 longer verify, since continuity checks treat a lost halt as a real state
 change.
 
+### Routes this executor may not take
+
+Only a direct Arcus route is dispatchable (`allowWrapped=false`, per the
+approved envelope on bot-strategy#772). The router, though, recommends
+whichever venue prices best, and that is frequently not Arcus: over one
+sample of the recorder archive on 2026-08-19, Rialto won about two thirds of
+the routes and Arcus about one third, with Arcus quoting fine and simply
+being outbid (by ~0.37% on the tick inspected).
+
+So a would-rotate plan the executor must refuse is an ordinary market
+outcome, not a fault. `live-tick` checks `is_direct_arcus_route` before
+building or writing anything, logs one `[arcus-route] ...` line naming the
+venue, and exits successfully; `validate_plan` still enforces the same
+predicate independently, for the caller-supplied plans `execute`/
+`auto-execute` take.
+
+This used to fail the unit instead. On 2026-08-19 twelve consecutive ticks
+exited non-zero while the bot was behaving exactly as designed
+(bot-strategy#817), which is the same signal a real fault would have had to
+stand out from. The economics of the constraint -- roughly two thirds of
+entry opportunities declined -- are tracked separately.
+
 The log-price ratio signal is evaluated against prior samples only. The current
 sample is appended after z-score calculation, avoiding same-tick look-ahead.
 This is a runtime/replay seam, not evidence that NVDA/AMD is economically

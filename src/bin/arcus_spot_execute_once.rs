@@ -12,8 +12,8 @@ use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, NaiveDate, Utc};
 use debot::arcus_spot::{
-    build_arcus_spot_kms_signer, ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision,
-    ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
+    build_arcus_spot_kms_signer, is_direct_arcus_route, ArcusSpotChainClient, ArcusSpotChainConfig,
+    ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
     ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig,
     ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotRegime,
     ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntime,
@@ -3007,6 +3007,31 @@ async fn main() -> Result<()> {
                     return write_live_tick_event(&event);
                 }
             };
+            // The router recommends whichever venue prices best, and that is
+            // usually not Arcus -- over one recent sample of the archive,
+            // Rialto won about two thirds of the routes. This executor may
+            // only dispatch a direct Arcus route, so those ticks are an
+            // ordinary market outcome: the strategy would rotate, the route
+            // it was handed is not one we are allowed to take.
+            //
+            // Treated as a fault until bot-strategy#817: the plan was built,
+            // written, and only refused deep inside the executor, so the
+            // unit exited non-zero. Twelve consecutive ticks on 2026-08-19
+            // therefore looked like a failing service while the bot was in
+            // fact behaving correctly, which is precisely the signal a real
+            // fault would have needed to stand out from. Declining here
+            // keeps the run successful and leaves no pending-plan file for a
+            // dispatch that never happened. `validate_plan` still refuses
+            // the same route independently.
+            if !is_direct_arcus_route(&plan) {
+                drop(checkpoint_lock);
+                eprintln!(
+                    "[arcus-route] declined a would-rotate plan: recommended venue {:?} is not the \
+                     direct Arcus route this executor may dispatch; nothing was submitted",
+                    plan.venue,
+                );
+                return write_live_tick_event(&event);
+            }
             let plan_config_digest = approval_digest(&config, &plan)?;
             // Durably record the plan and the recorder evidence from which
             // it was derived before dispatching it: unlike
@@ -5720,6 +5745,35 @@ runtime:
         );
         let error = validate_config(&mut config).unwrap_err();
         assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    /// bot-strategy#817: a plan the router put on another venue is an
+    /// ordinary market outcome, not a fault, so live-tick declines it before
+    /// building anything rather than letting the executor fail the run.
+    ///
+    /// `ArcusSpotLiveExecutor::validate_plan` calls this same predicate, so
+    /// the pre-dispatch check and the enforcement cannot drift apart into
+    /// live-tick dispatching something the executor then refuses.
+    #[test]
+    fn only_a_direct_arcus_route_is_dispatchable() {
+        let arcus = rotation_plan("entry_signal");
+        assert_eq!(arcus.venue, "arcus");
+        assert!(is_direct_arcus_route(&arcus));
+
+        // Case-insensitively: the venue string comes off the wire.
+        let mut shouty = rotation_plan("entry_signal");
+        shouty.venue = "ARCUS".to_string();
+        assert!(is_direct_arcus_route(&shouty));
+
+        // The venue that actually wins most routes in practice -- about two
+        // thirds of them in the recorder archive on 2026-08-19.
+        let mut rialto = rotation_plan("entry_signal");
+        rialto.venue = "rialto".to_string();
+        assert!(!is_direct_arcus_route(&rialto));
+
+        let mut empty = rotation_plan("entry_signal");
+        empty.venue = String::new();
+        assert!(!is_direct_arcus_route(&empty));
     }
 
     fn rotation_plan(trigger: &str) -> ArcusSpotRotationPlan {
