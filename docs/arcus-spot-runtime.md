@@ -131,6 +131,16 @@ venue, and exits successfully; `validate_plan` still enforces the same
 predicate independently, for the caller-supplied plans `execute`/
 `auto-execute` take.
 
+Each decline appends one line to `declined-routes.jsonl`, next to the
+runtime checkpoint: when, which way, how strong the signal was, at what size
+and marks. Counting declines does not say what they were worth — if the
+declined signals were the weak ones the surviving third flatters the
+strategy, and if they were the strong ones it understates it — so the record
+carries enough to price the counterfactual offline against the recorder
+archive, rather than putting a shadow position tracker inside a signing bot
+(bot-strategy#818, owner chose to keep the constraint and measure its cost).
+A failed write is reported and ignored: this file is analysis, not safety.
+
 This used to fail the unit instead. On 2026-08-19 twelve consecutive ticks
 exited non-zero while the bot was behaving exactly as designed
 (bot-strategy#817), which is the same signal a real fault would have had to

@@ -359,6 +359,94 @@ fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<Pa
     Ok(parent.join("live-tick-pending-plan.json"))
 }
 
+fn declined_route_log_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
+    let parent = config
+        .runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(parent.join("declined-routes.jsonl"))
+}
+
+/// Append one record of an entry the router priced onto a venue this
+/// executor may not take (bot-strategy#818).
+///
+/// The constraint costs roughly two thirds of entries, and counting them
+/// does not say what they were worth: if the declined signals were the weak
+/// ones the surviving third flatters the strategy, and if they were the
+/// strong ones it understates it. Nothing in the live path can tell those
+/// apart, and a shadow position tracker inside a signing bot is far more
+/// machinery than the question deserves. So record what a decline *was* --
+/// when, which way, how strong, at what size and price -- and price the
+/// counterfactual offline against the recorder archive, which is already
+/// collected and shipped to S3 continuously.
+///
+/// Failure to write is reported and then ignored. This file is analysis,
+/// not safety: failing a tick over it would recreate, for a strictly less
+/// important reason, exactly the "correct behaviour reported as a fault"
+/// problem that #817 just removed.
+fn decline_non_direct_route(
+    config: &ArcusSpotExecuteOnceConfig,
+    event: &ArcusSpotRuntimeEvent,
+    plan: &ArcusSpotRotationPlan,
+) -> Result<()> {
+    record_declined_route(config, event, plan);
+    eprintln!(
+        "[arcus-route] declined a would-rotate plan: recommended venue {:?} is not the direct \
+         Arcus route this executor may dispatch; nothing was submitted",
+        plan.venue,
+    );
+    write_live_tick_event(event)
+}
+
+fn record_declined_route(
+    config: &ArcusSpotExecuteOnceConfig,
+    event: &ArcusSpotRuntimeEvent,
+    plan: &ArcusSpotRotationPlan,
+) {
+    let record = serde_json::json!({
+        "declined_at": event.observed_at,
+        "sequence": event.sequence,
+        "pair": event.pair,
+        "z_score": event.z_score,
+        "trigger": plan.trigger,
+        "direction": plan.direction,
+        "recommended_venue": plan.venue,
+        "sell_symbol": plan.sell_symbol,
+        "buy_symbol": plan.buy_symbol,
+        "sell_quantity": plan.sell_quantity.to_string(),
+        "buy_quantity": plan.buy_quantity.to_string(),
+        "sell_amount_raw": plan.sell_amount_raw,
+        "buy_amount_raw": plan.buy_amount_raw,
+        "quote_received_at": plan.quote_received_at,
+        "optimistic_round_trip_loss_bps": plan.optimistic_round_trip_loss_bps.to_string(),
+        "all_in_round_trip_cost_bps": plan.all_in_round_trip_cost_bps.to_string(),
+        "token_a_reference_price_usd": event.token_a_reference_price_usd.map(|p| p.to_string()),
+        "token_b_reference_price_usd": event.token_b_reference_price_usd.map(|p| p.to_string()),
+    });
+    if let Err(error) = append_declined_route(config, &record) {
+        eprintln!("[arcus-route] failed to record the declined route: {error:#}");
+    }
+}
+
+fn append_declined_route(
+    config: &ArcusSpotExecuteOnceConfig,
+    record: &serde_json::Value,
+) -> Result<()> {
+    let path = declined_route_log_path(config)?;
+    let mut line = serde_json::to_vec(record).context("failed to serialize the declined route")?;
+    line.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(&line)
+        .with_context(|| format!("failed to append to {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", path.display()))
+}
+
 fn live_tick_observation_evidence_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
     let parent = config
         .runtime_state_path
@@ -3024,13 +3112,11 @@ async fn main() -> Result<()> {
             // dispatch that never happened. `validate_plan` still refuses
             // the same route independently.
             if !is_direct_arcus_route(&plan) {
+                // Held until the record is written so two concurrent ticks
+                // cannot interleave their declines out of order in the file.
+                let declined = decline_non_direct_route(&config, &event, &plan);
                 drop(checkpoint_lock);
-                eprintln!(
-                    "[arcus-route] declined a would-rotate plan: recommended venue {:?} is not the \
-                     direct Arcus route this executor may dispatch; nothing was submitted",
-                    plan.venue,
-                );
-                return write_live_tick_event(&event);
+                return declined;
             }
             let plan_config_digest = approval_digest(&config, &plan)?;
             // Durably record the plan and the recorder evidence from which
@@ -5745,6 +5831,76 @@ runtime:
         );
         let error = validate_config(&mut config).unwrap_err();
         assert!(error.to_string().contains("live-tick pending-plan path"));
+    }
+
+    /// bot-strategy#818 option C: counting declines does not say what they
+    /// were worth, so each one records enough to price the counterfactual
+    /// offline against the recorder archive — when, which way, how strong,
+    /// at what size and price.
+    #[test]
+    fn a_declined_route_is_recorded_with_enough_to_price_it_later() {
+        let dir = tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.json");
+        let runtime_path = dir.path().join("runtime.json");
+        let config = execute_once_config(
+            ledger_path.to_str().unwrap(),
+            runtime_path.to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+
+        let mut plan = rotation_plan("entry_signal");
+        plan.venue = "rialto".to_string();
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let runtime = store.load_existing(&config.runtime).unwrap();
+        let event = ArcusSpotRuntimeEvent {
+            sequence: 41,
+            observed_at: fixture_now(),
+            pair: "NVDA/AMD".to_string(),
+            mode: ArcusSpotRuntimeMode::Live,
+            token_a_reference_price_usd: Some(Decimal::from(200)),
+            token_b_reference_price_usd: Some(Decimal::from(100)),
+            relative_log_price: Some(0.5),
+            z_score: Some(2.9),
+            inventory_before: runtime.state().inventory,
+            inventory_after: runtime.state().inventory,
+            regime_before: ArcusSpotRegime::Neutral,
+            regime_after: ArcusSpotRegime::Neutral,
+            risk_before: None,
+            risk_after: None,
+            decision: ArcusSpotDecision::WouldRotate { plan: plan.clone() },
+        };
+
+        // Through the same entry point the live-tick arm returns, so a
+        // decline that stopped recording would fail here rather than
+        // silently produce an empty file at readout time.
+        decline_non_direct_route(&config, &event, &plan).unwrap();
+        decline_non_direct_route(&config, &event, &plan).unwrap();
+
+        let path = declined_route_log_path(&config).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+        );
+        let lines: Vec<&str> = {
+            let raw = fs::read_to_string(&path).unwrap();
+            Box::leak(raw.into_boxed_str()).lines().collect()
+        };
+        assert_eq!(lines.len(), 2, "each decline appends, none overwrite");
+
+        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        // Signal strength, so the weak-vs-strong question is answerable.
+        assert_eq!(row["z_score"], serde_json::json!(2.9));
+        // Which venue took it away from us.
+        assert_eq!(row["recommended_venue"], "rialto");
+        // Direction and size, to reconstruct the position.
+        assert_eq!(row["sell_symbol"], "NVDA");
+        assert_eq!(row["buy_symbol"], "AMD");
+        assert_eq!(row["sell_quantity"], "0.05");
+        // Marks, to price entry against the archive.
+        assert_eq!(row["token_a_reference_price_usd"], "200");
+        assert_eq!(row["token_b_reference_price_usd"], "100");
+        assert_eq!(row["sequence"], serde_json::json!(41));
     }
 
     /// bot-strategy#817: a plan the router put on another venue is an
