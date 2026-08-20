@@ -146,7 +146,12 @@ jobs:
   build-arm64:
     needs: [resolve-ref, check-native]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # ci.yml's own deploy job needed to raise this from an original 60min
+    # cap to 180 because the QEMU-emulated arm64 cargo build (full debot
+    # lib graph, incl. aws-sdk-s3) is slow on a cold cache. This binary
+    # pulls in the same lib graph via DexConnectorBox, so it hits the same
+    # wall — confirmed by a real 60min timeout on the first run here.
+    timeout-minutes: 180
     env:
       DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
     steps:
