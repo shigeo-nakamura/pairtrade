@@ -934,21 +934,35 @@ impl PairTradeEngine {
                             // the same evaluation tick. Other risk exits keep
                             // the established ineligible attribution.
                             //
-                            // `risk_exit` above is gated behind `defer_cap >
-                            // 0` (it only exists to bypass book-quality
-                            // deferral), so with the default
+                            // `risk_exit` already applies the right
+                            // precedence internally (stop_loss_z before
+                            // beta_floor, see risk_exit_reason), so a
+                            // `Some(_)` other than `Some("beta_floor")` means
+                            // a higher-precedence risk reason fired and must
+                            // not be relabeled — doing so would drop the
+                            // close from stop-loss metrics and skip arming
+                            // `stop_loss_cooldown_secs`, permitting an early
+                            // same-direction re-entry (Codex review).
+                            //
+                            // `risk_exit` is gated behind `defer_cap > 0` (it
+                            // only exists to bypass book-quality deferral),
+                            // so with the default
                             // `ineligible_close_defer_cap_secs=0` it is
                             // always `None` and could never surface
                             // `beta_floor` here — undercounting the new exit
                             // reason in exactly the default deployment
-                            // configuration. Check the floor independently
-                            // of whether deferral is enabled.
-                            let close_reason = if risk_exit == Some("beta_floor")
-                                || crate::pairtrade::exit::beta_floor_exit_due(pp, beta_eff)
-                            {
-                                "beta_floor"
-                            } else {
-                                "ineligible"
+                            // configuration. Only in that `None` case do we
+                            // fall back to checking the floor directly.
+                            let close_reason = match risk_exit {
+                                Some("beta_floor") => "beta_floor",
+                                Some(_) => "ineligible",
+                                None => {
+                                    if crate::pairtrade::exit::beta_floor_exit_due(pp, beta_eff) {
+                                        "beta_floor"
+                                    } else {
+                                        "ineligible"
+                                    }
+                                }
                             };
                             log::info!("[EXIT_CHECK] {} reason={}", key, close_reason);
                             // Deliberately NOT clearing ineligible_defer_since_ts
