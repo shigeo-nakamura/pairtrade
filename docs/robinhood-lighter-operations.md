@@ -5,7 +5,10 @@ Use UTC in every check and preserve venue exports under `~/bot/logs/`.
 
 ## Safe stop and rollback
 
-1. Block new entries with `/opt/debot-robinhood-lighter/KILL_SWITCH`.
+1. Block new entries with `/opt/debot/KILL_SWITCH`. `scripts/debot-pair-robinhood-lighter.sh`
+   does not set `KILL_SWITCH_PATH`, so `sentinel.rs` resolves the default global path, not a
+   path under `STATE_DIR` (`/opt/debot-robinhood-lighter`) — creating that directory's
+   `KILL_SWITCH` file does **not** block entries on this deployment.
 2. Confirm each arm's latest `[METRICS]` line reports `elig=true`, then verify
    BTC and ETH positions and pending orders directly against the venue. Do not
    infer flatness from `ENTRY` logs alone.
