@@ -1625,17 +1625,11 @@ fn require_acceptance_entry_within_strategy_limits(
     baseline: &ArcusSpotRuntimeState,
     plan: &ArcusSpotRotationPlan,
     signal_sample: f64,
-    sell_reference_price_usd: Decimal,
+    token_a_reference_price_usd: Decimal,
+    token_b_reference_price_usd: Decimal,
 ) -> Result<()> {
     if plan.trigger != ArcusSpotRotationTrigger::EntrySignal {
         bail!("Arcus acceptance from a neutral backup must be an entry signal");
-    }
-    // The current recorder row verifies only the A-to-B-to-A round trip.
-    // build_plan therefore refuses a fresh B-to-A entry until a separately
-    // verified B-to-A-to-B quote exists; continuity must not certify a
-    // direction that live-tick could never have proposed.
-    if plan.direction != ArcusSpotDirection::TokenAToTokenB {
-        bail!("Arcus acceptance reverse-direction entries are not supported by the planner");
     }
     if plan.optimistic_round_trip_loss_bps < Decimal::ZERO {
         bail!("Arcus acceptance optimistic round-trip loss must not be negative");
@@ -1675,6 +1669,10 @@ fn require_acceptance_entry_within_strategy_limits(
         .context("Arcus acceptance token decimals exceed Decimal range")?;
     let raw_scale = Decimal::try_from_i128_with_scale(raw_scale, 0)
         .context("Arcus acceptance token decimals exceed Decimal range")?;
+    let sell_reference_price_usd = match plan.direction {
+        ArcusSpotDirection::TokenAToTokenB => token_a_reference_price_usd,
+        ArcusSpotDirection::TokenBToTokenA => token_b_reference_price_usd,
+    };
     let expected_sell_raw = config
         .runtime
         .notional_usd
@@ -1690,11 +1688,46 @@ fn require_acceptance_entry_within_strategy_limits(
     {
         bail!("Arcus acceptance sell amount does not match the configured USD notional");
     }
-    let sellable = baseline
-        .inventory
-        .token_a
-        .checked_sub(config.runtime.inventory_floors.token_a)
-        .context("Arcus acceptance backup inventory is below its token A floor")?;
+    let (sellable, predicted_inventory) = match plan.direction {
+        ArcusSpotDirection::TokenAToTokenB => (
+            baseline
+                .inventory
+                .token_a
+                .checked_sub(config.runtime.inventory_floors.token_a)
+                .context("Arcus acceptance backup inventory is below its token A floor")?,
+            ArcusSpotInventory {
+                token_a: baseline
+                    .inventory
+                    .token_a
+                    .checked_sub(plan.sell_quantity)
+                    .context("Arcus acceptance predicted token A inventory underflow")?,
+                token_b: baseline
+                    .inventory
+                    .token_b
+                    .checked_add(plan.buy_quantity)
+                    .context("Arcus acceptance predicted token B inventory overflow")?,
+            },
+        ),
+        ArcusSpotDirection::TokenBToTokenA => (
+            baseline
+                .inventory
+                .token_b
+                .checked_sub(config.runtime.inventory_floors.token_b)
+                .context("Arcus acceptance backup inventory is below its token B floor")?,
+            ArcusSpotInventory {
+                token_a: baseline
+                    .inventory
+                    .token_a
+                    .checked_add(plan.buy_quantity)
+                    .context("Arcus acceptance predicted token A inventory overflow")?,
+                token_b: baseline
+                    .inventory
+                    .token_b
+                    .checked_sub(plan.sell_quantity)
+                    .context("Arcus acceptance predicted token B inventory underflow")?,
+            },
+        ),
+    };
     let maximum_rotation = sellable
         .checked_mul(config.runtime.max_rotation_fraction)
         .context("Arcus acceptance rotation cap exceeds Decimal range")?;
@@ -1705,18 +1738,6 @@ fn require_acceptance_entry_within_strategy_limits(
             maximum_rotation
         );
     }
-    let predicted_inventory = ArcusSpotInventory {
-        token_a: baseline
-            .inventory
-            .token_a
-            .checked_sub(plan.sell_quantity)
-            .context("Arcus acceptance predicted token A inventory underflow")?,
-        token_b: baseline
-            .inventory
-            .token_b
-            .checked_add(plan.buy_quantity)
-            .context("Arcus acceptance predicted token B inventory overflow")?,
-    };
     if plan.predicted_inventory != predicted_inventory {
         bail!("Arcus acceptance predicted inventory does not match the backup and plan quantities");
     }
@@ -1969,7 +1990,7 @@ fn require_acceptance_ledger_and_position_continuity(
             if signal_direction != plan.direction {
                 bail!("Arcus acceptance entry signal direction does not match its pending plan");
             }
-            let (token_a_reference_price_usd, _) =
+            let (token_a_reference_price_usd, token_b_reference_price_usd) =
                 acceptance_reference_prices(baseline_runtime, current_runtime, signal_sample)?;
             require_acceptance_entry_within_strategy_limits(
                 config,
@@ -1977,6 +1998,7 @@ fn require_acceptance_ledger_and_position_continuity(
                 &plan,
                 signal_sample,
                 token_a_reference_price_usd,
+                token_b_reference_price_usd,
             )?;
             let (actual_buy_quantity, filled_at) =
                 reconciled_fill_for_continuity(config, &plan, attempt, evidence.evaluation_time)?;
@@ -3016,14 +3038,11 @@ async fn main() -> Result<()> {
             let client = ArcusSpotClient::new(config.router.clone())
                 .context("invalid Arcus router configuration")?;
             let recorder_config = ArcusSpotRecorderConfig::from_csv(
-                &format!(
-                    "{}/{}",
-                    config.runtime.pair.sell_symbol, config.runtime.pair.buy_symbol
-                ),
+                &config.runtime.bidirectional_recorder_pairs_csv(),
                 &config.runtime.notional_usd.normalize().to_string(),
             )
             .context(
-                "failed to build a single-pair recorder config from the runtime pair/notional",
+                "failed to build a bidirectional recorder config from the runtime pair/notional",
             )?;
             let recorder = ArcusSpotRecorder::new(client, recorder_config)
                 .context("invalid Arcus recorder configuration")?;
@@ -5043,7 +5062,7 @@ runtime:
     }
 
     #[test]
-    fn continuity_verification_rejects_a_reverse_direction_entry() {
+    fn continuity_verification_accepts_a_valid_reverse_direction_entry() {
         let dir = tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.json");
         let runtime_path = dir.path().join("runtime.json");
@@ -5055,17 +5074,30 @@ runtime:
         let runtime = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
         let mut plan = rotation_plan("entry_signal");
         plan.direction = ArcusSpotDirection::TokenBToTokenA;
+        plan.sell_symbol = "AMD".to_string();
+        plan.buy_symbol = "NVDA".to_string();
+        plan.sell_token_address = "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string();
+        plan.buy_token_address = "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string();
+        plan.sell_quantity = Decimal::new(2, 2);
+        plan.buy_quantity = Decimal::new(4, 2);
+        plan.sell_amount_raw = "20000000000000000".to_string();
+        plan.buy_amount_raw = "40000000000000000".to_string();
+        plan.predicted_inventory = ArcusSpotInventory {
+            token_a: Decimal::new(39, 2),
+            token_b: Decimal::new(14, 2),
+        };
+        plan.predicted_inventory_imbalance_fraction =
+            Decimal::from_str("0.05405405405405406").unwrap();
 
-        let error = require_acceptance_entry_within_strategy_limits(
+        require_acceptance_entry_within_strategy_limits(
             &config,
             runtime.state(),
             &plan,
-            -0.125,
+            0.4_f64.ln(),
             Decimal::from(200),
+            Decimal::from(500),
         )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("reverse-direction"));
+        .unwrap();
     }
 
     #[test]
@@ -5089,6 +5121,7 @@ runtime:
             &plan,
             0.125,
             Decimal::from(200),
+            Decimal::from(100),
         )
         .unwrap_err();
 
@@ -5210,6 +5243,7 @@ runtime:
             &plan,
             0.125,
             Decimal::from(250),
+            Decimal::from(100),
         )
         .unwrap_err();
 

@@ -1129,11 +1129,12 @@ impl ArcusSpotRuntime {
         })
     }
 
-    /// Validates the recorder row and, depending on `signal`, either both
-    /// route legs (entries, and any tick without a rotation signal) or only
-    /// the leg an exit will actually execute.
+    /// Selects and validates the independently quoted round-trip cycle that
+    /// corresponds to `signal`. Entries consume the selected row's forward
+    /// leg; exits consume its reverse leg. With no signal, the current regime
+    /// identifies which cycle could eventually be exited.
     ///
-    /// An exit only ever consumes one leg (see `build_plan`'s direction
+    /// An exit only ever consumes one leg (see `build_plan`'s trigger
     /// match), and unlike an entry it does not need a verified round-trip
     /// cost -- the cost gate is entry-only (see `build_plan`). Requiring the
     /// *other*, unused leg to also be fresh and internally consistent here
@@ -1153,17 +1154,49 @@ impl ArcusSpotRuntime {
         let token_a_price_usd = price.token_a_price_usd;
         let token_b_price_usd = price.token_b_price_usd;
 
+        let cycle_forward_direction = match signal {
+            Some((direction, ArcusSpotRotationTrigger::EntrySignal)) => direction,
+            Some((ArcusSpotDirection::TokenAToTokenB, _)) => ArcusSpotDirection::TokenBToTokenA,
+            Some((ArcusSpotDirection::TokenBToTokenA, _)) => ArcusSpotDirection::TokenAToTokenB,
+            None => match self.state.regime {
+                ArcusSpotRegime::Neutral | ArcusSpotRegime::RotatedAToB => {
+                    ArcusSpotDirection::TokenAToTokenB
+                }
+                ArcusSpotRegime::RotatedBToA => ArcusSpotDirection::TokenBToTokenA,
+            },
+        };
+        let (
+            cycle_sell_symbol,
+            cycle_buy_symbol,
+            cycle_sell_token,
+            cycle_buy_token,
+            cycle_sell_price_usd,
+            cycle_buy_price_usd,
+        ) = match cycle_forward_direction {
+            ArcusSpotDirection::TokenAToTokenB => (
+                &self.config.pair.sell_symbol,
+                &self.config.pair.buy_symbol,
+                token_a,
+                token_b,
+                token_a_price_usd,
+                token_b_price_usd,
+            ),
+            ArcusSpotDirection::TokenBToTokenA => (
+                &self.config.pair.buy_symbol,
+                &self.config.pair.sell_symbol,
+                token_b,
+                token_a,
+                token_b_price_usd,
+                token_a_price_usd,
+            ),
+        };
+
         let matching_rows = snapshot
             .round_trips
             .iter()
             .filter(|row| {
-                row.pair
-                    .sell_symbol
-                    .eq_ignore_ascii_case(&self.config.pair.sell_symbol)
-                    && row
-                        .pair
-                        .buy_symbol
-                        .eq_ignore_ascii_case(&self.config.pair.buy_symbol)
+                row.pair.sell_symbol.eq_ignore_ascii_case(cycle_sell_symbol)
+                    && row.pair.buy_symbol.eq_ignore_ascii_case(cycle_buy_symbol)
                     && Decimal::from_str(&row.notional_usd)
                         .is_ok_and(|notional| notional == self.config.notional_usd)
             })
@@ -1173,8 +1206,8 @@ impl ArcusSpotRuntime {
                 ArcusSpotHoldCode::RouteUnavailable,
                 format!(
                     "expected one {}/{} row at USD {}; found {}",
-                    self.config.pair.sell_symbol,
-                    self.config.pair.buy_symbol,
+                    cycle_sell_symbol,
+                    cycle_buy_symbol,
                     self.config.notional_usd,
                     matching_rows.len()
                 ),
@@ -1188,14 +1221,14 @@ impl ArcusSpotRuntime {
             ));
         }
         validate_recorded_reference(
-            "token A",
+            "cycle sell token",
             row.sell_reference_price_usd.as_deref(),
-            token_a_price_usd,
+            cycle_sell_price_usd,
         )?;
         validate_recorded_reference(
-            "token B",
+            "cycle buy token",
             row.buy_reference_price_usd.as_deref(),
-            token_b_price_usd,
+            cycle_buy_price_usd,
         )?;
         if row.forward.is_none() || row.reverse.is_none() {
             return Err(ArcusSpotHold::new(
@@ -1212,103 +1245,63 @@ impl ArcusSpotRuntime {
         let forward_route = row.forward.as_ref().expect("checked above");
         let reverse_route = row.reverse.as_ref().expect("checked above");
 
-        let exit_direction = match signal {
-            Some((direction, trigger))
-                if trigger == ArcusSpotRotationTrigger::MeanReversionExit
-                    || trigger == ArcusSpotRotationTrigger::MaxHoldExit =>
-            {
-                Some(direction)
-            }
-            _ => None,
-        };
+        let is_exit = signal.is_some_and(|(_, trigger)| {
+            trigger == ArcusSpotRotationTrigger::MeanReversionExit
+                || trigger == ArcusSpotRotationTrigger::MaxHoldExit
+        });
 
-        let verified_round_trip_loss_bps = match exit_direction {
-            Some(ArcusSpotDirection::TokenAToTokenB) => {
-                validate_route_leg(
-                    forward_route,
-                    token_a,
-                    token_b,
-                    evaluation_time,
-                    self.config.max_quote_age_secs,
-                )?;
-                verify_requested_notional_amount(
-                    row,
-                    forward_route,
-                    self.config.notional_usd,
-                    token_a_price_usd,
-                    token_a,
-                )?;
-                // Not independently verified: the executing (forward) leg
-                // is validated above, and the cost gate this figure feeds
-                // does not apply to exits (see build_plan). Read as-reported
-                // rather than requiring the unused reverse leg to also be
-                // fresh and internally consistent.
-                parse_positive_or_zero(
-                    "optimistic_round_trip_loss_bps",
-                    row.optimistic_round_trip_loss_bps.as_deref(),
-                )?
-            }
-            Some(ArcusSpotDirection::TokenBToTokenA) => {
-                validate_route_leg(
-                    reverse_route,
-                    token_b,
-                    token_a,
-                    evaluation_time,
-                    self.config.max_quote_age_secs,
-                )?;
-                verify_reverse_notional_bound(
-                    reverse_route,
-                    self.config.notional_usd,
-                    token_b_price_usd,
-                    token_b,
-                )?;
-                parse_positive_or_zero(
-                    "optimistic_round_trip_loss_bps",
-                    row.optimistic_round_trip_loss_bps.as_deref(),
-                )?
-            }
-            None => {
-                // No exit is executing this tick (either an entry signal or
-                // none at all): both legs feed verified_round_trip_loss_bps
-                // below, and either one could still be selected as the
-                // executing route once a direction is chosen, so both must
-                // be trusted independently here.
-                validate_route_leg(
-                    forward_route,
-                    token_a,
-                    token_b,
-                    evaluation_time,
-                    self.config.max_quote_age_secs,
-                )?;
-                validate_route_leg(
-                    reverse_route,
-                    token_b,
-                    token_a,
-                    evaluation_time,
-                    self.config.max_quote_age_secs,
-                )?;
-                verify_requested_notional_amount(
-                    row,
-                    forward_route,
-                    self.config.notional_usd,
-                    token_a_price_usd,
-                    token_a,
-                )?;
-                // The reverse leg has no analogous requested_sell_amount to
-                // cross-check: its sell amount is whatever the forward
-                // leg's quote reported as its buy amount, not independently
-                // requested from the notional. A malformed or severely
-                // off-market forward quote could therefore size a B-to-A
-                // rotation far outside the configured notional while still
-                // linking correctly to the forward leg.
-                verify_reverse_notional_bound(
-                    reverse_route,
-                    self.config.notional_usd,
-                    token_b_price_usd,
-                    token_b,
-                )?;
-                verify_round_trip_linkage_and_loss(row)?
-            }
+        let verified_round_trip_loss_bps = if is_exit {
+            // The selected cycle's reverse leg is the only leg an exit
+            // consumes. The entry-only cost gate must not let the unused
+            // forward leg's freshness block a position close.
+            validate_route_leg(
+                reverse_route,
+                cycle_buy_token,
+                cycle_sell_token,
+                evaluation_time,
+                self.config.max_quote_age_secs,
+            )?;
+            verify_reverse_notional_bound(
+                reverse_route,
+                self.config.notional_usd,
+                cycle_buy_price_usd,
+                cycle_buy_token,
+            )?;
+            parse_positive_or_zero(
+                "optimistic_round_trip_loss_bps",
+                row.optimistic_round_trip_loss_bps.as_deref(),
+            )?
+        } else {
+            // An entry (or a tick with no exit) must independently validate
+            // both legs of the selected cycle before trusting its cost.
+            validate_route_leg(
+                forward_route,
+                cycle_sell_token,
+                cycle_buy_token,
+                evaluation_time,
+                self.config.max_quote_age_secs,
+            )?;
+            validate_route_leg(
+                reverse_route,
+                cycle_buy_token,
+                cycle_sell_token,
+                evaluation_time,
+                self.config.max_quote_age_secs,
+            )?;
+            verify_requested_notional_amount(
+                row,
+                forward_route,
+                self.config.notional_usd,
+                cycle_sell_price_usd,
+                cycle_sell_token,
+            )?;
+            verify_reverse_notional_bound(
+                reverse_route,
+                self.config.notional_usd,
+                cycle_buy_price_usd,
+                cycle_buy_token,
+            )?;
+            verify_round_trip_linkage_and_loss(row)?
         };
 
         Ok(SnapshotContext {
@@ -1403,28 +1396,6 @@ impl ArcusSpotRuntime {
         evaluation_time: DateTime<Utc>,
         inventory: ArcusSpotInventory,
     ) -> Result<ArcusSpotRotationPlan, ArcusSpotHold> {
-        // verified_round_trip_loss_bps is computed once per row from the
-        // forward leg's sell amount through to the reverse leg's return
-        // (see verify_round_trip_linkage_and_loss): it only describes the
-        // quoted A-to-B-to-A cycle. A TokenBToTokenA *entry* starts a fresh
-        // B-to-A-to-B cycle instead, which the row's single forward/reverse
-        // pair does not quote — the forward leg is fixed to the original A
-        // amount, not to whatever amount this entry would actually return
-        // to A via the reverse leg. Reusing the A-to-B-to-A figure here
-        // would cost-gate an unrelated cycle, which under nonlinear fees or
-        // slippage can pass a limit the real B-to-A-to-B cycle would not.
-        // A TokenBToTokenA *exit* (closing a position this same row's
-        // forward leg opened) is unaffected: it completes exactly the
-        // A-to-B-to-A cycle this figure measures.
-        if direction == ArcusSpotDirection::TokenBToTokenA
-            && trigger == ArcusSpotRotationTrigger::EntrySignal
-        {
-            return Err(ArcusSpotHold::new(
-                ArcusSpotHoldCode::RouteUnavailable,
-                "reverse-direction (B-to-A) entries require their own B-to-A-to-B round-trip \
-                 quote; this row's verified round-trip cost only covers the A-to-B-to-A cycle",
-            ));
-        }
         let route_loss = context.verified_round_trip_loss_bps;
         let all_in_cost = route_loss
             .checked_add(self.config.gas_buffer_bps)
@@ -1453,16 +1424,22 @@ impl ArcusSpotRuntime {
             ));
         }
 
-        let (route, sell_token, buy_token, sell_balance, sell_floor) = match direction {
+        let route = match trigger {
+            ArcusSpotRotationTrigger::EntrySignal => {
+                context.row.forward.as_ref().expect("validated forward")
+            }
+            ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit => {
+                context.row.reverse.as_ref().expect("validated reverse")
+            }
+        };
+        let (sell_token, buy_token, sell_balance, sell_floor) = match direction {
             ArcusSpotDirection::TokenAToTokenB => (
-                context.row.forward.as_ref().expect("validated forward"),
                 &context.token_a,
                 &context.token_b,
                 inventory.token_a,
                 self.config.inventory_floors.token_a,
             ),
             ArcusSpotDirection::TokenBToTokenA => (
-                context.row.reverse.as_ref().expect("validated reverse"),
                 &context.token_b,
                 &context.token_a,
                 inventory.token_b,
@@ -2613,6 +2590,73 @@ mod tests {
         }
     }
 
+    fn reverse_context(received_at: DateTime<Utc>, loss_bps: Decimal) -> SnapshotContext {
+        let base = context(received_at, loss_bps);
+        let forward_requested_at = received_at - Duration::seconds(1);
+        let reverse_requested_at = received_at;
+        let reverse_received_at = received_at + Duration::seconds(1);
+        let row = serde_json::from_value(json!({
+            "pair": {"sell_symbol": "AMD", "buy_symbol": "NVDA"},
+            "notional_usd": "5",
+            "sell_reference_price_usd": "100",
+            "buy_reference_price_usd": "200",
+            "requested_sell_amount": "50000000000000000",
+            "forward": {
+                "chain_id": 4663,
+                "sell_symbol": "AMD",
+                "buy_symbol": "NVDA",
+                "sell_token": base.token_b.address,
+                "buy_token": base.token_a.address,
+                "sell_amount": "50000000000000000",
+                "response": {
+                    "payload": {
+                        "recommended": "arcus",
+                        "all": [{
+                            "venue": "arcus",
+                            "buyAmount": "24500000000000000",
+                            "sellAmount": "50000000000000000",
+                            "fees": []
+                        }],
+                        "errors": []
+                    },
+                    "requested_at": forward_requested_at,
+                    "received_at": received_at,
+                    "latency_ms": 1000,
+                    "attempts": 1
+                }
+            },
+            "reverse": {
+                "chain_id": 4663,
+                "sell_symbol": "NVDA",
+                "buy_symbol": "AMD",
+                "sell_token": base.token_a.address,
+                "buy_token": base.token_b.address,
+                "sell_amount": "24500000000000000",
+                "response": {
+                    "payload": {
+                        "recommended": "arcus",
+                        "all": [{
+                            "venue": "arcus",
+                            "buyAmount": "49600000000000000",
+                            "sellAmount": "24500000000000000",
+                            "fees": []
+                        }],
+                        "errors": []
+                    },
+                    "requested_at": reverse_requested_at,
+                    "received_at": reverse_received_at,
+                    "latency_ms": 1000,
+                    "attempts": 1
+                }
+            },
+            "optimistic_return_amount": "49600000000000000",
+            "optimistic_round_trip_loss_bps": loss_bps.to_string(),
+            "errors": []
+        }))
+        .unwrap();
+        SnapshotContext { row, ..base }
+    }
+
     fn event_time() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 27, 0, 0, 10).unwrap()
     }
@@ -2638,11 +2682,10 @@ mod tests {
     }
 
     #[test]
-    fn reverse_direction_entry_is_refused_without_its_own_round_trip_cost() {
-        // context() only quotes the A-to-B-to-A cycle (forward then
-        // reverse); a TokenBToTokenA *entry* would start a fresh
-        // B-to-A-to-B cycle this row does not quote, so it must be refused
-        // rather than cost-gated on the unrelated A-to-B-to-A figure.
+    fn reverse_direction_entry_rejects_a_mismatched_forward_cycle() {
+        // context() only quotes A-to-B-to-A. Even though build_plan now
+        // accepts reverse entries, route identity must prevent an A-to-B
+        // forward leg from being reused as the B-to-A entry.
         let runtime = ArcusSpotRuntime::new(config()).unwrap();
         let error = runtime
             .build_plan(
@@ -2654,6 +2697,27 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::RouteUnavailable);
+    }
+
+    #[test]
+    fn reverse_direction_entry_uses_its_own_forward_cycle_and_cost() {
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let plan = runtime
+            .build_plan(
+                &reverse_context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        assert_eq!(plan.sell_symbol, "AMD");
+        assert_eq!(plan.buy_symbol, "NVDA");
+        assert_eq!(plan.sell_quantity, Decimal::new(5, 2));
+        assert_eq!(plan.buy_quantity, Decimal::new(245, 4));
+        assert_eq!(plan.predicted_inventory.token_a, Decimal::new(10245, 4));
+        assert_eq!(plan.predicted_inventory.token_b, Decimal::new(95, 2));
+        assert_eq!(plan.all_in_round_trip_cost_bps, Decimal::from(30));
     }
 
     #[test]
@@ -2673,6 +2737,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(plan.all_in_round_trip_cost_bps, Decimal::from(30));
+    }
+
+    #[test]
+    fn reverse_cycle_exit_uses_that_cycles_reverse_leg() {
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let plan = runtime
+            .build_plan(
+                &reverse_context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::MeanReversionExit,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        assert_eq!(plan.sell_symbol, "NVDA");
+        assert_eq!(plan.buy_symbol, "AMD");
+        assert_eq!(plan.sell_quantity, Decimal::new(245, 4));
+        assert_eq!(plan.buy_quantity, Decimal::new(496, 4));
     }
 
     #[test]
@@ -2943,6 +3025,89 @@ mod tests {
             }
             other => panic!("expected mean-reversion exit, got {other:?}"),
         }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn negative_entry_signal_uses_the_independent_reverse_cycle() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let current = (200.0_f64 / 100.0_f64).ln();
+        runtime.state.relative_log_price_history = vec![current + 0.01, current + 0.02];
+
+        let event = runtime.step_at(
+            &snapshot_with_bidirectional_rows(event_time()),
+            event_time(),
+        );
+        assert!(event.z_score.is_some_and(|score| score < -1.0));
+        match event.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.direction, ArcusSpotDirection::TokenBToTokenA);
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::EntrySignal);
+                assert_eq!(plan.sell_symbol, "AMD");
+                assert_eq!(plan.buy_symbol, "NVDA");
+                assert_eq!(plan.sell_quantity, Decimal::new(5, 2));
+                assert_eq!(plan.buy_quantity, Decimal::new(245, 4));
+            }
+            other => panic!("expected a reverse-direction simulated fill, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedBToA);
+    }
+
+    #[test]
+    fn negative_entry_signal_holds_when_the_reverse_cycle_is_missing() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let current = (200.0_f64 / 100.0_f64).ln();
+        runtime.state.relative_log_price_history = vec![current + 0.01, current + 0.02];
+
+        let event = runtime.step_at(&snapshot_with_valid_row(event_time()), event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::RouteUnavailable);
+                assert!(hold.detail.contains("AMD/NVDA"));
+            }
+            other => panic!("expected missing reverse-cycle hold, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn negative_entry_signal_holds_when_the_reverse_cycle_is_stale() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let current = (200.0_f64 / 100.0_f64).ln();
+        runtime.state.relative_log_price_history = vec![current + 0.01, current + 0.02];
+        let mut snapshot = snapshot_with_valid_row(event_time());
+        snapshot.round_trips.push(
+            reverse_context(
+                event_time() - Duration::seconds(runtime.config.max_quote_age_secs + 2),
+                Decimal::from(80),
+            )
+            .row,
+        );
+
+        let event = runtime.step_at(&snapshot, event_time());
+        assert!(matches!(
+            event.decision,
+            ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::StaleQuote
+        ));
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn reverse_cycle_entry_still_obeys_the_all_in_cost_limit() {
+        let mut cfg = config();
+        cfg.max_all_in_round_trip_cost_bps = Decimal::from(85);
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let current = (200.0_f64 / 100.0_f64).ln();
+        runtime.state.relative_log_price_history = vec![current + 0.01, current + 0.02];
+
+        let event = runtime.step_at(
+            &snapshot_with_bidirectional_rows(event_time()),
+            event_time(),
+        );
+        assert!(matches!(
+            event.decision,
+            ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::CostLimit
+        ));
         assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
     }
 
@@ -3883,6 +4048,14 @@ mod tests {
 
     fn snapshot_with_valid_row(collected_at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
         snapshot_with_valid_row_at_prices(collected_at, "200", "100")
+    }
+
+    fn snapshot_with_bidirectional_rows(collected_at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
+        let mut snapshot = snapshot_with_valid_row(collected_at);
+        snapshot
+            .round_trips
+            .push(reverse_context(collected_at - Duration::seconds(2), Decimal::from(80)).row);
+        snapshot
     }
 
     fn snapshot_with_valid_row_at_prices(
