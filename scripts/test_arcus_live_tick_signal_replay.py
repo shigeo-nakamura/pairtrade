@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,12 +32,32 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(observations[0].relative_log_price, -0.7)
         self.assertEqual(ignored, 0)
 
-    def test_rejects_conflicting_duplicate_sequence(self):
+    def test_rejects_non_stale_duplicate_sequence(self):
         start = datetime(2026, 8, 21, tzinfo=timezone.utc)
         journal = "\n".join(json.dumps(item) for item in
                             (event(4, start, -0.7, 1.25), event(4, start, -0.6, 1.25)))
-        with self.assertRaisesRegex(replay.ReplayError, "conflicting duplicate"):
+        with self.assertRaisesRegex(replay.ReplayError, "non-advancing sequence"):
             replay.extract_observations(journal)
+
+    def test_accepts_non_advancing_runtime_stale_event(self):
+        start = datetime(2026, 8, 21, tzinfo=timezone.utc)
+        stale = event(4, start + timedelta(minutes=1), None, None)
+        stale["decision"]["hold"] = {
+            "code": "stale_or_duplicate_observation", "detail": "fixture"}
+        journal = "\n".join(json.dumps(item) for item in
+                            (event(4, start, -0.7, 1.25), stale))
+        observations, _ = replay.extract_observations(journal)
+        self.assertEqual([item.sequence for item in observations], [4, 4])
+
+    def test_does_not_accept_a_recorder_snapshot_as_a_runtime_event(self):
+        start = datetime(2026, 8, 21, tzinfo=timezone.utc)
+        recorder = event(3, start, -0.8, 1.0)
+        del recorder["decision"]
+        journal = "\n".join(json.dumps(item) for item in
+                            (recorder, event(4, start, -0.7, 1.25)))
+        observations, ignored = replay.extract_observations(journal)
+        self.assertEqual([item.sequence for item in observations], [4])
+        self.assertEqual(ignored, 1)
 
     def test_checkpoint_tail_is_bit_exact(self):
         start = datetime(2026, 8, 21, tzinfo=timezone.utc)
@@ -60,6 +81,37 @@ class ReplayTests(unittest.TestCase):
                 event(index + 1, start + timedelta(minutes=15 * index), value, score)))
             history.append(value)
         self.assertEqual(replay.verify_recomputed_scores(observations, 3, 2)["scores_verified"], 5)
+
+    def test_gap_resets_score_verification_window(self):
+        start = datetime(2026, 8, 21, tzinfo=timezone.utc)
+        observations = [replay._event_from_object(item) for item in (
+            event(1, start, 0.1, None),
+            event(2, start + timedelta(minutes=15), 0.2, None),
+            event(4, start + timedelta(minutes=30), 0.3, 999.0),
+            event(5, start + timedelta(minutes=45), 0.4, 999.0))]
+        verification = replay.verify_recomputed_scores(observations, 2, 2)
+        self.assertEqual(verification["scores_verified"], 0)
+        self.assertEqual(verification["score_window_resets"], 1)
+
+    def test_gap_fails_closed_but_suffix_is_authoritative(self):
+        start = datetime(2026, 8, 21, tzinfo=timezone.utc)
+        journal = "\n".join(json.dumps(item) for item in (
+            event(1, start, 0.1, None),
+            event(3, start + timedelta(minutes=15), 0.2, None),
+            event(4, start + timedelta(minutes=30), 0.3, None)))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.log"
+            path.write_text(journal, encoding="utf-8")
+            with self.assertRaisesRegex(replay.ReplayError, "replay refused"):
+                replay.run(replay.build_parser().parse_args([str(path)]))
+            indicative = replay.run(replay.build_parser().parse_args(
+                [str(path), "--allow-gaps"]))
+            self.assertFalse(indicative["verification"]["authoritative"])
+            self.assertEqual(indicative["verification"]["sequence_gaps"][0]["missing"], 1)
+            suffix = replay.run(replay.build_parser().parse_args(
+                [str(path), "--start-sequence", "3"]))
+            self.assertTrue(suffix["verification"]["authoritative"])
+            self.assertEqual(suffix["input"]["first_sequence"], 3)
 
     def test_replays_mean_reversion_and_max_hold_with_runtime_ordering(self):
         start = datetime(2026, 8, 21, tzinfo=timezone.utc)

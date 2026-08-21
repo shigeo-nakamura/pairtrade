@@ -26,6 +26,7 @@ class Observation:
     observed_at_raw: str
     relative_log_price: float | None
     z_score: float | None
+    hold_code: str | None
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,9 @@ class ThresholdChange:
 @dataclass(frozen=True)
 class Trade:
     direction: str
+    entry_sequence: int
     entry_at: str
+    exit_sequence: int
     exit_at: str
     entry_z: float
     exit_z: float | None
@@ -58,11 +61,17 @@ def parse_timestamp(value: str) -> datetime:
 
 
 def _event_from_object(value: Any) -> Observation | None:
-    required = {"sequence", "observed_at", "relative_log_price", "z_score"}
+    required = {"sequence", "observed_at", "relative_log_price", "z_score", "decision"}
     if not isinstance(value, dict) or not required.issubset(value):
         return None
+    decision = value["decision"]
+    if not isinstance(decision, dict):
+        raise ReplayError("runtime event decision must be an object")
+    hold = decision.get("hold")
+    hold_code = hold.get("code") if isinstance(hold, dict) else None
     sequence, observed_at_raw = value["sequence"], value["observed_at"]
-    if not isinstance(sequence, int) or sequence < 1 or not isinstance(observed_at_raw, str):
+    if (not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1
+            or not isinstance(observed_at_raw, str)):
         raise ReplayError(f"invalid event identity at sequence {sequence!r}")
 
     def optional_finite(name: str) -> float | None:
@@ -74,7 +83,8 @@ def _event_from_object(value: Any) -> Observation | None:
         return float(raw)
 
     return Observation(sequence, parse_timestamp(observed_at_raw), observed_at_raw,
-                       optional_finite("relative_log_price"), optional_finite("z_score"))
+                       optional_finite("relative_log_price"), optional_finite("z_score"),
+                       hold_code if isinstance(hold_code, str) else None)
 
 
 def extract_observations(text: str) -> tuple[list[Observation], int]:
@@ -97,19 +107,16 @@ def extract_observations(text: str) -> tuple[list[Observation], int]:
             observations.append(event)
     if not observations:
         raise ReplayError("no Arcus live-tick runtime events found")
-    result, seen = [], {}
-    for event in observations:
-        previous = seen.get(event.sequence)
-        if previous is not None:
-            if previous != event:
-                raise ReplayError(f"conflicting duplicate sequence {event.sequence}")
-            continue
-        seen[event.sequence] = event
-        result.append(event)
-    for previous, current in zip(result, result[1:]):
-        if current.sequence <= previous.sequence or current.observed_at < previous.observed_at:
+    for previous, current in zip(observations, observations[1:]):
+        if current.sequence < previous.sequence or current.observed_at < previous.observed_at:
             raise ReplayError(f"journal is not ordered at sequence {current.sequence}")
-    return result, ignored
+        if (current.sequence == previous.sequence
+                and (current.hold_code != "stale_or_duplicate_observation"
+                     or current.relative_log_price is not None
+                     or current.z_score is not None)):
+            raise ReplayError(
+                f"non-advancing sequence {current.sequence} is not a stale observation")
+    return observations, ignored
 
 
 def informative_sample_count(history: Sequence[float]) -> int:
@@ -135,13 +142,18 @@ def runtime_z_score(history: Sequence[float], current: float, minimum: int) -> f
 
 def verify_recomputed_scores(observations: Sequence[Observation], window: int,
                              minimum: int) -> dict[str, int]:
-    history, verified = [], 0
+    history, verified, resets = [], 0, 0
+    previous_sequence = None
     for event in observations:
+        if previous_sequence is not None and event.sequence > previous_sequence + 1:
+            history = []
+            resets += 1
+        previous_sequence = event.sequence
         current = event.relative_log_price
         if current is None:
             continue
-        # The missing pre-retention prefix affects z until one full window has
-        # been collected. Logged z remains authoritative during that prefix.
+        # The missing pre-retention prefix or an internal sequence gap affects
+        # z until one complete live window has been collected after it.
         if len(history) >= window:
             expected = runtime_z_score(history[-window:], current, minimum)
             matches = expected == event.z_score or (
@@ -152,7 +164,8 @@ def verify_recomputed_scores(observations: Sequence[Observation], window: int,
                                   f"logged={event.z_score!r}, recomputed={expected!r}")
             verified += 1
         history.append(current)
-    return {"scores_verified": verified, "score_mismatches": 0}
+    return {"scores_verified": verified, "score_mismatches": 0,
+            "score_window_resets": resets}
 
 
 def load_checkpoint(path: Path) -> dict[str, Any]:
@@ -172,11 +185,18 @@ def verify_checkpoint_tail(observations: Sequence[Observation],
     state, config = checkpoint["state"], checkpoint["config"]
     history, window, sequence = (state.get("relative_log_price_history"),
                                  config.get("signal_window_samples"), state.get("sequence"))
+    minimum = config.get("min_signal_samples")
+    if not isinstance(sequence, int) or isinstance(sequence, bool):
+        raise ReplayError("checkpoint sequence must be an integer")
     if not isinstance(history, list) or not all(isinstance(v, (int, float))
                                                 and not isinstance(v, bool) for v in history):
         raise ReplayError("checkpoint relative_log_price_history must be numeric")
-    if not isinstance(window, int) or window < 2 or len(history) > window:
+    if (not isinstance(window, int) or isinstance(window, bool) or window < 2
+            or len(history) > window):
         raise ReplayError("invalid checkpoint signal window/history length")
+    if (not isinstance(minimum, int) or isinstance(minimum, bool)
+            or minimum < 2 or minimum > window):
+        raise ReplayError("invalid checkpoint minimum signal samples")
     if observations[-1].sequence != sequence:
         raise ReplayError(f"journal ends at {observations[-1].sequence}, checkpoint is {sequence}")
     journal = [event.relative_log_price for event in observations
@@ -188,7 +208,7 @@ def verify_checkpoint_tail(observations: Sequence[Observation],
             raise ReplayError(f"journal/checkpoint tail differs at index {index}")
     return {"checkpoint_sequence": sequence, "checkpoint_history_samples": len(history),
             "checkpoint_tail_exact": True, "signal_window_samples": window,
-            "min_signal_samples": config.get("min_signal_samples")}
+            "min_signal_samples": minimum}
 
 
 def threshold_at(changes: Sequence[ThresholdChange], observed_at: datetime) -> float:
@@ -227,14 +247,14 @@ def replay_trades(observations: Sequence[Observation], changes: Sequence[Thresho
         gross = ((entry.relative_log_price - event.relative_log_price)
                  if direction == "token_a_to_b"
                  else (event.relative_log_price - entry.relative_log_price)) * 10_000.0
-        trades.append(Trade(direction, entry.observed_at_raw, event.observed_at_raw,
-                            float(entry.z_score), z, "max_hold" if max_hold else "mean_reversion",
+        trades.append(Trade(direction, entry.sequence, entry.observed_at_raw,
+                            event.sequence, event.observed_at_raw, float(entry.z_score), z, "max_hold" if max_hold else "mean_reversion",
                             hold, gross, gross - cost_bps))
         open_trade = None
     if open_trade:
         direction, entry = open_trade
-        opened = {"direction": direction, "entry_at": entry.observed_at_raw,
-                  "entry_z": entry.z_score, "age_seconds_at_last_observation":
+        opened = {"direction": direction, "entry_sequence": entry.sequence,
+                  "entry_at": entry.observed_at_raw, "entry_z": entry.z_score, "age_seconds_at_last_observation":
                   int((observations[-1].observed_at - entry.observed_at).total_seconds())}
     else:
         opened = None
@@ -261,6 +281,23 @@ def exceedance_counts(observations: Sequence[Observation],
     return {format(t, "g"): sum(score >= t for score in scores) for t in thresholds}
 
 
+def filter_observations(observations: Sequence[Observation], start: int | None,
+                        end: int | None) -> list[Observation]:
+    selected = [event for event in observations
+                if (start is None or event.sequence >= start)
+                and (end is None or event.sequence <= end)]
+    if not selected:
+        raise ReplayError("no observations remain in the requested sequence range")
+    return selected
+
+
+def sequence_gaps(observations: Sequence[Observation]) -> list[dict[str, int]]:
+    return [{"after": previous.sequence, "before": current.sequence,
+             "missing": current.sequence - previous.sequence - 1}
+            for previous, current in zip(observations, observations[1:])
+            if current.sequence > previous.sequence + 1]
+
+
 def parse_threshold_change(raw: str) -> ThresholdChange:
     try:
         timestamp, value = raw.rsplit("=", 1)
@@ -283,39 +320,76 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-hold-secs", type=int, default=86400)
     parser.add_argument("--round-trip-cost-bps", type=float, default=0.0)
     parser.add_argument("--count-threshold", type=float, action="append", default=[2.5, 2.0, 1.5])
+    parser.add_argument("--start-sequence", type=int)
+    parser.add_argument("--end-sequence", type=int)
+    parser.add_argument("--allow-gaps", action="store_true",
+                        help="emit explicitly non-authoritative output across gaps")
     return parser
 
 
 def run(arguments: argparse.Namespace) -> dict[str, Any]:
-    if arguments.entry_z <= 0 or arguments.exit_z < 0 or arguments.max_hold_secs <= 0:
-        raise ReplayError("entry/exit/max-hold parameters are invalid")
-    observations, ignored = extract_observations(arguments.journal.read_text(encoding="utf-8"))
-    gaps = [[a.sequence, b.sequence] for a, b in zip(observations, observations[1:])
-            if b.sequence != a.sequence + 1]
-    verification, window, minimum = {"sequence_gaps": gaps}, 96, 32
+    numeric = (arguments.entry_z, arguments.exit_z, arguments.round_trip_cost_bps,
+               *arguments.count_threshold)
+    if (not all(math.isfinite(value) for value in numeric)
+            or arguments.entry_z <= 0 or arguments.exit_z < 0
+            or arguments.round_trip_cost_bps < 0 or arguments.max_hold_secs <= 0
+            or any(value <= 0 for value in arguments.count_threshold)):
+        raise ReplayError("entry/exit/cost/max-hold/count parameters are invalid")
+    if (arguments.start_sequence is not None and arguments.end_sequence is not None
+            and arguments.start_sequence > arguments.end_sequence):
+        raise ReplayError("start sequence must not exceed end sequence")
+
+    observations, ignored = extract_observations(
+        arguments.journal.read_text(encoding="utf-8"))
+    observations = filter_observations(
+        observations, arguments.start_sequence, arguments.end_sequence)
+    gaps = sequence_gaps(observations)
+    if gaps and not arguments.allow_gaps:
+        ranges = ", ".join(
+            f"{gap['after'] + 1}-{gap['before'] - 1}" for gap in gaps)
+        raise ReplayError(
+            f"journal has {sum(gap['missing'] for gap in gaps)} missing "
+            f"sequence(s) ({ranges}); replay refused")
+
+    verification = {"authoritative": not gaps, "sequence_gaps": gaps}
+    window, minimum = 96, 32
     if arguments.checkpoint:
         checkpoint = load_checkpoint(arguments.checkpoint)
         verification.update(verify_checkpoint_tail(observations, checkpoint))
-        window, minimum = checkpoint["config"]["signal_window_samples"], checkpoint["config"]["min_signal_samples"]
+        window = checkpoint["config"]["signal_window_samples"]
+        minimum = checkpoint["config"]["min_signal_samples"]
     verification.update(verify_recomputed_scores(observations, window, minimum))
+
     changes = [ThresholdChange(datetime.min.replace(tzinfo=timezone.utc), arguments.entry_z),
                *arguments.entry_z_change]
     if changes != sorted(changes, key=lambda change: change.effective_at):
         raise ReplayError("threshold changes must be chronological")
+    if arguments.exit_z >= min(change.value for change in changes):
+        raise ReplayError("exit z must be below every entry threshold")
+
     trades, opened = replay_trades(observations, changes, arguments.exit_z,
-                                   arguments.max_hold_secs, arguments.round_trip_cost_bps)
-    return {"input": {"observations": len(observations), "ignored_json_objects": ignored,
+                                   arguments.max_hold_secs,
+                                   arguments.round_trip_cost_bps)
+    return {"input": {"observations": len(observations),
+                      "ignored_json_objects": ignored,
                       "first_sequence": observations[0].sequence,
                       "last_sequence": observations[-1].sequence,
                       "first_observed_at": observations[0].observed_at_raw,
                       "last_observed_at": observations[-1].observed_at_raw},
             "parameters": {"entry_z_schedule": [
-                {"effective_at": c.effective_at.isoformat(), "value": c.value} for c in changes],
-                "exit_z_score": arguments.exit_z, "max_hold_secs": arguments.max_hold_secs,
-                "round_trip_cost_bps": arguments.round_trip_cost_bps},
+                {"effective_at": change.effective_at.isoformat(),
+                 "value": change.value} for change in changes],
+                "exit_z_score": arguments.exit_z,
+                "max_hold_secs": arguments.max_hold_secs,
+                "round_trip_cost_bps": arguments.round_trip_cost_bps,
+                "counterfactual_initial_regime": "neutral",
+                "counterfactual_scope":
+                    "signal-only; route/risk/inventory/fills are not replayed"},
             "verification": verification,
-            "exceedance_counts": exceedance_counts(observations, arguments.count_threshold),
-            "summary": summarize_trades(trades), "trades": [asdict(t) for t in trades],
+            "exceedance_counts": exceedance_counts(
+                observations, arguments.count_threshold),
+            "summary": summarize_trades(trades),
+            "trades": [asdict(trade) for trade in trades],
             "open_trade": opened}
 
 
