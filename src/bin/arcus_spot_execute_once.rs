@@ -12,13 +12,13 @@ use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, NaiveDate, Utc};
 use debot::arcus_spot::{
-    build_arcus_spot_kms_signer, is_direct_arcus_route, ArcusSpotChainClient, ArcusSpotChainConfig,
-    ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
-    ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig,
-    ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotRegime,
-    ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntime,
-    ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent,
-    ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    build_arcus_spot_kms_signer, is_supported_live_route, ArcusSpotChainClient,
+    ArcusSpotChainConfig, ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt,
+    ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
+    ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor,
+    ArcusSpotLiveExecutorConfig, ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan,
+    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
+    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
 use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
@@ -384,15 +384,15 @@ fn declined_route_log_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBu
 /// not safety: failing a tick over it would recreate, for a strictly less
 /// important reason, exactly the "correct behaviour reported as a fault"
 /// problem that #817 just removed.
-fn decline_non_direct_route(
+fn decline_unsupported_route(
     config: &ArcusSpotExecuteOnceConfig,
     event: &ArcusSpotRuntimeEvent,
     plan: &ArcusSpotRotationPlan,
 ) -> Result<()> {
     record_declined_route(config, event, plan);
     eprintln!(
-        "[arcus-route] declined a would-rotate plan: recommended venue {:?} is not the direct \
-         Arcus route this executor may dispatch; nothing was submitted",
+        "[arcus-route] declined a would-rotate plan: recommended venue {:?} is not one of the \
+         validated Arcus/Rialto routes this executor may dispatch; nothing was submitted",
         plan.venue,
     );
     write_live_tick_event(event)
@@ -1394,10 +1394,8 @@ fn reconciled_fill_for_continuity(
     if tx_hash == H256::zero() {
         bail!("Arcus acceptance transaction hash must not be zero");
     }
-    if !plan.venue.eq_ignore_ascii_case("arcus")
-        || !attempt.intent.venue.eq_ignore_ascii_case("arcus")
-    {
-        bail!("Arcus acceptance requires venue=arcus in both plan and intent");
+    if !is_supported_live_route(plan) {
+        bail!("Arcus acceptance requires an Arcus or Rialto plan");
     }
     let plan_config_digest = approval_digest(config, plan)?;
     if attempt.intent.plan_config_digest != plan_config_digest
@@ -3115,11 +3113,11 @@ async fn main() -> Result<()> {
                 }
             };
             // The router recommends whichever venue prices best, and that is
-            // usually not Arcus -- over one recent sample of the archive,
-            // Rialto won about two thirds of the routes. This executor may
-            // only dispatch a direct Arcus route, so those ticks are an
-            // ordinary market outcome: the strategy would rotate, the route
-            // it was handed is not one we are allowed to take.
+            // The executor supports the two venue paths whose typed data,
+            // prepared transaction, canonical contracts, and reconciliation
+            // semantics are explicitly validated: Arcus and Rialto. Any
+            // other router result (notably LI.FI) is an ordinary market
+            // outcome rather than a service fault.
             //
             // Treated as a fault until bot-strategy#817: the plan was built,
             // written, and only refused deep inside the executor, so the
@@ -3130,10 +3128,10 @@ async fn main() -> Result<()> {
             // keeps the run successful and leaves no pending-plan file for a
             // dispatch that never happened. `validate_plan` still refuses
             // the same route independently.
-            if !is_direct_arcus_route(&plan) {
+            if !is_supported_live_route(&plan) {
                 // Held until the record is written so two concurrent ticks
                 // cannot interleave their declines out of order in the file.
-                let declined = decline_non_direct_route(&config, &event, &plan);
+                let declined = decline_unsupported_route(&config, &event, &plan);
                 drop(checkpoint_lock);
                 return declined;
             }
@@ -3583,6 +3581,8 @@ router:
   trusted_permit2_spenders:
     arcus:
       - "0x006102b16A04c20306A28b652745D3973D7D24fa"
+    rialto:
+      - "0xC94135b63772b91D79d0A2DaAb2a8801f32359bD"
   trusted_token_addresses:
     NVDA: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC"
     AMD: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC"
@@ -5163,7 +5163,7 @@ runtime:
     }
 
     #[test]
-    fn continuity_verification_rejects_a_non_arcus_plan_and_intent() {
+    fn continuity_verification_accepts_rialto_and_rejects_an_unknown_venue() {
         let dir = tempdir().unwrap();
         let ledger_path = dir.path().join("ledger.json");
         let runtime_path = dir.path().join("runtime.json");
@@ -5172,6 +5172,20 @@ runtime:
             runtime_path.to_str().unwrap(),
             "100000000000000000",
         );
+        let mut rialto_plan = rotation_plan("entry_signal");
+        rialto_plan.venue = "rialto".to_string();
+        rialto_plan.quote_received_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let rialto_attempt = reconciled_entry_attempt(&config, &rialto_plan, 1);
+        reconciled_fill_for_continuity(
+            &config,
+            &rialto_plan,
+            &rialto_attempt,
+            rialto_attempt.prepared_at,
+        )
+        .unwrap();
+
         let mut plan = rotation_plan("entry_signal");
         plan.venue = "other".to_string();
         let attempt = reconciled_entry_attempt(&config, &plan, 1);
@@ -5179,7 +5193,7 @@ runtime:
         let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
             .unwrap_err();
 
-        assert!(error.to_string().contains("venue=arcus"));
+        assert!(error.to_string().contains("Arcus or Rialto"));
     }
 
     #[test]
@@ -5908,8 +5922,8 @@ runtime:
         // Through the same entry point the live-tick arm returns, so a
         // decline that stopped recording would fail here rather than
         // silently produce an empty file at readout time.
-        decline_non_direct_route(&config, &event, &plan).unwrap();
-        decline_non_direct_route(&config, &event, &plan).unwrap();
+        decline_unsupported_route(&config, &event, &plan).unwrap();
+        decline_unsupported_route(&config, &event, &plan).unwrap();
 
         let path = declined_route_log_path(&config).unwrap();
         assert_eq!(
@@ -5937,33 +5951,37 @@ runtime:
         assert_eq!(row["sequence"], serde_json::json!(41));
     }
 
-    /// bot-strategy#817: a plan the router put on another venue is an
-    /// ordinary market outcome, not a fault, so live-tick declines it before
-    /// building anything rather than letting the executor fail the run.
+    /// bot-strategy#817/#818: a plan on an unvalidated venue is an ordinary
+    /// market outcome, not a fault, so live-tick declines it before building
+    /// anything rather than letting the executor fail the run.
     ///
     /// `ArcusSpotLiveExecutor::validate_plan` calls this same predicate, so
     /// the pre-dispatch check and the enforcement cannot drift apart into
     /// live-tick dispatching something the executor then refuses.
     #[test]
-    fn only_a_direct_arcus_route_is_dispatchable() {
+    fn only_validated_arcus_and_rialto_routes_are_dispatchable() {
         let arcus = rotation_plan("entry_signal");
         assert_eq!(arcus.venue, "arcus");
-        assert!(is_direct_arcus_route(&arcus));
+        assert!(is_supported_live_route(&arcus));
 
         // Case-insensitively: the venue string comes off the wire.
         let mut shouty = rotation_plan("entry_signal");
         shouty.venue = "ARCUS".to_string();
-        assert!(is_direct_arcus_route(&shouty));
+        assert!(is_supported_live_route(&shouty));
 
         // The venue that actually wins most routes in practice -- about two
         // thirds of them in the recorder archive on 2026-08-19.
         let mut rialto = rotation_plan("entry_signal");
         rialto.venue = "rialto".to_string();
-        assert!(!is_direct_arcus_route(&rialto));
+        assert!(is_supported_live_route(&rialto));
+
+        let mut lifi = rotation_plan("entry_signal");
+        lifi.venue = "lifi".to_string();
+        assert!(!is_supported_live_route(&lifi));
 
         let mut empty = rotation_plan("entry_signal");
         empty.venue = String::new();
-        assert!(!is_direct_arcus_route(&empty));
+        assert!(!is_supported_live_route(&empty));
     }
 
     fn rotation_plan(trigger: &str) -> ArcusSpotRotationPlan {

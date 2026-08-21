@@ -58,8 +58,8 @@ pub struct ArcusSpotExecutionIntent {
 
 impl ArcusSpotExecutionIntent {
     fn validate(&self) -> Result<(Address, Address, U256, U256)> {
-        if !self.venue.eq_ignore_ascii_case("arcus") {
-            bail!("initial live execution requires venue=arcus");
+        if !self.venue.eq_ignore_ascii_case("arcus") && !self.venue.eq_ignore_ascii_case("rialto") {
+            bail!("live execution requires venue=arcus or venue=rialto");
         }
         if self.sell_symbol.trim().is_empty()
             || self.buy_symbol.trim().is_empty()
@@ -751,6 +751,23 @@ mod tests {
         let mut value = intent();
         value.plan_config_digest = String::new();
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn execution_intent_accepts_arcus_and_rialto_but_rejects_other_venues() {
+        for venue in ["arcus", "rialto", "RIALTO"] {
+            let mut candidate = intent();
+            candidate.venue = venue.to_string();
+            candidate.validate().unwrap();
+        }
+
+        let mut unsupported = intent();
+        unsupported.venue = "lifi".to_string();
+        assert!(unsupported
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("arcus or venue=rialto"));
     }
 
     #[test]
