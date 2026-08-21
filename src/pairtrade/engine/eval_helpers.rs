@@ -67,23 +67,29 @@ impl PairTradeEngine {
                 key
             );
             // Exit fallback (no recorded sizes): unwind at base hedge ratio.
-            // bot-strategy#461's notional shrink and bot-strategy#798's
-            // sizing_beta_floor are sizing-side only — even when #824 uses
-            // the floor as a close trigger, we must not re-apply it to exit
-            // quantities or we could leave a residual position.
             //
             // Use the position's last-known entry_beta (kept current by
             // dispatch_rehedge on every re-hedge fill) rather than the
-            // caller's current `beta` when it's available: opted-in entries
-            // are blocked below the sizing floor, so the real B leg was
-            // necessarily sized from a beta at or above it. A beta_floor
+            // caller's current `beta` when it's available: a beta_floor
             // close is, by construction, evaluated with `beta` already
-            // collapsed below that floor — recomputing notional_b from that
-            // collapsed value here would under-close the B leg relative to
-            // what's actually open, leaving residual exposure once the exit
-            // completes (Codex review, bot-strategy#824).
+            // collapsed below the sizing floor, so recomputing notional_b
+            // from that collapsed value would under-close the B leg
+            // relative to what's actually open.
+            //
+            // `entry_beta` itself is the RAW beta at entry — bot-strategy
+            // #798's sizing floor is applied on top of it (see
+            // `sizing::hedged_sizes` -> `resolve_sizing_beta`), so a
+            // position entered while beta was already below the floor
+            // (before this exit flag existed, or with the floor
+            // configured but the exit disabled) has entry_size_b sized
+            // from the FLOORED beta even though entry_beta stores the
+            // smaller raw value. Passing the current sizing_beta_floor
+            // here (instead of 0.0) re-derives that same floored value
+            // so this fallback matches entry's own hedge ratio in every
+            // case, not just the ones opted into #824 (Codex review).
             let unwind_beta = recorded.and_then(|p| p.entry_beta).unwrap_or(beta);
-            return self.hedged_sizes(inst_idx, pair, unwind_beta, p1, p2, 1.0, 0.0);
+            let sizing_beta_floor = self.pair_params_for(inst_idx, key).sizing_beta_floor;
+            return self.hedged_sizes(inst_idx, pair, unwind_beta, p1, p2, 1.0, sizing_beta_floor);
         }
 
         Ok((qty_a, qty_b))

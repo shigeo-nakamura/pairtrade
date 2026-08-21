@@ -359,10 +359,17 @@ impl PairTradeConfig {
             "BETA_UNCERTAINTY_MAX",
             &mut self.default_pair_params.beta_uncertainty_max,
         );
-        // bot-strategy#824: without this override the YAML-load path always
+        // bot-strategy#824: without these overrides the YAML-load path always
         // keeps the YAML/default value and ignores the env var, even though
         // the pure-env config path (`default_pair_params_from_env`) already
-        // reads it.
+        // reads both. Without `SIZING_BETA_FLOOR` specifically, a
+        // YAML-backed deployment enabling the feature entirely through env
+        // (SIZING_BETA_FLOOR + EXIT_ON_SIZING_BETA_FLOOR) would keep the
+        // floor at 0.0 and fail startup validation instead (Codex review).
+        env_override(
+            "SIZING_BETA_FLOOR",
+            &mut self.default_pair_params.sizing_beta_floor,
+        );
         env_override(
             "EXIT_ON_SIZING_BETA_FLOOR",
             &mut self.default_pair_params.exit_on_sizing_beta_floor,
