@@ -806,12 +806,48 @@ impl PairTradeEngine {
                         );
                     }
                 } else if eligible_shared && !defer_pending && spread_len < min_points {
-                    log::debug!(
-                        "[ZCHECK] {} skipped (spread history too short: {} < {})",
-                        key,
-                        spread_len,
-                        min_points
-                    );
+                    // bot-strategy#824 (Codex review): the beta-floor safety
+                    // exit only needs current_beta — already available via
+                    // per_pair_state.beta, independent of spread-history
+                    // warm-up — not z/std readiness. Without this
+                    // independent check, a recovered held position whose
+                    // beta has already collapsed below the sizing floor
+                    // could sit unclosed for dozens of bars after a restart
+                    // or history loss while waiting on min_points, exactly
+                    // the window the floor exit exists to protect against.
+                    let floor_due = if position_state.is_some() {
+                        crate::pairtrade::exit::beta_floor_exit_due(pp, beta_eff)
+                    } else {
+                        false
+                    };
+                    if floor_due {
+                        let pos = position_state.as_ref().expect("checked by floor_due");
+                        log::info!(
+                            "[EXIT_CHECK] {} reason=beta_floor beta={:.4} beta_floor={:.4} \
+                             (spread history warming up: {} < {})",
+                            key,
+                            beta_eff,
+                            pp.sizing_beta_floor,
+                            spread_len,
+                            min_points
+                        );
+                        if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                            state.pending_exit_reason = Some("beta_floor");
+                        }
+                        action = TradeAction::Close {
+                            direction: pos.direction,
+                            z: 0.0,
+                            beta: beta_eff,
+                            force: false,
+                        };
+                    } else {
+                        log::debug!(
+                            "[ZCHECK] {} skipped (spread history too short: {} < {})",
+                            key,
+                            spread_len,
+                            min_points
+                        );
+                    }
                 } else if position_state.is_some() && (!eligible_shared || defer_pending) {
                     // If pair falls out of eligibility, flatten. When the
                     // book-quality guard is enabled (bot-strategy#531), a
