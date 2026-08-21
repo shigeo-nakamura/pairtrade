@@ -71,7 +71,19 @@ impl PairTradeEngine {
             // sizing_beta_floor are sizing-side only — even when #824 uses
             // the floor as a close trigger, we must not re-apply it to exit
             // quantities or we could leave a residual position.
-            return self.hedged_sizes(inst_idx, pair, beta, p1, p2, 1.0, 0.0);
+            //
+            // Use the position's last-known entry_beta (kept current by
+            // dispatch_rehedge on every re-hedge fill) rather than the
+            // caller's current `beta` when it's available: opted-in entries
+            // are blocked below the sizing floor, so the real B leg was
+            // necessarily sized from a beta at or above it. A beta_floor
+            // close is, by construction, evaluated with `beta` already
+            // collapsed below that floor — recomputing notional_b from that
+            // collapsed value here would under-close the B leg relative to
+            // what's actually open, leaving residual exposure once the exit
+            // completes (Codex review, bot-strategy#824).
+            let unwind_beta = recorded.and_then(|p| p.entry_beta).unwrap_or(beta);
+            return self.hedged_sizes(inst_idx, pair, unwind_beta, p1, p2, 1.0, 0.0);
         }
 
         Ok((qty_a, qty_b))
