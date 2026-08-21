@@ -90,7 +90,6 @@ struct DipGridConfig {
     require_uptrend: bool,
     uptrend_lookback_secs: u64,
     uptrend_min_return_bps: f64,
-    taker_slippage_bps: u32,
     equity_usd_reference: f64,
     max_session_loss_bps: f64,
     kill_switch_path: PathBuf,
@@ -146,7 +145,6 @@ impl DipGridConfig {
             require_uptrend: env_bool("DIPGRID_REQUIRE_UPTREND", false),
             uptrend_lookback_secs: env_u64("DIPGRID_UPTREND_LOOKBACK_SECS", 14400),
             uptrend_min_return_bps: env_f64("DIPGRID_UPTREND_MIN_RETURN_BPS", 0.0),
-            taker_slippage_bps: env_u64("DIPGRID_TAKER_SLIPPAGE_BPS", 10) as u32,
             equity_usd_reference: env_f64("DIPGRID_EQUITY_USD_REFERENCE", 1000.0),
             max_session_loss_bps: env_f64("DIPGRID_MAX_SESSION_LOSS_BPS", 500.0),
             kill_switch_path: PathBuf::from(env_string(
@@ -325,6 +323,15 @@ impl DipGridEngine {
             self.state.peak_equity =
                 self.state.session_start_equity + self.state.realized_pnl_session;
             persist_state(&self.cfg.state_path, &self.state);
+            // The file is unconditionally removed so a stale ack from a prior
+            // incident never silently re-arms and clears the next halt too.
+            if let Err(e) = std::fs::remove_file(&self.cfg.risk_ack_path) {
+                log::warn!(
+                    "[RISK_ACK] failed to remove {} after ack: {:?}",
+                    self.cfg.risk_ack_path.display(),
+                    e
+                );
+            }
         }
     }
 
@@ -337,17 +344,24 @@ impl DipGridEngine {
         if self.cfg.dry_run {
             return Ok(size_dec);
         }
+        // `create_order_taker_ioc` is unimplemented for the Lighter connector
+        // (hard `Err`, see dex-connector's dex_impl.rs) — Lighter's native
+        // `create_order(price=None)` already gives IOC + 20% protection-price
+        // taker semantics, so route through that instead, matching every
+        // other pairtrade taker caller (entry/exit/hedge recovery).
         let resp = self
             .connector
-            .create_order_taker_ioc(
+            .create_order(
                 &self.cfg.symbol,
                 size_dec,
                 side,
-                self.cfg.taker_slippage_bps,
+                None,
+                None,
                 reduce_only,
+                None,
             )
             .await
-            .context("create_order_taker_ioc failed")?;
+            .context("create_order failed")?;
         resp.ordered_size
             .to_f64()
             .map(|f| Decimal::from_str(&format!("{f:.8}")).unwrap_or(size_dec))
