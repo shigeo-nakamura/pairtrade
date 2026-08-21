@@ -163,10 +163,6 @@ strategies:
     exit_z_score: 0.2
     stop_loss_z_score: 8.0
     force_close_time_secs: 10800
-    # #824: close the existing recorded quantities if rolling beta falls
-    # below the 0.6 entry sizing floor while this long-hold arm is open.
-    # freq remains the control and inherits the disabled default.
-    exit_on_sizing_beta_floor: true
     max_loss_r_mult: 1.0
     equity_usd_reference: 4000
     max_leverage: 50

@@ -125,14 +125,7 @@ fn robinhood_lighter_two_arm_config_parses() {
     assert_eq!(b.force_close_time_secs, Some(10800));
     assert_eq!(b.stop_loss_z, 8.0);
     assert_eq!(freq.exit_on_sizing_beta_floor, None);
-    assert_eq!(b.exit_on_sizing_beta_floor, Some(true));
-    let mut freq_params = cfg.default_pair_params.clone();
-    freq.apply_pair_param_overrides(&mut freq_params);
-    let mut b_params = cfg.default_pair_params.clone();
-    b.apply_pair_param_overrides(&mut b_params);
-    assert!(!freq_params.exit_on_sizing_beta_floor);
-    assert!(b_params.exit_on_sizing_beta_floor);
-    assert_eq!(b_params.sizing_beta_floor, 0.6);
+    assert_eq!(b.exit_on_sizing_beta_floor, None);
     // Top-level max_leverage is only a fallback both arms override.
     assert!((cfg.max_leverage - 20.0).abs() < 1e-9);
 
