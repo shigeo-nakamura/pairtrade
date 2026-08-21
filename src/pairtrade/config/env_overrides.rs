@@ -359,6 +359,14 @@ impl PairTradeConfig {
             "BETA_UNCERTAINTY_MAX",
             &mut self.default_pair_params.beta_uncertainty_max,
         );
+        // bot-strategy#824: without this override the YAML-load path always
+        // keeps the YAML/default value and ignores the env var, even though
+        // the pure-env config path (`default_pair_params_from_env`) already
+        // reads it.
+        env_override(
+            "EXIT_ON_SIZING_BETA_FLOOR",
+            &mut self.default_pair_params.exit_on_sizing_beta_floor,
+        );
         env_override(
             "ENTRY_VELOCITY_BLOCK_SIGMA_PER_MIN",
             &mut self.default_pair_params.entry_velocity_block_sigma_per_min,
