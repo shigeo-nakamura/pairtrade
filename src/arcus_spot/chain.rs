@@ -3,9 +3,10 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use dex_connector::ArcusSpotEip2612PermitContext;
 use ethers::{
-    contract::abigen,
+    abi::RawLog,
+    contract::{abigen, EthLogDecode},
     providers::{Http, Middleware, Provider, ProviderError, RpcError},
-    types::{Address, Bytes, TransactionRequest, H256, U256},
+    types::{Address, Bytes, TransactionReceipt, TransactionRequest, H256, U256},
 };
 use serde::{Deserialize, Serialize};
 use std::{str::FromStr, sync::Arc, time::Duration};
@@ -18,6 +19,13 @@ abigen!(
         function nonces(address owner) external view returns (uint256)
         function name() external view returns (string)
         function version() external view returns (string)
+    ]"#
+);
+
+abigen!(
+    ArcusSpotSwapShell,
+    r#"[
+        event SwapExecuted(address indexed taker, address indexed tokenIn, address indexed tokenOut, uint256 minAmountOut, uint256 amountIn, uint256 quotedAmountIn, uint256 quotedAmountOut, uint256 amountOut, uint256 tokenInBenchmarkPrice, uint256 tokenOutBenchmarkPrice, address router, bytes32 routeTag, bool success, string reason)
     ]"#
 );
 
@@ -137,6 +145,74 @@ pub struct ArcusSpotChainPreflight {
     pub exact_value_permit: Option<ArcusSpotEip2612PermitContext>,
 }
 
+/// Exact on-chain settlement facts that must be present in the canonical
+/// SwapShell receipt before a hosted-router status can be reconciled into
+/// the local execution ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArcusSpotSettlementReceiptExpectation {
+    pub venue: String,
+    pub taker: String,
+    pub sell_token: String,
+    pub buy_token: String,
+    pub sell_amount_raw: String,
+    pub minimum_buy_amount_raw: String,
+    pub swap_shell: String,
+    pub venue_router: String,
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedSettlementReceiptExpectation {
+    taker: Address,
+    sell_token: Address,
+    buy_token: Address,
+    sell_amount: U256,
+    minimum_buy_amount: U256,
+    swap_shell: Address,
+    venue_router: Address,
+    route_tag: [u8; 32],
+}
+
+impl ArcusSpotSettlementReceiptExpectation {
+    fn validate(&self) -> Result<ValidatedSettlementReceiptExpectation> {
+        let venue = self.venue.trim().to_ascii_lowercase();
+        let route_label = match venue.as_str() {
+            "arcus" => b"ARCUS".as_slice(),
+            "rialto" => b"RIALTO".as_slice(),
+            other => bail!("unsupported Arcus Spot settlement venue {other}"),
+        };
+        let mut route_tag = [0_u8; 32];
+        route_tag[..route_label.len()].copy_from_slice(route_label);
+
+        let taker = parse_nonzero_address("settlement taker", &self.taker)?;
+        let sell_token = parse_nonzero_address("settlement sell_token", &self.sell_token)?;
+        let buy_token = parse_nonzero_address("settlement buy_token", &self.buy_token)?;
+        let swap_shell = parse_nonzero_address("settlement swap_shell", &self.swap_shell)?;
+        let venue_router = parse_nonzero_address("settlement venue_router", &self.venue_router)?;
+        if sell_token == buy_token {
+            bail!("Arcus Spot settlement tokens must be distinct");
+        }
+        let sell_amount = parse_amount("settlement sell_amount_raw", &self.sell_amount_raw)?;
+        let minimum_buy_amount = parse_amount(
+            "settlement minimum_buy_amount_raw",
+            &self.minimum_buy_amount_raw,
+        )?;
+        if sell_amount.is_zero() || minimum_buy_amount.is_zero() {
+            bail!("Arcus Spot settlement amounts must be positive");
+        }
+
+        Ok(ValidatedSettlementReceiptExpectation {
+            taker,
+            sell_token,
+            buy_token,
+            sell_amount,
+            minimum_buy_amount,
+            swap_shell,
+            venue_router,
+            route_tag,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct ArcusSpotChainClient {
     config: ArcusSpotChainConfig,
@@ -253,6 +329,68 @@ fn redact_rpc_url(rpc_url: &str) -> String {
         },
         Err(_) => "<unparseable RPC URL>".to_string(),
     }
+}
+
+fn validate_settlement_receipt(
+    receipt: &TransactionReceipt,
+    confirmed_tx_hash: H256,
+    expected: ValidatedSettlementReceiptExpectation,
+) -> Result<()> {
+    if receipt.transaction_hash != confirmed_tx_hash {
+        bail!("Arcus Spot receipt transaction hash does not match confirmed transaction");
+    }
+    if receipt.status.map(|status| status.as_u64()) != Some(1) {
+        bail!("Arcus Spot settlement transaction did not succeed");
+    }
+    if receipt.to != Some(expected.swap_shell) {
+        bail!("Arcus Spot settlement transaction did not target the canonical SwapShell");
+    }
+
+    let matching_events = receipt
+        .logs
+        .iter()
+        .filter(|log| log.address == expected.swap_shell)
+        .filter_map(|log| {
+            SwapExecutedFilter::decode_log(&RawLog {
+                topics: log.topics.clone(),
+                data: log.data.to_vec(),
+            })
+            .ok()
+        })
+        .filter(|event| {
+            event.taker == expected.taker
+                && event.token_in == expected.sell_token
+                && event.token_out == expected.buy_token
+        })
+        .collect::<Vec<_>>();
+    if matching_events.len() != 1 {
+        bail!(
+            "Arcus Spot settlement receipt contains {} matching SwapExecuted events; expected exactly one",
+            matching_events.len()
+        );
+    }
+    let event = &matching_events[0];
+    if event.router != expected.venue_router {
+        bail!("Arcus Spot SwapExecuted router does not match the signed venue");
+    }
+    if event.route_tag != expected.route_tag {
+        bail!("Arcus Spot SwapExecuted route tag does not match the signed venue");
+    }
+    if !event.success {
+        bail!("Arcus Spot SwapExecuted reported an unsuccessful swap");
+    }
+    if event.amount_in != expected.sell_amount || event.quoted_amount_in != expected.sell_amount {
+        bail!("Arcus Spot SwapExecuted input amount does not match the signed amount");
+    }
+    if event.min_amount_out != expected.minimum_buy_amount {
+        bail!("Arcus Spot SwapExecuted minimum output does not match the signed minimum");
+    }
+    if event.quoted_amount_out < expected.minimum_buy_amount
+        || event.amount_out < expected.minimum_buy_amount
+    {
+        bail!("Arcus Spot SwapExecuted output is below the signed minimum");
+    }
+    Ok(())
 }
 
 impl ArcusSpotChainClient {
@@ -631,6 +769,37 @@ impl ArcusSpotChainClient {
         buy_token: Address,
         confirmed_tx_hash: H256,
     ) -> Result<ArcusSpotBalanceSnapshot> {
+        self.balances_requiring_receipt(taker, sell_token, buy_token, confirmed_tx_hash, None)
+            .await
+    }
+
+    /// Reconciliation read that additionally requires one exact
+    /// `SwapExecuted` event from the canonical Arcus SwapShell. This is the
+    /// live execution path for both Arcus and Rialto hosted-router routes.
+    pub async fn balances_requiring_settlement_receipt(
+        &self,
+        expectation: &ArcusSpotSettlementReceiptExpectation,
+        confirmed_tx_hash: H256,
+    ) -> Result<ArcusSpotBalanceSnapshot> {
+        let expected = expectation.validate()?;
+        self.balances_requiring_receipt(
+            expected.taker,
+            expected.sell_token,
+            expected.buy_token,
+            confirmed_tx_hash,
+            Some(expected),
+        )
+        .await
+    }
+
+    async fn balances_requiring_receipt(
+        &self,
+        taker: Address,
+        sell_token: Address,
+        buy_token: Address,
+        confirmed_tx_hash: H256,
+        settlement: Option<ValidatedSettlementReceiptExpectation>,
+    ) -> Result<ArcusSpotBalanceSnapshot> {
         if taker == Address::zero()
             || sell_token == Address::zero()
             || buy_token == Address::zero()
@@ -650,6 +819,10 @@ impl ArcusSpotChainClient {
                         "Arcus provider has not yet indexed confirmed tx {confirmed_tx_hash:#x}"
                     )));
                 };
+                if let Some(expected) = settlement {
+                    validate_settlement_receipt(&receipt, confirmed_tx_hash, expected)
+                        .map_err(ProviderAttemptError::Fatal)?;
+                }
                 // A single RPC URL commonly load-balances across a pool
                 // of backend nodes: the receipt lookup above and the
                 // balance reads below are separate requests that can land
@@ -998,7 +1171,11 @@ fn parse_amount(label: &str, raw: &str) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethers::types::TransactionReceipt;
+    use ethers::{
+        abi::{encode, Token},
+        types::{Log, U64},
+        utils::keccak256,
+    };
     use serde_json::{json, Value};
     use std::sync::Mutex;
     use tokio::{
@@ -1126,6 +1303,76 @@ mod tests {
         serde_json::to_value(receipt).unwrap()
     }
 
+    fn indexed_address(address: Address) -> H256 {
+        let mut topic = [0_u8; 32];
+        topic[12..].copy_from_slice(address.as_bytes());
+        H256::from(topic)
+    }
+
+    fn settlement_expectation(
+        venue: &str,
+        router: Address,
+    ) -> ArcusSpotSettlementReceiptExpectation {
+        let (taker, sell_token, buy_token) = test_addresses();
+        ArcusSpotSettlementReceiptExpectation {
+            venue: venue.to_string(),
+            taker: format!("{taker:#x}"),
+            sell_token: format!("{sell_token:#x}"),
+            buy_token: format!("{buy_token:#x}"),
+            sell_amount_raw: "1000".to_string(),
+            minimum_buy_amount_raw: "980".to_string(),
+            swap_shell: "0x4262efBd176F02824af27010bEa218429c33c7E8".to_string(),
+            venue_router: format!("{router:#x}"),
+        }
+    }
+
+    fn settlement_receipt(
+        route_tag: &str,
+        router: Address,
+        success: bool,
+        amount_out: u64,
+    ) -> TransactionReceipt {
+        let (taker, sell_token, buy_token) = test_addresses();
+        let swap_shell = Address::from_str("0x4262efBd176F02824af27010bEa218429c33c7E8").unwrap();
+        let tx_hash = H256::from_low_u64_be(0x818);
+        let mut tag = [0_u8; 32];
+        tag[..route_tag.len()].copy_from_slice(route_tag.as_bytes());
+        let event_signature = keccak256(
+            "SwapExecuted(address,address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,address,bytes32,bool,string)",
+        );
+        let data = encode(&[
+            Token::Uint(U256::from(980)),
+            Token::Uint(U256::from(1000)),
+            Token::Uint(U256::from(1000)),
+            Token::Uint(U256::from(990)),
+            Token::Uint(U256::from(amount_out)),
+            Token::Uint(U256::from(1)),
+            Token::Uint(U256::from(1)),
+            Token::Address(router),
+            Token::FixedBytes(tag.to_vec()),
+            Token::Bool(success),
+            Token::String(String::new()),
+        ]);
+        TransactionReceipt {
+            transaction_hash: tx_hash,
+            to: Some(swap_shell),
+            status: Some(U64::from(1)),
+            logs: vec![Log {
+                address: swap_shell,
+                topics: vec![
+                    H256::from(event_signature),
+                    indexed_address(taker),
+                    indexed_address(sell_token),
+                    indexed_address(buy_token),
+                ],
+                data: Bytes::from(data),
+                transaction_hash: Some(tx_hash),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
     fn abi_u256(value: u64) -> Value {
         json!(format!("0x{value:064x}"))
     }
@@ -1185,6 +1432,82 @@ mod tests {
     fn validates_exact_preflight_request() {
         let values = request().validate().unwrap();
         assert_eq!(values.required_sell, U256::from(1000));
+    }
+
+    #[test]
+    fn accepts_exact_arcus_and_rialto_swap_shell_events() {
+        for (venue, route_tag, router) in [
+            (
+                "arcus",
+                "ARCUS",
+                Address::from_str("0x006102b16A04c20306A28b652745D3973D7D24fa").unwrap(),
+            ),
+            (
+                "rialto",
+                "RIALTO",
+                Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap(),
+            ),
+        ] {
+            let receipt = settlement_receipt(route_tag, router, true, 985);
+            let expectation = settlement_expectation(venue, router).validate().unwrap();
+            validate_settlement_receipt(&receipt, H256::from_low_u64_be(0x818), expectation)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_swap_shell_event_for_wrong_venue() {
+        let rialto_router =
+            Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap();
+        let arcus_router = Address::from_str("0x006102b16A04c20306A28b652745D3973D7D24fa").unwrap();
+        let receipt = settlement_receipt("RIALTO", rialto_router, true, 985);
+        let expectation = settlement_expectation("arcus", arcus_router)
+            .validate()
+            .unwrap();
+        let error =
+            validate_settlement_receipt(&receipt, H256::from_low_u64_be(0x818), expectation)
+                .unwrap_err();
+        assert!(error.to_string().contains("router"));
+
+        let wrong_tag = settlement_receipt("ARCUS", rialto_router, true, 985);
+        let rialto_expectation = settlement_expectation("rialto", rialto_router)
+            .validate()
+            .unwrap();
+        assert!(validate_settlement_receipt(
+            &wrong_tag,
+            H256::from_low_u64_be(0x818),
+            rialto_expectation,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("route tag"));
+    }
+
+    #[test]
+    fn rejects_failed_or_below_minimum_swap_shell_event() {
+        let rialto_router =
+            Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap();
+        let expectation = settlement_expectation("rialto", rialto_router)
+            .validate()
+            .unwrap();
+
+        let failed = settlement_receipt("RIALTO", rialto_router, false, 985);
+        assert!(
+            validate_settlement_receipt(&failed, H256::from_low_u64_be(0x818), expectation,)
+                .unwrap_err()
+                .to_string()
+                .contains("unsuccessful")
+        );
+
+        let below_minimum = settlement_receipt("RIALTO", rialto_router, true, 979);
+        assert!(validate_settlement_receipt(
+            &below_minimum,
+            H256::from_low_u64_be(0x818),
+            expectation,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("below the signed minimum"));
     }
 
     #[test]

@@ -115,37 +115,39 @@ Take a fresh `state-backup` afterwards — backups from before the clear no
 longer verify, since continuity checks treat a lost halt as a real state
 change.
 
-### Routes this executor may not take
+### Supported and declined routes
 
-Only a direct Arcus route is dispatchable (`allowWrapped=false`, per the
-approved envelope on bot-strategy#772). The router, though, recommends
-whichever venue prices best, and that is frequently not Arcus: over one
-sample of the recorder archive on 2026-08-19, Rialto won about two thirds of
-the routes and Arcus about one third, with Arcus quoting fine and simply
-being outbid (by ~0.37% on the tick inspected).
+Direct-token Arcus and Rialto routes are dispatchable through the official
+Arcus hosted router (`allowWrapped=false`). LI.FI and every unknown venue stay
+fail-closed. The hosted router recommends whichever venue returns the best
+eligible quote, so Rialto being selected is an execution-price decision, not
+an Arcus points or airdrop decision. No rewards program is assumed by this
+runtime or by the acceptance criteria in bot-strategy#818.
 
-So a would-rotate plan the executor must refuse is an ordinary market
-outcome, not a fault. `live-tick` checks `is_direct_arcus_route` before
-building or writing anything, logs one `[arcus-route] ...` line naming the
-venue, and exits successfully; `validate_plan` still enforces the same
-predicate independently, for the caller-supplied plans `execute`/
-`auto-execute` take.
+Rialto uses a different signed envelope from direct Arcus: the EIP-712 Permit2
+witness and its prepared transaction are both validated, the signature is
+spliced only into the quoted placeholder, and the target is pinned to the
+canonical RialtoRouter. Submission and status polling still use Arcus's
+authenticated `/v1/submit` and `/v1/status` endpoints.
 
-Each decline appends one line to `declined-routes.jsonl`, next to the
-runtime checkpoint: when, which way, how strong the signal was, at what size
-and marks. Counting declines does not say what they were worth — if the
-declined signals were the weak ones the surviving third flatters the
-strategy, and if they were the strong ones it understates it — so the record
-carries enough to price the counterfactual offline against the recorder
-archive, rather than putting a shadow position tracker inside a signing bot
-(bot-strategy#818, owner chose to keep the constraint and measure its cost).
-A failed write is reported and ignored: this file is analysis, not safety.
+A hosted `confirmed` status is not sufficient to reconcile either venue.
+The transaction receipt must be successful and target the canonical
+SwapShell (`0x4262efBd176F02824af27010bEa218429c33c7E8`), with exactly one matching
+`SwapExecuted` event. The event must bind the original taker, tokens, signed
+input and minimum output, and must identify the canonical route:
 
-This used to fail the unit instead. On 2026-08-19 twelve consecutive ticks
-exited non-zero while the bot was behaving exactly as designed
-(bot-strategy#817), which is the same signal a real fault would have had to
-stand out from. The economics of the constraint -- roughly two thirds of
-entry opportunities declined -- are tracked separately.
+- Arcus: router `0x006102b16A04c20306A28b652745D3973D7D24fa`, tag `ARCUS`;
+- Rialto: router `0xC94135b63772b91D79d0A2DaAb2a8801f32359bD`, tag `RIALTO`.
+
+Only after that event passes are the existing EIP-1898 canonical-block wallet
+reads and exact balance reconciliation allowed to complete. Configuration
+must pin exactly those Arcus and Rialto Permit2 spenders; missing or extra
+addresses fail startup.
+
+When LI.FI or an unknown venue wins, `live-tick` logs one `[arcus-route] ...`
+line and exits successfully. Each decline also appends one analysis-only line
+to `declined-routes.jsonl`, next to the runtime checkpoint. A failed write is
+reported and ignored because this file is observability, not a safety gate.
 
 The log-price ratio signal is evaluated against prior samples only. The current
 sample is appended after z-score calculation, avoiding same-tick look-ahead.
@@ -157,7 +159,8 @@ qualified.
 With `arcus-spot-live`, the library provides:
 
 - a dedicated asymmetric AWS KMS signer restricted to EIP-712 typed data;
-- direct Arcus routing only with `allowWrapped=false`;
+- direct Arcus and Rialto routing only with `allowWrapped=false`; LI.FI and
+  unknown venues are refused;
 - exact-value EIP-2612 authorization when the existing Permit2 allowance is
   insufficient, and refusal of an allowance larger than the exact sell amount;
 - independent chain, wallet balance, gas, inventory-floor, token, spender,
@@ -182,7 +185,8 @@ With `arcus-spot-live`, the library provides:
   bot-strategy#823, since the cap rather than the signal was deciding how
   much the bot traded), and deployer-pinned raw sell maxima;
 - exactly one submit attempt, sticky `UNKNOWN` on ambiguous delivery, safe
-  status GETs, and exact pre/post wallet-balance reconciliation;
+  venue-specific status GETs, canonical SwapShell event verification, and
+  exact pre/post wallet-balance reconciliation;
 - a runtime commit seam that refuses fills inconsistent with the genuine
   strategy plan.
 

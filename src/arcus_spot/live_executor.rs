@@ -2,13 +2,13 @@ use super::{
     ArcusSpotBalanceSnapshot, ArcusSpotChainClient, ArcusSpotChainPreflightRequest,
     ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionIntent,
     ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock, ArcusSpotExecutionLedgerStore,
-    ArcusSpotExecutionPhase, ArcusSpotRotationPlan,
+    ArcusSpotExecutionPhase, ArcusSpotRotationPlan, ArcusSpotSettlementReceiptExpectation,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use dex_connector::{
-    sign_arcus_spot_quote, ArcusSpotClient, ArcusSpotPair, ArcusSpotQuoteRoutePolicy,
-    ArcusSpotSignableQuoteRequest, ArcusSpotSubmitError,
+    sign_arcus_spot_quote, sign_rialto_spot_quote, ArcusSpotClient, ArcusSpotConfig, ArcusSpotPair,
+    ArcusSpotQuoteRoutePolicy, ArcusSpotSignableQuoteRequest, ArcusSpotSubmitError,
 };
 use ethers::{
     signers::Signer,
@@ -19,10 +19,14 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt::Display, path::Path, str::FromStr};
 
 const ARCUS_VENUE: &str = "arcus";
+const RIALTO_VENUE: &str = "rialto";
+const CANONICAL_SWAP_SHELL: &str = "0x4262efBd176F02824af27010bEa218429c33c7E8";
+const CANONICAL_ARCUS_SETTLEMENT: &str = "0x006102b16A04c20306A28b652745D3973D7D24fa";
+const CANONICAL_RIALTO_ROUTER: &str = "0xC94135b63772b91D79d0A2DaAb2a8801f32359bD";
 
-/// Whether a plan routes through Arcus itself, the only venue this executor
-/// may dispatch to (`allowWrapped=false`, direct routing only, per the
-/// approved envelope on bot-strategy#772).
+/// Whether a plan uses one of the explicitly validated Arcus-hosted execution
+/// venues. Both remain direct-token routes (`allowWrapped=false`); LI.FI and
+/// every unknown venue stay fail-closed.
 ///
 /// Exposed so callers can ask *before* dispatching. The router recommends
 /// whichever venue prices best and that is frequently not Arcus, so a plan
@@ -30,8 +34,43 @@ const ARCUS_VENUE: &str = "arcus";
 /// fault -- see the caller in `live-tick` (bot-strategy#817). `validate_plan`
 /// still enforces it independently, since `execute`/`auto-execute` take a
 /// caller-supplied plan that never passed through that check.
-pub fn is_direct_arcus_route(plan: &ArcusSpotRotationPlan) -> bool {
-    plan.venue.eq_ignore_ascii_case(ARCUS_VENUE)
+pub fn is_supported_live_route(plan: &ArcusSpotRotationPlan) -> bool {
+    canonical_live_venue(&plan.venue).is_ok()
+}
+
+fn canonical_live_venue(venue: &str) -> Result<&'static str> {
+    if venue.eq_ignore_ascii_case(ARCUS_VENUE) {
+        Ok(ARCUS_VENUE)
+    } else if venue.eq_ignore_ascii_case(RIALTO_VENUE) {
+        Ok(RIALTO_VENUE)
+    } else {
+        bail!("Arcus Spot live execution does not support venue {venue:?}")
+    }
+}
+
+fn canonical_router_for_venue(venue: &str) -> Result<&'static str> {
+    match canonical_live_venue(venue)? {
+        ARCUS_VENUE => Ok(CANONICAL_ARCUS_SETTLEMENT),
+        RIALTO_VENUE => Ok(CANONICAL_RIALTO_ROUTER),
+        _ => unreachable!("canonical_live_venue returned an unsupported venue"),
+    }
+}
+
+fn require_canonical_venue_spender(
+    config: &ArcusSpotConfig,
+    venue: &str,
+    expected: &str,
+) -> Result<()> {
+    let configured = config
+        .trusted_permit2_spenders
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(venue))
+        .map(|(_, addresses)| addresses)
+        .with_context(|| format!("Arcus router config omitted the {venue} spender pin"))?;
+    if configured.len() != 1 || !configured[0].eq_ignore_ascii_case(expected) {
+        bail!("Arcus router config must pin exactly the canonical {venue} spender {expected}");
+    }
+    Ok(())
 }
 const CANONICAL_PERMIT2: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 /// Ceiling on `max_swaps_per_utc_day`, independent of whatever the config
@@ -46,7 +85,7 @@ const CANONICAL_PERMIT2: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 ///
 /// Twenty is still a ceiling, not a target. What actually bounds the damage
 /// is unchanged and unrelated to it: per-swap notional stays under the
-/// approved $10, the inventory floors hold, only direct Arcus routes
+/// approved $10, the inventory floors hold, only validated Arcus/Rialto routes
 /// dispatch, and the daily and cumulative loss stops now measure
 /// trading-attributed loss, so the cost of trading more lands directly on
 /// them. Ten round trips at the observed ~38 bps all-in on $9.50 is about
@@ -152,6 +191,8 @@ where
                 signer.address()
             );
         }
+        require_canonical_venue_spender(client.config(), ARCUS_VENUE, CANONICAL_ARCUS_SETTLEMENT)?;
+        require_canonical_venue_spender(client.config(), RIALTO_VENUE, CANONICAL_RIALTO_ROUTER)?;
         let ledger_lock = store.acquire_exclusive_lock(lock_namespace)?;
         let ledger = store.load_or_create(Utc::now())?;
         Ok(Self {
@@ -196,6 +237,7 @@ where
             bail!("Arcus approval digest has already been used for a prior execution attempt");
         }
         self.validate_plan(plan)?;
+        let venue = canonical_live_venue(&plan.venue)?;
         let request = ArcusSpotSignableQuoteRequest::new(
             plan.sell_symbol.clone(),
             plan.buy_symbol.clone(),
@@ -204,25 +246,26 @@ where
             self.config.slippage_bps,
             ArcusSpotQuoteRoutePolicy::DirectTokenOnly,
         );
-        let observation = self
-            .client
-            .arcus_signable_quote_by_symbol(&request)
-            .await
-            .context("Arcus fresh signable quote failed")?;
+        let observation = match venue {
+            ARCUS_VENUE => self.client.arcus_signable_quote_by_symbol(&request).await,
+            RIALTO_VENUE => self.client.rialto_signable_quote_by_symbol(&request).await,
+            _ => unreachable!("canonical_live_venue returned an unsupported venue"),
+        }
+        .with_context(|| format!("{venue} fresh signable quote failed"))?;
         let mut matching_quotes = observation
             .response
             .payload
             .quotes
             .iter()
-            .filter(|quote| quote.venue.eq_ignore_ascii_case(ARCUS_VENUE));
+            .filter(|quote| quote.venue.eq_ignore_ascii_case(venue));
         let quote = matching_quotes
             .next()
-            .context("fresh response omitted the direct Arcus venue quote")?;
+            .with_context(|| format!("fresh response omitted the {venue} venue quote"))?;
         if matching_quotes.next().is_some() {
-            bail!("fresh response contained duplicate Arcus venue quotes");
+            bail!("fresh response contained duplicate {venue} venue quotes");
         }
         if quote.sell_amount != plan.sell_amount_raw {
-            bail!("fresh Arcus quote changed the planned exact sell amount");
+            bail!("fresh {venue} quote changed the planned exact sell amount");
         }
         // Nothing upstream cross-checks a plan's raw (on-chain, what
         // actually gets swapped) and decimal (what the runtime commits to
@@ -280,17 +323,31 @@ where
             })
             .await
             .context("Arcus on-chain preflight failed")?;
-        let submission = sign_arcus_spot_quote(
-            &self.client,
-            &observation,
-            &self.signer,
-            preflight.exact_value_permit.as_ref(),
-        )
-        .await
-        .context("Arcus EIP-712 signing failed")?;
+        let submission = match venue {
+            ARCUS_VENUE => {
+                sign_arcus_spot_quote(
+                    &self.client,
+                    &observation,
+                    &self.signer,
+                    preflight.exact_value_permit.as_ref(),
+                )
+                .await
+            }
+            RIALTO_VENUE => {
+                sign_rialto_spot_quote(
+                    &self.client,
+                    &observation,
+                    &self.signer,
+                    preflight.exact_value_permit.as_ref(),
+                )
+                .await
+            }
+            _ => unreachable!("canonical_live_venue returned an unsupported venue"),
+        }
+        .with_context(|| format!("{venue} EIP-712 signing failed"))?;
         let payload_hash = submission.payload_hash()?;
         let intent = ArcusSpotExecutionIntent {
-            venue: ARCUS_VENUE.to_string(),
+            venue: venue.to_string(),
             sell_symbol: plan.sell_symbol.clone(),
             buy_symbol: plan.buy_symbol.clone(),
             sell_token: observation.sell_token.address,
@@ -384,9 +441,10 @@ where
                     .as_deref()
                     .context("submitted Arcus attempt omitted tx_hash")?;
                 let tx_hash = H256::from_str(tx_hash).context("stored Arcus tx_hash is invalid")?;
+                let venue = active.intent.venue.clone();
                 let status = self
                     .client
-                    .swap_status(ARCUS_VENUE, tx_hash)
+                    .swap_status(&venue, tx_hash)
                     .await
                     .context("Arcus status poll failed")?;
                 let mutation = self
@@ -511,8 +569,8 @@ where
             bail!("Arcus execution ledger has an active attempt");
         }
         self.validate_plan_age(plan)?;
-        if !is_direct_arcus_route(plan) {
-            bail!("initial live execution requires a direct Arcus strategy plan");
+        if !is_supported_live_route(plan) {
+            bail!("live execution requires an Arcus or Rialto strategy plan");
         }
         if plan.sell_symbol.eq_ignore_ascii_case(&plan.buy_symbol) {
             bail!("Arcus strategy plan symbols must be distinct");
@@ -567,8 +625,8 @@ where
         {
             bail!("Arcus reconciliation config does not match the original chain and taker");
         }
-        let sell_token = parse_nonzero_address("sell token", &active.intent.sell_token)?;
-        let buy_token = parse_nonzero_address("buy token", &active.intent.buy_token)?;
+        parse_nonzero_address("sell token", &active.intent.sell_token)?;
+        parse_nonzero_address("buy token", &active.intent.buy_token)?;
         let confirmed_tx_hash = active
             .tx_hash
             .as_deref()
@@ -584,7 +642,19 @@ where
         // Unknown (pairtrade#182, bot-strategy#779).
         let post = self
             .chain
-            .balances_requiring_primary_provider(taker, sell_token, buy_token, confirmed_tx_hash)
+            .balances_requiring_settlement_receipt(
+                &ArcusSpotSettlementReceiptExpectation {
+                    venue: active.intent.venue.clone(),
+                    taker: active.taker.clone(),
+                    sell_token: active.intent.sell_token.clone(),
+                    buy_token: active.intent.buy_token.clone(),
+                    sell_amount_raw: active.intent.sell_amount_raw.clone(),
+                    minimum_buy_amount_raw: active.intent.minimum_buy_amount_raw.clone(),
+                    swap_shell: CANONICAL_SWAP_SHELL.to_string(),
+                    venue_router: canonical_router_for_venue(&active.intent.venue)?.to_string(),
+                },
+                confirmed_tx_hash,
+            )
             .await
             .context("Arcus post-submit balance read failed");
         persist_reconciliation_read(&mut self.ledger, &self.store, post)
@@ -967,6 +1037,45 @@ mod tests {
         let mut stale_plan_window = config();
         stale_plan_window.max_plan_age_secs = HARD_MAX_PLAN_AGE_SECS + 1;
         assert!(stale_plan_window.validate().is_err());
+    }
+
+    #[test]
+    fn canonical_arcus_and_rialto_spender_pins_are_mandatory_and_exact() {
+        let mut router = ArcusSpotConfig::default();
+        router.trusted_permit2_spenders = BTreeMap::from([
+            (
+                ARCUS_VENUE.to_string(),
+                vec![CANONICAL_ARCUS_SETTLEMENT.to_string()],
+            ),
+            (
+                RIALTO_VENUE.to_string(),
+                vec![CANONICAL_RIALTO_ROUTER.to_string()],
+            ),
+        ]);
+        require_canonical_venue_spender(&router, ARCUS_VENUE, CANONICAL_ARCUS_SETTLEMENT).unwrap();
+        require_canonical_venue_spender(&router, RIALTO_VENUE, CANONICAL_RIALTO_ROUTER).unwrap();
+
+        router.trusted_permit2_spenders.remove(RIALTO_VENUE);
+        assert!(
+            require_canonical_venue_spender(&router, RIALTO_VENUE, CANONICAL_RIALTO_ROUTER)
+                .unwrap_err()
+                .to_string()
+                .contains("omitted")
+        );
+
+        router.trusted_permit2_spenders.insert(
+            RIALTO_VENUE.to_string(),
+            vec![
+                CANONICAL_RIALTO_ROUTER.to_string(),
+                "0x0000000000000000000000000000000000000001".to_string(),
+            ],
+        );
+        assert!(
+            require_canonical_venue_spender(&router, RIALTO_VENUE, CANONICAL_RIALTO_ROUTER)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly")
+        );
     }
 
     #[test]
