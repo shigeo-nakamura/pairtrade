@@ -34,7 +34,24 @@ pub fn is_direct_arcus_route(plan: &ArcusSpotRotationPlan) -> bool {
     plan.venue.eq_ignore_ascii_case(ARCUS_VENUE)
 }
 const CANONICAL_PERMIT2: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
-const HARD_MAX_DAILY_SWAPS: u32 = 10;
+/// Ceiling on `max_swaps_per_utc_day`, independent of whatever the config
+/// asks for, so a mis-set config cannot turn the bot loose for a day.
+///
+/// Raised 10 -> 20 (bot-strategy#823). Ten swaps is five round trips, and
+/// the probe's purpose shifted to qualifying volume on Arcus itself, where
+/// five round trips a day is the binding constraint rather than the signal:
+/// at `entry_z_score` 2.0 the strategy generates roughly fourteen
+/// dispatchable swaps a day, so the cap, not the market, was deciding how
+/// much it traded.
+///
+/// Twenty is still a ceiling, not a target. What actually bounds the damage
+/// is unchanged and unrelated to it: per-swap notional stays under the
+/// approved $10, the inventory floors hold, only direct Arcus routes
+/// dispatch, and the daily and cumulative loss stops now measure
+/// trading-attributed loss, so the cost of trading more lands directly on
+/// them. Ten round trips at the observed ~38 bps all-in on $9.50 is about
+/// $0.36 a day against a $2 daily stop.
+const HARD_MAX_DAILY_SWAPS: u32 = 20;
 const HARD_MAX_SLIPPAGE_BPS: u32 = 100;
 const HARD_MAX_PLAN_AGE_SECS: u64 = 60;
 
@@ -914,6 +931,28 @@ mod tests {
             ArcusSpotExecutionPhase::Confirmed
         );
         assert!(ledger.active.as_ref().unwrap().post_balances.is_none());
+    }
+
+    /// Pins the ceiling itself, which `validates_hard_live_caps` cannot:
+    /// it tests `HARD_MAX_DAILY_SWAPS + 1`, so it follows the constant
+    /// wherever it goes and would stay green if someone raised it again.
+    /// This is a deliberately-approved risk limit (bot-strategy#772, raised
+    /// once on #823), so moving it should require editing a test that says
+    /// the number out loud.
+    #[test]
+    fn the_daily_swap_ceiling_is_twenty() {
+        assert_eq!(HARD_MAX_DAILY_SWAPS, 20, "ten round trips a day");
+
+        let mut at_ceiling = config();
+        at_ceiling.max_swaps_per_utc_day = 20;
+        at_ceiling
+            .validate()
+            .expect("the ceiling itself must be usable");
+
+        let mut over = config();
+        over.max_swaps_per_utc_day = 21;
+        let error = over.validate().expect_err("one past it must not be");
+        assert!(error.to_string().contains("1..=20"), "{error}");
     }
 
     #[test]
