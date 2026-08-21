@@ -217,7 +217,6 @@ mod tests {
             entry_size_b: Some(Decimal::from_str("1.0").unwrap()),
             entry_z: Some(-2.0),
             entry_beta,
-            entry_sizing_beta: entry_beta,
             last_rehedge_ts,
             rehedge_realized_pnl: None,
             prev_beta_for_velocity: None,

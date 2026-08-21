@@ -565,7 +565,6 @@ impl Harness {
             entry_size_b: Some(dec("0.5")),
             entry_z: Some(2.4),
             entry_beta: Some(1.0),
-            entry_sizing_beta: Some(1.0),
             last_rehedge_ts: None,
             rehedge_realized_pnl: None,
             prev_beta_for_velocity: None,

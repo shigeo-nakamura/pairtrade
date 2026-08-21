@@ -542,17 +542,6 @@ impl PairTradeEngine {
                             // it for drift detection; Phase 2 will use it
                             // as the reference for re-balance qty.
                             entry_beta: Some(beta),
-                            // bot-strategy#824: the β actually used to size
-                            // entry_size_b (raw β floored by
-                            // sizing_beta_floor), so a later exit fallback
-                            // can reconstruct the true hedge ratio rather
-                            // than re-deriving it from entry_beta (which
-                            // can sit below the floor) and a possibly-since-
-                            // changed floor config.
-                            entry_sizing_beta: Some(crate::pairtrade::sizing::resolve_sizing_beta(
-                                beta,
-                                sizing_beta_floor,
-                            )),
                             last_rehedge_ts: None,
                             rehedge_realized_pnl: None,
                             prev_beta_for_velocity: None,

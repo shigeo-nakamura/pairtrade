@@ -770,18 +770,6 @@ impl PairTradeEngine {
             if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
                 let (ep_a, ep_b, es_a, es_b) =
                     Self::entry_prices_and_sizes(key, price_map, &pending.legs, &status);
-                // bot-strategy#824: derive the ratio actually filled — more
-                // accurate than resolve_sizing_beta(beta_at_entry, floor)
-                // here, since the real notional_a/notional_b from this
-                // settle IS the ground truth for what was hedged (unlike
-                // execute.rs's true-entry site, which sizes qtys.1 from a
-                // beta/floor combination before any fill exists).
-                let entry_sizing_beta = match (es_a, ep_a, es_b, ep_b) {
-                    (Some(sa), Some(pa), Some(sb), Some(pb)) if !sa.is_zero() && !pa.is_zero() => {
-                        ((sb * pb) / (sa * pa)).abs().to_f64()
-                    }
-                    _ => None,
-                };
                 state.position = Some(Position {
                     direction: pending.direction,
                     entered_at: Instant::now(),
@@ -792,7 +780,6 @@ impl PairTradeEngine {
                     entry_size_b: es_b,
                     entry_z: z_at_entry,
                     entry_beta: beta_at_entry,
-                    entry_sizing_beta,
                     last_rehedge_ts: None,
                     rehedge_realized_pnl: None,
                     prev_beta_for_velocity: None,
@@ -2538,7 +2525,6 @@ mod tests {
             entry_size_b: Some(dec("1.0")),
             entry_z: Some(2.4),
             entry_beta: Some(1.0),
-            entry_sizing_beta: Some(1.0),
             last_rehedge_ts: None,
             rehedge_realized_pnl: None,
             prev_beta_for_velocity: None,
@@ -2666,7 +2652,6 @@ mod tests {
             entry_size_b: Some(dec("1.0")),
             entry_z: Some(2.4),
             entry_beta: Some(1.0),
-            entry_sizing_beta: Some(1.0),
             last_rehedge_ts: None,
             rehedge_realized_pnl: None,
             prev_beta_for_velocity: None,
