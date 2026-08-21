@@ -234,6 +234,12 @@ impl PairTradeEngine {
                 pos.entry_size_b = Some(plan.expected_new_entry_size_b);
                 pos.entry_price_b = Some(new_entry_price_b);
                 pos.entry_beta = Some(current_beta);
+                // plan_rehedge_order resizes leg B to |current_beta| * size_a
+                // * (price_a/price_b) directly — unfloored, since re-hedge
+                // tracks drift precisely rather than defensively flooring
+                // like entry sizing does — so the ratio it actually applied
+                // is exactly current_beta.abs(), matching entry_beta here.
+                pos.entry_sizing_beta = Some(current_beta.abs());
                 pos.last_rehedge_ts = Some(now_ts);
                 let acc = pos.rehedge_realized_pnl.unwrap_or(Decimal::ZERO) + realized_delta;
                 pos.rehedge_realized_pnl = Some(acc);

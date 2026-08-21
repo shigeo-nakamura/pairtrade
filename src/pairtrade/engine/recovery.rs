@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use dex_connector::{DexError, PositionSnapshot};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use tokio::time::sleep;
 
@@ -567,6 +568,18 @@ impl PairTradeEngine {
                         .position
                         .as_ref()
                         .and_then(|p| p.prev_beta_for_velocity);
+                    // bot-strategy#824: derive from the live exchange-
+                    // reported notional ratio (ground truth for what's
+                    // actually hedged right now) rather than preserving a
+                    // pre-crash value, which recovery.rs cannot otherwise
+                    // reconcile against a possible rehedge that happened
+                    // out-of-band.
+                    let entry_sizing_beta = match (b.entry_price, q.entry_price) {
+                        (Some(pa), Some(pb)) if !b.size.is_zero() && !pa.is_zero() => {
+                            ((q.size * pb) / (b.size * pa)).abs().to_f64()
+                        }
+                        _ => None,
+                    };
                     state.position = Some(Position {
                         direction,
                         entered_at,
@@ -577,6 +590,7 @@ impl PairTradeEngine {
                         entry_size_b: Some(q.size),
                         entry_z: prev_entry_z,
                         entry_beta: prev_entry_beta,
+                        entry_sizing_beta,
                         last_rehedge_ts: prev_last_rehedge_ts,
                         rehedge_realized_pnl: prev_realized,
                         prev_beta_for_velocity: prev_velocity,

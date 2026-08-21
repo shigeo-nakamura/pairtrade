@@ -68,28 +68,30 @@ impl PairTradeEngine {
             );
             // Exit fallback (no recorded sizes): unwind at base hedge ratio.
             //
-            // Use the position's last-known entry_beta (kept current by
-            // dispatch_rehedge on every re-hedge fill) rather than the
-            // caller's current `beta` when it's available: a beta_floor
-            // close is, by construction, evaluated with `beta` already
-            // collapsed below the sizing floor, so recomputing notional_b
-            // from that collapsed value would under-close the B leg
-            // relative to what's actually open.
-            //
-            // `entry_beta` itself is the RAW beta at entry — bot-strategy
-            // #798's sizing floor is applied on top of it (see
-            // `sizing::hedged_sizes` -> `resolve_sizing_beta`), so a
-            // position entered while beta was already below the floor
-            // (before this exit flag existed, or with the floor
-            // configured but the exit disabled) has entry_size_b sized
-            // from the FLOORED beta even though entry_beta stores the
-            // smaller raw value. Passing the current sizing_beta_floor
-            // here (instead of 0.0) re-derives that same floored value
-            // so this fallback matches entry's own hedge ratio in every
-            // case, not just the ones opted into #824 (Codex review).
-            let unwind_beta = recorded.and_then(|p| p.entry_beta).unwrap_or(beta);
-            let sizing_beta_floor = self.pair_params_for(inst_idx, key).sizing_beta_floor;
-            return self.hedged_sizes(inst_idx, pair, unwind_beta, p1, p2, 1.0, sizing_beta_floor);
+            // Prefer `entry_sizing_beta` — the β this position's B leg was
+            // ACTUALLY hedged against (floored at true entry, or the exact
+            // notional_b/notional_a ratio when reconstructed from real fill/
+            // exchange data; kept current by dispatch_rehedge on every
+            // re-hedge fill). Using the caller's current `beta` instead
+            // would under-close the B leg whenever it's evaluated below the
+            // sizing floor (which a beta_floor close, by construction,
+            // always is), and even `entry_beta` (the RAW β at entry, before
+            // #798's floor is applied) can itself sit below the floor for a
+            // position entered before this exit flag existed — re-flooring
+            // that raw value with the CURRENT config is still only a guess
+            // if the floor has since changed, and could equally over-close
+            // (Codex review, bot-strategy#824). `entry_sizing_beta` is
+            // `None` only for positions opened before this field existed;
+            // for those this remains a best-effort guess.
+            let unwind_beta = match recorded.and_then(|p| p.entry_sizing_beta) {
+                Some(v) => v,
+                None => {
+                    let raw = recorded.and_then(|p| p.entry_beta).unwrap_or(beta);
+                    let floor = self.pair_params_for(inst_idx, key).sizing_beta_floor;
+                    sizing::resolve_sizing_beta(raw, floor)
+                }
+            };
+            return self.hedged_sizes(inst_idx, pair, unwind_beta, p1, p2, 1.0, 0.0);
         }
 
         Ok((qty_a, qty_b))
@@ -207,5 +209,108 @@ impl PairTradeEngine {
             notional_scale,
             sizing_beta_floor,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::pairtrade::pending_tests::DummyConnector;
+    use crate::pairtrade::state::{PairState, Position, PositionDirection};
+
+    fn snapshot(price: &str) -> SymbolSnapshot {
+        SymbolSnapshot {
+            price: Decimal::from_str(price).unwrap(),
+            funding_rate: Decimal::ZERO,
+            bid_price: None,
+            ask_price: None,
+            bid_size: Decimal::ZERO,
+            ask_size: Decimal::ZERO,
+            min_order: None,
+            min_tick: None,
+            size_decimals: None,
+            exchange_ts: None,
+        }
+    }
+
+    fn engine_with_position(
+        entry_beta: Option<f64>,
+        entry_sizing_beta: Option<f64>,
+    ) -> PairTradeEngine {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        engine.instances[0].default_pair_params.sizing_beta_floor = 0.5;
+        let mut state = PairState::new(2.0);
+        state.position = Some(Position {
+            direction: PositionDirection::LongSpread,
+            entered_at: Instant::now(),
+            entered_ts: 1_000_000,
+            entry_price_a: None,
+            entry_price_b: None,
+            // Both missing — the exact condition that reaches the
+            // hedged_sizes fallback under test.
+            entry_size_a: None,
+            entry_size_b: None,
+            entry_z: Some(2.0),
+            entry_beta,
+            entry_sizing_beta,
+            last_rehedge_ts: None,
+            rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
+        });
+        engine.instances[0]
+            .states
+            .insert("AAA/BBB".to_string(), state);
+        engine
+    }
+
+    #[test]
+    fn exit_fallback_uses_entry_sizing_beta_ignoring_caller_beta() {
+        let engine = engine_with_position(Some(0.3), Some(0.8));
+        let pair = PairSpec {
+            base: "AAA".to_string(),
+            quote: "BBB".to_string(),
+        };
+        let p1 = snapshot("100.0");
+        let p2 = snapshot("50.0");
+        // Two wildly different caller-supplied `beta` values (one of them
+        // even below the configured floor, mimicking a beta_floor close)
+        // must produce the SAME qty_b: entry_sizing_beta, not the caller's
+        // beta, drives this fallback.
+        let (_, qty_b_low) = engine
+            .exit_sizes_for_pair(0, "AAA/BBB", &pair, 0.1, &p1, &p2)
+            .unwrap();
+        let (_, qty_b_high) = engine
+            .exit_sizes_for_pair(0, "AAA/BBB", &pair, 0.95, &p1, &p2)
+            .unwrap();
+        assert_eq!(qty_b_low, qty_b_high);
+        assert!(qty_b_low > Decimal::ZERO);
+    }
+
+    #[test]
+    fn exit_fallback_without_entry_sizing_beta_floors_raw_entry_beta() {
+        // entry_sizing_beta unavailable (legacy position) — falls back to
+        // resolve_sizing_beta(entry_beta, current floor). entry_beta=0.3 is
+        // below the configured floor (0.5), so the floored 0.5 must be
+        // used, not the raw 0.3 nor the caller's beta.
+        let with_floor = engine_with_position(Some(0.3), None);
+        let without_floor_effect = engine_with_position(Some(0.5), None);
+        let pair = PairSpec {
+            base: "AAA".to_string(),
+            quote: "BBB".to_string(),
+        };
+        let p1 = snapshot("100.0");
+        let p2 = snapshot("50.0");
+        let (_, qty_b_floored) = with_floor
+            .exit_sizes_for_pair(0, "AAA/BBB", &pair, 0.99, &p1, &p2)
+            .unwrap();
+        let (_, qty_b_at_floor) = without_floor_effect
+            .exit_sizes_for_pair(0, "AAA/BBB", &pair, 0.01, &p1, &p2)
+            .unwrap();
+        assert_eq!(qty_b_floored, qty_b_at_floor);
     }
 }

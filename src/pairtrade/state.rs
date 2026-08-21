@@ -44,6 +44,16 @@ pub(super) struct Position {
     /// committed hedge ratio rather than a moving target. `None` for
     /// positions opened before #463 landed.
     pub(super) entry_beta: Option<f64>,
+    /// The actual β used to size `entry_size_b` — `resolve_sizing_beta(entry_beta,
+    /// sizing_beta_floor)` at true entry, or the exact notional_b/notional_a ratio
+    /// when reconstructed from real fill/exchange data. Unlike `entry_beta` (the
+    /// raw signal β, which can sit below the sizing floor), this is what the B leg
+    /// was actually hedged against, so the no-recorded-sizes exit fallback
+    /// (`exit_sizes_for_pair`) can reconstruct the true hedge ratio instead of
+    /// guessing from a beta/floor combination that may not match how this specific
+    /// position was sized (Codex review, bot-strategy#824). `None` for positions
+    /// opened before this field existed.
+    pub(super) entry_sizing_beta: Option<f64>,
     /// Replay-aware timestamp of the most recent re-hedge fire for this
     /// position. Drives the cool-down guard so a single β oscillation
     /// does not produce a stream of re-hedges. `None` until the first
