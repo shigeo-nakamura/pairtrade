@@ -38,9 +38,10 @@
 # --round-json loads the expected round config from a committed file
 # (configs/pairtrade/round.json) and asserts the running effective gauges match
 # EVERY field it declares (per-variant force_close / exit_z / stop_loss_z /
-# frozen_beta / equity_reference_usd / max_leverage, plus a top-level
-# max_leverage fallback for variants that don't declare their own — the
-# blocking preflight for the round-eval harness (#3 in bot-strategy#580). A
+# frozen_beta / equity_reference_usd / max_leverage / sizing_beta_floor /
+# exit_on_sizing_beta_floor, plus a top-level max_leverage fallback for
+# variants that don't declare their own — the blocking preflight for the
+# round-eval harness (#3 in bot-strategy#580). A
 # field absent from round.json is skipped; a declared field with no matching
 # gauge is reported as drift. Requires python3.
 #
@@ -68,6 +69,8 @@ declare -A EXPECT_SLZ=()
 declare -A EXPECT_FROZEN=()
 declare -A EXPECT_EQUITY=()
 declare -A EXPECT_MAXLEV_VARIANT=()
+declare -A EXPECT_SIZING_FLOOR=()
+declare -A EXPECT_EXIT_ON_FLOOR=()
 EXPECT_MAXLEV=""
 EXPECT_INELIG_CAP=""
 EXPECT_INELIG_SPREAD=""
@@ -114,7 +117,7 @@ if [ -n "$ROUND_JSON" ]; then
   # common case; the pre-existing `equity_reference_usd` cell had the same
   # bug). '|' is not IFS whitespace, so adjacent delimiters correctly yield
   # an empty field instead of collapsing.
-  while IFS='|' read -r kind v fc ez slz fz eq mlev; do
+  while IFS='|' read -r kind v fc ez slz fz eq mlev sbf eobf; do
     if [ "$kind" = "maxlev" ]; then EXPECT_MAXLEV="$v"; continue; fi
     if [ "$kind" = "ineligcap" ]; then EXPECT_INELIG_CAP="$v"; continue; fi
     if [ "$kind" = "ineligspread" ]; then EXPECT_INELIG_SPREAD="$v"; continue; fi
@@ -122,6 +125,8 @@ if [ -n "$ROUND_JSON" ]; then
     EXPECT_FC["$v"]="$fc"; EXPECT_EXITZ["$v"]="$ez"; EXPECT_SLZ["$v"]="$slz"
     EXPECT_FROZEN["$v"]="$fz"; EXPECT_EQUITY["$v"]="$eq"
     [ -n "$mlev" ] && EXPECT_MAXLEV_VARIANT["$v"]="$mlev"
+    [ -n "$sbf" ] && EXPECT_SIZING_FLOOR["$v"]="$sbf"
+    [ -n "$eobf" ] && EXPECT_EXIT_ON_FLOOR["$v"]="$eobf"
   done < <(python3 - "$ROUND_JSON" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -138,9 +143,10 @@ if d.get("ineligible_close_defer_stale_secs") is not None:
     print(f'ineligstale|{d["ineligible_close_defer_stale_secs"]}|||||')
 for v, p in d.get("variants", {}).items():
     fz = "" if p.get("use_frozen_beta_exit_z") is None else (1 if p["use_frozen_beta_exit_z"] else 0)
+    eobf = "" if p.get("exit_on_sizing_beta_floor") is None else (1 if p["exit_on_sizing_beta_floor"] else 0)
     print(f'var|{v.lower()}|{cell(p,"force_close_secs")}|{cell(p,"exit_z")}|'
           f'{cell(p,"stop_loss_z")}|{fz}|{cell(p,"equity_reference_usd")}|'
-          f'{cell(p,"max_leverage")}')
+          f'{cell(p,"max_leverage")}|{cell(p,"sizing_beta_floor")}|{eobf}')
 PY
 )
 fi
@@ -221,7 +227,8 @@ else
   # gauges is drift; every committed field is asserted for the rest.
   declared_variants=$(printf '%s\n' "${!EXPECT_FC[@]}" "${!EXPECT_EXITZ[@]}" \
     "${!EXPECT_SLZ[@]}" "${!EXPECT_FROZEN[@]}" "${!EXPECT_EQUITY[@]}" \
-    "${!EXPECT_MAXLEV_VARIANT[@]}" | sort -u | grep -v '^$' || true)
+    "${!EXPECT_MAXLEV_VARIANT[@]}" "${!EXPECT_SIZING_FLOOR[@]}" \
+    "${!EXPECT_EXIT_ON_FLOOR[@]}" | sort -u | grep -v '^$' || true)
   observed_variants=$(echo "$metrics" | grep '^pairtrade_effective_force_close_secs{' \
     | sed -n 's/.*variant="\([^"]*\)".*/\1/p' | sort -u)
   all_variants=$(printf '%s\n%s\n' "$declared_variants" "$observed_variants" | sort -u | grep -v '^$' || true)
@@ -245,11 +252,15 @@ else
     inelig_spread=$(gauge_for pairtrade_effective_ineligible_close_defer_spread_bps "$variant")
     inelig_stale=$(gauge_for pairtrade_effective_ineligible_close_defer_stale_secs "$variant")
     inelig_stale=${inelig_stale%.*}
-    say "variant $variant   : force_close=${fc_int}s exit_z=${ez:-?} stop_loss_z=${slz:-?} frozen_beta=${fz:-?} equity=${eq:-?} max_leverage=${mlev:-?} inelig_defer_cap=${inelig_cap:-?} inelig_defer_spread=${inelig_spread:-?} inelig_defer_stale=${inelig_stale:-?}"
+    sizing_floor=$(gauge_for pairtrade_effective_sizing_beta_floor "$variant")
+    exit_on_floor=$(gauge_for pairtrade_effective_exit_on_sizing_beta_floor "$variant"); exit_on_floor=${exit_on_floor%.*}
+    say "variant $variant   : force_close=${fc_int}s exit_z=${ez:-?} stop_loss_z=${slz:-?} frozen_beta=${fz:-?} equity=${eq:-?} max_leverage=${mlev:-?} inelig_defer_cap=${inelig_cap:-?} inelig_defer_spread=${inelig_spread:-?} inelig_defer_stale=${inelig_stale:-?} sizing_beta_floor=${sizing_floor:-?} exit_on_sizing_beta_floor=${exit_on_floor:-?}"
     assert_num "$variant" force_close "${EXPECT_FC[$variant]:-}" "$fc_int"
     assert_num "$variant" exit_z "${EXPECT_EXITZ[$variant]:-}" "$ez"
     assert_num "$variant" stop_loss_z "${EXPECT_SLZ[$variant]:-}" "$slz"
     assert_num "$variant" equity_reference_usd "${EXPECT_EQUITY[$variant]:-}" "$eq"
+    assert_num "$variant" sizing_beta_floor "${EXPECT_SIZING_FLOOR[$variant]:-}" "$sizing_floor"
+    assert_num "$variant" exit_on_sizing_beta_floor "${EXPECT_EXIT_ON_FLOOR[$variant]:-}" "$exit_on_floor"
     # Per-variant max_leverage (bot-strategy#814) wins when round.json declares
     # one for this variant; otherwise fall back to the top-level max_leverage,
     # matching the running process's own YAML/env override -> top-level order.
