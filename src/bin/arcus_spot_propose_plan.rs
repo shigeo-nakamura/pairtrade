@@ -373,13 +373,10 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
     let client = ArcusSpotClient::new(config.router.clone())
         .context("invalid Arcus router configuration")?;
     let recorder_config = ArcusSpotRecorderConfig::from_csv(
-        &format!(
-            "{}/{}",
-            config.runtime.pair.sell_symbol, config.runtime.pair.buy_symbol
-        ),
+        &config.runtime.bidirectional_recorder_pairs_csv(),
         &config.runtime.notional_usd.normalize().to_string(),
     )
-    .context("failed to build a single-pair recorder config from the runtime pair/notional")?;
+    .context("failed to build a bidirectional recorder config from the runtime pair/notional")?;
     let recorder = ArcusSpotRecorder::new(client, recorder_config)
         .context("invalid Arcus recorder configuration")?;
 

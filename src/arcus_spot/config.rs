@@ -68,6 +68,20 @@ impl ArcusSpotRuntimeConfig {
         self.pair.buy_symbol = self.pair.buy_symbol.trim().to_ascii_uppercase();
     }
 
+    /// Recorder pairs required to independently cost-gate entries in both
+    /// rotation directions. Each CSV row describes its own forward and
+    /// reverse cycle, so the reverse entry must start from a separately
+    /// requested B-to-A-to-B row rather than reusing the A-to-B-to-A cost.
+    pub fn bidirectional_recorder_pairs_csv(&self) -> String {
+        format!(
+            "{}/{}, {}/{}",
+            self.pair.sell_symbol,
+            self.pair.buy_symbol,
+            self.pair.buy_symbol,
+            self.pair.sell_symbol
+        )
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.chain_id == 0 {
             return Err("chain_id must be non-zero".to_string());
@@ -159,6 +173,7 @@ fn validate_inventory(name: &str, inventory: ArcusSpotInventory) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dex_connector::ArcusSpotRecorderConfig;
 
     fn valid_config() -> ArcusSpotRuntimeConfig {
         ArcusSpotRuntimeConfig {
@@ -206,5 +221,21 @@ mod tests {
         config.gas_buffer_bps = Decimal::from(60);
         config.settlement_buffer_bps = Decimal::from(41);
         assert!(config.validate().unwrap_err().contains("buffers"));
+    }
+
+    #[test]
+    fn recorder_pairs_cover_both_round_trip_cycles() {
+        let config = valid_config();
+        assert_eq!(
+            config.bidirectional_recorder_pairs_csv(),
+            "NVDA/AMD, AMD/NVDA"
+        );
+        let recorder =
+            ArcusSpotRecorderConfig::from_csv(&config.bidirectional_recorder_pairs_csv(), "5")
+                .unwrap();
+        assert_eq!(recorder.pairs.len(), 2);
+        assert_eq!(recorder.pairs[0], config.pair);
+        assert_eq!(recorder.pairs[1].sell_symbol, config.pair.buy_symbol);
+        assert_eq!(recorder.pairs[1].buy_symbol, config.pair.sell_symbol);
     }
 }
