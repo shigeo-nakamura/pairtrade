@@ -626,6 +626,7 @@ impl PairTradeEngine {
                                     shared,
                                     z,
                                     std,
+                                    current_beta: beta_eff,
                                     p1,
                                     p2,
                                     equity_base,
@@ -639,10 +640,12 @@ impl PairTradeEngine {
                                     .map(|s| s.last_velocity_sigma_per_min)
                                     .unwrap_or(0.0);
                                 log::info!(
-                                    "[EXIT_CHECK] {} reason={} z={:.2} exit_z={:.2} stop_z={:.2} vel={:.3} max_vel={:.3}",
+                                    "[EXIT_CHECK] {} reason={} z={:.2} beta={:.4} beta_floor={:.4} exit_z={:.2} stop_z={:.2} vel={:.3} max_vel={:.3}",
                                     key,
                                     reason,
                                     z,
+                                    beta_eff,
+                                    pp.sizing_beta_floor,
                                     pp.exit_z,
                                     pp.stop_loss_z,
                                     velocity_for_log,
@@ -830,6 +833,7 @@ impl PairTradeEngine {
                                 shared,
                                 z: z_now,
                                 std: std_now,
+                                current_beta: beta_eff,
                                 p1,
                                 p2,
                                 equity_base: equity_reference_snapshot,
@@ -907,7 +911,16 @@ impl PairTradeEngine {
                             }
                         }
                         if fire_close {
-                            log::info!("[EXIT_CHECK] {} reason=ineligible", key);
+                            // Preserve the dedicated #824 attribution when a
+                            // beta jump crosses the floor and eligibility on
+                            // the same evaluation tick. Other risk exits keep
+                            // the established ineligible attribution.
+                            let close_reason = if risk_exit == Some("beta_floor") {
+                                "beta_floor"
+                            } else {
+                                "ineligible"
+                            };
+                            log::info!("[EXIT_CHECK] {} reason={}", key, close_reason);
                             // Deliberately NOT clearing ineligible_defer_since_ts
                             // here: planning only proposes the close, and a
                             // failed placement with a reset timer would grant
@@ -916,7 +929,7 @@ impl PairTradeEngine {
                             // apply_post_exit_state once the position is
                             // actually gone.
                             if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
-                                state.pending_exit_reason = Some("ineligible");
+                                state.pending_exit_reason = Some(close_reason);
                             }
                             action = TradeAction::Close {
                                 direction: pos.direction,

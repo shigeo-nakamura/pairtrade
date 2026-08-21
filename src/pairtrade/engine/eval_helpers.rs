@@ -68,8 +68,9 @@ impl PairTradeEngine {
             );
             // Exit fallback (no recorded sizes): unwind at base hedge ratio.
             // bot-strategy#461's notional shrink and bot-strategy#798's
-            // sizing_beta_floor are entry-side only — we must not apply
-            // either here or we'd leave a residual position.
+            // sizing_beta_floor are sizing-side only — even when #824 uses
+            // the floor as a close trigger, we must not re-apply it to exit
+            // quantities or we could leave a residual position.
             return self.hedged_sizes(inst_idx, pair, beta, p1, p2, 1.0, 0.0);
         }
 

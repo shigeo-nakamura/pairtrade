@@ -124,6 +124,15 @@ fn robinhood_lighter_two_arm_config_parses() {
     assert!((b.max_leverage - 50.0).abs() < 1e-9);
     assert_eq!(b.force_close_time_secs, Some(10800));
     assert_eq!(b.stop_loss_z, 8.0);
+    assert_eq!(freq.exit_on_sizing_beta_floor, None);
+    assert_eq!(b.exit_on_sizing_beta_floor, Some(true));
+    let mut freq_params = cfg.default_pair_params.clone();
+    freq.apply_pair_param_overrides(&mut freq_params);
+    let mut b_params = cfg.default_pair_params.clone();
+    b.apply_pair_param_overrides(&mut b_params);
+    assert!(!freq_params.exit_on_sizing_beta_floor);
+    assert!(b_params.exit_on_sizing_beta_floor);
+    assert_eq!(b_params.sizing_beta_floor, 0.6);
     // Top-level max_leverage is only a fallback both arms override.
     assert!((cfg.max_leverage - 20.0).abs() < 1e-9);
 
@@ -651,6 +660,7 @@ fn strategy_config_for_overlay_test() -> StrategyConfig {
         rehedge_z_no_revert_factor: None,
         rehedge_velocity_projected_drift_min: None,
         beta_uncertainty_max: None,
+        exit_on_sizing_beta_floor: None,
         std_collapse_hold_down_secs: None,
         use_frozen_beta_exit_z: None,
         regime_block_entries: None,
@@ -681,6 +691,7 @@ fn strategy_pair_param_overlay_applies_all_strategy_overrides() {
     strategy.rehedge_z_no_revert_factor = Some(1.2);
     strategy.rehedge_velocity_projected_drift_min = Some(0.03);
     strategy.beta_uncertainty_max = Some(0.04);
+    strategy.exit_on_sizing_beta_floor = Some(true);
     strategy.std_collapse_hold_down_secs = Some(3600);
     strategy.use_frozen_beta_exit_z = Some(true);
     strategy.regime_block_entries = Some(true);
@@ -712,6 +723,7 @@ fn strategy_pair_param_overlay_applies_all_strategy_overrides() {
     assert_eq!(params.rehedge_z_no_revert_factor, 1.2);
     assert_eq!(params.rehedge_velocity_projected_drift_min, 0.03);
     assert_eq!(params.beta_uncertainty_max, 0.04);
+    assert!(params.exit_on_sizing_beta_floor);
     assert_eq!(params.std_collapse_hold_down_secs, 3600);
     assert!(params.use_frozen_beta_exit_z);
     assert!(params.regime_block_entries);
@@ -728,6 +740,7 @@ fn strategy_pair_param_overlay_preserves_inherited_optionals() {
         rehedge_live_enabled: true,
         std_collapse_hold_down_secs: 120,
         use_frozen_beta_exit_z: true,
+        exit_on_sizing_beta_floor: true,
         regime_block_entries: true,
         ..PairParams::default()
     };
@@ -744,5 +757,6 @@ fn strategy_pair_param_overlay_preserves_inherited_optionals() {
     assert!(params.rehedge_live_enabled);
     assert_eq!(params.std_collapse_hold_down_secs, 120);
     assert!(params.use_frozen_beta_exit_z);
+    assert!(params.exit_on_sizing_beta_floor);
     assert!(params.regime_block_entries);
 }

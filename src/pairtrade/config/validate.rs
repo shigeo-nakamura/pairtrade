@@ -104,6 +104,30 @@ impl PairTradeConfig {
                 RAW_BETA_GAP_MAX
             ));
         }
+        let beta_floor_enabled = self.strategies.iter().any(|strategy| {
+            strategy
+                .exit_on_sizing_beta_floor
+                .unwrap_or(self.default_pair_params.exit_on_sizing_beta_floor)
+        });
+        if beta_floor_enabled {
+            let validate_floor = |scope: &str, floor: f64| -> Result<()> {
+                if !floor.is_finite() || floor <= 0.0 {
+                    return Err(anyhow!(
+                        "{} enables exit_on_sizing_beta_floor but sizing_beta_floor ({}) must be finite and > 0",
+                        scope,
+                        floor
+                    ));
+                }
+                Ok(())
+            };
+            validate_floor(
+                "default_pair_params",
+                self.default_pair_params.sizing_beta_floor,
+            )?;
+            for (pair, params) in &self.pair_params {
+                validate_floor(&format!("pair_params.{pair}"), params.sizing_beta_floor)?;
+            }
+        }
         // 0 = legacy immediate force-close on SIGTERM; no grace window to
         // validate.
         if self.shutdown_grace_secs == 0 {

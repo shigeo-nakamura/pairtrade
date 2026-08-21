@@ -110,6 +110,9 @@ pub(in crate::pairtrade) struct PairTradeYaml {
     /// exactly `notional_a * |beta|` as before. Does not affect `beta_min`
     /// (entry eligibility) or the z-score/spread calculation, only sizing.
     pub(super) sizing_beta_floor: Option<f64>,
+    /// Opt a held position into an early exit when rolling `|beta|` drops
+    /// below `sizing_beta_floor`. Default false; bot-strategy#824.
+    pub(super) exit_on_sizing_beta_floor: Option<bool>,
     pub(super) hedge_ratio_max_deviation: Option<f64>,
     pub(super) circuit_breaker_tier1_losses: Option<u32>,
     pub(super) circuit_breaker_tier1_cooldown_secs: Option<u64>,
@@ -298,6 +301,8 @@ pub(in crate::pairtrade) struct StrategyYaml {
     pub(super) rehedge_z_no_revert_factor: Option<f64>,
     pub(super) rehedge_velocity_projected_drift_min: Option<f64>,
     pub(super) beta_uncertainty_max: Option<f64>,
+    /// Per-strategy opt-in for the hold-time beta-floor exit.
+    pub(super) exit_on_sizing_beta_floor: Option<bool>,
     /// bot-strategy#500: per-variant override of `std_collapse_hold_down_secs`.
     /// Lets a single challenger test the defensive hold-down while controls
     /// inherit the global default.

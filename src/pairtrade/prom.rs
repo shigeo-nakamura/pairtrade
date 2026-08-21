@@ -420,6 +420,7 @@ pub static CLOSE_REASON_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// stays correct on low-volume reasons.
 pub const KNOWN_CLOSE_REASONS: &[&str] = &[
     "stop_loss_z",
+    "beta_floor",
     "force_close",
     "exit_z",
     "max_loss_r",
@@ -452,7 +453,7 @@ pub static ENTRY_REJECT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
          session_halted, daily_loss, circuit_breaker, waiting_first_eval, \
          regime) and the in-`should_enter` filters \
          (cooldown, post_stop_cooldown, velocity, std_collapse, std_collapse_hold_down, \
-         stop_loss_z, spread_trend, beta_divergence, beta_min, \
+         stop_loss_z, spread_trend, beta_divergence, beta_min, beta_floor, \
          z_below_threshold, mtf, net_funding_min). Round-4 follow-up \
          (bot-strategy#355).",
         &["variant", "pair", "reason"],
@@ -539,6 +540,7 @@ pub const KNOWN_ENTRY_REJECT_REASONS: &[&str] = &[
     "spread_trend",
     "beta_divergence",
     "beta_min",
+    "beta_floor",
     "beta_uncertainty",
     "beta_clamp",
     "regime_innovation",
@@ -789,6 +791,22 @@ pub static EFFECTIVE_STOP_LOSS_Z: Lazy<GaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static EFFECTIVE_SIZING_BETA_FLOOR: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_sizing_beta_floor",
+        "Effective entry sizing beta floor for this variant; 0 disables.",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_EXIT_ON_SIZING_BETA_FLOOR: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_effective_exit_on_sizing_beta_floor",
+        "1 when held positions close after rolling beta falls below the sizing floor.",
+        &["variant"],
+    )
+});
+
 pub static EFFECTIVE_FROZEN_BETA_EXIT_Z: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge(
         "pairtrade_effective_frozen_beta_exit_z",
@@ -955,6 +973,8 @@ pub fn record_config_info(
     force_close_secs: u64,
     exit_z: f64,
     stop_loss_z: f64,
+    sizing_beta_floor: f64,
+    exit_on_sizing_beta_floor: bool,
     frozen_beta_exit_z: bool,
     equity_reference_usd: f64,
     max_leverage: f64,
@@ -981,6 +1001,12 @@ pub fn record_config_info(
     EFFECTIVE_STOP_LOSS_Z
         .with_label_values(&[variant])
         .set(stop_loss_z);
+    EFFECTIVE_SIZING_BETA_FLOOR
+        .with_label_values(&[variant])
+        .set(sizing_beta_floor);
+    EFFECTIVE_EXIT_ON_SIZING_BETA_FLOOR
+        .with_label_values(&[variant])
+        .set(if exit_on_sizing_beta_floor { 1 } else { 0 });
     EFFECTIVE_FROZEN_BETA_EXIT_Z
         .with_label_values(&[variant])
         .set(if frozen_beta_exit_z { 1 } else { 0 });

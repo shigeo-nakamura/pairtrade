@@ -255,6 +255,8 @@ impl PairTradeEngine {
                     effective.force_close_secs,
                     effective.exit_z,
                     effective.stop_loss_z,
+                    effective.sizing_beta_floor,
+                    effective.exit_on_sizing_beta_floor,
                     effective.use_frozen_beta_exit_z,
                     effective.equity_reference_usd,
                     effective.max_leverage,

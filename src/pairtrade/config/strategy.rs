@@ -53,6 +53,8 @@ pub struct StrategyConfig {
     pub rehedge_z_no_revert_factor: Option<f64>,
     pub rehedge_velocity_projected_drift_min: Option<f64>,
     pub beta_uncertainty_max: Option<f64>,
+    /// Per-strategy opt-in for the hold-time beta-floor exit (#824).
+    pub exit_on_sizing_beta_floor: Option<bool>,
     /// Per-strategy override of `std_collapse_hold_down_secs` (bot-strategy#500).
     pub std_collapse_hold_down_secs: Option<u64>,
     /// Per-strategy override of `use_frozen_beta_exit_z` (bot-strategy#473).
@@ -163,6 +165,7 @@ pub(super) fn resolve_strategies(
                     rehedge_z_no_revert_factor: s.rehedge_z_no_revert_factor,
                     rehedge_velocity_projected_drift_min: s.rehedge_velocity_projected_drift_min,
                     beta_uncertainty_max: s.beta_uncertainty_max,
+                    exit_on_sizing_beta_floor: s.exit_on_sizing_beta_floor,
                     std_collapse_hold_down_secs: s.std_collapse_hold_down_secs,
                     use_frozen_beta_exit_z: s.use_frozen_beta_exit_z,
                     regime_block_entries: s.regime_block_entries,
@@ -198,6 +201,7 @@ pub(super) fn resolve_strategies(
             rehedge_z_no_revert_factor: None,
             rehedge_velocity_projected_drift_min: None,
             beta_uncertainty_max: None,
+            exit_on_sizing_beta_floor: None,
             std_collapse_hold_down_secs: None,
             use_frozen_beta_exit_z: None,
             regime_block_entries: None,
@@ -272,6 +276,9 @@ impl StrategyConfig {
         }
         if let Some(v) = self.beta_uncertainty_max {
             params.beta_uncertainty_max = v;
+        }
+        if let Some(v) = self.exit_on_sizing_beta_floor {
+            params.exit_on_sizing_beta_floor = v;
         }
         if let Some(v) = self.std_collapse_hold_down_secs {
             params.std_collapse_hold_down_secs = v;
