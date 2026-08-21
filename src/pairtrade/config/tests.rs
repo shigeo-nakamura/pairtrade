@@ -121,12 +121,16 @@ fn robinhood_lighter_two_arm_config_parses() {
         Some("debot-pair-robinhood-lighter-b")
     );
     assert!((b.equity_reference_usd - 4000.0).abs() < 1e-9);
-    assert!((b.max_leverage - 50.0).abs() < 1e-9);
-    assert_eq!(b.force_close_time_secs, Some(10800));
-    assert_eq!(b.stop_loss_z, 8.0);
+    assert!((b.max_leverage - 30.0).abs() < 1e-9);
+    assert_eq!(b.force_close_time_secs, None);
+    assert_eq!(b.stop_loss_z, 4.0);
+    let mut b_params = cfg.default_pair_params.clone();
+    b.apply_pair_param_overrides(&mut b_params);
+    assert_eq!(b_params.force_close_secs, 3600);
+    assert_eq!(b_params.stop_loss_z, 4.0);
     assert_eq!(freq.exit_on_sizing_beta_floor, None);
     assert_eq!(b.exit_on_sizing_beta_floor, None);
-    // Top-level max_leverage is only a fallback both arms override.
+    // Top-level max_leverage is only a fallback; both arms resolve to 30x.
     assert!((cfg.max_leverage - 20.0).abs() < 1e-9);
 
     for (name, value) in saved {

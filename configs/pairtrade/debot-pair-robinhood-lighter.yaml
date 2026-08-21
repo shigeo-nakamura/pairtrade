@@ -1,11 +1,19 @@
 # Robinhood Chain Lighter launch configuration (#790/#794).
-# Two-arm split (bot-strategy#798, 2026-08-18): `freq` (original profile,
-# tighter stop/faster force_close) and `b` (Frankfurt-B clone: wider stop,
-# slower force_close), each on its own Lighter sub-account. Top-level
-# scalars below are the shared defaults / legacy fallback; the `strategies:`
-# block at the end overrides per-arm values. Launch remains DRY_RUN-flagged
-# in-file but the live process currently runs with dry_run=false — see
-# runbook before touching this file.
+# Two-arm split (bot-strategy#798, 2026-08-18): `freq` and `b`, each on its
+# own Lighter sub-account. `b` originally cloned the Frankfurt-B profile
+# (wider stop_loss_z=8.0, force_close=10800s, max_leverage=50) to test
+# whether more patience reduced the force_close loss asymmetry. Readout
+# 2026-08-21 (#798): force_close losses were already near-zero on both arms;
+# the dominant loss driver had shifted to `ineligible` exits, and `b`'s
+# wider/slower profile made per-trade ineligible losses materially worse
+# (avg -$103.74/trade vs freq's -$23.80, biggest single loss -$318.46) while
+# bleeding capital ~2x faster than freq on a per-$1000 basis. `b` was
+# reverted to freq's entry/exit/stop/force_close params and max_leverage
+# (2026-08-21) — only equity_usd_reference ($4,000 vs freq's $2,000) still
+# differs between the arms. Top-level scalars below are the shared defaults
+# / legacy fallback; the `strategies:` block at the end overrides per-arm
+# values. Launch remains DRY_RUN-flagged in-file but the live process
+# currently runs with dry_run=false — see runbook before touching this file.
 
 dex_name: lighter
 rest_endpoint: https://api.rh.lighter.xyz
@@ -42,12 +50,12 @@ metrics_window_length: 240
 warm_start_mode: relaxed
 warm_start_min_bars: 60
 
-# Preserve the Frankfurt canary multi-timeframe entry gate (freq arm default;
-# b arm overrides below).
+# Preserve the Frankfurt canary multi-timeframe entry gate (shared by both arms).
 mtf_windows: [15]
 mtf_z_min: 0.5
 
-# Frankfurt canary parameters (freq arm default; b arm overrides below).
+# Frankfurt canary parameters (shared by both arms as of 2026-08-21 — see
+# header note; b previously overrode these, reverted after readout).
 entry_z_score_base: 1.0
 entry_z_score_min: 0.8
 entry_z_score_max: 1.5
@@ -56,11 +64,10 @@ stop_loss_z_score: 4.0
 # bot-strategy#798: halved from 7200 (canary value) on 2026-08-17 for the
 # freq arm. Journal review 08-14..08-17 showed most exits hit force_close
 # rather than exit_z/stop_loss — the dominant frequency constraint for the
-# points-farming objective. b arm overrides this back up to 10800 (see
-# strategies: block) to test whether more patience changes the force_close
-# loss asymmetry (bot-strategy#798 mid-window/final readout).
+# points-farming objective. b arm now shares this value (reverted 2026-08-21,
+# see header note).
 force_close_time_secs: 3600
-shutdown_grace_secs: 10860
+shutdown_grace_secs: 3660
 
 # Post-stop cool-down (#316). 600 s blocks immediate re-entry after a
 # stop_loss_z exit on the same direction — Round 4 BT sweep on 5/3-5/8
@@ -126,15 +133,10 @@ circuit_breaker_tier2_cooldown_secs: 3600
 
 # Risk gates (bot-strategy#185). All bps fields are 1x-equivalent (market-
 # move) and multiplied by EACH ARM'S OWN resolved max_leverage at comparison
-# time (bot-strategy#814 made leverage per-instance) — the halt fires at the
-# same underlying market move on both arms even though freq (30x) and b
-# (50x) now run different leverage. Equity-% consequence naturally scales
-# with each arm's own leverage: freq's effective daily/session gates are
-# 75bps×30=2250bps (22.5%) / 50bps×30=1500bps (15%); b's are
-# 75bps×50=3750bps (37.5%) / 50bps×50=2500bps (25%). This is the intended
-# behavior of the leverage-neutralization design, not a miscalibration —
-# but b's 25% session-DD tolerance is wide for a real-money $4,000 account;
-# revisit if that's more slack than desired.
+# time (bot-strategy#814 made leverage per-instance). As of 2026-08-21 both
+# arms run max_leverage=30 (b's 50x reverted, see header note), so both now
+# have the same effective daily/session gates: 75bps×30=2250bps (22.5%) /
+# 50bps×30=1500bps (15%).
 risk:
   max_daily_loss_bps: 75
   max_daily_loss_action: block
@@ -148,8 +150,9 @@ risk:
   max_notional_headroom: 0.25
 
 # Two-arm split (bot-strategy#798, 2026-08-18; leverage split bot-strategy#814,
-# 2026-08-19). Field values not listed per-arm inherit the top-level scalar
-# above.
+# 2026-08-19; b reverted to freq's params/leverage 2026-08-21, see header
+# note — only equity_usd_reference still differs between the arms). Field
+# values not listed per-arm inherit the top-level scalar above.
 strategies:
   - id: freq
     agent_name: debot-pair-robinhood-lighter-freq
@@ -157,14 +160,5 @@ strategies:
     max_leverage: 30
   - id: b
     agent_name: debot-pair-robinhood-lighter-b
-    entry_z_score_base: 1.5
-    entry_z_score_min: 1.0
-    entry_z_score_max: 2.0
-    exit_z_score: 0.2
-    stop_loss_z_score: 8.0
-    force_close_time_secs: 10800
-    max_loss_r_mult: 1.0
     equity_usd_reference: 4000
-    max_leverage: 50
-    mtf_windows: [15]
-    mtf_z_min: 0.5
+    max_leverage: 30
