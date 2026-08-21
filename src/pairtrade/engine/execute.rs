@@ -43,9 +43,17 @@ impl PairTradeEngine {
                 force,
             } = plan.action
             {
-                let qtys = self
-                    .exit_sizes_for_pair(inst_idx, &plan.key, &plan.pair, beta, &plan.p1, &plan.p2)
-                    .context("exit_sizes_for_pair")?;
+                let qtys = match self.exit_sizes_for_pair(inst_idx, &plan.key, &plan.pair) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        log::error!(
+                            "[EXIT] {} skipping close this tick, exit_sizes_for_pair failed: {:#}",
+                            plan.key,
+                            e
+                        );
+                        continue;
+                    }
+                };
                 if qtys.0 <= Decimal::ZERO && qtys.1 <= Decimal::ZERO {
                     log::warn!(
                         "[EXIT] {} no open position sizes available; clearing state",
