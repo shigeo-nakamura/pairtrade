@@ -566,48 +566,66 @@ impl PairTradeEngine {
                                 }
                             }
                             if let Some(dec) = rehedge_decision {
-                                log::info!(
-                                    "[REHEDGE_NEEDED] variant={} pair={} entry_beta={:.4} current_beta={:.4} drift_pct={:.4} swing_usd={:.2}",
-                                    self.instances[inst_idx].id,
-                                    key,
-                                    dec.entry_beta,
-                                    dec.current_beta,
-                                    dec.drift_pct,
-                                    dec.notional_swing_usd,
-                                );
-                                crate::pairtrade::prom::REHEDGE_NEEDED_TOTAL
-                                    .with_label_values(&[
-                                        self.instances[inst_idx].id.as_str(),
-                                        key.as_str(),
-                                    ])
-                                    .inc();
-                                // bot-strategy#463 Phase 2: dispatch the
-                                // actual re-hedge if no other order is in
-                                // flight on this position. Dry-run / BT
-                                // always simulate; live opt-in via
-                                // `rehedge_live_enabled` (default false,
-                                // safety gate).
-                                let current_price_b = price_map
-                                    .get(&pair.quote)
-                                    .map(|s| s.price)
-                                    .unwrap_or(Decimal::ZERO);
-                                self.dispatch_rehedge(
-                                    inst_idx,
-                                    &key,
-                                    pair,
-                                    dec.current_beta,
-                                    current_price_b,
-                                    now_ts,
-                                )
-                                .await
-                                .unwrap_or_else(|e| {
-                                    log::warn!(
-                                        "[REHEDGE_DISPATCH] variant={} pair={} failed: {}",
+                                // bot-strategy#824: a β collapse severe
+                                // enough to trip the hold-time floor exit
+                                // also satisfies the (much looser)
+                                // re-hedge drift threshold. Resizing leg B
+                                // right before the same tick's full close
+                                // is a wasted trade (and a live taker
+                                // order when `rehedge_live_enabled` is on)
+                                // that can race the exit — skip the
+                                // re-hedge whenever the floor exit is due.
+                                if crate::pairtrade::exit::beta_floor_exit_due(pp, current_beta) {
+                                    log::info!(
+                                        "[REHEDGE_SKIPPED] variant={} pair={} reason=beta_floor_exit_due current_beta={:.4}",
                                         self.instances[inst_idx].id,
                                         key,
-                                        e
+                                        current_beta,
                                     );
-                                });
+                                } else {
+                                    log::info!(
+                                        "[REHEDGE_NEEDED] variant={} pair={} entry_beta={:.4} current_beta={:.4} drift_pct={:.4} swing_usd={:.2}",
+                                        self.instances[inst_idx].id,
+                                        key,
+                                        dec.entry_beta,
+                                        dec.current_beta,
+                                        dec.drift_pct,
+                                        dec.notional_swing_usd,
+                                    );
+                                    crate::pairtrade::prom::REHEDGE_NEEDED_TOTAL
+                                        .with_label_values(&[
+                                            self.instances[inst_idx].id.as_str(),
+                                            key.as_str(),
+                                        ])
+                                        .inc();
+                                    // bot-strategy#463 Phase 2: dispatch the
+                                    // actual re-hedge if no other order is in
+                                    // flight on this position. Dry-run / BT
+                                    // always simulate; live opt-in via
+                                    // `rehedge_live_enabled` (default false,
+                                    // safety gate).
+                                    let current_price_b = price_map
+                                        .get(&pair.quote)
+                                        .map(|s| s.price)
+                                        .unwrap_or(Decimal::ZERO);
+                                    self.dispatch_rehedge(
+                                        inst_idx,
+                                        &key,
+                                        pair,
+                                        dec.current_beta,
+                                        current_price_b,
+                                        now_ts,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        log::warn!(
+                                            "[REHEDGE_DISPATCH] variant={} pair={} failed: {}",
+                                            self.instances[inst_idx].id,
+                                            key,
+                                            e
+                                        );
+                                    });
+                                }
                             }
                             let equity_base = equity_reference_snapshot;
                             let reason_opt = {
@@ -915,7 +933,19 @@ impl PairTradeEngine {
                             // beta jump crosses the floor and eligibility on
                             // the same evaluation tick. Other risk exits keep
                             // the established ineligible attribution.
-                            let close_reason = if risk_exit == Some("beta_floor") {
+                            //
+                            // `risk_exit` above is gated behind `defer_cap >
+                            // 0` (it only exists to bypass book-quality
+                            // deferral), so with the default
+                            // `ineligible_close_defer_cap_secs=0` it is
+                            // always `None` and could never surface
+                            // `beta_floor` here — undercounting the new exit
+                            // reason in exactly the default deployment
+                            // configuration. Check the floor independently
+                            // of whether deferral is enabled.
+                            let close_reason = if risk_exit == Some("beta_floor")
+                                || crate::pairtrade::exit::beta_floor_exit_due(pp, beta_eff)
+                            {
                                 "beta_floor"
                             } else {
                                 "ineligible"
