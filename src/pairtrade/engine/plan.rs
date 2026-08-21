@@ -832,7 +832,15 @@ impl PairTradeEngine {
                         // into exactly the conditions the stop exists for
                         // (PR #166 Codex review). The close still fires with
                         // reason=ineligible, matching pre-guard behavior.
-                        let risk_exit = if defer_cap > 0 {
+                        // Computed unconditionally (independent of
+                        // `defer_cap`) so attribution below always sees
+                        // risk_exit_reason's own precedence (stop_loss_z
+                        // before beta_floor). `risk_exit` — gated behind
+                        // `defer_cap > 0` — stays the deferral-bypass signal
+                        // it always was; it must not fire (and must not log
+                        // the "[EXIT_DEFER] bypass" line) when the
+                        // book-quality guard itself is disabled.
+                        let risk_exit_full = {
                             let (z_now, std_now) = z_snapshot
                                 .map(|(z, std, _, _)| (z, std))
                                 .unwrap_or((0.0, 0.0));
@@ -857,9 +865,8 @@ impl PairTradeEngine {
                                 equity_base: equity_reference_snapshot,
                                 now_ts,
                             })
-                        } else {
-                            None
                         };
+                        let risk_exit = if defer_cap > 0 { risk_exit_full } else { None };
                         let degraded = if defer_cap > 0 && risk_exit.is_none() {
                             // This branch only runs on ticks where both
                             // legs emitted a bar, i.e. both just had an
@@ -934,35 +941,26 @@ impl PairTradeEngine {
                             // the same evaluation tick. Other risk exits keep
                             // the established ineligible attribution.
                             //
-                            // `risk_exit` already applies the right
-                            // precedence internally (stop_loss_z before
-                            // beta_floor, see risk_exit_reason), so a
+                            // `risk_exit_full` (unlike the deferral-gated
+                            // `risk_exit` above) is always computed, so it
+                            // always applies risk_exit_reason's own
+                            // precedence (stop_loss_z before beta_floor). A
                             // `Some(_)` other than `Some("beta_floor")` means
                             // a higher-precedence risk reason fired and must
                             // not be relabeled — doing so would drop the
                             // close from stop-loss metrics and skip arming
                             // `stop_loss_cooldown_secs`, permitting an early
-                            // same-direction re-entry (Codex review).
-                            //
-                            // `risk_exit` is gated behind `defer_cap > 0` (it
-                            // only exists to bypass book-quality deferral),
-                            // so with the default
-                            // `ineligible_close_defer_cap_secs=0` it is
-                            // always `None` and could never surface
-                            // `beta_floor` here — undercounting the new exit
-                            // reason in exactly the default deployment
-                            // configuration. Only in that `None` case do we
-                            // fall back to checking the floor directly.
-                            let close_reason = match risk_exit {
-                                Some("beta_floor") => "beta_floor",
-                                Some(_) => "ineligible",
-                                None => {
-                                    if crate::pairtrade::exit::beta_floor_exit_due(pp, beta_eff) {
-                                        "beta_floor"
-                                    } else {
-                                        "ineligible"
-                                    }
-                                }
+                            // same-direction re-entry (Codex review). Using
+                            // the deferral-gated `risk_exit` here instead
+                            // would undercount `beta_floor` whenever
+                            // `ineligible_close_defer_cap_secs=0` (the
+                            // default), since that variable is forced to
+                            // `None` in that configuration regardless of the
+                            // actual risk state.
+                            let close_reason = if risk_exit_full == Some("beta_floor") {
+                                "beta_floor"
+                            } else {
+                                "ineligible"
                             };
                             log::info!("[EXIT_CHECK] {} reason={}", key, close_reason);
                             // Deliberately NOT clearing ineligible_defer_since_ts
