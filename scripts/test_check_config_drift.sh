@@ -47,7 +47,7 @@ cat > "$ROUND_JSON" <<'EOF'
   "max_leverage": 20,
   "variants": {
     "freq": {"force_close_secs": 3600, "exit_z": 0.2, "stop_loss_z": 4.0, "equity_reference_usd": 2000, "max_leverage": 30},
-    "b": {"force_close_secs": 10800, "exit_z": 0.2, "stop_loss_z": 8.0, "equity_reference_usd": 4000, "max_leverage": 50},
+    "b": {"force_close_secs": 10800, "exit_z": 0.2, "stop_loss_z": 8.0, "equity_reference_usd": 4000, "max_leverage": 50, "sizing_beta_floor": 0.6, "exit_on_sizing_beta_floor": true},
     "c": {"force_close_secs": 3600, "exit_z": 0.2, "stop_loss_z": 4.0, "equity_reference_usd": 1000}
   }
 }
@@ -56,7 +56,10 @@ EOF
 write_metrics() {
   # $1 = observed max_leverage for variant b (30/50/20 = correct scenario;
   # anything else must be reported as drift).
+  # $2 = observed exit_on_sizing_beta_floor for variant b (default 1 = matches
+  # round.json; bot-strategy#824 review — the new field must be asserted too).
   local b_mlev="$1"
+  local b_eobf="${2:-1}"
   cat > "$WORK/metrics.txt" <<METRICS
 pairtrade_config_file_info{variant="freq",sha="$DISK_SHA"} 1
 pairtrade_effective_force_close_secs{variant="freq"} 3600
@@ -74,6 +77,12 @@ pairtrade_equity_reference_usd{variant="c"} 1000
 pairtrade_max_leverage_config{variant="freq"} 30
 pairtrade_max_leverage_config{variant="b"} $b_mlev
 pairtrade_max_leverage_config{variant="c"} 20
+pairtrade_effective_sizing_beta_floor{variant="freq"} 0
+pairtrade_effective_sizing_beta_floor{variant="b"} 0.6
+pairtrade_effective_sizing_beta_floor{variant="c"} 0
+pairtrade_effective_exit_on_sizing_beta_floor{variant="freq"} 0
+pairtrade_effective_exit_on_sizing_beta_floor{variant="b"} $b_eobf
+pairtrade_effective_exit_on_sizing_beta_floor{variant="c"} 0
 METRICS
 }
 
@@ -138,5 +147,20 @@ HTTP_PID=""
 echo "$out" | grep -q 'variant b effective max_leverage=20' \
   || fail "drift message did not name variant b's mismatched max_leverage; got: $out"
 echo "PASS: variant b running at the wrong (non-overridden) max_leverage is correctly flagged as drift"
+
+# --- Case 3: b's exit_on_sizing_beta_floor gauge disagrees with round.json ----
+write_metrics 50 0
+serve_metrics
+set +e
+out=$(run_check 2>&1)
+rc=$?
+set -e
+kill "$HTTP_PID" 2>/dev/null || true
+wait "$HTTP_PID" 2>/dev/null || true
+HTTP_PID=""
+[ "$rc" -eq 2 ] || fail "expected exit 2 (drift) when variant b's exit_on_sizing_beta_floor gauge (0) doesn't match round.json (1), got exit $rc: $out"
+echo "$out" | grep -q 'variant b effective exit_on_sizing_beta_floor=0' \
+  || fail "drift message did not name variant b's mismatched exit_on_sizing_beta_floor; got: $out"
+echo "PASS: variant b running with the beta-floor exit disabled when round.json enables it is correctly flagged as drift"
 
 echo "ALL CHECKS PASSED"

@@ -96,6 +96,13 @@ pub(super) const DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS: u64 = 0;
 /// using the rolling-β z regardless. See bot-strategy#473.
 pub(super) const DEFAULT_USE_FROZEN_BETA_EXIT_Z: bool = false;
 
+/// Close an already-held position when the rolling `|beta|` falls below the
+/// entry sizing floor. Default off preserves the entry-only semantics of
+/// `sizing_beta_floor`; selected variants may opt in after live/BT evidence
+/// shows that hold-time beta collapse creates directional exposure.
+/// See bot-strategy#824.
+pub(super) const DEFAULT_EXIT_ON_SIZING_BETA_FLOOR: bool = false;
+
 // Multi-timeframe z-score confluence (disabled by default)
 pub(super) const DEFAULT_MTF_Z_MIN: f64 = 0.0;
 

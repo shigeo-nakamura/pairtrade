@@ -5,7 +5,11 @@
 //!
 //! - `exit_sizes_for_pair` — pick exit qtys from the exchange snapshot
 //!   when available, fall back to the bot-recorded entry sizes, and
-//!   ultimately to `hedged_sizes` if both are missing.
+//!   error out (fail closed) if both are missing: `hedged_sizes` recomputes
+//!   qty_a from the CURRENT equity/leverage/price, so no beta/ratio guess —
+//!   however accurate — can make its absolute size match the real position,
+//!   and a wrong guess risks residual or reversed live exposure (Codex
+//!   review, bot-strategy#824).
 //! - `sum_entry_sizes_by_symbol` — collapse `pending.legs` (which can
 //!   hold two legs per symbol after a partial-fill reissue) to one
 //!   total per symbol; static fn so reconcile can call it without
@@ -22,7 +26,7 @@
 //! per-pair pipeline. `pair_eval::evaluate_pair` is now called directly
 //! at the single canonical site.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
 
 use super::super::config::PairSpec;
@@ -37,9 +41,6 @@ impl PairTradeEngine {
         inst_idx: usize,
         key: &str,
         pair: &PairSpec,
-        beta: f64,
-        p1: &SymbolSnapshot,
-        p2: &SymbolSnapshot,
     ) -> Result<(Decimal, Decimal)> {
         let base_snapshot = self.open_positions.get(&pair.base);
         let quote_snapshot = self.open_positions.get(&pair.quote);
@@ -62,15 +63,24 @@ impl PairTradeEngine {
         let qty_b = recorded_b.unwrap_or(Decimal::ZERO);
 
         if qty_a <= Decimal::ZERO && qty_b <= Decimal::ZERO {
-            log::warn!(
-                "[EXIT] {} missing position sizes from exchange/state; falling back to hedge sizing",
+            // Fail closed (Codex review, bot-strategy#824): with both the
+            // exchange snapshot AND the bot's recorded entry sizes missing,
+            // there is no way to recover the true position size.
+            // `hedged_sizes` recomputes leg A from the CURRENT
+            // equity/leverage/price/depth-multiplier/rounding — not the
+            // actual historical entry — so no beta/ratio guess, however
+            // accurate, can make its absolute output match what's really
+            // open. Any price move, config change, or equity change since
+            // entry would silently over- or under-close, risking residual
+            // or reversed live exposure. Refuse to guess: the caller skips
+            // this pair's close for this tick and retries next tick, once
+            // the exchange snapshot or recorded state (whichever caused
+            // this) has recovered.
+            return Err(anyhow!(
+                "{} exit fallback: exchange snapshot AND recorded entry sizes both \
+                 missing — refusing to guess a close size",
                 key
-            );
-            // Exit fallback (no recorded sizes): unwind at base hedge ratio.
-            // bot-strategy#461's notional shrink and bot-strategy#798's
-            // sizing_beta_floor are entry-side only — we must not apply
-            // either here or we'd leave a residual position.
-            return self.hedged_sizes(inst_idx, pair, beta, p1, p2, 1.0, 0.0);
+            ));
         }
 
         Ok((qty_a, qty_b))
@@ -188,5 +198,74 @@ impl PairTradeEngine {
             notional_scale,
             sizing_beta_floor,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::pairtrade::pending_tests::DummyConnector;
+    use crate::pairtrade::state::{PairState, Position, PositionDirection};
+
+    fn engine_with_state(position: Option<Position>) -> PairTradeEngine {
+        let connector = Arc::new(DummyConnector::default());
+        let mut engine = PairTradeEngine::test_instance(connector);
+        let mut state = PairState::new(2.0);
+        state.position = position;
+        engine.instances[0]
+            .states
+            .insert("AAA/BBB".to_string(), state);
+        engine
+    }
+
+    fn pair() -> PairSpec {
+        PairSpec {
+            base: "AAA".to_string(),
+            quote: "BBB".to_string(),
+        }
+    }
+
+    fn bare_position() -> Position {
+        Position {
+            direction: PositionDirection::LongSpread,
+            entered_at: Instant::now(),
+            entered_ts: 1_000_000,
+            entry_price_a: None,
+            entry_price_b: None,
+            entry_size_a: None,
+            entry_size_b: None,
+            entry_z: Some(2.0),
+            entry_beta: Some(1.0),
+            last_rehedge_ts: None,
+            rehedge_realized_pnl: None,
+            prev_beta_for_velocity: None,
+        }
+    }
+
+    #[test]
+    fn exit_sizes_fails_closed_when_snapshot_and_recorded_sizes_both_missing() {
+        // No exchange snapshot in `open_positions` (test_instance starts
+        // empty) and no recorded entry_size_a/b — the exact "we've lost
+        // track of the true size" case where any guessed close risks
+        // residual or reversed live exposure (Codex review, bot-strategy#824).
+        let engine = engine_with_state(Some(bare_position()));
+        let err = engine
+            .exit_sizes_for_pair(0, "AAA/BBB", &pair())
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to guess"));
+    }
+
+    #[test]
+    fn exit_sizes_uses_recorded_sizes_when_present() {
+        let mut position = bare_position();
+        position.entry_size_a = Some(Decimal::from(1));
+        position.entry_size_b = Some(Decimal::from(2));
+        let engine = engine_with_state(Some(position));
+        let (qty_a, qty_b) = engine.exit_sizes_for_pair(0, "AAA/BBB", &pair()).unwrap();
+        assert_eq!(qty_a, Decimal::from(1));
+        assert_eq!(qty_b, Decimal::from(2));
     }
 }

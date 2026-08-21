@@ -30,6 +30,8 @@ pub struct EffectiveConfig {
     pub force_close_secs: u64,
     pub exit_z: f64,
     pub stop_loss_z: f64,
+    pub sizing_beta_floor: f64,
+    pub exit_on_sizing_beta_floor: bool,
     pub use_frozen_beta_exit_z: bool,
     pub equity_reference_usd: f64,
     pub max_leverage: f64,
@@ -70,6 +72,8 @@ impl EffectiveConfig {
             force_close_secs: effective.force_close_secs,
             exit_z: effective.exit_z,
             stop_loss_z: effective.stop_loss_z,
+            sizing_beta_floor: effective.sizing_beta_floor,
+            exit_on_sizing_beta_floor: effective.exit_on_sizing_beta_floor,
             use_frozen_beta_exit_z: effective.use_frozen_beta_exit_z,
             equity_reference_usd: strategy.equity_reference_usd,
             max_leverage,
@@ -117,7 +121,8 @@ impl EffectiveConfig {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "force_close_secs={};exit_z={:.6};stop_loss_z={:.6};use_frozen_beta_exit_z={};\
+            "force_close_secs={};exit_z={:.6};stop_loss_z={:.6};sizing_beta_floor={:.6};\
+             exit_on_sizing_beta_floor={};use_frozen_beta_exit_z={};\
              equity_reference_usd={:.6};max_leverage={:.6};dry_run={};\
              entry_z_base={:.6};entry_z_min={:.6};entry_z_max={:.6};\
              mtf_windows={};mtf_z_min={:.6};max_loss_r_mult={:.6};\
@@ -132,6 +137,8 @@ impl EffectiveConfig {
             self.force_close_secs,
             self.exit_z,
             self.stop_loss_z,
+            self.sizing_beta_floor,
+            self.exit_on_sizing_beta_floor,
             self.use_frozen_beta_exit_z,
             self.equity_reference_usd,
             self.max_leverage,
@@ -167,12 +174,14 @@ impl EffectiveConfig {
     /// format documented in bot-strategy#580.
     pub fn log_line(&self) -> String {
         format!(
-            "[CONFIG] variant={} force_close={} exit_z={} stop_loss_z={} frozen_beta={} \
+            "[CONFIG] variant={} force_close={} exit_z={} stop_loss_z={} sizing_beta_floor={} exit_on_beta_floor={} frozen_beta={} \
              equity_ref={} max_leverage={} dry_run={} inelig_defer_cap={} elig_margin_grace={} elig_beta_exit={} fp={}",
             self.variant,
             self.force_close_secs,
             self.exit_z,
             self.stop_loss_z,
+            self.sizing_beta_floor,
+            self.exit_on_sizing_beta_floor,
             self.use_frozen_beta_exit_z,
             self.equity_reference_usd,
             self.max_leverage,
@@ -249,6 +258,7 @@ mod tests {
             rehedge_z_no_revert_factor: None,
             rehedge_velocity_projected_drift_min: None,
             beta_uncertainty_max: None,
+            exit_on_sizing_beta_floor: None,
             std_collapse_hold_down_secs: None,
             use_frozen_beta_exit_z: Some(false),
             regime_block_entries: None,
@@ -303,6 +313,21 @@ mod tests {
     }
 
     #[test]
+    fn beta_floor_exit_change_moves_the_fingerprint() {
+        let mut p_off = sample_params();
+        p_off.sizing_beta_floor = 0.6;
+        let mut p_on = p_off.clone();
+        p_on.exit_on_sizing_beta_floor = true;
+        let fp_off =
+            EffectiveConfig::from_resolved(&sample_strategy("b"), &p_off, 5.0, true, 0, 20.0, 30)
+                .fingerprint();
+        let fp_on =
+            EffectiveConfig::from_resolved(&sample_strategy("b"), &p_on, 5.0, true, 0, 20.0, 30)
+                .fingerprint();
+        assert_ne!(fp_off, fp_on);
+    }
+
+    #[test]
     fn ineligible_defer_change_moves_the_fingerprint() {
         // The guard's knobs change live close timing (0 disables it, 300 can
         // hold closes), so guard-off vs guard-on must never share a
@@ -351,6 +376,8 @@ mod tests {
                 .log_line();
         assert!(line.starts_with("[CONFIG] variant=a "));
         assert!(line.contains("force_close=10800"));
+        assert!(line.contains("sizing_beta_floor=0"));
+        assert!(line.contains("exit_on_beta_floor=false"));
         assert!(line.contains("frozen_beta=false"));
         assert!(line.contains("equity_ref=1000"));
         assert!(line.contains("inelig_defer_cap=0"));

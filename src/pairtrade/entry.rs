@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 
 use super::config::{PairParams, PairTradeConfig};
+use super::exit::beta_floor_exit_due;
 use super::state::{PairSharedState, PairState, PositionDirection};
 use super::stats::{spread_slope_sigma, BETA_CLAMP_MAX, BETA_CLAMP_MIN};
 use super::util::tail_std;
@@ -362,6 +363,13 @@ pub(super) fn should_enter(check: EntryCheck<'_>) -> Result<(), &'static str> {
     // Beta minimum filter: block entry if beta is too low (hedge leg too small)
     if pp.beta_min > 0.0 && shared.beta < pp.beta_min {
         return Err("beta_min");
+    }
+    // #824: once an opted-in held position exits on beta collapse, keep new
+    // entries blocked until beta recovers above the same sizing floor. Without
+    // this gate the generic cooldown could permit re-entry followed by an
+    // immediate beta_floor exit on the next tick.
+    if beta_floor_exit_due(pp, shared.beta) {
+        return Err("beta_floor");
     }
     // bot-strategy#462 Phase 2 — Kalman β-uncertainty gate. Rigorous
     // alternative to the beta_gap proxy: the filter's posterior σ_β

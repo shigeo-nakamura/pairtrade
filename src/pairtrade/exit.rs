@@ -14,6 +14,7 @@ pub(super) struct ExitCheck<'a> {
     pub(super) shared: &'a PairSharedState,
     pub(super) z: f64,
     pub(super) std: f64,
+    pub(super) current_beta: f64,
     pub(super) p1: &'a SymbolSnapshot,
     pub(super) p2: &'a SymbolSnapshot,
     pub(super) equity_base: f64,
@@ -28,6 +29,7 @@ pub(super) fn exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
         shared,
         z,
         std,
+        current_beta,
         p1,
         p2,
         equity_base,
@@ -40,6 +42,9 @@ pub(super) fn exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
 
     if z_for_exit.abs() >= pp.stop_loss_z {
         return Some("stop_loss_z");
+    }
+    if beta_floor_exit_due(pp, current_beta) {
+        return Some("beta_floor");
     }
     if now_ts.saturating_sub(pos.entered_ts) >= pp.force_close_secs as i64 {
         return Some("force_close");
@@ -77,8 +82,8 @@ pub(super) fn exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
     None
 }
 
-/// The risk-triggered subset of `exit_reason`: `stop_loss_z`, `max_loss_r`
-/// and `risk_budget`, under the same frozen-β view and precedence those gates
+/// The risk-triggered subset of `exit_reason`: `stop_loss_z`, `beta_floor`,
+/// `max_loss_r` and `risk_budget`, under the same frozen-β view and precedence those gates
 /// have in `exit_reason`. Used by the ineligible-close book-quality guard
 /// (bot-strategy#531, PR #166 review): a position that is already stopped
 /// out, past its loss budget or at its risk-budget target must close
@@ -92,6 +97,7 @@ pub(super) fn risk_exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
         shared,
         z,
         std,
+        current_beta,
         p1,
         p2,
         equity_base,
@@ -103,7 +109,21 @@ pub(super) fn risk_exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
     if z_for_exit.abs() >= pp.stop_loss_z {
         return Some("stop_loss_z");
     }
+    if beta_floor_exit_due(pp, current_beta) {
+        return Some("beta_floor");
+    }
     pnl_risk_exit(cfg, pp, compute_pnl(pos, p1.price, p2.price), equity_base)
+}
+
+/// Hold-time beta collapse guard (bot-strategy#824). This is deliberately a
+/// close trigger rather than a resize: the normal exit path then unwinds the
+/// exchange/recorded entry quantities and cannot leave a residual leg.
+pub(super) fn beta_floor_exit_due(pp: &PairParams, current_beta: f64) -> bool {
+    pp.exit_on_sizing_beta_floor
+        && pp.sizing_beta_floor.is_finite()
+        && pp.sizing_beta_floor > 0.0
+        && current_beta.is_finite()
+        && current_beta.abs() < pp.sizing_beta_floor
 }
 
 /// bot-strategy#473: when the YAML opts into frozen-β exit and the position
@@ -196,4 +216,38 @@ pub(super) fn compute_pnl(
     // into the volume-weighted `entry_price_b` and do not appear here.
     let realized = pos.rehedge_realized_pnl.unwrap_or(Decimal::ZERO);
     Some(pnl_a + pnl_b + realized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(enabled: bool, floor: f64) -> PairParams {
+        PairParams {
+            exit_on_sizing_beta_floor: enabled,
+            sizing_beta_floor: floor,
+            ..PairParams::default()
+        }
+    }
+
+    #[test]
+    fn beta_floor_exit_requires_explicit_opt_in() {
+        assert!(!beta_floor_exit_due(&params(false, 0.6), 0.3));
+    }
+
+    #[test]
+    fn beta_floor_exit_fires_strictly_below_floor() {
+        let pp = params(true, 0.6);
+        assert!(beta_floor_exit_due(&pp, 0.5999));
+        assert!(beta_floor_exit_due(&pp, -0.3));
+        assert!(!beta_floor_exit_due(&pp, 0.6));
+        assert!(!beta_floor_exit_due(&pp, 0.7));
+    }
+
+    #[test]
+    fn beta_floor_exit_rejects_disabled_or_invalid_inputs() {
+        assert!(!beta_floor_exit_due(&params(true, 0.0), 0.0));
+        assert!(!beta_floor_exit_due(&params(true, f64::NAN), 0.3));
+        assert!(!beta_floor_exit_due(&params(true, 0.6), f64::NAN));
+    }
 }

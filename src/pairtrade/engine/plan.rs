@@ -566,48 +566,66 @@ impl PairTradeEngine {
                                 }
                             }
                             if let Some(dec) = rehedge_decision {
-                                log::info!(
-                                    "[REHEDGE_NEEDED] variant={} pair={} entry_beta={:.4} current_beta={:.4} drift_pct={:.4} swing_usd={:.2}",
-                                    self.instances[inst_idx].id,
-                                    key,
-                                    dec.entry_beta,
-                                    dec.current_beta,
-                                    dec.drift_pct,
-                                    dec.notional_swing_usd,
-                                );
-                                crate::pairtrade::prom::REHEDGE_NEEDED_TOTAL
-                                    .with_label_values(&[
-                                        self.instances[inst_idx].id.as_str(),
-                                        key.as_str(),
-                                    ])
-                                    .inc();
-                                // bot-strategy#463 Phase 2: dispatch the
-                                // actual re-hedge if no other order is in
-                                // flight on this position. Dry-run / BT
-                                // always simulate; live opt-in via
-                                // `rehedge_live_enabled` (default false,
-                                // safety gate).
-                                let current_price_b = price_map
-                                    .get(&pair.quote)
-                                    .map(|s| s.price)
-                                    .unwrap_or(Decimal::ZERO);
-                                self.dispatch_rehedge(
-                                    inst_idx,
-                                    &key,
-                                    pair,
-                                    dec.current_beta,
-                                    current_price_b,
-                                    now_ts,
-                                )
-                                .await
-                                .unwrap_or_else(|e| {
-                                    log::warn!(
-                                        "[REHEDGE_DISPATCH] variant={} pair={} failed: {}",
+                                // bot-strategy#824: a β collapse severe
+                                // enough to trip the hold-time floor exit
+                                // also satisfies the (much looser)
+                                // re-hedge drift threshold. Resizing leg B
+                                // right before the same tick's full close
+                                // is a wasted trade (and a live taker
+                                // order when `rehedge_live_enabled` is on)
+                                // that can race the exit — skip the
+                                // re-hedge whenever the floor exit is due.
+                                if crate::pairtrade::exit::beta_floor_exit_due(pp, current_beta) {
+                                    log::info!(
+                                        "[REHEDGE_SKIPPED] variant={} pair={} reason=beta_floor_exit_due current_beta={:.4}",
                                         self.instances[inst_idx].id,
                                         key,
-                                        e
+                                        current_beta,
                                     );
-                                });
+                                } else {
+                                    log::info!(
+                                        "[REHEDGE_NEEDED] variant={} pair={} entry_beta={:.4} current_beta={:.4} drift_pct={:.4} swing_usd={:.2}",
+                                        self.instances[inst_idx].id,
+                                        key,
+                                        dec.entry_beta,
+                                        dec.current_beta,
+                                        dec.drift_pct,
+                                        dec.notional_swing_usd,
+                                    );
+                                    crate::pairtrade::prom::REHEDGE_NEEDED_TOTAL
+                                        .with_label_values(&[
+                                            self.instances[inst_idx].id.as_str(),
+                                            key.as_str(),
+                                        ])
+                                        .inc();
+                                    // bot-strategy#463 Phase 2: dispatch the
+                                    // actual re-hedge if no other order is in
+                                    // flight on this position. Dry-run / BT
+                                    // always simulate; live opt-in via
+                                    // `rehedge_live_enabled` (default false,
+                                    // safety gate).
+                                    let current_price_b = price_map
+                                        .get(&pair.quote)
+                                        .map(|s| s.price)
+                                        .unwrap_or(Decimal::ZERO);
+                                    self.dispatch_rehedge(
+                                        inst_idx,
+                                        &key,
+                                        pair,
+                                        dec.current_beta,
+                                        current_price_b,
+                                        now_ts,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        log::warn!(
+                                            "[REHEDGE_DISPATCH] variant={} pair={} failed: {}",
+                                            self.instances[inst_idx].id,
+                                            key,
+                                            e
+                                        );
+                                    });
+                                }
                             }
                             let equity_base = equity_reference_snapshot;
                             let reason_opt = {
@@ -626,6 +644,7 @@ impl PairTradeEngine {
                                     shared,
                                     z,
                                     std,
+                                    current_beta: beta_eff,
                                     p1,
                                     p2,
                                     equity_base,
@@ -639,10 +658,12 @@ impl PairTradeEngine {
                                     .map(|s| s.last_velocity_sigma_per_min)
                                     .unwrap_or(0.0);
                                 log::info!(
-                                    "[EXIT_CHECK] {} reason={} z={:.2} exit_z={:.2} stop_z={:.2} vel={:.3} max_vel={:.3}",
+                                    "[EXIT_CHECK] {} reason={} z={:.2} beta={:.4} beta_floor={:.4} exit_z={:.2} stop_z={:.2} vel={:.3} max_vel={:.3}",
                                     key,
                                     reason,
                                     z,
+                                    beta_eff,
+                                    pp.sizing_beta_floor,
                                     pp.exit_z,
                                     pp.stop_loss_z,
                                     velocity_for_log,
@@ -785,12 +806,48 @@ impl PairTradeEngine {
                         );
                     }
                 } else if eligible_shared && !defer_pending && spread_len < min_points {
-                    log::debug!(
-                        "[ZCHECK] {} skipped (spread history too short: {} < {})",
-                        key,
-                        spread_len,
-                        min_points
-                    );
+                    // bot-strategy#824 (Codex review): the beta-floor safety
+                    // exit only needs current_beta — already available via
+                    // per_pair_state.beta, independent of spread-history
+                    // warm-up — not z/std readiness. Without this
+                    // independent check, a recovered held position whose
+                    // beta has already collapsed below the sizing floor
+                    // could sit unclosed for dozens of bars after a restart
+                    // or history loss while waiting on min_points, exactly
+                    // the window the floor exit exists to protect against.
+                    let floor_due = if position_state.is_some() {
+                        crate::pairtrade::exit::beta_floor_exit_due(pp, beta_eff)
+                    } else {
+                        false
+                    };
+                    if floor_due {
+                        let pos = position_state.as_ref().expect("checked by floor_due");
+                        log::info!(
+                            "[EXIT_CHECK] {} reason=beta_floor beta={:.4} beta_floor={:.4} \
+                             (spread history warming up: {} < {})",
+                            key,
+                            beta_eff,
+                            pp.sizing_beta_floor,
+                            spread_len,
+                            min_points
+                        );
+                        if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                            state.pending_exit_reason = Some("beta_floor");
+                        }
+                        action = TradeAction::Close {
+                            direction: pos.direction,
+                            z: 0.0,
+                            beta: beta_eff,
+                            force: false,
+                        };
+                    } else {
+                        log::debug!(
+                            "[ZCHECK] {} skipped (spread history too short: {} < {})",
+                            key,
+                            spread_len,
+                            min_points
+                        );
+                    }
                 } else if position_state.is_some() && (!eligible_shared || defer_pending) {
                     // If pair falls out of eligibility, flatten. When the
                     // book-quality guard is enabled (bot-strategy#531), a
@@ -811,7 +868,15 @@ impl PairTradeEngine {
                         // into exactly the conditions the stop exists for
                         // (PR #166 Codex review). The close still fires with
                         // reason=ineligible, matching pre-guard behavior.
-                        let risk_exit = if defer_cap > 0 {
+                        // Computed unconditionally (independent of
+                        // `defer_cap`) so attribution below always sees
+                        // risk_exit_reason's own precedence (stop_loss_z
+                        // before beta_floor). `risk_exit` — gated behind
+                        // `defer_cap > 0` — stays the deferral-bypass signal
+                        // it always was; it must not fire (and must not log
+                        // the "[EXIT_DEFER] bypass" line) when the
+                        // book-quality guard itself is disabled.
+                        let risk_exit_full = {
                             let (z_now, std_now) = z_snapshot
                                 .map(|(z, std, _, _)| (z, std))
                                 .unwrap_or((0.0, 0.0));
@@ -830,14 +895,14 @@ impl PairTradeEngine {
                                 shared,
                                 z: z_now,
                                 std: std_now,
+                                current_beta: beta_eff,
                                 p1,
                                 p2,
                                 equity_base: equity_reference_snapshot,
                                 now_ts,
                             })
-                        } else {
-                            None
                         };
+                        let risk_exit = if defer_cap > 0 { risk_exit_full } else { None };
                         let degraded = if defer_cap > 0 && risk_exit.is_none() {
                             // This branch only runs on ticks where both
                             // legs emitted a bar, i.e. both just had an
@@ -907,7 +972,33 @@ impl PairTradeEngine {
                             }
                         }
                         if fire_close {
-                            log::info!("[EXIT_CHECK] {} reason=ineligible", key);
+                            // Preserve the dedicated #824 attribution when a
+                            // beta jump crosses the floor and eligibility on
+                            // the same evaluation tick. Other risk exits keep
+                            // the established ineligible attribution.
+                            //
+                            // `risk_exit_full` (unlike the deferral-gated
+                            // `risk_exit` above) is always computed, so it
+                            // always applies risk_exit_reason's own
+                            // precedence (stop_loss_z before beta_floor). A
+                            // `Some(_)` other than `Some("beta_floor")` means
+                            // a higher-precedence risk reason fired and must
+                            // not be relabeled — doing so would drop the
+                            // close from stop-loss metrics and skip arming
+                            // `stop_loss_cooldown_secs`, permitting an early
+                            // same-direction re-entry (Codex review). Using
+                            // the deferral-gated `risk_exit` here instead
+                            // would undercount `beta_floor` whenever
+                            // `ineligible_close_defer_cap_secs=0` (the
+                            // default), since that variable is forced to
+                            // `None` in that configuration regardless of the
+                            // actual risk state.
+                            let close_reason = if risk_exit_full == Some("beta_floor") {
+                                "beta_floor"
+                            } else {
+                                "ineligible"
+                            };
+                            log::info!("[EXIT_CHECK] {} reason={}", key, close_reason);
                             // Deliberately NOT clearing ineligible_defer_since_ts
                             // here: planning only proposes the close, and a
                             // failed placement with a reset timer would grant
@@ -916,7 +1007,7 @@ impl PairTradeEngine {
                             // apply_post_exit_state once the position is
                             // actually gone.
                             if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
-                                state.pending_exit_reason = Some("ineligible");
+                                state.pending_exit_reason = Some(close_reason);
                             }
                             action = TradeAction::Close {
                                 direction: pos.direction,

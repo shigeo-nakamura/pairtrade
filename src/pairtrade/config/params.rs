@@ -32,6 +32,11 @@ pub struct PairParams {
     /// notional = leg_A_notional * |beta|, unbounded below). Does not
     /// affect `beta_min` (entry eligibility) or z-score/spread math.
     pub sizing_beta_floor: f64,
+    /// When enabled, close a held position once the rolling `|beta|` falls
+    /// below `sizing_beta_floor`. The exit still unwinds exchange/recorded
+    /// entry quantities; it never re-applies the floor to exit sizing.
+    /// Default false preserves the entry-only behavior. bot-strategy#824.
+    pub exit_on_sizing_beta_floor: bool,
     pub hedge_ratio_max_deviation: f64,
     pub lookback_hours_short: u64,
     pub lookback_hours_long: u64,
@@ -211,6 +216,10 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
         beta_divergence_max: env_parse("BETA_DIVERGENCE_MAX", DEFAULT_BETA_DIVERGENCE_MAX),
         beta_min: env_parse("BETA_MIN", 0.0),
         sizing_beta_floor: env_parse("SIZING_BETA_FLOOR", 0.0),
+        exit_on_sizing_beta_floor: env_parse(
+            "EXIT_ON_SIZING_BETA_FLOOR",
+            DEFAULT_EXIT_ON_SIZING_BETA_FLOOR,
+        ),
         hedge_ratio_max_deviation: env_parse("HEDGE_RATIO_MAX_DEVIATION", 1.0),
         lookback_hours_short: env_parse(
             "PAIR_SELECTION_LOOKBACK_HOURS_SHORT",
@@ -343,6 +352,9 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
             .unwrap_or(DEFAULT_BETA_DIVERGENCE_MAX),
         beta_min: yaml.beta_min.unwrap_or(0.0),
         sizing_beta_floor: yaml.sizing_beta_floor.unwrap_or(0.0),
+        exit_on_sizing_beta_floor: yaml
+            .exit_on_sizing_beta_floor
+            .unwrap_or(DEFAULT_EXIT_ON_SIZING_BETA_FLOOR),
         hedge_ratio_max_deviation: yaml.hedge_ratio_max_deviation.unwrap_or(1.0),
         lookback_hours_short: yaml
             .pair_selection_lookback_hours_short
