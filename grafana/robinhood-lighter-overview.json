@@ -495,8 +495,8 @@
     {
       "id": 9,
       "type": "timeseries",
-      "title": "Close gross PnL — per close (bps of entry notional)",
-      "description": "Per-close gross PnL (price moves only, fees+funding excluded) normalized by entry notional, plotted as scatter (1 point ~= 1 close). Uses delta(), not increase(), on the _sum series: pairtrade_close_gross_pnl_bps accepts negative (losing) observations, so the running _sum counter can decrease — increase() would misread that decrease as a counter reset and apply reset-compensation, corrupting exactly the loss points this panel exists to show.",
+      "title": "Close gross PnL — windowed average per $__rate_interval (bps of entry notional)",
+      "description": "Gross PnL (price moves only, fees+funding excluded) normalized by entry notional, averaged over each $__rate_interval window and plotted as a scatter of those windowed averages — NOT a literal per-close event scatter. When trade cadence is low relative to the window (the common case here), a window usually contains at most one close and the point reads as that close's PnL, but if the panel step drops below the window (e.g. zoomed in) the same close can be re-plotted across consecutive evaluations, and two closes landing in the same window are shown as their average rather than as two points. An explicit `interval` floor is set below to reduce (not eliminate) the re-plotting case. Uses delta(), not increase(), on the _sum series: pairtrade_close_gross_pnl_bps accepts negative (losing) observations, so the running _sum counter can decrease — increase() would misread that decrease as a counter reset and apply reset-compensation, corrupting exactly the loss points this panel exists to show.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -507,6 +507,7 @@
         {
           "expr": "delta(pairtrade_close_gross_pnl_bps_sum{instance=~\"debot-robinhood.*\",variant!=\"\"}[$__rate_interval]) / delta(pairtrade_close_gross_pnl_bps_count{instance=~\"debot-robinhood.*\",variant!=\"\"}[$__rate_interval])",
           "legendFormat": "{{variant}} {{reason}}",
+          "interval": "1m",
           "refId": "A"
         }
       ],
