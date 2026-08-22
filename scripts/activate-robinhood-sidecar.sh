@@ -10,6 +10,15 @@ fi
 INSTALL_DIR=$1
 BUNDLE_DIR=${SIDECAR_BUNDLE_DIR:-$INSTALL_DIR/robinhood-sidecar-bundle}
 BOOTSTRAP_BIN=${BOOTSTRAP_BIN:-$INSTALL_DIR/scripts/bootstrap-robinhood-sidecar.sh}
+FLOCK_BIN=${FLOCK_BIN:-flock}
+RUNTIME_LOCK_FILE=${ROBINHOOD_RUNTIME_LOCK_FILE:-/run/lock/debot-robinhood-runtime.lock}
+
+# Runtime publication uses the same lock. Because this helper runs as a
+# separate systemd dependency, waiting here cannot deadlock the bot start job;
+# the bot has not entered ExecStartPre/ExecStart yet.
+install -d -m 0755 "$(dirname "$RUNTIME_LOCK_FILE")"
+exec 9>"$RUNTIME_LOCK_FILE"
+"$FLOCK_BIN" -x 9
 
 # Migration guard: config-only deploys can install this hook before the first
 # runtime deploy has staged a local bundle. Preserve the pre-hook behavior until

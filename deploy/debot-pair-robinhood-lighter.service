@@ -2,12 +2,13 @@
 Description=Robinhood Chain Lighter BTC/ETH pairtrade
 After=network-online.target
 Wants=network-online.target
+Requires=debot-pair-robinhood-sidecar-activation.service
+After=debot-pair-robinhood-sidecar-activation.service
 
 [Service]
 User=ec2-user
 WorkingDirectory=-/opt/debot-robinhood-lighter
 ExecStartPre=+/usr/bin/install -d -o ec2-user -g ec2-user -m 0750 /opt/debot-robinhood-lighter /home/ec2-user/debot_status
-ExecStartPre=+/bin/bash /opt/debot/scripts/activate-robinhood-sidecar.sh /opt/debot
 ExecStart=/bin/bash /opt/debot/scripts/debot-pair-robinhood-lighter.sh
 Environment=PROM_LISTEN=127.0.0.1:9464
 Environment=STATUS_S3_BUCKET=debot-dashboard
