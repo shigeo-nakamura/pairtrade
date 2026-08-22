@@ -1,0 +1,1130 @@
+{
+  "title": "Robinhood Lighter overview",
+  "uid": "robinhood-lighter-overview",
+  "tags": [
+    "pairtrade",
+    "bot",
+    "robinhood"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "z-score + position state (freq / b)",
+      "description": "Combined view: signed z-score lines plus abs(z), exit band lines at +/-0.2, and per-variant position-state bars overlaid at fixed Y levels (freq=3.0, b=2.5). Position bars are `(pairtrade_has_position == 1) * Y_offset` rendered as thick step lines so the same panel timeline aligns z and position on identical x-pixels. Robinhood Lighter runs a 2-arm split (bot-strategy#798/#834): freq = $5,000 points-volume incumbent, b = $3,000 defensive challenger (higher entry threshold, hold-time beta-floor exit). Both currently run the same 1h force_close / 30x profile after b's original wider/slower clone was reverted 2026-08-21.",
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_z{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "legendFormat": "{{variant}}",
+          "refId": "A"
+        },
+        {
+          "expr": "(pairtrade_has_position{instance=~\"debot-robinhood.*\",variant=\"freq\"} == 1) * 3.0",
+          "legendFormat": "freq pos",
+          "refId": "B"
+        },
+        {
+          "expr": "(pairtrade_has_position{instance=~\"debot-robinhood.*\",variant=\"b\"} == 1) * 2.5",
+          "legendFormat": "b pos",
+          "refId": "C"
+        },
+        {
+          "expr": "abs(pairtrade_z{instance=~\"debot-robinhood.*\",variant!=\"\"})",
+          "legendFormat": "abs {{variant}}",
+          "refId": "D"
+        },
+        {
+          "expr": "vector(0.2)",
+          "legendFormat": "exit_z band +0.2",
+          "refId": "E"
+        },
+        {
+          "expr": "vector(-0.2)",
+          "legendFormat": "exit_z band -0.2",
+          "refId": "F"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": -4,
+          "max": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true,
+            "axisWidth": 120
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^freq.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^b( |$)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*pos$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 10
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "stepAfter"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 30
+              },
+              {
+                "id": "custom.spanNulls",
+                "value": false
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^abs.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "stepAfter"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^exit_z band.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Relative beta_gap = |beta_s - beta_l| / beta_eff (gate 0.30)",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_beta_gap_relative{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "legendFormat": "{{variant}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.3
+              }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "description": "Relative beta divergence = |beta_s - beta_l| / beta_eff. This is the value the entry filter compares against `beta_divergence_max` (0.30) — exceeding the red line hard-blocks entries, and `beta_gap_entry_z_scale` linearly raises the entry-z threshold even below it."
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Variants currently in position",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 20
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (pairtrade_has_position{instance=~\"debot-robinhood.*\",variant!=\"\"})",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "gray",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "textMode": "value_and_name",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Position age (seconds, > 0 only while in position)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_position_age_seconds{instance=~\"debot-robinhood.*\",variant!=\"\"} > 0",
+          "legendFormat": "{{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "state-timeline",
+      "title": "Eligibility (cointegration filter)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_eligible{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "legendFormat": "{{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "color": "red",
+                  "text": "NOT ELIGIBLE"
+                },
+                "1": {
+                  "color": "green",
+                  "text": "ELIGIBLE"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Time since last trade (seconds, -1 before first trade)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 31
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_time_since_last_trade_seconds{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "legendFormat": "{{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Close reasons (count last 24h)",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 31
+      },
+      "targets": [
+        {
+          "expr": "sum by (variant, reason) (increase(pairtrade_close_reason_total{instance=~\"debot-robinhood.*\",variant!=\"\"}[24h]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "instance": true
+            },
+            "indexByName": {
+              "variant": 0,
+              "reason": 1,
+              "Value #A": 2
+            },
+            "renameByName": {
+              "Value #A": "count"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "variant"
+              },
+              {
+                "field": "reason"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          },
+          "noValue": "0"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "count"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "continuous-GrYlRd"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Snapshot age (seconds)",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_snapshot_age_seconds{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "legendFormat": "{{variant}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 120
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Close gross PnL — windowed average per $__rate_interval (bps of entry notional)",
+      "description": "Gross PnL (price moves only, fees+funding excluded) normalized by entry notional, averaged over each $__rate_interval window and plotted as a scatter of those windowed averages — NOT a literal per-close event scatter. When trade cadence is low relative to the window (the common case here), a window usually contains at most one close and the point reads as that close's PnL, but if the panel step drops below the window (e.g. zoomed in) the same close can be re-plotted across consecutive evaluations, and two closes landing in the same window are shown as their average rather than as two points. An explicit `interval` floor is set below to reduce (not eliminate) the re-plotting case. Computed as instant subtraction (`metric - (metric offset $__rate_interval or metric*0)`) rather than delta()/increase(): pairtrade_close_gross_pnl_bps accepts negative (losing) observations, so increase()'s counter-reset compensation would corrupt exactly the loss points this panel exists to show, and plain delta()/increase() both return no data for a (variant,pair,reason) combination's very first-ever close (no earlier sample exists to diff against) — the `or metric*0` fallback treats an absent prior sample as a zero baseline so that first close is still captured. Trade-off: a genuine process restart between the offset sample and now (state re-accumulating from zero) can still show as one spurious large-magnitude point, same as any counter-based approach.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 43
+      },
+      "targets": [
+        {
+          "expr": "(pairtrade_close_gross_pnl_bps_sum{instance=~\"debot-robinhood.*\",variant!=\"\"} - (pairtrade_close_gross_pnl_bps_sum{instance=~\"debot-robinhood.*\",variant!=\"\"} offset $__rate_interval or pairtrade_close_gross_pnl_bps_sum{instance=~\"debot-robinhood.*\",variant!=\"\"} * 0)) / (pairtrade_close_gross_pnl_bps_count{instance=~\"debot-robinhood.*\",variant!=\"\"} - (pairtrade_close_gross_pnl_bps_count{instance=~\"debot-robinhood.*\",variant!=\"\"} offset $__rate_interval or pairtrade_close_gross_pnl_bps_count{instance=~\"debot-robinhood.*\",variant!=\"\"} * 0))",
+          "legendFormat": "{{variant}} {{reason}}",
+          "interval": "1m",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "points",
+            "pointSize": 6,
+            "spanNulls": false,
+            "lineWidth": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* exit_z$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* expected_value$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* stop_loss_z$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* max_loss_r$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* risk_budget$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "magenta"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* force_close$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "dark-red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* maintenance_preempt$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#5DADE2"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* ineligible$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#888888"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* unknown$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#CCCCCC"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Per-leg slippage p50/p90 (bps, by variant / order_type)",
+      "description": "Median + 90th-percentile slippage vs decision-time reference price, signed positive = cost. post_only fills typically hover near 0; taker fills are the adverse tail. Aggregated by variant as well as order_type so a regression on one arm (e.g. the challenger) isn't diluted by the other.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 43
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, variant, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=~\"debot-robinhood.*\",variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{variant}} {{order_type}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le, variant, order_type) (rate(pairtrade_leg_slippage_bps_bucket{instance=~\"debot-robinhood.*\",variant!=\"\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{variant}} {{order_type}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Entry rejects breakdown (24h, by gate)",
+      "description": "Stacked area of `increase(pairtrade_entry_reject_total[24h])`, broken down by the gate that fired. Use this to see which filter is responsible for blocked entries — especially when the live trade rate looks low. Common reasons: `z_below_threshold`, `beta_divergence` (hard gate at `beta_divergence_max=0.30`), `beta_min`, `mtf`.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      },
+      "targets": [
+        {
+          "expr": "sum by (variant, reason) (increase(pairtrade_entry_reject_total{instance=~\"debot-robinhood.*\",variant!=\"\"}[24h]))",
+          "legendFormat": "{{variant}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Kalman beta uncertainty (sqrt(P)) — calibration view",
+      "description": "`pairtrade_beta_uncertainty` = sqrt of the Kalman filter's posterior variance. This is the rigorous 1-sigma uncertainty of the current beta estimate; it dominates the beta_s/beta_l divergence proxy used today.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 59
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_beta_uncertainty{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "legendFormat": "{{variant}} {{pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "state-timeline",
+      "title": "Maintenance / degraded windows",
+      "description": "1 when the per-tick gate observes maintenance_status() != None on the venue connector (RSS-announced Lighter maintenance or observed-degraded mode from the OutageDetector). Visualises the exact windows during which entries are blocked and error-watch is suppressed.",
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 67
+      },
+      "targets": [
+        {
+          "expr": "max by (instance) (pairtrade_maintenance_active{instance=~\"debot-robinhood.*\",variant!=\"\"})",
+          "legendFormat": "{{instance}} (pairtrade)",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "rowHeight": 0.9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "color": "green",
+                  "text": "OK"
+                },
+                "1": {
+                  "color": "red",
+                  "text": "MAINTENANCE"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Strategy step duration p50 / p99",
+      "description": "Engine-wide wall-clock duration of Strategy::step().",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 73
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (instance, le) (rate(pairtrade_step_duration_seconds_bucket{instance=~\"debot-robinhood.*\"}[15m])))",
+          "legendFormat": "{{instance}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(pairtrade_step_duration_seconds_bucket{instance=~\"debot-robinhood.*\"}[15m])))",
+          "legendFormat": "{{instance}} p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "spanNulls": true
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 2.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "table",
+      "title": "Capital / leverage config drift",
+      "description": "Resolved runtime config per variant. Post-#834 readout: freq is configured for equity=$5000 / max_leverage=30 (points-volume incumbent), b for equity=$3000 / max_leverage=30 (defensive challenger, b's original 50x/wider-stop profile was reverted 2026-08-21 per #798). Unexpected values indicate environment/YAML drift.",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 81
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_equity_reference_usd{instance=~\"debot-robinhood.*\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "equity reference",
+          "refId": "A"
+        },
+        {
+          "expr": "pairtrade_max_leverage_config{instance=~\"debot-robinhood.*\"}",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "max leverage",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Held-exit eligibility grace (#742)",
+      "description": "Raw eligibility always gates new entries. Held-exit eligibility may remain 1 only during the narrow ADF + marginal beta-gap grace, while grace_active identifies that bounded exposure extension explicitly. All three series must return to their ordinary state on recovery, expiry, or severe bypass.",
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 88
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_eligible{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "legendFormat": "raw {{variant}} {{pair}}",
+          "refId": "A"
+        },
+        {
+          "expr": "pairtrade_exit_eligible{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "legendFormat": "held exit {{variant}} {{pair}}",
+          "refId": "B"
+        },
+        {
+          "expr": "pairtrade_eligibility_margin_grace_active{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "legendFormat": "grace active {{variant}} {{pair}}",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^raw.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^held exit.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^grace active.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 35
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Eligibility-grace outcomes — selected range",
+      "description": "severe_bypass and expired are the primary safety/rollback signals; started without recovered/expired indicates the selected time range ends during an active grace.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 88
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (increase(pairtrade_eligibility_margin_grace_total{instance=~\"debot-robinhood.*\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Eligibility-grace effective config",
+      "description": "Resolved effective grace config per variant.",
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "targets": [
+        {
+          "expr": "pairtrade_effective_eligibility_margin_grace_secs{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "instant": true,
+          "legendFormat": "{{variant}} grace seconds",
+          "refId": "A"
+        },
+        {
+          "expr": "pairtrade_effective_eligibility_beta_gap_exit{instance=~\"debot-robinhood.*\",variant!=\"\"}",
+          "instant": true,
+          "legendFormat": "{{variant}} beta-gap exit",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "horizontal",
+        "textMode": "value_and_name",
+        "colorMode": "value"
+      }
+    }
+  ]
+}
