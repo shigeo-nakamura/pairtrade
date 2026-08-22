@@ -1,6 +1,6 @@
 # Robinhood Chain Lighter launch configuration (#790/#794).
-# Two-arm split (bot-strategy#798, 2026-08-18): `freq` and `b`, each on its
-# own Lighter sub-account. `b` originally cloned the Frankfurt-B profile
+# Two-arm split (bot-strategy#798/#834): `freq` and `b`, each on its own
+# Lighter sub-account. `b` originally cloned the Frankfurt-B profile
 # (wider stop_loss_z=8.0, force_close=10800s, max_leverage=50) to test
 # whether more patience reduced the force_close loss asymmetry. Readout
 # 2026-08-21 (#798): force_close losses were already near-zero on both arms;
@@ -8,12 +8,14 @@
 # wider/slower profile made per-trade ineligible losses materially worse
 # (avg -$103.74/trade vs freq's -$23.80, biggest single loss -$318.46) while
 # bleeding capital ~2x faster than freq on a per-$1000 basis. `b` was
-# reverted to freq's entry/exit/stop/force_close params and max_leverage
-# (2026-08-21) — only equity_usd_reference ($4,000 vs freq's $2,000) still
-# differs between the arms. Top-level scalars below are the shared defaults
-# / legacy fallback; the `strategies:` block at the end overrides per-arm
-# values. Launch remains DRY_RUN-flagged in-file but the live process
-# currently runs with dry_run=false — see runbook before touching this file.
+# reverted to freq's profile (2026-08-21). The next evaluation (#834) uses
+# all $8,000 as active capital: freq is the $5,000 points-volume incumbent;
+# b is a $3,000 defensive challenger with a higher entry threshold and the
+# hold-time beta-floor exit enabled. Both remain at the safer 1h/30x profile.
+# Top-level scalars below are the shared defaults / legacy fallback; the
+# `strategies:` block at the end overrides per-arm values. Launch remains
+# DRY_RUN-flagged in-file but the live process currently runs with
+# dry_run=false — see runbook before touching this file.
 
 dex_name: lighter
 rest_endpoint: https://api.rh.lighter.xyz
@@ -54,8 +56,8 @@ warm_start_min_bars: 60
 mtf_windows: [15]
 mtf_z_min: 0.5
 
-# Frankfurt canary parameters (shared by both arms as of 2026-08-21 — see
-# header note; b previously overrode these, reverted after readout).
+# Frankfurt canary parameters (freq defaults; b overrides entry-z only for
+# the #834 defensive challenger).
 entry_z_score_base: 1.0
 entry_z_score_min: 0.8
 entry_z_score_max: 1.5
@@ -134,31 +136,36 @@ circuit_breaker_tier2_cooldown_secs: 3600
 # Risk gates (bot-strategy#185). All bps fields are 1x-equivalent (market-
 # move) and multiplied by EACH ARM'S OWN resolved max_leverage at comparison
 # time (bot-strategy#814 made leverage per-instance). As of 2026-08-21 both
-# arms run max_leverage=30 (b's 50x reverted, see header note), so both now
-# have the same effective daily/session gates: 75bps×30=2250bps (22.5%) /
-# 50bps×30=1500bps (15%).
+# arms run max_leverage=30 (b's 50x reverted, see header note), so both have
+# the same effective daily gate: 75bps×30=2250bps (22.5%). #834 tightens the
+# rolling session gate to 25bps×30=750bps (7.5%) while retaining $8,000 of
+# active equity for airdrop/points volume.
 risk:
   max_daily_loss_bps: 75
   max_daily_loss_action: block
   daily_reset_utc_hour: 0
   # Phase 3-1: rolling-peak session DD. Sticky halt + auto-flatten of the
   # breaching instance, cleared only by `sudo touch /opt/debot-robinhood-lighter/RISK_ACK`.
-  max_session_loss_bps: 50
+  max_session_loss_bps: 25
   session_dd_lookback_secs: 2592000  # 30 d
   session_dd_sample_secs: 3600       # 1 h
   # Per-leg cap: reference equity × the arm's own max_leverage × 0.25.
   max_notional_headroom: 0.25
 
-# Two-arm split (bot-strategy#798, 2026-08-18; leverage split bot-strategy#814,
-# 2026-08-19; b reverted to freq's params/leverage 2026-08-21, see header
-# note — only equity_usd_reference still differs between the arms). Field
-# values not listed per-arm inherit the top-level scalar above.
+# Two-arm split for bot-strategy#834. Only the entry-z profile and hold-time
+# beta-floor exit intentionally differ, keeping the comparison attributable.
+# Field values not listed per-arm inherit the top-level scalar above.
 strategies:
   - id: freq
     agent_name: debot-pair-robinhood-lighter-freq
-    equity_usd_reference: 2000
+    equity_usd_reference: 5000
     max_leverage: 30
+    exit_on_sizing_beta_floor: false
   - id: b
     agent_name: debot-pair-robinhood-lighter-b
-    equity_usd_reference: 4000
+    entry_z_score_base: 1.5
+    entry_z_score_min: 1.0
+    entry_z_score_max: 2.0
+    equity_usd_reference: 3000
     max_leverage: 30
+    exit_on_sizing_beta_floor: true
