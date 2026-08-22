@@ -51,7 +51,12 @@ if [ "${1:-}" = --validate-only ]; then
     mode=validate
     shift
 fi
-test "$1" = test-bucket
+if [ "$mode" = activate ]; then
+    test "$1" = local-bundle
+    test -d "$SIDECAR_BUNDLE_DIR"
+else
+    test "$1" = test-bucket
+fi
 test -f "$2/manifest.json"
 jq -e '.dex_connector_sha == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$2/manifest.json" >/dev/null
 printf '%s\n' "$mode" >> "$BOOTSTRAP_LOG"
@@ -59,12 +64,20 @@ if [ "$mode" = validate ] && [ "${FAIL_PREFLIGHT:-0}" = 1 ]; then
     echo "simulated sidecar provenance failure" >&2
     exit 1
 fi
+if [ "$mode" = validate ] && [ -n "${SIDECAR_STAGE_DIR:-}" ]; then
+    mkdir -p "$SIDECAR_STAGE_DIR"
+    printf 'fake sidecar\n' > "$SIDECAR_STAGE_DIR/lighter-ratelimit"
+    sidecar_sha=$(sha256sum "$SIDECAR_STAGE_DIR/lighter-ratelimit" | awk '{print $1}')
+    printf '%s  lighter-ratelimit\n' "$sidecar_sha" > "$SIDECAR_STAGE_DIR/lighter-ratelimit.sha256"
+    printf '{}\n' > "$SIDECAR_STAGE_DIR/manifest.json"
+    printf '[Service]\n' > "$SIDECAR_STAGE_DIR/lighter-ratelimit.service"
+fi
 SCRIPT
 
 cat > "$WORK/install-command" <<'SCRIPT'
 #!/bin/bash
 set -euo pipefail
-if [ "${FAIL_RUNTIME_INSTALL:-0}" = 1 ] && [[ " $* " == *" $FAKE_INSTALL_DIR/lib/libsigner.so "* ]]; then
+if [ "${FAIL_RUNTIME_INSTALL:-0}" = 1 ] && [[ " $* " == *" $FAKE_INSTALL_DIR/robinhood-sidecar-bundle/ "* ]]; then
     echo "simulated runtime install failure" >&2
     exit 1
 fi
@@ -116,9 +129,19 @@ cmp "$S3_ROOT/debot/debot" "$INSTALL_DIR/bin/debot"
 cmp "$S3_ROOT/debot/libsigner.so" "$INSTALL_DIR/lib/libsigner.so"
 cmp "$S3_ROOT/debot/checksums.sha256" "$INSTALL_DIR/checksums.sha256"
 cmp "$S3_ROOT/debot/manifest.json" "$INSTALL_DIR/manifest.json"
-test "$(cat "$INSTALL_DIR/robinhood-sidecar-s3-bucket")" = test-bucket
+test -f "$INSTALL_DIR/robinhood-sidecar-bundle/lighter-ratelimit"
+test -f "$INSTALL_DIR/robinhood-sidecar-bundle/lighter-ratelimit.sha256"
+test -f "$INSTALL_DIR/robinhood-sidecar-bundle/manifest.json"
+test -f "$INSTALL_DIR/robinhood-sidecar-bundle/lighter-ratelimit.service"
 test "$(stat -c %U:%G:%a "$INSTALL_DIR/bin")" = "$(id -un):$(id -gn):750"
 test "$(stat -c %U:%G:%a "$INSTALL_DIR/lib")" = "$(id -un):$(id -gn):750"
+test "$(cat "$WORK/bootstrap.log")" = validate
+
+# A legacy config-only host without a staged bundle remains restartable.
+BOOTSTRAP_BIN="$WORK/bootstrap" BOOTSTRAP_LOG="$WORK/bootstrap.log" \
+  bash "$REPO_ROOT/scripts/activate-robinhood-sidecar.sh" "$WORK/legacy-install" \
+  2>"$WORK/legacy-warning.log"
+grep -F "bundle not staged yet" "$WORK/legacy-warning.log"
 test "$(cat "$WORK/bootstrap.log")" = validate
 
 # The systemd pre-start helper activates the sidecar against committed runtime.

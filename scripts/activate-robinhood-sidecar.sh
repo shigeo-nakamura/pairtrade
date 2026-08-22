@@ -8,21 +8,24 @@ if [ "$#" -ne 1 ]; then
 fi
 
 INSTALL_DIR=$1
-BUCKET_FILE=${SIDECAR_BUCKET_FILE:-$INSTALL_DIR/robinhood-sidecar-s3-bucket}
+BUNDLE_DIR=${SIDECAR_BUNDLE_DIR:-$INSTALL_DIR/robinhood-sidecar-bundle}
 BOOTSTRAP_BIN=${BOOTSTRAP_BIN:-$INSTALL_DIR/scripts/bootstrap-robinhood-sidecar.sh}
 
-if [ ! -f "$BUCKET_FILE" ]; then
-    echo "Robinhood sidecar bucket file is missing: $BUCKET_FILE" >&2
-    exit 2
+# Migration guard: config-only deploys can install this hook before the first
+# runtime deploy has staged a local bundle. Preserve the pre-hook behavior until
+# that runtime migration completes instead of blocking a crash restart.
+if [ ! -d "$BUNDLE_DIR" ]; then
+    echo "WARNING: Robinhood sidecar bundle not staged yet; preserving the existing sidecar" >&2
+    exit 0
 fi
 
-mapfile -t BUCKET_LINES < "$BUCKET_FILE"
-if [ "${#BUCKET_LINES[@]}" -ne 1 ] ||
-   [[ ! "${BUCKET_LINES[0]}" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
-    echo "Robinhood sidecar bucket file is invalid: $BUCKET_FILE" >&2
-    exit 2
-fi
-S3_BUCKET=${BUCKET_LINES[0]}
+for required in lighter-ratelimit lighter-ratelimit.sha256 manifest.json lighter-ratelimit.service; do
+    if [ ! -f "$BUNDLE_DIR/$required" ]; then
+        echo "Robinhood staged sidecar bundle is incomplete: $BUNDLE_DIR/$required" >&2
+        exit 2
+    fi
+done
 
-echo "Activating Robinhood sidecar during coordinated bot start (bucket=$S3_BUCKET)"
-exec bash "$BOOTSTRAP_BIN" "$S3_BUCKET" "$INSTALL_DIR"
+export SIDECAR_BUNDLE_DIR="$BUNDLE_DIR"
+echo "Activating Robinhood sidecar from local staged bundle during coordinated bot start"
+exec bash "$BOOTSTRAP_BIN" local-bundle "$INSTALL_DIR"

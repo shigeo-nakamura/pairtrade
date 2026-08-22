@@ -16,6 +16,8 @@ SIDECAR_ROOT=${SIDECAR_ROOT:-/opt/lighter-ratelimit}
 SOCKET_PATH=${SOCKET_PATH:-/run/lighter-ratelimit/lighter-ratelimit.sock}
 INSTALL_OWNER=${INSTALL_OWNER:-root}
 INSTALL_GROUP=${INSTALL_GROUP:-root}
+SOURCE_BUNDLE_DIR=${SIDECAR_BUNDLE_DIR:-}
+STAGE_BUNDLE_DIR=${SIDECAR_STAGE_DIR:-}
 
 probe_socket() {
   "$PYTHON_BIN" - "$SOCKET_PATH" <<'PY'
@@ -79,10 +81,17 @@ CHECKSUM="$WORK/lighter-ratelimit.sha256"
 MANIFEST="$WORK/manifest.json"
 UNIT="$WORK/$SERVICE"
 
-"$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/lighter-ratelimit" "$BINARY"
-"$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/lighter-ratelimit.sha256" "$CHECKSUM"
-"$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/manifest.json" "$MANIFEST"
-"$AWS_BIN" s3 cp "s3://$S3_BUCKET/deploy/lighter-ratelimit.service" "$UNIT"
+if [ -n "$SOURCE_BUNDLE_DIR" ]; then
+  cp -- "$SOURCE_BUNDLE_DIR/lighter-ratelimit" "$BINARY"
+  cp -- "$SOURCE_BUNDLE_DIR/lighter-ratelimit.sha256" "$CHECKSUM"
+  cp -- "$SOURCE_BUNDLE_DIR/manifest.json" "$MANIFEST"
+  cp -- "$SOURCE_BUNDLE_DIR/$SERVICE" "$UNIT"
+else
+  "$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/lighter-ratelimit" "$BINARY"
+  "$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/lighter-ratelimit.sha256" "$CHECKSUM"
+  "$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/manifest.json" "$MANIFEST"
+  "$AWS_BIN" s3 cp "s3://$S3_BUCKET/deploy/lighter-ratelimit.service" "$UNIT"
+fi
 
 ACTUAL_SOURCE_SHA=$("$JQ_BIN" -r '
   if (.source_sha | type) == "string" then .source_sha
@@ -131,6 +140,13 @@ UNIT_BEFORE=$(awk -F= '$1 == "Before" { print substr($0, index($0, "=") + 1) }' 
 if [[ " $UNIT_BEFORE " != *" $BOT_SERVICE "* ]]; then
   echo "$SERVICE does not order itself before $BOT_SERVICE" >&2
   exit 1
+fi
+
+if [ -n "$STAGE_BUNDLE_DIR" ]; then
+  install -d -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 "$STAGE_BUNDLE_DIR"
+  install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 "$BINARY" "$STAGE_BUNDLE_DIR/lighter-ratelimit"
+  install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
+    "$CHECKSUM" "$MANIFEST" "$UNIT" "$STAGE_BUNDLE_DIR/"
 fi
 
 if [ "$VALIDATE_ONLY" = true ]; then

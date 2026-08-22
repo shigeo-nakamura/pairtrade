@@ -74,6 +74,7 @@ test "$1" = s3
 test "$2" = cp
 source=$3
 destination=$4
+printf '%s\n' "$source" >> "$AWS_LOG"
 case "$source" in
   */lighter-ratelimit) artifact=lighter-ratelimit ;;
   */lighter-ratelimit.sha256) artifact=lighter-ratelimit.sha256 ;;
@@ -131,6 +132,7 @@ esac
 EOF
 chmod +x "$WORK/aws" "$WORK/file" "$WORK/ldd" "$WORK/systemd-analyze" "$WORK/systemctl"
 : > "$WORK/systemctl.log"
+: > "$WORK/aws.log"
 
 TEST_OWNER=$(id -un)
 TEST_GROUP=$(id -gn)
@@ -143,6 +145,7 @@ run_bootstrap() {
   fi
   FAKE_BUNDLE="$BUNDLE" \
   AWS_BIN="$WORK/aws" \
+  AWS_LOG="$WORK/aws.log" \
   FILE_BIN="$WORK/file" \
   LDD_BIN="$WORK/ldd" \
   SYSTEMCTL="$WORK/systemctl" \
@@ -155,17 +158,25 @@ run_bootstrap() {
   SYSTEMD_ANALYZE="$WORK/systemd-analyze" \
   SYSTEMD_DIR="$SYSTEMD_DIR" \
   SIDECAR_ROOT="$SIDECAR_ROOT" \
+  SIDECAR_BUNDLE_DIR="${SIDECAR_BUNDLE_DIR:-}" \
+  SIDECAR_STAGE_DIR="${SIDECAR_STAGE_DIR:-}" \
   SOCKET_PATH="$SOCKET_PATH" \
   INSTALL_OWNER="$TEST_OWNER" \
   INSTALL_GROUP="$TEST_GROUP" \
     bash "$REPO_ROOT/scripts/bootstrap-robinhood-sidecar.sh" "${mode_args[@]}" test-bucket "$PAIRTRADE_DIR"
 }
 
-run_bootstrap --validate-only
+SIDECAR_STAGE_DIR="$WORK/staged-sidecar" run_bootstrap --validate-only
+test "$(wc -l < "$WORK/aws.log")" -eq 4
+cmp "$BUNDLE/lighter-ratelimit" "$WORK/staged-sidecar/lighter-ratelimit"
+cmp "$BUNDLE/lighter-ratelimit.sha256" "$WORK/staged-sidecar/lighter-ratelimit.sha256"
+cmp "$BUNDLE/manifest.json" "$WORK/staged-sidecar/manifest.json"
+cmp "$BUNDLE/lighter-ratelimit.service" "$WORK/staged-sidecar/lighter-ratelimit.service"
 test ! -e "$SIDECAR_ROOT/bin/lighter-ratelimit"
 test ! -s "$WORK/systemctl.log"
 
-run_bootstrap
+SIDECAR_BUNDLE_DIR="$WORK/staged-sidecar" run_bootstrap
+test "$(wc -l < "$WORK/aws.log")" -eq 4
 cmp "$BUNDLE/lighter-ratelimit" "$SIDECAR_ROOT/bin/lighter-ratelimit"
 cmp "$BUNDLE/lighter-ratelimit.service" "$SYSTEMD_DIR/lighter-ratelimit.service"
 cmp "$BUNDLE/manifest.json" "$SIDECAR_ROOT/active-manifest.json"

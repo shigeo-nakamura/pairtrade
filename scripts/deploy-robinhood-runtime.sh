@@ -25,10 +25,6 @@ if [[ ! "$EXPECTED_DEBOT_SHA" =~ ^[0-9a-f]{64}$ ]] ||
     echo "expected artifact SHA-256 values must each contain exactly 64 lowercase hex characters" >&2
     exit 2
 fi
-if [[ ! "$S3_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
-    echo "invalid S3 bucket name for deferred sidecar activation: $S3_BUCKET" >&2
-    exit 2
-fi
 
 WORK=$(mktemp -d)
 cleanup() {
@@ -38,7 +34,6 @@ trap cleanup EXIT
 
 STAGE="$WORK/pairtrade"
 mkdir -p "$STAGE/bin" "$STAGE/lib"
-printf '%s\n' "$S3_BUCKET" > "$STAGE/robinhood-sidecar-s3-bucket"
 
 "$AWS_BIN" s3 cp "s3://$S3_BUCKET/debot/debot" "$STAGE/bin/debot"
 "$AWS_BIN" s3 cp "s3://$S3_BUCKET/debot/libsigner.so" "$STAGE/lib/libsigner.so"
@@ -66,19 +61,27 @@ echo "$EXPECTED_LIBSIGNER_SHA  $STAGE/lib/libsigner.so" | sha256sum -c -
 # Validate the matching sidecar without installing or restarting it. The old
 # sidecar remains active until systemd coordinates activation with the next bot
 # start (#836).
-bash "$BOOTSTRAP_BIN" --validate-only "$S3_BUCKET" "$STAGE"
+SIDECAR_STAGE_DIR="$STAGE/robinhood-sidecar-bundle" \
+    bash "$BOOTSTRAP_BIN" --validate-only "$S3_BUCKET" "$STAGE"
 
 RUNTIME_FILES=(
     bin/debot
     lib/libsigner.so
     checksums.sha256
     manifest.json
-    robinhood-sidecar-s3-bucket
+    robinhood-sidecar-bundle/lighter-ratelimit
+    robinhood-sidecar-bundle/lighter-ratelimit.sha256
+    robinhood-sidecar-bundle/manifest.json
+    robinhood-sidecar-bundle/lighter-ratelimit.service
 )
 BACKUP="$WORK/runtime-backup"
 PRESENT_FILE="$WORK/runtime-present"
 mkdir -p "$BACKUP"
 : > "$PRESENT_FILE"
+BUNDLE_DIR_PREEXISTED=false
+if [ -d "$INSTALL_DIR/robinhood-sidecar-bundle" ]; then
+    BUNDLE_DIR_PREEXISTED=true
+fi
 for relative in "${RUNTIME_FILES[@]}"; do
     target="$INSTALL_DIR/$relative"
     if [ -e "$target" ]; then
@@ -97,6 +100,9 @@ rollback_runtime() {
             cp -a -- "$BACKUP/$relative" "$target"
         fi
     done
+    if [ "$BUNDLE_DIR_PREEXISTED" = false ]; then
+        rmdir -- "$INSTALL_DIR/robinhood-sidecar-bundle" 2>/dev/null || true
+    fi
 }
 
 commit_runtime() {
@@ -110,9 +116,16 @@ commit_runtime() {
         "$STAGE/checksums.sha256" "$INSTALL_DIR/checksums.sha256" || return 1
     "$INSTALL_BIN" -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
         "$STAGE/manifest.json" "$INSTALL_DIR/manifest.json" || return 1
+    "$INSTALL_BIN" -d -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 \
+        "$INSTALL_DIR/robinhood-sidecar-bundle" || return 1
+    "$INSTALL_BIN" -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 \
+        "$STAGE/robinhood-sidecar-bundle/lighter-ratelimit" \
+        "$INSTALL_DIR/robinhood-sidecar-bundle/lighter-ratelimit" || return 1
     "$INSTALL_BIN" -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
-        "$STAGE/robinhood-sidecar-s3-bucket" \
-        "$INSTALL_DIR/robinhood-sidecar-s3-bucket" || return 1
+        "$STAGE/robinhood-sidecar-bundle/lighter-ratelimit.sha256" \
+        "$STAGE/robinhood-sidecar-bundle/manifest.json" \
+        "$STAGE/robinhood-sidecar-bundle/lighter-ratelimit.service" \
+        "$INSTALL_DIR/robinhood-sidecar-bundle/" || return 1
 
     (cd "$INSTALL_DIR" && sha256sum -c checksums.sha256) || return 1
     test "$(stat -c %U:%G:%a "$INSTALL_DIR/bin/debot")" = \
@@ -123,8 +136,10 @@ commit_runtime() {
         "$RUNTIME_DIR_OWNER:$RUNTIME_DIR_GROUP:750" || return 1
     test "$(stat -c %U:%G:%a "$INSTALL_DIR/lib")" = \
         "$RUNTIME_DIR_OWNER:$RUNTIME_DIR_GROUP:750" || return 1
-    test "$(stat -c %U:%G:%a "$INSTALL_DIR/robinhood-sidecar-s3-bucket")" = \
-        "$INSTALL_OWNER:$INSTALL_GROUP:644" || return 1
+    (cd "$INSTALL_DIR/robinhood-sidecar-bundle" && \
+        sha256sum -c lighter-ratelimit.sha256) || return 1
+    test "$(stat -c %U:%G:%a "$INSTALL_DIR/robinhood-sidecar-bundle/lighter-ratelimit")" = \
+        "$INSTALL_OWNER:$INSTALL_GROUP:755" || return 1
 }
 
 if ! commit_runtime; then
@@ -133,4 +148,4 @@ if ! commit_runtime; then
     exit 1
 fi
 
-echo "Robinhood pairtrade runtime installed; sidecar activation is deferred to the coordinated bot start (debot=$EXPECTED_DEBOT_SHA libsigner=$EXPECTED_LIBSIGNER_SHA)"
+echo "Robinhood pairtrade runtime and verified local sidecar bundle installed; activation is deferred to the coordinated bot start (debot=$EXPECTED_DEBOT_SHA libsigner=$EXPECTED_LIBSIGNER_SHA)"

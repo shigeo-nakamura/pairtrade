@@ -8,6 +8,7 @@ repo = Path(__file__).resolve().parents[1]
 config_workflow = (repo / ".github/workflows/deploy-configs.yml").read_text()
 runtime_workflow = (repo / ".github/workflows/ci.yml").read_text()
 runtime_deployer = (repo / "scripts/deploy-robinhood-runtime.sh").read_text()
+sidecar_activator = (repo / "scripts/activate-robinhood-sidecar.sh").read_text()
 service_unit = (repo / "deploy/debot-pair-robinhood-lighter.service").read_text()
 
 config_job = config_workflow.split("  deploy-robinhood-configs:\n", 1)[1]
@@ -30,6 +31,11 @@ preflight = runtime_deployer.index('bash "$BOOTSTRAP_BIN" --validate-only')
 runtime_commit = runtime_deployer.index("if ! commit_runtime")
 assert preflight < runtime_commit
 assert 'bash "$BOOTSTRAP_BIN" "$S3_BUCKET" "$INSTALL_DIR"' not in runtime_deployer
+assert "robinhood-sidecar-bundle" in runtime_deployer
+assert "robinhood-sidecar-s3-bucket" not in runtime_deployer
+assert "s3://" not in sidecar_activator
+assert "SIDECAR_BUNDLE_DIR" in sidecar_activator
+assert "bundle not staged yet" in sidecar_activator
 
 sidecar_prestart = service_unit.index(
     "ExecStartPre=+/bin/bash /opt/debot/scripts/activate-robinhood-sidecar.sh"
