@@ -97,8 +97,21 @@ EOF
 
 cat > "$WORK/systemd-analyze" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SYSTEMD_ANALYZE_LOG"
 test "$1" = verify
-test -f "$2"
+if [ "${2:-}" = --recursive-errors=no ]; then
+  test "${3:-}" = "--root=${3#--root=}"
+  verify_root=${3#--root=}
+  test "${4:-}" = /etc/systemd/system/lighter-ratelimit.service
+  test -f "$verify_root$4"
+  test -x "$verify_root/opt/lighter-ratelimit/bin/lighter-ratelimit"
+else
+  test -f "$2"
+fi
+if [ "${FAIL_SYSTEMD_VERIFY:-0}" = 1 ]; then
+  echo "simulated invalid sidecar unit" >&2
+  exit 1
+fi
 EOF
 
 cat > "$WORK/systemctl" <<'EOF'
@@ -156,6 +169,8 @@ run_bootstrap() {
   FAKE_SIDECAR_LOG="$WORK/fake-sidecar-server.log" \
   FAKE_SIDECAR_PIDS_FILE="$FAKE_SIDECAR_PIDS_FILE" \
   SYSTEMD_ANALYZE="$WORK/systemd-analyze" \
+  SYSTEMD_ANALYZE_LOG="$WORK/systemd-analyze.log" \
+  FAIL_SYSTEMD_VERIFY="${FAIL_SYSTEMD_VERIFY:-0}" \
   SYSTEMD_DIR="$SYSTEMD_DIR" \
   SIDECAR_ROOT="$SIDECAR_ROOT" \
   SIDECAR_BUNDLE_DIR="${SIDECAR_BUNDLE_DIR:-}" \
@@ -166,6 +181,21 @@ run_bootstrap() {
     bash "$REPO_ROOT/scripts/bootstrap-robinhood-sidecar.sh" "${mode_args[@]}" test-bucket "$PAIRTRADE_DIR"
 }
 
+# A systemd-invalid unit must fail preflight before the local bundle or live
+# sidecar is mutated.
+: > "$WORK/systemd-analyze.log"
+if FAIL_SYSTEMD_VERIFY=1 SIDECAR_STAGE_DIR="$WORK/invalid-staged-sidecar" \
+  run_bootstrap --validate-only >"$WORK/systemd-verify-failure.log" 2>&1; then
+  echo "expected invalid sidecar unit to fail preflight" >&2
+  exit 1
+fi
+grep -F "simulated invalid sidecar unit" "$WORK/systemd-verify-failure.log"
+test ! -e "$WORK/invalid-staged-sidecar"
+test ! -e "$SIDECAR_ROOT/bin/lighter-ratelimit"
+test ! -s "$WORK/systemctl.log"
+test "$(wc -l < "$WORK/systemd-analyze.log")" -eq 1
+: > "$WORK/aws.log"
+
 SIDECAR_STAGE_DIR="$WORK/staged-sidecar" run_bootstrap --validate-only
 test "$(wc -l < "$WORK/aws.log")" -eq 4
 cmp "$BUNDLE/lighter-ratelimit" "$WORK/staged-sidecar/lighter-ratelimit"
@@ -174,6 +204,7 @@ cmp "$BUNDLE/manifest.json" "$WORK/staged-sidecar/manifest.json"
 cmp "$BUNDLE/lighter-ratelimit.service" "$WORK/staged-sidecar/lighter-ratelimit.service"
 test ! -e "$SIDECAR_ROOT/bin/lighter-ratelimit"
 test ! -s "$WORK/systemctl.log"
+test "$(wc -l < "$WORK/systemd-analyze.log")" -eq 2
 
 SIDECAR_BUNDLE_DIR="$WORK/staged-sidecar" run_bootstrap
 test "$(wc -l < "$WORK/aws.log")" -eq 4

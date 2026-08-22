@@ -27,6 +27,23 @@ assert "RUNTIME_DIR_GROUP=${RUNTIME_DIR_GROUP:-ec2-user}" in runtime_deployer
 assert "systemctl restart debot-pair-robinhood-lighter" not in runtime_job
 assert "systemctl start debot-pair-robinhood-lighter" not in runtime_job
 
+hook_download = runtime_job.index(
+    "aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
+)
+hook_verify = runtime_job.index(
+    "systemd-analyze verify /tmp/debot-pair-robinhood-lighter.service"
+)
+hook_install = runtime_job.index(
+    "mv /tmp/debot-pair-robinhood-lighter.service "
+    "/etc/systemd/system/debot-pair-robinhood-lighter.service"
+)
+hook_reload = runtime_job.index("systemctl daemon-reload")
+runtime_deploy = runtime_job.index("deploy-robinhood-runtime.sh")
+assert hook_download < hook_verify < hook_install < hook_reload < runtime_deploy, (
+    "the coordinated-start unit must be validated and installed before the "
+    "new runtime and local sidecar bundle are committed"
+)
+
 preflight = runtime_deployer.index('bash "$BOOTSTRAP_BIN" --validate-only')
 runtime_commit = runtime_deployer.index("if ! commit_runtime")
 assert preflight < runtime_commit

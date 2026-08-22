@@ -142,6 +142,18 @@ if [[ " $UNIT_BEFORE " != *" $BOT_SERVICE "* ]]; then
   exit 1
 fi
 
+# Validate the downloaded/staged unit before either reporting preflight success
+# or copying it into the local activation bundle. Activation also verifies the
+# installed copy, but by then a bad unit would already have replaced the live
+# file and could block the coordinated bot start.
+VERIFY_ROOT="$WORK/systemd-verify-root"
+install -D -m 0755 "$BINARY" \
+  "$VERIFY_ROOT/opt/lighter-ratelimit/bin/lighter-ratelimit"
+install -D -m 0644 "$UNIT" \
+  "$VERIFY_ROOT/etc/systemd/system/$SERVICE"
+"$SYSTEMD_ANALYZE" verify --recursive-errors=no --root="$VERIFY_ROOT" \
+  "/etc/systemd/system/$SERVICE"
+
 if [ -n "$STAGE_BUNDLE_DIR" ]; then
   install -d -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 "$STAGE_BUNDLE_DIR"
   install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 "$BINARY" "$STAGE_BUNDLE_DIR/lighter-ratelimit"
