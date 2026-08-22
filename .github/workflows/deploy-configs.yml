@@ -48,8 +48,10 @@ jobs:
       - name: Verify Robinhood deploy workflow isolation
         run: python3 debot/scripts/test_robinhood_deploy_workflows.py
 
-      - name: Validate Robinhood systemd unit
-        run: systemd-analyze verify debot/deploy/debot-pair-robinhood-lighter.service
+      - name: Validate Robinhood systemd units
+        run: |
+          systemd-analyze verify debot/deploy/debot-pair-robinhood-sidecar-activation.service
+          systemd-analyze verify debot/deploy/debot-pair-robinhood-lighter.service
 
       - name: Validate Lighter market preflight
         run: |
@@ -125,6 +127,7 @@ jobs:
           aws s3 cp debot/deploy/pair-data-collector.service "s3://${S3_BUCKET}/deploy/pair-data-collector.service"
           aws s3 cp debot/deploy/debot-pair-shadow.service "s3://${S3_BUCKET}/deploy/debot-pair-shadow.service"
           aws s3 cp debot/deploy/debot-pair-shadow-macro.service "s3://${S3_BUCKET}/deploy/debot-pair-shadow-macro.service"
+          aws s3 cp debot/deploy/debot-pair-robinhood-sidecar-activation.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service"
           aws s3 cp debot/deploy/debot-pair-robinhood-lighter.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
 
       - name: Deploy via SSM (no restart)
@@ -189,7 +192,7 @@ jobs:
             --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
             --comment "Deploy Robinhood Lighter pairtrade config; no start or restart" \
-            --parameters commands="set -e,sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts --exclude *.env,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
+            --parameters commands="set -e,sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts --exclude *.env,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-sidecar-activation.service,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo systemd-analyze verify /tmp/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-sidecar-activation.service /etc/systemd/system/debot-pair-robinhood-sidecar-activation.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
             --query Command.CommandId --output text)
           set +e
           aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}"
