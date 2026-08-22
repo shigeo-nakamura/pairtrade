@@ -79,11 +79,21 @@ UNIT="$WORK/$SERVICE"
 "$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/manifest.json" "$MANIFEST"
 "$AWS_BIN" s3 cp "s3://$S3_BUCKET/deploy/lighter-ratelimit.service" "$UNIT"
 
-"$JQ_BIN" -e --arg source_sha "$EXPECTED_SOURCE_SHA" '
+ACTUAL_SOURCE_SHA=$("$JQ_BIN" -r '
+  if (.source_sha | type) == "string" then .source_sha
+  else "<missing-or-non-string>"
+  end
+' "$MANIFEST")
+if [ "$ACTUAL_SOURCE_SHA" != "$EXPECTED_SOURCE_SHA" ]; then
+  echo "Robinhood sidecar provenance mismatch: expected dex-connector source $EXPECTED_SOURCE_SHA, artifact has $ACTUAL_SOURCE_SHA" >&2
+  echo "Rebuild/deploy lighter-ratelimit for $EXPECTED_SOURCE_SHA before deploying the pairtrade runtime." >&2
+  exit 1
+fi
+
+"$JQ_BIN" -e '
   .schema_version == 1 and
   .artifact == "lighter-ratelimit" and
   .architecture == "aarch64" and
-  .source_sha == $source_sha and
   (.deployment_source_sha | type == "string" and test("^[0-9a-f]{40}$")) and
   (.binary_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
   .mode == "0755" and

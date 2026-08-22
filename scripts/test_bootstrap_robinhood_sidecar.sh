@@ -185,10 +185,12 @@ cmp "$BUNDLE/manifest.json" "$SIDECAR_ROOT/active-manifest.json"
 jq '.source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
   "$BUNDLE/manifest.json" > "$WORK/manifest.bad"
 mv "$WORK/manifest.bad" "$BUNDLE/manifest.json"
-if run_bootstrap; then
+if run_bootstrap >"$WORK/provenance-mismatch.log" 2>&1; then
   echo "expected source provenance mismatch to fail" >&2
   exit 1
 fi
+grep -F "expected dex-connector source $SOURCE_SHA" "$WORK/provenance-mismatch.log"
+grep -F "artifact has aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$WORK/provenance-mismatch.log"
 cmp "$BUNDLE/lighter-ratelimit" "$SIDECAR_ROOT/bin/lighter-ratelimit"
 
 echo "Robinhood sidecar bootstrap tests passed"

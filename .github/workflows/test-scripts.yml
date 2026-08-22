@@ -25,3 +25,7 @@ jobs:
         run: python3 scripts/test_arcus_live_tick_signal_replay.py -v
       - name: Run Robinhood sidecar bootstrap tests
         run: bash scripts/test_bootstrap_robinhood_sidecar.sh
+      - name: Run Robinhood runtime staging tests
+        run: bash scripts/test_deploy_robinhood_runtime.sh
+      - name: Verify Robinhood deploy workflow isolation
+        run: python3 scripts/test_robinhood_deploy_workflows.py
