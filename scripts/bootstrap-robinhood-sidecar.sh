@@ -40,8 +40,13 @@ if payload.get("granted") is not True:
 PY
 }
 
+VALIDATE_ONLY=false
+if [ "${1:-}" = --validate-only ]; then
+  VALIDATE_ONLY=true
+  shift
+fi
 if [ "$#" -ne 2 ]; then
-  echo "usage: $0 S3_BUCKET PAIRTRADE_INSTALL_DIR" >&2
+  echo "usage: $0 [--validate-only] S3_BUCKET PAIRTRADE_INSTALL_DIR" >&2
   exit 2
 fi
 S3_BUCKET=$1
@@ -126,6 +131,11 @@ UNIT_BEFORE=$(awk -F= '$1 == "Before" { print substr($0, index($0, "=") + 1) }' 
 if [[ " $UNIT_BEFORE " != *" $BOT_SERVICE "* ]]; then
   echo "$SERVICE does not order itself before $BOT_SERVICE" >&2
   exit 1
+fi
+
+if [ "$VALIDATE_ONLY" = true ]; then
+  echo "Robinhood sidecar artifact validated without activation (source=$EXPECTED_SOURCE_SHA)"
+  exit 0
 fi
 
 TARGET_BINARY="$SIDECAR_ROOT/bin/lighter-ratelimit"

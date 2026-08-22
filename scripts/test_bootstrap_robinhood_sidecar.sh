@@ -137,6 +137,10 @@ TEST_GROUP=$(id -gn)
 FAKE_SIDECAR_PIDS_FILE="$WORK/fake-sidecar-server.pids"
 : > "$FAKE_SIDECAR_PIDS_FILE"
 run_bootstrap() {
+  local -a mode_args=()
+  if [ "${1:-}" = --validate-only ]; then
+    mode_args+=(--validate-only)
+  fi
   FAKE_BUNDLE="$BUNDLE" \
   AWS_BIN="$WORK/aws" \
   FILE_BIN="$WORK/file" \
@@ -154,8 +158,12 @@ run_bootstrap() {
   SOCKET_PATH="$SOCKET_PATH" \
   INSTALL_OWNER="$TEST_OWNER" \
   INSTALL_GROUP="$TEST_GROUP" \
-    bash "$REPO_ROOT/scripts/bootstrap-robinhood-sidecar.sh" test-bucket "$PAIRTRADE_DIR"
+    bash "$REPO_ROOT/scripts/bootstrap-robinhood-sidecar.sh" "${mode_args[@]}" test-bucket "$PAIRTRADE_DIR"
 }
+
+run_bootstrap --validate-only
+test ! -e "$SIDECAR_ROOT/bin/lighter-ratelimit"
+test ! -s "$WORK/systemctl.log"
 
 run_bootstrap
 cmp "$BUNDLE/lighter-ratelimit" "$SIDECAR_ROOT/bin/lighter-ratelimit"

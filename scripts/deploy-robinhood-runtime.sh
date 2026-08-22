@@ -16,6 +16,7 @@ JQ_BIN=${JQ_BIN:-jq}
 BOOTSTRAP_BIN=${BOOTSTRAP_BIN:-$INSTALL_DIR/scripts/bootstrap-robinhood-sidecar.sh}
 INSTALL_OWNER=${INSTALL_OWNER:-root}
 INSTALL_GROUP=${INSTALL_GROUP:-root}
+INSTALL_BIN=${INSTALL_BIN:-install}
 
 if [[ ! "$EXPECTED_DEBOT_SHA" =~ ^[0-9a-f]{64}$ ]] ||
    [[ ! "$EXPECTED_LIBSIGNER_SHA" =~ ^[0-9a-f]{64}$ ]]; then
@@ -55,24 +56,66 @@ echo "$EXPECTED_LIBSIGNER_SHA  $STAGE/lib/libsigner.so" | sha256sum -c -
       (.dex_connector_sha | type == "string" and test("^[0-9a-f]{40}$"))
     ' "$STAGE/manifest.json" >/dev/null
 
-# Validate/activate the sidecar against the staged manifest. A provenance
-# failure therefore occurs before any installed pairtrade runtime artifact is
-# changed (bot-strategy#836).
-bash "$BOOTSTRAP_BIN" "$S3_BUCKET" "$STAGE"
+# Validate the matching sidecar without installing or restarting it. The old
+# sidecar remains active until the runtime transaction succeeds (#836).
+bash "$BOOTSTRAP_BIN" --validate-only "$S3_BUCKET" "$STAGE"
 
-install -d -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0750 \
-    "$INSTALL_DIR/bin" "$INSTALL_DIR/lib"
-install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 \
-    "$STAGE/bin/debot" "$INSTALL_DIR/bin/debot"
-install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
-    "$STAGE/lib/libsigner.so" "$INSTALL_DIR/lib/libsigner.so"
-install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
-    "$STAGE/checksums.sha256" "$INSTALL_DIR/checksums.sha256"
-install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
-    "$STAGE/manifest.json" "$INSTALL_DIR/manifest.json"
+RUNTIME_FILES=(
+    bin/debot
+    lib/libsigner.so
+    checksums.sha256
+    manifest.json
+)
+BACKUP="$WORK/runtime-backup"
+PRESENT_FILE="$WORK/runtime-present"
+mkdir -p "$BACKUP"
+: > "$PRESENT_FILE"
+for relative in "${RUNTIME_FILES[@]}"; do
+    target="$INSTALL_DIR/$relative"
+    if [ -e "$target" ]; then
+        mkdir -p "$BACKUP/$(dirname "$relative")"
+        cp -a -- "$target" "$BACKUP/$relative"
+        printf '%s\n' "$relative" >> "$PRESENT_FILE"
+    fi
+done
 
-(cd "$INSTALL_DIR" && sha256sum -c checksums.sha256)
-test "$(stat -c %U:%G:%a "$INSTALL_DIR/bin/debot")" = "$INSTALL_OWNER:$INSTALL_GROUP:755"
-test "$(stat -c %U:%G:%a "$INSTALL_DIR/lib/libsigner.so")" = "$INSTALL_OWNER:$INSTALL_GROUP:644"
+rollback_runtime() {
+    for relative in "${RUNTIME_FILES[@]}"; do
+        target="$INSTALL_DIR/$relative"
+        rm -f -- "$target"
+        if grep -Fxq "$relative" "$PRESENT_FILE"; then
+            mkdir -p "$INSTALL_DIR/$(dirname "$relative")"
+            cp -a -- "$BACKUP/$relative" "$target"
+        fi
+    done
+}
 
-echo "Robinhood pairtrade runtime installed after sidecar preflight (debot=$EXPECTED_DEBOT_SHA libsigner=$EXPECTED_LIBSIGNER_SHA)"
+commit_runtime() {
+    "$INSTALL_BIN" -d -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0750 \
+        "$INSTALL_DIR/bin" "$INSTALL_DIR/lib" || return 1
+    "$INSTALL_BIN" -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 \
+        "$STAGE/bin/debot" "$INSTALL_DIR/bin/debot" || return 1
+    "$INSTALL_BIN" -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
+        "$STAGE/lib/libsigner.so" "$INSTALL_DIR/lib/libsigner.so" || return 1
+    "$INSTALL_BIN" -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
+        "$STAGE/checksums.sha256" "$INSTALL_DIR/checksums.sha256" || return 1
+    "$INSTALL_BIN" -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
+        "$STAGE/manifest.json" "$INSTALL_DIR/manifest.json" || return 1
+
+    (cd "$INSTALL_DIR" && sha256sum -c checksums.sha256) || return 1
+    test "$(stat -c %U:%G:%a "$INSTALL_DIR/bin/debot")" = \
+        "$INSTALL_OWNER:$INSTALL_GROUP:755" || return 1
+    test "$(stat -c %U:%G:%a "$INSTALL_DIR/lib/libsigner.so")" = \
+        "$INSTALL_OWNER:$INSTALL_GROUP:644" || return 1
+}
+
+if ! commit_runtime; then
+    echo "Robinhood runtime install failed; restoring the previous runtime before sidecar activation" >&2
+    rollback_runtime
+    exit 1
+fi
+
+# Revalidate the bundle against the committed manifest, then activate it.
+bash "$BOOTSTRAP_BIN" "$S3_BUCKET" "$INSTALL_DIR"
+
+echo "Robinhood pairtrade runtime and sidecar installed (debot=$EXPECTED_DEBOT_SHA libsigner=$EXPECTED_LIBSIGNER_SHA)"

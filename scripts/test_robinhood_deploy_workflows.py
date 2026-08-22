@@ -7,6 +7,7 @@ from pathlib import Path
 repo = Path(__file__).resolve().parents[1]
 config_workflow = (repo / ".github/workflows/deploy-configs.yml").read_text()
 runtime_workflow = (repo / ".github/workflows/ci.yml").read_text()
+runtime_deployer = (repo / "scripts/deploy-robinhood-runtime.sh").read_text()
 
 config_job = config_workflow.split("  deploy-robinhood-configs:\n", 1)[1]
 assert "bootstrap-robinhood-sidecar.sh" not in config_job, (
@@ -21,5 +22,12 @@ assert "bootstrap-robinhood-sidecar.sh" not in runtime_job, (
 )
 assert "systemctl restart debot-pair-robinhood-lighter" not in runtime_job
 assert "systemctl start debot-pair-robinhood-lighter" not in runtime_job
+
+preflight = runtime_deployer.index('bash "$BOOTSTRAP_BIN" --validate-only')
+runtime_commit = runtime_deployer.index("if ! commit_runtime")
+sidecar_activation = runtime_deployer.index(
+    'bash "$BOOTSTRAP_BIN" "$S3_BUCKET" "$INSTALL_DIR"'
+)
+assert preflight < runtime_commit < sidecar_activation
 
 print("Robinhood deploy workflow isolation tests passed")
