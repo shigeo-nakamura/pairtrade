@@ -7,7 +7,6 @@ cleanup() {
     rm -rf -- "$WORK"
 }
 trap cleanup EXIT
-export ROBINHOOD_RUNTIME_LOCK_FILE="$WORK/runtime.lock"
 
 S3_ROOT="$WORK/s3"
 INSTALL_DIR="$WORK/install"
@@ -145,25 +144,10 @@ BOOTSTRAP_BIN="$WORK/bootstrap" BOOTSTRAP_LOG="$WORK/bootstrap.log" \
 grep -F "bundle not staged yet" "$WORK/legacy-warning.log"
 test "$(cat "$WORK/bootstrap.log")" = validate
 
-# The systemd dependency activates the sidecar against committed runtime.
+# The systemd pre-start helper activates the sidecar against committed runtime.
 BOOTSTRAP_BIN="$WORK/bootstrap" BOOTSTRAP_LOG="$WORK/bootstrap.log" \
   bash "$REPO_ROOT/scripts/activate-robinhood-sidecar.sh" "$INSTALL_DIR"
 test "$(sed -n '2p' "$WORK/bootstrap.log")" = activate
 test "$(wc -l < "$WORK/bootstrap.log")" -eq 2
-
-# A bot-start activation waits while a runtime publication owns the shared
-# lock, so it cannot inspect or activate a partially committed file set.
-exec 8>"$ROBINHOOD_RUNTIME_LOCK_FILE"
-flock -x 8
-BOOTSTRAP_BIN="$WORK/bootstrap" BOOTSTRAP_LOG="$WORK/bootstrap.log" \
-  bash "$REPO_ROOT/scripts/activate-robinhood-sidecar.sh" "$INSTALL_DIR" &
-ACTIVATION_PID=$!
-sleep 0.2
-kill -0 "$ACTIVATION_PID"
-test "$(wc -l < "$WORK/bootstrap.log")" -eq 2
-flock -u 8
-wait "$ACTIVATION_PID"
-test "$(sed -n '3p' "$WORK/bootstrap.log")" = activate
-test "$(wc -l < "$WORK/bootstrap.log")" -eq 3
 
 echo "Robinhood runtime staging tests passed"

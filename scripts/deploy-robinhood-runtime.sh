@@ -19,8 +19,6 @@ INSTALL_GROUP=${INSTALL_GROUP:-root}
 RUNTIME_DIR_OWNER=${RUNTIME_DIR_OWNER:-ec2-user}
 RUNTIME_DIR_GROUP=${RUNTIME_DIR_GROUP:-ec2-user}
 INSTALL_BIN=${INSTALL_BIN:-install}
-FLOCK_BIN=${FLOCK_BIN:-flock}
-RUNTIME_LOCK_FILE=${ROBINHOOD_RUNTIME_LOCK_FILE:-/run/lock/debot-robinhood-runtime.lock}
 
 if [[ ! "$EXPECTED_DEBOT_SHA" =~ ^[0-9a-f]{64}$ ]] ||
    [[ ! "$EXPECTED_LIBSIGNER_SHA" =~ ^[0-9a-f]{64}$ ]]; then
@@ -65,13 +63,6 @@ echo "$EXPECTED_LIBSIGNER_SHA  $STAGE/lib/libsigner.so" | sha256sum -c -
 # start (#836).
 SIDECAR_STAGE_DIR="$STAGE/robinhood-sidecar-bundle" \
     bash "$BOOTSTRAP_BIN" --validate-only "$S3_BUCKET" "$STAGE"
-
-# Serialize the visibility-changing commit with the systemd sidecar activation
-# dependency. A crash/manual bot start during these sequential installs waits
-# on the same lock and therefore cannot observe a mixed runtime/bundle.
-install -d -m 0755 "$(dirname "$RUNTIME_LOCK_FILE")"
-exec 9>"$RUNTIME_LOCK_FILE"
-"$FLOCK_BIN" -x 9
 
 RUNTIME_FILES=(
     bin/debot
