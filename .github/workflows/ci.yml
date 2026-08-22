@@ -399,6 +399,7 @@ jobs:
           # Canary unit (bot-strategy#376) — Frankfurt-only, deployed by this
           # same job.
           aws s3 cp debot/deploy/debot-pair-canary.service "s3://${S3_BUCKET}/deploy/debot-pair-canary.service"
+          aws s3 cp debot/deploy/debot-pair-robinhood-sidecar-activation.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service"
           aws s3 cp debot/deploy/debot-pair-robinhood-lighter.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
 
       - name: Deploy via SSM (no restart)
@@ -553,7 +554,13 @@ jobs:
             --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
             --comment "Deploy Robinhood Lighter pairtrade artifacts; no start or restart" \
-            --parameters commands="set -e,sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/bin ${INSTALL_DIR}/lib ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 cp s3://${S3_BUCKET}/debot/debot ${INSTALL_DIR}/bin/debot,aws s3 cp s3://${S3_BUCKET}/debot/libsigner.so ${INSTALL_DIR}/lib/libsigner.so,aws s3 cp s3://${S3_BUCKET}/debot/checksums.sha256 ${INSTALL_DIR}/checksums.sha256,aws s3 cp s3://${S3_BUCKET}/debot/manifest.json ${INSTALL_DIR}/manifest.json,sudo chown root:root ${INSTALL_DIR}/bin/debot ${INSTALL_DIR}/lib/libsigner.so ${INSTALL_DIR}/checksums.sha256 ${INSTALL_DIR}/manifest.json,sudo chmod 755 ${INSTALL_DIR}/bin/debot,sudo chmod 644 ${INSTALL_DIR}/lib/libsigner.so ${INSTALL_DIR}/checksums.sha256 ${INSTALL_DIR}/manifest.json,echo ${DEBOT_SHA256} ${INSTALL_DIR}/bin/debot | sudo sha256sum -c - || exit 1,echo ${LIBSIGNER_SHA256} ${INSTALL_DIR}/lib/libsigner.so | sudo sha256sum -c - || exit 1,cd ${INSTALL_DIR} && sudo sha256sum -c checksums.sha256 || exit 1,stat -c %U:%G:%a ${INSTALL_DIR}/bin/debot | grep -qx root:root:755 || exit 1,stat -c %U:%G:%a ${INSTALL_DIR}/lib/libsigner.so | grep -qx root:root:644 || exit 1,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts,sudo bash ${INSTALL_DIR}/scripts/bootstrap-robinhood-sidecar.sh ${S3_BUCKET} ${INSTALL_DIR},sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
+            --parameters commands="set -e,sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-sidecar-activation.service,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo systemd-analyze verify /tmp/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-sidecar-activation.service /etc/systemd/system/debot-pair-robinhood-sidecar-activation.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-runtime.sh ${S3_BUCKET} ${INSTALL_DIR} ${DEBOT_SHA256} ${LIBSIGNER_SHA256},sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
             --query Command.CommandId --output text)
+          set +e
           aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}"
+          WAIT_STATUS=$?
           aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
+          set -e
+          if [ ${WAIT_STATUS} -ne 0 ]; then
+            exit ${WAIT_STATUS}
+          fi

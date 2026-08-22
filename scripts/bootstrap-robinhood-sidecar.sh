@@ -16,6 +16,8 @@ SIDECAR_ROOT=${SIDECAR_ROOT:-/opt/lighter-ratelimit}
 SOCKET_PATH=${SOCKET_PATH:-/run/lighter-ratelimit/lighter-ratelimit.sock}
 INSTALL_OWNER=${INSTALL_OWNER:-root}
 INSTALL_GROUP=${INSTALL_GROUP:-root}
+SOURCE_BUNDLE_DIR=${SIDECAR_BUNDLE_DIR:-}
+STAGE_BUNDLE_DIR=${SIDECAR_STAGE_DIR:-}
 
 probe_socket() {
   "$PYTHON_BIN" - "$SOCKET_PATH" <<'PY'
@@ -40,8 +42,13 @@ if payload.get("granted") is not True:
 PY
 }
 
+VALIDATE_ONLY=false
+if [ "${1:-}" = --validate-only ]; then
+  VALIDATE_ONLY=true
+  shift
+fi
 if [ "$#" -ne 2 ]; then
-  echo "usage: $0 S3_BUCKET PAIRTRADE_INSTALL_DIR" >&2
+  echo "usage: $0 [--validate-only] S3_BUCKET PAIRTRADE_INSTALL_DIR" >&2
   exit 2
 fi
 S3_BUCKET=$1
@@ -74,16 +81,33 @@ CHECKSUM="$WORK/lighter-ratelimit.sha256"
 MANIFEST="$WORK/manifest.json"
 UNIT="$WORK/$SERVICE"
 
-"$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/lighter-ratelimit" "$BINARY"
-"$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/lighter-ratelimit.sha256" "$CHECKSUM"
-"$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/manifest.json" "$MANIFEST"
-"$AWS_BIN" s3 cp "s3://$S3_BUCKET/deploy/lighter-ratelimit.service" "$UNIT"
+if [ -n "$SOURCE_BUNDLE_DIR" ]; then
+  cp -- "$SOURCE_BUNDLE_DIR/lighter-ratelimit" "$BINARY"
+  cp -- "$SOURCE_BUNDLE_DIR/lighter-ratelimit.sha256" "$CHECKSUM"
+  cp -- "$SOURCE_BUNDLE_DIR/manifest.json" "$MANIFEST"
+  cp -- "$SOURCE_BUNDLE_DIR/$SERVICE" "$UNIT"
+else
+  "$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/lighter-ratelimit" "$BINARY"
+  "$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/lighter-ratelimit.sha256" "$CHECKSUM"
+  "$AWS_BIN" s3 cp "s3://$S3_BUCKET/lighter-ratelimit/manifest.json" "$MANIFEST"
+  "$AWS_BIN" s3 cp "s3://$S3_BUCKET/deploy/lighter-ratelimit.service" "$UNIT"
+fi
 
-"$JQ_BIN" -e --arg source_sha "$EXPECTED_SOURCE_SHA" '
+ACTUAL_SOURCE_SHA=$("$JQ_BIN" -r '
+  if (.source_sha | type) == "string" then .source_sha
+  else "<missing-or-non-string>"
+  end
+' "$MANIFEST")
+if [ "$ACTUAL_SOURCE_SHA" != "$EXPECTED_SOURCE_SHA" ]; then
+  echo "Robinhood sidecar provenance mismatch: expected dex-connector source $EXPECTED_SOURCE_SHA, artifact has $ACTUAL_SOURCE_SHA" >&2
+  echo "Rebuild/deploy lighter-ratelimit for $EXPECTED_SOURCE_SHA before deploying the pairtrade runtime." >&2
+  exit 1
+fi
+
+"$JQ_BIN" -e '
   .schema_version == 1 and
   .artifact == "lighter-ratelimit" and
   .architecture == "aarch64" and
-  .source_sha == $source_sha and
   (.deployment_source_sha | type == "string" and test("^[0-9a-f]{40}$")) and
   (.binary_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
   .mode == "0755" and
@@ -116,6 +140,30 @@ UNIT_BEFORE=$(awk -F= '$1 == "Before" { print substr($0, index($0, "=") + 1) }' 
 if [[ " $UNIT_BEFORE " != *" $BOT_SERVICE "* ]]; then
   echo "$SERVICE does not order itself before $BOT_SERVICE" >&2
   exit 1
+fi
+
+# Validate the downloaded/staged unit before either reporting preflight success
+# or copying it into the local activation bundle. Activation also verifies the
+# installed copy, but by then a bad unit would already have replaced the live
+# file and could block the coordinated bot start.
+VERIFY_ROOT="$WORK/systemd-verify-root"
+install -D -m 0755 "$BINARY" \
+  "$VERIFY_ROOT/opt/lighter-ratelimit/bin/lighter-ratelimit"
+install -D -m 0644 "$UNIT" \
+  "$VERIFY_ROOT/etc/systemd/system/$SERVICE"
+"$SYSTEMD_ANALYZE" verify --recursive-errors=no --root="$VERIFY_ROOT" \
+  "/etc/systemd/system/$SERVICE"
+
+if [ -n "$STAGE_BUNDLE_DIR" ]; then
+  install -d -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 "$STAGE_BUNDLE_DIR"
+  install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 "$BINARY" "$STAGE_BUNDLE_DIR/lighter-ratelimit"
+  install -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0644 \
+    "$CHECKSUM" "$MANIFEST" "$UNIT" "$STAGE_BUNDLE_DIR/"
+fi
+
+if [ "$VALIDATE_ONLY" = true ]; then
+  echo "Robinhood sidecar artifact validated without activation (source=$EXPECTED_SOURCE_SHA)"
+  exit 0
 fi
 
 TARGET_BINARY="$SIDECAR_ROOT/bin/lighter-ratelimit"

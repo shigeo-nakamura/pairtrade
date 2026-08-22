@@ -20,6 +20,7 @@ set -eu
 
 ENV_DIR="${DEBOT_ENV_DIR:-/opt/debot/scripts}"
 STATE_DIR="${DEBOT_ROBINHOOD_STATE_DIR:-/opt/debot-robinhood-lighter}"
+RUNTIME_DIR="${DEBOT_ROBINHOOD_RUNTIME_DIR:-/run/debot-pair-robinhood-lighter/runtime}"
 
 set -a
 source "$ENV_DIR/debot_secrets_common.env"
@@ -74,11 +75,16 @@ export LIGHTER_STARTUP_JITTER_SECS=0
 export RISK_ACK_PATH="$STATE_DIR/RISK_ACK"
 export RESTART_PENDING_PATH="$STATE_DIR/RESTART_PENDING"
 
-if [ -f /opt/debot/lib/libsigner.so ]; then
-    export LIGHTER_GO_PATH=/opt/debot/lib
+if [ ! -x "$RUNTIME_DIR/bin/debot" ]; then
+    echo "FATAL: pinned Robinhood runtime is missing executable: $RUNTIME_DIR/bin/debot" >&2
+    exit 1
+fi
+
+if [ -f "$RUNTIME_DIR/lib/libsigner.so" ]; then
+    export LIGHTER_GO_PATH="$RUNTIME_DIR/lib"
     export LD_LIBRARY_PATH="${LIGHTER_GO_PATH}:${LD_LIBRARY_PATH:-}"
 fi
 
 mkdir -p "$DEBOT_STATUS_DIR" "$STATE_DIR/history_archive_robinhood_lighter"
 cd "$STATE_DIR"
-exec /opt/debot/bin/debot
+exec "$RUNTIME_DIR/bin/debot"
