@@ -17,7 +17,7 @@
 # #750 fill-VWAP PnL, #752 DD denominators, #783 capital-rebaseline continuity,
 # and #531 ineligible defer on Frankfurt main. The 500 bps session gate remains
 # armed; no scale beyond $10k is authorized in this round.
-# Before restart, confirm A/B/C collateral and flat state, set ROUND_ID=round10,
+# Before restart, confirm A/B/C collateral and flat state, set round_id=round10,
 # remove the boundary DRY_RUN override, and obtain explicit Frankfurt approval.
 # =============================================================================
 
@@ -26,6 +26,7 @@ rest_endpoint: https://mainnet.zklighter.elliot.ai/
 web_socket_endpoint: wss://mainnet.zklighter.elliot.ai/stream
 dry_run: false
 agent_name: debot-pair-btceth
+round_id: round10
 
 # Data dump for BT (independent of trading; observe_only must be set explicitly)
 enable_data_dump: true
