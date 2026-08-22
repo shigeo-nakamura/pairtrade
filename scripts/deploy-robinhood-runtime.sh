@@ -16,6 +16,8 @@ JQ_BIN=${JQ_BIN:-jq}
 BOOTSTRAP_BIN=${BOOTSTRAP_BIN:-$INSTALL_DIR/scripts/bootstrap-robinhood-sidecar.sh}
 INSTALL_OWNER=${INSTALL_OWNER:-root}
 INSTALL_GROUP=${INSTALL_GROUP:-root}
+RUNTIME_DIR_OWNER=${RUNTIME_DIR_OWNER:-ec2-user}
+RUNTIME_DIR_GROUP=${RUNTIME_DIR_GROUP:-ec2-user}
 INSTALL_BIN=${INSTALL_BIN:-install}
 
 if [[ ! "$EXPECTED_DEBOT_SHA" =~ ^[0-9a-f]{64}$ ]] ||
@@ -91,7 +93,7 @@ rollback_runtime() {
 }
 
 commit_runtime() {
-    "$INSTALL_BIN" -d -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0750 \
+    "$INSTALL_BIN" -d -o "$RUNTIME_DIR_OWNER" -g "$RUNTIME_DIR_GROUP" -m 0750 \
         "$INSTALL_DIR/bin" "$INSTALL_DIR/lib" || return 1
     "$INSTALL_BIN" -o "$INSTALL_OWNER" -g "$INSTALL_GROUP" -m 0755 \
         "$STAGE/bin/debot" "$INSTALL_DIR/bin/debot" || return 1
@@ -107,6 +109,10 @@ commit_runtime() {
         "$INSTALL_OWNER:$INSTALL_GROUP:755" || return 1
     test "$(stat -c %U:%G:%a "$INSTALL_DIR/lib/libsigner.so")" = \
         "$INSTALL_OWNER:$INSTALL_GROUP:644" || return 1
+    test "$(stat -c %U:%G:%a "$INSTALL_DIR/bin")" = \
+        "$RUNTIME_DIR_OWNER:$RUNTIME_DIR_GROUP:750" || return 1
+    test "$(stat -c %U:%G:%a "$INSTALL_DIR/lib")" = \
+        "$RUNTIME_DIR_OWNER:$RUNTIME_DIR_GROUP:750" || return 1
 }
 
 if ! commit_runtime; then

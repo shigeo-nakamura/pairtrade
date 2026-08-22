@@ -20,6 +20,8 @@ assert "deploy-robinhood-runtime.sh" in runtime_job
 assert "bootstrap-robinhood-sidecar.sh" not in runtime_job, (
     "runtime workflow must delegate staged sidecar preflight to the runtime deploy script"
 )
+assert "RUNTIME_DIR_OWNER=${RUNTIME_DIR_OWNER:-ec2-user}" in runtime_deployer
+assert "RUNTIME_DIR_GROUP=${RUNTIME_DIR_GROUP:-ec2-user}" in runtime_deployer
 assert "systemctl restart debot-pair-robinhood-lighter" not in runtime_job
 assert "systemctl start debot-pair-robinhood-lighter" not in runtime_job
 

@@ -82,6 +82,8 @@ run_deploy() {
   FAKE_INSTALL_DIR="$INSTALL_DIR" \
   INSTALL_OWNER="$(id -un)" \
   INSTALL_GROUP="$(id -gn)" \
+  RUNTIME_DIR_OWNER="$(id -un)" \
+  RUNTIME_DIR_GROUP="$(id -gn)" \
     bash "$REPO_ROOT/scripts/deploy-robinhood-runtime.sh" \
       test-bucket "$INSTALL_DIR" "$DEBOT_SHA" "$LIBSIGNER_SHA"
 }
@@ -114,6 +116,8 @@ cmp "$S3_ROOT/debot/debot" "$INSTALL_DIR/bin/debot"
 cmp "$S3_ROOT/debot/libsigner.so" "$INSTALL_DIR/lib/libsigner.so"
 cmp "$S3_ROOT/debot/checksums.sha256" "$INSTALL_DIR/checksums.sha256"
 cmp "$S3_ROOT/debot/manifest.json" "$INSTALL_DIR/manifest.json"
+test "$(stat -c %U:%G:%a "$INSTALL_DIR/bin")" = "$(id -un):$(id -gn):750"
+test "$(stat -c %U:%G:%a "$INSTALL_DIR/lib")" = "$(id -un):$(id -gn):750"
 test "$(sed -n '1p' "$WORK/bootstrap.log")" = validate
 test "$(sed -n '2p' "$WORK/bootstrap.log")" = activate
 test "$(wc -l < "$WORK/bootstrap.log")" -eq 2
