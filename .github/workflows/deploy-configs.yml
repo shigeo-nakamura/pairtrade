@@ -32,6 +32,7 @@ jobs:
           bash -n debot/scripts/debot-pair-shadow-macro.sh
           bash -n debot/scripts/debot-pair-robinhood-lighter.sh
           bash -n debot/scripts/bootstrap-robinhood-sidecar.sh
+          bash -n debot/scripts/activate-robinhood-sidecar.sh
           bash -n debot/scripts/deploy-robinhood-config.sh
           bash -n debot/scripts/deploy-robinhood-runtime.sh
           bash -n debot/scripts/test_bootstrap_robinhood_sidecar.sh

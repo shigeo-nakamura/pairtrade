@@ -7,6 +7,7 @@ Wants=network-online.target
 User=ec2-user
 WorkingDirectory=-/opt/debot-robinhood-lighter
 ExecStartPre=+/usr/bin/install -d -o ec2-user -g ec2-user -m 0750 /opt/debot-robinhood-lighter /home/ec2-user/debot_status
+ExecStartPre=+/bin/bash /opt/debot/scripts/activate-robinhood-sidecar.sh /opt/debot
 ExecStart=/bin/bash /opt/debot/scripts/debot-pair-robinhood-lighter.sh
 Environment=PROM_LISTEN=127.0.0.1:9464
 Environment=STATUS_S3_BUCKET=debot-dashboard

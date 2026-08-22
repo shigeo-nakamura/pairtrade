@@ -109,16 +109,21 @@ diff -ru "$WORK/install.before" "$INSTALL_DIR"
 grep -F "restoring the previous runtime before sidecar activation" "$WORK/install-failure.log"
 test "$(cat "$WORK/bootstrap.log")" = validate
 
-# A successful transaction activates the sidecar only after runtime commit.
+# A successful deploy commits runtime metadata but does not activate the sidecar.
 : > "$WORK/bootstrap.log"
 run_deploy
 cmp "$S3_ROOT/debot/debot" "$INSTALL_DIR/bin/debot"
 cmp "$S3_ROOT/debot/libsigner.so" "$INSTALL_DIR/lib/libsigner.so"
 cmp "$S3_ROOT/debot/checksums.sha256" "$INSTALL_DIR/checksums.sha256"
 cmp "$S3_ROOT/debot/manifest.json" "$INSTALL_DIR/manifest.json"
+test "$(cat "$INSTALL_DIR/robinhood-sidecar-s3-bucket")" = test-bucket
 test "$(stat -c %U:%G:%a "$INSTALL_DIR/bin")" = "$(id -un):$(id -gn):750"
 test "$(stat -c %U:%G:%a "$INSTALL_DIR/lib")" = "$(id -un):$(id -gn):750"
-test "$(sed -n '1p' "$WORK/bootstrap.log")" = validate
+test "$(cat "$WORK/bootstrap.log")" = validate
+
+# The systemd pre-start helper activates the sidecar against committed runtime.
+BOOTSTRAP_BIN="$WORK/bootstrap" BOOTSTRAP_LOG="$WORK/bootstrap.log" \
+  bash "$REPO_ROOT/scripts/activate-robinhood-sidecar.sh" "$INSTALL_DIR"
 test "$(sed -n '2p' "$WORK/bootstrap.log")" = activate
 test "$(wc -l < "$WORK/bootstrap.log")" -eq 2
 
