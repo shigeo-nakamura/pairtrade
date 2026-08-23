@@ -100,5 +100,107 @@
         }
       }
     ]
+  },
+  {
+    "uid": "canary-entry-slippage-p95",
+    "title": "Canary entry slippage P95 above +1.0 bps (7d)",
+    "ruleGroup": "bot-fleet",
+    "folderUID": "bot-alerts",
+    "noDataState": "OK",
+    "execErrState": "Error",
+    "for": "6h",
+    "condition": "B",
+    "annotations": {
+      "summary": "Canary entry-leg slippage P95 over the last 7d is above +1.0 bps",
+      "description": "bot-strategy#412 signal #4 (entry) Stage C tail detector. Post-#705 baseline (2026-08-04, N=198 main / N=40 canary) recorded canary entry P95 at -0.01 bps vs main +0.45 bps; +1.0 bps is an exact histogram bucket boundary and exceeds 2x the higher post-fix baseline. Uses a 7d range and >= 30 fill guard (vs. the P50 rule's 6h/4-fill fast path) because canary produces too few fills for a meaningful 6h P95."
+    },
+    "labels": { "service": "pairtrade", "severity": "warning", "source": "grafana" },
+    "data": [
+      {
+        "refId": "A",
+        "queryType": "",
+        "relativeTimeRange": { "from": 604800, "to": 0 },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[7d]))) and on () (sum(increase(pairtrade_leg_slippage_bps_count{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[7d])) >= 30)",
+          "hide": false,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "A"
+        }
+      },
+      {
+        "refId": "B",
+        "queryType": "",
+        "relativeTimeRange": { "from": 0, "to": 0 },
+        "datasourceUid": "-100",
+        "model": {
+          "conditions": [{
+            "evaluator": { "params": [1.0], "type": "gt" },
+            "operator": { "type": "and" },
+            "query": { "params": ["A"] },
+            "reducer": { "params": [], "type": "last" },
+            "type": "query"
+          }],
+          "datasource": { "type": "__expr__", "uid": "-100" },
+          "hide": false,
+          "intervalMs": 1000,
+          "maxDataPoints": 43200,
+          "refId": "B",
+          "type": "classic_conditions"
+        }
+      }
+    ]
+  },
+  {
+    "uid": "canary-exit-slippage-p95",
+    "title": "Canary exit slippage P95 above +2.0 bps (7d)",
+    "ruleGroup": "bot-fleet",
+    "folderUID": "bot-alerts",
+    "noDataState": "OK",
+    "execErrState": "Error",
+    "for": "6h",
+    "condition": "B",
+    "annotations": {
+      "summary": "Canary exit-leg slippage P95 over the last 7d is above +2.0 bps",
+      "description": "bot-strategy#412 signal #4 (exit) Stage C tail detector. Post-#705 baseline (2026-08-04, N=209 main / N=40 canary) recorded canary exit P95 at +0.80 bps vs main +0.95 bps; +2.0 bps is an exact histogram bucket boundary and exceeds 2x the higher post-fix baseline. Uses a 7d range and >= 30 fill guard (vs. the P50 rule's 6h/4-fill fast path) because canary produces too few fills for a meaningful 6h P95."
+    },
+    "labels": { "service": "pairtrade", "severity": "warning", "source": "grafana" },
+    "data": [
+      {
+        "refId": "A",
+        "queryType": "",
+        "relativeTimeRange": { "from": 604800, "to": 0 },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[7d]))) and on () (sum(increase(pairtrade_leg_slippage_bps_count{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[7d])) >= 30)",
+          "hide": false,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "A"
+        }
+      },
+      {
+        "refId": "B",
+        "queryType": "",
+        "relativeTimeRange": { "from": 0, "to": 0 },
+        "datasourceUid": "-100",
+        "model": {
+          "conditions": [{
+            "evaluator": { "params": [2.0], "type": "gt" },
+            "operator": { "type": "and" },
+            "query": { "params": ["A"] },
+            "reducer": { "params": [], "type": "last" },
+            "type": "query"
+          }],
+          "datasource": { "type": "__expr__", "uid": "-100" },
+          "hide": false,
+          "intervalMs": 1000,
+          "maxDataPoints": 43200,
+          "refId": "B",
+          "type": "classic_conditions"
+        }
+      }
+    ]
   }
 ]
