@@ -119,11 +119,13 @@
       {
         "refId": "A",
         "queryType": "",
-        "relativeTimeRange": { "from": 604800, "to": 0 },
+        "relativeTimeRange": { "from": 600, "to": 0 },
         "datasourceUid": "__PROMETHEUS_UID__",
         "model": {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[7d]))) and on () (sum(increase(pairtrade_leg_slippage_bps_count{instance=\"debot-frankfurt-canary\",leg=\"entry\"}[7d])) >= 30)",
           "hide": false,
+          "instant": true,
+          "range": false,
           "intervalMs": 60000,
           "maxDataPoints": 43200,
           "refId": "A"
@@ -170,11 +172,13 @@
       {
         "refId": "A",
         "queryType": "",
-        "relativeTimeRange": { "from": 604800, "to": 0 },
+        "relativeTimeRange": { "from": 600, "to": 0 },
         "datasourceUid": "__PROMETHEUS_UID__",
         "model": {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(pairtrade_leg_slippage_bps_bucket{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[7d]))) and on () (sum(increase(pairtrade_leg_slippage_bps_count{instance=\"debot-frankfurt-canary\",leg=\"exit\"}[7d])) >= 30)",
           "hide": false,
+          "instant": true,
+          "range": false,
           "intervalMs": 60000,
           "maxDataPoints": 43200,
           "refId": "A"
