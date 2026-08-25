@@ -90,11 +90,12 @@ cooldown_secs: 60
 slippage_bps: 0
 fee_bps: 0
 entry_post_only_timeout_secs: 30
-# bot-strategy#860: normal exits rest passively for at most three 5s engine
-# ticks before the reconcile loop cancels and takes over as taker. Emergency
-# exits (stop/beta floor/loss budget/maintenance) bypass maker-first entirely.
+# bot-strategy#860: normal exits rest passively for at most one 5s engine tick
+# before the reconcile loop cancels and takes over as taker. The 2026-08-22..25
+# BBO counterfactual favored 5s over 10-30s because longer waits accumulated
+# maker adverse selection. Emergency exits bypass maker-first entirely.
 exit_post_only_enabled: true
-exit_post_only_timeout_secs: 15
+exit_post_only_timeout_secs: 5
 
 # Filters (relaxed: let z-score do the work)
 spread_velocity_max_sigma_per_min: 0.15

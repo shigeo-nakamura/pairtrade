@@ -111,7 +111,7 @@ fn robinhood_lighter_three_arm_config_parses() {
     assert_eq!(cfg.dex_name, "lighter");
     assert_eq!(cfg.strategies.len(), 3);
     assert!(cfg.default_pair_params.exit_post_only_enabled);
-    assert_eq!(cfg.default_pair_params.exit_post_only_timeout_secs, 15);
+    assert_eq!(cfg.default_pair_params.exit_post_only_timeout_secs, 5);
     let freq = &cfg.strategies[0];
     assert_eq!(freq.id, "freq");
     assert_eq!(
