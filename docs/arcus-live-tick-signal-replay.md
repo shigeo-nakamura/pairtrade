@@ -14,8 +14,9 @@ are checked independently. The executor validates the latest segment before
 every append and fsyncs each record. Files are mode 0600 under a mode-0700
 directory.
 
-At 00:12 UTC the archive timer verifies and deterministically compresses the
-closed day, then publishes data before its manifest under:
+At 00:12 UTC the archive timer scans every local closed UTC-day segment,
+verifies and deterministically compresses each one, then publishes data before
+its manifest under:
 
     s3://debot-dashboard/arcus-archive/live-tick-events/debot-arcus/YYYY/MM/
 
@@ -25,6 +26,9 @@ days. The immutable writer refuses to replace a key with different bytes.
 Each manifest records raw and compressed hashes, byte counts, sequence/time
 bounds, and first/last chain hashes. A missing day after stream initialization,
 payload/hash/chain corruption, or an S3 collision is a hard archive failure.
+Rechecking an already archived segment is byte-identical and harmless. This
+full closed-segment scan is required because a persistent systemd timer
+coalesces a multi-day outage into one catch-up activation.
 
 Fetch and verify a closed range before replay:
 

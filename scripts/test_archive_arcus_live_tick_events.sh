@@ -109,6 +109,15 @@ run_archive() {
   S3_PREFIX=arcus-archive/live-tick-events/test-host \
     bash "$REPO_ROOT/scripts/archive_arcus_live_tick_events.sh" "$1"
 }
+run_archive_all() {
+  PATH="$WORK/bin:$PATH" \
+  FAKE_S3="$FAKE_S3" \
+  STREAM_DIR="$STREAM_DIR" \
+  VERIFY_SCRIPT="$REPO_ROOT/scripts/arcus_live_tick_event_stream.py" \
+  S3_BUCKET=test-private \
+  S3_PREFIX=arcus-archive/live-tick-events/test-host \
+    bash "$REPO_ROOT/scripts/archive_arcus_live_tick_events.sh"
+}
 
 # A fresh deployment has no segment for the prior day; that expected boundary
 # is a no-op. Once a first segment exists, a later missing day is an error.
@@ -121,8 +130,9 @@ if STREAM_DIR="$WORK/gapped" run_archive 2026-08-24; then
   exit 1
 fi
 
-run_archive 2026-08-23
-run_archive 2026-08-24
+# Regression for Codex P1: one catch-up activation after a multi-day outage
+# must publish every closed segment, not only yesterday.
+run_archive_all
 
 DATA_23="$FAKE_S3/test-private/arcus-archive/live-tick-events/test-host/2026/08/2026-08-23.events.jsonl.gz"
 MANIFEST_23="$FAKE_S3/test-private/arcus-archive/live-tick-events/test-host/2026/08/2026-08-23.manifest.json"

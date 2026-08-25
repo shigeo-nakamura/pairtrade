@@ -1,8 +1,38 @@
 #!/usr/bin/env bash
-# Verify and immutably archive one closed UTC day of Arcus live-tick events.
+# Verify and immutably archive all closed UTC-day Arcus live-tick segments.
+# An explicit YYYY-MM-DD limits the operation to one day for repair/testing.
 set -euo pipefail
 
-DATE="${1:-$(date -u -d 'yesterday' +%Y-%m-%d)}"
+if [ "$#" -gt 1 ]; then
+  echo "usage: $0 [YYYY-MM-DD]" >&2
+  exit 64
+fi
+
+STATE_DIR="${STATE_DIR:-/var/lib/debot-arcus/spot-execute-once}"
+STREAM_DIR="${STREAM_DIR:-$STATE_DIR/live-tick-events}"
+if [ "$#" -eq 0 ]; then
+  if [ ! -d "$STREAM_DIR" ]; then
+    echo "[archive_arcus_events] stream not initialized; no closed segments to archive"
+    exit 0
+  fi
+  LAST_CLOSED=$(date -u -d 'yesterday' +%Y-%m-%d)
+  CLOSED_SEGMENTS=0
+  while IFS= read -r segment; do
+    day=$(basename "$segment" .jsonl)
+    if [[ "$day" > "$LAST_CLOSED" ]]; then
+      continue
+    fi
+    # Persistent timers coalesce an arbitrary outage into one activation.
+    # Re-run every closed segment idempotently so a multi-day outage cannot
+    # leave older days stranded only on the instance.
+    "$0" "$day"
+    CLOSED_SEGMENTS=$((CLOSED_SEGMENTS + 1))
+  done < <(find "$STREAM_DIR" -maxdepth 1 -type f -name '????-??-??.jsonl' | sort)
+  echo "[archive_arcus_events] verified closed segments=$CLOSED_SEGMENTS through=$LAST_CLOSED"
+  exit 0
+fi
+
+DATE=$1
 if ! [[ "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
    [ "$(date -u -d "$DATE" +%Y-%m-%d 2>/dev/null || true)" != "$DATE" ]; then
   echo "ERROR: DATE must be a real YYYY-MM-DD date, got: $DATE" >&2
@@ -13,8 +43,6 @@ if [[ "$DATE" > "$(date -u -d 'yesterday' +%Y-%m-%d)" ]]; then
   exit 64
 fi
 
-STATE_DIR="${STATE_DIR:-/var/lib/debot-arcus/spot-execute-once}"
-STREAM_DIR="${STREAM_DIR:-$STATE_DIR/live-tick-events}"
 VERIFY_SCRIPT="${VERIFY_SCRIPT:-/usr/local/libexec/debot/arcus_live_tick_event_stream.py}"
 S3_BUCKET="${S3_BUCKET:-debot-dashboard}"
 S3_PREFIX="${S3_PREFIX:-arcus-archive/live-tick-events/debot-arcus}"
