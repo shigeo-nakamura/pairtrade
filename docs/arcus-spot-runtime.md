@@ -536,7 +536,9 @@ stages the exact event and its hash in the sibling mode-0600
 event stream, then removes and directory-fsyncs the pending sidecar. Before any
 new snapshot, the next writer completes an event whose checkpoint committed,
 discards an advancing event whose checkpoint did not commit, or only clears an
-event already present at the stream tail. State backup refuses an unresolved
+event already present at the stream tail. An empty or partial final append is
+truncated only when its bytes are an exact prefix of the staged, hashed record;
+unrelated corruption remains a hard error. State backup refuses an unresolved
 sidecar. A crash can therefore neither replace the checkpointed payload with a
 later stale observation nor duplicate an already-appended event. The separate
 `archive-arcus-live-tick-events.timer` verifies each closed UTC day and writes

@@ -110,18 +110,8 @@ impl ArcusSpotLiveTickEventStream {
             validate_event_continuity(&previous.event, event)?;
         }
 
-        let event_json = serde_json::to_string(event)
-            .context("failed to serialize Arcus live-tick event payload")?;
-        let event_sha256 = sha256_prefixed(event_json.as_bytes());
         let previous_chain_sha256 = previous.map(|item| item.record.chain_sha256);
-        let chain_sha256 = chain_sha256(previous_chain_sha256.as_deref(), &event_sha256);
-        let record = ArcusSpotLiveTickEventRecord {
-            schema_version: EVENT_STREAM_SCHEMA_VERSION,
-            previous_chain_sha256,
-            event_sha256,
-            chain_sha256,
-            event_json,
-        };
+        let record = event_record(event, previous_chain_sha256)?;
 
         let existed = segment_path.exists();
         let mut file = OpenOptions::new()
@@ -219,55 +209,145 @@ impl ArcusSpotLiveTickEventStream {
         (&file)
             .read_to_end(&mut bytes)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        if !bytes.ends_with(b"\n") {
+        verify_segment_bytes(path, &bytes)
+    }
+
+    /// Remove only a provably incomplete prefix of the exact staged record.
+    /// Any other unterminated content remains a hard error.
+    fn repair_incomplete_pending_append(
+        &self,
+        event: &ArcusSpotRuntimeEvent,
+        pending_event_sha256: &str,
+    ) -> Result<()> {
+        self.ensure_private_directory()?;
+        let segment_path = self.directory.join(segment_name(event.observed_at));
+        let segments = self.segment_paths()?;
+        let Some(segment_index) = segments.iter().position(|path| path == &segment_path) else {
+            return Ok(());
+        };
+        if segment_index + 1 != segments.len() {
             bail!(
-                "Arcus event-stream segment {} has an unterminated final record",
-                path.display()
+                "Arcus incomplete pending append is not in the latest stream segment {}",
+                segment_path.display()
             );
         }
-        let mut verified: Vec<VerifiedRecord> = Vec::new();
-        for (index, line) in bytes[..bytes.len() - 1]
-            .split(|byte| *byte == b'\n')
-            .enumerate()
-        {
-            if line.is_empty() {
-                bail!(
-                    "empty Arcus event-stream record at {}:{}",
-                    path.display(),
-                    index + 1
-                );
-            }
-            let record: ArcusSpotLiveTickEventRecord =
-                serde_json::from_slice(line).with_context(|| {
-                    format!(
-                        "invalid Arcus event-stream record at {}:{}",
-                        path.display(),
-                        index + 1
-                    )
-                })?;
-            let event = verify_record(&record).with_context(|| {
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&segment_path)
+            .with_context(|| {
+                format!(
+                    "failed to open Arcus event-stream segment {} for pending recovery",
+                    segment_path.display()
+                )
+            })?;
+        validate_private_regular_file(&file, &segment_path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if bytes.ends_with(b"\n") {
+            // The interrupted append may have written the complete record but
+            // failed during sync. Re-establish durability before recovery is
+            // allowed to clear the only staged copy.
+            file.sync_all()?;
+            return Ok(());
+        }
+
+        let complete_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let complete_records = if complete_len == 0 {
+            Vec::new()
+        } else {
+            verify_segment_bytes(&segment_path, &bytes[..complete_len])?
+        };
+        let previous = if let Some(previous) = complete_records.last() {
+            Some(previous.clone())
+        } else if segment_index > 0 {
+            self.verify_segment(&segments[segment_index - 1])?.pop()
+        } else {
+            None
+        };
+        if let Some(previous) = &previous {
+            validate_event_continuity(&previous.event, event)?;
+        }
+        let expected = event_record(event, previous.map(|item| item.record.chain_sha256))?;
+        if expected.event_sha256 != pending_event_sha256 {
+            bail!("Arcus incomplete append does not match the pending event hash");
+        }
+        let mut expected_bytes = serde_json::to_vec(&expected)
+            .context("failed to serialize expected Arcus pending stream record")?;
+        expected_bytes.push(b'\n');
+        let incomplete = &bytes[complete_len..];
+        if !expected_bytes.starts_with(incomplete) {
+            bail!(
+                "Arcus unterminated stream tail does not match the pending event at {}",
+                segment_path.display()
+            );
+        }
+
+        file.set_len(complete_len as u64)?;
+        file.sync_all()?;
+        drop(file);
+        if complete_len == 0 {
+            fs::remove_file(&segment_path)?;
+            File::open(&self.directory)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+fn verify_segment_bytes(path: &Path, bytes: &[u8]) -> Result<Vec<VerifiedRecord>> {
+    if !bytes.ends_with(b"\n") {
+        bail!(
+            "Arcus event-stream segment {} has an unterminated final record",
+            path.display()
+        );
+    }
+    let mut verified: Vec<VerifiedRecord> = Vec::new();
+    for (index, line) in bytes[..bytes.len() - 1]
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        if line.is_empty() {
+            bail!(
+                "empty Arcus event-stream record at {}:{}",
+                path.display(),
+                index + 1
+            );
+        }
+        let record: ArcusSpotLiveTickEventRecord =
+            serde_json::from_slice(line).with_context(|| {
                 format!(
                     "invalid Arcus event-stream record at {}:{}",
                     path.display(),
                     index + 1
                 )
             })?;
-            if let Some(previous) = verified.last() {
-                if record.previous_chain_sha256.as_deref()
-                    != Some(previous.record.chain_sha256.as_str())
-                {
-                    bail!(
-                        "Arcus event-stream hash-chain break at {}:{}",
-                        path.display(),
-                        index + 1
-                    );
-                }
-                validate_event_continuity(&previous.event, &event)?;
+        let event = verify_record(&record).with_context(|| {
+            format!(
+                "invalid Arcus event-stream record at {}:{}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        if let Some(previous) = verified.last() {
+            if record.previous_chain_sha256.as_deref()
+                != Some(previous.record.chain_sha256.as_str())
+            {
+                bail!(
+                    "Arcus event-stream hash-chain break at {}:{}",
+                    path.display(),
+                    index + 1
+                );
             }
-            verified.push(VerifiedRecord { record, event });
+            validate_event_continuity(&previous.event, &event)?;
         }
-        Ok(verified)
+        verified.push(VerifiedRecord { record, event });
     }
+    Ok(verified)
 }
 
 impl ArcusSpotLiveTickEventPublisher {
@@ -293,6 +373,10 @@ impl ArcusSpotLiveTickEventPublisher {
         let Some((document, event)) = self.load_pending()? else {
             return Ok(());
         };
+        if event.sequence == checkpoint_sequence {
+            self.stream
+                .repair_incomplete_pending_append(&event, &document.event_sha256)?;
+        }
         let tail = self.stream.latest_verified_record()?;
         if let Some(tail) = &tail {
             if tail.event == event && tail.record.event_sha256 == document.event_sha256 {
@@ -486,6 +570,23 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+fn event_record(
+    event: &ArcusSpotRuntimeEvent,
+    previous_chain_sha256: Option<String>,
+) -> Result<ArcusSpotLiveTickEventRecord> {
+    let event_json = serde_json::to_string(event)
+        .context("failed to serialize Arcus live-tick event payload")?;
+    let event_sha256 = sha256_prefixed(event_json.as_bytes());
+    let chain_sha256 = chain_sha256(previous_chain_sha256.as_deref(), &event_sha256);
+    Ok(ArcusSpotLiveTickEventRecord {
+        schema_version: EVENT_STREAM_SCHEMA_VERSION,
+        previous_chain_sha256,
+        event_sha256,
+        chain_sha256,
+        event_json,
+    })
 }
 
 fn segment_name(at: DateTime<Utc>) -> String {
@@ -763,6 +864,102 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn recovers_a_partial_record_append_in_an_existing_segment() {
+        let dir = tempdir().unwrap();
+        let publisher = publisher(dir.path());
+        publisher
+            .stream()
+            .append(&event(10, "2026-08-25T00:02:00Z"))
+            .unwrap();
+        let pending = event(11, "2026-08-25T00:17:00Z");
+        publisher.stage(&pending).unwrap();
+        let previous = publisher
+            .stream()
+            .latest_verified_record()
+            .unwrap()
+            .unwrap();
+        let record = event_record(&pending, Some(previous.record.chain_sha256)).unwrap();
+        let record_bytes = serde_json::to_vec(&record).unwrap();
+        let segment = dir.path().join("events/2026-08-25.jsonl");
+        OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(&record_bytes[..record_bytes.len() / 2])
+            .unwrap();
+
+        publisher.recover(11).unwrap();
+
+        assert!(!publisher.pending_path().exists());
+        assert_eq!(fs::read_to_string(segment).unwrap().lines().count(), 2);
+        assert_eq!(
+            publisher
+                .stream()
+                .latest_verified_record()
+                .unwrap()
+                .unwrap()
+                .event,
+            pending
+        );
+    }
+
+    #[test]
+    fn recovers_an_empty_new_daily_segment_and_preserves_the_chain() {
+        let dir = tempdir().unwrap();
+        let publisher = publisher(dir.path());
+        let first = publisher
+            .stream()
+            .append(&event(10, "2026-08-25T23:47:00Z"))
+            .unwrap();
+        let pending = event(11, "2026-08-26T00:02:00Z");
+        publisher.stage(&pending).unwrap();
+        let empty_segment = dir.path().join("events/2026-08-26.jsonl");
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&empty_segment)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        publisher.recover(11).unwrap();
+
+        let line = fs::read_to_string(&empty_segment).unwrap();
+        assert_eq!(line.lines().count(), 1);
+        let record: ArcusSpotLiveTickEventRecord = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(record.previous_chain_sha256, Some(first.chain_sha256));
+        assert_eq!(verify_record(&record).unwrap(), pending);
+    }
+
+    #[test]
+    fn refuses_to_truncate_an_unterminated_tail_that_is_not_the_pending_record() {
+        let dir = tempdir().unwrap();
+        let publisher = publisher(dir.path());
+        publisher
+            .stream()
+            .append(&event(10, "2026-08-25T00:02:00Z"))
+            .unwrap();
+        publisher.stage(&event(11, "2026-08-25T00:17:00Z")).unwrap();
+        let segment = dir.path().join("events/2026-08-25.jsonl");
+        OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(b"{\"schema_version\":9")
+            .unwrap();
+        let before = fs::read(&segment).unwrap();
+
+        let error = publisher.recover(11).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match the pending event"));
+        assert_eq!(fs::read(segment).unwrap(), before);
+        assert!(publisher.pending_path().exists());
     }
 
     #[test]
