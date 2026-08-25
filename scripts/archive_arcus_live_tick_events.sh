@@ -11,7 +11,7 @@ fi
 
 STATE_DIR="${STATE_DIR:-/var/lib/debot-arcus/spot-execute-once}"
 STREAM_DIR="${STREAM_DIR:-$STATE_DIR/live-tick-events}"
-START_MARKER="$STREAM_DIR/.archive-start-date"
+START_MARKER="${ARCHIVE_START_MARKER:-$STREAM_DIR.archive-start-date}"
 LAST_CLOSED="${ARCUS_ARCHIVE_LAST_CLOSED_UTC:-$(date -u -d 'yesterday' +%Y-%m-%d)}"
 if ! [[ "$LAST_CLOSED" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
    [ "$(date -u -d "$LAST_CLOSED" +%Y-%m-%d 2>/dev/null || true)" != "$LAST_CLOSED" ]; then
@@ -20,7 +20,7 @@ if ! [[ "$LAST_CLOSED" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
 fi
 
 resolve_stream_start() {
-  local first_segment marker_bytes marker_tmp start_date
+  local first_segment marker_bytes marker_dir marker_tmp start_date
   if [ -e "$START_MARKER" ] || [ -L "$START_MARKER" ]; then
     if [ ! -f "$START_MARKER" ] || [ -L "$START_MARKER" ]; then
       echo "ERROR: Arcus archive start marker must be a regular file: $START_MARKER" >&2
@@ -52,12 +52,13 @@ resolve_stream_start() {
     echo "ERROR: invalid first Arcus event segment date: $first_segment" >&2
     return 1
   fi
-  marker_tmp=$(mktemp "$STREAM_DIR/.archive-start-date.XXXXXX")
+  marker_dir=$(dirname "$START_MARKER")
+  marker_tmp=$(mktemp "$START_MARKER.XXXXXX")
   printf '%s\n' "$start_date" > "$marker_tmp"
   chmod 0600 "$marker_tmp"
   sync -f "$marker_tmp"
   mv "$marker_tmp" "$START_MARKER"
-  sync -f "$STREAM_DIR"
+  sync -f "$marker_dir"
   echo "[archive_arcus_events] initialized durable start date=$start_date" >&2
   printf '%s\n' "$start_date"
 }

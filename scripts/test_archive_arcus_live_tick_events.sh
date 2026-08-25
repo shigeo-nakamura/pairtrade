@@ -136,13 +136,15 @@ if STREAM_DIR="$WORK/gapped" run_archive_all; then
   echo "expected the scheduled scan to detect a missing closed day" >&2
   exit 1
 fi
-test "$(cat "$WORK/gapped/.archive-start-date")" = 2026-08-23
-test "$(stat -c %a "$WORK/gapped/.archive-start-date")" = 600
+test "$(cat "$WORK/gapped.archive-start-date")" = 2026-08-23
+test "$(stat -c %a "$WORK/gapped.archive-start-date")" = 600
+test ! -e "$WORK/gapped/.archive-start-date"
 
 # The lower bound must survive loss of the first segment instead of silently
 # promoting the next surviving filename to the stream start.
 mkdir -p "$WORK/lost-first"
 cp -a "$STREAM_DIR/." "$WORK/lost-first/"
+cp "$STREAM_DIR.archive-start-date" "$WORK/lost-first.archive-start-date"
 rm "$WORK/lost-first/2026-08-23.jsonl"
 if STREAM_DIR="$WORK/lost-first" run_archive_all; then
   echo "expected the durable start marker to detect first-segment loss" >&2
@@ -153,6 +155,7 @@ fi
 # record is lost: the predecessor segment/manifest boundary must reject it.
 mkdir -p "$WORK/truncated-first"
 cp -a "$STREAM_DIR/." "$WORK/truncated-first/"
+cp "$STREAM_DIR.archive-start-date" "$WORK/truncated-first.archive-start-date"
 tail -n +2 "$WORK/truncated-first/2026-08-24.jsonl" \
   > "$WORK/truncated-first/2026-08-24.jsonl.new"
 mv "$WORK/truncated-first/2026-08-24.jsonl.new" \
