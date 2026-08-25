@@ -545,7 +545,9 @@ marker is not recalculated from the remaining segment filenames. The scan fails
 closed if a date is missing, rather than misrepresenting lost evidence as an
 empty observation day. Before publishing a later day it also verifies that
 day's head against both the preceding local segment and the preceding immutable
-archive manifest.
+archive manifest. A second fsynced marker advances only after a day's manifest
+is published, so later timer runs cheaply scan local calendar continuity but do
+hash/compression/S3 work only after the archive high-water date.
 `deploy-arcus-live-tick-event-archive.yml` installs and enables only that
 archive timer; it never invokes the executor or changes the trading timer.
 Current local/S3 data is retained indefinitely, while noncurrent S3 versions

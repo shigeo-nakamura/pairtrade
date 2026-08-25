@@ -6,7 +6,9 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 STREAM_DIR="$WORK/state/live-tick-events"
 FAKE_S3="$WORK/s3"
+FAKE_AWS_LOG="$WORK/aws.log"
 mkdir -p "$STREAM_DIR" "$FAKE_S3" "$WORK/bin"
+: > "$FAKE_AWS_LOG"
 
 python3 - "$REPO_ROOT/scripts" "$STREAM_DIR" <<'PY'
 import importlib.util
@@ -76,6 +78,9 @@ done
 test -n "$bucket"
 test -n "$key"
 object="$FAKE_S3/$bucket/$key"
+if [ -n "${FAKE_AWS_LOG:-}" ]; then
+  printf '%s %s\n' "$action" "$key" >> "$FAKE_AWS_LOG"
+fi
 case "$action" in
   head-object)
     test -f "$object"
@@ -104,6 +109,7 @@ chmod +x "$WORK/bin/aws"
 run_archive() {
   PATH="$WORK/bin:$PATH" \
   FAKE_S3="$FAKE_S3" \
+  FAKE_AWS_LOG="$FAKE_AWS_LOG" \
   STREAM_DIR="$STREAM_DIR" \
   VERIFY_SCRIPT="$REPO_ROOT/scripts/arcus_live_tick_event_stream.py" \
   S3_BUCKET=test-private \
@@ -114,6 +120,7 @@ run_archive() {
 run_archive_all() {
   PATH="$WORK/bin:$PATH" \
   FAKE_S3="$FAKE_S3" \
+  FAKE_AWS_LOG="$FAKE_AWS_LOG" \
   STREAM_DIR="$STREAM_DIR" \
   VERIFY_SCRIPT="$REPO_ROOT/scripts/arcus_live_tick_event_stream.py" \
   S3_BUCKET=test-private \
@@ -139,6 +146,9 @@ fi
 test "$(cat "$WORK/gapped.archive-start-date")" = 2026-08-23
 test "$(stat -c %a "$WORK/gapped.archive-start-date")" = 600
 test ! -e "$WORK/gapped/.archive-start-date"
+
+# Seed the immutable predecessor manifest used by later corruption tests.
+run_archive 2026-08-23
 
 # The lower bound must survive loss of the first segment instead of silently
 # promoting the next surviving filename to the stream start.
@@ -170,6 +180,14 @@ test ! -e "$FAKE_S3/test-private/arcus-archive/live-tick-events/test-host/2026/0
 # Regression for Codex P1: one catch-up activation after a multi-day outage
 # must publish every closed segment, not only yesterday.
 run_archive_all
+test "$(cat "$STREAM_DIR.archive-high-water-date")" = 2026-08-24
+test "$(stat -c %a "$STREAM_DIR.archive-high-water-date")" = 600
+
+# Regression for Codex P2: after reaching yesterday, a scheduled activation
+# performs only the cheap local calendar scan and no historical S3 revalidation.
+: > "$FAKE_AWS_LOG"
+run_archive_all
+test ! -s "$FAKE_AWS_LOG"
 
 DATA_23="$FAKE_S3/test-private/arcus-archive/live-tick-events/test-host/2026/08/2026-08-23.events.jsonl.gz"
 MANIFEST_23="$FAKE_S3/test-private/arcus-archive/live-tick-events/test-host/2026/08/2026-08-23.manifest.json"

@@ -12,6 +12,7 @@ fi
 STATE_DIR="${STATE_DIR:-/var/lib/debot-arcus/spot-execute-once}"
 STREAM_DIR="${STREAM_DIR:-$STATE_DIR/live-tick-events}"
 START_MARKER="${ARCHIVE_START_MARKER:-$STREAM_DIR.archive-start-date}"
+HIGH_WATER_MARKER="${ARCHIVE_HIGH_WATER_MARKER:-$STREAM_DIR.archive-high-water-date}"
 LAST_CLOSED="${ARCUS_ARCHIVE_LAST_CLOSED_UTC:-$(date -u -d 'yesterday' +%Y-%m-%d)}"
 if ! [[ "$LAST_CLOSED" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
    [ "$(date -u -d "$LAST_CLOSED" +%Y-%m-%d 2>/dev/null || true)" != "$LAST_CLOSED" ]; then
@@ -63,6 +64,41 @@ resolve_stream_start() {
   printf '%s\n' "$start_date"
 }
 
+read_high_water() {
+  local high_water marker_bytes
+  if [ ! -e "$HIGH_WATER_MARKER" ] && [ ! -L "$HIGH_WATER_MARKER" ]; then
+    return
+  fi
+  if [ ! -f "$HIGH_WATER_MARKER" ] || [ -L "$HIGH_WATER_MARKER" ]; then
+    echo "ERROR: Arcus archive high-water marker must be a regular file: $HIGH_WATER_MARKER" >&2
+    return 1
+  fi
+  if [ "$(stat -c %a "$HIGH_WATER_MARKER")" != 600 ]; then
+    echo "ERROR: Arcus archive high-water marker must have mode 0600: $HIGH_WATER_MARKER" >&2
+    return 1
+  fi
+  marker_bytes=$(wc -c < "$HIGH_WATER_MARKER")
+  high_water=$(sed -n '1p' "$HIGH_WATER_MARKER")
+  if [ "$marker_bytes" -ne 11 ] ||
+     ! [[ "$high_water" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
+     [ "$(date -u -d "$high_water" +%Y-%m-%d 2>/dev/null || true)" != "$high_water" ]; then
+    echo "ERROR: invalid Arcus archive high-water marker: $HIGH_WATER_MARKER" >&2
+    return 1
+  fi
+  printf '%s\n' "$high_water"
+}
+
+persist_high_water() {
+  local high_water=$1 marker_dir marker_tmp
+  marker_dir=$(dirname "$HIGH_WATER_MARKER")
+  marker_tmp=$(mktemp "$HIGH_WATER_MARKER.XXXXXX")
+  printf '%s\n' "$high_water" > "$marker_tmp"
+  chmod 0600 "$marker_tmp"
+  sync -f "$marker_tmp"
+  mv "$marker_tmp" "$HIGH_WATER_MARKER"
+  sync -f "$marker_dir"
+}
+
 if [ "$#" -eq 0 ]; then
   if [ -L "$STREAM_DIR" ]; then
     echo "ERROR: refusing symlink Arcus event stream directory: $STREAM_DIR" >&2
@@ -79,20 +115,40 @@ if [ "$#" -eq 0 ]; then
   fi
   day=$START_DATE
   CLOSED_SEGMENTS=0
+  # This calendar scan remains deliberately cheap and detects deletion of any
+  # local day, including history below the archive high-water mark.
   while [[ "$day" < "$LAST_CLOSED" || "$day" == "$LAST_CLOSED" ]]; do
     segment="$STREAM_DIR/$day.jsonl"
     if [ ! -f "$segment" ] || [ -L "$segment" ]; then
       echo "ERROR: missing or non-regular closed Arcus event segment: $segment" >&2
       exit 1
     fi
-    # Persistent timers coalesce an arbitrary outage into one activation.
-    # Re-run every calendar day idempotently and fail closed on a missing day;
-    # otherwise an outage can silently leave an un-fetchable archive gap.
-    "$0" "$day"
     CLOSED_SEGMENTS=$((CLOSED_SEGMENTS + 1))
     day=$(date -u -d "$day + 1 day" +%Y-%m-%d)
   done
-  echo "[archive_arcus_events] verified closed segments=$CLOSED_SEGMENTS through=$LAST_CLOSED"
+
+  HIGH_WATER=$(read_high_water)
+  if [ -n "$HIGH_WATER" ] &&
+     { [[ "$HIGH_WATER" < "$START_DATE" ]] || [[ "$HIGH_WATER" > "$LAST_CLOSED" ]]; }; then
+    echo "ERROR: Arcus archive high-water $HIGH_WATER is outside $START_DATE..$LAST_CLOSED" >&2
+    exit 1
+  fi
+  if [ -n "$HIGH_WATER" ]; then
+    day=$(date -u -d "$HIGH_WATER + 1 day" +%Y-%m-%d)
+  else
+    day=$START_DATE
+  fi
+  ARCHIVED_SEGMENTS=0
+  # Persistent timers coalesce an arbitrary outage into one activation. Only
+  # days beyond the durable high-water mark need hash/compression/S3 work.
+  while [[ "$day" < "$LAST_CLOSED" || "$day" == "$LAST_CLOSED" ]]; do
+    "$0" "$day"
+    persist_high_water "$day"
+    HIGH_WATER=$day
+    ARCHIVED_SEGMENTS=$((ARCHIVED_SEGMENTS + 1))
+    day=$(date -u -d "$day + 1 day" +%Y-%m-%d)
+  done
+  echo "[archive_arcus_events] verified closed segments=$CLOSED_SEGMENTS newly_archived=$ARCHIVED_SEGMENTS high_water=${HIGH_WATER:-none} through=$LAST_CLOSED"
   exit 0
 fi
 
