@@ -1519,16 +1519,40 @@ impl PairTradeEngine {
                 } else {
                     "retain_peak_and_denominator"
                 };
-                log::warn!(
-                    "[SESSION_DD] {} capital rebaseline deferred: raw_equity_delta={:.2} accounted_pnl_delta={:.2} inferred_capital_delta={:.2} baseline={:.2} equity={:.2} action={}",
-                    self.instances[inst_idx].id,
-                    reconciliation.raw_equity_delta,
-                    reconciliation.accounted_pnl_delta,
-                    reconciliation.inferred_capital_delta,
-                    baseline_equity,
-                    equity,
-                    action,
-                );
+                // The same min_usd the operator configured to decide "large
+                // enough to matter" also decides log severity here: a
+                // sub-min_usd inferred_capital_delta can never itself have
+                // reached Verified (see classify_capital_basis_delta), so by
+                // the operator's own materiality bar this deferral is
+                // ordinary settlement noise (fill-VWAP/funding-tick lag,
+                // bot-strategy#859), not a candidate capital event worth an
+                // operator's attention -- WARN is reserved for a deferral
+                // that is still large enough it could plausibly be a missed
+                // transfer.
+                if reconciliation.inferred_capital_delta.abs() >= min_usd {
+                    log::warn!(
+                        "[SESSION_DD] {} capital rebaseline deferred: raw_equity_delta={:.2} accounted_pnl_delta={:.2} inferred_capital_delta={:.2} baseline={:.2} equity={:.2} action={}",
+                        self.instances[inst_idx].id,
+                        reconciliation.raw_equity_delta,
+                        reconciliation.accounted_pnl_delta,
+                        reconciliation.inferred_capital_delta,
+                        baseline_equity,
+                        equity,
+                        action,
+                    );
+                } else {
+                    log::info!(
+                        "[SESSION_DD] {} capital rebaseline deferred (sub-${:.0} residual, routine settlement lag): raw_equity_delta={:.2} accounted_pnl_delta={:.2} inferred_capital_delta={:.2} baseline={:.2} equity={:.2} action={}",
+                        self.instances[inst_idx].id,
+                        min_usd,
+                        reconciliation.raw_equity_delta,
+                        reconciliation.accounted_pnl_delta,
+                        reconciliation.inferred_capital_delta,
+                        baseline_equity,
+                        equity,
+                        action,
+                    );
+                }
                 self.record_risk_event_for_instance(
                     inst_idx,
                     "session_dd",
@@ -1552,16 +1576,37 @@ impl PairTradeEngine {
                 reconciliation,
                 stuck_secs,
             }) => {
-                log::warn!(
-                    "[SESSION_DD] {} capital rebaseline deferral gave up after {}s stuck (limit {}s): raw_equity_delta={:.2} accounted_pnl_delta={:.2} inferred_capital_delta={:.2} equity={:.2}; anchor force-advanced, neither accounting nor a transfer credited for this event",
-                    self.instances[inst_idx].id,
-                    stuck_secs,
-                    CAPITAL_REBASELINE_GIVEUP_SECS,
-                    reconciliation.raw_equity_delta,
-                    reconciliation.accounted_pnl_delta,
-                    reconciliation.inferred_capital_delta,
-                    equity,
-                );
+                // Same materiality gate as the Deferred branch above: a
+                // sub-min_usd inferred_capital_delta timing out is routine
+                // settlement lag repeatedly failing to hit the (deliberately
+                // tight, see CAPITAL_DELTA_EPSILON) "genuinely zero" bar
+                // within CAPITAL_REBASELINE_GIVEUP_SECS -- not a stuck
+                // reconciliation of something that could plausibly be a
+                // missed transfer (bot-strategy#859).
+                if reconciliation.inferred_capital_delta.abs() >= min_usd {
+                    log::warn!(
+                        "[SESSION_DD] {} capital rebaseline deferral gave up after {}s stuck (limit {}s): raw_equity_delta={:.2} accounted_pnl_delta={:.2} inferred_capital_delta={:.2} equity={:.2}; anchor force-advanced, neither accounting nor a transfer credited for this event",
+                        self.instances[inst_idx].id,
+                        stuck_secs,
+                        CAPITAL_REBASELINE_GIVEUP_SECS,
+                        reconciliation.raw_equity_delta,
+                        reconciliation.accounted_pnl_delta,
+                        reconciliation.inferred_capital_delta,
+                        equity,
+                    );
+                } else {
+                    log::info!(
+                        "[SESSION_DD] {} capital rebaseline deferral gave up after {}s stuck (limit {}s, sub-${:.0} residual, routine settlement lag): raw_equity_delta={:.2} accounted_pnl_delta={:.2} inferred_capital_delta={:.2} equity={:.2}; anchor force-advanced, neither accounting nor a transfer credited for this event",
+                        self.instances[inst_idx].id,
+                        stuck_secs,
+                        CAPITAL_REBASELINE_GIVEUP_SECS,
+                        min_usd,
+                        reconciliation.raw_equity_delta,
+                        reconciliation.accounted_pnl_delta,
+                        reconciliation.inferred_capital_delta,
+                        equity,
+                    );
+                }
                 self.record_risk_event_for_instance(
                     inst_idx,
                     "session_dd",
