@@ -1,9 +1,44 @@
 # Arcus live-tick signal replay
 
 Trade-level and threshold-tuning claims must use `arcus-spot-live-tick`'s own
-observation sequence, not the independently sampled recorder archive. Export
-the unit journal with `journalctl -o cat` and copy the matching
-`runtime_state.json`, then pin the journal boundary to that checkpoint and run:
+observation sequence, not the independently sampled recorder archive. The
+authoritative source for observations produced after bot-strategy #825 is the
+executor-owned append-only stream:
+
+    /var/lib/debot-arcus/spot-execute-once/live-tick-events/YYYY-MM-DD.jsonl
+
+Every compact runtime-event payload is stored verbatim inside a schema-1
+envelope. SHA-256 binds the exact payload bytes, and a domain-separated chain
+binds record order across UTC-day segments. Sequence and timestamp continuity
+are checked independently. The executor validates the latest segment before
+every append and fsyncs each record. Files are mode 0600 under a mode-0700
+directory.
+
+At 00:12 UTC the archive timer verifies and deterministically compresses the
+closed day, then publishes data before its manifest under:
+
+    s3://debot-dashboard/arcus-archive/live-tick-events/debot-arcus/YYYY/MM/
+
+That bucket is private and versioned. Current local segments and current S3
+versions have indefinite retention; noncurrent S3 versions expire after 90
+days. The immutable writer refuses to replace a key with different bytes.
+Each manifest records raw and compressed hashes, byte counts, sequence/time
+bounds, and first/last chain hashes. A missing day after stream initialization,
+payload/hash/chain corruption, or an S3 collision is a hard archive failure.
+
+Fetch and verify a closed range before replay:
+
+    scripts/fetch_arcus_live_tick_events.sh 2026-08-26 2026-09-25 /tmp/arcus-live-events.jsonl
+    scripts/arcus_live_tick_signal_replay.py /tmp/arcus-live-events.jsonl --entry-z 2.0
+
+The fetcher verifies every archive manifest and compressed/raw hash, then
+verifies the chain and sequence across day boundaries. The replay verifies the
+durable envelope again and includes `verification.durable_event_stream` in
+its result. It never falls back to permissive journal parsing when an input
+looks like a durable stream but fails integrity.
+
+For a replay ending at the current checkpoint, copy `runtime_state.json`, pin
+the boundary, and retain the stronger checkpoint-tail comparison:
 
     end_sequence="$(jq -r .state.sequence /path/to/runtime_state.json)"
     scripts/arcus_live_tick_signal_replay.py \
@@ -14,7 +49,7 @@ the unit journal with `journalctl -o cat` and copy the matching
       --entry-z-change 2026-08-20T13:26:22Z=2.0 \
       --round-trip-cost-bps 35
 
-The journaled z-score is the decision source of truth. The tool also
+The event's recorded z-score is the decision source of truth. The tool also
 recomputes every score whose full rolling window is present in the export,
 using the runtime's population variance and informative-sample guard. With a
 checkpoint it requires the journal's final sequence to equal the checkpoint
@@ -34,6 +69,11 @@ Trust rules:
   closed.
 - The trade table is a neutral-start, signal-only counterfactual. It does not
   replay route, risk, inventory, or fill gates.
+- Journald remains a retention-limited fallback for events before the durable
+  stream's deployment. The lost 2026-08-19 through 2026-08-22 portion cannot
+  be reconstructed byte-exactly; the independent recorder must not be
+  substituted for it. Authoritative coverage begins with the first durable
+  stream record.
 
 The output includes:
 

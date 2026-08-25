@@ -11,6 +11,8 @@ mod chain;
 mod checkpoint;
 mod config;
 #[cfg(feature = "arcus-spot-live")]
+mod event_stream;
+#[cfg(feature = "arcus-spot-live")]
 mod execution_ledger;
 #[cfg(feature = "arcus-spot-live")]
 mod kms;
@@ -24,6 +26,8 @@ pub use chain::*;
 #[cfg(feature = "arcus-spot-live")]
 pub use checkpoint::*;
 pub use config::*;
+#[cfg(feature = "arcus-spot-live")]
+pub use event_stream::*;
 #[cfg(feature = "arcus-spot-live")]
 pub use execution_ledger::*;
 #[cfg(feature = "arcus-spot-live")]

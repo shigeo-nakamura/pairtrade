@@ -526,6 +526,21 @@ active/enabled state; it never enables, disables, starts, stops, or restarts
 the timer/service and never invokes the executor. A new host therefore remains
 inactive until an operator makes a separate, explicit activation decision.
 
+Every checkpointed live-tick decision is also appended while holding the
+checkpoint namespace lock to a private, daily, hash-chained event stream under
+`/var/lib/debot-arcus/spot-execute-once/live-tick-events/`. Checkpoint
+publication precedes the append: a crash in that narrow boundary fails the
+oneshot, and the following run refuses the visible sequence gap instead of
+silently blessing an incomplete replay. The separate
+`archive-arcus-live-tick-events.timer` verifies each closed UTC day and writes
+an immutable compressed segment plus integrity manifest to the private
+`debot-dashboard/arcus-archive/live-tick-events/debot-arcus/` prefix.
+`deploy-arcus-live-tick-event-archive.yml` installs and enables only that
+archive timer; it never invokes the executor or changes the trading timer.
+Current local/S3 data is retained indefinitely, while noncurrent S3 versions
+expire after 90 days. See `docs/arcus-live-tick-signal-replay.md` for fetch,
+verification, and replay commands.
+
 `arcus-spot-runtime` is deliberately excluded. It remains the deterministic
 archive replay CLI below; if it later gains a distinct live-daemon role, add a
 separate artifact and lifecycle only when that runtime contract exists.

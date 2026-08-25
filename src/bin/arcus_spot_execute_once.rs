@@ -16,9 +16,10 @@ use debot::arcus_spot::{
     ArcusSpotChainConfig, ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt,
     ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
     ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor,
-    ArcusSpotLiveExecutorConfig, ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan,
-    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
-    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventStream, ArcusSpotRegime,
+    ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntime,
+    ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent,
+    ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
 use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
@@ -453,6 +454,18 @@ fn live_tick_observation_evidence_path(config: &ArcusSpotExecuteOnceConfig) -> R
         .parent()
         .context("Arcus runtime_state_path has no parent")?;
     Ok(parent.join("live-tick-observation-evidence.json"))
+}
+
+fn live_tick_event_stream(
+    config: &ArcusSpotExecuteOnceConfig,
+) -> Result<ArcusSpotLiveTickEventStream> {
+    let parent = config
+        .runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(ArcusSpotLiveTickEventStream::new(
+        parent.join("live-tick-events"),
+    ))
 }
 
 const LIVE_TICK_EVIDENCE_SCHEMA_VERSION: u32 = 1;
@@ -3105,6 +3118,16 @@ async fn main() -> Result<()> {
             // because this run happened not to rotate would silently widen
             // gaps in the very history the entry/exit z-score needs.
             store.persist(&runtime)?;
+            // Journald is not the replay source of truth. Persist every
+            // checkpointed decision, including WouldRotate ticks whose stdout
+            // later becomes an execution attempt, to the private hash-chained
+            // stream. This happens while the checkpoint lock is still held so
+            // concurrent state writers cannot reorder events. If the append
+            // fails after the checkpoint commit, this invocation fails loudly
+            // and the next append refuses the visible sequence gap.
+            live_tick_event_stream(&config)?
+                .append(&event)
+                .context("failed to append Arcus live-tick durable event")?;
             let plan = match event.decision.clone() {
                 ArcusSpotDecision::WouldRotate { plan } => plan,
                 ArcusSpotDecision::Observe { .. } | ArcusSpotDecision::SimulatedFill { .. } => {
