@@ -544,6 +544,11 @@ later stale observation nor duplicate an already-appended event. The separate
 `archive-arcus-live-tick-events.timer` verifies each closed UTC day and writes
 an immutable compressed segment plus integrity manifest to the private
 `debot-dashboard/arcus-archive/live-tick-events/debot-arcus/` prefix.
+Before publishing a segment, the archiver briefly takes the shared checkpoint
+lock and refuses to proceed while a pending event exists, preventing an
+interrupted checkpoint/append boundary from being frozen into an incomplete
+immutable archive. It releases the lock before verification/compression/S3 so
+normal trade evaluation is not held behind network I/O.
 Its catch-up scan walks every UTC date from the first segment through yesterday
 using a private, fsynced start-date marker in the archive service's dedicated
 `/var/lib/debot-arcus-archive/` systemd state directory. It remains outside the

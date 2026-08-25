@@ -9,6 +9,10 @@ FAKE_S3="$WORK/s3"
 FAKE_AWS_LOG="$WORK/aws.log"
 mkdir -p "$STREAM_DIR" "$FAKE_S3" "$WORK/bin"
 : > "$FAKE_AWS_LOG"
+CHECKPOINT_LOCK="$WORK/state/.runtime_state.json.lock"
+PENDING_EVENT="$WORK/state/live-tick-event-pending.json"
+: > "$CHECKPOINT_LOCK"
+chmod 0600 "$CHECKPOINT_LOCK"
 
 python3 - "$REPO_ROOT/scripts" "$STREAM_DIR" <<'PY'
 import importlib.util
@@ -111,6 +115,8 @@ run_archive() {
   FAKE_S3="$FAKE_S3" \
   FAKE_AWS_LOG="$FAKE_AWS_LOG" \
   STREAM_DIR="$STREAM_DIR" \
+  ARCUS_CHECKPOINT_LOCK_PATH="$CHECKPOINT_LOCK" \
+  ARCUS_PENDING_EVENT_PATH="$PENDING_EVENT" \
   VERIFY_SCRIPT="$REPO_ROOT/scripts/arcus_live_tick_event_stream.py" \
   S3_BUCKET=test-private \
   S3_PREFIX=arcus-archive/live-tick-events/test-host \
@@ -122,6 +128,8 @@ run_archive_all() {
   FAKE_S3="$FAKE_S3" \
   FAKE_AWS_LOG="$FAKE_AWS_LOG" \
   STREAM_DIR="$STREAM_DIR" \
+  ARCUS_CHECKPOINT_LOCK_PATH="$CHECKPOINT_LOCK" \
+  ARCUS_PENDING_EVENT_PATH="$PENDING_EVENT" \
   VERIFY_SCRIPT="$REPO_ROOT/scripts/arcus_live_tick_event_stream.py" \
   S3_BUCKET=test-private \
   S3_PREFIX=arcus-archive/live-tick-events/test-host \
@@ -146,6 +154,18 @@ fi
 test "$(cat "$WORK/gapped.archive-start-date")" = 2026-08-23
 test "$(stat -c %a "$WORK/gapped.archive-start-date")" = 600
 test ! -e "$WORK/gapped/.archive-start-date"
+
+# An unresolved checkpointed event must block immutable publication. The next
+# runtime writer, not the archive process, owns exact-event recovery.
+: > "$PENDING_EVENT"
+chmod 0600 "$PENDING_EVENT"
+: > "$FAKE_AWS_LOG"
+if run_archive 2026-08-23; then
+  echo "expected an unresolved pending event to block archive publication" >&2
+  exit 1
+fi
+test ! -s "$FAKE_AWS_LOG"
+rm "$PENDING_EVENT"
 
 # Seed the immutable predecessor manifest used by later corruption tests.
 run_archive 2026-08-23

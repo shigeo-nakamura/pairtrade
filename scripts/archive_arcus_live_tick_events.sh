@@ -11,6 +11,8 @@ fi
 
 STATE_DIR="${STATE_DIR:-/var/lib/debot-arcus/spot-execute-once}"
 STREAM_DIR="${STREAM_DIR:-$STATE_DIR/live-tick-events}"
+CHECKPOINT_LOCK="${ARCUS_CHECKPOINT_LOCK_PATH:-$STATE_DIR/.runtime_state.json.lock}"
+PENDING_EVENT="${ARCUS_PENDING_EVENT_PATH:-$STATE_DIR/live-tick-event-pending.json}"
 START_MARKER="${ARCHIVE_START_MARKER:-$STREAM_DIR.archive-start-date}"
 HIGH_WATER_MARKER="${ARCHIVE_HIGH_WATER_MARKER:-$STREAM_DIR.archive-high-water-date}"
 LAST_CLOSED="${ARCUS_ARCHIVE_LAST_CLOSED_UTC:-$(date -u -d 'yesterday' +%Y-%m-%d)}"
@@ -97,6 +99,31 @@ persist_high_water() {
   sync -f "$marker_tmp"
   mv "$marker_tmp" "$HIGH_WATER_MARKER"
   sync -f "$marker_dir"
+}
+
+refuse_unresolved_pending_event() {
+  local checkpoint_fd
+  if [ ! -f "$CHECKPOINT_LOCK" ] || [ -L "$CHECKPOINT_LOCK" ]; then
+    echo "ERROR: missing or unsafe Arcus checkpoint lock: $CHECKPOINT_LOCK" >&2
+    return 1
+  fi
+  if [ "$(stat -c %a "$CHECKPOINT_LOCK")" != 600 ]; then
+    echo "ERROR: Arcus checkpoint lock must have mode 0600: $CHECKPOINT_LOCK" >&2
+    return 1
+  fi
+  exec {checkpoint_fd}< "$CHECKPOINT_LOCK"
+  flock -x "$checkpoint_fd"
+  if [ -e "$PENDING_EVENT" ] || [ -L "$PENDING_EVENT" ]; then
+    echo "ERROR: unresolved Arcus pending event blocks immutable archive publication: $PENDING_EVENT" >&2
+    flock -u "$checkpoint_fd"
+    exec {checkpoint_fd}<&-
+    return 1
+  fi
+  # A writer that began before midnight has either completed or left its
+  # pending sidecar before this exclusive lock was granted. After unlock, a
+  # live recorder snapshot cannot append to this already-closed UTC day.
+  flock -u "$checkpoint_fd"
+  exec {checkpoint_fd}<&-
 }
 
 if [ "$#" -eq 0 ]; then
@@ -189,6 +216,7 @@ if [ "$(stat -c %a "$SEGMENT")" != 600 ]; then
   echo "ERROR: Arcus event segment must have mode 0600: $SEGMENT" >&2
   exit 1
 fi
+refuse_unresolved_pending_event
 START_DATE=$(resolve_stream_start)
 if [ -z "$START_DATE" ] || [[ "$DATE" < "$START_DATE" ]]; then
   echo "ERROR: Arcus archive date precedes or lacks its durable stream start" >&2

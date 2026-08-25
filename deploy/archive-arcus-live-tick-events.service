@@ -10,6 +10,8 @@ User=arcus
 Group=arcus
 UMask=0077
 Environment=STATE_DIR=/var/lib/debot-arcus/spot-execute-once
+Environment=ARCUS_CHECKPOINT_LOCK_PATH=/var/lib/debot-arcus/spot-execute-once/.runtime_state.json.lock
+Environment=ARCUS_PENDING_EVENT_PATH=/var/lib/debot-arcus/spot-execute-once/live-tick-event-pending.json
 Environment=ARCHIVE_START_MARKER=/var/lib/debot-arcus-archive/live-tick-events.start-date
 Environment=ARCHIVE_HIGH_WATER_MARKER=/var/lib/debot-arcus-archive/live-tick-events.high-water-date
 Environment=S3_BUCKET=debot-dashboard

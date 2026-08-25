@@ -2447,6 +2447,18 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
         resolve_path_for_collision_check(&live_tick_observation_evidence_path(config)?);
     let pending_event_path =
         resolve_path_for_collision_check(&live_tick_pending_event_path(config)?);
+    let event_stream_path =
+        resolve_path_for_collision_check(live_tick_event_stream(config)?.directory());
+    if ledger_path == event_stream_path
+        || ledger_path.starts_with(&event_stream_path)
+        || runtime_state_path == event_stream_path
+        || runtime_state_path.starts_with(&event_stream_path)
+    {
+        bail!(
+            "Arcus ledger_path/runtime_state_path must not resolve to or beneath the derived live-tick event-stream directory {}",
+            event_stream_path.display()
+        );
+    }
     if observation_evidence_path == ledger_path
         || observation_evidence_path == runtime_state_path
         || observation_evidence_path == pending_plan_path
@@ -5824,6 +5836,26 @@ runtime:
         );
         let error = validate_config(&mut config).unwrap_err();
         assert!(error.to_string().contains("live-tick pending-event path"));
+    }
+
+    #[test]
+    fn config_rejects_state_files_in_the_event_stream_directory() {
+        for ledger_path in [
+            "/var/lib/x/live-tick-events",
+            "/var/lib/x/live-tick-events/ledger.json",
+        ] {
+            let mut config = execute_once_config(ledger_path, "/var/lib/x/runtime.json", "1000");
+            let error = validate_config(&mut config).unwrap_err();
+            assert!(error.to_string().contains("event-stream directory"));
+        }
+
+        let mut config = execute_once_config(
+            "/var/lib/x/ledger.json",
+            "/var/lib/x/live-tick-events",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("event-stream directory"));
     }
 
     #[test]
