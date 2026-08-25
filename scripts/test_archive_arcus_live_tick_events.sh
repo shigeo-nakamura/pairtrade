@@ -107,6 +107,7 @@ run_archive() {
   VERIFY_SCRIPT="$REPO_ROOT/scripts/arcus_live_tick_event_stream.py" \
   S3_BUCKET=test-private \
   S3_PREFIX=arcus-archive/live-tick-events/test-host \
+  ARCUS_ARCHIVE_LAST_CLOSED_UTC=2026-08-24 \
     bash "$REPO_ROOT/scripts/archive_arcus_live_tick_events.sh" "$1"
 }
 run_archive_all() {
@@ -116,6 +117,7 @@ run_archive_all() {
   VERIFY_SCRIPT="$REPO_ROOT/scripts/arcus_live_tick_event_stream.py" \
   S3_BUCKET=test-private \
   S3_PREFIX=arcus-archive/live-tick-events/test-host \
+  ARCUS_ARCHIVE_LAST_CLOSED_UTC=2026-08-24 \
     bash "$REPO_ROOT/scripts/archive_arcus_live_tick_events.sh"
 }
 
@@ -127,6 +129,10 @@ mkdir -p "$WORK/gapped"
 cp "$STREAM_DIR/2026-08-23.jsonl" "$WORK/gapped/"
 if STREAM_DIR="$WORK/gapped" run_archive 2026-08-24; then
   echo "expected a post-initialization missing day to fail" >&2
+  exit 1
+fi
+if STREAM_DIR="$WORK/gapped" run_archive_all; then
+  echo "expected the scheduled scan to detect a missing closed day" >&2
   exit 1
 fi
 

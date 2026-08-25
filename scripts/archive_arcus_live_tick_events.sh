@@ -10,24 +10,38 @@ fi
 
 STATE_DIR="${STATE_DIR:-/var/lib/debot-arcus/spot-execute-once}"
 STREAM_DIR="${STREAM_DIR:-$STATE_DIR/live-tick-events}"
+LAST_CLOSED="${ARCUS_ARCHIVE_LAST_CLOSED_UTC:-$(date -u -d 'yesterday' +%Y-%m-%d)}"
+if ! [[ "$LAST_CLOSED" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
+   [ "$(date -u -d "$LAST_CLOSED" +%Y-%m-%d 2>/dev/null || true)" != "$LAST_CLOSED" ]; then
+  echo "ERROR: ARCUS_ARCHIVE_LAST_CLOSED_UTC must be a real YYYY-MM-DD date" >&2
+  exit 64
+fi
 if [ "$#" -eq 0 ]; then
   if [ ! -d "$STREAM_DIR" ]; then
     echo "[archive_arcus_events] stream not initialized; no closed segments to archive"
     exit 0
   fi
-  LAST_CLOSED=$(date -u -d 'yesterday' +%Y-%m-%d)
+  FIRST_SEGMENT=$(find "$STREAM_DIR" -maxdepth 1 -type f -name '????-??-??.jsonl' \
+    -printf '%f\n' | sort | sed -n '1p')
+  if [ -z "$FIRST_SEGMENT" ] || [[ "$FIRST_SEGMENT" > "$LAST_CLOSED.jsonl" ]]; then
+    echo "[archive_arcus_events] no closed segments through=$LAST_CLOSED"
+    exit 0
+  fi
+  day=${FIRST_SEGMENT%.jsonl}
   CLOSED_SEGMENTS=0
-  while IFS= read -r segment; do
-    day=$(basename "$segment" .jsonl)
-    if [[ "$day" > "$LAST_CLOSED" ]]; then
-      continue
+  while [[ "$day" < "$LAST_CLOSED" || "$day" == "$LAST_CLOSED" ]]; do
+    segment="$STREAM_DIR/$day.jsonl"
+    if [ ! -f "$segment" ] || [ -L "$segment" ]; then
+      echo "ERROR: missing or non-regular closed Arcus event segment: $segment" >&2
+      exit 1
     fi
     # Persistent timers coalesce an arbitrary outage into one activation.
-    # Re-run every closed segment idempotently so a multi-day outage cannot
-    # leave older days stranded only on the instance.
+    # Re-run every calendar day idempotently and fail closed on a missing day;
+    # otherwise an outage can silently leave an un-fetchable archive gap.
     "$0" "$day"
     CLOSED_SEGMENTS=$((CLOSED_SEGMENTS + 1))
-  done < <(find "$STREAM_DIR" -maxdepth 1 -type f -name '????-??-??.jsonl' | sort)
+    day=$(date -u -d "$day + 1 day" +%Y-%m-%d)
+  done
   echo "[archive_arcus_events] verified closed segments=$CLOSED_SEGMENTS through=$LAST_CLOSED"
   exit 0
 fi
@@ -38,7 +52,7 @@ if ! [[ "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
   echo "ERROR: DATE must be a real YYYY-MM-DD date, got: $DATE" >&2
   exit 64
 fi
-if [[ "$DATE" > "$(date -u -d 'yesterday' +%Y-%m-%d)" ]]; then
+if [[ "$DATE" > "$LAST_CLOSED" ]]; then
   echo "ERROR: refusing to archive an open or future UTC day: $DATE" >&2
   exit 64
 fi
@@ -54,7 +68,7 @@ if [ ! -f "$SEGMENT" ] || [ -L "$SEGMENT" ]; then
     exit 0
   fi
   FIRST_SEGMENT=$(find "$STREAM_DIR" -maxdepth 1 -type f -name '????-??-??.jsonl' \
-    -printf '%f\n' | sort | head -1)
+    -printf '%f\n' | sort | sed -n '1p')
   if [ -n "$FIRST_SEGMENT" ] && [[ "$DATE.jsonl" < "$FIRST_SEGMENT" ]]; then
     echo "[archive_arcus_events] skipping date before stream start: date=$DATE first=$FIRST_SEGMENT"
     exit 0
