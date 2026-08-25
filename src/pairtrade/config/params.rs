@@ -49,10 +49,14 @@ pub struct PairParams {
     pub circuit_breaker_tier2_losses: u32,
     pub circuit_breaker_tier2_cooldown_secs: u64,
     pub entry_post_only_timeout_secs: u64,
+    /// Explicitly enable maker-first exits even when `fee_bps == 0`.
+    /// Default false preserves existing venue behavior. Emergency exits still
+    /// bypass this path and submit immediately as taker. bot-strategy#860.
+    pub exit_post_only_enabled: bool,
     /// Per-leg fill timeout for exit post-only orders (seconds). 0 disables
-    /// the monitor (legacy behavior: post-only legs rest until filled). On
-    /// venues with `fee_bps == 0` this knob has no effect because exits do
-    /// not enter the post-only path. See bot-strategy#306.
+    /// the monitor (legacy behavior: post-only legs rest until filled).
+    /// Zero-fee venues require `exit_post_only_enabled=true` to enter this
+    /// path. See bot-strategy#306/#860.
     pub exit_post_only_timeout_secs: u64,
     // Phase 2 filters (0.0 = disabled)
     pub entry_velocity_block_sigma_per_min: f64,
@@ -258,6 +262,7 @@ pub(super) fn default_pair_params_from_env() -> PairParams {
             "ENTRY_POST_ONLY_TIMEOUT_SECS",
             DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS,
         ),
+        exit_post_only_enabled: env_parse("EXIT_POST_ONLY_ENABLED", DEFAULT_EXIT_POST_ONLY_ENABLED),
         exit_post_only_timeout_secs: env_parse(
             "EXIT_POST_ONLY_TIMEOUT_SECS",
             DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS,
@@ -387,6 +392,9 @@ pub(super) fn default_pair_params_from_yaml(yaml: &PairTradeYaml) -> PairParams 
         entry_post_only_timeout_secs: yaml
             .entry_post_only_timeout_secs
             .unwrap_or(DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS),
+        exit_post_only_enabled: yaml
+            .exit_post_only_enabled
+            .unwrap_or(DEFAULT_EXIT_POST_ONLY_ENABLED),
         exit_post_only_timeout_secs: yaml
             .exit_post_only_timeout_secs
             .unwrap_or(DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS),

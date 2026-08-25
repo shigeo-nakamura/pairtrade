@@ -1,6 +1,6 @@
 # Robinhood Chain Lighter launch configuration (#790/#794).
-# Two-arm split (bot-strategy#798/#834): `freq` and `b`, each on its own
-# Lighter sub-account. `b` originally cloned the Frankfurt-B profile
+# Three-arm split (bot-strategy#798/#834/#837): `freq`, `b`, and `freq2`,
+# each on its own Lighter sub-account. `b` originally cloned the Frankfurt-B profile
 # (wider stop_loss_z=8.0, force_close=10800s, max_leverage=50) to test
 # whether more patience reduced the force_close loss asymmetry. Readout
 # 2026-08-21 (#798): force_close losses were already near-zero on both arms;
@@ -9,9 +9,9 @@
 # (avg -$103.74/trade vs freq's -$23.80, biggest single loss -$318.46) while
 # bleeding capital ~2x faster than freq on a per-$1000 basis. `b` was
 # reverted to freq's profile (2026-08-21). The next evaluation (#834) uses
-# all $8,000 as active capital: freq is the $5,000 points-volume incumbent;
+# $9,000 as active capital: freq is the $5,000 points-volume incumbent;
 # b is a $3,000 defensive challenger with a higher entry threshold and the
-# hold-time beta-floor exit enabled. Both remain at the safer 1h/30x profile.
+# hold-time beta-floor exit enabled; freq2 is a $1,000/50x frequency probe.
 # Top-level scalars below are the shared defaults / legacy fallback; the
 # `strategies:` block at the end overrides per-arm values. Launch remains
 # DRY_RUN-flagged in-file but the live process currently runs with
@@ -52,7 +52,7 @@ metrics_window_length: 240
 warm_start_mode: relaxed
 warm_start_min_bars: 60
 
-# Preserve the Frankfurt canary multi-timeframe entry gate (shared by both arms).
+# Preserve the Frankfurt canary multi-timeframe entry gate (shared by all arms).
 mtf_windows: [15]
 mtf_z_min: 0.5
 
@@ -82,7 +82,7 @@ stop_loss_cooldown_secs: 600
 # in strategies: below, bot-strategy#814).
 risk_pct_per_trade: 0.40
 equity_usd_reference: 2000
-max_leverage: 20  # Fallback only — both arms override this below.
+max_leverage: 20  # Fallback only — all three arms override this below.
 max_loss_r_mult: 1.0
 
 # Execution
@@ -90,6 +90,11 @@ cooldown_secs: 60
 slippage_bps: 0
 fee_bps: 0
 entry_post_only_timeout_secs: 30
+# bot-strategy#860: normal exits rest passively for at most three 5s engine
+# ticks before the reconcile loop cancels and takes over as taker. Emergency
+# exits (stop/beta floor/loss budget/maintenance) bypass maker-first entirely.
+exit_post_only_enabled: true
+exit_post_only_timeout_secs: 15
 
 # Filters (relaxed: let z-score do the work)
 spread_velocity_max_sigma_per_min: 0.15
@@ -135,11 +140,9 @@ circuit_breaker_tier2_cooldown_secs: 3600
 
 # Risk gates (bot-strategy#185). All bps fields are 1x-equivalent (market-
 # move) and multiplied by EACH ARM'S OWN resolved max_leverage at comparison
-# time (bot-strategy#814 made leverage per-instance). As of 2026-08-21 both
-# arms run max_leverage=30 (b's 50x reverted, see header note), so both have
-# the same effective daily gate: 75bps×30=2250bps (22.5%). #834 tightens the
-# rolling session gate to 25bps×30=750bps (7.5%) while retaining $8,000 of
-# active equity for airdrop/points volume.
+# time (bot-strategy#814 made leverage per-instance). freq/b run 30x, giving
+# effective daily/session gates of 2250bps/750bps (22.5%/7.5%). freq2 runs
+# 50x, giving 3750bps/1250bps (37.5%/12.5%). Total active equity is $9,000.
 risk:
   max_daily_loss_bps: 75
   max_daily_loss_action: block
@@ -152,9 +155,8 @@ risk:
   # Per-leg cap: reference equity × the arm's own max_leverage × 0.25.
   max_notional_headroom: 0.25
 
-# Two-arm split for bot-strategy#834. Only the entry-z profile and hold-time
-# beta-floor exit intentionally differ, keeping the comparison attributable.
-# Field values not listed per-arm inherit the top-level scalar above.
+# Three-arm split for bot-strategy#834/#837. Field values not listed per-arm
+# inherit the top-level scalar above.
 strategies:
   - id: freq
     agent_name: debot-pair-robinhood-lighter-freq
@@ -169,3 +171,8 @@ strategies:
     equity_usd_reference: 3000
     max_leverage: 30
     exit_on_sizing_beta_floor: true
+  - id: freq2
+    agent_name: debot-pair-robinhood-lighter-freq2
+    equity_usd_reference: 1000
+    max_leverage: 50
+    exit_on_sizing_beta_floor: false

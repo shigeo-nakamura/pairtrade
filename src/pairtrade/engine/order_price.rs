@@ -28,13 +28,36 @@ impl PairTradeEngine {
         self.cfg.fee_bps > 0.0 && self.post_only_supported()
     }
 
+    /// Exit-side post-only gate. Fee-bearing venues retain their existing
+    /// behavior; zero-fee venues must opt in explicitly so #860 cannot change
+    /// entry placement or any unrelated deployment by default.
+    pub(in crate::pairtrade) fn should_post_only_exit(&self) -> bool {
+        self.post_only_supported()
+            && (self.cfg.fee_bps > 0.0 || self.cfg.default_pair_params.exit_post_only_enabled)
+    }
+
     pub(in crate::pairtrade) fn order_reference_price_from_snapshot(
         &self,
         symbol: &str,
         side: dex_connector::OrderSide,
         snapshot: &SymbolSnapshot,
     ) -> Decimal {
-        let use_book = self.cfg.slippage_bps < 0 || self.should_post_only();
+        self.order_reference_price_from_snapshot_for_mode(
+            symbol,
+            side,
+            snapshot,
+            self.should_post_only(),
+        )
+    }
+
+    pub(in crate::pairtrade) fn order_reference_price_from_snapshot_for_mode(
+        &self,
+        symbol: &str,
+        side: dex_connector::OrderSide,
+        snapshot: &SymbolSnapshot,
+        post_only: bool,
+    ) -> Decimal {
+        let use_book = self.cfg.slippage_bps < 0 || post_only;
         if use_book {
             let side_price = match side {
                 dex_connector::OrderSide::Long => snapshot.ask_price,
@@ -61,27 +84,55 @@ impl PairTradeEngine {
         Some(self.order_reference_price_from_snapshot(symbol, side, snapshot))
     }
 
+    pub(in crate::pairtrade) fn order_reference_price_for_mode(
+        &self,
+        symbol: &str,
+        side: dex_connector::OrderSide,
+        prices: &HashMap<String, SymbolSnapshot>,
+        post_only: bool,
+    ) -> Option<Decimal> {
+        let snapshot = prices.get(symbol)?;
+        Some(self.order_reference_price_from_snapshot_for_mode(symbol, side, snapshot, post_only))
+    }
+
     pub(in crate::pairtrade) fn limit_price_for(
         &mut self,
         symbol: &str,
         side: dex_connector::OrderSide,
         prices: &HashMap<String, SymbolSnapshot>,
     ) -> Option<Decimal> {
-        let snapshot = prices.get(symbol)?;
-        let reference = self.order_reference_price_from_snapshot(symbol, side, snapshot);
-        let adjusted = self.apply_slippage(Some(reference), side)?;
-        Some(self.quantize_order_price_with_snapshot(symbol, adjusted, side, snapshot))
+        self.limit_price_for_mode(symbol, side, prices, self.should_post_only())
     }
 
-    pub(in crate::pairtrade) fn limit_price_for_snapshot(
+    pub(in crate::pairtrade) fn limit_price_for_mode(
+        &mut self,
+        symbol: &str,
+        side: dex_connector::OrderSide,
+        prices: &HashMap<String, SymbolSnapshot>,
+        post_only: bool,
+    ) -> Option<Decimal> {
+        let snapshot = prices.get(symbol)?;
+        let reference =
+            self.order_reference_price_from_snapshot_for_mode(symbol, side, snapshot, post_only);
+        let adjusted = self.apply_slippage(Some(reference), side)?;
+        Some(self.quantize_order_price_with_snapshot_for_mode(
+            symbol, adjusted, side, snapshot, post_only,
+        ))
+    }
+
+    pub(in crate::pairtrade) fn limit_price_for_snapshot_for_mode(
         &mut self,
         symbol: &str,
         side: dex_connector::OrderSide,
         snapshot: &SymbolSnapshot,
+        post_only: bool,
     ) -> Option<Decimal> {
-        let reference = self.order_reference_price_from_snapshot(symbol, side, snapshot);
+        let reference =
+            self.order_reference_price_from_snapshot_for_mode(symbol, side, snapshot, post_only);
         let adjusted = self.apply_slippage(Some(reference), side)?;
-        Some(self.quantize_order_price_with_snapshot(symbol, adjusted, side, snapshot))
+        Some(self.quantize_order_price_with_snapshot_for_mode(
+            symbol, adjusted, side, snapshot, post_only,
+        ))
     }
 
     pub(in crate::pairtrade) async fn refreshed_limit_price(
@@ -90,9 +141,20 @@ impl PairTradeEngine {
         side: dex_connector::OrderSide,
         prices: &HashMap<String, SymbolSnapshot>,
     ) -> Option<RefreshedLimitPrice> {
+        self.refreshed_limit_price_for_mode(symbol, side, prices, self.should_post_only())
+            .await
+    }
+
+    pub(in crate::pairtrade) async fn refreshed_limit_price_for_mode(
+        &mut self,
+        symbol: &str,
+        side: dex_connector::OrderSide,
+        prices: &HashMap<String, SymbolSnapshot>,
+        post_only: bool,
+    ) -> Option<RefreshedLimitPrice> {
         match self.refresh_symbol_snapshot(symbol).await {
             Ok(snapshot) => self
-                .limit_price_for_snapshot(symbol, side, &snapshot)
+                .limit_price_for_snapshot_for_mode(symbol, side, &snapshot, post_only)
                 .map(|limit| RefreshedLimitPrice {
                     limit,
                     submit_snapshot: Some(snapshot),
@@ -103,7 +165,7 @@ impl PairTradeEngine {
                     symbol,
                     err
                 );
-                self.limit_price_for(symbol, side, prices)
+                self.limit_price_for_mode(symbol, side, prices, post_only)
                     .map(|limit| RefreshedLimitPrice {
                         limit,
                         submit_snapshot: None,
@@ -157,7 +219,7 @@ impl PairTradeEngine {
         limit: Option<Decimal>,
         allow_post_only: bool,
     ) -> Option<i64> {
-        if allow_post_only && limit.is_some() && self.should_post_only() {
+        if allow_post_only && limit.is_some() {
             Some(-2)
         } else {
             None
@@ -199,12 +261,13 @@ impl PairTradeEngine {
         order_pricing::quantize_order_size_close(symbol, size, prices)
     }
 
-    pub(in crate::pairtrade) fn quantize_order_price_with_snapshot(
+    pub(in crate::pairtrade) fn quantize_order_price_with_snapshot_for_mode(
         &mut self,
         symbol: &str,
         price: Decimal,
         side: dex_connector::OrderSide,
         snapshot: &SymbolSnapshot,
+        post_only: bool,
     ) -> Decimal {
         let mut effective_tick_size = snapshot.min_tick;
 
@@ -238,7 +301,7 @@ impl PairTradeEngine {
         // bot-strategy#216: tick rounding is a no-op when the touch price is
         // already a tick multiple (Extended BTC tick=1 with integer prices),
         // so post-only limits land at touch and get rejected/crossed.
-        if self.should_post_only() {
+        if post_only {
             let touch = match side {
                 dex_connector::OrderSide::Long => snapshot.ask_price,
                 dex_connector::OrderSide::Short => snapshot.bid_price,

@@ -1820,6 +1820,96 @@ async fn place_pair_orders_unlatches_guard_when_a_later_retry_loses_pricing() {
     );
 }
 
+fn maker_exit_test_prices() -> HashMap<String, SymbolSnapshot> {
+    HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ])
+}
+
+fn maker_exit_test_pair() -> PairSpec {
+    PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn zero_fee_exit_post_only_opt_in_is_bounded() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 0.0;
+    engine.cfg.default_pair_params.exit_post_only_enabled = true;
+    engine.cfg.default_pair_params.exit_post_only_timeout_secs = 15;
+
+    let (legs, takeover_at) = engine
+        .close_pair_orders(
+            &maker_exit_test_pair(),
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &maker_exit_test_prices(),
+            false,
+        )
+        .await
+        .expect("zero-fee maker-first close should succeed");
+
+    assert_eq!(legs.len(), 2);
+    assert!(legs.iter().all(|leg| leg.post_only));
+    assert!(legs.iter().all(|leg| leg.limit_price.is_some()));
+    assert!(takeover_at.is_some());
+}
+
+#[tokio::test]
+async fn zero_fee_exit_opt_in_does_not_change_entry_mode() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 0.0;
+    engine.cfg.default_pair_params.exit_post_only_enabled = true;
+    engine.cfg.default_pair_params.exit_post_only_timeout_secs = 15;
+
+    let legs = engine
+        .place_pair_orders(
+            0,
+            &maker_exit_test_pair(),
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &maker_exit_test_prices(),
+        )
+        .await
+        .expect("entry should preserve the existing zero-fee mode");
+
+    assert_eq!(legs.len(), 2);
+    assert!(legs.iter().all(|leg| !leg.post_only));
+}
+
+#[tokio::test]
+async fn immediate_market_exit_bypasses_zero_fee_post_only_opt_in() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 0.0;
+    engine.cfg.default_pair_params.exit_post_only_enabled = true;
+    engine.cfg.default_pair_params.exit_post_only_timeout_secs = 15;
+
+    let (legs, takeover_at) = engine
+        .close_pair_orders(
+            &maker_exit_test_pair(),
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &maker_exit_test_prices(),
+            true,
+        )
+        .await
+        .expect("emergency close should use the immediate market path");
+
+    assert_eq!(legs.len(), 2);
+    assert!(legs.iter().all(|leg| !leg.post_only));
+    assert!(legs.iter().all(|leg| leg.limit_price.is_none()));
+    assert!(takeover_at.is_none());
+}
+
 #[tokio::test]
 async fn close_pair_orders_records_taker_mode_after_post_only_fallback() {
     let connector = Arc::new(DummyConnector::default());

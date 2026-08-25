@@ -37,6 +37,7 @@ use super::super::exit::compute_pnl;
 use super::super::funding_history;
 use super::super::market::SymbolSnapshot;
 use super::super::pnl_log::{PnlLogRecord, PnlTradeDetails};
+use super::super::prom;
 use super::super::state::{PairState, PendingLeg, PendingOrders, PendingStatus, Position};
 use super::super::PairTradeEngine;
 use super::placement::ReissuePartialLegsRequest;
@@ -603,6 +604,9 @@ impl PairTradeEngine {
                         pending.placed_at.elapsed().as_secs(),
                         status.open_remaining,
                     );
+                prom::EXIT_POST_ONLY_TAKEOVER_TOTAL
+                    .with_label_values(&[self.instances[inst_idx].id.as_str(), key])
+                    .inc();
             }
             let next_retry = pending.hedge_retry_count.saturating_add(1);
             if next_retry > MAX_EXIT_RETRIES {

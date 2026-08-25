@@ -315,6 +315,10 @@ impl PairTradeConfig {
             &mut self.default_pair_params.entry_post_only_timeout_secs,
         );
         env_override(
+            "EXIT_POST_ONLY_ENABLED",
+            &mut self.default_pair_params.exit_post_only_enabled,
+        );
+        env_override(
             "EXIT_POST_ONLY_TIMEOUT_SECS",
             &mut self.default_pair_params.exit_post_only_timeout_secs,
         );

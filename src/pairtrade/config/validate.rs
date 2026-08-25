@@ -104,6 +104,13 @@ impl PairTradeConfig {
                 RAW_BETA_GAP_MAX
             ));
         }
+        if self.default_pair_params.exit_post_only_enabled
+            && self.default_pair_params.exit_post_only_timeout_secs == 0
+        {
+            return Err(anyhow!(
+                "exit_post_only_enabled requires exit_post_only_timeout_secs > 0 so maker-first exits have a bounded taker takeover"
+            ));
+        }
         let beta_floor_enabled = self.strategies.iter().any(|strategy| {
             strategy
                 .exit_on_sizing_beta_floor
