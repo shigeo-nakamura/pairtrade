@@ -10,10 +10,13 @@ User=arcus
 Group=arcus
 UMask=0077
 Environment=STATE_DIR=/var/lib/debot-arcus/spot-execute-once
+Environment=ARCHIVE_START_MARKER=/var/lib/debot-arcus-archive/live-tick-events.start-date
 Environment=S3_BUCKET=debot-dashboard
 Environment=S3_PREFIX=arcus-archive/live-tick-events/debot-arcus
 ExecStart=/usr/local/libexec/debot/archive_arcus_live_tick_events.sh
 TimeoutStartSec=900
+StateDirectory=debot-arcus-archive
+StateDirectoryMode=0700
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
