@@ -39,6 +39,12 @@ case "$command" in
   is-enabled)
     if [ -e "$FAKE_ENABLED" ]; then printf 'enabled\n'
     elif [ -e "$FAKE_SYSTEMD_DIR/$1" ]; then printf 'disabled\n'
+    elif [ "${MISSING_ENABLED_STYLE:-not-found}" = systemd-error ]; then
+      printf 'Failed to get unit file state for %s: No such file or directory\n' "$1" >&2
+      exit 4
+    elif [ "${MISSING_ENABLED_STYLE:-not-found}" = unexpected-error ]; then
+      printf 'Failed to connect to bus: Permission denied\n' >&2
+      exit 1
     else printf 'not-found\n'; fi
     ;;
   is-active)
@@ -92,13 +98,22 @@ run_installer() {
   FAKE_LIBEXEC_DIR="$LIBEXEC" \
   FAKE_ENABLED="$WORK/enabled" \
   FAKE_ACTIVE="$WORK/active" \
+  MISSING_ENABLED_STYLE="${MISSING_ENABLED_STYLE:-not-found}" \
   SYSTEMD_ANALYZE="$WORK/systemd-analyze" \
   INSTALL_OWNER="$TEST_OWNER" \
   INSTALL_GROUP="$TEST_GROUP" \
     bash "$REPO_ROOT/scripts/install_arcus_live_tick_event_archive.sh" "$SOURCE" "$1"
 }
 
-run_installer first
+if MISSING_ENABLED_STYLE=unexpected-error run_installer rejected; then
+  echo "expected unrelated systemctl error to be rejected" >&2
+  exit 1
+fi
+test ! -e "$PROVENANCE/releases/rejected"
+test ! -e "$WORK/enabled"
+
+# Reproduce the exact missing-unit output from the Arcus Amazon Linux host.
+MISSING_ENABLED_STYLE=systemd-error run_installer first
 test -e "$WORK/enabled"
 test -e "$WORK/active"
 test -f "$PROVENANCE/releases/first/manifest.json"

@@ -44,8 +44,17 @@ if [ "${checksum_names[*]}" != "${expected_names[*]}" ]; then
 fi
 (cd "$SOURCE_DIR" && sha256sum -c release.sha256)
 
-enabled_before=$("$SYSTEMCTL" is-enabled "$TIMER" 2>&1 || true)
-active_before=$("$SYSTEMCTL" is-active "$TIMER" 2>&1 || true)
+enabled_before=$(LC_ALL=C "$SYSTEMCTL" is-enabled "$TIMER" 2>&1 || true)
+active_before=$(LC_ALL=C "$SYSTEMCTL" is-active "$TIMER" 2>&1 || true)
+# Amazon Linux 2023's systemd reports an absent unit as a diagnostic sentence
+# instead of the documented `not-found` state. Normalize only that exact result
+# and only while the target unit is genuinely absent; all other diagnostics
+# remain fatal so an inaccessible or broken systemd state cannot be mistaken
+# for a safe first install.
+if [ "$enabled_before" = "Failed to get unit file state for $TIMER: No such file or directory" ] \
+   && [ ! -e "$SYSTEMD_DIR/$TIMER" ] && [ ! -L "$SYSTEMD_DIR/$TIMER" ]; then
+  enabled_before=not-found
+fi
 case "$enabled_before" in enabled|disabled|not-found) ;; *)
   echo "unexpected timer enabled state: $enabled_before" >&2; exit 1 ;;
 esac
