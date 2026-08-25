@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily immutable archive of Arcus live-tick events
+
+[Timer]
+OnCalendar=*-*-* 00:12:00 UTC
+Persistent=true
+RandomizedDelaySec=45s
+Unit=archive-arcus-live-tick-events.service
+
+[Install]
+WantedBy=timers.target

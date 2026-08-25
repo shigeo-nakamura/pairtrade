@@ -526,6 +526,47 @@ active/enabled state; it never enables, disables, starts, stops, or restarts
 the timer/service and never invokes the executor. A new host therefore remains
 inactive until an operator makes a separate, explicit activation decision.
 
+Every decision checkpointed by `live-tick` or the shared-state
+`arcus-spot-propose-plan propose` command is also appended while holding the
+checkpoint namespace lock to a private, daily, hash-chained event stream under
+`/var/lib/debot-arcus/spot-execute-once/live-tick-events/`. Checkpoint
+publication is wrapped in a recoverable protocol: the writer first atomically
+stages the exact event and its hash in the sibling mode-0600
+`live-tick-event-pending.json`, publishes the checkpoint, appends and fsyncs the
+event stream, then removes and directory-fsyncs the pending sidecar. Before any
+new snapshot, the next writer completes an event whose checkpoint committed,
+discards an advancing event whose checkpoint did not commit, or only clears an
+event already present at the stream tail. An empty or partial final append is
+truncated only when its bytes are an exact prefix of the staged, hashed record;
+unrelated corruption remains a hard error. State backup refuses an unresolved
+sidecar. A crash can therefore neither replace the checkpointed payload with a
+later stale observation nor duplicate an already-appended event. The separate
+`archive-arcus-live-tick-events.timer` verifies each closed UTC day and writes
+an immutable compressed segment plus integrity manifest to the private
+`debot-dashboard/arcus-archive/live-tick-events/debot-arcus/` prefix.
+Before publishing a segment, the archiver briefly takes the shared checkpoint
+lock and refuses to proceed while a pending event exists, preventing an
+interrupted checkpoint/append boundary from being frozen into an incomplete
+immutable archive. It releases the lock before verification/compression/S3 so
+normal trade evaluation is not held behind network I/O.
+Its catch-up scan walks every UTC date from the first segment through yesterday
+using a private, fsynced start-date marker in the archive service's dedicated
+`/var/lib/debot-arcus-archive/` systemd state directory. It remains outside the
+segment directory, so the event writer still sees only daily JSONL files, and
+the read-only archive service never needs write access to those segments. The
+marker is not recalculated from the remaining segment filenames. The scan fails
+closed if a date is missing, rather than misrepresenting lost evidence as an
+empty observation day. Before publishing a later day it also verifies that
+day's head against both the preceding local segment and the preceding immutable
+archive manifest. A second fsynced marker advances only after a day's manifest
+is published, so later timer runs cheaply scan local calendar continuity but do
+hash/compression/S3 work only after the archive high-water date.
+`deploy-arcus-live-tick-event-archive.yml` installs and enables only that
+archive timer; it never invokes the executor or changes the trading timer.
+Current local/S3 data is retained indefinitely, while noncurrent S3 versions
+expire after 90 days. See `docs/arcus-live-tick-signal-replay.md` for fetch,
+verification, and replay commands.
+
 `arcus-spot-runtime` is deliberately excluded. It remains the deterministic
 archive replay CLI below; if it later gains a distinct live-daemon role, add a
 separate artifact and lifecycle only when that runtime contract exists.

@@ -16,6 +16,13 @@ replay = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = replay
 SPEC.loader.exec_module(replay)
 
+STREAM_SCRIPT = Path(__file__).with_name("arcus_live_tick_event_stream.py")
+STREAM_SPEC = importlib.util.spec_from_file_location(
+    "arcus_event_stream_test", STREAM_SCRIPT)
+event_stream = importlib.util.module_from_spec(STREAM_SPEC)
+assert STREAM_SPEC.loader
+STREAM_SPEC.loader.exec_module(event_stream)
+
 
 def event(sequence, when, price, z_score):
     return {"sequence": sequence, "observed_at": when.isoformat().replace("+00:00", "Z"),
@@ -24,6 +31,41 @@ def event(sequence, when, price, z_score):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_hash_chained_stream_is_verified_and_unwrapped(self):
+        item = event(41, datetime(2026, 8, 25, tzinfo=timezone.utc), 0.5, 1.0)
+        event_json = json.dumps(item, separators=(",", ":"))
+        event_hash = event_stream.sha256_prefixed(event_json.encode())
+        record = {
+            "schema_version": 1,
+            "previous_chain_sha256": None,
+            "event_sha256": event_hash,
+            "chain_sha256": event_stream.chain_sha256(None, event_hash),
+            "event_json": event_json,
+        }
+        observations, ignored, integrity = (
+            replay.extract_observations_with_integrity(
+                json.dumps(record, separators=(",", ":")) + "\n"
+            )
+        )
+        self.assertEqual([item.sequence for item in observations], [41])
+        self.assertEqual(ignored, 0)
+        self.assertTrue(integrity["hash_chain_valid"])
+
+    def test_corrupt_hash_chained_stream_never_falls_back_to_journal_parser(self):
+        item = event(41, datetime(2026, 8, 25, tzinfo=timezone.utc), 0.5, 1.0)
+        event_json = json.dumps(item, separators=(",", ":"))
+        record = {
+            "schema_version": 1,
+            "previous_chain_sha256": None,
+            "event_sha256": "sha256:" + "0" * 64,
+            "chain_sha256": "sha256:" + "0" * 64,
+            "event_json": event_json,
+        }
+        with self.assertRaisesRegex(
+                replay.ReplayError, "invalid durable event stream"):
+            replay.extract_observations_with_integrity(
+                json.dumps(record) + "\n")
+
     def test_extracts_pretty_event_among_systemd_noise(self):
         start = datetime(2026, 8, 21, tzinfo=timezone.utc)
         journal = "Starting...\n" + json.dumps(event(4, start, -0.7, 1.25), indent=2) + "\nDone\n"

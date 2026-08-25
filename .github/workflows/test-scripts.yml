@@ -23,6 +23,12 @@ jobs:
         run: python3 scripts/test_round_performance_report.py -v
       - name: Run Arcus live signal replay unit tests
         run: python3 scripts/test_arcus_live_tick_signal_replay.py -v
+      - name: Run Arcus durable event stream unit tests
+        run: python3 scripts/test_arcus_live_tick_event_stream.py -v
+      - name: Run Arcus event archive integration tests
+        run: bash scripts/test_archive_arcus_live_tick_events.sh
+      - name: Run Arcus event archive installer tests
+        run: bash scripts/test_install_arcus_live_tick_event_archive.sh
       - name: Run Robinhood sidecar bootstrap tests
         run: bash scripts/test_bootstrap_robinhood_sidecar.sh
       - name: Run Robinhood runtime staging tests

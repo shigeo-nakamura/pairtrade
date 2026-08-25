@@ -6,11 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import arcus_live_tick_event_stream as event_stream
 
 SIGNAL_FLAT_EPSILON = 1e-12
 
@@ -51,12 +55,20 @@ class Trade:
 
 
 def parse_timestamp(value: str) -> datetime:
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?"
+        r"(Z|[+-]\d{2}:\d{2})",
+        value,
+    )
+    if not match:
+        raise ReplayError(f"invalid RFC3339 timestamp {value!r}")
+    base, fraction, offset = match.groups()
+    micros = (fraction or "0")[:6].ljust(6, "0")
+    normalized = f"{base}.{micros}{'+00:00' if offset == 'Z' else offset}"
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(normalized)
     except ValueError as error:
         raise ReplayError(f"invalid RFC3339 timestamp {value!r}") from error
-    if parsed.tzinfo is None:
-        raise ReplayError(f"timestamp must include an offset: {value!r}")
     return parsed.astimezone(timezone.utc)
 
 
@@ -87,8 +99,33 @@ def _event_from_object(value: Any) -> Observation | None:
                        hold_code if isinstance(hold_code, str) else None)
 
 
-def extract_observations(text: str) -> tuple[list[Observation], int]:
+def extract_observations_with_integrity(
+        text: str) -> tuple[list[Observation], int, dict[str, Any] | None]:
     """Extract pretty JSON events from ``journalctl -o cat`` output."""
+    first_line = next((line for line in text.splitlines() if line), "")
+    try:
+        first_object = json.loads(first_line)
+    except json.JSONDecodeError:
+        first_object = None
+    stream_fields = {
+        "schema_version", "previous_chain_sha256", "event_sha256",
+        "chain_sha256", "event_json",
+    }
+    if isinstance(first_object, dict) and set(first_object) == stream_fields:
+        try:
+            values, integrity = event_stream.verify_stream_bytes([
+                ("durable-event-stream", text.encode())
+            ])
+        except event_stream.StreamError as error:
+            raise ReplayError(f"invalid durable event stream: {error}") from error
+        observations = []
+        for value in values:
+            event = _event_from_object(value)
+            if event is None:
+                raise ReplayError("durable stream payload is not a runtime event")
+            observations.append(event)
+        return observations, 0, integrity
+
     decoder, observations, ignored, offset = json.JSONDecoder(), [], 0, 0
     while True:
         start = text.find("{", offset)
@@ -116,6 +153,11 @@ def extract_observations(text: str) -> tuple[list[Observation], int]:
                      or current.z_score is not None)):
             raise ReplayError(
                 f"non-advancing sequence {current.sequence} is not a stale observation")
+    return observations, ignored, None
+
+
+def extract_observations(text: str) -> tuple[list[Observation], int]:
+    observations, ignored, _ = extract_observations_with_integrity(text)
     return observations, ignored
 
 
@@ -339,7 +381,7 @@ def run(arguments: argparse.Namespace) -> dict[str, Any]:
             and arguments.start_sequence > arguments.end_sequence):
         raise ReplayError("start sequence must not exceed end sequence")
 
-    observations, ignored = extract_observations(
+    observations, ignored, stream_integrity = extract_observations_with_integrity(
         arguments.journal.read_text(encoding="utf-8"))
     observations = filter_observations(
         observations, arguments.start_sequence, arguments.end_sequence)
@@ -352,6 +394,8 @@ def run(arguments: argparse.Namespace) -> dict[str, Any]:
             f"sequence(s) ({ranges}); replay refused")
 
     verification = {"authoritative": not gaps, "sequence_gaps": gaps}
+    if stream_integrity is not None:
+        verification["durable_event_stream"] = stream_integrity
     window, minimum = 96, 32
     if arguments.checkpoint:
         checkpoint = load_checkpoint(arguments.checkpoint)

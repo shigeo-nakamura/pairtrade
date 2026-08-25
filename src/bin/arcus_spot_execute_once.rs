@@ -16,9 +16,10 @@ use debot::arcus_spot::{
     ArcusSpotChainConfig, ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt,
     ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
     ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor,
-    ArcusSpotLiveExecutorConfig, ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan,
-    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
-    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventStream,
+    ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger,
+    ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig,
+    ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
 use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
@@ -455,6 +456,35 @@ fn live_tick_observation_evidence_path(config: &ArcusSpotExecuteOnceConfig) -> R
     Ok(parent.join("live-tick-observation-evidence.json"))
 }
 
+fn live_tick_event_stream(
+    config: &ArcusSpotExecuteOnceConfig,
+) -> Result<ArcusSpotLiveTickEventStream> {
+    let parent = config
+        .runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(ArcusSpotLiveTickEventStream::new(
+        parent.join("live-tick-events"),
+    ))
+}
+
+fn live_tick_pending_event_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
+    let parent = config
+        .runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(parent.join("live-tick-event-pending.json"))
+}
+
+fn live_tick_event_publisher(
+    config: &ArcusSpotExecuteOnceConfig,
+) -> Result<ArcusSpotLiveTickEventPublisher> {
+    Ok(ArcusSpotLiveTickEventPublisher::new(
+        live_tick_event_stream(config)?,
+        live_tick_pending_event_path(config)?,
+    ))
+}
+
 const LIVE_TICK_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const OBSERVATION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 
@@ -761,6 +791,13 @@ fn capture_arcus_state(config: &ArcusSpotExecuteOnceConfig) -> Result<ArcusSpotS
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let runtime = checkpoint_store.load_existing(&config.runtime)?;
     let ledger = ledger_store.load_existing()?;
+    match fs::symlink_metadata(live_tick_pending_event_path(config)?) {
+        Ok(_) => bail!(
+            "Arcus pending durable event must be recovered by live-tick/propose before state backup"
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect Arcus pending durable event"),
+    }
     let checkpoint_bytes =
         read_private_regular_file(&config.runtime_state_path, "Arcus runtime checkpoint")?;
     let ledger_bytes = read_private_regular_file(&config.ledger_path, "Arcus execution ledger")?;
@@ -2408,6 +2445,20 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
     }
     let observation_evidence_path =
         resolve_path_for_collision_check(&live_tick_observation_evidence_path(config)?);
+    let pending_event_path =
+        resolve_path_for_collision_check(&live_tick_pending_event_path(config)?);
+    let event_stream_path =
+        resolve_path_for_collision_check(live_tick_event_stream(config)?.directory());
+    if ledger_path == event_stream_path
+        || ledger_path.starts_with(&event_stream_path)
+        || runtime_state_path == event_stream_path
+        || runtime_state_path.starts_with(&event_stream_path)
+    {
+        bail!(
+            "Arcus ledger_path/runtime_state_path must not resolve to or beneath the derived live-tick event-stream directory {}",
+            event_stream_path.display()
+        );
+    }
     if observation_evidence_path == ledger_path
         || observation_evidence_path == runtime_state_path
         || observation_evidence_path == pending_plan_path
@@ -2415,6 +2466,16 @@ fn validate_config(config: &mut ArcusSpotExecuteOnceConfig) -> Result<()> {
         bail!(
             "Arcus durable state paths must not resolve to the derived live-tick observation-evidence path {}",
             observation_evidence_path.display()
+        );
+    }
+    if pending_event_path == ledger_path
+        || pending_event_path == runtime_state_path
+        || pending_event_path == pending_plan_path
+        || pending_event_path == observation_evidence_path
+    {
+        bail!(
+            "Arcus durable state paths must not resolve to the derived live-tick pending-event path {}",
+            pending_event_path.display()
         );
     }
     config.runtime.normalize();
@@ -3067,6 +3128,10 @@ async fn main() -> Result<()> {
                 ledger_store_for_checkpoint.acquire_exclusive_lock(&config.runtime_state_path)?;
 
             let mut runtime = store.load_or_create(&config.runtime)?;
+            let event_publisher = live_tick_event_publisher(&config)?;
+            event_publisher
+                .recover(runtime.state().sequence)
+                .context("failed to recover Arcus pending durable event")?;
             let previous_sequence = runtime.state().sequence;
             // step_at itself rejects a snapshot whose collection_finished_at
             // is not strictly newer than the last one it genuinely advanced
@@ -3104,7 +3169,20 @@ async fn main() -> Result<()> {
             // tick's signal depends on, and losing a tick's contribution
             // because this run happened not to rotate would silently widen
             // gaps in the very history the entry/exit z-score needs.
+            event_publisher
+                .stage(&event)
+                .context("failed to stage Arcus durable event before checkpoint")?;
             store.persist(&runtime)?;
+            // Journald is not the replay source of truth. Persist every
+            // checkpointed decision, including WouldRotate ticks whose stdout
+            // later becomes an execution attempt, to the private hash-chained
+            // stream. This happens while the checkpoint lock is still held so
+            // concurrent state writers cannot reorder events. The exact event
+            // was staged before the checkpoint rename, so a later invocation
+            // can finish an append interrupted after checkpoint publication.
+            event_publisher
+                .commit(&event)
+                .context("failed to commit Arcus live-tick durable event")?;
             let plan = match event.decision.clone() {
                 ArcusSpotDecision::WouldRotate { plan } => plan,
                 ArcusSpotDecision::Observe { .. } | ArcusSpotDecision::SimulatedFill { .. } => {
@@ -5747,6 +5825,54 @@ runtime:
         assert!(error
             .to_string()
             .contains("live-tick observation-evidence path"));
+    }
+
+    #[test]
+    fn config_rejects_a_ledger_path_colliding_with_the_pending_event() {
+        let mut config = execute_once_config(
+            "/var/lib/x/live-tick-event-pending.json",
+            "/var/lib/x/runtime.json",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("live-tick pending-event path"));
+    }
+
+    #[test]
+    fn config_rejects_state_files_in_the_event_stream_directory() {
+        for ledger_path in [
+            "/var/lib/x/live-tick-events",
+            "/var/lib/x/live-tick-events/ledger.json",
+        ] {
+            let mut config = execute_once_config(ledger_path, "/var/lib/x/runtime.json", "1000");
+            let error = validate_config(&mut config).unwrap_err();
+            assert!(error.to_string().contains("event-stream directory"));
+        }
+
+        let mut config = execute_once_config(
+            "/var/lib/x/ledger.json",
+            "/var/lib/x/live-tick-events",
+            "1000",
+        );
+        let error = validate_config(&mut config).unwrap_err();
+        assert!(error.to_string().contains("event-stream directory"));
+    }
+
+    #[test]
+    fn state_backup_refuses_an_unresolved_pending_event() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "1000",
+        );
+        persist_initial_operator_state(&config);
+        fs::write(live_tick_pending_event_path(&config).unwrap(), b"pending").unwrap();
+
+        let error = create_arcus_state_backup(&config, &dir.path().join("backup")).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("pending durable event must be recovered"));
     }
 
     #[test]

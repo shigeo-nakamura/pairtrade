@@ -23,13 +23,20 @@ instead the manifest binds its canonical SHA-256 digest.
 | Execution ledger | `/var/lib/debot-arcus/spot-execute-once/ledger.json` | schema 2; monotonic attempt sequence, immutable archive and any active recovery state |
 | Recovery evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-pending-plan.json` | optional schema-1 envelope: exact plan, recorder snapshot and evaluation time needed by `auto-resume` and continuity verification |
 | Observation evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-observation-evidence.json` | optional schema-2 sidecar: latest sequence-advancing recorder snapshot, evaluation time and resulting runtime sequence/watermark; schema 1 remains readable only as an unchanged backup baseline |
+| Durable replay stream | `/var/lib/debot-arcus/spot-execute-once/live-tick-events/YYYY-MM-DD.jsonl` | append-only schema-1 runtime events with payload and cross-record SHA-256 chain; replay evidence, never a restore target |
+| Pending replay event | `/var/lib/debot-arcus/spot-execute-once/live-tick-event-pending.json` | mode-0600 exact event+hash staged before checkpoint publication and removed only after stream fsync; recovered under the namespace lock before any new observation |
 | Namespace lock | `/var/lib/debot-arcus/spot-execute-once/.runtime_state.json.lock` | mode-0600 process lock shared by live-tick, execute/resume, proposer and state tooling |
 
 Checkpoint and ledger stores already use create-new temporary files, file
 `fsync`, atomic rename and parent-directory `fsync`. `live-tick` writes the
 pending recovery and observation evidence while holding the checkpoint
 namespace lock; `arcus-spot-propose-plan propose` writes the same observation
-evidence whenever it advances that shared checkpoint. A backup therefore
+evidence whenever it advances that shared checkpoint. Both writers append the
+resulting runtime event to the same durable stream before releasing that lock.
+They stage an exact hashed pending event before the checkpoint rename and
+recover it before processing a new snapshot, so a crash cannot substitute a
+later stale observation. State backup refuses an unresolved pending event.
+A backup therefore
 observes a lock-consistent boundary. Backup schema 3 hashes and copies both
 optional sidecars and rejects observation evidence whose schema-1 snapshot
 watermark or schema-2 result boundary does not match the checkpoint. If evidence
@@ -42,6 +49,12 @@ it is never accepted as first-run state. Ledger inspection does not run the
 normal restart recovery that rewrites `Dispatching` to `Unknown`. The tool
 also refuses to create a missing lock, preventing a root-run inspection from
 leaving behind a root-owned lock that the `arcus` service could not reopen.
+The durable replay stream is not copied into point-in-time state backups and
+must never be deleted, truncated, or restored with a checkpoint. It is
+independently retained and archived as historical evidence. After #825 is
+deployed, a rollback candidate that can advance the checkpoint but cannot
+append the same durable stream is ineligible: it would create a detected
+sequence gap and destroy authoritative coverage. Use a forward fix instead.
 
 ## Offline commands
 
@@ -154,10 +167,14 @@ in UTC.
    observation before persisting its checkpoint, including structurally invalid
    ticks, and bind the resulting runtime sequence/watermark; a binary that only
    writes the rotation-plan sidecar cannot certify no-swap state. If the
-   candidate release's
-   source/provenance cannot demonstrate that
-   capability, use a forward fix. Every state backup or verification below
-   runs the manifest-verified
+   candidate release's source/provenance cannot demonstrate that capability,
+   use a forward fix.
+
+   The candidate must additionally contain the #825 hash-chained event-stream
+   append after every checkpoint publication. A pre-#825 candidate is no
+   longer eligible after the first durable stream record exists. If this
+   capability is absent or uncertain, use a forward fix.
+   Every state backup or verification below runs the manifest-verified
    verifier binary from its immutable release directory, never the mutable
    `/usr/local/bin` path or the rollback candidate under test.
 

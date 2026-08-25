@@ -15,6 +15,7 @@ on:
       - "src/lib.rs"
       - "src/arcus_spot/**"
       - "src/bin/arcus_spot_execute_once.rs"
+      - "src/bin/arcus_spot_propose_plan.rs"
   workflow_dispatch:
     inputs:
       dex_connector_ref:
@@ -89,6 +90,7 @@ jobs:
         run: |
           cargo test --release --locked --no-default-features --features arcus-spot-live --lib arcus_spot
           cargo test --release --locked --no-default-features --features arcus-spot-live --bin arcus-spot-execute-once
+          cargo test --release --locked --no-default-features --features arcus-spot-live --bin arcus-spot-propose-plan
 
   build-deploy:
     name: Build Arcus Spot executor (native arm64)
