@@ -37,6 +37,7 @@ use super::super::exit::compute_pnl;
 use super::super::funding_history;
 use super::super::market::SymbolSnapshot;
 use super::super::pnl_log::{PnlLogRecord, PnlTradeDetails};
+use super::super::prom;
 use super::super::state::{PairState, PendingLeg, PendingOrders, PendingStatus, Position};
 use super::super::PairTradeEngine;
 use super::placement::ReissuePartialLegsRequest;
@@ -475,7 +476,7 @@ impl PairTradeEngine {
         let status = self.pending_status(&pending).await?;
         let mut pending = pending;
         Self::update_pending_fills(&mut pending, &status.fills);
-        let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
+        let mut filled_qtys = Self::filled_by_leg(&pending, &status.fills);
         // (record, realized_pnl, funding_carry_usd) — the third element
         // is folded into `inst.funding_carry_today` at the same site as
         // `realized_pnl_today` below. 0.0 when no ticks were observed.
@@ -603,6 +604,9 @@ impl PairTradeEngine {
                         pending.placed_at.elapsed().as_secs(),
                         status.open_remaining,
                     );
+                prom::EXIT_POST_ONLY_TAKEOVER_TOTAL
+                    .with_label_values(&[self.instances[inst_idx].id.as_str(), key])
+                    .inc();
             }
             let next_retry = pending.hedge_retry_count.saturating_add(1);
             if next_retry > MAX_EXIT_RETRIES {
@@ -626,30 +630,50 @@ impl PairTradeEngine {
                 }
                 return Ok(());
             }
-            if status.open_remaining > 0 && !takeover_fired {
-                log::warn!(
-                    "[ORDER] {} exit orders stale ({}s), cancelling {} legs",
-                    key,
-                    pending.placed_at.elapsed().as_secs(),
-                    status.open_remaining
-                );
-                for leg in &pending.legs {
-                    let filled = filled_qtys
-                        .get(&leg.order_id)
-                        .cloned()
-                        .unwrap_or(Decimal::ZERO);
-                    let is_open = status.open_ids.contains(&leg.order_id);
-                    log::debug!(
-                            "[ORDER] {} exit leg status symbol={} order_id={} target={} filled={} open={}",
-                            key,
-                            leg.symbol,
-                            leg.order_id,
-                            leg.target,
-                            filled,
-                            is_open
-                        );
+            if status.open_remaining > 0 {
+                if !takeover_fired {
+                    log::warn!(
+                        "[ORDER] {} exit orders stale ({}s), cancelling {} legs",
+                        key,
+                        pending.placed_at.elapsed().as_secs(),
+                        status.open_remaining
+                    );
+                    for leg in &pending.legs {
+                        let filled = filled_qtys
+                            .get(&leg.order_id)
+                            .cloned()
+                            .unwrap_or(Decimal::ZERO);
+                        let is_open = status.open_ids.contains(&leg.order_id);
+                        log::debug!(
+                                "[ORDER] {} exit leg status symbol={} order_id={} target={} filled={} open={}",
+                                key,
+                                leg.symbol,
+                                leg.order_id,
+                                leg.target,
+                                filled,
+                                is_open
+                            );
+                    }
                 }
                 self.cancel_pending_orders(&pending).await?;
+                if takeover_fired {
+                    // A taker takeover must not race the resting post-only
+                    // exits. Wait for cancellation acknowledgement and
+                    // refresh fills so any late fill reduces the replacement
+                    // quantity immediately before MARKET placement.
+                    self.await_pending_cancellation(&pending).await;
+                    match self.pending_status(&pending).await {
+                        Ok(refreshed) => {
+                            Self::update_pending_fills(&mut pending, &refreshed.fills);
+                            filled_qtys = Self::filled_by_leg(&pending, &refreshed.fills);
+                        }
+                        Err(err) => log::warn!(
+                            "[ORDER] {} exit post-cancel fill refresh failed; using pre-cancel snapshot: {:?}",
+                            key,
+                            err
+                        ),
+                    }
+                }
             }
             // Re-attempt closing missing legs based on filled qty,
             // reusing filled_qtys defined earlier.

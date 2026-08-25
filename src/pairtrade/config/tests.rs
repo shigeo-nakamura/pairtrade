@@ -9,7 +9,7 @@ use super::*;
 /// config files both declaring a strategy `id: b`, so both tests touch
 /// `EQUITY_REFERENCE_USD_B`) can observe each other's transient value and
 /// fail nondeterministically (bot-strategy#814 PR review: this is exactly
-/// how `robinhood_lighter_two_arm_config_parses` and
+/// how `robinhood_lighter_three_arm_config_parses` and
 /// `per_strategy_equity_env_override` collided in CI). Every test that
 /// calls `std::env::set_var` or `remove_var` must hold this lock for its
 /// full duration.
@@ -74,12 +74,12 @@ fn hyperliquid_observer_config_parses() {
     }
 }
 
-// bot-strategy#814: smoke-tests the committed Robinhood two-arm config
+// bot-strategy#814/#837/#860: smoke-tests the committed Robinhood config
 // against the real schema, so a hand-edited YAML that would panic the live
 // process on boot (deny_unknown_fields, bad field names, etc.) fails CI
 // instead. Mirrors hyperliquid_observer_config_parses above.
 #[test]
-fn robinhood_lighter_two_arm_config_parses() {
+fn robinhood_lighter_three_arm_config_parses() {
     let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let vars = [
         "DEX_NAME",
@@ -89,8 +89,12 @@ fn robinhood_lighter_two_arm_config_parses() {
         "MAX_LEVERAGE",
         "MAX_LEVERAGE_FREQ",
         "MAX_LEVERAGE_B",
+        "MAX_LEVERAGE_FREQ2",
         "EQUITY_REFERENCE_USD_FREQ",
         "EQUITY_REFERENCE_USD_B",
+        "EQUITY_REFERENCE_USD_FREQ2",
+        "EXIT_POST_ONLY_ENABLED",
+        "EXIT_POST_ONLY_TIMEOUT_SECS",
     ];
     let saved: Vec<_> = vars
         .iter()
@@ -105,7 +109,9 @@ fn robinhood_lighter_two_arm_config_parses() {
             .expect("robinhood lighter yaml load");
 
     assert_eq!(cfg.dex_name, "lighter");
-    assert_eq!(cfg.strategies.len(), 2);
+    assert_eq!(cfg.strategies.len(), 3);
+    assert!(cfg.default_pair_params.exit_post_only_enabled);
+    assert_eq!(cfg.default_pair_params.exit_post_only_timeout_secs, 5);
     let freq = &cfg.strategies[0];
     assert_eq!(freq.id, "freq");
     assert_eq!(
@@ -137,10 +143,63 @@ fn robinhood_lighter_two_arm_config_parses() {
     assert_eq!(freq.exit_on_sizing_beta_floor, Some(false));
     assert_eq!(b.exit_on_sizing_beta_floor, Some(true));
     assert!(b_params.exit_on_sizing_beta_floor);
+    let freq2 = &cfg.strategies[2];
+    assert_eq!(freq2.id, "freq2");
+    assert_eq!(
+        freq2.agent_name.as_deref(),
+        Some("debot-pair-robinhood-lighter-freq2")
+    );
+    assert!((freq2.equity_reference_usd - 1000.0).abs() < 1e-9);
+    assert!((freq2.max_leverage - 50.0).abs() < 1e-9);
+    assert_eq!(freq2.exit_on_sizing_beta_floor, Some(false));
     assert_eq!(cfg.risk.max_session_loss_bps, 25);
-    // Top-level max_leverage is only a fallback; both arms resolve to 30x.
+    // Top-level max_leverage is only a fallback; all arms override it.
     assert!((cfg.max_leverage - 20.0).abs() < 1e-9);
 
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
+#[test]
+fn exit_post_only_opt_in_requires_bounded_takeover() {
+    let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let vars = ["EXIT_POST_ONLY_ENABLED", "EXIT_POST_ONLY_TIMEOUT_SECS"];
+    let saved: Vec<_> = vars
+        .iter()
+        .map(|name| ((*name).to_string(), std::env::var(name).ok()))
+        .collect();
+    for name in vars {
+        std::env::remove_var(name);
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "pairtrade_exit_post_only_validation_{}.yaml",
+        std::process::id()
+    ));
+    let base = r#"
+dex_name: lighter
+rest_endpoint: https://example
+web_socket_endpoint: wss://example
+dry_run: true
+universe_pairs:
+- BTC/ETH
+exit_post_only_enabled: true
+"#;
+    std::fs::write(&path, base).unwrap();
+    let err = PairTradeConfig::from_yaml_path(&path)
+        .expect_err("unbounded maker-first exits must be rejected");
+    assert!(format!("{err:#}").contains("exit_post_only_timeout_secs > 0"));
+
+    std::fs::write(&path, format!("{base}exit_post_only_timeout_secs: 15\n")).unwrap();
+    let cfg = PairTradeConfig::from_yaml_path(&path).expect("bounded maker-first config");
+    assert!(cfg.default_pair_params.exit_post_only_enabled);
+    assert_eq!(cfg.default_pair_params.exit_post_only_timeout_secs, 15);
+
+    let _ = std::fs::remove_file(&path);
     for (name, value) in saved {
         match value {
             Some(value) => std::env::set_var(name, value),

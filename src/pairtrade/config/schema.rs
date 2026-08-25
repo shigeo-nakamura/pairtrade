@@ -119,6 +119,7 @@ pub(in crate::pairtrade) struct PairTradeYaml {
     pub(super) circuit_breaker_tier2_losses: Option<u32>,
     pub(super) circuit_breaker_tier2_cooldown_secs: Option<u64>,
     pub(super) entry_post_only_timeout_secs: Option<u64>,
+    pub(super) exit_post_only_enabled: Option<bool>,
     pub(super) exit_post_only_timeout_secs: Option<u64>,
     // Phase 2 filters (default off: 0.0 disables)
     pub(super) entry_velocity_block_sigma_per_min: Option<f64>,

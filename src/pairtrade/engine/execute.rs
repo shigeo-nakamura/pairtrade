@@ -17,7 +17,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use super::super::apply_post_exit_state;
-use super::super::exit::compute_pnl;
+use super::super::exit::{compute_pnl, exit_uses_market};
 use super::super::funding_history;
 use super::super::market::SymbolSnapshot;
 use super::super::pnl_log::{PnlLogRecord, PnlTradeDetails};
@@ -317,8 +317,27 @@ impl PairTradeEngine {
                     );
                 } else {
                     let placed_ts_ms = Utc::now().timestamp_millis();
+                    let close_reason = self.instances[inst_idx]
+                        .states
+                        .get(&plan.key)
+                        .and_then(|state| state.pending_exit_reason);
+                    // Preserve every non-opted-in deployment's legacy
+                    // `force` semantics exactly. Reason-based maker-first
+                    // classification is activated only by #860's explicit
+                    // zero-fee exit opt-in (currently Robinhood only).
+                    let use_market = exit_uses_market(
+                        self.cfg.default_pair_params.exit_post_only_enabled,
+                        close_reason,
+                        force,
+                    );
+                    log::info!(
+                        "[EXIT_EXECUTION] pair={} reason={} mode={}",
+                        plan.key,
+                        close_reason.unwrap_or("unknown"),
+                        if use_market { "taker" } else { "maker_first" },
+                    );
                     let (legs, exit_taker_takeover_at) = match self
-                        .close_pair_orders(&plan.pair, direction, qtys, price_map, force)
+                        .close_pair_orders(&plan.pair, direction, qtys, price_map, use_market)
                         .await
                     {
                         Ok(out) => out,

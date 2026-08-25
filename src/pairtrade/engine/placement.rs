@@ -54,7 +54,7 @@ struct PostOnlyOrderRequest<'a> {
     side: dex_connector::OrderSide,
     reduce_only: bool,
     prices: &'a HashMap<String, SymbolSnapshot>,
-    allow_post_only: bool,
+    post_only_requested: bool,
     max_post_only_attempts: usize,
     fallback_to_taker: bool,
     capital_guard_inst_idx: Option<usize>,
@@ -778,12 +778,12 @@ impl PairTradeEngine {
             side,
             reduce_only,
             prices,
-            allow_post_only,
+            post_only_requested,
             max_post_only_attempts,
             fallback_to_taker,
             capital_guard_inst_idx,
         } = request;
-        let use_post_only = allow_post_only && self.should_post_only();
+        let use_post_only = post_only_requested && self.post_only_supported();
         let max_attempts = max_post_only_attempts.max(1);
         let max_elapsed = Duration::from_millis(POST_ONLY_RETRY_MAX_ELAPSED_MS);
         let start = Instant::now();
@@ -811,12 +811,15 @@ impl PairTradeEngine {
         let last_err = loop {
             attempt += 1;
             let (limit, submit_snapshot) = if use_post_only {
-                match self.refreshed_limit_price(symbol, side, prices).await {
+                match self
+                    .refreshed_limit_price_for_mode(symbol, side, prices, true)
+                    .await
+                {
                     Some(pricing) => (Some(pricing.limit), pricing.submit_snapshot),
                     None => (None, None),
                 }
             } else {
-                (self.limit_price_for(symbol, side, prices), None)
+                (self.limit_price_for_mode(symbol, side, prices, false), None)
             };
             if use_post_only && limit.is_none() {
                 // A later retry's own pricing failure (not attempt 1's,
@@ -1094,7 +1097,7 @@ impl PairTradeEngine {
                 side: side_a,
                 reduce_only: false,
                 prices,
-                allow_post_only: true,
+                post_only_requested: post_only,
                 max_post_only_attempts: entry_attempts,
                 fallback_to_taker: false,
                 capital_guard_inst_idx: Some(inst_idx),
@@ -1138,7 +1141,7 @@ impl PairTradeEngine {
                 side: side_b,
                 reduce_only: false,
                 prices,
-                allow_post_only: true,
+                post_only_requested: post_only,
                 max_post_only_attempts: entry_attempts,
                 fallback_to_taker: false,
                 capital_guard_inst_idx: Some(inst_idx),
@@ -1286,8 +1289,11 @@ impl PairTradeEngine {
         use_market: bool,
     ) -> Result<(Vec<PendingLeg>, Option<Instant>)> {
         let (side_a, side_b) = Self::exit_sides_for(direction);
-        let ref_price_a = self.order_reference_price(&pair.base, side_a, prices);
-        let ref_price_b = self.order_reference_price(&pair.quote, side_b, prices);
+        let post_only = !use_market && self.should_post_only_exit();
+        let ref_price_a =
+            self.order_reference_price_for_mode(&pair.base, side_a, prices, post_only);
+        let ref_price_b =
+            self.order_reference_price_for_mode(&pair.quote, side_b, prices, post_only);
         let qty_a = self.quantize_order_size_close(&pair.base, qtys.0, prices);
         let qty_b = self.quantize_order_size_close(&pair.quote, qtys.1, prices);
         if qty_a != qtys.0 {
@@ -1309,14 +1315,13 @@ impl PairTradeEngine {
         let limit_a = if use_market {
             None
         } else {
-            self.limit_price_for(&pair.base, side_a, prices)
+            self.limit_price_for_mode(&pair.base, side_a, prices, post_only)
         };
         let limit_b = if use_market {
             None
         } else {
-            self.limit_price_for(&pair.quote, side_b, prices)
+            self.limit_price_for_mode(&pair.quote, side_b, prices, post_only)
         };
-        let post_only = !use_market && self.should_post_only();
         log::debug!(
             "[ORDER_PARAMS][EXIT] pair={}/{} side_a={:?} qty_a={} ref_price_a={} limit_a={:?} side_b={:?} qty_b={} ref_price_b={} limit_b={:?} post_only={}",
             pair.base,
@@ -1363,7 +1368,7 @@ impl PairTradeEngine {
                     side: side_a,
                     reduce_only: true,
                     prices,
-                    allow_post_only: true,
+                    post_only_requested: post_only,
                     max_post_only_attempts: POST_ONLY_EXIT_ATTEMPTS,
                     fallback_to_taker: true,
                     capital_guard_inst_idx: None,
@@ -1445,7 +1450,7 @@ impl PairTradeEngine {
                     side: side_b,
                     reduce_only: true,
                     prices,
-                    allow_post_only: true,
+                    post_only_requested: post_only,
                     max_post_only_attempts: POST_ONLY_EXIT_ATTEMPTS,
                     fallback_to_taker: true,
                     capital_guard_inst_idx: None,
@@ -1527,14 +1532,11 @@ impl PairTradeEngine {
             }
         }
 
-        // bot-strategy#306 / #408: on fee-bearing venues (Extended) where the
-        // exit went out post-only, schedule a deadline at which the reconcile
-        // loop will cancel the resting legs and reissue as taker. Frankfurt
-        // (fee_bps=0) takes the use_market / non-post-only path above, so no
-        // leg is post-only and `takeover_at` stays None — Frankfurt behavior
-        // is unchanged regardless of the configured timeout. Prior to #408
-        // this was a synchronous in-step monitor that blocked `step()` for
-        // the full timeout and caused STEP_OVERRUN warns.
+        // bot-strategy#306 / #408 / #860: when the exit went out post-only,
+        // schedule a deadline at which the reconcile loop cancels resting
+        // legs and reissues as taker. Fee-bearing venues retain their legacy
+        // behavior; zero-fee venues need the explicit exit-only opt-in.
+        // Prior to #408 this monitor blocked `step()` synchronously.
         let exit_timeout = self.cfg.default_pair_params.exit_post_only_timeout_secs;
         let exit_post_only = legs.iter().any(|leg| leg.post_only);
         let takeover_at = if exit_post_only && exit_timeout > 0 {

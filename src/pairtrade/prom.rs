@@ -645,6 +645,14 @@ pub static LEG_FILL_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     )
 });
 
+pub static EXIT_POST_ONLY_TAKEOVER_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter(
+        "pairtrade_exit_post_only_takeover_total",
+        "Post-only exit deadlines that fired and reissued remaining legs as taker.",
+        &["variant", "pair"],
+    )
+});
+
 pub static STEP_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram(
         "pairtrade_step_duration_seconds",
@@ -816,6 +824,22 @@ pub static EFFECTIVE_FROZEN_BETA_EXIT_Z: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
 });
 
+pub static EFFECTIVE_EXIT_POST_ONLY_ENABLED: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge(
+        "pairtrade_effective_exit_post_only_enabled",
+        "1 when the running process allows maker-first exits on zero-fee venues.",
+        &["variant"],
+    )
+});
+
+pub static EFFECTIVE_EXIT_POST_ONLY_TIMEOUT_SECS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge(
+        "pairtrade_effective_exit_post_only_timeout_secs",
+        "Effective maker-first exit deadline before taker takeover, in seconds.",
+        &["variant"],
+    )
+});
+
 pub static EFFECTIVE_INELIGIBLE_CLOSE_DEFER_CAP_SECS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge(
         "pairtrade_effective_ineligible_close_defer_cap_secs",
@@ -976,6 +1000,8 @@ pub fn record_config_info(
     sizing_beta_floor: f64,
     exit_on_sizing_beta_floor: bool,
     frozen_beta_exit_z: bool,
+    exit_post_only_enabled: bool,
+    exit_post_only_timeout_secs: u64,
     equity_reference_usd: f64,
     max_leverage: f64,
     ineligible_close_defer_cap_secs: i64,
@@ -1010,6 +1036,12 @@ pub fn record_config_info(
     EFFECTIVE_FROZEN_BETA_EXIT_Z
         .with_label_values(&[variant])
         .set(if frozen_beta_exit_z { 1 } else { 0 });
+    EFFECTIVE_EXIT_POST_ONLY_ENABLED
+        .with_label_values(&[variant])
+        .set(if exit_post_only_enabled { 1 } else { 0 });
+    EFFECTIVE_EXIT_POST_ONLY_TIMEOUT_SECS
+        .with_label_values(&[variant])
+        .set(exit_post_only_timeout_secs as f64);
     // Every field committed in round.json must be assertable from /metrics at
     // boot (bot-strategy#580 review). equity_reference_usd / max_leverage are
     // also refreshed per-tick in prom_metrics.rs; stamping them here makes the

@@ -115,6 +115,31 @@ pub(super) fn risk_exit_reason(check: ExitCheck<'_>) -> Option<&'static str> {
     pnl_risk_exit(cfg, pp, compute_pnl(pos, p1.price, p2.price), equity_base)
 }
 
+/// Decide whether an exit must bypass maker-first placement. Only explicitly
+/// non-urgent timing/signal exits may rest post-only; unknown reasons fail
+/// safe to an immediate taker close. Startup/shutdown/recovery flattening uses
+/// separate direct-market paths and never reaches this helper.
+pub(super) fn exit_requires_immediate_market(reason: Option<&str>) -> bool {
+    !matches!(
+        reason,
+        Some("force_close" | "exit_z" | "expected_value" | "ineligible")
+    )
+}
+
+/// Preserve the legacy `force` switch unless the deployment explicitly opts
+/// into #860's reason-based maker-first exit policy.
+pub(super) fn exit_uses_market(
+    maker_first_opt_in: bool,
+    reason: Option<&str>,
+    legacy_force: bool,
+) -> bool {
+    if maker_first_opt_in {
+        exit_requires_immediate_market(reason)
+    } else {
+        legacy_force
+    }
+}
+
 /// Hold-time beta collapse guard (bot-strategy#824). This is deliberately a
 /// close trigger rather than a resize: the normal exit path then unwinds the
 /// exchange/recorded entry quantities and cannot leave a residual leg.
@@ -249,5 +274,31 @@ mod tests {
         assert!(!beta_floor_exit_due(&params(true, 0.0), 0.0));
         assert!(!beta_floor_exit_due(&params(true, f64::NAN), 0.3));
         assert!(!beta_floor_exit_due(&params(true, 0.6), f64::NAN));
+    }
+
+    #[test]
+    fn maker_first_is_limited_to_non_urgent_exit_reasons() {
+        for reason in ["force_close", "exit_z", "expected_value", "ineligible"] {
+            assert!(!exit_requires_immediate_market(Some(reason)), "{reason}");
+        }
+        for reason in [
+            "stop_loss_z",
+            "beta_floor",
+            "max_loss_r",
+            "risk_budget",
+            "maintenance_preempt",
+            "unknown",
+        ] {
+            assert!(exit_requires_immediate_market(Some(reason)), "{reason}");
+        }
+        assert!(exit_requires_immediate_market(None));
+    }
+
+    #[test]
+    fn non_opted_in_deployments_keep_legacy_force_semantics() {
+        assert!(exit_uses_market(false, Some("force_close"), true));
+        assert!(!exit_uses_market(false, Some("stop_loss_z"), false));
+        assert!(!exit_uses_market(true, Some("force_close"), true));
+        assert!(exit_uses_market(true, Some("stop_loss_z"), false));
     }
 }

@@ -67,6 +67,7 @@ pub(in crate::pairtrade) struct DummyConnector {
     /// failure so the cancel+reissue fallback can be exercised.
     modify_calls: Mutex<Vec<ModifyCall>>,
     cancel_order_calls: AtomicUsize,
+    cancel_orders_calls: AtomicUsize,
     modify_should_fail: AtomicBool,
     reject_priced_orders: AtomicBool,
     /// Codex review PR #159: count of `get_ticker` calls and an optional
@@ -412,6 +413,7 @@ impl DexConnector for DummyConnector {
         _symbol: Option<String>,
         _order_ids: Vec<String>,
     ) -> Result<(), DexError> {
+        self.cancel_orders_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1820,6 +1822,96 @@ async fn place_pair_orders_unlatches_guard_when_a_later_retry_loses_pricing() {
     );
 }
 
+fn maker_exit_test_prices() -> HashMap<String, SymbolSnapshot> {
+    HashMap::from([
+        ("AAA".to_string(), snapshot_721("100.0")),
+        ("BBB".to_string(), snapshot_721("50.0")),
+    ])
+}
+
+fn maker_exit_test_pair() -> PairSpec {
+    PairSpec {
+        base: "AAA".to_string(),
+        quote: "BBB".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn zero_fee_exit_post_only_opt_in_is_bounded() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 0.0;
+    engine.cfg.default_pair_params.exit_post_only_enabled = true;
+    engine.cfg.default_pair_params.exit_post_only_timeout_secs = 15;
+
+    let (legs, takeover_at) = engine
+        .close_pair_orders(
+            &maker_exit_test_pair(),
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &maker_exit_test_prices(),
+            false,
+        )
+        .await
+        .expect("zero-fee maker-first close should succeed");
+
+    assert_eq!(legs.len(), 2);
+    assert!(legs.iter().all(|leg| leg.post_only));
+    assert!(legs.iter().all(|leg| leg.limit_price.is_some()));
+    assert!(takeover_at.is_some());
+}
+
+#[tokio::test]
+async fn zero_fee_exit_opt_in_does_not_change_entry_mode() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 0.0;
+    engine.cfg.default_pair_params.exit_post_only_enabled = true;
+    engine.cfg.default_pair_params.exit_post_only_timeout_secs = 15;
+
+    let legs = engine
+        .place_pair_orders(
+            0,
+            &maker_exit_test_pair(),
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &maker_exit_test_prices(),
+        )
+        .await
+        .expect("entry should preserve the existing zero-fee mode");
+
+    assert_eq!(legs.len(), 2);
+    assert!(legs.iter().all(|leg| !leg.post_only));
+}
+
+#[tokio::test]
+async fn immediate_market_exit_bypasses_zero_fee_post_only_opt_in() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector);
+    engine.cfg.dex_name = "lighter".to_string();
+    engine.cfg.fee_bps = 0.0;
+    engine.cfg.default_pair_params.exit_post_only_enabled = true;
+    engine.cfg.default_pair_params.exit_post_only_timeout_secs = 15;
+
+    let (legs, takeover_at) = engine
+        .close_pair_orders(
+            &maker_exit_test_pair(),
+            PositionDirection::LongSpread,
+            (dec("0.010"), dec("0.020")),
+            &maker_exit_test_prices(),
+            true,
+        )
+        .await
+        .expect("emergency close should use the immediate market path");
+
+    assert_eq!(legs.len(), 2);
+    assert!(legs.iter().all(|leg| !leg.post_only));
+    assert!(legs.iter().all(|leg| leg.limit_price.is_none()));
+    assert!(takeover_at.is_none());
+}
+
 #[tokio::test]
 async fn close_pair_orders_records_taker_mode_after_post_only_fallback() {
     let connector = Arc::new(DummyConnector::default());
@@ -3054,6 +3146,66 @@ async fn market_takeover_recomputes_remaining_after_cancel_ack() {
     assert_eq!(side, OrderSide::Short);
     assert_eq!(price, None, "takeover order must be MARKET");
     assert!(!reduce_only);
+}
+
+/// Exit-side maker timeout must cancel the resting order, await the
+/// acknowledgement, and recompute the MARKET remainder from the refreshed
+/// fill snapshot. This locks the post-only takeover against late-fill races.
+#[tokio::test]
+async fn exit_takeover_recomputes_remaining_after_cancel_ack() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec![], vec![("exit-leg".to_string(), dec("0.5"))]]),
+    );
+    connector.open_ids_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from(vec![vec!["exit-leg".to_string()], vec![]]),
+    );
+
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    seed_state(&mut engine, "AAA/BBB");
+    let mut leg = entry_leg_721("BBB", "exit-leg", "2.0", OrderSide::Long);
+    leg.reduce_only = true;
+    leg.post_only = true;
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_exit = Some(PendingOrders {
+        legs: vec![leg],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: Some(Instant::now() - Duration::from_secs(1)),
+    });
+    let mut price_map = HashMap::new();
+    price_map.insert("BBB".to_string(), snapshot_721("2000.0"));
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        connector.cancel_orders_calls.load(Ordering::SeqCst),
+        1,
+        "resting post-only exit must be cancelled before taker takeover"
+    );
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "exactly one MARKET reissue expected");
+    let (symbol, size, side, price, reduce_only) = calls[0].clone();
+    assert_eq!(symbol, "BBB");
+    assert_eq!(
+        size,
+        dec("1.5"),
+        "replacement must subtract the late fill observed after cancellation"
+    );
+    assert_eq!(side, OrderSide::Long);
+    assert_eq!(price, None, "takeover order must be MARKET");
+    assert!(reduce_only, "exit takeover must remain reduce-only");
 }
 
 /// Defense layer, short-leg direction (the live 2026-07-08 shape): the

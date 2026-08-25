@@ -70,15 +70,18 @@ pub(super) const DEFAULT_CB_TIER1_COOLDOWN_SECS: u64 = 0;
 pub(super) const DEFAULT_CB_TIER2_LOSSES: u32 = 0;
 pub(super) const DEFAULT_CB_TIER2_COOLDOWN_SECS: u64 = 0;
 pub(super) const DEFAULT_ENTRY_POST_ONLY_TIMEOUT_SECS: u64 = 0;
+/// Opt zero-fee venues into maker-first exit placement. Default false keeps
+/// every existing venue on its current execution path; selected deployments
+/// must explicitly enable it together with a bounded exit takeover timeout.
+/// See bot-strategy#860.
+pub(super) const DEFAULT_EXIT_POST_ONLY_ENABLED: bool = false;
 /// Per-leg fill timeout for exit post-only orders (seconds). After both exit
 /// legs are placed as post-only limits, the bot polls fill state and, once
 /// this many seconds have elapsed, cancels any leg still resting unfilled and
 /// re-places it as a taker (market) order. 0 disables the monitor entirely
 /// (legacy behavior: post-only legs rest until they fill or the next pair
-/// cycle replaces them). The monitor is also gated on
-/// `should_post_only() == true` (i.e. `fee_bps > 0`), so on Frankfurt
-/// (fee_bps=0) this knob has no effect regardless of the configured value.
-/// See bot-strategy#306.
+/// cycle replaces them). Zero-fee venues only enter this path when
+/// `exit_post_only_enabled=true`. See bot-strategy#306/#860.
 pub(super) const DEFAULT_EXIT_POST_ONLY_TIMEOUT_SECS: u64 = 0;
 // EXIT_FILL_POLL_MS / EXIT_CANCEL_SETTLE_MS were the in-step
 // `monitor_exit_legs_with_timeout` polling constants and were removed when
