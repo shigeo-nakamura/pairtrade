@@ -972,32 +972,19 @@ impl PairTradeEngine {
                             }
                         }
                         if fire_close {
-                            // Preserve the dedicated #824 attribution when a
-                            // beta jump crosses the floor and eligibility on
-                            // the same evaluation tick. Other risk exits keep
-                            // the established ineligible attribution.
+                            // Preserve any simultaneous risk attribution when
+                            // eligibility breaks on the same tick. Besides
+                            // keeping stop-loss metrics/cooldown correct, this
+                            // makes the execution layer bypass maker-first for
+                            // stop_loss_z / beta_floor / max_loss_r /
+                            // risk_budget instead of treating the close as a
+                            // non-urgent ineligible flatten.
                             //
-                            // `risk_exit_full` (unlike the deferral-gated
-                            // `risk_exit` above) is always computed, so it
-                            // always applies risk_exit_reason's own
-                            // precedence (stop_loss_z before beta_floor). A
-                            // `Some(_)` other than `Some("beta_floor")` means
-                            // a higher-precedence risk reason fired and must
-                            // not be relabeled — doing so would drop the
-                            // close from stop-loss metrics and skip arming
-                            // `stop_loss_cooldown_secs`, permitting an early
-                            // same-direction re-entry (Codex review). Using
-                            // the deferral-gated `risk_exit` here instead
-                            // would undercount `beta_floor` whenever
-                            // `ineligible_close_defer_cap_secs=0` (the
-                            // default), since that variable is forced to
-                            // `None` in that configuration regardless of the
-                            // actual risk state.
-                            let close_reason = if risk_exit_full == Some("beta_floor") {
-                                "beta_floor"
-                            } else {
-                                "ineligible"
-                            };
+                            // Use `risk_exit_full`, not the deferral-gated
+                            // `risk_exit`: the latter is forced to `None` when
+                            // the book-quality guard is disabled even if an
+                            // urgent risk gate is active.
+                            let close_reason = risk_exit_full.unwrap_or("ineligible");
                             log::info!("[EXIT_CHECK] {} reason={}", key, close_reason);
                             // Deliberately NOT clearing ineligible_defer_since_ts
                             // here: planning only proposes the close, and a

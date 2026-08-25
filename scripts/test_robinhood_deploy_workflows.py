@@ -99,5 +99,10 @@ assert "DEBOT_ROBINHOOD_RUNTIME_DIR" in launcher
 assert "exec \"$RUNTIME_DIR/bin/debot\"" in launcher
 assert "export LIGHTER_GO_PATH=\"$RUNTIME_DIR/lib\"" in launcher
 assert "exec /opt/debot/bin/debot" not in launcher
+variant_loader = launcher.split("vars_for_variant() {", 1)[1].split("while IFS=", 1)[0]
+assert "unset LIGHTER_PUBLIC_API_KEY LIGHTER_PRIVATE_API_KEY" in variant_loader
+assert variant_loader.index("unset LIGHTER_PUBLIC_API_KEY") < variant_loader.index(
+    'source "$1"'
+)
 
 print("Robinhood atomic deploy workflow tests passed")

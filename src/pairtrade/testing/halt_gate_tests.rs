@@ -2679,6 +2679,12 @@ fn defer_count(instance_id: &str, reason: &str) -> u64 {
         .get()
 }
 
+fn close_reason_count(instance_id: &str, reason: &str) -> u64 {
+    prom::CLOSE_REASON_TOTAL
+        .with_label_values(&[instance_id, PAIR_KEY, reason])
+        .get()
+}
+
 /// Shared setup: engine with the guard enabled, a fresh held position
 /// (age 5s, far below force_close_secs=60), the pair forced ineligible,
 /// and a 40 bps book (above the 20 bps guard threshold, below the 200 bps
@@ -2974,6 +2980,8 @@ async fn ineligible_close_bypasses_deferral_when_risk_exit_pending() {
         state.position.as_mut().unwrap().entry_price_a = Some(dec("400"));
     }
     let deferred_before = defer_count("hg-inelig-risk", "spread");
+    let risk_reason_before = close_reason_count("hg-inelig-risk", "max_loss_r");
+    let ineligible_reason_before = close_reason_count("hg-inelig-risk", "ineligible");
 
     h.step().await;
     assert!(
@@ -2984,6 +2992,16 @@ async fn ineligible_close_bypasses_deferral_when_risk_exit_pending() {
         defer_count("hg-inelig-risk", "spread"),
         deferred_before,
         "the bypass must not count as a deferral"
+    );
+    assert_eq!(
+        close_reason_count("hg-inelig-risk", "max_loss_r"),
+        risk_reason_before + 1,
+        "the simultaneous max-loss reason must reach execution attribution"
+    );
+    assert_eq!(
+        close_reason_count("hg-inelig-risk", "ineligible"),
+        ineligible_reason_before,
+        "an urgent risk exit must not be downgraded to maker-first ineligible"
     );
     assert!(
         h.engine.instances[0].states[PAIR_KEY]

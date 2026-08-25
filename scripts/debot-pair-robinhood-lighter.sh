@@ -36,6 +36,12 @@ set +a
 vars_for_variant() {
   (
     suffix="$2"
+    # Do not let the subshell inherit freq's unsuffixed credentials. The
+    # variant file must provide its own keys or the fail-loud check below
+    # must reject startup.
+    unset LIGHTER_PUBLIC_API_KEY LIGHTER_PRIVATE_API_KEY \
+          LIGHTER_API_KEY_INDEX LIGHTER_WALLET_ADDRESS \
+          LIGHTER_EVM_WALLET_PRIVATE_KEY LIGHTER_ACCOUNT_INDEX
     # shellcheck disable=SC1090
     source "$1" >/dev/null 2>&1
     for var in LIGHTER_PUBLIC_API_KEY LIGHTER_PRIVATE_API_KEY \
