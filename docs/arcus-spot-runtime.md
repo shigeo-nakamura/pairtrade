@@ -530,9 +530,15 @@ Every decision checkpointed by `live-tick` or the shared-state
 `arcus-spot-propose-plan propose` command is also appended while holding the
 checkpoint namespace lock to a private, daily, hash-chained event stream under
 `/var/lib/debot-arcus/spot-execute-once/live-tick-events/`. Checkpoint
-publication precedes the append: a crash in that narrow boundary fails the
-oneshot, and the following run refuses the visible sequence gap instead of
-silently blessing an incomplete replay. The separate
+publication is wrapped in a recoverable protocol: the writer first atomically
+stages the exact event and its hash in the sibling mode-0600
+`live-tick-event-pending.json`, publishes the checkpoint, appends and fsyncs the
+event stream, then removes and directory-fsyncs the pending sidecar. Before any
+new snapshot, the next writer completes an event whose checkpoint committed,
+discards an advancing event whose checkpoint did not commit, or only clears an
+event already present at the stream tail. State backup refuses an unresolved
+sidecar. A crash can therefore neither replace the checkpointed payload with a
+later stale observation nor duplicate an already-appended event. The separate
 `archive-arcus-live-tick-events.timer` verifies each closed UTC day and writes
 an immutable compressed segment plus integrity manifest to the private
 `debot-dashboard/arcus-archive/live-tick-events/debot-arcus/` prefix.

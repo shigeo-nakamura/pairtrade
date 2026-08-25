@@ -22,9 +22,9 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use debot::arcus_spot::{
-    replay_jsonl, ArcusSpotDecision, ArcusSpotExecutionLedgerStore, ArcusSpotLiveTickEventStream,
-    ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig,
-    ArcusSpotRuntimeMode,
+    replay_jsonl, ArcusSpotDecision, ArcusSpotExecutionLedgerStore,
+    ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventStream, ArcusSpotRuntime,
+    ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode,
 };
 use dex_connector::{
     ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig,
@@ -116,6 +116,16 @@ fn runtime_event_stream(runtime_state_path: &Path) -> Result<ArcusSpotLiveTickEv
     ))
 }
 
+fn runtime_event_publisher(runtime_state_path: &Path) -> Result<ArcusSpotLiveTickEventPublisher> {
+    let parent = runtime_state_path
+        .parent()
+        .context("Arcus runtime_state_path has no parent")?;
+    Ok(ArcusSpotLiveTickEventPublisher::new(
+        runtime_event_stream(runtime_state_path)?,
+        parent.join("live-tick-event-pending.json"),
+    ))
+}
+
 fn lexically_normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -175,7 +185,8 @@ fn validate_runtime_state_path(runtime_state_path: &Path) -> Result<()> {
         bail!("Arcus runtime_state_path must be absolute");
     }
     let evidence_path = observation_evidence_path(runtime_state_path)?;
-    let stream = runtime_event_stream(runtime_state_path)?;
+    let publisher = runtime_event_publisher(runtime_state_path)?;
+    let stream = publisher.stream();
     if paths_alias(runtime_state_path, &evidence_path) {
         bail!(
             "Arcus runtime_state_path must not alias the derived observation evidence path {}",
@@ -184,6 +195,8 @@ fn validate_runtime_state_path(runtime_state_path: &Path) -> Result<()> {
     }
     if paths_alias(runtime_state_path, stream.directory())
         || paths_alias(&evidence_path, stream.directory())
+        || paths_alias(runtime_state_path, publisher.pending_path())
+        || paths_alias(&evidence_path, publisher.pending_path())
     {
         bail!(
             "Arcus runtime_state_path must not alias the derived event-stream directory {}",
@@ -202,7 +215,8 @@ fn validate_plan_output_path(runtime_state_path: &Path, out_path: &Path) -> Resu
             .join(out_path)
     };
     let evidence_path = observation_evidence_path(runtime_state_path)?;
-    let stream = runtime_event_stream(runtime_state_path)?;
+    let publisher = runtime_event_publisher(runtime_state_path)?;
+    let stream = publisher.stream();
     let parent = runtime_state_path
         .parent()
         .context("Arcus runtime_state_path has no parent")?;
@@ -217,6 +231,7 @@ fn validate_plan_output_path(runtime_state_path: &Path, out_path: &Path) -> Resu
         || paths_alias(&absolute_out, &evidence_path)
         || paths_alias(&absolute_out, &lock_path)
         || resolved_output.starts_with(&resolved_stream)
+        || paths_alias(&absolute_out, publisher.pending_path())
     {
         bail!(
             "PLAN_JSON_OUT {} must not alias Arcus runtime state or reside in its event-stream directory",
@@ -369,6 +384,13 @@ fn bootstrap(config_path: &str, samples_path: &str) -> Result<()> {
             stream.directory().display()
         );
     }
+    let publisher = runtime_event_publisher(&config.runtime_state_path)?;
+    if publisher.pending_path().exists() {
+        bail!(
+            "pending durable event {} already exists; bootstrap refuses to orphan recovery state",
+            publisher.pending_path().display()
+        );
+    }
     let mut runtime = ArcusSpotRuntime::new(config.runtime.clone()).map_err(anyhow::Error::msg)?;
     let file =
         fs::File::open(samples_path).with_context(|| format!("failed to open {samples_path}"))?;
@@ -399,6 +421,10 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
     let _lock = lock_runtime_checkpoint(&config.runtime_state_path)?;
     let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
     let mut runtime = store.load_or_create(&config.runtime)?;
+    let event_publisher = runtime_event_publisher(&config.runtime_state_path)?;
+    event_publisher
+        .recover(runtime.state().sequence)
+        .context("failed to recover Arcus pending durable event")?;
 
     let client = ArcusSpotClient::new(config.router.clone())
         .context("invalid Arcus router configuration")?;
@@ -436,14 +462,17 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
     // warm up and stay warm across repeated propose invocations, and lets a
     // real risk-halt engagement observed here survive to the next
     // invocation instead of being silently discarded.
+    event_publisher
+        .stage(&event)
+        .context("failed to stage Arcus durable event before checkpoint")?;
     store.persist(&runtime)?;
     // `propose` shares both the checkpoint and its signal history with
     // `live-tick`. Publish the exact event under that same namespace lock so
     // neither writer can create a replay gap or substitute a later stale event
     // for the observation that actually advanced the shared signal window.
-    runtime_event_stream(&config.runtime_state_path)?
-        .append(&event)
-        .context("failed to append the Arcus shared-runtime durable event")?;
+    event_publisher
+        .commit(&event)
+        .context("failed to commit the Arcus shared-runtime durable event")?;
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -629,15 +658,29 @@ runtime_state_path: relative/path.json
     }
 
     #[test]
+    fn runtime_event_publisher_uses_a_sibling_pending_file() {
+        let publisher = runtime_event_publisher(Path::new("/var/lib/arcus/runtime.json")).unwrap();
+        assert_eq!(
+            publisher.pending_path(),
+            Path::new("/var/lib/arcus/live-tick-event-pending.json")
+        );
+    }
+
+    #[test]
     fn plan_output_rejects_checkpoint_and_observation_evidence_paths() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_path = dir.path().join("runtime.json");
         let evidence_path = observation_evidence_path(&runtime_path).unwrap();
+        let pending_event_path = runtime_event_publisher(&runtime_path)
+            .unwrap()
+            .pending_path()
+            .to_path_buf();
         let lock_path = dir.path().join(".runtime.json.lock");
 
         assert!(validate_plan_output_path(&runtime_path, &runtime_path).is_err());
         assert!(validate_plan_output_path(&runtime_path, &evidence_path).is_err());
         assert!(validate_plan_output_path(&runtime_path, &lock_path).is_err());
+        assert!(validate_plan_output_path(&runtime_path, &pending_event_path).is_err());
         assert!(validate_plan_output_path(
             &runtime_path,
             &dir.path().join("live-tick-events/2026-08-25.jsonl"),

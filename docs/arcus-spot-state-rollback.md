@@ -24,6 +24,7 @@ instead the manifest binds its canonical SHA-256 digest.
 | Recovery evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-pending-plan.json` | optional schema-1 envelope: exact plan, recorder snapshot and evaluation time needed by `auto-resume` and continuity verification |
 | Observation evidence | `/var/lib/debot-arcus/spot-execute-once/live-tick-observation-evidence.json` | optional schema-2 sidecar: latest sequence-advancing recorder snapshot, evaluation time and resulting runtime sequence/watermark; schema 1 remains readable only as an unchanged backup baseline |
 | Durable replay stream | `/var/lib/debot-arcus/spot-execute-once/live-tick-events/YYYY-MM-DD.jsonl` | append-only schema-1 runtime events with payload and cross-record SHA-256 chain; replay evidence, never a restore target |
+| Pending replay event | `/var/lib/debot-arcus/spot-execute-once/live-tick-event-pending.json` | mode-0600 exact event+hash staged before checkpoint publication and removed only after stream fsync; recovered under the namespace lock before any new observation |
 | Namespace lock | `/var/lib/debot-arcus/spot-execute-once/.runtime_state.json.lock` | mode-0600 process lock shared by live-tick, execute/resume, proposer and state tooling |
 
 Checkpoint and ledger stores already use create-new temporary files, file
@@ -32,6 +33,9 @@ pending recovery and observation evidence while holding the checkpoint
 namespace lock; `arcus-spot-propose-plan propose` writes the same observation
 evidence whenever it advances that shared checkpoint. Both writers append the
 resulting runtime event to the same durable stream before releasing that lock.
+They stage an exact hashed pending event before the checkpoint rename and
+recover it before processing a new snapshot, so a crash cannot substitute a
+later stale observation. State backup refuses an unresolved pending event.
 A backup therefore
 observes a lock-consistent boundary. Backup schema 3 hashes and copies both
 optional sidecars and rejects observation evidence whose schema-1 snapshot
