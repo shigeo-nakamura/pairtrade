@@ -30,7 +30,9 @@ Checkpoint and ledger stores already use create-new temporary files, file
 `fsync`, atomic rename and parent-directory `fsync`. `live-tick` writes the
 pending recovery and observation evidence while holding the checkpoint
 namespace lock; `arcus-spot-propose-plan propose` writes the same observation
-evidence whenever it advances that shared checkpoint. A backup therefore
+evidence whenever it advances that shared checkpoint. Both writers append the
+resulting runtime event to the same durable stream before releasing that lock.
+A backup therefore
 observes a lock-consistent boundary. Backup schema 3 hashes and copies both
 optional sidecars and rejects observation evidence whose schema-1 snapshot
 watermark or schema-2 result boundary does not match the checkpoint. If evidence

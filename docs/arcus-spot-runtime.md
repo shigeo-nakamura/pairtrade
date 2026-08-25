@@ -526,7 +526,8 @@ active/enabled state; it never enables, disables, starts, stops, or restarts
 the timer/service and never invokes the executor. A new host therefore remains
 inactive until an operator makes a separate, explicit activation decision.
 
-Every checkpointed live-tick decision is also appended while holding the
+Every decision checkpointed by `live-tick` or the shared-state
+`arcus-spot-propose-plan propose` command is also appended while holding the
 checkpoint namespace lock to a private, daily, hash-chained event stream under
 `/var/lib/debot-arcus/spot-execute-once/live-tick-events/`. Checkpoint
 publication precedes the append: a crash in that narrow boundary fails the
