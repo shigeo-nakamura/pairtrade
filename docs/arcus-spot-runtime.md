@@ -537,8 +537,11 @@ silently blessing an incomplete replay. The separate
 an immutable compressed segment plus integrity manifest to the private
 `debot-dashboard/arcus-archive/live-tick-events/debot-arcus/` prefix.
 Its catch-up scan walks every UTC date from the first segment through yesterday
-and fails closed if a date is missing, rather than misrepresenting lost evidence
-as an empty observation day.
+using a private, fsynced start-date marker that is not recalculated from the
+remaining segment filenames. It fails closed if a date is missing, rather than
+misrepresenting lost evidence as an empty observation day. Before publishing a
+later day it also verifies that day's head against both the preceding local
+segment and the preceding immutable archive manifest.
 `deploy-arcus-live-tick-event-archive.yml` installs and enables only that
 archive timer; it never invokes the executor or changes the trading timer.
 Current local/S3 data is retained indefinitely, while noncurrent S3 versions

@@ -25,6 +25,7 @@ previous = None
 for sequence, observed_at in (
     (70, "2026-08-23T23:47:00.123456789Z"),
     (71, "2026-08-24T00:02:00Z"),
+    (72, "2026-08-24T00:07:00Z"),
 ):
     event = {
         "sequence": sequence,
@@ -135,6 +136,33 @@ if STREAM_DIR="$WORK/gapped" run_archive_all; then
   echo "expected the scheduled scan to detect a missing closed day" >&2
   exit 1
 fi
+test "$(cat "$WORK/gapped/.archive-start-date")" = 2026-08-23
+test "$(stat -c %a "$WORK/gapped/.archive-start-date")" = 600
+
+# The lower bound must survive loss of the first segment instead of silently
+# promoting the next surviving filename to the stream start.
+mkdir -p "$WORK/lost-first"
+cp -a "$STREAM_DIR/." "$WORK/lost-first/"
+rm "$WORK/lost-first/2026-08-23.jsonl"
+if STREAM_DIR="$WORK/lost-first" run_archive_all; then
+  echo "expected the durable start marker to detect first-segment loss" >&2
+  exit 1
+fi
+
+# A valid later record cannot make a daily segment publishable after its first
+# record is lost: the predecessor segment/manifest boundary must reject it.
+mkdir -p "$WORK/truncated-first"
+cp -a "$STREAM_DIR/." "$WORK/truncated-first/"
+tail -n +2 "$WORK/truncated-first/2026-08-24.jsonl" \
+  > "$WORK/truncated-first/2026-08-24.jsonl.new"
+mv "$WORK/truncated-first/2026-08-24.jsonl.new" \
+  "$WORK/truncated-first/2026-08-24.jsonl"
+chmod 0600 "$WORK/truncated-first/2026-08-24.jsonl"
+if STREAM_DIR="$WORK/truncated-first" run_archive 2026-08-24; then
+  echo "expected a truncated daily head to fail predecessor verification" >&2
+  exit 1
+fi
+test ! -e "$FAKE_S3/test-private/arcus-archive/live-tick-events/test-host/2026/08/2026-08-24.events.jsonl.gz"
 
 # Regression for Codex P1: one catch-up activation after a multi-day outage
 # must publish every closed segment, not only yesterday.
@@ -158,7 +186,7 @@ S3_PREFIX=arcus-archive/live-tick-events/test-host \
 
 python3 "$REPO_ROOT/scripts/arcus_live_tick_event_stream.py" \
   "$WORK/fetched.jsonl" --manifest-out "$WORK/fetched.manifest.json" >/dev/null
-test "$(wc -l < "$WORK/fetched.jsonl")" -eq 2
+test "$(wc -l < "$WORK/fetched.jsonl")" -eq 3
 test "$(wc -l < "$WORK/fetched.jsonl.manifests.jsonl")" -eq 2
 python3 - "$MANIFEST_23" <<'PY'
 import json
