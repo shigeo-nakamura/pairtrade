@@ -64,6 +64,22 @@ EOF
 chmod +x "$WORK/systemctl"
 : > "$WORK/systemctl.log"
 
+cat > "$WORK/systemd-analyze" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test "$1" = verify
+shift
+test -x "$FAKE_LIBEXEC_DIR/archive_arcus_live_tick_events.sh"
+test -x "$FAKE_LIBEXEC_DIR/arcus_live_tick_event_stream.py"
+for unit in "$@"; do
+  test -f "$unit"
+done
+if [ "${FAIL_ANALYZE:-false}" = true ]; then
+  exit 1
+fi
+EOF
+chmod +x "$WORK/systemd-analyze"
+
 TEST_OWNER=$(id -un)
 TEST_GROUP=$(id -gn)
 run_installer() {
@@ -73,9 +89,10 @@ run_installer() {
   SYSTEMCTL="$WORK/systemctl" \
   SYSTEMCTL_LOG="$WORK/systemctl.log" \
   FAKE_SYSTEMD_DIR="$SYSTEMD" \
+  FAKE_LIBEXEC_DIR="$LIBEXEC" \
   FAKE_ENABLED="$WORK/enabled" \
   FAKE_ACTIVE="$WORK/active" \
-  SYSTEMD_ANALYZE=/bin/true \
+  SYSTEMD_ANALYZE="$WORK/systemd-analyze" \
   INSTALL_OWNER="$TEST_OWNER" \
   INSTALL_GROUP="$TEST_GROUP" \
     bash "$REPO_ROOT/scripts/install_arcus_live_tick_event_archive.sh" "$SOURCE" "$1"
@@ -107,9 +124,10 @@ if FAIL_ENABLE=true \
    SYSTEMCTL="$WORK/systemctl" \
    SYSTEMCTL_LOG="$WORK/systemctl.log" \
    FAKE_SYSTEMD_DIR="$SYSTEMD" \
+   FAKE_LIBEXEC_DIR="$LIBEXEC" \
    FAKE_ENABLED="$WORK/enabled" \
    FAKE_ACTIVE="$WORK/active" \
-   SYSTEMD_ANALYZE=/bin/true \
+   SYSTEMD_ANALYZE="$WORK/systemd-analyze" \
    INSTALL_OWNER="$TEST_OWNER" \
    INSTALL_GROUP="$TEST_GROUP" \
      bash "$REPO_ROOT/scripts/install_arcus_live_tick_event_archive.sh" "$SOURCE" failed; then

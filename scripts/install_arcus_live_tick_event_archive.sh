@@ -43,7 +43,6 @@ if [ "${checksum_names[*]}" != "${expected_names[*]}" ]; then
   exit 2
 fi
 (cd "$SOURCE_DIR" && sha256sum -c release.sha256)
-"$SYSTEMD_ANALYZE" verify "$SOURCE_DIR/$SERVICE" "$SOURCE_DIR/$TIMER"
 
 enabled_before=$("$SYSTEMCTL" is-enabled "$TIMER" 2>&1 || true)
 active_before=$("$SYSTEMCTL" is-active "$TIMER" 2>&1 || true)
