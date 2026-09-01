@@ -19,6 +19,9 @@ REPO_ROOT = SCRIPT_DIR.parent
 MODULE_PATH = SCRIPT_DIR / "engine_b_phase0.py"
 CONFIG_PATH = REPO_ROOT / "configs" / "engine-b" / "phase0.json"
 LOCK_PATH = SCRIPT_DIR / "engine_b_phase0_requirements.txt"
+INSTALLER_PATH = SCRIPT_DIR / "install_engine_b_phase0.sh"
+ARCHIVE_UNIT_PATH = REPO_ROOT / "deploy" / "engine-b-phase0-archive.service"
+DEPLOY_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "deploy-configs.yml"
 
 SPEC = importlib.util.spec_from_file_location("engine_b_phase0", MODULE_PATH)
 assert SPEC and SPEC.loader
@@ -142,6 +145,29 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(engine_b.normalize_exchange_timestamp_us(1_774_884_082_309_144), 1_774_884_082_309_144)
 
 
+class DeploymentTests(unittest.TestCase):
+    def test_installer_records_commit_and_installs_all_units(self) -> None:
+        installer = INSTALLER_PATH.read_text()
+        workflow = DEPLOY_WORKFLOW_PATH.read_text()
+        for unit in (
+            "engine-b-phase0.service",
+            "engine-b-phase0-archive.service",
+            "engine-b-phase0-archive.timer",
+        ):
+            self.assertIn(unit, installer)
+            self.assertIn(f"/tmp/engine-b-phase0-units/{unit}", workflow)
+        self.assertIn("ENGINE_B_PHASE0_CODE_COMMIT", installer)
+        self.assertIn('"$INSTALL_DIR/release.env"', installer)
+        self.assertIn("ENGINE_B_PHASE0_CODE_COMMIT=${GITHUB_SHA}", workflow)
+        self.assertIn("systemctl daemon-reload", installer)
+        self.assertNotIn("systemctl restart", installer)
+        self.assertNotIn("systemctl start", installer)
+
+    def test_archive_deletion_is_disabled_in_unit(self) -> None:
+        unit = ARCHIVE_UNIT_PATH.read_text()
+        self.assertIn("ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false", unit)
+
+
 class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_normalized_public_data_is_persisted(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
@@ -150,6 +176,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             sink = engine_b.DatabaseSink(config, "test-run", "test-commit")
             sink.start()
             recv_us = 1_774_884_082_309_144
+            event_us = recv_us - 5
+            bucket_start_us = event_us - event_us % 60_000_000
             connection = {
                 "id": "connection-1",
                 "venue": "robinhood",
@@ -179,7 +207,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 "trade",
                 {
                     "recv_us": recv_us,
-                    "srv_us": recv_us - 5,
+                    "partition_us": event_us,
+                    "event_ts_us": event_us,
+                    "bucket_start_us": bucket_start_us,
+                    "srv_us": event_us,
                     "connection": connection,
                     "venue": "robinhood",
                     "market_id": 37,
@@ -203,6 +234,90 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(connection_db.execute("SELECT COUNT(*) FROM book_event").fetchone(), (1,))
                 self.assertEqual(connection_db.execute("SELECT COUNT(*) FROM book_level").fetchone(), (2,))
                 self.assertEqual(connection_db.execute("SELECT exchange_trade_id FROM trade").fetchone(), ("123",))
+                self.assertEqual(
+                    connection_db.execute(
+                        "SELECT open, high, low, close, volume, trade_count, is_complete FROM ohlcv_1m"
+                    ).fetchone(),
+                    ("159.71", "159.71", "159.71", "159.71", "1.25", 1, 1),
+                )
+                self.assertEqual(connection_db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+            finally:
+                connection_db.close()
+
+
+    async def test_deduplicates_and_merges_late_trades_in_event_partition(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory)
+            object.__setattr__(config, "database_dir", database_dir)
+            sink = engine_b.DatabaseSink(config, "late-run", "late-commit")
+            sink.start()
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            receive_us = hour_start_us + 3_605_000_000
+            connection = {
+                "id": "connection-late",
+                "venue": "robinhood",
+                "started_us": receive_us,
+                "api_schema_version": config.api_schema_version,
+            }
+
+            def trade_payload(
+                trade_id: str, event_offset_us: int, local_sequence: int,
+                price: str, size: str,
+            ) -> dict[str, object]:
+                event_us = hour_start_us + event_offset_us
+                return {
+                    "recv_us": receive_us + local_sequence,
+                    "partition_us": event_us,
+                    "event_ts_us": event_us,
+                    "bucket_start_us": event_us - event_us % 60_000_000,
+                    "srv_us": event_us,
+                    "connection": connection,
+                    "venue": "robinhood",
+                    "market_id": 37,
+                    "symbol": "SKHY",
+                    "trade_id": trade_id,
+                    "exchange_sequence": str(local_sequence),
+                    "local_sequence": local_sequence,
+                    "price": price,
+                    "size": size,
+                    "aggressor_side": "buy",
+                    "raw_public_json": json.dumps({"trade_id": trade_id}),
+                }
+
+            for payload in (
+                trade_payload("a", 3_570_000_000, 1, "100", "1"),
+                trade_payload("a", 3_570_000_000, 2, "100", "1"),
+                trade_payload("b", 3_550_000_000, 3, "90", "2"),
+                trade_payload("c", 3_590_000_000, 4, "110", "3"),
+            ):
+                await sink.put("trade", payload)
+            await sink.queue.join()
+            await sink.close()
+
+            event_partition = engine_b.partition_for_us(hour_start_us)
+            receive_partition = engine_b.partition_for_us(receive_us)
+            db_path = database_dir / f"engine_b_phase0_{event_partition}.sqlite3"
+            self.assertTrue(db_path.is_file())
+            self.assertFalse(
+                (database_dir / f"engine_b_phase0_{receive_partition}.sqlite3").exists()
+            )
+            connection_db = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(connection_db.execute("SELECT COUNT(*) FROM trade").fetchone(), (3,))
+                self.assertEqual(
+                    connection_db.execute(
+                        """SELECT open, high, low, close, volume, trade_count, is_complete,
+                                  first_trade_ts_us, last_trade_ts_us
+                           FROM ohlcv_1m"""
+                    ).fetchone(),
+                    (
+                        "90", "110", "90", "110", "6", 3, 1,
+                        hour_start_us + 3_550_000_000,
+                        hour_start_us + 3_590_000_000,
+                    ),
+                )
                 self.assertEqual(connection_db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
             finally:
                 connection_db.close()

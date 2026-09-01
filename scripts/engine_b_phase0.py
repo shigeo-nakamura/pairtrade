@@ -42,7 +42,8 @@ LOG = logging.getLogger("engine_b_phase0")
 UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+OHLCV_FINALIZE_GRACE_US = 120_000_000
 
 
 SCHEMA = """
@@ -147,6 +148,8 @@ CREATE TABLE IF NOT EXISTS ohlcv_1m (
   volume TEXT NOT NULL,
   trade_count INTEGER NOT NULL,
   is_complete INTEGER NOT NULL,
+  first_trade_ts_us INTEGER NOT NULL,
+  last_trade_ts_us INTEGER NOT NULL,
   PRIMARY KEY(bucket_start_us, venue, market_id, source)
 );
 
@@ -468,39 +471,6 @@ class BookState:
                 state[price] = size
 
 
-@dataclass
-class BarState:
-    bucket_start_us: int
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
-    volume: Decimal
-    trade_count: int
-
-    def update(self, price: Decimal, size: Decimal) -> None:
-        self.high = max(self.high, price)
-        self.low = min(self.low, price)
-        self.close = price
-        self.volume += size
-        self.trade_count += 1
-
-    def payload(self, venue: str, market: MarketConfig) -> dict[str, Any]:
-        return {
-            "bucket_start_us": self.bucket_start_us,
-            "venue": venue,
-            "market_id": market.market_id,
-            "symbol": market.symbol,
-            "source": "event_derived",
-            "open": format(self.open, "f"),
-            "high": format(self.high, "f"),
-            "low": format(self.low, "f"),
-            "close": format(self.close, "f"),
-            "volume": format(self.volume, "f"),
-            "trade_count": self.trade_count,
-            "is_complete": 0,
-        }
-
 
 class Metrics:
     def __init__(self) -> None:
@@ -622,6 +592,7 @@ class DatabaseSink:
         path = self.config.database_dir / f"engine_b_phase0_{partition}.sqlite3"
         connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         connection.executescript(SCHEMA)
+        self._migrate(connection)
         started_us = now_us()
         connection.execute(
             "INSERT OR IGNORE INTO schema_metadata(schema_version, created_ts_us) VALUES (?, ?)",
@@ -649,6 +620,21 @@ class DatabaseSink:
         self._connections[partition] = connection
         return connection
 
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ohlcv_1m)")
+        }
+        if "first_trade_ts_us" not in columns:
+            connection.execute("ALTER TABLE ohlcv_1m ADD COLUMN first_trade_ts_us INTEGER")
+        if "last_trade_ts_us" not in columns:
+            connection.execute("ALTER TABLE ohlcv_1m ADD COLUMN last_trade_ts_us INTEGER")
+        connection.execute(
+            """UPDATE ohlcv_1m
+               SET first_trade_ts_us = COALESCE(first_trade_ts_us, bucket_start_us),
+                   last_trade_ts_us = COALESCE(last_trade_ts_us, bucket_start_us)
+               WHERE first_trade_ts_us IS NULL OR last_trade_ts_us IS NULL"""
+        )
+
     @staticmethod
     def _ensure_connection(connection: sqlite3.Connection, payload: dict[str, Any]) -> None:
         meta = payload.get("connection")
@@ -673,7 +659,7 @@ class DatabaseSink:
         for kind, payload in batch:
             if kind == "__stop__":
                 continue
-            grouped[partition_for_us(int(payload["recv_us"]))].append((kind, payload))
+            grouped[partition_for_us(int(payload.get("partition_us", payload["recv_us"])))].append((kind, payload))
         for partition, commands in grouped.items():
             connection = self._connection(partition)
             try:
@@ -685,10 +671,81 @@ class DatabaseSink:
             except Exception:
                 connection.rollback()
                 raise
-        today_partition = partition_for_us(now_us())
+        for connection in self._connections.values():
+            self._finalize_ohlcv(connection, now_us())
+            connection.commit()
+        current_partition = partition_for_us(now_us())
         for partition in list(self._connections):
-            if partition < today_partition:
+            if partition < current_partition:
                 self._connections.pop(partition).close()
+
+    @staticmethod
+    def _finalize_ohlcv(connection: sqlite3.Connection, observed_us: int) -> None:
+        final_bucket_cutoff = observed_us - OHLCV_FINALIZE_GRACE_US - 60_000_000
+        connection.execute(
+            """UPDATE ohlcv_1m SET is_complete = 1
+               WHERE is_complete = 0 AND bucket_start_us <= ?""",
+            (final_bucket_cutoff,),
+        )
+
+    @staticmethod
+    def _merge_ohlcv_trade(connection: sqlite3.Connection, payload: dict[str, Any]) -> None:
+        source = "event_derived"
+        key = (
+            payload["bucket_start_us"],
+            payload["venue"],
+            payload["market_id"],
+            source,
+        )
+        existing = connection.execute(
+            """SELECT open, high, low, close, volume, trade_count,
+                      first_trade_ts_us, last_trade_ts_us
+               FROM ohlcv_1m
+               WHERE bucket_start_us = ? AND venue = ? AND market_id = ? AND source = ?""",
+            key,
+        ).fetchone()
+        price = Decimal(payload["price"])
+        size = Decimal(payload["size"])
+        event_ts_us = int(payload["event_ts_us"])
+        if existing is None:
+            price_text = format(price, "f")
+            connection.execute(
+                """INSERT INTO ohlcv_1m(
+                     bucket_start_us, venue, market_id, symbol, source, open, high,
+                     low, close, volume, trade_count, first_trade_ts_us,
+                     last_trade_ts_us, is_complete
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)""",
+                (
+                    payload["bucket_start_us"], payload["venue"], payload["market_id"],
+                    payload["symbol"], source, price_text, price_text, price_text,
+                    price_text, format(size, "f"), event_ts_us, event_ts_us,
+                ),
+            )
+            return
+
+        open_price, high, low, close_price, volume, trade_count, first_ts, last_ts = existing
+        if event_ts_us < int(first_ts):
+            open_price, first_ts = format(price, "f"), event_ts_us
+        if event_ts_us >= int(last_ts):
+            close_price, last_ts = format(price, "f"), event_ts_us
+        connection.execute(
+            """UPDATE ohlcv_1m
+               SET open = ?, high = ?, low = ?, close = ?, volume = ?,
+                   trade_count = ?, first_trade_ts_us = ?, last_trade_ts_us = ?,
+                   is_complete = 0
+               WHERE bucket_start_us = ? AND venue = ? AND market_id = ? AND source = ?""",
+            (
+                open_price,
+                format(max(Decimal(high), price), "f"),
+                format(min(Decimal(low), price), "f"),
+                close_price,
+                format(Decimal(volume) + size, "f"),
+                int(trade_count) + 1,
+                first_ts,
+                last_ts,
+                *key,
+            ),
+        )
 
     def _apply(self, connection: sqlite3.Connection, kind: str, payload: dict[str, Any]) -> None:
         if kind == "connection_start":
@@ -720,7 +777,7 @@ class DatabaseSink:
                 [(event_id, *level) for level in payload["levels"]],
             )
         elif kind == "trade":
-            connection.execute(
+            cursor = connection.execute(
                 """INSERT OR IGNORE INTO trade(
                      connection_session_id, venue, market_id, symbol, exchange_trade_id,
                      exchange_sequence, local_sequence, ts_recv_us, ts_srv_us, price, size,
@@ -728,27 +785,14 @@ class DatabaseSink:
                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     payload["connection"]["id"], payload["venue"], payload["market_id"],
-                    payload["symbol"], payload.get("trade_id"), payload.get("exchange_sequence"),
+                    payload["symbol"], payload["trade_id"], payload.get("exchange_sequence"),
                     payload["local_sequence"], payload["recv_us"], payload.get("srv_us"),
                     payload["price"], payload["size"], payload.get("aggressor_side"),
                     payload["raw_public_json"],
                 ),
             )
-        elif kind == "ohlcv":
-            connection.execute(
-                """INSERT INTO ohlcv_1m(
-                     bucket_start_us, venue, market_id, symbol, source, open, high,
-                     low, close, volume, trade_count, is_complete
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(bucket_start_us, venue, market_id, source) DO UPDATE SET
-                     high=excluded.high, low=excluded.low, close=excluded.close,
-                     volume=excluded.volume, trade_count=excluded.trade_count,
-                     is_complete=excluded.is_complete""",
-                tuple(payload[key] for key in (
-                    "bucket_start_us", "venue", "market_id", "symbol", "source", "open",
-                    "high", "low", "close", "volume", "trade_count", "is_complete"
-                )),
-            )
+            if cursor.rowcount == 1:
+                self._merge_ohlcv_trade(connection, payload)
         elif kind == "funding":
             connection.execute(
                 """INSERT OR REPLACE INTO funding(
@@ -851,7 +895,6 @@ class Collector:
         self.metrics = metrics
         self.stop_event = asyncio.Event()
         self.books: dict[tuple[str, int], BookState] = {}
-        self.bars: dict[tuple[str, int, int], BarState] = {}
         self.local_sequences: defaultdict[tuple[str, str, int], int] = defaultdict(int)
         self.last_health_error: str | None = None
 
@@ -1102,45 +1145,47 @@ class Collector:
             price_text = canonical_decimal(trade["price"])
             size_text = canonical_decimal(trade["size"])
             srv_us = normalize_exchange_timestamp_us(trade.get("timestamp", message.get("timestamp")))
+            event_ts_us = srv_us or recv_us
+            bucket_start_us = event_ts_us - event_ts_us % 60_000_000
             is_maker_ask = trade.get("is_maker_ask")
             aggressor_side = None if is_maker_ask is None else ("buy" if is_maker_ask else "sell")
-            trade_id = trade.get("trade_id_str", trade.get("trade_id"))
+            raw_public_json = json.dumps(trade, sort_keys=True, separators=(",", ":"))
+            raw_trade_id = trade.get("trade_id_str", trade.get("trade_id"))
+            trade_id = (
+                str(raw_trade_id)
+                if raw_trade_id is not None
+                else "synthetic:"
+                + hashlib.sha256(
+                    f"{venue.name}:{market_id}:".encode() + raw_public_json.encode()
+                ).hexdigest()
+            )
             await self.sink.put(
                 "trade",
                 {
                     "recv_us": recv_us,
+                    "partition_us": event_ts_us,
+                    "event_ts_us": event_ts_us,
+                    "bucket_start_us": bucket_start_us,
                     "srv_us": srv_us,
                     "connection": connection,
                     "venue": venue.name,
                     "market_id": market_id,
                     "symbol": market.symbol,
-                    "trade_id": str(trade_id) if trade_id is not None else None,
+                    "trade_id": trade_id,
                     "exchange_sequence": exchange_sequence,
                     "local_sequence": self.next_sequence(venue.name, "trade", market_id),
                     "price": price_text,
                     "size": size_text,
                     "aggressor_side": aggressor_side,
-                    "raw_public_json": json.dumps(trade, sort_keys=True, separators=(",", ":")),
+                    "raw_public_json": raw_public_json,
                 },
             )
-            bar_timestamp_us = srv_us or recv_us
-            bucket_start_us = bar_timestamp_us - bar_timestamp_us % 60_000_000
-            bar_key = (venue.name, market_id, bucket_start_us)
-            price, size = Decimal(price_text), Decimal(size_text)
-            bar = self.bars.get(bar_key)
-            if bar is None:
-                bar = BarState(bucket_start_us, price, price, price, price, size, 1)
-                self.bars[bar_key] = bar
-            else:
-                bar.update(price, size)
-            bar_payload = bar.payload(venue.name, market)
-            bar_payload["recv_us"] = recv_us
-            await self.sink.put("ohlcv", bar_payload)
         if trades:
-            self.metrics.inc("engine_b_phase0_trade_total", {"venue": venue.name, "symbol": market.symbol}, len(trades))
-        cutoff = recv_us - 120_000_000
-        for key in [key for key in self.bars if key[2] < cutoff]:
-            self.bars.pop(key, None)
+            self.metrics.inc(
+                "engine_b_phase0_trade_total",
+                {"venue": venue.name, "symbol": market.symbol},
+                len(trades),
+            )
 
     async def handle_market_stats(
         self, venue: VenueConfig, message: dict[str, Any], recv_us: int

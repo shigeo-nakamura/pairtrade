@@ -35,11 +35,17 @@ counted as valid Phase 0A samples.
 - Metrics: `127.0.0.1:9472/metrics`
 
 The databases rotate hourly because the normalized public feed is too large
-for the host's 20 GiB root volume. At minute 10, the archive timer checks each
-closed SQLite partition, uploads a gzip plus SHA-256 file with AES256 S3
-server-side encryption, verifies the remote objects, and only then removes the
-closed local database. The active hour and any database with `-wal`/`-shm`
-sidecars are never removed.
+for the host's 20 GiB root volume. At minute 10, the archive timer checkpoints
+an abandoned WAL for each closed partition, finalizes its remaining closed
+OHLCV rows, and runs SQLite integrity checking. A partition still owned by a
+live writer is skipped. The timer uploads a gzip plus SHA-256 file with AES256
+S3 server-side encryption, downloads both objects again, validates the gzip,
+byte equality, decompressed checksum, and remote SQLite integrity, and only then
+reaches the deletion
+gate. Local deletion is disabled by default through
+`ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false`; the active hour is never an
+archive target. If the source file changes or recreates WAL sidecars during upload,
+the verified snapshot remains in S3 but the local partition is retained.
 
 Archive prefix:
 
@@ -50,16 +56,26 @@ s3://debot-dashboard/debot/engine-b/phase0/raw/<host>/YYYY/MM/
 ## Install and start
 
 The host requires Python 3.11. `install_engine_b_phase0.sh` creates an isolated
-venv and installs the exact dependency versions, but never starts or restarts a
-service.
+venv, installs exact dependencies and the three staged systemd units, and
+writes the required full Git commit to `/opt/engine-b-phase0/release.env`. It
+runs `daemon-reload` but never starts or restarts a service. The normal
+Robinhood deploy workflow stages the units and passes `GITHUB_SHA`; for a
+manual install, provide both values explicitly.
 
 ```bash
 sudo dnf install -y python3.11 python3.11-pip
-sudo bash /opt/debot/scripts/install_engine_b_phase0.sh
-sudo systemctl daemon-reload
+sudo env \
+  ENGINE_B_PHASE0_CODE_COMMIT=<40-character-deployed-git-sha> \
+  ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/path/to/staged/units \
+  bash /opt/debot/scripts/install_engine_b_phase0.sh
 sudo systemctl enable --now engine-b-phase0.service
-sudo systemctl enable --now engine-b-phase0-archive.timer
 ```
+
+The Tokyo deployment currently keeps `engine-b-phase0-archive.timer` disabled.
+Enabling verified-local deletion requires explicit operator approval. After
+that approval, set `ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true` in a systemd
+override for `engine-b-phase0-archive.service`, reload systemd, and enable the
+timer. Never enable deletion merely to bypass a failed archive check.
 
 Verification:
 

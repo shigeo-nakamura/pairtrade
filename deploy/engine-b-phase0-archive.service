@@ -10,6 +10,7 @@ Group=ec2-user
 Environment=ENGINE_B_PHASE0_DATA_DIR=/var/lib/engine-b-phase0/data
 Environment=ENGINE_B_PHASE0_S3_BUCKET=debot-dashboard
 Environment=ENGINE_B_PHASE0_S3_PREFIX=debot/engine-b/phase0/raw
+Environment=ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false
 ExecStart=/bin/bash /opt/debot/scripts/engine_b_phase0_archive.sh
 ProtectHome=true
 ProtectSystem=strict
