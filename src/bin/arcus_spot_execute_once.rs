@@ -550,20 +550,48 @@ fn build_repair_report(config_path: &Path, events_jsonl_path: &Path) -> Result<s
     });
 
     let report = match matches.as_slice() {
-        [plan] => serde_json::json!({
-            "status": "recovered",
-            "active_attempt": active_summary,
-            "candidates_scanned": candidates,
-            "recovered_plan": plan,
-            "next_steps": [
-                format!(
-                    "Write the exact bytes of `recovered_plan` above to {} (mode 0600, owner `arcus`).",
-                    live_tick_pending_plan_path(&config)?.display(),
-                ),
-                "Then either restart arcus-spot-live-tick.timer, or run `auto-resume CONFIG_YAML <that path>` directly, to let the existing resume path reconcile this attempt.".to_string(),
-                "This command did not write anything itself; review the plan above against the production evidence in bot-strategy#869 before restoring it.".to_string(),
-            ],
-        }),
+        [plan] => {
+            // resume_status_and_reconcile only accepts Submitted, Confirmed,
+            // or Reconciled (live_executor.rs); every other phase bails.
+            // Restoring the pending-plan file and pointing an operator at
+            // auto-resume for e.g. Prepared/Dispatching/Unknown/OperatorHold/
+            // Rejected/Failed would just fail again, and OperatorHold/Unknown
+            // in particular need a human judgement call this tool cannot make
+            // (Codex P2 follow-up, pairtrade#240).
+            let resumable = matches!(
+                active.phase,
+                ArcusSpotExecutionPhase::Submitted
+                    | ArcusSpotExecutionPhase::Confirmed
+                    | ArcusSpotExecutionPhase::Reconciled
+            );
+            let next_steps = if resumable {
+                vec![
+                    format!(
+                        "Write the exact bytes of `recovered_plan` above to {} (mode 0600, owner `arcus`).",
+                        live_tick_pending_plan_path(&config)?.display(),
+                    ),
+                    "Then either restart arcus-spot-live-tick.timer, or run `auto-resume CONFIG_YAML <that path>` directly, to let the existing resume path reconcile this attempt.".to_string(),
+                    "This command did not write anything itself; review the plan above against the production evidence in bot-strategy#869 before restoring it.".to_string(),
+                ]
+            } else {
+                vec![
+                    format!(
+                        "The active attempt is in phase {:?}, which resume_status_and_reconcile does not accept (only Submitted/Confirmed/Reconciled) -- restoring the pending-plan file and running auto-resume would fail again.",
+                        active.phase,
+                    ),
+                    "`recovered_plan` is still the digest-proven plan behind this attempt; use it as evidence for a manual decision (e.g. clear-risk-halt-style administrator action) rather than the ordinary resume path.".to_string(),
+                    "This command did not write anything itself.".to_string(),
+                ]
+            };
+            serde_json::json!({
+                "status": "recovered",
+                "active_attempt": active_summary,
+                "candidates_scanned": candidates,
+                "recovered_plan": plan,
+                "resumable_via_auto_resume": resumable,
+                "next_steps": next_steps,
+            })
+        }
         [] => serde_json::json!({
             "status": "no_digest_match",
             "active_attempt": active_summary,
@@ -2482,6 +2510,7 @@ fn usage() -> &'static str {
   arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once live-tick CONFIG_YAML
   arcus-spot-execute-once clear-risk-halt CONFIG_YAML
+  arcus-spot-execute-once repair-report CONFIG_YAML EVENTS_JSONL
 
 state-backup and state-verify-* are offline operator commands. They never
 construct an RPC/router client, KMS signer, approval policy, or executor and
@@ -3648,6 +3677,7 @@ mod tests {
         assert!(usage().contains("state-verify-exact CONFIG_YAML BACKUP_DIR"));
         assert!(usage().contains("state-verify-continuity CONFIG_YAML BACKUP_DIR"));
         assert!(usage().contains("clear-risk-halt CONFIG_YAML"));
+        assert!(usage().contains("repair-report CONFIG_YAML EVENTS_JSONL"));
     }
 
     fn live_runtime_config() -> ArcusSpotRuntimeConfig {
@@ -6842,9 +6872,61 @@ runtime:
             report["active_attempt"]["tx_hash"],
             serde_json::json!(active.tx_hash)
         );
+        // Submitted is one of the phases resume_status_and_reconcile accepts,
+        // so it is fine to point the operator at auto-resume here.
+        assert_eq!(report["resumable_via_auto_resume"], true);
+        assert!(report["next_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step.as_str().unwrap().contains("auto-resume")));
         // Exactly the intent-matching, digest-matching candidate -- the
         // decoy never appears because it fails the coarse filter first.
         assert_eq!(report["candidates_scanned"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn repair_report_flags_a_recovered_plan_in_a_non_resumable_phase_for_manual_review() {
+        // Codex P2 follow-up, pairtrade#240: resume_status_and_reconcile only
+        // accepts Submitted/Confirmed/Reconciled (live_executor.rs); pointing
+        // an operator at auto-resume for e.g. an OperatorHold attempt would
+        // just fail again and, worse, imply the tool has a routine answer
+        // for a state that specifically needs a human decision.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+
+        let mut plan = rotation_plan("entry_signal");
+        plan.venue = "rialto".to_string();
+        let at = fixture_now();
+        let mut active = repair_report_active_submitted_attempt(&config, &plan, at);
+        active.phase = ArcusSpotExecutionPhase::OperatorHold;
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_repair_report(&config_path, &events_path).unwrap();
+        assert_eq!(report["status"], "recovered");
+        assert_eq!(report["resumable_via_auto_resume"], false);
+        let steps: Vec<&str> = report["next_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step.as_str().unwrap())
+            .collect();
+        assert!(!steps.iter().any(|step| step.contains("run `auto-resume")));
+        assert!(steps.iter().any(|step| step.contains("OperatorHold")));
     }
 
     #[test]
