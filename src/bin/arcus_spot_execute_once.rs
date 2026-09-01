@@ -449,11 +449,16 @@ fn build_repair_report(config_path: &Path, events_jsonl_path: &Path) -> Result<s
     let config_bytes = read_private_regular_file(config_path, "config")?;
     let config = parse_config(&config_bytes, config_path)?;
 
+    // Held for the rest of this function, not just the read: a
+    // resume/execute/live-tick invocation racing an in-progress archive
+    // scan could otherwise reconcile or archive this exact attempt (and
+    // possibly start a new one) while this report still describes it as
+    // active, then hand the operator instructions that would overwrite the
+    // *new* attempt's pending-plan evidence with the stale plan recovered
+    // here (Codex P2 follow-up, pairtrade#240).
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
-    let ledger = {
-        let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
-        ledger_store.load_existing()?
-    };
+    let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+    let ledger = ledger_store.load_existing()?;
 
     let Some(active) = ledger.active.clone() else {
         return Ok(serde_json::json!({
@@ -566,8 +571,13 @@ fn build_repair_report(config_path: &Path, events_jsonl_path: &Path) -> Result<s
             );
             let next_steps = if resumable {
                 vec![
+                    "Confirm arcus-spot-live-tick.timer (and any manual execute/auto-execute/auto-resume/live-tick invocation) stays stopped from now through the write below -- this report's exclusive lock is released once it prints, so a concurrent invocation could otherwise reconcile/archive this exact attempt (and start a new one) before the file is restored.".to_string(),
                     format!(
-                        "Write the exact bytes of `recovered_plan` above to {} (mode 0600, owner `arcus`).",
+                        "Immediately before writing, re-run repair-report and confirm `active_attempt` still has the same sequence ({}), idempotency_key, and tx_hash printed here; abort if any differ -- that means this attempt already moved on and the plan above is stale.",
+                        active_summary["sequence"],
+                    ),
+                    format!(
+                        "Then write the exact bytes of `recovered_plan` above to {} (mode 0600, owner `arcus`).",
                         live_tick_pending_plan_path(&config)?.display(),
                     ),
                     "Then either restart arcus-spot-live-tick.timer, or run `auto-resume CONFIG_YAML <that path>` directly, to let the existing resume path reconcile this attempt.".to_string(),
@@ -6875,11 +6885,24 @@ runtime:
         // Submitted is one of the phases resume_status_and_reconcile accepts,
         // so it is fine to point the operator at auto-resume here.
         assert_eq!(report["resumable_via_auto_resume"], true);
-        assert!(report["next_steps"]
+        let steps: Vec<&str> = report["next_steps"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|step| step.as_str().unwrap().contains("auto-resume")));
+            .map(|step| step.as_str().unwrap())
+            .collect();
+        assert!(steps.iter().any(|step| step.contains("auto-resume")));
+        // Codex P2 follow-up, pairtrade#240: the report's own exclusive
+        // lock is released once this call returns, so the guidance must
+        // tell the operator to revalidate attempt identity immediately
+        // before restoring the file rather than trusting this snapshot
+        // indefinitely.
+        assert!(steps
+            .iter()
+            .any(|step| step.contains("re-run repair-report")));
+        assert!(steps
+            .iter()
+            .any(|step| step.contains(&active.sequence.to_string())));
         // Exactly the intent-matching, digest-matching candidate -- the
         // decoy never appears because it fails the coarse filter first.
         assert_eq!(report["candidates_scanned"].as_array().unwrap().len(), 1);
