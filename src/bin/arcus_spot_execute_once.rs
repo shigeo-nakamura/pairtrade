@@ -384,23 +384,38 @@ fn live_tick_active_recovery_plan(
     Ok(Some((plan, digest)))
 }
 
+fn load_live_tick_active_recovery_plan(
+    config: &ArcusSpotExecuteOnceConfig,
+    ledger_store: &ArcusSpotExecutionLedgerStore,
+) -> Result<Option<(ArcusSpotRotationPlan, String)>> {
+    let ledger = ledger_store.load_or_create(Utc::now())?;
+    live_tick_active_recovery_plan(config, &ledger)
+}
+
+async fn resume_live_tick_attempt(
+    config: &ArcusSpotExecuteOnceConfig,
+    plan: ArcusSpotRotationPlan,
+    plan_config_digest: String,
+) -> Result<ArcusSpotExecutionAttempt> {
+    let mut executor = executor_from_config(config).await?;
+    let attempt = executor.resume_status_and_reconcile().await?;
+    finalize_reconciled_attempt(config, &mut executor, &plan, &plan_config_digest, attempt)
+}
+
 async fn resume_active_live_tick_attempt(
     config: &ArcusSpotExecuteOnceConfig,
 ) -> Result<Option<ArcusSpotExecutionAttempt>> {
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let lock = ledger_store.acquire_exclusive_lock(&config.runtime_state_path)?;
-    let ledger = ledger_store.load_or_create(Utc::now())?;
-    let recovery = live_tick_active_recovery_plan(config, &ledger)?;
+    let recovery = load_live_tick_active_recovery_plan(config, &ledger_store)?;
     drop(lock);
 
     let Some((plan, plan_config_digest)) = recovery else {
         return Ok(None);
     };
-    let mut executor = executor_from_config(config).await?;
-    let attempt = executor.resume_status_and_reconcile().await?;
-    let attempt =
-        finalize_reconciled_attempt(config, &mut executor, &plan, &plan_config_digest, attempt)?;
-    Ok(Some(attempt))
+    Ok(Some(
+        resume_live_tick_attempt(config, plan, plan_config_digest).await?,
+    ))
 }
 
 fn declined_route_log_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
@@ -3178,6 +3193,19 @@ async fn main() -> Result<()> {
                 ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
             let checkpoint_lock =
                 ledger_store_for_checkpoint.acquire_exclusive_lock(&config.runtime_state_path)?;
+
+            // The optimistic check before the public snapshot fetch is not
+            // sufficient by itself: another live-tick can dispatch while
+            // this invocation is collecting that snapshot. Re-read the
+            // ledger under the same lock that guards the checkpoint before
+            // advancing the runtime or replacing pending-plan evidence.
+            if let Some((plan, plan_config_digest)) =
+                load_live_tick_active_recovery_plan(&config, &ledger_store_for_checkpoint)?
+            {
+                drop(checkpoint_lock);
+                let attempt = resume_live_tick_attempt(&config, plan, plan_config_digest).await?;
+                return write_attempt(&attempt);
+            }
 
             let mut runtime = store.load_or_create(&config.runtime)?;
             let event_publisher = live_tick_event_publisher(&config)?;
@@ -6213,6 +6241,43 @@ runtime:
             live_tick_active_recovery_plan(&config, &ArcusSpotExecutionLedger::default()).unwrap();
 
         assert!(recovery.is_none());
+    }
+
+    #[test]
+    fn live_tick_recheck_observes_an_attempt_created_after_the_initial_check() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        let plan = rotation_plan("entry_signal");
+        persist_test_live_tick_plan(&config, &plan);
+
+        let initial_lock = store
+            .acquire_exclusive_lock(&config.runtime_state_path)
+            .unwrap();
+        assert!(load_live_tick_active_recovery_plan(&config, &store)
+            .unwrap()
+            .is_none());
+        drop(initial_lock);
+
+        let competing_lock = store
+            .acquire_exclusive_lock(&config.runtime_state_path)
+            .unwrap();
+        store
+            .persist(&ledger_with_active_plan(&config, &plan))
+            .unwrap();
+        drop(competing_lock);
+
+        let checkpoint_lock = store
+            .acquire_exclusive_lock(&config.runtime_state_path)
+            .unwrap();
+        let recovery = load_live_tick_active_recovery_plan(&config, &store).unwrap();
+        drop(checkpoint_lock);
+
+        assert!(recovery.is_some());
     }
 
     /// bot-strategy#817/#818: a plan on an unvalidated venue is an ordinary
