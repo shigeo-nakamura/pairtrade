@@ -290,6 +290,15 @@ def partition_for_us(timestamp_us: int) -> str:
     return datetime.fromtimestamp(timestamp_us / 1_000_000, UTC).strftime("%Y%m%d_%H")
 
 
+def partition_start_us(partition: str) -> int:
+    return int(
+        datetime.strptime(partition, "%Y%m%d_%H")
+        .replace(tzinfo=UTC)
+        .timestamp()
+        * 1_000_000
+    )
+
+
 def normalize_exchange_timestamp_us(value: Any) -> int | None:
     """Normalize documented millisecond/microsecond timestamps to microseconds."""
     if value is None:
@@ -741,10 +750,17 @@ class Metrics:
 
 
 class DatabaseSink:
-    def __init__(self, config: AppConfig, collector_run_id: str, code_commit: str) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        collector_run_id: str,
+        code_commit: str,
+        run_started_us: int | None = None,
+    ) -> None:
         self.config = config
         self.collector_run_id = collector_run_id
         self.code_commit = code_commit
+        self.run_started_us = now_us() if run_started_us is None else run_started_us
         self.queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(
             maxsize=config.queue_maxsize
         )
@@ -809,10 +825,10 @@ class DatabaseSink:
         connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         connection.executescript(SCHEMA)
         self._migrate(connection)
-        started_us = now_us()
+        opened_us = now_us()
         connection.execute(
             "INSERT OR IGNORE INTO schema_metadata(schema_version, created_ts_us) VALUES (?, ?)",
-            (SCHEMA_VERSION, started_us),
+            (SCHEMA_VERSION, opened_us),
         )
         connection.execute(
             """INSERT OR IGNORE INTO collector_manifest(
@@ -822,7 +838,7 @@ class DatabaseSink:
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
             (
                 self.collector_run_id,
-                started_us,
+                self.run_started_us,
                 self.config.document_version,
                 self.config.collector_version,
                 self.code_commit,
@@ -852,10 +868,18 @@ class DatabaseSink:
         )
 
     @staticmethod
-    def _ensure_connection(connection: sqlite3.Connection, payload: dict[str, Any]) -> None:
+    def _ensure_connection(
+        connection: sqlite3.Connection, payload: dict[str, Any], partition: str
+    ) -> None:
         meta = payload.get("connection")
         if not meta:
             return
+        partition_started_us = partition_start_us(partition)
+        partition_ended_us = partition_started_us + 3_600_000_000
+        segment_started_us = min(
+            max(int(meta["started_us"]), partition_started_us),
+            partition_ended_us,
+        )
         connection.execute(
             """INSERT OR IGNORE INTO ws_connection(
                  connection_session_id, venue, channel, started_ts_recv_us,
@@ -865,7 +889,7 @@ class DatabaseSink:
                 meta["id"],
                 meta["venue"],
                 "multiplexed_public",
-                meta["started_us"],
+                segment_started_us,
                 meta["api_schema_version"],
             ),
         )
@@ -969,7 +993,7 @@ class DatabaseSink:
         try:
             connection.execute("BEGIN")
             for kind, payload in commands:
-                self._ensure_connection(connection, payload)
+                self._ensure_connection(connection, payload, partition)
                 self._apply(connection, kind, payload)
             connection.commit()
         except Exception:
@@ -1024,14 +1048,22 @@ class DatabaseSink:
                 with self._partition_lock(sealed_partition):
                     self._record_late_trade_identities(sealed_partition, payloads)
 
+        current_partition = partition_for_us(now_us())
         for partition, connection in list(self._connections.items()):
             with self._partition_lock(partition):
                 self._finalize_ohlcv(connection, now_us())
+                if partition < current_partition:
+                    partition_ended_us = partition_start_us(partition) + 3_600_000_000
+                    connection.execute(
+                        """UPDATE ws_connection
+                           SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
+                               end_reason = 'partition_rotation'
+                           WHERE ended_ts_recv_us IS NULL""",
+                        (partition_ended_us,),
+                    )
                 connection.commit()
-        current_partition = partition_for_us(now_us())
-        for partition in list(self._connections):
-            if partition < current_partition:
-                self._connections.pop(partition).close()
+                if partition < current_partition:
+                    self._connections.pop(partition).close()
 
     @staticmethod
     def _finalize_ohlcv(connection: sqlite3.Connection, observed_us: int) -> None:
@@ -1103,7 +1135,7 @@ class DatabaseSink:
 
     def _apply(self, connection: sqlite3.Connection, kind: str, payload: dict[str, Any]) -> None:
         if kind == "connection_start":
-            self._ensure_connection(connection, payload)
+            pass
         elif kind == "connection_end":
             connection.execute(
                 """UPDATE ws_connection SET ended_ts_recv_us = ?, end_reason = ?
@@ -1897,10 +1929,11 @@ async def async_main(args: argparse.Namespace) -> int:
             )
         )
         return 0
+    run_started_us = now_us()
     collector_run_id = str(uuid.uuid4())
     code_commit = os.environ.get("ENGINE_B_PHASE0_CODE_COMMIT", "UNKNOWN_UNDEPLOYED")
     metrics = Metrics()
-    sink = DatabaseSink(config, collector_run_id, code_commit)
+    sink = DatabaseSink(config, collector_run_id, code_commit, run_started_us)
     sink.start()
     collector = Collector(config, sink, metrics)
     loop = asyncio.get_running_loop()

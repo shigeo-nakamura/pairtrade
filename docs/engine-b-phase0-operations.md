@@ -46,6 +46,14 @@ encryption, downloads both objects again, validates byte equality, gzip,
 decompressed checksum, and remote SQLite integrity, and only then reaches the
 deletion gate.
 
+A physical WebSocket connection that spans an hourly boundary is represented
+as one partition-local `ws_connection` segment in each database. Closed
+partitions end their open segments at the hour boundary with
+`end_reason=partition_rotation`; the active partition records the real close
+time and reason. Every partition for one collector process preserves the same
+`collector_manifest.started_ts_us`, so database rotation is not mistaken for a
+collector restart.
+
 Local deletion is disabled by default through
 `ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false`; the active hour is never an
 archive target. When deletion is explicitly enabled, a verified stable

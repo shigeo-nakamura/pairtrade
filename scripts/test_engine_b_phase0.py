@@ -381,6 +381,103 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 connection_db.close()
 
+    async def test_spanning_connection_is_segmented_and_run_start_is_stable(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory)
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            next_hour_us = hour_start_us + 3_600_000_000
+            run_started_us = hour_start_us + 1_000_000
+            connection_started_us = hour_start_us + 1_800_000_000
+            connection_ended_us = next_hour_us + 600_000_000
+            connection = {
+                "id": "connection-spanning-hours",
+                "venue": "robinhood",
+                "started_us": connection_started_us,
+                "api_schema_version": config.api_schema_version,
+            }
+
+            def book(recv_us: int, local_sequence: int) -> dict[str, object]:
+                return {
+                    "recv_us": recv_us,
+                    "connection": connection,
+                    "venue": "robinhood",
+                    "market_id": 37,
+                    "symbol": "SKHY",
+                    "event_kind": "raw",
+                    "exchange_sequence": str(local_sequence),
+                    "begin_sequence": None,
+                    "exchange_offset": None,
+                    "local_sequence": local_sequence,
+                    "complete": False,
+                    "levels": [],
+                }
+
+            sink = engine_b.DatabaseSink(
+                config, "spanning-run", "spanning-commit", run_started_us
+            )
+            for path in (database_dir, sink.sealed_dir, sink.lock_dir):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(
+                engine_b, "now_us", return_value=connection_ended_us
+            ):
+                sink._write_batch(
+                    [
+                        (
+                            "connection_start",
+                            {"recv_us": connection_started_us, "connection": connection},
+                        ),
+                        ("book", book(connection_started_us, 1)),
+                        ("book", book(next_hour_us + 1_000_000, 2)),
+                        (
+                            "connection_end",
+                            {
+                                "recv_us": connection_ended_us,
+                                "reason": "clean_close",
+                                "connection": connection,
+                            },
+                        ),
+                    ]
+                )
+            await sink.close()
+
+            first_partition = engine_b.partition_for_us(hour_start_us)
+            second_partition = engine_b.partition_for_us(next_hour_us)
+            expected_sessions = {
+                first_partition: (
+                    connection_started_us,
+                    next_hour_us,
+                    "partition_rotation",
+                ),
+                second_partition: (
+                    next_hour_us,
+                    connection_ended_us,
+                    "clean_close",
+                ),
+            }
+            for partition, expected_session in expected_sessions.items():
+                db = sqlite3.connect(
+                    database_dir / f"engine_b_phase0_{partition}.sqlite3"
+                )
+                try:
+                    self.assertEqual(
+                        db.execute(
+                            """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                               FROM ws_connection"""
+                        ).fetchone(),
+                        expected_session,
+                    )
+                    self.assertEqual(
+                        db.execute(
+                            "SELECT started_ts_us FROM collector_manifest"
+                        ).fetchone(),
+                        (run_started_us,),
+                    )
+                finally:
+                    db.close()
+
 
     async def test_deduplicates_and_merges_late_trades_in_event_partition(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
