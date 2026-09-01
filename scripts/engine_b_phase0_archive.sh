@@ -29,18 +29,28 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
     continue
   fi
   seal_path="$SEALED_DIR/$partition.json"
-  if [ -e "$seal_path" ]; then
-    echo "Skipping already sealed partition: $db" >&2
-    continue
-  fi
   lock_file="$LOCK_DIR/$partition.lock"
   exec {lock_fd}> "$lock_file"
   chmod 0640 "$lock_file"
   flock "$lock_fd"
   if [ -e "$seal_path" ]; then
+    if [ "$DELETE_VERIFIED_LOCAL" != "true" ]; then
+      flock -u "$lock_fd"
+      exec {lock_fd}>&-
+      echo "Retaining sealed partition because local deletion is disabled: $db" >&2
+      continue
+    fi
+    if [ -e "$db-wal" ] || [ -e "$db-shm" ]; then
+      echo "Refusing sealed-partition recovery with SQLite sidecars: $db" >&2
+      exit 1
+    fi
+    trade_index_path="$SEALED_DIR/$partition.trade_ids.sqlite3"
+    "$PYTHON_BIN" "$OBSERVER_SCRIPT" --verify-sealed-partition \
+      "$db" "$trade_index_path" "$seal_path" "$partition"
+    rm -f -- "$db"
     flock -u "$lock_fd"
     exec {lock_fd}>&-
-    echo "Skipping partition sealed while waiting for lock: $db" >&2
+    echo "Recovered and removed verified sealed partition left by an interrupted archive: $db"
     continue
   fi
   set +e

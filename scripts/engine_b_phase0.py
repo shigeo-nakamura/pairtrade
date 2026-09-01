@@ -340,7 +340,7 @@ def synthetic_trade_id(
         sort_keys=True,
         separators=(",", ":"),
     )
-    return "synthetic:" + hashlib.sha256(identity.encode()).hexdigest()
+    return "synthetic:v2:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
 def build_sealed_trade_index(
@@ -410,6 +410,7 @@ def build_sealed_trade_index(
                 stable_trade_id = (
                     exchange_trade_id
                     if exchange_trade_id is not None
+                    and not exchange_trade_id.startswith("synthetic:")
                     else synthetic_trade_id(
                         venue,
                         market_id,
@@ -432,6 +433,46 @@ def build_sealed_trade_index(
             raise RuntimeError(
                 f"trade identity index integrity_check failed: {index_path}"
             )
+    finally:
+        index.close()
+        source.close()
+
+
+def verify_sealed_partition(
+    source_path: Path,
+    index_path: Path,
+    seal_path: Path,
+    partition: str,
+) -> None:
+    seal = json.loads(seal_path.read_text())
+    expected_sha256 = seal.get("sha256")
+    if (
+        seal.get("partition") != partition
+        or seal.get("trade_index") != index_path.name
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+    ):
+        raise RuntimeError(f"sealed partition metadata is invalid: {seal_path}")
+    digest = hashlib.sha256()
+    with source_path.open("rb") as source_file:
+        while chunk := source_file.read(1024 * 1024):
+            digest.update(chunk)
+    if digest.hexdigest() != expected_sha256:
+        raise RuntimeError(
+            f"sealed local database does not match verified archive: {source_path}"
+        )
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+    index = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
+    try:
+        if source.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+            raise RuntimeError(f"sealed local database integrity failed: {source_path}")
+        if index.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+            raise RuntimeError(f"sealed trade identity index integrity failed: {index_path}")
+        metadata = index.execute(
+            "SELECT partition, canonical_db_sha256 FROM sealed_metadata"
+        ).fetchone()
+        if metadata != (partition, expected_sha256):
+            raise RuntimeError(f"sealed trade identity index mismatch: {index_path}")
     finally:
         index.close()
         source.close()
@@ -1747,6 +1788,11 @@ def parse_args() -> argparse.Namespace:
         nargs=4,
         metavar=("SOURCE_DB", "INDEX_DB", "PARTITION", "CANONICAL_SHA256"),
     )
+    parser.add_argument(
+        "--verify-sealed-partition",
+        nargs=4,
+        metavar=("SOURCE_DB", "INDEX_DB", "SEAL_JSON", "PARTITION"),
+    )
     return parser.parse_args()
 
 
@@ -1816,6 +1862,12 @@ def main() -> int:
         source, index, partition, canonical_sha256 = args.build_sealed_trade_index
         build_sealed_trade_index(
             Path(source), Path(index), partition, canonical_sha256
+        )
+        return 0
+    if args.verify_sealed_partition is not None:
+        source, index, seal, partition = args.verify_sealed_partition
+        verify_sealed_partition(
+            Path(source), Path(index), Path(seal), partition
         )
         return 0
     if args.smoke_seconds is not None and args.smoke_seconds <= 0:

@@ -172,7 +172,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ids), 4)
         self.assertNotEqual(ids[0], ids[1])
         self.assertEqual(ids[:2], ids[2:])
-        self.assertTrue(all(str(value).startswith("synthetic:") for value in ids))
+        self.assertTrue(all(str(value).startswith("synthetic:v2:") for value in ids))
 
 
 class ConfigTests(unittest.TestCase):

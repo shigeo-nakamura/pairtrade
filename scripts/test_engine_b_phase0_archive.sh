@@ -82,6 +82,24 @@ connection.execute(
         '{"price":"101","size":"2"}',
     ),
 )
+connection.execute(
+    """INSERT INTO trade(
+         connection_session_id, venue, market_id, exchange_trade_id,
+         exchange_sequence, local_sequence, ts_recv_us, ts_srv_us,
+         raw_public_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    (
+        "legacy-connection",
+        "robinhood",
+        37,
+        "synthetic:obsolete-hash",
+        "9001",
+        3,
+        1_774_884_082_400_000,
+        1_774_884_082_309_000,
+        '{"price":"101","size":"2"}',
+    ),
+)
 connection.commit()
 os._exit(0)
 PY
@@ -188,7 +206,7 @@ import sys
 seal = json.load(open(sys.argv[1]))
 assert seal["partition"] == "20000101_00"
 assert seal["trade_index"] == "20000101_00.trade_ids.sqlite3"
-assert seal["trade_identity_count"] == 2
+assert seal["trade_identity_count"] == 3
 assert seal["sha256"] == sys.argv[3]
 connection = sqlite3.connect(f"file:{sys.argv[2]}?mode=ro", uri=True)
 try:
@@ -200,26 +218,42 @@ try:
         " ORDER BY exchange_trade_id"
     ).fetchall()
     assert ("robinhood", 37, "canonical-trade") in identities
-    identity = json.dumps(
-        {
-            "venue": "robinhood",
-            "market_id": 37,
-            "event_ts_us": 1_774_884_082_309_000,
-            "exchange_sequence": "9001",
-            "trade_position": 1,
-            "raw_public_json": '{"price":"101","size":"2"}',
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    expected_synthetic = "synthetic:" + hashlib.sha256(identity.encode()).hexdigest()
-    assert ("robinhood", 37, expected_synthetic) in identities
+    for position in (1, 2):
+        identity = json.dumps(
+            {
+                "venue": "robinhood",
+                "market_id": 37,
+                "event_ts_us": 1_774_884_082_309_000,
+                "exchange_sequence": "9001",
+                "trade_position": position,
+                "raw_public_json": '{"price":"101","size":"2"}',
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        expected_synthetic = (
+            "synthetic:v2:" + hashlib.sha256(identity.encode()).hexdigest()
+        )
+        assert ("robinhood", 37, expected_synthetic) in identities
+    assert not any(row[2] == "synthetic:obsolete-hash" for row in identities)
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 finally:
     connection.close()
 PY
 canonical_sha=$(sha256sum "$archive" | cut -d' ' -f1)
 trade_index_sha=$(sha256sum "$trade_index" | cut -d' ' -f1)
+cp "$restored_db" "$old_db"
+FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
+ENGINE_B_PHASE0_DATA_DIR="$DATA_DIR" \
+ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
+ENGINE_B_PHASE0_S3_PREFIX=test-prefix \
+ENGINE_B_PHASE0_PYTHON=python3 \
+ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true \
+bash "$(dirname "$0")/engine_b_phase0_archive.sh"
+test ! -e "$old_db"
+test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$canonical_sha"
+test "$(sha256sum "$trade_index" | cut -d' ' -f1)" = "$trade_index_sha"
+
 python3 - "$old_db" <<'PY'
 import sqlite3
 import sys
@@ -230,16 +264,20 @@ connection.execute("INSERT INTO fragment VALUES ('late-only')")
 connection.commit()
 connection.close()
 PY
-FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
-ENGINE_B_PHASE0_DATA_DIR="$DATA_DIR" \
-ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
-ENGINE_B_PHASE0_S3_PREFIX=test-prefix \
-ENGINE_B_PHASE0_PYTHON=python3 \
-ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true \
-bash "$(dirname "$0")/engine_b_phase0_archive.sh"
+if FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
+    ENGINE_B_PHASE0_DATA_DIR="$DATA_DIR" \
+    ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
+    ENGINE_B_PHASE0_S3_PREFIX=test-prefix \
+    ENGINE_B_PHASE0_PYTHON=python3 \
+    ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true \
+    bash "$(dirname "$0")/engine_b_phase0_archive.sh"; then
+  echo "Mismatched sealed fragment was removed or re-archived" >&2
+  exit 1
+fi
 test -f "$old_db"
 test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$canonical_sha"
 test "$(sha256sum "$trade_index" | cut -d' ' -f1)" = "$trade_index_sha"
+rm -f -- "$old_db"
 
 corrupt_db="$DATA_DIR/engine_b_phase0_20000101_01.sqlite3"
 python3 - "$corrupt_db" <<'PY'
