@@ -7,9 +7,11 @@ Use UTC for all timestamps.
 
 `engine_b_phase0.py` has no Lighter SDK, signer, account-authentication, or
 order module. Its outbound WebSocket allowlist contains only public
-`subscribe`, `unsubscribe`, `ping`, and `pong` messages. The service does not
-load `/opt/debot/scripts/*.env`, so it cannot read the Robinhood `freq2`
-credentials. `collector_manifest.order_capability` and the Prometheus gauge
+`subscribe`, `unsubscribe`, `ping`, and `pong` messages. The service runs as
+the dedicated `engine-b-phase0` Unix identity from a root-owned runtime copy;
+its systemd mount namespace makes `/opt/debot` inaccessible. It therefore
+cannot read the Robinhood `freq2` credentials owned by the trading identity.
+`collector_manifest.order_capability` and the Prometheus gauge
 `engine_b_phase0_order_capability` must both remain `0`.
 
 The observer collects two explicitly labelled venues:
@@ -48,9 +50,12 @@ Local deletion is disabled by default through
 `ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false`; the active hour is never an
 archive target. When deletion is explicitly enabled, a verified stable
 partition is atomically marked in `/var/lib/engine-b-phase0/sealed/` before its
-local database is removed. The collector never recreates a sealed canonical
-partition: later events for that exchange hour are stored in the active
-partition's `late_trade` table with the original sealed partition recorded.
+local database is removed. The seal includes an exact SQLite index of the
+canonical archive's trade identities. The collector never recreates a sealed
+canonical partition: replayed canonical trades are discarded using that
+index, while genuinely new events for that exchange hour are stored in the
+active partition's `late_trade` table with the original sealed partition
+recorded.
 If the source changes or WAL sidecars reappear during upload, the seal is rolled
 back and the local partition is retained.
 
@@ -62,10 +67,11 @@ s3://debot-dashboard/debot/engine-b/phase0/raw/<host>/YYYY/MM/
 
 ## Install and start
 
-The host requires Python 3.11. `install_engine_b_phase0.sh` creates an isolated
-venv, installs exact dependencies and the three staged systemd units, and
-writes the required full Git commit to `/opt/engine-b-phase0/release.env`. It
-runs `daemon-reload` but never starts or restarts a service. The normal
+The host requires Python 3.11. `install_engine_b_phase0.sh` creates the
+dedicated system identity and a root-owned isolated venv/runtime, installs
+exact dependencies and the three staged systemd units, and writes the required
+full Git commit to `/opt/engine-b-phase0/release.env`. It runs
+`daemon-reload` but never starts or restarts a service. The normal
 Robinhood deploy workflow stages the units and passes `GITHUB_SHA`; for a
 manual install, provide both values explicitly.
 

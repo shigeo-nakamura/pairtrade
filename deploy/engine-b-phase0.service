@@ -5,25 +5,29 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ec2-user
-Group=ec2-user
+User=engine-b-phase0
+Group=engine-b-phase0
 WorkingDirectory=/opt/engine-b-phase0
 StateDirectory=engine-b-phase0
 StateDirectoryMode=0750
 RuntimeDirectory=engine-b-phase0
 RuntimeDirectoryMode=0750
 Environment=PYTHONUNBUFFERED=1
-Environment=ENGINE_B_PHASE0_CONFIG=/opt/debot/configs/engine-b/phase0.json
-Environment=ENGINE_B_PHASE0_REQUIREMENTS_LOCK=/opt/debot/scripts/engine_b_phase0_requirements.txt
+Environment=ENGINE_B_PHASE0_CONFIG=/opt/engine-b-phase0/phase0.json
+Environment=ENGINE_B_PHASE0_REQUIREMENTS_LOCK=/opt/engine-b-phase0/requirements.txt
 EnvironmentFile=-/opt/engine-b-phase0/release.env
-ExecStartPre=/bin/bash /opt/debot/scripts/run_engine_b_phase0.sh --validate-config
-ExecStart=/bin/bash /opt/debot/scripts/run_engine_b_phase0.sh
+ExecStartPre=/usr/bin/env /opt/engine-b-phase0/venv/bin/python /opt/engine-b-phase0/engine_b_phase0.py --validate-config
+ExecStart=/usr/bin/env /opt/engine-b-phase0/venv/bin/python /opt/engine-b-phase0/engine_b_phase0.py
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=30
 
-# Phase 0 is intentionally unable to read the Robinhood/freq2 credentials.
+# Phase 0 runs under a dedicated identity and cannot see /opt/debot, which
+# contains the Robinhood/freq2 credential file used by the trading service.
+InaccessiblePaths=/opt/debot
 ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
 ProtectSystem=strict
 PrivateTmp=true
 NoNewPrivileges=true

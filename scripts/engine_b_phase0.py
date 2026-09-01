@@ -690,6 +690,55 @@ class DatabaseSink:
     def _is_partition_sealed(self, partition: str) -> bool:
         return (self.sealed_dir / f"{partition}.json").is_file()
 
+    def _archived_trade_exists(self, partition: str, payload: dict[str, Any]) -> bool:
+        index_path = self.sealed_dir / f"{partition}.trade_ids.sqlite3"
+        seal_path = self.sealed_dir / f"{partition}.json"
+        try:
+            seal = json.loads(seal_path.read_text())
+            if (
+                seal.get("partition") != partition
+                or seal.get("trade_index") != index_path.name
+                or not isinstance(seal.get("sha256"), str)
+            ):
+                raise RuntimeError(f"sealed partition metadata is invalid: {seal_path}")
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"sealed partition metadata is unreadable: {seal_path}"
+            ) from exc
+        if not index_path.is_file():
+            raise RuntimeError(
+                f"sealed partition trade identity index is missing: {index_path}"
+            )
+        connection = sqlite3.connect(
+            f"file:{index_path}?mode=ro", uri=True, timeout=5
+        )
+        try:
+            metadata = connection.execute(
+                "SELECT partition, canonical_db_sha256 FROM sealed_metadata"
+            ).fetchone()
+            if metadata != (partition, seal["sha256"]):
+                raise RuntimeError(
+                    f"sealed trade identity index metadata mismatch: {index_path}"
+                )
+            return (
+                connection.execute(
+                    """SELECT 1 FROM archived_trade_identity
+                       WHERE venue = ? AND market_id = ? AND exchange_trade_id = ?""",
+                    (
+                        payload["venue"],
+                        payload["market_id"],
+                        payload["trade_id"],
+                    ),
+                ).fetchone()
+                is not None
+            )
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(
+                f"sealed trade identity index is unreadable: {index_path}"
+            ) from exc
+        finally:
+            connection.close()
+
     @contextmanager
     def _partition_lock(self, partition: str):
         lock_path = self.lock_dir / f"{partition}.lock"
@@ -733,6 +782,16 @@ class DatabaseSink:
                             raise RuntimeError(
                                 f"non-trade command targeted sealed partition {partition}: {kind}"
                             )
+                        if self._archived_trade_exists(partition, payload):
+                            LOG.debug(
+                                "Discarding replayed archived trade venue=%s market_id=%s "
+                                "trade_id=%s sealed_partition=%s",
+                                payload["venue"],
+                                payload["market_id"],
+                                payload["trade_id"],
+                                partition,
+                            )
+                            continue
                         late_payload = dict(payload)
                         late_payload["sealed_partition"] = partition
                         late_commands.append(("late_trade", late_payload))

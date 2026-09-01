@@ -102,7 +102,7 @@ PY
   remote_tmp=$(mktemp "$DATA_DIR/.${base}.remote.XXXXXX.gz")
   remote_checksum_tmp=$(mktemp "$DATA_DIR/.${base}.remote-checksum.XXXXXX")
   remote_db_tmp=$(mktemp "$DATA_DIR/.${base}.remote-db.XXXXXX")
-  trap 'rm -f -- "$archive_tmp" "$checksum_tmp" "$remote_tmp" "$remote_checksum_tmp" "$remote_db_tmp" "${seal_tmp:-}"' EXIT
+  trap 'rm -f -- "$archive_tmp" "$checksum_tmp" "$remote_tmp" "$remote_checksum_tmp" "$remote_db_tmp" "${seal_tmp:-}" "${trade_index_tmp:-}"' EXIT
 
   gzip -c "$db" > "$archive_tmp"
   gzip -t "$archive_tmp"
@@ -152,10 +152,74 @@ PY
 
   seal_created=false
   if [ "$DELETE_VERIFIED_LOCAL" = "true" ]; then
+    trade_index_path="$SEALED_DIR/$partition.trade_ids.sqlite3"
+    trade_index_tmp=$(mktemp "$SEALED_DIR/.${partition}.trade-ids.XXXXXX.sqlite3")
+    "$PYTHON_BIN" - "$db" "$trade_index_tmp" "$partition" "$expected_db_sha" <<'PY'
+import sqlite3
+import sys
+
+source_path, index_path, partition, canonical_sha256 = sys.argv[1:]
+source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+index = sqlite3.connect(index_path)
+try:
+    index.execute(
+        """CREATE TABLE sealed_metadata(
+             partition TEXT PRIMARY KEY,
+             canonical_db_sha256 TEXT NOT NULL
+           )"""
+    )
+    index.execute(
+        """CREATE TABLE archived_trade_identity(
+             venue TEXT NOT NULL,
+             market_id INTEGER NOT NULL,
+             exchange_trade_id TEXT NOT NULL,
+             PRIMARY KEY(venue, market_id, exchange_trade_id)
+           ) WITHOUT ROWID"""
+    )
+    tables = {
+        row[0]
+        for row in source.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "trade" in tables:
+        index.executemany(
+            """INSERT OR IGNORE INTO archived_trade_identity
+               VALUES (?, ?, ?)""",
+            source.execute(
+                "SELECT venue, market_id, exchange_trade_id FROM trade"
+            ),
+        )
+    index.execute(
+        "INSERT INTO sealed_metadata VALUES (?, ?)",
+        (partition, canonical_sha256),
+    )
+    index.commit()
+    if index.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+        raise SystemExit(f"trade identity index integrity_check failed: {index_path}")
+finally:
+    index.close()
+    source.close()
+PY
+    chmod 0640 "$trade_index_tmp"
+    trade_identity_count=$(
+      "$PYTHON_BIN" - "$trade_index_tmp" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    print(connection.execute("SELECT COUNT(*) FROM archived_trade_identity").fetchone()[0])
+finally:
+    connection.close()
+PY
+    )
+    mv "$trade_index_tmp" "$trade_index_path"
     seal_tmp=$(mktemp "$SEALED_DIR/.${partition}.XXXXXX")
     sealed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    printf '{"partition":"%s","s3_key":"s3://%s/%s","sha256":"%s","sealed_at":"%s"}\n' \
-      "$partition" "$S3_BUCKET" "$key" "$expected_db_sha" "$sealed_at" > "$seal_tmp"
+    printf '{"partition":"%s","s3_key":"s3://%s/%s","sha256":"%s","trade_index":"%s","trade_identity_count":%s,"sealed_at":"%s"}\n' \
+      "$partition" "$S3_BUCKET" "$key" "$expected_db_sha" \
+      "$(basename "$trade_index_path")" "$trade_identity_count" "$sealed_at" > "$seal_tmp"
     chmod 0640 "$seal_tmp"
     mv "$seal_tmp" "$seal_path"
     seal_created=true
@@ -168,12 +232,14 @@ PY
     source_stable=false
     if [ "$seal_created" = "true" ]; then
       rm -f -- "$seal_path"
+      rm -f -- "$trade_index_path"
       seal_created=false
     fi
   fi
   if [ "$DELETE_VERIFIED_LOCAL" = "true" ] && [ "$source_stable" = "true" ]; then
     if ! rm -f -- "$db"; then
       rm -f -- "$seal_path"
+      rm -f -- "$trade_index_path"
       exit 1
     fi
     echo "Archived, sealed, verified, and removed closed partition: $db -> s3://$S3_BUCKET/$key"
@@ -182,7 +248,7 @@ PY
   else
     echo "Archived and verified closed partition; local deletion disabled: $db -> s3://$S3_BUCKET/$key"
   fi
-  rm -f -- "$archive_tmp" "$checksum_tmp" "$remote_tmp" "$remote_checksum_tmp" "$remote_db_tmp" "${seal_tmp:-}"
+  rm -f -- "$archive_tmp" "$checksum_tmp" "$remote_tmp" "$remote_checksum_tmp" "$remote_db_tmp" "${seal_tmp:-}" "${trade_index_tmp:-}"
   trap - EXIT
   flock -u "$lock_fd"
   exec {lock_fd}>&-

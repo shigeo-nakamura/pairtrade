@@ -30,8 +30,12 @@ connection = sqlite3.connect(sys.argv[1])
 connection.execute("PRAGMA journal_mode=WAL")
 connection.execute("CREATE TABLE sample(value TEXT NOT NULL)")
 connection.execute("CREATE TABLE ohlcv_1m(is_complete INTEGER NOT NULL)")
+connection.execute(
+    "CREATE TABLE trade(venue TEXT NOT NULL, market_id INTEGER NOT NULL, exchange_trade_id TEXT NOT NULL)"
+)
 connection.execute("INSERT INTO sample VALUES ('recovered-from-wal')")
 connection.execute("INSERT INTO ohlcv_1m VALUES (0)")
+connection.execute("INSERT INTO trade VALUES ('robinhood', 37, 'canonical-trade')")
 connection.commit()
 os._exit(0)
 PY
@@ -126,16 +130,33 @@ stored_sha=$(cut -d' ' -f1 "$checksum")
 test "$stored_sha" = "$expected_sha"
 grep -Eq '^[0-9a-f]{64}  engine_b_phase0_20000101_00.sqlite3$' "$checksum"
 seal="$ROOT/sealed/20000101_00.json"
+trade_index="$ROOT/sealed/20000101_00.trade_ids.sqlite3"
 test -f "$seal"
-python3 - "$seal" "$expected_sha" <<'PY'
+test -f "$trade_index"
+python3 - "$seal" "$trade_index" "$expected_sha" <<'PY'
 import json
+import sqlite3
 import sys
 
 seal = json.load(open(sys.argv[1]))
 assert seal["partition"] == "20000101_00"
-assert seal["sha256"] == sys.argv[2]
+assert seal["trade_index"] == "20000101_00.trade_ids.sqlite3"
+assert seal["trade_identity_count"] == 1
+assert seal["sha256"] == sys.argv[3]
+connection = sqlite3.connect(f"file:{sys.argv[2]}?mode=ro", uri=True)
+try:
+    assert connection.execute("SELECT partition FROM sealed_metadata").fetchone() == (
+        "20000101_00",
+    )
+    assert connection.execute(
+        "SELECT venue, market_id, exchange_trade_id FROM archived_trade_identity"
+    ).fetchone() == ("robinhood", 37, "canonical-trade")
+    assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+finally:
+    connection.close()
 PY
 canonical_sha=$(sha256sum "$archive" | cut -d' ' -f1)
+trade_index_sha=$(sha256sum "$trade_index" | cut -d' ' -f1)
 python3 - "$old_db" <<'PY'
 import sqlite3
 import sys
@@ -155,6 +176,7 @@ ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true \
 bash "$(dirname "$0")/engine_b_phase0_archive.sh"
 test -f "$old_db"
 test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$canonical_sha"
+test "$(sha256sum "$trade_index" | cut -d' ' -f1)" = "$trade_index_sha"
 
 corrupt_db="$DATA_DIR/engine_b_phase0_20000101_01.sqlite3"
 python3 - "$corrupt_db" <<'PY'

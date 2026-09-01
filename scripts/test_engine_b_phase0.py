@@ -20,6 +20,7 @@ MODULE_PATH = SCRIPT_DIR / "engine_b_phase0.py"
 CONFIG_PATH = REPO_ROOT / "configs" / "engine-b" / "phase0.json"
 LOCK_PATH = SCRIPT_DIR / "engine_b_phase0_requirements.txt"
 INSTALLER_PATH = SCRIPT_DIR / "install_engine_b_phase0.sh"
+OBSERVER_UNIT_PATH = REPO_ROOT / "deploy" / "engine-b-phase0.service"
 ARCHIVE_UNIT_PATH = REPO_ROOT / "deploy" / "engine-b-phase0-archive.service"
 DEPLOY_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "deploy-configs.yml"
 
@@ -166,6 +167,22 @@ class DeploymentTests(unittest.TestCase):
     def test_archive_deletion_is_disabled_in_unit(self) -> None:
         unit = ARCHIVE_UNIT_PATH.read_text()
         self.assertIn("ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false", unit)
+
+    def test_services_use_credential_isolated_identity(self) -> None:
+        observer = OBSERVER_UNIT_PATH.read_text()
+        archive = ARCHIVE_UNIT_PATH.read_text()
+        installer = INSTALLER_PATH.read_text()
+        for unit in (observer, archive):
+            self.assertIn("User=engine-b-phase0", unit)
+            self.assertIn("Group=engine-b-phase0", unit)
+            self.assertIn("InaccessiblePaths=/opt/debot", unit)
+            self.assertNotIn("User=ec2-user", unit)
+        self.assertIn("ProtectProc=invisible", observer)
+        self.assertNotIn("ExecStart=/bin/bash /opt/debot/", observer)
+        self.assertNotIn("ExecStart=/bin/bash /opt/debot/", archive)
+        self.assertIn('useradd --system --gid "$SERVICE_GROUP"', installer)
+        self.assertIn('"$INSTALL_DIR/engine_b_phase0.py"', installer)
+        self.assertIn('"$INSTALL_DIR/engine_b_phase0_archive.sh"', installer)
 
 
 class DatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -323,7 +340,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 connection_db.close()
 
 
-    async def test_routes_sealed_partition_trades_to_late_table(self) -> None:
+    async def test_deduplicates_archive_replay_and_routes_new_sealed_trade(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         with tempfile.TemporaryDirectory() as directory:
             database_dir = Path(directory) / "data"
@@ -334,17 +351,46 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             event_us = recv_us - 7_200_000_000
             event_partition = engine_b.partition_for_us(event_us)
             (sink.sealed_dir / f"{event_partition}.json").write_text(
-                json.dumps({"partition": event_partition}) + "\n"
+                json.dumps(
+                    {
+                        "partition": event_partition,
+                        "sha256": "canonical-sha",
+                        "trade_index": f"{event_partition}.trade_ids.sqlite3",
+                    }
+                )
+                + "\n"
             )
+            trade_index = sink.sealed_dir / f"{event_partition}.trade_ids.sqlite3"
+            index_connection = sqlite3.connect(trade_index)
+            index_connection.execute(
+                "CREATE TABLE sealed_metadata(partition TEXT PRIMARY KEY, canonical_db_sha256 TEXT NOT NULL)"
+            )
+            index_connection.execute(
+                """CREATE TABLE archived_trade_identity(
+                     venue TEXT NOT NULL,
+                     market_id INTEGER NOT NULL,
+                     exchange_trade_id TEXT NOT NULL,
+                     PRIMARY KEY(venue, market_id, exchange_trade_id)
+                   ) WITHOUT ROWID"""
+            )
+            index_connection.execute(
+                "INSERT INTO sealed_metadata VALUES (?, ?)",
+                (event_partition, "canonical-sha"),
+            )
+            index_connection.execute(
+                "INSERT INTO archived_trade_identity VALUES (?, ?, ?)",
+                ("robinhood", 37, "archived-before-seal"),
+            )
+            index_connection.commit()
+            index_connection.close()
             connection = {
                 "id": "connection-sealed",
                 "venue": "robinhood",
                 "started_us": recv_us,
                 "api_schema_version": config.api_schema_version,
             }
-            await sink.put(
-                "trade",
-                {
+            def sealed_trade(trade_id: str, sequence: int) -> dict[str, object]:
+                return {
                     "recv_us": recv_us,
                     "partition_us": event_us,
                     "event_ts_us": event_us,
@@ -354,15 +400,17 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "venue": "robinhood",
                     "market_id": 37,
                     "symbol": "SKHY",
-                    "trade_id": "late-after-seal",
-                    "exchange_sequence": "late-1",
-                    "local_sequence": 1,
+                    "trade_id": trade_id,
+                    "exchange_sequence": f"late-{sequence}",
+                    "local_sequence": sequence,
                     "price": "101",
                     "size": "2",
                     "aggressor_side": "buy",
                     "raw_public_json": "{}",
-                },
-            )
+                }
+
+            await sink.put("trade", sealed_trade("archived-before-seal", 1))
+            await sink.put("trade", sealed_trade("late-after-seal", 2))
             await sink.queue.join()
             await sink.close()
 
