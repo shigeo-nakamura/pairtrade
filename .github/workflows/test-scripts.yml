@@ -17,6 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Install Engine B Phase 0 test dependency
+        run: python3 -m pip install -r scripts/engine_b_phase0_requirements.txt
+      - name: Run Engine B Phase 0 observer tests
+        run: python3 scripts/test_engine_b_phase0.py
+      - name: Run Engine B Phase 0 archive test
+        run: bash scripts/test_engine_b_phase0_archive.sh
       - name: Run canary_diff_report.py unit tests
         run: python3 scripts/test_canary_diff_report.py -v
       - name: Run round_performance_report.py unit tests

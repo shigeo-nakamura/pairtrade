@@ -1,0 +1,72 @@
+{
+  "document_version": "0.3",
+  "collector_version": "phase0a-observer-v1",
+  "api_schema_version": "lighter-public-api-2026-08",
+  "database_dir": "/var/lib/engine-b-phase0/data",
+  "health_file": "/run/engine-b-phase0/status.json",
+  "metrics_listen": "127.0.0.1:9472",
+  "top_levels": 5,
+  "reconstructed_snapshot_interval_ms": 1000,
+  "rest_poll_seconds": 60,
+  "min_daily_volume_usd": "100000",
+  "queue_maxsize": 100000,
+  "db_batch_max": 1000,
+  "db_flush_interval_ms": 250,
+  "venues": [
+    {
+      "name": "robinhood",
+      "rest_url": "https://api.rh.lighter.xyz",
+      "ws_url": "wss://api.rh.lighter.xyz/stream",
+      "role": "future_execution_venue",
+      "required_same_venue_symbols": [
+        "SKHY",
+        "SNDK",
+        "SOXL",
+        "NVDA",
+        "EWY",
+        "USDKRW"
+      ],
+      "known_missing_symbols": ["EWY", "USDKRW"],
+      "markets": [
+        {"symbol": "SKHY", "market_id": 37, "role": "kr_candidate"},
+        {"symbol": "SNDK", "market_id": 32, "role": "us_candidate"},
+        {"symbol": "MU", "market_id": 31, "role": "us_candidate"},
+        {"symbol": "SOXL", "market_id": 35, "role": "control"},
+        {"symbol": "NVDA", "market_id": 15, "role": "control"},
+        {"symbol": "SPY", "market_id": 26, "role": "exploratory"},
+        {"symbol": "QQQ", "market_id": 25, "role": "exploratory"}
+      ]
+    },
+    {
+      "name": "lighter_mainnet_context",
+      "rest_url": "https://mainnet.zklighter.elliot.ai",
+      "ws_url": "wss://mainnet.zklighter.elliot.ai/stream?readonly=true",
+      "role": "spec_v0.3_complete_context",
+      "required_same_venue_symbols": [
+        "SKHY",
+        "SNDK",
+        "SOXL",
+        "NVDA",
+        "EWY",
+        "USDKRW"
+      ],
+      "known_missing_symbols": [],
+      "markets": [
+        {"symbol": "SKHY", "market_id": 216, "role": "kr_candidate"},
+        {"symbol": "SKHYNIXUSD", "market_id": 161, "role": "kr_candidate"},
+        {"symbol": "SAMSUNGUSD", "market_id": 162, "role": "kr_exploratory"},
+        {"symbol": "SNDK", "market_id": 139, "role": "us_candidate"},
+        {"symbol": "MU", "market_id": 164, "role": "us_candidate"},
+        {"symbol": "WDC", "market_id": 223, "role": "us_exploratory"},
+        {"symbol": "KIOXIA", "market_id": 225, "role": "us_exploratory"},
+        {"symbol": "SOXL", "market_id": 197, "role": "control"},
+        {"symbol": "NVDA", "market_id": 110, "role": "control"},
+        {"symbol": "EWY", "market_id": 166, "role": "control"},
+        {"symbol": "USDKRW", "market_id": 105, "role": "control"},
+        {"symbol": "SPY", "market_id": 128, "role": "exploratory"},
+        {"symbol": "QQQ", "market_id": 129, "role": "exploratory"},
+        {"symbol": "CHIP", "market_id": 163, "role": "exploratory"}
+      ]
+    }
+  ]
+}

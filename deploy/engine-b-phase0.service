@@ -1,0 +1,39 @@
+[Unit]
+Description=Engine B Phase 0A public-data observer (bot-strategy#866)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/opt/engine-b-phase0
+StateDirectory=engine-b-phase0
+StateDirectoryMode=0750
+RuntimeDirectory=engine-b-phase0
+RuntimeDirectoryMode=0750
+Environment=PYTHONUNBUFFERED=1
+Environment=ENGINE_B_PHASE0_CONFIG=/opt/debot/configs/engine-b/phase0.json
+Environment=ENGINE_B_PHASE0_REQUIREMENTS_LOCK=/opt/debot/scripts/engine_b_phase0_requirements.txt
+EnvironmentFile=-/opt/engine-b-phase0/release.env
+ExecStartPre=/bin/bash /opt/debot/scripts/run_engine_b_phase0.sh --validate-config
+ExecStart=/bin/bash /opt/debot/scripts/run_engine_b_phase0.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+
+# Phase 0 is intentionally unable to read the Robinhood/freq2 credentials.
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

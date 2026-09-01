@@ -35,9 +35,19 @@ jobs:
           bash -n debot/scripts/activate-robinhood-sidecar.sh
           bash -n debot/scripts/deploy-robinhood-config.sh
           bash -n debot/scripts/deploy-robinhood-runtime.sh
+          bash -n debot/scripts/engine_b_phase0_archive.sh
+          bash -n debot/scripts/install_engine_b_phase0.sh
+          bash -n debot/scripts/run_engine_b_phase0.sh
           bash -n debot/scripts/test_bootstrap_robinhood_sidecar.sh
           bash -n debot/scripts/test_deploy_robinhood_runtime.sh
           python3 -m py_compile debot/scripts/test_robinhood_deploy_workflows.py
+          python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
+
+      - name: Test Engine B Phase 0 observer
+        run: |
+          python3 -m pip install -r debot/scripts/engine_b_phase0_requirements.txt
+          python3 debot/scripts/test_engine_b_phase0.py
+          bash debot/scripts/test_engine_b_phase0_archive.sh
 
       - name: Test Robinhood sidecar bootstrap
         run: bash debot/scripts/test_bootstrap_robinhood_sidecar.sh
@@ -52,6 +62,9 @@ jobs:
         run: |
           systemd-analyze verify debot/deploy/debot-pair-robinhood-sidecar-activation.service
           systemd-analyze verify debot/deploy/debot-pair-robinhood-lighter.service
+          systemd-analyze verify debot/deploy/engine-b-phase0.service
+          systemd-analyze verify debot/deploy/engine-b-phase0-archive.service
+          systemd-analyze verify debot/deploy/engine-b-phase0-archive.timer
 
       - name: Validate Lighter market preflight
         run: |
@@ -129,6 +142,9 @@ jobs:
           aws s3 cp debot/deploy/debot-pair-shadow-macro.service "s3://${S3_BUCKET}/deploy/debot-pair-shadow-macro.service"
           aws s3 cp debot/deploy/debot-pair-robinhood-sidecar-activation.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service"
           aws s3 cp debot/deploy/debot-pair-robinhood-lighter.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
+          aws s3 cp debot/deploy/engine-b-phase0.service "s3://${S3_BUCKET}/deploy/engine-b-phase0.service"
+          aws s3 cp debot/deploy/engine-b-phase0-archive.service "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.service"
+          aws s3 cp debot/deploy/engine-b-phase0-archive.timer "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.timer"
 
       - name: Deploy via SSM (no restart)
         env:
