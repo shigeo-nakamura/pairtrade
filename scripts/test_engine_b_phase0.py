@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -211,7 +212,7 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
-    async def test_synthetic_ids_distinguish_positions_and_survive_replay(self) -> None:
+    async def test_synthetic_ids_preserve_multiset_across_overlapping_snapshots(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         venue = next(item for item in config.venues if item.name == "robinhood")
         sink = RecordingSink()
@@ -223,25 +224,33 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             "api_schema_version": config.api_schema_version,
         }
         trade = {"price": "101", "size": "2", "is_maker_ask": True}
-        message = {
+        other = {"price": "102", "size": "1", "is_maker_ask": False}
+        first_message = {
             "channel": "trade/37",
             "nonce": 9001,
             "timestamp": 1_774_884_082_309,
-            "trades": [trade, trade],
+            "trades": [trade, trade, other],
+        }
+        overlapping_message = {
+            "channel": "trade/37",
+            "nonce": 9002,
+            "timestamp": 1_774_884_082_309,
+            "trades": [other, trade, trade],
         }
 
         await collector.handle_trades(
-            venue, connection, message, 1_774_884_082_400_000
+            venue, connection, first_message, 1_774_884_082_400_000
         )
         await collector.handle_trades(
-            venue, connection, message, 1_774_884_083_400_000
+            venue, connection, overlapping_message, 1_774_884_083_400_000
         )
 
         ids = [payload["trade_id"] for kind, payload in sink.commands if kind == "trade"]
-        self.assertEqual(len(ids), 4)
+        self.assertEqual(len(ids), 6)
         self.assertNotEqual(ids[0], ids[1])
-        self.assertEqual(ids[:2], ids[2:])
-        self.assertTrue(all(str(value).startswith("synthetic:v2:") for value in ids))
+        self.assertEqual(ids[:2], ids[4:])
+        self.assertEqual(ids[2], ids[3])
+        self.assertTrue(all(str(value).startswith("synthetic:v3:") for value in ids))
 
 
 class ConfigTests(unittest.TestCase):
@@ -485,6 +494,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                    ) WITHOUT ROWID"""
             )
             index_connection.execute(
+                """CREATE TABLE late_trade_identity(
+                     venue TEXT NOT NULL,
+                     market_id INTEGER NOT NULL,
+                     exchange_trade_id TEXT NOT NULL,
+                     PRIMARY KEY(venue, market_id, exchange_trade_id)
+                   ) WITHOUT ROWID"""
+            )
+            index_connection.execute(
                 "INSERT INTO sealed_metadata VALUES (?, ?)",
                 (event_partition, "canonical-sha"),
             )
@@ -524,6 +541,31 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             await sink.put("trade", sealed_trade("late-after-seal", 2))
             await sink.queue.join()
             await sink.close()
+
+            index_connection = sqlite3.connect(trade_index)
+            try:
+                self.assertEqual(
+                    index_connection.execute(
+                        "SELECT exchange_trade_id FROM late_trade_identity"
+                    ).fetchall(),
+                    [("late-after-seal",)],
+                )
+            finally:
+                index_connection.close()
+
+            second_recv_us = recv_us + 3_600_000_000
+            second_partition = engine_b.partition_for_us(second_recv_us)
+            sink2 = engine_b.DatabaseSink(config, "sealed-run-2", "sealed-commit")
+            with mock.patch.object(engine_b, "now_us", return_value=second_recv_us):
+                sink2.start()
+                replay = sealed_trade("late-after-seal", 3)
+                replay["recv_us"] = second_recv_us
+                await sink2.put("trade", replay)
+                await sink2.queue.join()
+                await sink2.close()
+            self.assertFalse(
+                (database_dir / f"engine_b_phase0_{second_partition}.sqlite3").exists()
+            )
 
             self.assertFalse(
                 (database_dir / f"engine_b_phase0_{event_partition}.sqlite3").exists()

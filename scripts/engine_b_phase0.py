@@ -324,8 +324,7 @@ def synthetic_trade_id(
     venue: str,
     market_id: int,
     event_ts_us: int,
-    exchange_sequence: str | None,
-    trade_position: int,
+    stable_occurrence: int,
     raw_public_json: str,
 ) -> str:
     identity = json.dumps(
@@ -333,14 +332,13 @@ def synthetic_trade_id(
             "venue": venue,
             "market_id": market_id,
             "event_ts_us": event_ts_us,
-            "exchange_sequence": exchange_sequence,
-            "trade_position": trade_position,
+            "stable_occurrence": stable_occurrence,
             "raw_public_json": raw_public_json,
         },
         sort_keys=True,
         separators=(",", ":"),
     )
-    return "synthetic:v2:" + hashlib.sha256(identity.encode()).hexdigest()
+    return "synthetic:v3:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
 def build_sealed_trade_index(
@@ -366,6 +364,14 @@ def build_sealed_trade_index(
                  PRIMARY KEY(venue, market_id, exchange_trade_id)
                ) WITHOUT ROWID"""
         )
+        index.execute(
+            """CREATE TABLE late_trade_identity(
+                 venue TEXT NOT NULL,
+                 market_id INTEGER NOT NULL,
+                 exchange_trade_id TEXT NOT NULL,
+                 PRIMARY KEY(venue, market_id, exchange_trade_id)
+               ) WITHOUT ROWID"""
+        )
         tables = {
             row[0]
             for row in source.execute(
@@ -374,7 +380,7 @@ def build_sealed_trade_index(
         }
         if "trade" in tables:
             last_message: tuple[str, str, int, int, str | None] | None = None
-            trade_position = 0
+            stable_occurrences: defaultdict[tuple[int, str], int] = defaultdict(int)
             rows = source.execute(
                 """SELECT trade_row_id, connection_session_id, venue, market_id,
                           exchange_trade_id, exchange_sequence, local_sequence,
@@ -403,20 +409,26 @@ def build_sealed_trade_index(
                     exchange_sequence,
                 )
                 if message_identity == last_message:
-                    trade_position += 1
+                    pass
                 else:
                     last_message = message_identity
-                    trade_position = 0
+                    stable_occurrences.clear()
+                event_ts_us = ts_srv_us or ts_recv_us
+                occurrence_key = (event_ts_us, raw_public_json)
+                stable_occurrence = stable_occurrences[occurrence_key]
+                stable_occurrences[occurrence_key] += 1
                 stable_trade_id = (
                     exchange_trade_id
                     if exchange_trade_id is not None
-                    and not exchange_trade_id.startswith("synthetic:")
+                    and (
+                        not exchange_trade_id.startswith("synthetic:")
+                        or exchange_trade_id.startswith("synthetic:v3:")
+                    )
                     else synthetic_trade_id(
                         venue,
                         market_id,
-                        ts_srv_us or ts_recv_us,
-                        exchange_sequence,
-                        trade_position,
+                        event_ts_us,
+                        stable_occurrence,
                         raw_public_json,
                     )
                 )
@@ -891,22 +903,51 @@ class DatabaseSink:
                 raise RuntimeError(
                     f"sealed trade identity index metadata mismatch: {index_path}"
                 )
-            return (
-                connection.execute(
-                    """SELECT 1 FROM archived_trade_identity
-                       WHERE venue = ? AND market_id = ? AND exchange_trade_id = ?""",
-                    (
-                        payload["venue"],
-                        payload["market_id"],
-                        payload["trade_id"],
-                    ),
-                ).fetchone()
-                is not None
+            identity = (
+                payload["venue"],
+                payload["market_id"],
+                payload["trade_id"],
             )
+            archived = connection.execute(
+                """SELECT 1 FROM archived_trade_identity
+                   WHERE venue = ? AND market_id = ? AND exchange_trade_id = ?""",
+                identity,
+            ).fetchone()
+            late = connection.execute(
+                """SELECT 1 FROM late_trade_identity
+                   WHERE venue = ? AND market_id = ? AND exchange_trade_id = ?""",
+                identity,
+            ).fetchone()
+            return archived is not None or late is not None
         except sqlite3.DatabaseError as exc:
             raise RuntimeError(
                 f"sealed trade identity index is unreadable: {index_path}"
             ) from exc
+        finally:
+            connection.close()
+
+    def _record_late_trade_identities(
+        self, partition: str, payloads: list[dict[str, Any]]
+    ) -> None:
+        index_path = self.sealed_dir / f"{partition}.trade_ids.sqlite3"
+        connection = sqlite3.connect(index_path, timeout=5)
+        try:
+            connection.executemany(
+                """INSERT OR IGNORE INTO late_trade_identity
+                   VALUES (?, ?, ?)""",
+                [
+                    (
+                        payload["venue"],
+                        payload["market_id"],
+                        payload["trade_id"],
+                    )
+                    for payload in payloads
+                ],
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -976,6 +1017,12 @@ class DatabaseSink:
                 if self._is_partition_sealed(late_partition):
                     raise RuntimeError(f"active late-trade partition is sealed: {late_partition}")
                 self._write_partition(late_partition, late_commands)
+            late_by_sealed: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+            for _, payload in late_commands:
+                late_by_sealed[payload["sealed_partition"]].append(payload)
+            for sealed_partition, payloads in late_by_sealed.items():
+                with self._partition_lock(sealed_partition):
+                    self._record_late_trade_identities(sealed_partition, payloads)
 
         for partition, connection in list(self._connections.items()):
             with self._partition_lock(partition):
@@ -1478,7 +1525,8 @@ class Collector:
             return
         exchange_sequence = str(message["nonce"]) if message.get("nonce") is not None else None
         trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
-        for trade_position, trade in enumerate(trades):
+        stable_occurrences: defaultdict[tuple[int, str], int] = defaultdict(int)
+        for trade in trades:
             price_text = canonical_decimal(trade["price"])
             size_text = canonical_decimal(trade["size"])
             srv_us = normalize_exchange_timestamp_us(trade.get("timestamp", message.get("timestamp")))
@@ -1487,6 +1535,9 @@ class Collector:
             is_maker_ask = trade.get("is_maker_ask")
             aggressor_side = None if is_maker_ask is None else ("buy" if is_maker_ask else "sell")
             raw_public_json = json.dumps(trade, sort_keys=True, separators=(",", ":"))
+            occurrence_key = (event_ts_us, raw_public_json)
+            stable_occurrence = stable_occurrences[occurrence_key]
+            stable_occurrences[occurrence_key] += 1
             raw_trade_id = trade.get("trade_id_str", trade.get("trade_id"))
             trade_id = (
                 str(raw_trade_id)
@@ -1495,8 +1546,7 @@ class Collector:
                     venue.name,
                     market_id,
                     event_ts_us,
-                    exchange_sequence,
-                    trade_position,
+                    stable_occurrence,
                     raw_public_json,
                 )
             )

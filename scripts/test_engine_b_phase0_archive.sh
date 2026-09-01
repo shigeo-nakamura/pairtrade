@@ -100,6 +100,24 @@ connection.execute(
         '{"price":"101","size":"2"}',
     ),
 )
+connection.execute(
+    """INSERT INTO trade(
+         connection_session_id, venue, market_id, exchange_trade_id,
+         exchange_sequence, local_sequence, ts_recv_us, ts_srv_us,
+         raw_public_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    (
+        "legacy-connection",
+        "robinhood",
+        37,
+        "synthetic:v3:preserve-me",
+        "9001",
+        4,
+        1_774_884_082_400_000,
+        1_774_884_082_309_000,
+        '{"price":"101","size":"2"}',
+    ),
+)
 connection.commit()
 os._exit(0)
 PY
@@ -206,7 +224,7 @@ import sys
 seal = json.load(open(sys.argv[1]))
 assert seal["partition"] == "20000101_00"
 assert seal["trade_index"] == "20000101_00.trade_ids.sqlite3"
-assert seal["trade_identity_count"] == 3
+assert seal["trade_identity_count"] == 4
 assert seal["sha256"] == sys.argv[3]
 connection = sqlite3.connect(f"file:{sys.argv[2]}?mode=ro", uri=True)
 try:
@@ -218,24 +236,25 @@ try:
         " ORDER BY exchange_trade_id"
     ).fetchall()
     assert ("robinhood", 37, "canonical-trade") in identities
+    assert ("robinhood", 37, "synthetic:v3:preserve-me") in identities
     for position in (1, 2):
         identity = json.dumps(
             {
                 "venue": "robinhood",
                 "market_id": 37,
                 "event_ts_us": 1_774_884_082_309_000,
-                "exchange_sequence": "9001",
-                "trade_position": position,
+                "stable_occurrence": position,
                 "raw_public_json": '{"price":"101","size":"2"}',
             },
             sort_keys=True,
             separators=(",", ":"),
         )
         expected_synthetic = (
-            "synthetic:v2:" + hashlib.sha256(identity.encode()).hexdigest()
+            "synthetic:v3:" + hashlib.sha256(identity.encode()).hexdigest()
         )
         assert ("robinhood", 37, expected_synthetic) in identities
     assert not any(row[2] == "synthetic:obsolete-hash" for row in identities)
+    assert connection.execute("SELECT COUNT(*) FROM late_trade_identity").fetchone() == (0,)
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 finally:
     connection.close()
