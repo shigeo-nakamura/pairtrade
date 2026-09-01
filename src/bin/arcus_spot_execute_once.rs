@@ -11,15 +11,17 @@ use aes_gcm::{
 use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, NaiveDate, Utc};
+#[cfg(test)]
+use debot::arcus_spot::event_record;
 use debot::arcus_spot::{
-    build_arcus_spot_kms_signer, is_supported_live_route, ArcusSpotChainClient,
+    build_arcus_spot_kms_signer, is_supported_live_route, verify_record, ArcusSpotChainClient,
     ArcusSpotChainConfig, ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt,
     ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
     ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor,
-    ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventStream,
-    ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger,
-    ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig,
-    ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventRecord,
+    ArcusSpotLiveTickEventStream, ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan,
+    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
+    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
 use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
@@ -416,6 +418,167 @@ async fn resume_active_live_tick_attempt(
     Ok(Some(
         resume_live_tick_attempt(config, plan, plan_config_digest).await?,
     ))
+}
+
+/// Read-only diagnostic for an active execution attempt whose live-tick
+/// pending-plan evidence was lost or overwritten (bot-strategy#869): scans an
+/// operator-supplied, already fetch-and-verified durable event export
+/// (`scripts/fetch_arcus_live_tick_events.sh`) for the `WouldRotate` plan
+/// that produced the attempt, and reports it if -- and only if -- recomputing
+/// `approval_digest` against the *current* config reproduces exactly the
+/// digest the ledger recorded at dispatch time. That digest match is the same
+/// check `live_tick_active_recovery_plan` performs; passing it here is proof
+/// this is genuinely the plan that was signed and dispatched, not a
+/// same-shaped guess.
+///
+/// This command never writes the ledger, the runtime checkpoint, or the
+/// pending-plan file. On a confirmed match it prints the plan JSON an
+/// operator can choose to write to the pending-plan path themselves, after
+/// review, to let the ordinary resume path (auto-resume / next live-tick)
+/// finish reconciliation on its own.
+fn repair_report(config_path: &Path, events_jsonl_path: &Path) -> Result<()> {
+    let report = build_repair_report(config_path, events_jsonl_path)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).context("failed to serialize Arcus repair report")?
+    );
+    Ok(())
+}
+
+fn build_repair_report(config_path: &Path, events_jsonl_path: &Path) -> Result<serde_json::Value> {
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    let ledger = {
+        let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+        ledger_store.load_existing()?
+    };
+
+    let Some(active) = ledger.active.clone() else {
+        return Ok(serde_json::json!({
+            "status": "no_active_attempt",
+            "detail": "the ledger has no active attempt; there is nothing to repair",
+        }));
+    };
+
+    let events_bytes = fs::read(events_jsonl_path).with_context(|| {
+        format!(
+            "failed to read Arcus event export {}",
+            events_jsonl_path.display()
+        )
+    })?;
+    let events_text = String::from_utf8(events_bytes).with_context(|| {
+        format!(
+            "Arcus event export {} is not valid UTF-8",
+            events_jsonl_path.display()
+        )
+    })?;
+
+    #[derive(Serialize)]
+    struct Candidate {
+        sequence: u64,
+        observed_at: DateTime<Utc>,
+        venue: String,
+        sell_symbol: String,
+        buy_symbol: String,
+        sell_amount_raw: String,
+        plan_config_digest: String,
+        digest_matches_ledger: bool,
+    }
+
+    let mut candidates = Vec::new();
+    let mut matches = Vec::new();
+    for (line_no, line) in events_text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record: ArcusSpotLiveTickEventRecord =
+            serde_json::from_str(line).with_context(|| {
+                format!(
+                    "{} line {} is not a valid Arcus event record",
+                    events_jsonl_path.display(),
+                    line_no + 1
+                )
+            })?;
+        let event = verify_record(&record).with_context(|| {
+            format!(
+                "{} line {} failed event-record verification",
+                events_jsonl_path.display(),
+                line_no + 1
+            )
+        })?;
+        let ArcusSpotDecision::WouldRotate { plan } = event.decision else {
+            continue;
+        };
+        if !plan.venue.eq_ignore_ascii_case(&active.intent.venue)
+            || !plan
+                .sell_symbol
+                .eq_ignore_ascii_case(&active.intent.sell_symbol)
+            || !plan
+                .buy_symbol
+                .eq_ignore_ascii_case(&active.intent.buy_symbol)
+            || plan.sell_amount_raw != active.intent.sell_amount_raw
+        {
+            continue;
+        }
+        let digest = approval_digest(&config, &plan)?;
+        let digest_matches_ledger = digest == active.intent.plan_config_digest;
+        candidates.push(Candidate {
+            sequence: event.sequence,
+            observed_at: event.observed_at,
+            venue: plan.venue.clone(),
+            sell_symbol: plan.sell_symbol.clone(),
+            buy_symbol: plan.buy_symbol.clone(),
+            sell_amount_raw: plan.sell_amount_raw.clone(),
+            plan_config_digest: digest.clone(),
+            digest_matches_ledger,
+        });
+        if digest_matches_ledger {
+            matches.push(plan);
+        }
+    }
+
+    let active_summary = serde_json::json!({
+        "sequence": active.sequence,
+        "phase": active.phase,
+        "tx_hash": active.tx_hash,
+        "dispatched_at": active.dispatched_at,
+        "idempotency_key": active.idempotency_key,
+        "plan_config_digest": active.intent.plan_config_digest,
+    });
+
+    let report = match matches.as_slice() {
+        [plan] => serde_json::json!({
+            "status": "recovered",
+            "active_attempt": active_summary,
+            "candidates_scanned": candidates,
+            "recovered_plan": plan,
+            "next_steps": [
+                format!(
+                    "Write the exact bytes of `recovered_plan` above to {} (mode 0600, owner `arcus`).",
+                    live_tick_pending_plan_path(&config)?.display(),
+                ),
+                "Then either restart arcus-spot-live-tick.timer, or run `auto-resume CONFIG_YAML <that path>` directly, to let the existing resume path reconcile this attempt.".to_string(),
+                "This command did not write anything itself; review the plan above against the production evidence in bot-strategy#869 before restoring it.".to_string(),
+            ],
+        }),
+        [] => serde_json::json!({
+            "status": "no_digest_match",
+            "active_attempt": active_summary,
+            "candidates_scanned": candidates,
+            "detail": "no WouldRotate event matching this attempt's venue/symbols/sell_amount_raw reproduced the ledger's plan_config_digest under the current config. Either the event export does not cover the dispatch time, or the config has changed since dispatch -- do not hand-construct a plan to force a match.",
+        }),
+        many => serde_json::json!({
+            "status": "ambiguous",
+            "active_attempt": active_summary,
+            "candidates_scanned": candidates,
+            "digest_matching_candidate_count": many.len(),
+            "detail": "more than one candidate plan reproduced the ledger digest; refusing to pick one. This should not happen and needs manual review.",
+        }),
+    };
+    Ok(report)
 }
 
 fn declined_route_log_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
@@ -3005,6 +3168,9 @@ async fn main() -> Result<()> {
                     .context("failed to serialize Arcus state verification report")?
             );
             Ok(())
+        }
+        [command, config_path, events_jsonl_path] if command == "repair-report" => {
+            repair_report(Path::new(config_path), Path::new(events_jsonl_path))
         }
         [command, digest, key_path] if command == "sign-approval" => {
             let signing_key = read_ed25519_signing_key(Path::new(key_path))?;
@@ -6514,6 +6680,245 @@ runtime:
         );
         let reloaded = store.load_or_create(&config).unwrap();
         assert_eq!(reloaded.state().sequence, runtime.state().sequence);
+    }
+
+    fn write_private_file(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn repair_report_active_submitted_attempt(
+        config: &ArcusSpotExecuteOnceConfig,
+        plan: &ArcusSpotRotationPlan,
+        at: DateTime<Utc>,
+    ) -> ArcusSpotExecutionAttempt {
+        let payload_hash = format!("sha256:{}", "b".repeat(64));
+        ArcusSpotExecutionAttempt {
+            sequence: 2,
+            idempotency_key: format!(
+                "arcus-spot-{:020}-{}",
+                2,
+                &payload_hash["sha256:".len()..][..16]
+            ),
+            payload_hash,
+            chain_id: config.runtime.chain_id,
+            taker: config.executor.taker.clone(),
+            prepared_at: at,
+            dispatched_at: Some(at),
+            updated_at: at,
+            phase: ArcusSpotExecutionPhase::Submitted,
+            intent: ArcusSpotExecutionIntent {
+                venue: plan.venue.clone(),
+                sell_symbol: plan.sell_symbol.clone(),
+                buy_symbol: plan.buy_symbol.clone(),
+                sell_token: plan.sell_token_address.clone(),
+                buy_token: plan.buy_token_address.clone(),
+                sell_amount_raw: plan.sell_amount_raw.clone(),
+                minimum_buy_amount_raw: "1".to_string(),
+                plan_config_digest: approval_digest(config, plan).unwrap(),
+            },
+            pre_balances: ArcusSpotBalanceSnapshot {
+                observed_at: at,
+                sell_token: plan.sell_token_address.clone(),
+                buy_token: plan.buy_token_address.clone(),
+                sell_balance_raw: "1000000000000000000".to_string(),
+                buy_balance_raw: "100000000000000000".to_string(),
+                gas_balance_wei: "1000000000000000".to_string(),
+            },
+            post_balances: None,
+            tx_hash: Some(format!("0x{:064x}", 7)),
+            router_status: Some("submitted".to_string()),
+            detail: None,
+        }
+    }
+
+    /// Persists a runtime checkpoint plus a ledger whose only attempt is
+    /// `active`, and provisions the executor lock file so
+    /// `acquire_existing_exclusive_lock` (the read-only primitive
+    /// `repair_report` uses) succeeds exactly as it would against a real
+    /// deployment.
+    fn persist_repair_report_ledger_state(
+        config: &ArcusSpotExecuteOnceConfig,
+        active: Option<ArcusSpotExecutionAttempt>,
+    ) {
+        let runtime = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&runtime)
+            .unwrap();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger.next_sequence = 3;
+        ledger.active = active;
+        let store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        store.persist(&ledger).unwrap();
+        drop(
+            store
+                .acquire_exclusive_lock(&config.runtime_state_path)
+                .unwrap(),
+        );
+    }
+
+    fn repair_report_would_rotate_event(
+        sequence: u64,
+        observed_at: DateTime<Utc>,
+        plan: ArcusSpotRotationPlan,
+    ) -> ArcusSpotRuntimeEvent {
+        ArcusSpotRuntimeEvent {
+            sequence,
+            observed_at,
+            pair: "NVDA/AMD".to_string(),
+            mode: ArcusSpotRuntimeMode::Live,
+            token_a_reference_price_usd: Some(Decimal::from(200)),
+            token_b_reference_price_usd: Some(Decimal::from(100)),
+            relative_log_price: Some(0.5),
+            z_score: Some(2.9),
+            inventory_before: ArcusSpotInventory {
+                token_a: Decimal::new(30, 2),
+                token_b: Decimal::new(21, 2),
+            },
+            inventory_after: ArcusSpotInventory {
+                token_a: Decimal::new(30, 2),
+                token_b: Decimal::new(21, 2),
+            },
+            regime_before: ArcusSpotRegime::Neutral,
+            regime_after: ArcusSpotRegime::Neutral,
+            risk_before: None,
+            risk_after: None,
+            decision: ArcusSpotDecision::WouldRotate { plan },
+        }
+    }
+
+    fn write_repair_report_event_archive(path: &Path, events: &[ArcusSpotRuntimeEvent]) {
+        let mut previous = None;
+        let mut lines = Vec::new();
+        for event in events {
+            let record = event_record(event, previous.clone()).unwrap();
+            previous = Some(record.chain_sha256.clone());
+            lines.push(serde_json::to_string(&record).unwrap());
+        }
+        write_private_file(path, lines.join("\n").as_bytes());
+    }
+
+    #[test]
+    fn repair_report_recovers_a_plan_that_reproduces_the_ledger_digest() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+
+        let mut plan = rotation_plan("entry_signal");
+        plan.venue = "rialto".to_string();
+        let at = fixture_now();
+        let active = repair_report_active_submitted_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active.clone()));
+
+        // A decoy at an unrelated sell_amount_raw must not match the coarse
+        // intent filter, and so must never even reach a digest comparison.
+        let mut decoy = plan.clone();
+        decoy.sell_amount_raw = "999999999999999999".to_string();
+        decoy.sell_quantity = Decimal::new(999999, 6);
+        write_repair_report_event_archive(
+            &events_path,
+            &[
+                repair_report_would_rotate_event(100, at - chrono::Duration::seconds(10), decoy),
+                repair_report_would_rotate_event(101, at, plan.clone()),
+            ],
+        );
+
+        let report = build_repair_report(&config_path, &events_path).unwrap();
+        assert_eq!(report["status"], "recovered");
+        assert_eq!(
+            report["recovered_plan"]["sell_amount_raw"],
+            serde_json::json!(plan.sell_amount_raw)
+        );
+        assert_eq!(
+            report["active_attempt"]["tx_hash"],
+            serde_json::json!(active.tx_hash)
+        );
+        // Exactly the intent-matching, digest-matching candidate -- the
+        // decoy never appears because it fails the coarse filter first.
+        assert_eq!(report["candidates_scanned"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn repair_report_refuses_a_same_shaped_plan_that_does_not_reproduce_the_digest() {
+        // Regression coverage for the real bot-strategy#869 incident: a
+        // later live-tick had already overwritten `live-tick-pending-plan.json`
+        // by the time this ran, and the nearest same-venue/same-symbols/
+        // same-sell_amount_raw `WouldRotate` event in the durable archive
+        // turned out to carry different quote-derived fields (a fresh quote
+        // was pulled between evaluation and dispatch) and so did not
+        // reproduce the ledger's `plan_config_digest`. The report must say
+        // so plainly rather than ever recommending a same-shaped plan it
+        // cannot prove is the one that was actually signed and dispatched.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+
+        let mut plan = rotation_plan("entry_signal");
+        plan.venue = "rialto".to_string();
+        let at = fixture_now();
+        let active = repair_report_active_submitted_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+
+        // Same venue/symbols/sell_amount_raw (passes the coarse filter) but
+        // a different quote -- exactly what a re-quote between the logged
+        // evaluation and the actual dispatch produces.
+        let mut near_miss = plan.clone();
+        near_miss.buy_quantity = plan.buy_quantity + Decimal::new(1, 6);
+        near_miss.buy_amount_raw = "44954909625073291".to_string();
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(
+                101,
+                at - chrono::Duration::seconds(2),
+                near_miss,
+            )],
+        );
+
+        let report = build_repair_report(&config_path, &events_path).unwrap();
+        assert_eq!(report["status"], "no_digest_match");
+        let candidates = report["candidates_scanned"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["digest_matches_ledger"], false);
+        assert!(report.get("recovered_plan").is_none());
+    }
+
+    #[test]
+    fn repair_report_reports_no_active_attempt_when_the_ledger_is_flat() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        persist_repair_report_ledger_state(&config, None);
+        write_private_file(&events_path, b"");
+
+        let report = build_repair_report(&config_path, &events_path).unwrap();
+        assert_eq!(report["status"], "no_active_attempt");
     }
 
     #[test]
