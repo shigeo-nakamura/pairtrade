@@ -323,5 +323,68 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 connection_db.close()
 
 
+    async def test_routes_sealed_partition_trades_to_late_table(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            sink = engine_b.DatabaseSink(config, "sealed-run", "sealed-commit")
+            sink.start()
+            recv_us = engine_b.now_us()
+            event_us = recv_us - 7_200_000_000
+            event_partition = engine_b.partition_for_us(event_us)
+            (sink.sealed_dir / f"{event_partition}.json").write_text(
+                json.dumps({"partition": event_partition}) + "\n"
+            )
+            connection = {
+                "id": "connection-sealed",
+                "venue": "robinhood",
+                "started_us": recv_us,
+                "api_schema_version": config.api_schema_version,
+            }
+            await sink.put(
+                "trade",
+                {
+                    "recv_us": recv_us,
+                    "partition_us": event_us,
+                    "event_ts_us": event_us,
+                    "bucket_start_us": event_us - event_us % 60_000_000,
+                    "srv_us": event_us,
+                    "connection": connection,
+                    "venue": "robinhood",
+                    "market_id": 37,
+                    "symbol": "SKHY",
+                    "trade_id": "late-after-seal",
+                    "exchange_sequence": "late-1",
+                    "local_sequence": 1,
+                    "price": "101",
+                    "size": "2",
+                    "aggressor_side": "buy",
+                    "raw_public_json": "{}",
+                },
+            )
+            await sink.queue.join()
+            await sink.close()
+
+            self.assertFalse(
+                (database_dir / f"engine_b_phase0_{event_partition}.sqlite3").exists()
+            )
+            active_partition = engine_b.partition_for_us(recv_us)
+            active_db = database_dir / f"engine_b_phase0_{active_partition}.sqlite3"
+            connection_db = sqlite3.connect(active_db)
+            try:
+                self.assertEqual(connection_db.execute("SELECT COUNT(*) FROM trade").fetchone(), (0,))
+                self.assertEqual(connection_db.execute("SELECT COUNT(*) FROM ohlcv_1m").fetchone(), (0,))
+                self.assertEqual(
+                    connection_db.execute(
+                        "SELECT exchange_trade_id, sealed_partition FROM late_trade"
+                    ).fetchone(),
+                    ("late-after-seal", event_partition),
+                )
+                self.assertEqual(connection_db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+            finally:
+                connection_db.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

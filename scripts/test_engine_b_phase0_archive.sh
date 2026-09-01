@@ -125,6 +125,36 @@ expected_sha=$(sha256sum "$restored_db" | cut -d' ' -f1)
 stored_sha=$(cut -d' ' -f1 "$checksum")
 test "$stored_sha" = "$expected_sha"
 grep -Eq '^[0-9a-f]{64}  engine_b_phase0_20000101_00.sqlite3$' "$checksum"
+seal="$ROOT/sealed/20000101_00.json"
+test -f "$seal"
+python3 - "$seal" "$expected_sha" <<'PY'
+import json
+import sys
+
+seal = json.load(open(sys.argv[1]))
+assert seal["partition"] == "20000101_00"
+assert seal["sha256"] == sys.argv[2]
+PY
+canonical_sha=$(sha256sum "$archive" | cut -d' ' -f1)
+python3 - "$old_db" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("CREATE TABLE fragment(value TEXT NOT NULL)")
+connection.execute("INSERT INTO fragment VALUES ('late-only')")
+connection.commit()
+connection.close()
+PY
+FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
+ENGINE_B_PHASE0_DATA_DIR="$DATA_DIR" \
+ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
+ENGINE_B_PHASE0_S3_PREFIX=test-prefix \
+ENGINE_B_PHASE0_PYTHON=python3 \
+ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true \
+bash "$(dirname "$0")/engine_b_phase0_archive.sh"
+test -f "$old_db"
+test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$canonical_sha"
 
 corrupt_db="$DATA_DIR/engine_b_phase0_20000101_01.sqlite3"
 python3 - "$corrupt_db" <<'PY'

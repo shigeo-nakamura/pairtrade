@@ -37,15 +37,22 @@ counted as valid Phase 0A samples.
 The databases rotate hourly because the normalized public feed is too large
 for the host's 20 GiB root volume. At minute 10, the archive timer checkpoints
 an abandoned WAL for each closed partition, finalizes its remaining closed
-OHLCV rows, and runs SQLite integrity checking. A partition still owned by a
-live writer is skipped. The timer uploads a gzip plus SHA-256 file with AES256
-S3 server-side encryption, downloads both objects again, validates the gzip,
-byte equality, decompressed checksum, and remote SQLite integrity, and only then
-reaches the deletion
-gate. Local deletion is disabled by default through
+OHLCV rows, and runs SQLite integrity checking. The collector and archiver use
+the same per-partition `flock`, so a live writer and seal/delete operation cannot
+race. The timer uploads a gzip plus SHA-256 file with AES256 S3 server-side
+encryption, downloads both objects again, validates byte equality, gzip,
+decompressed checksum, and remote SQLite integrity, and only then reaches the
+deletion gate.
+
+Local deletion is disabled by default through
 `ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false`; the active hour is never an
-archive target. If the source file changes or recreates WAL sidecars during upload,
-the verified snapshot remains in S3 but the local partition is retained.
+archive target. When deletion is explicitly enabled, a verified stable
+partition is atomically marked in `/var/lib/engine-b-phase0/sealed/` before its
+local database is removed. The collector never recreates a sealed canonical
+partition: later events for that exchange hour are stored in the active
+partition's `late_trade` table with the original sealed partition recorded.
+If the source changes or WAL sidecars reappear during upload, the seal is rolled
+back and the local partition is retained.
 
 Archive prefix:
 

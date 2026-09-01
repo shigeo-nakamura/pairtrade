@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -26,6 +27,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -42,7 +44,7 @@ LOG = logging.getLogger("engine_b_phase0")
 UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 OHLCV_FINALIZE_GRACE_US = 120_000_000
 
 
@@ -134,6 +136,31 @@ CREATE TABLE IF NOT EXISTS trade (
 
 CREATE INDEX IF NOT EXISTS idx_trade_venue_symbol_time
   ON trade(venue, symbol, ts_recv_us);
+
+CREATE TABLE IF NOT EXISTS late_trade (
+  late_trade_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  connection_session_id TEXT NOT NULL,
+  venue TEXT NOT NULL,
+  market_id INTEGER NOT NULL,
+  symbol TEXT NOT NULL,
+  exchange_trade_id TEXT NOT NULL,
+  exchange_sequence TEXT,
+  local_sequence INTEGER NOT NULL,
+  ts_recv_us INTEGER NOT NULL,
+  ts_srv_us INTEGER,
+  event_ts_us INTEGER NOT NULL,
+  sealed_partition TEXT NOT NULL,
+  price TEXT NOT NULL,
+  size TEXT NOT NULL,
+  aggressor_side TEXT,
+  raw_public_json TEXT NOT NULL,
+  UNIQUE(venue, market_id, exchange_trade_id, sealed_partition),
+  FOREIGN KEY(connection_session_id)
+    REFERENCES ws_connection(connection_session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_late_trade_venue_symbol_time
+  ON late_trade(venue, symbol, ts_recv_us);
 
 CREATE TABLE IF NOT EXISTS ohlcv_1m (
   bucket_start_us INTEGER NOT NULL,
@@ -539,12 +566,16 @@ class DatabaseSink:
             maxsize=config.queue_maxsize
         )
         self._connections: dict[str, sqlite3.Connection] = {}
+        self.state_dir = config.database_dir.parent
+        self.sealed_dir = self.state_dir / "sealed"
+        self.lock_dir = self.state_dir / "locks"
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
     def start(self) -> None:
-        self.config.database_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.config.database_dir, 0o750)
+        for directory in (self.config.database_dir, self.sealed_dir, self.lock_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+            os.chmod(directory, 0o750)
         self._task = asyncio.create_task(self._run(), name="sqlite-writer")
 
     async def put(self, kind: str, payload: dict[str, Any]) -> None:
@@ -586,6 +617,8 @@ class DatabaseSink:
                 self.queue.task_done()
 
     def _connection(self, partition: str) -> sqlite3.Connection:
+        if self._is_partition_sealed(partition):
+            raise RuntimeError(f"refusing to open sealed partition: {partition}")
         connection = self._connections.get(partition)
         if connection is not None:
             return connection
@@ -654,26 +687,70 @@ class DatabaseSink:
             ),
         )
 
+    def _is_partition_sealed(self, partition: str) -> bool:
+        return (self.sealed_dir / f"{partition}.json").is_file()
+
+    @contextmanager
+    def _partition_lock(self, partition: str):
+        lock_path = self.lock_dir / f"{partition}.lock"
+        with lock_path.open("a+") as lock_file:
+            os.chmod(lock_path, 0o640)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _write_partition(
+        self, partition: str, commands: list[tuple[str, dict[str, Any]]]
+    ) -> None:
+        connection = self._connection(partition)
+        try:
+            connection.execute("BEGIN")
+            for kind, payload in commands:
+                self._ensure_connection(connection, payload)
+                self._apply(connection, kind, payload)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         for kind, payload in batch:
             if kind == "__stop__":
                 continue
-            grouped[partition_for_us(int(payload.get("partition_us", payload["recv_us"])))].append((kind, payload))
+            partition_us = int(payload.get("partition_us", payload["recv_us"]))
+            grouped[partition_for_us(partition_us)].append((kind, payload))
+
+        late_commands: list[tuple[str, dict[str, Any]]] = []
         for partition, commands in grouped.items():
-            connection = self._connection(partition)
-            try:
-                connection.execute("BEGIN")
-                for kind, payload in commands:
-                    self._ensure_connection(connection, payload)
-                    self._apply(connection, kind, payload)
+            with self._partition_lock(partition):
+                if self._is_partition_sealed(partition):
+                    regular_commands = []
+                    for kind, payload in commands:
+                        if kind != "trade":
+                            raise RuntimeError(
+                                f"non-trade command targeted sealed partition {partition}: {kind}"
+                            )
+                        late_payload = dict(payload)
+                        late_payload["sealed_partition"] = partition
+                        late_commands.append(("late_trade", late_payload))
+                    commands = regular_commands
+                if commands:
+                    self._write_partition(partition, commands)
+
+        if late_commands:
+            late_partition = partition_for_us(now_us())
+            with self._partition_lock(late_partition):
+                if self._is_partition_sealed(late_partition):
+                    raise RuntimeError(f"active late-trade partition is sealed: {late_partition}")
+                self._write_partition(late_partition, late_commands)
+
+        for partition, connection in list(self._connections.items()):
+            with self._partition_lock(partition):
+                self._finalize_ohlcv(connection, now_us())
                 connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-        for connection in self._connections.values():
-            self._finalize_ohlcv(connection, now_us())
-            connection.commit()
         current_partition = partition_for_us(now_us())
         for partition in list(self._connections):
             if partition < current_partition:
@@ -775,6 +852,22 @@ class DatabaseSink:
             connection.executemany(
                 "INSERT INTO book_level(book_event_id, side, level, price, size) VALUES (?, ?, ?, ?, ?)",
                 [(event_id, *level) for level in payload["levels"]],
+            )
+        elif kind == "late_trade":
+            connection.execute(
+                """INSERT OR IGNORE INTO late_trade(
+                     connection_session_id, venue, market_id, symbol, exchange_trade_id,
+                     exchange_sequence, local_sequence, ts_recv_us, ts_srv_us,
+                     event_ts_us, sealed_partition, price, size, aggressor_side,
+                     raw_public_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    payload["connection"]["id"], payload["venue"], payload["market_id"],
+                    payload["symbol"], payload["trade_id"], payload.get("exchange_sequence"),
+                    payload["local_sequence"], payload["recv_us"], payload.get("srv_us"),
+                    payload["event_ts_us"], payload["sealed_partition"], payload["price"],
+                    payload["size"], payload.get("aggressor_side"), payload["raw_public_json"],
+                ),
             )
         elif kind == "trade":
             cursor = connection.execute(
