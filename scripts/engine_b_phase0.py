@@ -596,23 +596,39 @@ class BookState:
     synced: bool = False
     last_reconstructed_us: int = 0
 
-    def apply_snapshot(self, payload: dict[str, Any]) -> None:
+    def apply_snapshot(self, payload: dict[str, Any]) -> bool:
+        nonce = self._sequence(payload.get("nonce"))
+        if nonce is None:
+            self.synced = False
+            self.last_nonce = None
+            self.bids.clear()
+            self.asks.clear()
+            return False
         self.bids = self._levels_to_map(payload.get("bids", []))
         self.asks = self._levels_to_map(payload.get("asks", []))
-        self.last_nonce = self._sequence(payload.get("nonce"))
+        self.last_nonce = nonce
         self.synced = True
+        return True
 
     def apply_delta(self, payload: dict[str, Any]) -> tuple[bool, str | None, str | None]:
         begin_nonce = self._sequence(payload.get("begin_nonce"))
+        next_nonce = self._sequence(payload.get("nonce"))
         expected = self.last_nonce
-        if not self.synced or (begin_nonce is not None and expected is not None and begin_nonce != expected):
+        if (
+            not self.synced
+            or begin_nonce is None
+            or next_nonce is None
+            or expected is None
+            or begin_nonce != expected
+        ):
             self.synced = False
+            self.last_nonce = None
             self.bids.clear()
             self.asks.clear()
             return False, expected, begin_nonce
         self._apply_levels(self.bids, payload.get("bids", []))
         self._apply_levels(self.asks, payload.get("asks", []))
-        self.last_nonce = self._sequence(payload.get("nonce")) or self.last_nonce
+        self.last_nonce = next_nonce
         return True, expected, begin_nonce
 
     def reconstructed_levels(self, top_levels: int) -> list[tuple[str, int, str, str]]:
@@ -1371,7 +1387,7 @@ class Collector:
             payload.get("last_updated_at", message.get("last_updated_at", message.get("timestamp")))
         )
         event_kind = "snapshot" if message_type == "subscribed/order_book" else "delta"
-        complete = event_kind == "snapshot"
+        complete = event_kind == "snapshot" and payload.get("nonce") is not None
         await self.sink.put(
             "book",
             {
@@ -1390,30 +1406,42 @@ class Collector:
                 "levels": BookState.raw_levels(payload),
             },
         )
-        if complete:
-            state.apply_snapshot(payload)
+        if event_kind == "snapshot":
+            applied = state.apply_snapshot(payload)
+            expected = None
+            observed = (
+                str(payload["nonce"]) if payload.get("nonce") is not None else None
+            )
         else:
             applied, expected, observed = state.apply_delta(payload)
-            if not applied:
-                self.metrics.inc("engine_b_phase0_sequence_gap_total", {"venue": venue.name, "symbol": market.symbol})
-                await self.sink.put(
-                    "gap",
-                    {
-                        "recv_us": recv_us,
-                        "connection_id": connection["id"],
-                        "venue": venue.name,
-                        "market_id": market_id,
-                        "symbol": market.symbol,
-                        "channel": "order_book",
-                        "expected_sequence": expected,
-                        "observed_sequence": observed,
-                        "reason": "begin_nonce_mismatch_or_unsynced_delta",
-                    },
-                )
-                await send_public_control(ws, {"type": "unsubscribe", "channel": f"order_book/{market_id}"})
-                await send_public_control(ws, {"type": "subscribe", "channel": f"order_book/{market_id}"})
-                self.metrics.book_synced[(venue.name, market_id)] = False
-                return
+        if not applied:
+            self.metrics.inc("engine_b_phase0_sequence_gap_total", {"venue": venue.name, "symbol": market.symbol})
+            if event_kind == "snapshot":
+                reason = "snapshot_missing_nonce"
+            elif payload.get("begin_nonce") is None:
+                reason = "delta_missing_begin_nonce"
+            elif payload.get("nonce") is None:
+                reason = "delta_missing_nonce"
+            else:
+                reason = "begin_nonce_mismatch_or_unsynced_delta"
+            await self.sink.put(
+                "gap",
+                {
+                    "recv_us": recv_us,
+                    "connection_id": connection["id"],
+                    "venue": venue.name,
+                    "market_id": market_id,
+                    "symbol": market.symbol,
+                    "channel": "order_book",
+                    "expected_sequence": expected,
+                    "observed_sequence": observed,
+                    "reason": reason,
+                },
+            )
+            await send_public_control(ws, {"type": "unsubscribe", "channel": f"order_book/{market_id}"})
+            await send_public_control(ws, {"type": "subscribe", "channel": f"order_book/{market_id}"})
+            self.metrics.book_synced[(venue.name, market_id)] = False
+            return
         self.metrics.book_synced[(venue.name, market_id)] = state.synced
         if state.synced and recv_us - state.last_reconstructed_us >= self.config.reconstructed_snapshot_interval_ms * 1_000:
             state.last_reconstructed_us = recv_us

@@ -140,6 +140,75 @@ class BookStateTests(unittest.TestCase):
         self.assertEqual((expected, observed), ("10", "12"))
         self.assertFalse(state.synced)
 
+    def test_missing_sequence_invalidates_book(self) -> None:
+        state = engine_b.BookState()
+        self.assertFalse(state.apply_snapshot({"bids": [], "asks": []}))
+        self.assertFalse(state.synced)
+
+        self.assertTrue(
+            state.apply_snapshot({"nonce": 10, "bids": [], "asks": []})
+        )
+        applied, _, observed = state.apply_delta(
+            {"nonce": 11, "bids": [], "asks": []}
+        )
+        self.assertFalse(applied)
+        self.assertIsNone(observed)
+        self.assertFalse(state.synced)
+
+        self.assertTrue(
+            state.apply_snapshot({"nonce": 20, "bids": [], "asks": []})
+        )
+        applied, expected, observed = state.apply_delta(
+            {"begin_nonce": 20, "bids": [], "asks": []}
+        )
+        self.assertFalse(applied)
+        self.assertEqual((expected, observed), ("20", "20"))
+        self.assertFalse(state.synced)
+
+
+class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_snapshot_nonce_never_emits_reconstruction(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        metrics = engine_b.Metrics()
+        collector = engine_b.Collector(config, sink, metrics)
+        ws = FakeWebSocket()
+        connection = {
+            "id": "missing-snapshot-nonce",
+            "venue": venue.name,
+            "started_us": 1_774_884_000_000_000,
+            "api_schema_version": config.api_schema_version,
+        }
+        await collector.handle_book(
+            ws,
+            venue,
+            connection,
+            {
+                "type": "subscribed/order_book",
+                "channel": "order_book/37",
+                "order_book": {
+                    "bids": [{"price": "100", "size": "1"}],
+                    "asks": [{"price": "101", "size": "1"}],
+                },
+            },
+            1_774_884_082_400_000,
+        )
+
+        books = [payload for kind, payload in sink.commands if kind == "book"]
+        gaps = [payload for kind, payload in sink.commands if kind == "gap"]
+        self.assertEqual(len(books), 1)
+        self.assertFalse(books[0]["complete"])
+        self.assertEqual(gaps[0]["reason"], "snapshot_missing_nonce")
+        self.assertFalse(metrics.book_synced[(venue.name, 37)])
+        self.assertEqual(
+            ws.messages,
+            [
+                {"type": "unsubscribe", "channel": "order_book/37"},
+                {"type": "subscribe", "channel": "order_book/37"},
+            ],
+        )
+
 
 class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_synthetic_ids_distinguish_positions_and_survive_replay(self) -> None:

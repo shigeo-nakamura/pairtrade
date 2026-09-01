@@ -110,6 +110,9 @@ curl -fsS http://127.0.0.1:9472/metrics | grep engine_b_phase0_order_capability
 Confirm both venues are connected, all expected books become synchronized,
 the DB queue remains bounded, SQLite `PRAGMA integrity_check` returns `ok`, and
 `order_capability` is `false`/`0`.
+Book snapshots without a nonce, and deltas without both begin/end nonces, are
+recorded as incomplete sequence gaps and force a public-channel resubscribe;
+they never produce reconstructed top-of-book rows.
 
 ## `freq2` account record
 
