@@ -360,6 +360,49 @@ fn live_tick_pending_plan_path(config: &ArcusSpotExecuteOnceConfig) -> Result<Pa
     Ok(parent.join("live-tick-pending-plan.json"))
 }
 
+/// Recover an unattended live-tick attempt before accepting another market
+/// observation. The plan file is the immutable strategy evidence that the
+/// active ledger digest commits to; a later tick must never replace it while
+/// the prior swap is still unresolved.
+fn live_tick_active_recovery_plan(
+    config: &ArcusSpotExecuteOnceConfig,
+    ledger: &ArcusSpotExecutionLedger,
+) -> Result<Option<(ArcusSpotRotationPlan, String)>> {
+    let Some(active) = ledger.active.as_ref() else {
+        return Ok(None);
+    };
+    let path = live_tick_pending_plan_path(config)?;
+    let bytes = read_private_regular_file(&path, "Arcus active live-tick pending plan")?;
+    let plan = plan_from_document(
+        &bytes,
+        &format!("Arcus active live-tick pending plan {}", path.display()),
+    )?;
+    let digest = approval_digest(config, &plan)?;
+    if active.intent.plan_config_digest != digest {
+        bail!("Arcus active execution attempt does not match its live-tick pending-plan evidence");
+    }
+    Ok(Some((plan, digest)))
+}
+
+async fn resume_active_live_tick_attempt(
+    config: &ArcusSpotExecuteOnceConfig,
+) -> Result<Option<ArcusSpotExecutionAttempt>> {
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    let lock = ledger_store.acquire_exclusive_lock(&config.runtime_state_path)?;
+    let ledger = ledger_store.load_or_create(Utc::now())?;
+    let recovery = live_tick_active_recovery_plan(config, &ledger)?;
+    drop(lock);
+
+    let Some((plan, plan_config_digest)) = recovery else {
+        return Ok(None);
+    };
+    let mut executor = executor_from_config(config).await?;
+    let attempt = executor.resume_status_and_reconcile().await?;
+    let attempt =
+        finalize_reconciled_attempt(config, &mut executor, &plan, &plan_config_digest, attempt)?;
+    Ok(Some(attempt))
+}
+
 fn declined_route_log_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
     let parent = config
         .runtime_state_path
@@ -2274,8 +2317,11 @@ and ledger advancement but refuses sequence/history regression, lost attempts,
 or a position-state change without a corresponding ledger change. Neither
 command restores or deletes live state.
 
-live-tick is the unattended-probe entry point: it fetches exactly one live
-snapshot itself (the same public, read-only recorder client
+live-tick is the unattended-probe entry point. Before accepting a new market
+snapshot, it resumes any active ledger attempt from the digest-bound original
+pending-plan evidence; unresolved or mismatched evidence fails closed without
+advancing the signal checkpoint. With no active attempt, it fetches exactly one
+live snapshot itself (the same public, read-only recorder client
 arcus-spot-propose-plan and the archival collector use -- never a
 caller-supplied file, which would have no authenticated origin), evaluates
 the strategy signal (ArcusSpotRuntime::step_at) against it, always persists
@@ -2293,8 +2339,10 @@ its recorder snapshot and evaluation time in
 <runtime_state_path's directory>/live-tick-observation-evidence.json. Before
 dispatching, it also writes the plan-bearing recovery envelope to
 <runtime_state_path's directory>/live-tick-pending-plan.json (both mode 0600);
-if the process exits after Submitted but before confirmation, recover with
-auto-resume CONFIG_YAML <that path>.
+while an attempt is active that file cannot be replaced by a later signal. If the
+process exits after Submitted but before confirmation, the next live-tick
+resumes it automatically; auto-resume CONFIG_YAML <that path> remains the
+manual recovery command.
 
 auto-execute/auto-resume/live-tick skip the offline human approval signature
 (explicit owner decision while total inventory at risk stays small -- see
@@ -3080,6 +3128,10 @@ async fn main() -> Result<()> {
             let config = parse_config(&config_bytes, Path::new(config_path))?;
             let policy = auto_execute_policy_from_admin_file()?;
             require_config_within_auto_execute_policy(&config, &policy)?;
+
+            if let Some(attempt) = resume_active_live_tick_attempt(&config).await? {
+                return write_attempt(&attempt);
+            }
 
             // Fetch the snapshot live, from the same public, read-only
             // recorder client the archival collector and
@@ -6075,6 +6127,92 @@ runtime:
         assert_eq!(row["token_a_reference_price_usd"], "200");
         assert_eq!(row["token_b_reference_price_usd"], "100");
         assert_eq!(row["sequence"], serde_json::json!(41));
+    }
+
+    fn persist_test_live_tick_plan(
+        config: &ArcusSpotExecuteOnceConfig,
+        plan: &ArcusSpotRotationPlan,
+    ) {
+        let at = fixture_now();
+        let evidence = ArcusSpotLiveTickEvidence {
+            schema_version: LIVE_TICK_EVIDENCE_SCHEMA_VERSION,
+            evaluation_time: at,
+            snapshot: accepted_entry_snapshot(at),
+            plan: plan.clone(),
+        };
+        write_private_regular_file_atomic(
+            &live_tick_pending_plan_path(config).unwrap(),
+            &serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn ledger_with_active_plan(
+        config: &ArcusSpotExecuteOnceConfig,
+        plan: &ArcusSpotRotationPlan,
+    ) -> ArcusSpotExecutionLedger {
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger.next_sequence = 2;
+        ledger.active = Some(reconciled_entry_attempt(config, plan, 1));
+        ledger
+    }
+
+    #[test]
+    fn live_tick_active_recovery_loads_the_digest_bound_pending_plan() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        persist_test_live_tick_plan(&config, &plan);
+        let ledger = ledger_with_active_plan(&config, &plan);
+
+        let (recovered, digest) = live_tick_active_recovery_plan(&config, &ledger)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recovered, plan);
+        assert_eq!(digest, ledger.active.unwrap().intent.plan_config_digest);
+    }
+
+    #[test]
+    fn live_tick_active_recovery_rejects_overwritten_pending_plan() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        let ledger = ledger_with_active_plan(&config, &plan);
+        let mut later_plan = plan;
+        later_plan.buy_quantity = Decimal::new(49, 2);
+        persist_test_live_tick_plan(&config, &later_plan);
+
+        let error = live_tick_active_recovery_plan(&config, &ledger).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match its live-tick pending-plan evidence"));
+    }
+
+    #[test]
+    fn live_tick_without_an_active_attempt_ignores_stale_pending_evidence() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let pending_path = live_tick_pending_plan_path(&config).unwrap();
+        write_private_regular_file_atomic(&pending_path, b"stale-not-json").unwrap();
+
+        let recovery =
+            live_tick_active_recovery_plan(&config, &ArcusSpotExecutionLedger::default()).unwrap();
+
+        assert!(recovery.is_none());
     }
 
     /// bot-strategy#817/#818: a plan on an unvalidated venue is an ordinary
