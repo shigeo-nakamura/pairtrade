@@ -6,6 +6,7 @@ DATA_DIR=${ENGINE_B_PHASE0_DATA_DIR:-/var/lib/engine-b-phase0/data}
 S3_BUCKET=${ENGINE_B_PHASE0_S3_BUCKET:-debot-dashboard}
 S3_PREFIX=${ENGINE_B_PHASE0_S3_PREFIX:-debot/engine-b/phase0/raw}
 PYTHON_BIN=${ENGINE_B_PHASE0_PYTHON:-/opt/engine-b-phase0/venv/bin/python}
+OBSERVER_SCRIPT=${ENGINE_B_PHASE0_OBSERVER_SCRIPT:-$(dirname "$0")/engine_b_phase0.py}
 DELETE_VERIFIED_LOCAL=${ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL:-false}
 CURRENT_PARTITION=$(date -u +%Y%m%d_%H)
 HOST_ID=$(hostname -s)
@@ -154,53 +155,8 @@ PY
   if [ "$DELETE_VERIFIED_LOCAL" = "true" ]; then
     trade_index_path="$SEALED_DIR/$partition.trade_ids.sqlite3"
     trade_index_tmp=$(mktemp "$SEALED_DIR/.${partition}.trade-ids.XXXXXX.sqlite3")
-    "$PYTHON_BIN" - "$db" "$trade_index_tmp" "$partition" "$expected_db_sha" <<'PY'
-import sqlite3
-import sys
-
-source_path, index_path, partition, canonical_sha256 = sys.argv[1:]
-source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
-index = sqlite3.connect(index_path)
-try:
-    index.execute(
-        """CREATE TABLE sealed_metadata(
-             partition TEXT PRIMARY KEY,
-             canonical_db_sha256 TEXT NOT NULL
-           )"""
-    )
-    index.execute(
-        """CREATE TABLE archived_trade_identity(
-             venue TEXT NOT NULL,
-             market_id INTEGER NOT NULL,
-             exchange_trade_id TEXT NOT NULL,
-             PRIMARY KEY(venue, market_id, exchange_trade_id)
-           ) WITHOUT ROWID"""
-    )
-    tables = {
-        row[0]
-        for row in source.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
-    }
-    if "trade" in tables:
-        index.executemany(
-            """INSERT OR IGNORE INTO archived_trade_identity
-               VALUES (?, ?, ?)""",
-            source.execute(
-                "SELECT venue, market_id, exchange_trade_id FROM trade"
-            ),
-        )
-    index.execute(
-        "INSERT INTO sealed_metadata VALUES (?, ?)",
-        (partition, canonical_sha256),
-    )
-    index.commit()
-    if index.execute("PRAGMA integrity_check").fetchone() != ("ok",):
-        raise SystemExit(f"trade identity index integrity_check failed: {index_path}")
-finally:
-    index.close()
-    source.close()
-PY
+    "$PYTHON_BIN" "$OBSERVER_SCRIPT" --build-sealed-trade-index \
+      "$db" "$trade_index_tmp" "$partition" "$expected_db_sha"
     chmod 0640 "$trade_index_tmp"
     trade_identity_count=$(
       "$PYTHON_BIN" - "$trade_index_tmp" <<'PY'

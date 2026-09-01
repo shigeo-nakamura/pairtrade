@@ -31,11 +31,57 @@ connection.execute("PRAGMA journal_mode=WAL")
 connection.execute("CREATE TABLE sample(value TEXT NOT NULL)")
 connection.execute("CREATE TABLE ohlcv_1m(is_complete INTEGER NOT NULL)")
 connection.execute(
-    "CREATE TABLE trade(venue TEXT NOT NULL, market_id INTEGER NOT NULL, exchange_trade_id TEXT NOT NULL)"
+    """CREATE TABLE trade(
+         trade_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+         connection_session_id TEXT NOT NULL,
+         venue TEXT NOT NULL,
+         market_id INTEGER NOT NULL,
+         exchange_trade_id TEXT,
+         exchange_sequence TEXT,
+         local_sequence INTEGER NOT NULL,
+         ts_recv_us INTEGER NOT NULL,
+         ts_srv_us INTEGER,
+         raw_public_json TEXT NOT NULL
+       )"""
 )
 connection.execute("INSERT INTO sample VALUES ('recovered-from-wal')")
 connection.execute("INSERT INTO ohlcv_1m VALUES (0)")
-connection.execute("INSERT INTO trade VALUES ('robinhood', 37, 'canonical-trade')")
+connection.execute(
+    """INSERT INTO trade(
+         connection_session_id, venue, market_id, exchange_trade_id,
+         exchange_sequence, local_sequence, ts_recv_us, ts_srv_us,
+         raw_public_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    (
+        "legacy-connection",
+        "robinhood",
+        37,
+        "canonical-trade",
+        "9001",
+        1,
+        1_774_884_082_400_000,
+        1_774_884_082_309_000,
+        '{"price":"101","size":"2"}',
+    ),
+)
+connection.execute(
+    """INSERT INTO trade(
+         connection_session_id, venue, market_id, exchange_trade_id,
+         exchange_sequence, local_sequence, ts_recv_us, ts_srv_us,
+         raw_public_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    (
+        "legacy-connection",
+        "robinhood",
+        37,
+        None,
+        "9001",
+        2,
+        1_774_884_082_400_000,
+        1_774_884_082_309_000,
+        '{"price":"101","size":"2"}',
+    ),
+)
 connection.commit()
 os._exit(0)
 PY
@@ -135,22 +181,39 @@ test -f "$seal"
 test -f "$trade_index"
 python3 - "$seal" "$trade_index" "$expected_sha" <<'PY'
 import json
+import hashlib
 import sqlite3
 import sys
 
 seal = json.load(open(sys.argv[1]))
 assert seal["partition"] == "20000101_00"
 assert seal["trade_index"] == "20000101_00.trade_ids.sqlite3"
-assert seal["trade_identity_count"] == 1
+assert seal["trade_identity_count"] == 2
 assert seal["sha256"] == sys.argv[3]
 connection = sqlite3.connect(f"file:{sys.argv[2]}?mode=ro", uri=True)
 try:
     assert connection.execute("SELECT partition FROM sealed_metadata").fetchone() == (
         "20000101_00",
     )
-    assert connection.execute(
+    identities = connection.execute(
         "SELECT venue, market_id, exchange_trade_id FROM archived_trade_identity"
-    ).fetchone() == ("robinhood", 37, "canonical-trade")
+        " ORDER BY exchange_trade_id"
+    ).fetchall()
+    assert ("robinhood", 37, "canonical-trade") in identities
+    identity = json.dumps(
+        {
+            "venue": "robinhood",
+            "market_id": 37,
+            "event_ts_us": 1_774_884_082_309_000,
+            "exchange_sequence": "9001",
+            "trade_position": 1,
+            "raw_public_json": '{"price":"101","size":"2"}',
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected_synthetic = "synthetic:" + hashlib.sha256(identity.encode()).hexdigest()
+    assert ("robinhood", 37, expected_synthetic) in identities
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 finally:
     connection.close()

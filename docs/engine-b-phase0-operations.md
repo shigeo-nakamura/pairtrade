@@ -55,7 +55,11 @@ canonical archive's trade identities. The collector never recreates a sealed
 canonical partition: replayed canonical trades are discarded using that
 index, while genuinely new events for that exchange hour are stored in the
 active partition's `late_trade` table with the original sealed partition
-recorded.
+recorded. ID-less trades receive a stable synthetic identity containing the
+exchange event timestamp, message sequence, and position. When an older
+partition still contains NULL trade IDs, the index builder reconstructs the
+same identity from its stored receive/message ordering instead of refusing to
+seal the partition.
 If the source changes or WAL sidecars reappear during upload, the seal is rolled
 back and the local partition is retained.
 

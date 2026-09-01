@@ -37,9 +37,6 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-from websockets.asyncio.client import connect
-
-
 LOG = logging.getLogger("engine_b_phase0")
 UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
@@ -321,6 +318,123 @@ def canonical_decimal(value: Any) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return "0" if text == "-0" else text
+
+
+def synthetic_trade_id(
+    venue: str,
+    market_id: int,
+    event_ts_us: int,
+    exchange_sequence: str | None,
+    trade_position: int,
+    raw_public_json: str,
+) -> str:
+    identity = json.dumps(
+        {
+            "venue": venue,
+            "market_id": market_id,
+            "event_ts_us": event_ts_us,
+            "exchange_sequence": exchange_sequence,
+            "trade_position": trade_position,
+            "raw_public_json": raw_public_json,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "synthetic:" + hashlib.sha256(identity.encode()).hexdigest()
+
+
+def build_sealed_trade_index(
+    source_path: Path,
+    index_path: Path,
+    partition: str,
+    canonical_sha256: str,
+) -> None:
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+    index = sqlite3.connect(index_path)
+    try:
+        index.execute(
+            """CREATE TABLE sealed_metadata(
+                 partition TEXT PRIMARY KEY,
+                 canonical_db_sha256 TEXT NOT NULL
+               )"""
+        )
+        index.execute(
+            """CREATE TABLE archived_trade_identity(
+                 venue TEXT NOT NULL,
+                 market_id INTEGER NOT NULL,
+                 exchange_trade_id TEXT NOT NULL,
+                 PRIMARY KEY(venue, market_id, exchange_trade_id)
+               ) WITHOUT ROWID"""
+        )
+        tables = {
+            row[0]
+            for row in source.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "trade" in tables:
+            last_message: tuple[str, str, int, int, str | None] | None = None
+            trade_position = 0
+            rows = source.execute(
+                """SELECT trade_row_id, connection_session_id, venue, market_id,
+                          exchange_trade_id, exchange_sequence, local_sequence,
+                          ts_recv_us, ts_srv_us, raw_public_json
+                   FROM trade
+                   ORDER BY connection_session_id, venue, market_id, ts_recv_us,
+                            local_sequence, trade_row_id"""
+            )
+            for (
+                _trade_row_id,
+                connection_session_id,
+                venue,
+                market_id,
+                exchange_trade_id,
+                exchange_sequence,
+                _local_sequence,
+                ts_recv_us,
+                ts_srv_us,
+                raw_public_json,
+            ) in rows:
+                message_identity = (
+                    connection_session_id,
+                    venue,
+                    market_id,
+                    ts_recv_us,
+                    exchange_sequence,
+                )
+                if message_identity == last_message:
+                    trade_position += 1
+                else:
+                    last_message = message_identity
+                    trade_position = 0
+                stable_trade_id = (
+                    exchange_trade_id
+                    if exchange_trade_id is not None
+                    else synthetic_trade_id(
+                        venue,
+                        market_id,
+                        ts_srv_us or ts_recv_us,
+                        exchange_sequence,
+                        trade_position,
+                        raw_public_json,
+                    )
+                )
+                index.execute(
+                    "INSERT OR IGNORE INTO archived_trade_identity VALUES (?, ?, ?)",
+                    (venue, market_id, stable_trade_id),
+                )
+        index.execute(
+            "INSERT INTO sealed_metadata VALUES (?, ?)",
+            (partition, canonical_sha256),
+        )
+        index.commit()
+        if index.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+            raise RuntimeError(
+                f"trade identity index integrity_check failed: {index_path}"
+            )
+    finally:
+        index.close()
+        source.close()
 
 
 def parse_market_id(channel: str) -> int:
@@ -1105,6 +1219,8 @@ class Collector:
             raise RuntimeError("database writer ended unexpectedly")
 
     async def feed_loop(self, venue: VenueConfig) -> None:
+        from websockets.asyncio.client import connect
+
         backoff = 1
         while not self.stop_event.is_set():
             connection = {
@@ -1293,7 +1409,7 @@ class Collector:
             return
         exchange_sequence = str(message["nonce"]) if message.get("nonce") is not None else None
         trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
-        for trade in trades:
+        for trade_position, trade in enumerate(trades):
             price_text = canonical_decimal(trade["price"])
             size_text = canonical_decimal(trade["size"])
             srv_us = normalize_exchange_timestamp_us(trade.get("timestamp", message.get("timestamp")))
@@ -1306,10 +1422,14 @@ class Collector:
             trade_id = (
                 str(raw_trade_id)
                 if raw_trade_id is not None
-                else "synthetic:"
-                + hashlib.sha256(
-                    f"{venue.name}:{market_id}:".encode() + raw_public_json.encode()
-                ).hexdigest()
+                else synthetic_trade_id(
+                    venue.name,
+                    market_id,
+                    event_ts_us,
+                    exchange_sequence,
+                    trade_position,
+                    raw_public_json,
+                )
             )
             await self.sink.put(
                 "trade",
@@ -1622,6 +1742,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-listen")
     parser.add_argument("--smoke-seconds", type=int)
     parser.add_argument("--validate-config", action="store_true")
+    parser.add_argument(
+        "--build-sealed-trade-index",
+        nargs=4,
+        metavar=("SOURCE_DB", "INDEX_DB", "PARTITION", "CANONICAL_SHA256"),
+    )
     return parser.parse_args()
 
 
@@ -1687,6 +1812,12 @@ def main() -> int:
         format="%(asctime)sZ %(levelname)s %(name)s %(message)s",
     )
     args = parse_args()
+    if args.build_sealed_trade_index is not None:
+        source, index, partition, canonical_sha256 = args.build_sealed_trade_index
+        build_sealed_trade_index(
+            Path(source), Path(index), partition, canonical_sha256
+        )
+        return 0
     if args.smoke_seconds is not None and args.smoke_seconds <= 0:
         raise SystemExit("--smoke-seconds must be positive")
     return asyncio.run(async_main(args))

@@ -39,6 +39,14 @@ class FakeWebSocket:
         self.messages.append(json.loads(payload))
 
 
+class RecordingSink:
+    def __init__(self) -> None:
+        self.commands: list[tuple[str, dict[str, object]]] = []
+
+    async def put(self, kind: str, payload: dict[str, object]) -> None:
+        self.commands.append((kind, payload))
+
+
 class ReadOnlyBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_allows_only_public_control_messages(self) -> None:
         ws = FakeWebSocket()
@@ -131,6 +139,40 @@ class BookStateTests(unittest.TestCase):
         self.assertFalse(applied)
         self.assertEqual((expected, observed), ("10", "12"))
         self.assertFalse(state.synced)
+
+
+class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_synthetic_ids_distinguish_positions_and_survive_replay(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        connection = {
+            "id": "trade-identity-connection",
+            "venue": venue.name,
+            "started_us": 1_774_884_000_000_000,
+            "api_schema_version": config.api_schema_version,
+        }
+        trade = {"price": "101", "size": "2", "is_maker_ask": True}
+        message = {
+            "channel": "trade/37",
+            "nonce": 9001,
+            "timestamp": 1_774_884_082_309,
+            "trades": [trade, trade],
+        }
+
+        await collector.handle_trades(
+            venue, connection, message, 1_774_884_082_400_000
+        )
+        await collector.handle_trades(
+            venue, connection, message, 1_774_884_083_400_000
+        )
+
+        ids = [payload["trade_id"] for kind, payload in sink.commands if kind == "trade"]
+        self.assertEqual(len(ids), 4)
+        self.assertNotEqual(ids[0], ids[1])
+        self.assertEqual(ids[:2], ids[2:])
+        self.assertTrue(all(str(value).startswith("synthetic:") for value in ids))
 
 
 class ConfigTests(unittest.TestCase):
