@@ -581,6 +581,7 @@ fn build_repair_report(config_path: &Path, events_jsonl_path: &Path) -> Result<s
                         live_tick_pending_plan_path(&config)?.display(),
                     ),
                     "Then either restart arcus-spot-live-tick.timer, or run `auto-resume CONFIG_YAML <that path>` directly, to let the existing resume path reconcile this attempt.".to_string(),
+                    "`recovered_plan` is a bare ArcusSpotRotationPlan, not a full live-tick evidence envelope -- this tool cannot reconstruct the original recorder snapshot from the compact event archive. auto-resume/live-tick accept a bare plan (plan_from_document's legacy fallback), but state-verify-continuity requires the full envelope for any on-disk pending-plan file and will reject this one until the next live-tick dispatch overwrites it with a fresh full-envelope version -- expect that, don't treat it as a new incident.".to_string(),
                     "This command did not write anything itself; review the plan above against the production evidence in bot-strategy#869 before restoring it.".to_string(),
                 ]
             } else {
@@ -6903,6 +6904,13 @@ runtime:
         assert!(steps
             .iter()
             .any(|step| step.contains(&active.sequence.to_string())));
+        // Codex P2 follow-up, pairtrade#240: a restored bare plan is not a
+        // full live-tick evidence envelope, so state-verify-continuity will
+        // reject it until overwritten by a genuine dispatch. The report must
+        // say so up front rather than let it surprise the operator later.
+        assert!(steps
+            .iter()
+            .any(|step| step.contains("state-verify-continuity")));
         // Exactly the intent-matching, digest-matching candidate -- the
         // decoy never appears because it fails the coarse filter first.
         assert_eq!(report["candidates_scanned"].as_array().unwrap().len(), 1);
