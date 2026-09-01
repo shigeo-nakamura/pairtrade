@@ -34,7 +34,7 @@ env:
   AWS_REGION: eu-central-1
   INSTALL_DIR: /opt/debot-hl
   # Keep in sync with ci.yml's pin; hyperliquid-sdk landed in v4.7.5.
-  DEX_CONNECTOR_REF: v4.7.14
+  DEX_CONNECTOR_REF: v4.7.15
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
   RUST_TOOLCHAIN: 1.94.1
 
