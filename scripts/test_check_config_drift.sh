@@ -4,7 +4,9 @@
 #   1. round.json can declare a per-variant `max_leverage` override (falling
 #      back to the top-level value for a variant that doesn't declare one),
 #      matching how the running process itself resolves leverage.
-#   2. The round.json field parser uses '|' as its internal record
+#   2. Process-wide eligibility grace values and the exact expected variant set
+#      are also enforced, so a stale disabled arm cannot pass preflight.
+#   3. The round.json field parser uses '|' as its internal record
 #      separator, not a tab — an empty cell adjacent to a tab (e.g. the
 #      common case of `use_frozen_beta_exit_z` left undeclared) used to be
 #      silently swallowed by bash's `read`, which treats a run of IFS
@@ -45,6 +47,8 @@ ROUND_JSON="$WORK/round.json"
 cat > "$ROUND_JSON" <<'EOF'
 {
   "max_leverage": 20,
+  "eligibility_margin_grace_secs": 60,
+  "eligibility_beta_gap_exit": 0.25,
   "variants": {
     "freq": {"force_close_secs": 3600, "exit_z": 0.2, "stop_loss_z": 4.0, "equity_reference_usd": 2000, "max_leverage": 30},
     "b": {"force_close_secs": 10800, "exit_z": 0.2, "stop_loss_z": 8.0, "equity_reference_usd": 4000, "max_leverage": 50, "sizing_beta_floor": 0.6, "exit_on_sizing_beta_floor": true},
@@ -56,10 +60,11 @@ EOF
 write_metrics() {
   # $1 = observed max_leverage for variant b (30/50/20 = correct scenario;
   # anything else must be reported as drift).
-  # $2 = observed exit_on_sizing_beta_floor for variant b (default 1 = matches
-  # round.json; bot-strategy#824 review — the new field must be asserted too).
+  # $2 = observed exit_on_sizing_beta_floor for variant b (default 1).
+  # $3 = observed eligibility grace for variant b (default 60).
   local b_mlev="$1"
   local b_eobf="${2:-1}"
+  local b_grace="${3:-60}"
   cat > "$WORK/metrics.txt" <<METRICS
 pairtrade_config_file_info{variant="freq",sha="$DISK_SHA"} 1
 pairtrade_effective_force_close_secs{variant="freq"} 3600
@@ -77,6 +82,12 @@ pairtrade_equity_reference_usd{variant="c"} 1000
 pairtrade_max_leverage_config{variant="freq"} 30
 pairtrade_max_leverage_config{variant="b"} $b_mlev
 pairtrade_max_leverage_config{variant="c"} 20
+pairtrade_effective_eligibility_margin_grace_secs{variant="freq"} 60
+pairtrade_effective_eligibility_margin_grace_secs{variant="b"} $b_grace
+pairtrade_effective_eligibility_margin_grace_secs{variant="c"} 60
+pairtrade_effective_eligibility_beta_gap_exit{variant="freq"} 0.25
+pairtrade_effective_eligibility_beta_gap_exit{variant="b"} 0.25
+pairtrade_effective_eligibility_beta_gap_exit{variant="c"} 0.25
 pairtrade_effective_sizing_beta_floor{variant="freq"} 0
 pairtrade_effective_sizing_beta_floor{variant="b"} 0.6
 pairtrade_effective_sizing_beta_floor{variant="c"} 0
@@ -162,5 +173,36 @@ HTTP_PID=""
 echo "$out" | grep -q 'variant b effective exit_on_sizing_beta_floor=0' \
   || fail "drift message did not name variant b's mismatched exit_on_sizing_beta_floor; got: $out"
 echo "PASS: variant b running with the beta-floor exit disabled when round.json enables it is correctly flagged as drift"
+
+# --- Case 4: process-wide held-position grace disagrees with round.json -------
+write_metrics 50 1 0
+serve_metrics
+set +e
+out=$(run_check 2>&1)
+rc=$?
+set -e
+kill "$HTTP_PID" 2>/dev/null || true
+wait "$HTTP_PID" 2>/dev/null || true
+HTTP_PID=""
+[ "$rc" -eq 2 ] || fail "expected exit 2 when b grace=0 but round.json requires 60, got exit $rc: $out"
+echo "$out" | grep -q 'variant b effective eligibility_margin_grace_secs=0' \
+  || fail "grace drift did not name variant b and the mismatched value: $out"
+echo "PASS: eligibility-margin grace drift is detected"
+
+# --- Case 5: running metrics contain an arm absent from round.json -----------
+write_metrics 50
+printf 'pairtrade_effective_force_close_secs{variant="ghost"} 10800\n' >> "$WORK/metrics.txt"
+serve_metrics
+set +e
+out=$(run_check 2>&1)
+rc=$?
+set -e
+kill "$HTTP_PID" 2>/dev/null || true
+wait "$HTTP_PID" 2>/dev/null || true
+HTTP_PID=""
+[ "$rc" -eq 2 ] || fail "expected exit 2 for unexpected running variant, got exit $rc: $out"
+echo "$out" | grep -q 'unexpected running variant ghost is absent from round.json' \
+  || fail "unexpected variant drift did not identify ghost: $out"
+echo "PASS: unexpected running variant is detected"
 
 echo "ALL CHECKS PASSED"

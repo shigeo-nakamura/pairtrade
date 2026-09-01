@@ -39,11 +39,13 @@
 # (configs/pairtrade/round.json) and asserts the running effective gauges match
 # EVERY field it declares (per-variant force_close / exit_z / stop_loss_z /
 # frozen_beta / equity_reference_usd / max_leverage / sizing_beta_floor /
-# exit_on_sizing_beta_floor, plus a top-level max_leverage fallback for
+# exit_on_sizing_beta_floor, process-wide ineligible-close and eligibility-grace
+# settings, plus a top-level max_leverage fallback for
 # variants that don't declare their own — the blocking preflight for the
 # round-eval harness (#3 in bot-strategy#580). A
 # field absent from round.json is skipped; a declared field with no matching
-# gauge is reported as drift. Requires python3.
+# gauge is reported as drift. When --round-json is used, its variant set is
+# exact: an unexpected running variant is also drift. Requires python3.
 #
 # max_leverage is per-variant since bot-strategy#814 (pairtrade StrategyConfig
 # now resolves it per strategy, not from a single process-wide scalar): a
@@ -75,6 +77,9 @@ EXPECT_MAXLEV=""
 EXPECT_INELIG_CAP=""
 EXPECT_INELIG_SPREAD=""
 EXPECT_INELIG_STALE=""
+EXPECT_ELIG_GRACE=""
+EXPECT_ELIG_BETA_EXIT=""
+EXPECT_EXACT_VARIANTS=0
 
 # Seed EXPECT_FC from EXPECT_FC_<VARIANT> env vars (e.g. EXPECT_FC_A=10800).
 for kv in $(env | grep -E '^EXPECT_FC_[A-Za-z0-9]+=' || true); do
@@ -102,6 +107,7 @@ note_drift() { DRIFT=1; echo "‼️  DRIFT: $*" >&2; }
 
 # Load expected per-variant params from a committed round file (#3).
 if [ -n "$ROUND_JSON" ]; then
+  EXPECT_EXACT_VARIANTS=1
   if [ ! -f "$ROUND_JSON" ]; then echo "round file not found: $ROUND_JSON" >&2; exit 1; fi
   if ! command -v python3 >/dev/null; then echo "--round-json needs python3" >&2; exit 1; fi
   # Assert EVERY field committed in round.json (#580 review): a round that
@@ -122,6 +128,8 @@ if [ -n "$ROUND_JSON" ]; then
     if [ "$kind" = "ineligcap" ]; then EXPECT_INELIG_CAP="$v"; continue; fi
     if [ "$kind" = "ineligspread" ]; then EXPECT_INELIG_SPREAD="$v"; continue; fi
     if [ "$kind" = "ineligstale" ]; then EXPECT_INELIG_STALE="$v"; continue; fi
+    if [ "$kind" = "eliggrace" ]; then EXPECT_ELIG_GRACE="$v"; continue; fi
+    if [ "$kind" = "eligbeta" ]; then EXPECT_ELIG_BETA_EXIT="$v"; continue; fi
     EXPECT_FC["$v"]="$fc"; EXPECT_EXITZ["$v"]="$ez"; EXPECT_SLZ["$v"]="$slz"
     EXPECT_FROZEN["$v"]="$fz"; EXPECT_EQUITY["$v"]="$eq"
     [ -n "$mlev" ] && EXPECT_MAXLEV_VARIANT["$v"]="$mlev"
@@ -141,6 +149,10 @@ if d.get("ineligible_close_defer_spread_bps") is not None:
     print(f'ineligspread|{d["ineligible_close_defer_spread_bps"]}|||||')
 if d.get("ineligible_close_defer_stale_secs") is not None:
     print(f'ineligstale|{d["ineligible_close_defer_stale_secs"]}|||||')
+if d.get("eligibility_margin_grace_secs") is not None:
+    print(f'eliggrace|{d["eligibility_margin_grace_secs"]}|||||')
+if d.get("eligibility_beta_gap_exit") is not None:
+    print(f'eligbeta|{d["eligibility_beta_gap_exit"]}|||||')
 for v, p in d.get("variants", {}).items():
     fz = "" if p.get("use_frozen_beta_exit_z") is None else (1 if p["use_frozen_beta_exit_z"] else 0)
     eobf = "" if p.get("exit_on_sizing_beta_floor") is None else (1 if p["exit_on_sizing_beta_floor"] else 0)
@@ -235,6 +247,10 @@ else
   is_declared() { printf '%s\n' "$declared_variants" | grep -qx "$1"; }
   for variant in $all_variants; do
     fc_raw=$(gauge_for pairtrade_effective_force_close_secs "$variant")
+    if [ "$EXPECT_EXACT_VARIANTS" -eq 1 ] && ! is_declared "$variant"; then
+      note_drift "unexpected running variant $variant is absent from round.json — stale or wrong config loaded."
+      continue
+    fi
     if [ -z "$fc_raw" ]; then
       if is_declared "$variant"; then
         note_drift "expected variant $variant (round.json) is ABSENT from running metrics — config not loaded, or the variant was dropped/renamed."
@@ -252,9 +268,12 @@ else
     inelig_spread=$(gauge_for pairtrade_effective_ineligible_close_defer_spread_bps "$variant")
     inelig_stale=$(gauge_for pairtrade_effective_ineligible_close_defer_stale_secs "$variant")
     inelig_stale=${inelig_stale%.*}
+    elig_grace=$(gauge_for pairtrade_effective_eligibility_margin_grace_secs "$variant")
+    elig_grace=${elig_grace%.*}
+    elig_beta_exit=$(gauge_for pairtrade_effective_eligibility_beta_gap_exit "$variant")
     sizing_floor=$(gauge_for pairtrade_effective_sizing_beta_floor "$variant")
     exit_on_floor=$(gauge_for pairtrade_effective_exit_on_sizing_beta_floor "$variant"); exit_on_floor=${exit_on_floor%.*}
-    say "variant $variant   : force_close=${fc_int}s exit_z=${ez:-?} stop_loss_z=${slz:-?} frozen_beta=${fz:-?} equity=${eq:-?} max_leverage=${mlev:-?} inelig_defer_cap=${inelig_cap:-?} inelig_defer_spread=${inelig_spread:-?} inelig_defer_stale=${inelig_stale:-?} sizing_beta_floor=${sizing_floor:-?} exit_on_sizing_beta_floor=${exit_on_floor:-?}"
+    say "variant $variant   : force_close=${fc_int}s exit_z=${ez:-?} stop_loss_z=${slz:-?} frozen_beta=${fz:-?} equity=${eq:-?} max_leverage=${mlev:-?} inelig_defer_cap=${inelig_cap:-?} inelig_defer_spread=${inelig_spread:-?} inelig_defer_stale=${inelig_stale:-?} elig_grace=${elig_grace:-?} elig_beta_exit=${elig_beta_exit:-?} sizing_beta_floor=${sizing_floor:-?} exit_on_sizing_beta_floor=${exit_on_floor:-?}"
     assert_num "$variant" force_close "${EXPECT_FC[$variant]:-}" "$fc_int"
     assert_num "$variant" exit_z "${EXPECT_EXITZ[$variant]:-}" "$ez"
     assert_num "$variant" stop_loss_z "${EXPECT_SLZ[$variant]:-}" "$slz"
@@ -269,6 +288,8 @@ else
     assert_num "$variant" ineligible_close_defer_cap_secs "$EXPECT_INELIG_CAP" "$inelig_cap"
     assert_num "$variant" ineligible_close_defer_spread_bps "$EXPECT_INELIG_SPREAD" "$inelig_spread"
     assert_num "$variant" ineligible_close_defer_stale_secs "$EXPECT_INELIG_STALE" "$inelig_stale"
+    assert_num "$variant" eligibility_margin_grace_secs "$EXPECT_ELIG_GRACE" "$elig_grace"
+    assert_num "$variant" eligibility_beta_gap_exit "$EXPECT_ELIG_BETA_EXIT" "$elig_beta_exit"
     want_fz="${EXPECT_FROZEN[$variant]:-}"
     if [ -n "$want_fz" ] && [ -n "$fz" ] && [ "$fz" != "$want_fz" ]; then
       note_drift "variant $variant frozen_beta_exit_z=${fz} ≠ expected ${want_fz} (round config)."
