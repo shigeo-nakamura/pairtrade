@@ -1,10 +1,11 @@
 #!/bin/bash
-# Robinhood Chain Lighter launcher — three-arm split (bot-strategy#798/#837).
+# Robinhood Chain Lighter launcher — two-arm split (bot-strategy#798/#868).
 # freq reuses the original sub-account: it relies on
 # pairtrade::config::lighter_env's fallback to the *unsuffixed* vars, so
 # unlike the Frankfurt A/B/C launcher (scripts/debot-pair-btceth.sh) this
-# script cannot blanket `unset` them afterward. b and freq2 get their own
-# sub-accounts; credentials are loaded via the same source-in-a-subshell technique
+# script cannot blanket `unset` them afterward. b gets its own sub-account
+# (freq2's 50x clone arm was terminated 2026-09-01, bot-strategy#868);
+# credentials are loaded via the same source-in-a-subshell technique
 # as debot-pair-btceth.sh's `vars_for_variant` (handles comments/whitespace
 # correctly, unlike a hand-rolled `IFS='=' read` line parser) and
 # re-exported with the per-variant suffix (lighter_env -> id.to_uppercase()).
@@ -56,9 +57,6 @@ vars_for_variant() {
 while IFS='=' read -r _key _val; do
   export "$_key=$_val"
 done < <(vars_for_variant "$ENV_DIR/debot-pair-robinhood-lighter-b.env" B)
-while IFS='=' read -r _key _val; do
-  export "$_key=$_val"
-done < <(vars_for_variant "$ENV_DIR/debot-pair-robinhood-lighter-freq2.env" FREQ2)
 unset _key _val
 
 # Fail loudly instead of letting lighter_env() silently fall back to
@@ -78,7 +76,6 @@ require_variant_credentials() {
   fi
 }
 require_variant_credentials B "$ENV_DIR/debot-pair-robinhood-lighter-b.env"
-require_variant_credentials FREQ2 "$ENV_DIR/debot-pair-robinhood-lighter-freq2.env"
 
 # Set after debot.env so generic values cannot route this bot to another venue.
 export REST_ENDPOINT=https://api.rh.lighter.xyz
