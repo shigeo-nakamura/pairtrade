@@ -41,7 +41,7 @@ LOG = logging.getLogger("engine_b_phase0")
 UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 MAX_TRADE_EVENT_AGE_US = 7 * 24 * 60 * 60 * 1_000_000
 MAX_TRADE_EVENT_FUTURE_US = 5 * 60 * 1_000_000
 OHLCV_FINALIZE_GRACE_US = 120_000_000
@@ -74,9 +74,11 @@ CREATE TABLE IF NOT EXISTS ws_connection (
   venue TEXT NOT NULL,
   channel TEXT NOT NULL,
   started_ts_recv_us INTEGER NOT NULL,
+  last_activity_ts_recv_us INTEGER NOT NULL,
   ended_ts_recv_us INTEGER,
   api_schema_version TEXT NOT NULL,
-  end_reason TEXT
+  end_reason TEXT,
+  is_physical INTEGER NOT NULL CHECK(is_physical IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS sealed_session_interval (
@@ -610,12 +612,22 @@ def build_sealed_trade_index(
                 ),
             )
         if "ws_connection" in tables:
+            session_columns = {
+                row[1]
+                for row in source.execute("PRAGMA table_info(ws_connection)")
+            }
+            physical_filter = (
+                " WHERE is_physical = 1"
+                if "is_physical" in session_columns
+                else ""
+            )
             index.executemany(
                 "INSERT OR IGNORE INTO archived_connection_session VALUES (?, ?, ?, ?)",
                 source.execute(
                     """SELECT connection_session_id, started_ts_recv_us,
                               ended_ts_recv_us, end_reason
                        FROM ws_connection"""
+                    + physical_filter
                 ),
             )
         index.execute(
@@ -1157,6 +1169,23 @@ class DatabaseSink:
         }
         if "continuation_id" not in gap_columns:
             connection.execute("ALTER TABLE data_gap ADD COLUMN continuation_id TEXT")
+        session_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ws_connection)")
+        }
+        if "last_activity_ts_recv_us" not in session_columns:
+            connection.execute(
+                "ALTER TABLE ws_connection ADD COLUMN last_activity_ts_recv_us INTEGER"
+            )
+            connection.execute(
+                """UPDATE ws_connection
+                   SET last_activity_ts_recv_us = started_ts_recv_us
+                   WHERE last_activity_ts_recv_us IS NULL"""
+            )
+        if "is_physical" not in session_columns:
+            connection.execute(
+                """ALTER TABLE ws_connection
+                   ADD COLUMN is_physical INTEGER NOT NULL DEFAULT 1"""
+            )
         late_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(late_trade)")
         }
@@ -1249,21 +1278,28 @@ class DatabaseSink:
             return
         partition_started_us = partition_start_us(partition)
         partition_ended_us = partition_started_us + 3_600_000_000
+        connection_started_us = int(meta["started_us"])
+        is_physical = connection_started_us < partition_ended_us
         segment_started_us = min(
-            max(int(meta["started_us"]), partition_started_us),
+            max(connection_started_us, partition_started_us),
             partition_ended_us,
         )
         connection.execute(
             """INSERT OR IGNORE INTO ws_connection(
                  connection_session_id, venue, channel, started_ts_recv_us,
-                 api_schema_version
-               ) VALUES (?, ?, ?, ?, ?)""",
+                 last_activity_ts_recv_us, ended_ts_recv_us,
+                 api_schema_version, end_reason, is_physical
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 meta["id"],
                 meta["venue"],
                 "multiplexed_public",
                 segment_started_us,
+                segment_started_us,
+                None if is_physical else segment_started_us,
                 meta["api_schema_version"],
+                None if is_physical else "event_time_reference",
+                int(is_physical),
             ),
         )
 
@@ -1504,10 +1540,18 @@ class DatabaseSink:
                 ).fetchone()
                 if table is None:
                     return False
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(ws_connection)")
+                }
+                physical_filter = (
+                    " AND is_physical = 1" if "is_physical" in columns else ""
+                )
                 return (
                     connection.execute(
                         """SELECT 1 FROM ws_connection
-                           WHERE connection_session_id = ?""",
+                           WHERE connection_session_id = ?"""
+                        + physical_filter,
                         (connection_session_id,),
                     ).fetchone()
                     is not None
@@ -1766,24 +1810,27 @@ class DatabaseSink:
                     ).fetchone()
                     if table is None:
                         continue
-                    connection.execute("BEGIN")
-                    connection.execute(
-                        """DELETE FROM data_gap
-                           WHERE ts_end_us IS NULL
-                             AND channel IN ('connection', 'order_book')
-                             AND gap_id NOT IN (
-                               SELECT MIN(gap_id) FROM data_gap
-                               WHERE ts_end_us IS NULL
-                                 AND channel IN ('connection', 'order_book')
-                               GROUP BY venue, market_id, channel
-                             )"""
+                    session_columns = {
+                        row[1]
+                        for row in connection.execute(
+                            "PRAGMA table_info(ws_connection)"
+                        )
+                    }
+                    activity_expression = (
+                        "COALESCE(last_activity_ts_recv_us, started_ts_recv_us)"
+                        if "last_activity_ts_recv_us" in session_columns
+                        else "started_ts_recv_us"
                     )
-                    connection.commit()
+                    physical_filter = (
+                        " AND is_physical = 1"
+                        if "is_physical" in session_columns
+                        else ""
+                    )
                     rows = connection.execute(
-                        """SELECT connection_session_id, venue,
-                                  started_ts_recv_us
+                        f"""SELECT connection_session_id, venue,
+                                  started_ts_recv_us, {activity_expression}
                            FROM ws_connection
-                           WHERE ended_ts_recv_us IS NULL"""
+                           WHERE ended_ts_recv_us IS NULL{physical_filter}"""
                     ).fetchall()
                     if not rows:
                         continue
@@ -1795,8 +1842,10 @@ class DatabaseSink:
                         )
                     }
                     venues = {venue.name: venue for venue in self.config.venues}
-                    for session_id, venue, started_us in rows:
-                        last_activity_us = int(started_us)
+                    for session_id, venue, started_us, durable_activity_us in rows:
+                        last_activity_us = max(
+                            int(started_us), int(durable_activity_us)
+                        )
                         if "book_event" in tables:
                             book_activity = connection.execute(
                                 """SELECT MAX(ts_recv_us) FROM book_event
@@ -1908,6 +1957,19 @@ class DatabaseSink:
                     ).fetchone()
                     if table is None:
                         continue
+                    connection.execute("BEGIN")
+                    connection.execute(
+                        """DELETE FROM data_gap
+                           WHERE ts_end_us IS NULL
+                             AND channel IN ('connection', 'order_book')
+                             AND gap_id NOT IN (
+                               SELECT MIN(gap_id) FROM data_gap
+                               WHERE ts_end_us IS NULL
+                                 AND channel IN ('connection', 'order_book')
+                               GROUP BY venue, market_id, channel
+                             )"""
+                    )
+                    connection.commit()
                     rows = connection.execute(
                         """SELECT gap_id, venue, market_id, symbol, channel,
                                   expected_sequence, observed_sequence, reason
@@ -2131,6 +2193,7 @@ class DatabaseSink:
                     """SELECT connection_session_id, venue, api_schema_version
                        FROM ws_connection
                        WHERE ended_ts_recv_us IS NULL
+                         AND is_physical = 1
                          AND started_ts_recv_us < ?""",
                     (partition_ended_us,),
                 ):
@@ -2196,7 +2259,7 @@ class DatabaseSink:
                     """UPDATE ws_connection
                        SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
                            end_reason = 'partition_rotation'
-                       WHERE ended_ts_recv_us IS NULL""",
+                       WHERE ended_ts_recv_us IS NULL AND is_physical = 1""",
                     (partition_ended_us,),
                 )
                 connection.commit()
@@ -2711,11 +2774,20 @@ class DatabaseSink:
                         ),
                     ),
                 )
+        elif kind == "connection_activity":
+            connection.execute(
+                """UPDATE ws_connection
+                   SET last_activity_ts_recv_us = MAX(
+                         last_activity_ts_recv_us, ?
+                       )
+                   WHERE connection_session_id = ? AND is_physical = 1""",
+                (payload["recv_us"], payload["connection"]["id"]),
+            )
         elif kind == "connection_end":
             connection.execute(
                 """UPDATE ws_connection SET ended_ts_recv_us = ?, end_reason = ?
                    WHERE connection_session_id = ?
-                     AND ended_ts_recv_us IS NULL""",
+                     AND ended_ts_recv_us IS NULL AND is_physical = 1""",
                 (payload["recv_us"], payload["reason"], payload["connection"]["id"]),
             )
         elif kind == "book":
@@ -3023,6 +3095,10 @@ class Collector:
                     async for raw_message in ws:
                         recv_us = now_us()
                         self.metrics.last_message_us[venue.name] = recv_us
+                        await self.sink.put(
+                            "connection_activity",
+                            {"recv_us": recv_us, "connection": connection},
+                        )
                         message = json.loads(raw_message)
                         message_type = message.get("type", "")
                         if message_type == "connected":

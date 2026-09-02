@@ -321,6 +321,59 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(starts), 1)
         self.assertEqual(starts[0]["recv_us"], 1_774_884_082_400_000)
 
+    async def test_market_stats_message_records_connection_activity(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+        class OneMessageWebSocket:
+            emitted = False
+
+            async def __aenter__(self) -> OneMessageWebSocket:
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+            def __aiter__(self) -> OneMessageWebSocket:
+                return self
+
+            async def __anext__(self) -> str:
+                if self.emitted:
+                    raise StopAsyncIteration
+                self.emitted = True
+                collector.stop_event.set()
+                return json.dumps(
+                    {
+                        "type": "update/market_stats",
+                        "channel": "market_stats/37",
+                        "market_stats": {"mark_price": "159.71"},
+                    }
+                )
+
+        timestamps = iter(
+            (
+                1_774_884_082_400_000,
+                1_774_884_082_500_000,
+                1_774_884_082_600_000,
+            )
+        )
+        with (
+            mock.patch.dict(
+                sys.modules,
+                self.websocket_modules(lambda *args, **kwargs: OneMessageWebSocket()),
+            ),
+            mock.patch.object(engine_b, "now_us", side_effect=lambda: next(timestamps)),
+        ):
+            await collector.feed_loop(venue)
+
+        activities = [
+            payload for kind, payload in sink.commands if kind == "connection_activity"
+        ]
+        self.assertEqual(len(activities), 1)
+        self.assertEqual(activities[0]["recv_us"], 1_774_884_082_500_000)
+
 
 class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_synthetic_ids_preserve_multiset_across_overlapping_snapshots(self) -> None:
@@ -2359,7 +2412,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             database_dir = Path(directory) / "data"
             object.__setattr__(config, "database_dir", database_dir)
             started_us = 1_774_884_000_000_000
-            activity_us = started_us + 10_000_000
+            book_activity_us = started_us + 10_000_000
+            activity_us = book_activity_us + 20_000_000
             recovered_us = activity_us + 120_000_000
             connection = {
                 "id": "crashed-after-book",
@@ -2388,8 +2442,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                         (
                             "book",
                             {
-                                "recv_us": activity_us,
-                                "srv_us": activity_us,
+                                "recv_us": book_activity_us,
+                                "srv_us": book_activity_us,
                                 "connection": connection,
                                 "venue": venue.name,
                                 "market_id": 37,
@@ -2402,6 +2456,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                                 "complete": True,
                                 "levels": [],
                             },
+                        ),
+                        (
+                            "connection_activity",
+                            {"recv_us": activity_us, "connection": connection},
                         ),
                     ]
                 )
@@ -2453,6 +2511,124 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 database.close()
+
+    async def test_historical_trade_uses_non_physical_connection_reference(
+        self,
+    ) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            historical_start_us = 1_774_880_400_000_000
+            historical_start_us -= historical_start_us % 3_600_000_000
+            current_start_us = historical_start_us + 3_600_000_000
+            connection_started_us = current_start_us + 10_000_000
+            received_us = current_start_us + 20_000_000
+            event_us = historical_start_us + 30_000_000
+            connection = {
+                "id": "current-socket-historical-trade",
+                "venue": "robinhood",
+                "started_us": connection_started_us,
+                "api_schema_version": config.api_schema_version,
+            }
+            sink = engine_b.DatabaseSink(
+                config, "historical-trade-run", "historical-trade-commit"
+            )
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(
+                engine_b, "now_us", return_value=current_start_us + 30_000_000
+            ):
+                sink._write_batch(
+                    [
+                        (
+                            "connection_start",
+                            {
+                                "recv_us": connection_started_us,
+                                "connection": connection,
+                            },
+                        ),
+                        (
+                            "connection_activity",
+                            {"recv_us": received_us, "connection": connection},
+                        ),
+                        (
+                            "trade",
+                            {
+                                "recv_us": received_us,
+                                "partition_us": event_us,
+                                "event_ts_us": event_us,
+                                "bucket_start_us": event_us - event_us % 60_000_000,
+                                "srv_us": event_us,
+                                "connection": connection,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                                "symbol": "SKHY",
+                                "trade_id": "historical-trade",
+                                "replay_alias": None,
+                                "snapshot_occurrence": None,
+                                "exchange_sequence": "1",
+                                "local_sequence": 1,
+                                "price": "159.71",
+                                "size": "1",
+                                "aggressor_side": "buy",
+                                "raw_public_json": "{}",
+                            },
+                        ),
+                    ]
+                )
+            self.assertEqual(list(sink.session_continuation_dir.glob("*.json")), [])
+            await sink.close()
+
+            historical_db = sqlite3.connect(
+                database_dir
+                / (
+                    "engine_b_phase0_"
+                    f"{engine_b.partition_for_us(event_us)}.sqlite3"
+                )
+            )
+            current_db = sqlite3.connect(
+                database_dir
+                / (
+                    "engine_b_phase0_"
+                    f"{engine_b.partition_for_us(received_us)}.sqlite3"
+                )
+            )
+            try:
+                self.assertEqual(
+                    historical_db.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us,
+                                  end_reason, is_physical
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (
+                        current_start_us,
+                        current_start_us,
+                        "event_time_reference",
+                        0,
+                    ),
+                )
+                self.assertEqual(
+                    historical_db.execute("SELECT COUNT(*) FROM trade").fetchone(),
+                    (1,),
+                )
+                self.assertEqual(
+                    current_db.execute(
+                        """SELECT started_ts_recv_us, last_activity_ts_recv_us,
+                                  ended_ts_recv_us, is_physical
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (connection_started_us, received_us, None, 1),
+                )
+            finally:
+                historical_db.close()
+                current_db.close()
 
     async def test_session_marker_advances_past_sealed_destination(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)

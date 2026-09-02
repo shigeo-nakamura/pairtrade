@@ -47,7 +47,14 @@ decompressed checksum, and remote SQLite integrity, and only then reaches the
 deletion gate.
 
 A physical WebSocket connection that spans an hourly boundary is represented
-as one partition-local `ws_connection` segment in each database. Closed
+as one partition-local `ws_connection` segment in each database. Schema v9
+records `last_activity_ts_recv_us` for every received application message,
+including market-stats, ping/pong, malformed payloads, and delayed trades whose
+exchange event belongs to another hour. Crash recovery uses that durable receive
+time rather than only local book/trade rows. A delayed trade retained in an
+older unsealed event-time partition receives an `is_physical=0`,
+`event_time_reference` row solely to satisfy provenance/FK linkage; it is never
+rotated, archived, or counted as a physical session. Closed
 partitions end their open segments at the hour boundary with
 `end_reason=partition_rotation`; the active partition records the real close
 time and reason. Every partition for one collector process preserves the same
