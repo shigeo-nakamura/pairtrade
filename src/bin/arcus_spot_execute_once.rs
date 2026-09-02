@@ -963,14 +963,21 @@ fn require_active_attempt_matches_pins(
 }
 
 /// The write path for `manual-reconcile-apply` (bot-strategy#869). Requires
-/// the caller to pin the exact attempt (`expected_sequence`/
-/// `expected_idempotency_key`/`expected_tx_hash`) so a stale invocation
-/// against an attempt that already moved on fails closed instead of acting
-/// on the wrong one. Calls `resume_status_and_reconcile` (pure on-chain
-/// status/balance reads, never a new signature or submission) to advance
-/// Submitted/Confirmed toward Reconciled exactly like `auto-resume` does,
-/// then -- only once Reconciled -- commits via the digest-bypass path
-/// instead of the ordinary digest-checked one.
+/// CONFIG_YAML to match `auto_execute_policy.json`'s administrator-approved
+/// digest -- the same gate `auto-execute`/`auto-resume`/`clear-risk-halt`
+/// enforce, and load-bearing here for the same reason: this path skips both
+/// the offline signature and the plan_config_digest match, so nothing else
+/// proves `ledger_path`/`runtime_state_path` are the genuine production
+/// paths rather than a caller-fabricated ledger paired with the real
+/// checkpoint (Codex P1 follow-up, pairtrade#241). Also requires the caller
+/// to pin the exact attempt (`expected_sequence`/`expected_idempotency_key`/
+/// `expected_tx_hash`) so a stale invocation against an attempt that
+/// already moved on fails closed instead of acting on the wrong one. Calls
+/// `resume_status_and_reconcile` (pure on-chain status/balance reads, never
+/// a new signature or submission) to advance Submitted/Confirmed toward
+/// Reconciled exactly like `auto-resume` does, then -- only once Reconciled
+/// -- commits via the digest-bypass path instead of the ordinary
+/// digest-checked one.
 async fn manual_reconcile_apply(
     config_path: &Path,
     events_jsonl_path: &Path,
@@ -982,6 +989,18 @@ async fn manual_reconcile_apply(
 ) -> Result<()> {
     let config_bytes = read_private_regular_file(config_path, "config")?;
     let config = parse_config(&config_bytes, config_path)?;
+    // Same administrator-approval gate as auto-execute/auto-resume/
+    // clear-risk-halt (Codex P1 follow-up, pairtrade#241): this path skips
+    // both the offline Ed25519 signature *and* the plan_config_digest match
+    // by design, so nothing else here proves CONFIG_YAML itself -- in
+    // particular ledger_path and runtime_state_path -- is the genuine
+    // production config rather than one redirecting ledger_path at a
+    // caller-fabricated, already-Reconciled ledger while keeping the real
+    // production runtime_state_path, which would let this command commit a
+    // wholly fictitious fill to the real checkpoint without ever reading
+    // the chain.
+    let policy = auto_execute_policy_from_admin_file()?;
+    require_config_within_auto_execute_policy(&config, &policy)?;
     let expected_sequence: u64 = expected_sequence
         .trim()
         .parse()
@@ -2937,10 +2956,13 @@ EIP-1898-pinned reconciliation already computed -- refusing if either
 disagrees. -report only ever loads the ledger file and never mutates
 anything, including when the preview looks correct; run it first, then
 -apply with the exact same arguments plus this attempt's
-sequence/idempotency_key/tx_hash pinned explicitly. -apply resumes the
-attempt toward Reconciled (pure on-chain status/balance reads, exactly like
-auto-resume) and only then commits, archiving the attempt afterward. Neither
-command is reachable from execute/auto-execute/resume/auto-resume/live-tick.
+sequence/idempotency_key/tx_hash pinned explicitly. -apply requires
+CONFIG_YAML to match auto_execute_policy.json's administrator-approved
+digest (same gate as auto-execute/auto-resume/clear-risk-halt), then
+resumes the attempt toward Reconciled (pure on-chain status/balance reads,
+exactly like auto-resume) and only then commits, archiving the attempt
+afterward. Neither command is reachable from
+execute/auto-execute/resume/auto-resume/live-tick.
 
 state-backup and state-verify-* are offline operator commands. They never
 construct an RPC/router client, KMS signer, approval policy, or executor and
