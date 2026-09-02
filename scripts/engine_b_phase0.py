@@ -3694,10 +3694,23 @@ class Collector:
             except TimeoutError:
                 pass
 
-    async def write_provisional_session(self, session_date: date) -> None:
+    @staticmethod
+    def _placeholder_krx_open_close_us(session_date: date) -> tuple[int, int]:
+        # Standard-schedule placeholder (09:00-15:30 KST, no DST): used only
+        # when the frozen calendar has no entry for this date, or the market
+        # is closed and there is no real open/close to report.
         t0 = datetime.combine(session_date, datetime_time(0, 0), UTC)
         t1 = datetime.combine(session_date, datetime_time(6, 30), UTC)
+        return int(t0.timestamp() * 1_000_000), int(t1.timestamp() * 1_000_000)
+
+    @staticmethod
+    def _placeholder_us_open_us(session_date: date) -> int:
+        # Standard-schedule placeholder (9:30am America/New_York); tz-aware
+        # so DST still shifts it correctly even without a resolved entry.
         t2_ny = datetime.combine(session_date, datetime_time(9, 30), ZoneInfo("America/New_York"))
+        return int(t2_ny.astimezone(UTC).timestamp() * 1_000_000)
+
+    async def write_provisional_session(self, session_date: date) -> None:
         missing = sorted(
             {
                 f"{venue.name}:{symbol}"
@@ -3708,10 +3721,13 @@ class Collector:
 
         resolved = self.trading_calendar.resolve(session_date) if self.trading_calendar else None
         reasons: list[str] = []
+        placeholder_t0_us, placeholder_t1_us = self._placeholder_krx_open_close_us(session_date)
+        placeholder_t2_us = self._placeholder_us_open_us(session_date)
         if resolved is None:
             krx_is_open = 0
             us_cash_is_open = 0
             calendar_version = "UNRESOLVED_A7_zoneinfo_only"
+            t0_us, t1_us, t2_us = placeholder_t0_us, placeholder_t1_us, placeholder_t2_us
             reasons.append("A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR")
             if session_date.weekday() >= 5:
                 reasons.append("PROVISIONAL_WEEKEND")
@@ -3719,8 +3735,12 @@ class Collector:
             krx_is_open = 1 if resolved["krx_is_open"] else 0
             us_cash_is_open = 1 if resolved["us_is_open"] else 0
             calendar_version = self.trading_calendar.calendar_version
-            if not resolved["krx_is_open"]:
+            if resolved["krx_is_open"]:
+                t0_us, t1_us = resolved["krx_open_utc_us"], resolved["krx_close_utc_us"]
+            else:
+                t0_us, t1_us = placeholder_t0_us, placeholder_t1_us
                 reasons.append("KRX_CLOSED")
+            t2_us = resolved["us_open_utc_us"] if resolved["us_is_open"] else placeholder_t2_us
             if not resolved["us_is_open"]:
                 reasons.append("US_CASH_CLOSED")
         if missing:
@@ -3732,9 +3752,9 @@ class Collector:
                 "recv_us": now_us(),
                 "session_id": f"provisional-{session_date.isoformat()}",
                 "krx_business_date": session_date.isoformat(),
-                "t0_us": int(t0.timestamp() * 1_000_000),
-                "t1_us": int(t1.timestamp() * 1_000_000),
-                "t2_us": int(t2_ny.astimezone(UTC).timestamp() * 1_000_000),
+                "t0_us": t0_us,
+                "t1_us": t1_us,
+                "t2_us": t2_us,
                 "krx_is_open": krx_is_open,
                 "us_cash_is_open": us_cash_is_open,
                 "calendar_version": calendar_version,
@@ -3755,10 +3775,25 @@ class Collector:
             except TimeoutError:
                 pass
 
+    def calendar_covers_upcoming_sessions(self) -> bool:
+        # Object presence alone is not enough: the frozen file's committed
+        # date range eventually runs out (configs/engine-b/trading_calendar.json
+        # currently ends 2027-12-31), after which every new session_loop date
+        # silently falls back to fail-closed even though a calendar object is
+        # still loaded. Check the dates session_loop actually writes (today,
+        # tomorrow) rather than just whether `self.trading_calendar` is set.
+        if self.trading_calendar is None:
+            return False
+        today = datetime.now(UTC).date()
+        return (
+            self.trading_calendar.resolve(today) is not None
+            and self.trading_calendar.resolve(today + timedelta(days=1)) is not None
+        )
+
     def health_payload(self) -> dict[str, Any]:
         current_us = now_us()
         blockers = []
-        if self.trading_calendar is None:
+        if not self.calendar_covers_upcoming_sessions():
             blockers.append("A7 verified KRX/US calendar unresolved")
         blockers.append("Robinhood Lighter lacks same-venue EWY and USDKRW")
         return {

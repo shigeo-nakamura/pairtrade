@@ -38,6 +38,25 @@ import exchange_calendars as xcals
 KRX_CALENDAR = "XKRX"
 US_CALENDAR = "XNYS"
 
+# One-off KRX closures that exchange_calendars' rule-based/recurring-holiday
+# data does not capture -- administrative closures the exchange announces
+# separately, sometimes years in advance of the recurring-holiday table being
+# updated. Each entry needs a citable primary source (the exchange's own
+# announcement, not just an aggregator) recorded here; cross-check a given
+# year against KRX's own published notice before trusting rule-only output
+# for it (see docs/engine-b-phase0-operations.md).
+KRX_ONE_OFF_CLOSURES: dict[str, str] = {
+    # 9th nationwide local elections (지방선거): government-designated public
+    # holiday; KRX announced closure of securities/derivatives/commodities
+    # markets on 2026-05-20.
+    # https://en.sedaily.com/finance/2026/05/20/korea-exchange-to-close-on-local-election-day-constitution
+    "2026-06-03": "kr_local_election_day",
+    # Constitution Day (제헌절) was reinstated as a public holiday for 2026;
+    # KRX announced the same closure alongside Local Election Day.
+    # https://en.sedaily.com/finance/2026/05/20/korea-exchange-to-close-on-local-election-day-constitution
+    "2026-07-17": "kr_constitution_day_2026_reinstatement",
+}
+
 
 def _daterange(start: date, end: date):
     current = start
@@ -76,7 +95,7 @@ def build_sessions(start: date, end: date) -> dict[str, dict[str, Any]]:
     sessions: dict[str, dict[str, Any]] = {}
     for day in _daterange(start, end):
         iso = day.isoformat()
-        krx_is_open = bool(krx.is_session(iso))
+        krx_is_open = bool(krx.is_session(iso)) and iso not in KRX_ONE_OFF_CLOSURES
         us_is_open = bool(us.is_session(iso))
         entry: dict[str, Any] = {
             "krx_is_open": krx_is_open,
@@ -105,6 +124,11 @@ def build_document(start: date, end: date) -> dict[str, Any]:
     # (start, end, exchange_calendars version) so CI can regenerate it and
     # diff byte-for-byte against the committed file. Provenance (when/who)
     # comes from git history instead.
+    applied_overrides = {
+        iso: reason
+        for iso, reason in KRX_ONE_OFF_CLOSURES.items()
+        if start.isoformat() <= iso <= end.isoformat()
+    }
     return {
         "schema_version": 1,
         "calendar_version": f"xkrx-xnys-exchange_calendars-{package_version}-{digest}",
@@ -112,6 +136,10 @@ def build_document(start: date, end: date) -> dict[str, Any]:
         "krx_calendar": KRX_CALENDAR,
         "us_calendar": US_CALENDAR,
         "range": {"start": start.isoformat(), "end": end.isoformat()},
+        # Not part of `digest` (that hashes only `sessions`), but still part
+        # of what CI's byte-for-byte diff verifies -- an audit trail for why
+        # a date disagrees with the library's own recurring-holiday rules.
+        "krx_one_off_closures": applied_overrides,
         "sessions": sessions,
     }
 

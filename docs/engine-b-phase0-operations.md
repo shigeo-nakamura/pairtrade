@@ -39,13 +39,25 @@ generated offline by `scripts/engine_b_trading_calendar_freeze.py` from the
 market; pinned in `scripts/engine_b_trading_calendar_freeze_requirements.txt`).
 The observer itself never imports a calendar library: it loads this JSON with
 stdlib `json` at startup (`TradingCalendar.load`) and looks up each date by
-ISO string. `Collector.health_payload()["trading_calendar_version"]` reports
-the loaded `calendar_version`, or `null` if no calendar loaded.
+ISO string. When a date resolves, `trading_session.t0_us`/`t1_us`/`t2_us`
+(KRX open, KRX close, US cash open) come from that date's real
+`krx_open_utc_us`/`krx_close_utc_us`/`us_open_utc_us`, not a fixed
+09:00/15:30 KST or 9:30am America/New_York placeholder -- this matters on
+irregular-schedule days such as the delayed open on the first trading day of
+a year. `Collector.health_payload()["trading_calendar_version"]` reports the
+loaded `calendar_version`, or `null` if no calendar loaded.
 
-If the frozen file is missing, unreadable, or a queried date falls outside
-its committed `range`, the observer falls back to the original fail-closed
-placeholder for that date only (`krx_is_open=0`, `us_cash_is_open=0`,
-`calendar_version=UNRESOLVED_A7_zoneinfo_only`,
+`health_payload()["phase0_sample_blockers"]` drops the A-7 line only when
+`Collector.calendar_covers_upcoming_sessions()` is true, i.e. the loaded
+calendar actually resolves both today and tomorrow (the two dates
+`session_loop` writes) -- a calendar object being loaded is not enough once
+its committed `range` runs out (currently 2027-12-31); re-freeze with an
+extended range before then.
+
+If the frozen file is missing, unreadable, a session entry is malformed, or a
+queried date falls outside its committed `range`, the observer falls back to
+the original fail-closed placeholder for that date only (`krx_is_open=0`,
+`us_cash_is_open=0`, `calendar_version=UNRESOLVED_A7_zoneinfo_only`,
 `validity_reason` includes `A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR`) --
 never a crash.
 
@@ -53,6 +65,17 @@ KRX observes no DST (`Asia/Seoul` is a fixed UTC+9), so its session hours are
 stable; the US cash market's `America/New_York` session shifts by an hour
 across the EDT/EST boundary, which `exchange_calendars` resolves correctly
 from the IANA tzdb without any special-casing here.
+
+`exchange_calendars`' recurring-holiday rules can still miss a one-off
+administrative KRX closure announced separately (2026-06-03 Local Election
+Day and 2026-07-17 Constitution Day both required this: the library marked
+them open). `scripts/engine_b_trading_calendar_freeze.py`'s
+`KRX_ONE_OFF_CLOSURES` dict overrides specific dates with a citable source
+comment for each; the generated document's `krx_one_off_closures` field
+records which overrides applied within a given `--start`/`--end`. Before
+trusting a freeze for gate evaluation (G0-8 needs A-7 resolved), cross-check
+the covered years against KRX's own published holiday notice and extend
+`KRX_ONE_OFF_CLOSURES` for anything the library still gets wrong.
 
 **Re-freezing** (extend the covered date range, pick up an
 `exchange_calendars` release, or after cross-checking a specific year against

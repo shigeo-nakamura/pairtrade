@@ -1,6 +1,10 @@
 {
-  "calendar_version": "xkrx-xnys-exchange_calendars-4.13.2-2f13f08a664c",
+  "calendar_version": "xkrx-xnys-exchange_calendars-4.13.2-2b7c7ed4f263",
   "krx_calendar": "XKRX",
+  "krx_one_off_closures": {
+    "2026-06-03": "kr_local_election_day",
+    "2026-07-17": "kr_constitution_day_2026_reinstatement"
+  },
   "range": {
     "end": "2027-12-31",
     "start": "2026-01-01"
@@ -1232,9 +1236,9 @@
       "us_open_utc_us": 1780407000000000
     },
     "2026-06-03": {
-      "krx_close_utc_us": 1780468200000000,
-      "krx_is_open": true,
-      "krx_open_utc_us": 1780444800000000,
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
       "us_close_utc_us": 1780516800000000,
       "us_is_open": true,
       "us_open_utc_us": 1780493400000000
@@ -1584,9 +1588,9 @@
       "us_open_utc_us": 1784208600000000
     },
     "2026-07-17": {
-      "krx_close_utc_us": 1784269800000000,
-      "krx_is_open": true,
-      "krx_open_utc_us": 1784246400000000,
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
       "us_close_utc_us": 1784318400000000,
       "us_is_open": true,
       "us_open_utc_us": 1784295000000000

@@ -49,6 +49,16 @@ class BuildSessionsTests(unittest.TestCase):
         self.assertTrue(us_labor_day["krx_is_open"])
         self.assertFalse(us_labor_day["us_is_open"])
 
+    def test_one_off_krx_closures_override_the_library(self) -> None:
+        sessions = freeze.build_sessions(date(2026, 6, 1), date(2026, 7, 20))
+        for iso in freeze.KRX_ONE_OFF_CLOSURES:
+            entry = sessions[iso]
+            self.assertFalse(entry["krx_is_open"], f"{iso} should be forced closed")
+            self.assertIsNone(entry["krx_open_utc_us"])
+            self.assertIsNone(entry["krx_close_utc_us"])
+            # US cash market is unaffected by a Korean administrative holiday.
+            self.assertTrue(entry["us_is_open"])
+
     def test_dst_shifts_us_open_hour_but_not_krx(self) -> None:
         sessions = freeze.build_sessions(date(2026, 1, 5), date(2026, 7, 6))
         winter_us_open = sessions["2026-01-05"]["us_open_utc_us"]
@@ -72,6 +82,15 @@ class BuildDocumentTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(first["calendar_version"].startswith("xkrx-xnys-exchange_calendars-"))
         self.assertNotIn("generated_at", first)
+
+    def test_krx_one_off_closures_field_is_range_filtered(self) -> None:
+        containing = freeze.build_document(date(2026, 1, 1), date(2026, 12, 31))
+        self.assertEqual(
+            containing["krx_one_off_closures"],
+            {"2026-06-03": "kr_local_election_day", "2026-07-17": "kr_constitution_day_2026_reinstatement"},
+        )
+        before = freeze.build_document(date(2026, 1, 1), date(2026, 5, 31))
+        self.assertEqual(before["krx_one_off_closures"], {})
 
     def test_range_shrink_changes_calendar_version(self) -> None:
         wide = freeze.build_document(date(2026, 1, 1), date(2026, 12, 31))

@@ -1015,13 +1015,56 @@ class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
         return config
 
     def _config_with_fixture_calendar(self, tmp_path: Path) -> engine_b.AppConfig:
+        sessions = {
+            "2026-09-02": {
+                "krx_is_open": True,
+                "krx_open_utc_us": 1788307200000000,
+                "krx_close_utc_us": 1788330600000000,
+                "us_is_open": True,
+                "us_open_utc_us": 1788355800000000,
+                "us_close_utc_us": 1788379200000000,
+            },
+            "2026-09-07": {
+                "krx_is_open": True,
+                "krx_open_utc_us": 1788739200000000,
+                "krx_close_utc_us": 1788762600000000,
+                "us_is_open": False,
+                "us_open_utc_us": None,
+                "us_close_utc_us": None,
+            },
+            # A resolved-but-closed KRX day (e.g. a one-off administrative
+            # holiday override), distinct from an unresolved/absent date.
+            "2026-06-03": {
+                "krx_is_open": False,
+                "krx_open_utc_us": None,
+                "krx_close_utc_us": None,
+                "us_is_open": True,
+                "us_open_utc_us": 1780493400000000,
+                "us_close_utc_us": 1780516800000000,
+            },
+        }
+        # health_payload() checks calendar coverage for "today"/"tomorrow" by
+        # wall-clock time, not just object presence -- extend the fixture to
+        # always cover those two dates too so that check stays meaningful
+        # regardless of when this test happens to run.
+        today = engine_b.datetime.now(engine_b.UTC).date()
+        for offset in (0, 1):
+            iso = (today + engine_b.timedelta(days=offset)).isoformat()
+            sessions.setdefault(
+                iso,
+                {
+                    "krx_is_open": True,
+                    "krx_open_utc_us": 0,
+                    "krx_close_utc_us": 1,
+                    "us_is_open": True,
+                    "us_open_utc_us": 0,
+                    "us_close_utc_us": 1,
+                },
+            )
         fixture = {
             "schema_version": 1,
             "calendar_version": "xkrx-xnys-exchange_calendars-TEST-fixture",
-            "sessions": {
-                "2026-09-02": {"krx_is_open": True, "us_is_open": True},
-                "2026-09-07": {"krx_is_open": True, "us_is_open": False},
-            },
+            "sessions": sessions,
         }
         path = tmp_path / "trading_calendar.json"
         path.write_text(json.dumps(fixture))
@@ -1072,6 +1115,36 @@ class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
             # Robinhood's missing EWY/USDKRW is a separate, still-open blocker.
             self.assertIn("SAME_VENUE_REQUIRED_SYMBOLS_MISSING=", payload["validity_reason"])
 
+    async def test_resolved_open_day_uses_real_session_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config_with_fixture_calendar(Path(tmp))
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+            await collector.write_provisional_session(date(2026, 9, 2))
+            _, payload = sink.commands[-1]
+            self.assertEqual(payload["t0_us"], 1788307200000000)  # real krx_open_utc_us
+            self.assertEqual(payload["t1_us"], 1788330600000000)  # real krx_close_utc_us
+            self.assertEqual(payload["t2_us"], 1788355800000000)  # real us_open_utc_us
+
+    async def test_resolved_closed_krx_day_falls_back_to_placeholder_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config_with_fixture_calendar(Path(tmp))
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+            election_day = date(2026, 6, 3)
+            await collector.write_provisional_session(election_day)
+            _, payload = sink.commands[-1]
+            placeholder_t0, placeholder_t1 = collector._placeholder_krx_open_close_us(election_day)
+            self.assertEqual(payload["t0_us"], placeholder_t0)
+            self.assertEqual(payload["t1_us"], placeholder_t1)
+            self.assertEqual(payload["t2_us"], 1780493400000000)  # real us_open_utc_us, US unaffected
+            self.assertEqual(payload["krx_is_open"], 0)
+            self.assertEqual(payload["us_cash_is_open"], 1)
+            self.assertIn("KRX_CLOSED", payload["validity_reason"])
+            self.assertNotIn("US_CASH_CLOSED", payload["validity_reason"])
+
     async def test_resolved_asymmetric_closed_day_reports_us_cash_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config_with_fixture_calendar(Path(tmp))
@@ -1114,6 +1187,30 @@ class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("A7 verified KRX/US calendar unresolved", payload["phase0_sample_blockers"])
             self.assertIn("Robinhood Lighter lacks same-venue EWY and USDKRW", payload["phase0_sample_blockers"])
             self.assertEqual(payload["trading_calendar_version"], "xkrx-xnys-exchange_calendars-TEST-fixture")
+
+    def test_health_payload_flags_calendar_whose_range_has_expired(self) -> None:
+        # A loaded calendar object that no longer covers today/tomorrow (its
+        # committed range ran out) must still report the A-7 blocker -- not
+        # just "was a calendar ever loaded".
+        fixture = {
+            "schema_version": 1,
+            "calendar_version": "xkrx-xnys-exchange_calendars-TEST-expired",
+            "sessions": {"2020-01-01": {"krx_is_open": True, "us_is_open": True}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(json.dumps(fixture))
+            config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+            object.__setattr__(config, "trading_calendar_file", path)
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+            self.assertIsNotNone(collector.trading_calendar)
+            self.assertFalse(collector.calendar_covers_upcoming_sessions())
+
+            payload = collector.health_payload()
+            self.assertIn("A7 verified KRX/US calendar unresolved", payload["phase0_sample_blockers"])
+            # trading_calendar_version still reports the loaded (stale) version.
+            self.assertEqual(payload["trading_calendar_version"], "xkrx-xnys-exchange_calendars-TEST-expired")
 
 
 class RestPollingTests(unittest.IsolatedAsyncioTestCase):
