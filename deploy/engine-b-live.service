@@ -1,0 +1,58 @@
+[Unit]
+Description=Engine B live-experiment binary (bot-strategy#866) -- minimal-notional infrastructure smoke test, NOT the validated Phase 1/2 strategy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=engine-b-live
+Group=engine-b-live
+WorkingDirectory=/opt/engine-b-live
+StateDirectory=engine-b-live
+StateDirectoryMode=0750
+RuntimeDirectory=engine-b-live
+RuntimeDirectoryMode=0750
+# Two EnvironmentFile= lines: the first is the non-secret tuning config
+# (git-committed as configs/engine-b/live.json, converted to KEY=VALUE by
+# scripts/install_engine_b_live.sh at install time); the second is the
+# host-only Lighter credential file this unit's own identity owns, created
+# once per docs/engine-b-live-operations.md's provisioning runbook and
+# never synced from git. Later files override earlier ones, but the two
+# are disjoint key sets by design.
+EnvironmentFile=/opt/engine-b-live/live-config.env
+EnvironmentFile=/etc/engine-b-live/live-secrets.env
+Environment=RUST_LOG=info
+ExecStart=/opt/engine-b-live/bin/engine_b_live
+Restart=on-failure
+RestartSec=15
+# No SIGTERM-graceful-close handling exists in this prototype binary yet
+# (see engine_b_live.rs's KNOWN GAPS / docs/engine-b-live-operations.md) --
+# an open position is NOT reduce-only-closed on shutdown. Keep this short;
+# a long TimeoutStopSec here would misleadingly imply graceful handling
+# that does not exist. Manually flatten any open position (or wait for the
+# next scheduled exit window) before a planned restart.
+TimeoutStopSec=30
+
+# This identity must never be able to read the Robinhood trading bot's
+# freq/b/freq2 credentials (/opt/debot) or the Phase 0 observer's identity
+# (separate dedicated user, no credentials of its own either way). Unlike
+# engine-b-phase0.service, this unit DOES need outbound KMS calls (to
+# decrypt its own Lighter credentials) and a WS connection to Lighter
+# mainnet, so it omits ProtectSystem=strict/RestrictAddressFamilies'
+# tighter siblings that phase0 uses for a fully read-only process; it still
+# keeps the credential- and privilege-isolation directives.
+InaccessiblePaths=/opt/debot /opt/engine-b-phase0
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

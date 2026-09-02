@@ -48,12 +48,16 @@ assert "RUNTIME_DIR_GROUP=${RUNTIME_DIR_GROUP:-root}" in runtime_deployer
 assert "systemctl restart debot-pair-robinhood-lighter" not in runtime_job
 assert "systemctl start debot-pair-robinhood-lighter" not in runtime_job
 
+# The deploy-robinhood-lighter job's SSM command is JSON
+# (--parameters file://), not inline shorthand (pairtrade#243/#245):
+# __S3_BUCKET__ is a placeholder in the commands array, substituted by a
+# sed line after the heredoc, not GitHub Actions' own ${S3_BUCKET} syntax.
 activation_download = runtime_job.index(
-    "aws s3 cp s3://${S3_BUCKET}/deploy/"
+    "aws s3 cp s3://__S3_BUCKET__/deploy/"
     "debot-pair-robinhood-sidecar-activation.service"
 )
 bot_download = runtime_job.index(
-    "aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
+    "aws s3 cp s3://__S3_BUCKET__/deploy/debot-pair-robinhood-lighter.service"
 )
 unit_verify = runtime_job.index(
     "systemd-analyze verify /tmp/debot-pair-robinhood-sidecar-activation.service "
