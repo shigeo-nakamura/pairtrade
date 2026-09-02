@@ -810,6 +810,21 @@ fn u256_decimal(label: &str, value: U256) -> Result<Decimal> {
 /// the plan digest, or an operator-attested settled-amount cross-check --
 /// on top of this), but a plan that doesn't even match this coarse shape is
 /// certainly not the same swap.
+///
+/// Token addresses are checked here too, not just symbols: a symbol
+/// registry can resolve the same symbol to a different ERC-20 contract at a
+/// later time than it did when the actual intent was signed and dispatched
+/// (the same risk `require_fresh_quote_token_addresses_match_plan` guards
+/// against for a fresh quote). For `reconciled_runtime_fill` this is
+/// already implied by the digest match, so the check is redundant there and
+/// changes nothing. For `manual_reconciled_runtime_fill`, which has no
+/// digest to fall back on, it is load-bearing: without it, an
+/// archive-authenticated candidate with the right symbols but a remapped
+/// contract (and therefore a different token decimals count) would still
+/// pass, and its `buy_quantity`/`buy_amount_raw` ratio would silently
+/// mis-scale the real settled `bought_raw` into the wrong decimals before
+/// committing it to the runtime checkpoint (Codex P1 follow-up,
+/// pairtrade#241).
 fn require_intent_matches_plan_shape(
     active: &ArcusSpotExecutionAttempt,
     plan: &ArcusSpotRotationPlan,
@@ -824,6 +839,14 @@ fn require_intent_matches_plan_shape(
             .buy_symbol
             .eq_ignore_ascii_case(&plan.buy_symbol)
         || active.intent.sell_amount_raw != plan.sell_amount_raw
+        || !active
+            .intent
+            .sell_token
+            .eq_ignore_ascii_case(&plan.sell_token_address)
+        || !active
+            .intent
+            .buy_token
+            .eq_ignore_ascii_case(&plan.buy_token_address)
     {
         bail!("Arcus reconciled attempt does not match the approved runtime plan");
     }
@@ -1392,6 +1415,38 @@ mod tests {
         let active = reconciled_attempt(now);
         let mut plan = plan_with_buy_amount("1000");
         plan.sell_symbol = "MSFT".to_string();
+        let error =
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the approved runtime plan"));
+    }
+
+    #[test]
+    fn manual_reconciled_fill_rejects_a_plan_whose_buy_token_address_was_remapped() {
+        // Codex P1 follow-up, pairtrade#241: symbols/venue/sell_amount_raw
+        // alone don't prove the candidate resolves to the same ERC-20
+        // contracts the ledger's intent actually signed against. Without
+        // this check, a remapped buy_token (different decimals) would still
+        // pass the coarse shape match and mis-scale the real settled
+        // bought_raw via the candidate's buy_quantity/buy_amount_raw ratio.
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let mut plan = plan_with_buy_amount("1000");
+        plan.buy_token_address = "0x0000000000000000000000000000000000000099".to_string();
+        let error =
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the approved runtime plan"));
+    }
+
+    #[test]
+    fn manual_reconciled_fill_rejects_a_plan_whose_sell_token_address_was_remapped() {
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let mut plan = plan_with_buy_amount("1000");
+        plan.sell_token_address = "0x0000000000000000000000000000000000000099".to_string();
         let error =
             manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000").unwrap_err();
         assert!(error
