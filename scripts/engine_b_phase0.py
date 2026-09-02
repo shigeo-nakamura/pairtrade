@@ -1475,6 +1475,51 @@ class DatabaseSink:
         finally:
             connection.close()
 
+    def _retained_connection_session_exists(
+        self, partition: str, connection_session_id: str
+    ) -> bool:
+        database_path = (
+            self.config.database_dir / f"engine_b_phase0_{partition}.sqlite3"
+        )
+        if not database_path.is_file():
+            return False
+        with self._partition_lock(partition):
+            connection = self._connections.get(partition)
+            borrowed = connection is not None
+            if connection is None:
+                try:
+                    connection = sqlite3.connect(
+                        f"file:{database_path}?mode=ro", uri=True, timeout=5
+                    )
+                except sqlite3.OperationalError as exc:
+                    if not database_path.exists():
+                        return False
+                    raise RuntimeError(
+                        f"session continuation target is unreadable: {database_path}"
+                    ) from exc
+            try:
+                table = connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                       WHERE type = 'table' AND name = 'ws_connection'"""
+                ).fetchone()
+                if table is None:
+                    return False
+                return (
+                    connection.execute(
+                        """SELECT 1 FROM ws_connection
+                           WHERE connection_session_id = ?""",
+                        (connection_session_id,),
+                    ).fetchone()
+                    is not None
+                )
+            except sqlite3.DatabaseError as exc:
+                raise RuntimeError(
+                    f"session continuation target is unreadable: {database_path}"
+                ) from exc
+            finally:
+                if not borrowed:
+                    connection.close()
+
     def _local_late_trade_state(
         self, sealed_partition: str, payload: dict[str, Any]
     ) -> tuple[bool, set[str]]:
@@ -1823,7 +1868,7 @@ class DatabaseSink:
                 self._load_session_continuations(
                     {
                         marker_path
-                        for marker_path, _, _ in recovered_session_markers
+                        for marker_path, _, _, _ in recovered_session_markers
                     }
                 )
             )
@@ -1831,8 +1876,14 @@ class DatabaseSink:
         batch = [
             *(
                 command
-                for _, start_command, end_command in recovered_session_markers
-                for command in (start_command, end_command)
+                for _, start_command, end_command, restart_gaps in (
+                    recovered_session_markers
+                )
+                for command in (
+                    start_command,
+                    end_command,
+                    *(("gap", gap) for gap in restart_gaps),
+                )
                 if command is not None
             ),
             *(("gap", payload) for _, payload in recovered_gap_markers),
@@ -1953,7 +2004,7 @@ class DatabaseSink:
         current_partition = partition_for_us(write_us)
         marker_paths = [marker_path for marker_path, _ in recovered_gap_markers]
         session_marker_paths = [
-            marker_path for marker_path, _, _ in recovered_session_markers
+            marker_path for marker_path, _, _, _ in recovered_session_markers
         ]
         rotation_queue = sorted(
             partition
@@ -2125,6 +2176,7 @@ class DatabaseSink:
             Path,
             tuple[str, dict[str, Any]],
             tuple[str, dict[str, Any]] | None,
+            list[dict[str, Any]],
         ]
     ]:
         if not self.session_continuation_dir.is_dir():
@@ -2156,7 +2208,11 @@ class DatabaseSink:
             start_us = int(marker["start_us"])
             destination_partition = partition_for_us(start_us)
             connection_meta = dict(marker["connection"])
+            preserve_open = (
+                marker.get("source_collector_run_id") == self.collector_run_id
+            )
             sealed_intervals: list[dict[str, Any]] = []
+            sealed_restart_gap_intervals: list[dict[str, Any]] = []
             while self._is_partition_sealed(destination_partition):
                 archived = self._sealed_connection_session_exists(
                     destination_partition, str(connection_meta["id"])
@@ -2171,32 +2227,94 @@ class DatabaseSink:
                     archived,
                 )
                 if not archived:
-                    interval_id = "sealed-session-missing:" + hashlib.sha256(
-                        (
-                            f"{marker['continuation_id']}:"
-                            f"{destination_partition}"
-                        ).encode("utf-8")
-                    ).hexdigest()
-                    sealed_intervals.append(
-                        {
-                            "interval_id": interval_id,
-                            "sealed_partition": destination_partition,
-                            "start_us": start_us,
-                            "end_us": destination_end_us,
-                        }
-                    )
+                    interval = {
+                        "sealed_partition": destination_partition,
+                        "start_us": start_us,
+                        "end_us": destination_end_us,
+                    }
+                    if preserve_open:
+                        interval_id = "sealed-session-missing:" + hashlib.sha256(
+                            (
+                                f"{marker['continuation_id']}:"
+                                f"{destination_partition}"
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        sealed_intervals.append(
+                            {"interval_id": interval_id, **interval}
+                        )
+                    else:
+                        sealed_restart_gap_intervals.append(interval)
                 start_us = destination_end_us
                 destination_partition = partition_for_us(start_us)
             connection_meta["started_us"] = start_us
             recovered_us = now_us()
-            preserve_open = (
-                marker.get("source_collector_run_id") == self.collector_run_id
+            destination_exists = (
+                preserve_open
+                or self._retained_connection_session_exists(
+                    destination_partition, str(connection_meta["id"])
+                )
             )
             recovery_reason = (
                 "partition_rotation"
                 if preserve_open
                 else "collector_restart_recovery"
             )
+            restart_gaps: list[dict[str, Any]] = []
+            if not preserve_open and (
+                not destination_exists or sealed_restart_gap_intervals
+            ):
+                venue_config = next(
+                    (
+                        venue
+                        for venue in self.config.venues
+                        if venue.name == connection_meta["venue"]
+                    ),
+                    None,
+                )
+                if venue_config is None:
+                    raise RuntimeError(
+                        "session continuation has unknown venue: "
+                        f"{connection_meta['venue']}"
+                    )
+                for market in venue_config.markets:
+                    continuation_hash = hashlib.sha256(
+                        (
+                            f"{marker['continuation_id']}:restart-gap:"
+                            f"{destination_partition}:{market.market_id}"
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    gap_intervals = [
+                        {
+                            "interval_id": "sealed-session-gap:"
+                            + hashlib.sha256(
+                                (
+                                    f"{marker['continuation_id']}:"
+                                    f"{interval['sealed_partition']}:"
+                                    f"{market.market_id}"
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                            **interval,
+                        }
+                        for interval in sealed_restart_gap_intervals
+                    ]
+                    restart_gaps.append(
+                        {
+                            "recv_us": recovered_us,
+                            "partition_us": start_us,
+                            "connection_id": connection_meta["id"],
+                            "venue": venue_config.name,
+                            "market_id": market.market_id,
+                            "symbol": market.symbol,
+                            "channel": "connection",
+                            "start_us": start_us,
+                            "end_us": start_us if destination_exists else None,
+                            "continuation_id": (
+                                f"session-restart:{continuation_hash}"
+                            ),
+                            "reason": recovery_reason,
+                            "sealed_intervals": gap_intervals,
+                        }
+                    )
             recovered.append(
                 (
                     marker_path,
@@ -2211,15 +2329,16 @@ class DatabaseSink:
                         },
                     ),
                     None
-                    if preserve_open
+                    if destination_exists
                     else (
                         "connection_end",
                         {
-                            "recv_us": recovered_us,
+                            "recv_us": start_us,
                             "reason": recovery_reason,
                             "connection": connection_meta,
                         },
                     ),
+                    restart_gaps,
                 )
             )
         return recovered

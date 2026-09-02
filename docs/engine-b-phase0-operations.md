@@ -180,16 +180,21 @@ likewise carried through idle hourly partitions even when no feed payload
 arrives. Each session handoff is write-ahead journaled before the old segment
 is closed. The marker records the source collector run ID: the same live
 collector preserves the destination segment as open, while a different process
-recreates the segment and bounds it at the recovery timestamp with
-`collector_restart_recovery`.
+only preserves a destination segment that was durably created. If the marker
+was fsynced but the destination write never committed, recovery creates a
+zero-length segment at the handoff boundary and records a connection gap from
+that boundary through the replacement snapshot with
+`collector_restart_recovery`. Missing sealed-hour destinations are recorded as
+`sealed_gap_interval` evidence rather than as connected session time.
 Startup also discovers open rows left in retained databases by an earlier
 process, bounds each orphaned physical session at its last durable book/trade
 activity, and records a connection gap from that point through the replacement
 snapshot. Recovery therefore does not count crash downtime as connected and
-does not depend on the archive timer. If a journal target
-was already sealed, the sidecar proves whether that session segment exists;
-any missing sealed-hour interval is carried into the next retained database as
-`sealed_session_interval` evidence before recovery advances.
+does not depend on the archive timer. If a journal target was already sealed,
+the sidecar proves whether that session segment exists; same-process live
+handoffs carry a missing sealed-hour segment into the next retained database as
+`sealed_session_interval` evidence, while restart recovery uses
+`sealed_gap_interval` so crash downtime cannot look connected.
 `ws_connection` starts only after the WebSocket handshake succeeds. DNS,
 TCP/TLS, and handshake failures contribute connection-gap evidence but never
 create a physical session row or inflate session duration.

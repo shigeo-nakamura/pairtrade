@@ -1790,6 +1790,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_marker_survives_failed_continuation_write(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
         with tempfile.TemporaryDirectory() as directory:
             database_dir = Path(directory) / "data"
             object.__setattr__(config, "database_dir", database_dir)
@@ -1866,7 +1867,19 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             ):
                 path.mkdir(parents=True, exist_ok=True)
             with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
-                recovered_sink._write_batch([])
+                recovered_sink._write_batch(
+                    [
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": venue.name,
+                                "market_id": market.market_id,
+                            },
+                        )
+                        for market in venue.markets
+                    ]
+                )
             self.assertEqual(
                 list(recovered_sink.session_continuation_dir.glob("*.json")), []
             )
@@ -1897,8 +1910,24 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchone(),
                     (
                         next_hour_us,
-                        recovered_us,
+                        next_hour_us,
                         "collector_restart_recovery",
+                    ),
+                )
+                self.assertEqual(
+                    second_db.execute(
+                        """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_start_us),
+                                  MIN(ts_end_us), MAX(ts_end_us), COUNT(DISTINCT reason)
+                           FROM data_gap WHERE venue = 'robinhood'
+                             AND channel = 'connection'"""
+                    ).fetchone(),
+                    (
+                        len(venue.markets),
+                        next_hour_us,
+                        next_hour_us,
+                        recovered_us,
+                        recovered_us,
+                        1,
                     ),
                 )
             finally:
@@ -2051,9 +2080,20 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchone(),
                     (
                         boundary_us,
-                        recovered_us,
+                        boundary_us,
                         "collector_restart_recovery",
                     ),
+                )
+                robinhood = next(
+                    item for item in config.venues if item.name == "robinhood"
+                )
+                self.assertEqual(
+                    destination.execute(
+                        """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
+                           FROM data_gap WHERE venue = 'robinhood'
+                             AND channel = 'connection'"""
+                    ).fetchone(),
+                    (len(robinhood.markets), boundary_us, None),
                 )
             finally:
                 source.close()
@@ -2409,23 +2449,41 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchone(),
                     (
                         sealed_end_us,
-                        recovered_us,
+                        sealed_end_us,
                         "collector_restart_recovery",
                     ),
                 )
                 self.assertEqual(
                     recovered_db.execute(
-                        """SELECT sealed_partition, connection_session_id,
-                                  ts_start_us, ts_end_us, reason
-                           FROM sealed_session_interval"""
+                        "SELECT COUNT(*) FROM sealed_session_interval"
+                    ).fetchone(),
+                    (0,),
+                )
+                robinhood = next(
+                    item for item in config.venues if item.name == "robinhood"
+                )
+                self.assertEqual(
+                    recovered_db.execute(
+                        """SELECT COUNT(*), MIN(sealed_partition),
+                                  MIN(ts_start_us), MAX(ts_end_us),
+                                  COUNT(DISTINCT reason)
+                           FROM sealed_gap_interval"""
                     ).fetchone(),
                     (
+                        len(robinhood.markets),
                         sealed_partition,
-                        "sealed-session",
                         sealed_start_us,
                         sealed_end_us,
-                        "collector_restart_recovery",
+                        1,
                     ),
+                )
+                self.assertEqual(
+                    recovered_db.execute(
+                        """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
+                           FROM data_gap WHERE venue = 'robinhood'
+                             AND channel = 'connection'"""
+                    ).fetchone(),
+                    (len(robinhood.markets), sealed_end_us, None),
                 )
             finally:
                 recovered_db.close()
