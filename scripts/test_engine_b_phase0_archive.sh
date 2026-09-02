@@ -32,8 +32,12 @@ connection.execute("CREATE TABLE sample(value TEXT NOT NULL)")
 connection.execute("CREATE TABLE ohlcv_1m(is_complete INTEGER NOT NULL)")
 connection.execute(
     """CREATE TABLE ws_connection(
+         connection_session_id TEXT PRIMARY KEY,
+         venue TEXT NOT NULL,
+         channel TEXT NOT NULL,
          started_ts_recv_us INTEGER NOT NULL,
          ended_ts_recv_us INTEGER,
+         api_schema_version TEXT NOT NULL,
          end_reason TEXT
        )"""
 )
@@ -68,8 +72,14 @@ connection.execute(
 connection.execute("INSERT INTO sample VALUES ('recovered-from-wal')")
 connection.execute("INSERT INTO ohlcv_1m VALUES (0)")
 connection.execute(
-    "INSERT INTO ws_connection VALUES (?, NULL, NULL)",
-    (946_684_800_000_000,),
+    "INSERT INTO ws_connection VALUES (?, ?, ?, ?, NULL, ?, NULL)",
+    (
+        "legacy-connection",
+        "robinhood",
+        "multiplexed_public",
+        946_684_800_000_000,
+        "2026-01",
+    ),
 )
 connection.execute(
     """INSERT INTO data_gap(
@@ -277,6 +287,22 @@ assert marker["start_us"] == 946_688_400_000_000
 assert marker["source_partition"] == "20000101_00"
 assert marker["source_gap_id"] == 1
 PY
+session_marker=$(find "$ROOT/session-continuations" -type f -name '*.json')
+test -n "$session_marker"
+python3 - "$session_marker" <<'PY'
+import json
+import sys
+marker = json.load(open(sys.argv[1]))
+assert marker["continuation_id"] == "partition:20000101_00:legacy-connection"
+assert marker["start_us"] == 946_688_400_000_000
+assert marker["source_partition"] == "20000101_00"
+assert marker["connection"] == {
+    "id": "legacy-connection",
+    "venue": "robinhood",
+    "started_us": 946_688_400_000_000,
+    "api_schema_version": "2026-01",
+}
+PY
 python3 - "$seal" "$trade_index" "$expected_sha" <<'PY'
 import json
 import hashlib
@@ -332,6 +358,9 @@ try:
     assert connection.execute(
         "SELECT COUNT(*) FROM archived_gap_continuation"
     ).fetchone() == (0,)
+    assert connection.execute(
+        "SELECT connection_session_id FROM archived_connection_session"
+    ).fetchone() == ("legacy-connection",)
     assert connection.execute("SELECT COUNT(*) FROM late_trade_identity").fetchone() == (0,)
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 finally:

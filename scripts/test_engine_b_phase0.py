@@ -1296,6 +1296,206 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 first_db.close()
                 second_db.close()
 
+    async def test_startup_discovers_orphaned_session_without_archive_timer(
+        self,
+    ) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            next_hour_us = hour_start_us + 3_600_000_000
+            recovered_us = next_hour_us + 300_000_000
+            connection_started_us = hour_start_us + 3_000_000_000
+            first_partition = engine_b.partition_for_us(hour_start_us)
+            second_partition = engine_b.partition_for_us(next_hour_us)
+            connection_meta = {
+                "id": "orphaned-before-rotation",
+                "venue": "robinhood",
+                "started_us": connection_started_us,
+                "api_schema_version": config.api_schema_version,
+            }
+
+            crashed_sink = engine_b.DatabaseSink(
+                config, "orphan-source-run", "orphan-source-commit"
+            )
+            for path in (
+                database_dir,
+                crashed_sink.sealed_dir,
+                crashed_sink.lock_dir,
+                crashed_sink.gap_continuation_dir,
+                crashed_sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(
+                engine_b, "now_us", return_value=connection_started_us
+            ):
+                crashed_sink._write_batch(
+                    [
+                        (
+                            "connection_start",
+                            {
+                                "recv_us": connection_started_us,
+                                "connection": connection_meta,
+                            },
+                        )
+                    ]
+                )
+            for connection in crashed_sink._connections.values():
+                connection.close()
+            crashed_sink._connections.clear()
+
+            recovered_sink = engine_b.DatabaseSink(
+                config, "orphan-recovery-run", "orphan-recovery-commit"
+            )
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                recovered_sink._write_batch([])
+            self.assertEqual(
+                list(recovered_sink.session_continuation_dir.glob("*.json")), []
+            )
+            await recovered_sink.close()
+
+            first_db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{first_partition}.sqlite3"
+            )
+            second_db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{second_partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    first_db.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (
+                        connection_started_us,
+                        next_hour_us,
+                        "partition_rotation",
+                    ),
+                )
+                self.assertEqual(
+                    second_db.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (
+                        next_hour_us,
+                        recovered_us,
+                        "collector_restart_recovery",
+                    ),
+                )
+            finally:
+                first_db.close()
+                second_db.close()
+
+    async def test_session_marker_advances_past_sealed_destination(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            source_start_us = 1_700_000_000_000_000
+            source_start_us -= source_start_us % 3_600_000_000
+            sealed_start_us = source_start_us + 3_600_000_000
+            sealed_end_us = sealed_start_us + 3_600_000_000
+            recovered_us = sealed_end_us + 120_000_000
+            source_partition = engine_b.partition_for_us(source_start_us)
+            sealed_partition = engine_b.partition_for_us(sealed_start_us)
+            recovered_partition = engine_b.partition_for_us(sealed_end_us)
+            sink = engine_b.DatabaseSink(
+                config, "sealed-session-run", "sealed-session-commit"
+            )
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            sealed_sha = "b" * 64
+            (sink.sealed_dir / f"{sealed_partition}.json").write_text(
+                json.dumps({"partition": sealed_partition, "sha256": sealed_sha})
+                + "\n"
+            )
+            sealed_index = sqlite3.connect(
+                sink.sealed_dir / f"{sealed_partition}.trade_ids.sqlite3"
+            )
+            sealed_index.execute(
+                """CREATE TABLE sealed_metadata(
+                     partition TEXT PRIMARY KEY,
+                     canonical_db_sha256 TEXT NOT NULL
+                   )"""
+            )
+            sealed_index.execute(
+                """CREATE TABLE archived_connection_session(
+                     connection_session_id TEXT PRIMARY KEY,
+                     started_ts_recv_us INTEGER NOT NULL,
+                     ended_ts_recv_us INTEGER,
+                     end_reason TEXT
+                   ) WITHOUT ROWID"""
+            )
+            sealed_index.execute(
+                "INSERT INTO sealed_metadata VALUES (?, ?)",
+                (sealed_partition, sealed_sha),
+            )
+            sealed_index.commit()
+            sealed_index.close()
+            sink._persist_session_continuation_marker(
+                {
+                    "continuation_id": (
+                        f"partition:{source_partition}:sealed-session"
+                    ),
+                    "start_us": sealed_start_us,
+                    "source_partition": source_partition,
+                    "connection": {
+                        "id": "sealed-session",
+                        "venue": "robinhood",
+                        "started_us": sealed_start_us,
+                        "api_schema_version": config.api_schema_version,
+                    },
+                }
+            )
+
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                sink._write_batch([])
+            self.assertEqual(
+                list(sink.session_continuation_dir.glob("*.json")), []
+            )
+            await sink.close()
+
+            recovered_db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{recovered_partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    recovered_db.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (
+                        sealed_end_us,
+                        recovered_us,
+                        "collector_restart_recovery",
+                    ),
+                )
+                self.assertEqual(
+                    recovered_db.execute(
+                        """SELECT sealed_partition, connection_session_id,
+                                  ts_start_us, ts_end_us, reason
+                           FROM sealed_session_interval"""
+                    ).fetchone(),
+                    (
+                        sealed_partition,
+                        "sealed-session",
+                        sealed_start_us,
+                        sealed_end_us,
+                        "collector_restart_recovery",
+                    ),
+                )
+            finally:
+                recovered_db.close()
+
 
     async def test_deduplicates_and_merges_late_trades_in_event_partition(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
@@ -1454,6 +1654,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
             await sink.put("trade", sealed_trade("archived-before-seal", 1))
             await sink.put("trade", sealed_trade("late-after-seal", 2))
+            await sink.put(
+                "connection_end",
+                {
+                    "recv_us": recv_us,
+                    "connection": connection,
+                    "reason": "test_complete",
+                },
+            )
             await sink.queue.join()
             await sink.close()
 

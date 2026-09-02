@@ -41,7 +41,7 @@ LOG = logging.getLogger("engine_b_phase0")
 UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 OHLCV_FINALIZE_GRACE_US = 120_000_000
 
 
@@ -75,6 +75,18 @@ CREATE TABLE IF NOT EXISTS ws_connection (
   ended_ts_recv_us INTEGER,
   api_schema_version TEXT NOT NULL,
   end_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sealed_session_interval (
+  interval_id TEXT PRIMARY KEY,
+  sealed_partition TEXT NOT NULL,
+  connection_session_id TEXT NOT NULL,
+  venue TEXT NOT NULL,
+  ts_start_us INTEGER NOT NULL,
+  ts_end_us INTEGER NOT NULL,
+  api_schema_version TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  CHECK(ts_end_us >= ts_start_us)
 );
 
 CREATE TABLE IF NOT EXISTS book_event (
@@ -415,6 +427,14 @@ def build_sealed_trade_index(
                  gap_id INTEGER NOT NULL
                ) WITHOUT ROWID"""
         )
+        index.execute(
+            """CREATE TABLE archived_connection_session(
+                 connection_session_id TEXT PRIMARY KEY,
+                 started_ts_recv_us INTEGER NOT NULL,
+                 ended_ts_recv_us INTEGER,
+                 end_reason TEXT
+               ) WITHOUT ROWID"""
+        )
         tables = {
             row[0]
             for row in source.execute(
@@ -508,6 +528,15 @@ def build_sealed_trade_index(
                 source.execute(
                     """SELECT continuation_id, gap_id FROM data_gap
                        WHERE continuation_id IS NOT NULL"""
+                ),
+            )
+        if "ws_connection" in tables:
+            index.executemany(
+                "INSERT OR IGNORE INTO archived_connection_session VALUES (?, ?, ?, ?)",
+                source.execute(
+                    """SELECT connection_session_id, started_ts_recv_us,
+                              ended_ts_recv_us, end_reason
+                       FROM ws_connection"""
                 ),
             )
         index.execute(
@@ -900,6 +929,7 @@ class DatabaseSink:
         self.lock_dir = self.state_dir / "locks"
         self.gap_continuation_dir = self.state_dir / "gap-continuations"
         self.session_continuation_dir = self.state_dir / "session-continuations"
+        self._startup_recovery_pending = True
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -1158,6 +1188,53 @@ class DatabaseSink:
         finally:
             connection.close()
 
+    def _sealed_connection_session_exists(
+        self, partition: str, connection_session_id: str
+    ) -> bool:
+        index_path = self.sealed_dir / f"{partition}.trade_ids.sqlite3"
+        seal_path = self.sealed_dir / f"{partition}.json"
+        if not index_path.is_file():
+            raise RuntimeError(
+                f"sealed partition session index is missing: {index_path}"
+            )
+        try:
+            seal = json.loads(seal_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"sealed partition metadata is unreadable: {seal_path}"
+            ) from exc
+        connection = sqlite3.connect(
+            f"file:{index_path}?mode=ro", uri=True, timeout=5
+        )
+        try:
+            metadata = connection.execute(
+                "SELECT partition, canonical_db_sha256 FROM sealed_metadata"
+            ).fetchone()
+            if metadata != (partition, seal.get("sha256")):
+                raise RuntimeError(
+                    f"sealed session index metadata mismatch: {index_path}"
+                )
+            table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type = 'table'
+                     AND name = 'archived_connection_session'"""
+            ).fetchone()
+            if table is None:
+                raise RuntimeError(
+                    f"sealed partition session index is incompatible: {index_path}"
+                )
+            return connection.execute(
+                """SELECT 1 FROM archived_connection_session
+                   WHERE connection_session_id = ?""",
+                (connection_session_id,),
+            ).fetchone() is not None
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(
+                f"sealed session index is unreadable: {index_path}"
+            ) from exc
+        finally:
+            connection.close()
+
     def _local_late_trade_exists(
         self, sealed_partition: str, payload: dict[str, Any]
     ) -> bool:
@@ -1323,9 +1400,99 @@ class DatabaseSink:
             temporary.unlink(missing_ok=True)
         return marker_path
 
+    def _recover_orphaned_sessions(self, recovered_us: int) -> None:
+        current_partition = partition_for_us(recovered_us)
+        for database_path in sorted(
+            self.config.database_dir.glob("engine_b_phase0_*.sqlite3")
+        ):
+            partition = database_path.stem.removeprefix("engine_b_phase0_")
+            try:
+                if (
+                    partition_for_us(partition_start_us(partition)) != partition
+                    or partition > current_partition
+                    or self._is_partition_sealed(partition)
+                ):
+                    continue
+            except ValueError:
+                continue
+            with self._partition_lock(partition):
+                if self._is_partition_sealed(partition) or not database_path.is_file():
+                    continue
+                try:
+                    connection = sqlite3.connect(
+                        f"file:{database_path}?mode=rw", uri=True, timeout=5
+                    )
+                except sqlite3.OperationalError as exc:
+                    if not database_path.exists():
+                        continue
+                    raise RuntimeError(
+                        f"orphaned session database is unreadable: {database_path}"
+                    ) from exc
+                try:
+                    table = connection.execute(
+                        """SELECT 1 FROM sqlite_master
+                           WHERE type = 'table' AND name = 'ws_connection'"""
+                    ).fetchone()
+                    if table is None:
+                        continue
+                    rows = connection.execute(
+                        """SELECT connection_session_id, venue, api_schema_version
+                           FROM ws_connection
+                           WHERE ended_ts_recv_us IS NULL"""
+                    ).fetchall()
+                    if not rows:
+                        continue
+                    connection.execute("BEGIN")
+                    if partition == current_partition:
+                        connection.execute(
+                            """UPDATE ws_connection
+                               SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
+                                   end_reason = 'collector_restart_recovery'
+                               WHERE ended_ts_recv_us IS NULL""",
+                            (recovered_us,),
+                        )
+                    else:
+                        partition_ended_us = (
+                            partition_start_us(partition) + 3_600_000_000
+                        )
+                        for session_id, venue, api_schema_version in rows:
+                            self._persist_session_continuation_marker(
+                                {
+                                    "continuation_id": (
+                                        f"partition:{partition}:{session_id}"
+                                    ),
+                                    "start_us": partition_ended_us,
+                                    "source_partition": partition,
+                                    "connection": {
+                                        "id": session_id,
+                                        "venue": venue,
+                                        "started_us": partition_ended_us,
+                                        "api_schema_version": api_schema_version,
+                                    },
+                                }
+                            )
+                        connection.execute(
+                            """UPDATE ws_connection
+                               SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
+                                   end_reason = 'partition_rotation'
+                               WHERE ended_ts_recv_us IS NULL""",
+                            (partition_ended_us,),
+                        )
+                    connection.commit()
+                except sqlite3.DatabaseError as exc:
+                    connection.rollback()
+                    raise RuntimeError(
+                        f"orphaned session database is unreadable: {database_path}"
+                    ) from exc
+                finally:
+                    connection.close()
+
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         gap_closes: list[dict[str, Any]] = []
+        if self._startup_recovery_pending:
+            self._recover_orphaned_sessions(now_us())
+            self._startup_recovery_pending = False
         recovered_gap_markers = self._load_gap_continuations()
         recovered_session_markers = self._load_session_continuations()
         batch = [
@@ -1579,12 +1746,39 @@ class DatabaseSink:
             self._complete_session_source_close(marker)
             start_us = int(marker["start_us"])
             destination_partition = partition_for_us(start_us)
-            if self._is_partition_sealed(destination_partition):
-                raise RuntimeError(
-                    "session continuation destination is sealed; restore and verify "
-                    f"the partition before recovery: {destination_partition}"
-                )
             connection_meta = dict(marker["connection"])
+            sealed_intervals: list[dict[str, Any]] = []
+            while self._is_partition_sealed(destination_partition):
+                archived = self._sealed_connection_session_exists(
+                    destination_partition, str(connection_meta["id"])
+                )
+                destination_end_us = (
+                    partition_start_us(destination_partition) + 3_600_000_000
+                )
+                LOG.warning(
+                    "Advancing recovered session continuation past sealed "
+                    "partition %s archived=%s",
+                    destination_partition,
+                    archived,
+                )
+                if not archived:
+                    interval_id = "sealed-session-missing:" + hashlib.sha256(
+                        (
+                            f"{marker['continuation_id']}:"
+                            f"{destination_partition}"
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    sealed_intervals.append(
+                        {
+                            "interval_id": interval_id,
+                            "sealed_partition": destination_partition,
+                            "start_us": start_us,
+                            "end_us": destination_end_us,
+                        }
+                    )
+                start_us = destination_end_us
+                destination_partition = partition_for_us(start_us)
+            connection_meta["started_us"] = start_us
             recovered_us = now_us()
             recovered.append(
                 (
@@ -1595,6 +1789,7 @@ class DatabaseSink:
                             "recv_us": start_us,
                             "partition_us": start_us,
                             "connection": connection_meta,
+                            "sealed_intervals": sealed_intervals,
                         },
                     ),
                     (
@@ -1855,7 +2050,23 @@ class DatabaseSink:
 
     def _apply(self, connection: sqlite3.Connection, kind: str, payload: dict[str, Any]) -> None:
         if kind == "connection_start":
-            pass
+            for interval in payload.get("sealed_intervals", []):
+                connection.execute(
+                    """INSERT OR IGNORE INTO sealed_session_interval(
+                         interval_id, sealed_partition, connection_session_id,
+                         venue, ts_start_us, ts_end_us, api_schema_version, reason
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        interval["interval_id"],
+                        interval["sealed_partition"],
+                        payload["connection"]["id"],
+                        payload["connection"]["venue"],
+                        interval["start_us"],
+                        interval["end_us"],
+                        payload["connection"]["api_schema_version"],
+                        "collector_restart_recovery",
+                    ),
+                )
         elif kind == "connection_end":
             connection.execute(
                 """UPDATE ws_connection SET ended_ts_recv_us = ?, end_reason = ?

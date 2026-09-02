@@ -14,6 +14,7 @@ STATE_DIR=${ENGINE_B_PHASE0_STATE_DIR:-$(dirname "$DATA_DIR")}
 LOCK_DIR="$STATE_DIR/locks"
 SEALED_DIR="$STATE_DIR/sealed"
 GAP_CONTINUATION_DIR="$STATE_DIR/gap-continuations"
+SESSION_CONTINUATION_DIR="$STATE_DIR/session-continuations"
 
 fsync_files_and_directory() {
   "$PYTHON_BIN" - "$@" <<'PY'
@@ -148,7 +149,7 @@ if [ ! -d "$DATA_DIR" ]; then
   echo "No Engine B data directory yet: $DATA_DIR"
   exit 0
 fi
-install -d -m 0750 "$LOCK_DIR" "$SEALED_DIR" "$GAP_CONTINUATION_DIR"
+install -d -m 0750 "$LOCK_DIR" "$SEALED_DIR" "$GAP_CONTINUATION_DIR" "$SESSION_CONTINUATION_DIR"
 
 shopt -s nullglob
 for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
@@ -193,8 +194,9 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
     continue
   fi
   set +e
-  "$PYTHON_BIN" - "$db" "$partition" "$GAP_CONTINUATION_DIR" <<'PY'
+  "$PYTHON_BIN" - "$db" "$partition" "$GAP_CONTINUATION_DIR" "$SESSION_CONTINUATION_DIR" <<'PY'
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -206,6 +208,9 @@ try:
     checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     if checkpoint and checkpoint[0]:
         raise SystemExit(75)
+    mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+    if mode.lower() != "delete":
+        raise SystemExit(f"could not leave WAL mode for {sys.argv[1]}: {mode}")
     tables = {
         row[0]
         for row in connection.execute(
@@ -220,6 +225,50 @@ try:
     if "ohlcv_1m" in tables:
         connection.execute("UPDATE ohlcv_1m SET is_complete = 1 WHERE is_complete = 0")
     if "ws_connection" in tables:
+        marker_dir = Path(sys.argv[4])
+        rows = connection.execute(
+            """SELECT connection_session_id, venue, api_schema_version
+               FROM ws_connection WHERE ended_ts_recv_us IS NULL"""
+        ).fetchall()
+        for session_id, venue, api_schema_version in rows:
+            continuation_id = f"partition:{sys.argv[2]}:{session_id}"
+            marker = {
+                "continuation_id": continuation_id,
+                "start_us": partition_end_us,
+                "source_partition": sys.argv[2],
+                "connection": {
+                    "id": session_id,
+                    "venue": venue,
+                    "started_us": partition_end_us,
+                    "api_schema_version": api_schema_version,
+                },
+            }
+            marker_name = hashlib.sha256(continuation_id.encode()).hexdigest()
+            marker_path = marker_dir / f"{marker_name}.json"
+            encoded = json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
+            if marker_path.exists():
+                if marker_path.read_text() != encoded:
+                    raise RuntimeError(
+                        f"session continuation marker mismatch: {marker_path}"
+                    )
+            else:
+                temporary = marker_path.with_name(
+                    f".{marker_path.name}.{os.getpid()}.tmp"
+                )
+                try:
+                    with temporary.open("w") as output:
+                        output.write(encoded)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.chmod(temporary, 0o640)
+                    os.replace(temporary, marker_path)
+                    directory_fd = os.open(marker_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                finally:
+                    temporary.unlink(missing_ok=True)
         connection.execute(
             """UPDATE ws_connection
                SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
@@ -274,9 +323,6 @@ try:
         )
     if "ohlcv_1m" in tables or "ws_connection" in tables or "data_gap" in tables:
         connection.commit()
-    mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
-    if mode.lower() != "delete":
-        raise SystemExit(f"could not leave WAL mode for {sys.argv[1]}: {mode}")
     result = connection.execute("PRAGMA integrity_check").fetchone()[0]
 except sqlite3.OperationalError as exc:
     if "locked" in str(exc).lower() or "busy" in str(exc).lower():

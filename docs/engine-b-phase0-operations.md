@@ -173,6 +173,11 @@ likewise carried through idle hourly partitions even when no feed payload
 arrives. Each session handoff is write-ahead journaled before the old segment
 is closed; after a collector crash, recovery recreates the destination segment
 and bounds it at the recovery timestamp with `collector_restart_recovery`.
+Startup also discovers open rows left in retained databases by an earlier
+process, so recovery does not depend on the archive timer. If a journal target
+was already sealed, the sidecar proves whether that session segment exists;
+any missing sealed-hour interval is carried into the next retained database as
+`sealed_session_interval` evidence before recovery advances.
 
 ## `freq2` account record
 

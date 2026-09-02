@@ -79,7 +79,8 @@ if [ -d "$STATE_DIR" ]; then
   find "$STATE_DIR" -type f -exec chmod g+rw,o-rwx {} +
 else
   install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 \
-    "$STATE_DIR" "$STATE_DIR/data" "$STATE_DIR/locks" "$STATE_DIR/sealed"
+    "$STATE_DIR" "$STATE_DIR/data" "$STATE_DIR/locks" "$STATE_DIR/sealed" \
+    "$STATE_DIR/gap-continuations" "$STATE_DIR/session-continuations"
 fi
 
 requirements_hash=$(sha256sum "$REQUIREMENTS" | cut -d' ' -f1)
