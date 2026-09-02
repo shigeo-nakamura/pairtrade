@@ -15,14 +15,15 @@ use chrono::{DateTime, NaiveDate, Utc};
 use debot::arcus_spot::event_record;
 use debot::arcus_spot::{
     build_arcus_spot_kms_signer, is_supported_live_route,
-    manual_reconciled_runtime_fill_for_attempt, verify_record, ArcusSpotChainClient,
-    ArcusSpotChainConfig, ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt,
-    ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
-    ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor,
-    ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventRecord,
-    ArcusSpotLiveTickEventStream, ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan,
-    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
-    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    manual_reconciled_runtime_fill_for_attempt, verify_archive_events, verify_record,
+    ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision, ArcusSpotDirection,
+    ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore,
+    ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner,
+    ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventPublisher,
+    ArcusSpotLiveTickEventRecord, ArcusSpotLiveTickEventStream, ArcusSpotRegime,
+    ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntime,
+    ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent,
+    ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
 use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
@@ -646,33 +647,26 @@ fn scan_manual_reconcile_candidates(
             events_jsonl_path.display()
         )
     })?;
-    let events_text = String::from_utf8(events_bytes).with_context(|| {
+    if events_bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Unlike repair-report's per-line verify_record scan, this must prove
+    // the whole file is an unbroken, genuine slice of the real event
+    // stream, not just that each line's own hashes are self-consistent:
+    // there is no plan_config_digest downstream here to catch a spliced or
+    // partially-forged file the way repair-report's digest match would
+    // (Codex P2 follow-up, pairtrade#241). verify_archive_events requires a
+    // continuous hash chain and a monotonic, gap-free sequence across every
+    // record in the file, exactly like the on-host event stream's own
+    // segment verification.
+    let events = verify_archive_events(events_jsonl_path, &events_bytes).with_context(|| {
         format!(
-            "Arcus event export {} is not valid UTF-8",
+            "{} failed archive verification",
             events_jsonl_path.display()
         )
     })?;
     let mut candidates = Vec::new();
-    for (line_no, line) in events_text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let record: ArcusSpotLiveTickEventRecord =
-            serde_json::from_str(line).with_context(|| {
-                format!(
-                    "{} line {} is not a valid Arcus event record",
-                    events_jsonl_path.display(),
-                    line_no + 1
-                )
-            })?;
-        let event = verify_record(&record).with_context(|| {
-            format!(
-                "{} line {} failed event-record verification",
-                events_jsonl_path.display(),
-                line_no + 1
-            )
-        })?;
+    for event in events {
         let ArcusSpotDecision::WouldRotate { plan } = event.decision else {
             continue;
         };
@@ -7285,7 +7279,14 @@ runtime:
             previous = Some(record.chain_sha256.clone());
             lines.push(serde_json::to_string(&record).unwrap());
         }
-        write_private_file(path, lines.join("\n").as_bytes());
+        // verify_archive_events (manual-reconcile-*'s stricter archive
+        // check, unlike repair-report's own per-line scan) requires a
+        // trailing newline, matching a genuine on-host segment file.
+        let mut content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        write_private_file(path, content.as_bytes());
     }
 
     #[test]
@@ -7620,6 +7621,65 @@ runtime:
         assert!(
             error.to_string().contains("no WouldRotate event matching"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn manual_reconcile_report_rejects_an_archive_with_a_broken_hash_chain() {
+        // Codex P2 follow-up, pairtrade#241: verify_record alone proves
+        // only that a single record's own hashes are self-consistent -- it
+        // says nothing about whether the record is a genuine, unmodified
+        // part of the real event stream. A forged record can carry
+        // perfectly self-consistent hashes of its own while breaking the
+        // chain to its neighbor. repair-report catches this downstream via
+        // plan_config_digest; manual-reconcile-* has no such backstop, so
+        // it must catch it here instead (verify_archive_events).
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = repair_report_active_submitted_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+
+        // A genuine two-event chain, plus a third record whose own hashes
+        // are internally self-consistent (it would pass verify_record on
+        // its own) but whose previous_chain_sha256 does not chain from the
+        // second event -- exactly what splicing a forged record into an
+        // otherwise real export looks like.
+        let genuine = [
+            repair_report_would_rotate_event(101, at, plan.clone()),
+            repair_report_would_rotate_event(102, at + chrono::Duration::seconds(1), plan.clone()),
+        ];
+        let mut lines = Vec::new();
+        let mut previous = None;
+        for event in &genuine {
+            let record = event_record(event, previous.clone()).unwrap();
+            previous = Some(record.chain_sha256.clone());
+            lines.push(serde_json::to_string(&record).unwrap());
+        }
+        let forged_event =
+            repair_report_would_rotate_event(103, at + chrono::Duration::seconds(2), plan.clone());
+        let forged_record = event_record(&forged_event, None).unwrap();
+        lines.push(serde_json::to_string(&forged_record).unwrap());
+        let mut content = lines.join("\n");
+        content.push('\n');
+        write_private_file(&events_path, content.as_bytes());
+
+        let error =
+            build_manual_reconcile_report(&config_path, &events_path, "1", "1").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("hash-chain break"),
+            "{error:#}"
         );
     }
 
