@@ -470,6 +470,125 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(sink.commands, [])
 
+    async def test_sealed_same_batch_update_snapshot_uses_pending_alias(
+        self,
+    ) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        recording = RecordingSink()
+        collector = engine_b.Collector(config, recording, engine_b.Metrics())
+        event_us = 1_774_884_082_309_000
+        recv_us = event_us + 7_200_000_000
+        connection_meta = {
+            "id": "sealed-same-batch-alias",
+            "venue": venue.name,
+            "started_us": recv_us,
+            "api_schema_version": config.api_schema_version,
+        }
+        trade = {
+            "price": "101",
+            "size": "2",
+            "timestamp": event_us // 1_000,
+        }
+        await collector.handle_trades(
+            venue,
+            connection_meta,
+            {
+                "type": "update/trade",
+                "channel": "trade/37",
+                "nonce": 9001,
+                "trades": [trade],
+            },
+            recv_us,
+        )
+        await collector.handle_trades(
+            venue,
+            connection_meta,
+            {
+                "type": "subscribed/trade",
+                "channel": "trade/37",
+                "nonce": 9002,
+                "trades": [trade],
+            },
+            recv_us + 1,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            sink = engine_b.DatabaseSink(
+                config, "sealed-alias-run", "sealed-alias-commit"
+            )
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            event_partition = engine_b.partition_for_us(event_us)
+            index_path = sink.sealed_dir / f"{event_partition}.trade_ids.sqlite3"
+            index = sqlite3.connect(index_path)
+            index.executescript(
+                """CREATE TABLE sealed_metadata(
+                     partition TEXT PRIMARY KEY,
+                     canonical_db_sha256 TEXT NOT NULL
+                   );
+                   CREATE TABLE archived_trade_identity(
+                     venue TEXT NOT NULL,
+                     market_id INTEGER NOT NULL,
+                     exchange_trade_id TEXT NOT NULL,
+                     PRIMARY KEY(venue, market_id, exchange_trade_id)
+                   ) WITHOUT ROWID;
+                   CREATE TABLE late_trade_identity(
+                     venue TEXT NOT NULL,
+                     market_id INTEGER NOT NULL,
+                     exchange_trade_id TEXT NOT NULL,
+                     PRIMARY KEY(venue, market_id, exchange_trade_id)
+                   ) WITHOUT ROWID;
+                   CREATE TABLE archived_trade_replay_alias(
+                     venue TEXT NOT NULL,
+                     market_id INTEGER NOT NULL,
+                     replay_alias TEXT NOT NULL,
+                     exchange_trade_id TEXT NOT NULL,
+                     PRIMARY KEY(venue, market_id, exchange_trade_id)
+                   ) WITHOUT ROWID;"""
+            )
+            index.execute(
+                "INSERT INTO sealed_metadata VALUES (?, ?)",
+                (event_partition, "empty-sealed-alias"),
+            )
+            index.commit()
+            index.close()
+            (sink.sealed_dir / f"{event_partition}.json").write_text(
+                json.dumps(
+                    {
+                        "partition": event_partition,
+                        "sha256": "empty-sealed-alias",
+                        "trade_index": index_path.name,
+                    }
+                )
+                + "\n"
+            )
+            with mock.patch.object(engine_b, "now_us", return_value=recv_us + 2):
+                sink._write_batch(recording.commands)
+            await sink.close()
+            active_partition = engine_b.partition_for_us(recv_us)
+            active = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{active_partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    active.execute(
+                        """SELECT COUNT(*), COUNT(DISTINCT replay_alias)
+                           FROM late_trade"""
+                    ).fetchone(),
+                    (1, 1),
+                )
+            finally:
+                active.close()
+
 
 class ConfigTests(unittest.TestCase):
     def test_config_records_robinhood_same_venue_blocker(self) -> None:
@@ -482,6 +601,38 @@ class ConfigTests(unittest.TestCase):
     def test_timestamp_normalization(self) -> None:
         self.assertEqual(engine_b.normalize_exchange_timestamp_us(1_773_854_156_654), 1_773_854_156_654_000)
         self.assertEqual(engine_b.normalize_exchange_timestamp_us(1_774_884_082_309_144), 1_774_884_082_309_144)
+
+
+class RestPollingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_volume_is_recorded_as_poll_failure(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        metrics = engine_b.Metrics()
+        collector = engine_b.Collector(config, sink, metrics)
+        response = {
+            "order_book_details": [
+                {
+                    "market_id": market.market_id,
+                    "symbol": market.symbol,
+                    "status": "active",
+                    "daily_quote_token_volume": None,
+                }
+                for market in venue.markets
+            ]
+        }
+        with mock.patch.object(engine_b, "fetch_json", return_value=response):
+            await collector.poll_venue(venue)
+        self.assertEqual(sink.commands, [])
+        self.assertEqual(
+            metrics.gauges[
+                (
+                    "engine_b_phase0_rest_poll_success",
+                    (("venue", venue.name),),
+                )
+            ],
+            0,
+        )
 
 
 class DeploymentTests(unittest.TestCase):

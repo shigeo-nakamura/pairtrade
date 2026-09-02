@@ -1732,6 +1732,10 @@ class DatabaseSink:
             grouped[partition_for_us(partition_us)].append((kind, payload))
 
         late_commands: list[tuple[str, dict[str, Any]]] = []
+        pending_late_primary: set[tuple[str, str, int, str]] = set()
+        pending_late_aliases: defaultdict[
+            tuple[str, str, int, str | None], set[str]
+        ] = defaultdict(set)
         for partition, commands in grouped.items():
             with self._partition_lock(partition):
                 if self._is_partition_sealed(partition):
@@ -1741,7 +1745,46 @@ class DatabaseSink:
                             raise RuntimeError(
                                 f"non-trade command targeted sealed partition {partition}: {kind}"
                             )
-                        if self._archived_trade_exists(partition, payload):
+                        primary_key = (
+                            partition,
+                            payload["venue"],
+                            payload["market_id"],
+                            payload["trade_id"],
+                        )
+                        replay_alias = payload.get("replay_alias")
+                        alias_key = (
+                            partition,
+                            payload["venue"],
+                            payload["market_id"],
+                            replay_alias,
+                        )
+                        archived = self._archived_trade_exists(
+                            partition, payload
+                        )
+                        pending_alias_replay = False
+                        if (
+                            not archived
+                            and replay_alias is not None
+                            and payload.get("snapshot_occurrence") is not None
+                        ):
+                            sealed_alias_ids = (
+                                self._sealed_trade_replay_alias_ids(
+                                    partition, payload
+                                )
+                            )
+                            _, local_alias_ids = self._local_late_trade_state(
+                                partition, payload
+                            )
+                            pending_alias_replay = len(
+                                sealed_alias_ids
+                                | local_alias_ids
+                                | pending_late_aliases[alias_key]
+                            ) > int(payload["snapshot_occurrence"])
+                        if (
+                            archived
+                            or primary_key in pending_late_primary
+                            or pending_alias_replay
+                        ):
                             LOG.debug(
                                 "Discarding replayed archived trade venue=%s market_id=%s "
                                 "trade_id=%s sealed_partition=%s",
@@ -1754,6 +1797,11 @@ class DatabaseSink:
                         late_payload = dict(payload)
                         late_payload["sealed_partition"] = partition
                         late_commands.append(("late_trade", late_payload))
+                        pending_late_primary.add(primary_key)
+                        if replay_alias is not None:
+                            pending_late_aliases[alias_key].add(
+                                payload["trade_id"]
+                            )
                     commands = regular_commands
                 if commands:
                     self._write_partition(partition, commands)
@@ -2940,7 +2988,10 @@ class Collector:
                     )
                 status = str(detail.get("status", "unknown"))
                 force_reduce_only = bool((detail.get("market_config") or {}).get("force_reduce_only", False))
-                volume = Decimal(str(detail.get("daily_quote_token_volume", "0")))
+                volume_text = canonical_decimal(
+                    detail.get("daily_quote_token_volume", "0")
+                )
+                volume = Decimal(volume_text)
                 reasons = []
                 if status != "active":
                     reasons.append(f"status={status}")
@@ -2957,7 +3008,7 @@ class Collector:
                         "symbol": market.symbol,
                         "status": status,
                         "force_reduce_only": force_reduce_only,
-                        "daily_volume_usd": canonical_decimal(volume),
+                        "daily_volume_usd": volume_text,
                         "open_interest": canonical_decimal(detail["open_interest"]) if detail.get("open_interest") is not None else None,
                         "is_eligible": not reasons,
                         "eligibility_reason": "eligible" if not reasons else ",".join(reasons),
