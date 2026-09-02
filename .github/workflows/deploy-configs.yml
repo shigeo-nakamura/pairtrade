@@ -42,6 +42,7 @@ jobs:
           bash -n debot/scripts/engine_b_phase0_archive.sh
           bash -n debot/scripts/install_engine_b_phase0.sh
           bash -n debot/scripts/run_engine_b_phase0.sh
+          bash -n debot/scripts/install_engine_b_live.sh
           bash -n debot/scripts/test_bootstrap_robinhood_sidecar.sh
           bash -n debot/scripts/test_deploy_robinhood_runtime.sh
           python3 -m py_compile debot/scripts/test_robinhood_deploy_workflows.py
