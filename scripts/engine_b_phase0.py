@@ -7,9 +7,16 @@ It records Robinhood Lighter (the intended future execution venue) alongside a
 complete standard-Lighter context feed because Robinhood currently lacks EWY
 and USDKRW, two controls required by requirements v0.3.
 
-The absence of those same-venue controls and the unresolved exchange calendar
-are recorded as fail-closed session-invalid reasons.  Collection can begin,
-but these rows must not be counted as valid Phase 0A samples yet.
+The exchange calendar (A-7) is resolved from a frozen, pre-computed KRX/US
+cash-market session table (see scripts/engine_b_trading_calendar_freeze.py
+and configs/engine-b/trading_calendar.json) that this process loads with
+stdlib `json` at startup -- it never imports a calendar library itself. If
+the frozen table is missing, unreadable, or does not cover a given date, the
+observer falls back to the original fail-closed placeholder for that date.
+Robinhood's missing same-venue EWY/USDKRW controls are recorded separately
+and remain a fail-closed session-invalid reason regardless of A-7. Collection
+can begin, but rows carrying any session-invalid reason must not be counted
+as valid Phase 0A samples yet.
 """
 
 from __future__ import annotations
@@ -820,6 +827,7 @@ class AppConfig:
     api_schema_version: str
     database_dir: Path
     health_file: Path
+    trading_calendar_file: Path | None
     metrics_host: str
     metrics_port: int
     top_levels: int
@@ -879,6 +887,7 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         api_schema_version=str(raw["api_schema_version"]),
         database_dir=Path(raw["database_dir"]),
         health_file=Path(raw["health_file"]),
+        trading_calendar_file=Path(raw["trading_calendar_file"]) if raw.get("trading_calendar_file") else None,
         metrics_host=host,
         metrics_port=int(port_text),
         top_levels=int(raw["top_levels"]),
@@ -890,6 +899,39 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         db_flush_interval_ms=int(raw["db_flush_interval_ms"]),
         venues=tuple(venues),
     )
+
+
+@dataclass(frozen=True)
+class TradingCalendar:
+    """Frozen KRX/US cash-market session table (A-7).
+
+    Loaded once from a static JSON artifact produced offline by
+    scripts/engine_b_trading_calendar_freeze.py. This module never imports a
+    calendar library itself: `load` only ever calls stdlib `json`, and any
+    failure to load or parse the file degrades to `None` (fail-closed,
+    A-7-unresolved for every date) rather than raising, since a calendar
+    load problem must not take down the observer.
+    """
+
+    calendar_version: str
+    sessions: dict[str, dict[str, Any]]
+
+    @classmethod
+    def load(cls, path: Path) -> "TradingCalendar | None":
+        try:
+            raw = json.loads(path.read_bytes())
+            calendar_version = str(raw["calendar_version"])
+            sessions = dict(raw["sessions"])
+            for entry in sessions.values():
+                if not isinstance(entry["krx_is_open"], bool) or not isinstance(entry["us_is_open"], bool):
+                    raise TypeError("session entry krx_is_open/us_is_open must be bool")
+            return cls(calendar_version=calendar_version, sessions=sessions)
+        except (OSError, ValueError, KeyError, TypeError):
+            LOG.exception("Failed to load trading calendar from %s; A-7 remains unresolved", path)
+            return None
+
+    def resolve(self, session_date: date) -> dict[str, Any] | None:
+        return self.sessions.get(session_date.isoformat())
 
 
 @dataclass
@@ -3097,6 +3139,13 @@ class Collector:
         self.books: dict[tuple[str, int], BookState] = {}
         self.local_sequences: defaultdict[tuple[str, str, int], int] = defaultdict(int)
         self.last_health_error: str | None = None
+        self.trading_calendar = (
+            TradingCalendar.load(config.trading_calendar_file)
+            if config.trading_calendar_file is not None
+            else None
+        )
+        if self.trading_calendar is None:
+            LOG.warning("A-7 trading calendar not loaded; session rows remain fail-closed")
 
     def request_stop(self) -> None:
         self.stop_event.set()
@@ -3656,11 +3705,27 @@ class Collector:
                 for symbol in venue.known_missing_symbols
             }
         )
-        reasons = ["A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR"]
+
+        resolved = self.trading_calendar.resolve(session_date) if self.trading_calendar else None
+        reasons: list[str] = []
+        if resolved is None:
+            krx_is_open = 0
+            us_cash_is_open = 0
+            calendar_version = "UNRESOLVED_A7_zoneinfo_only"
+            reasons.append("A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR")
+            if session_date.weekday() >= 5:
+                reasons.append("PROVISIONAL_WEEKEND")
+        else:
+            krx_is_open = 1 if resolved["krx_is_open"] else 0
+            us_cash_is_open = 1 if resolved["us_is_open"] else 0
+            calendar_version = self.trading_calendar.calendar_version
+            if not resolved["krx_is_open"]:
+                reasons.append("KRX_CLOSED")
+            if not resolved["us_is_open"]:
+                reasons.append("US_CASH_CLOSED")
         if missing:
             reasons.append("SAME_VENUE_REQUIRED_SYMBOLS_MISSING=" + ",".join(missing))
-        if session_date.weekday() >= 5:
-            reasons.append("PROVISIONAL_WEEKEND")
+
         await self.sink.put(
             "session",
             {
@@ -3670,10 +3735,10 @@ class Collector:
                 "t0_us": int(t0.timestamp() * 1_000_000),
                 "t1_us": int(t1.timestamp() * 1_000_000),
                 "t2_us": int(t2_ny.astimezone(UTC).timestamp() * 1_000_000),
-                "krx_is_open": 0,
-                "us_cash_is_open": 0,
-                "calendar_version": "UNRESOLVED_A7_zoneinfo_only",
-                "validity_reason": ";".join(reasons),
+                "krx_is_open": krx_is_open,
+                "us_cash_is_open": us_cash_is_open,
+                "calendar_version": calendar_version,
+                "validity_reason": ";".join(reasons) if reasons else None,
             },
         )
 
@@ -3692,6 +3757,10 @@ class Collector:
 
     def health_payload(self) -> dict[str, Any]:
         current_us = now_us()
+        blockers = []
+        if self.trading_calendar is None:
+            blockers.append("A7 verified KRX/US calendar unresolved")
+        blockers.append("Robinhood Lighter lacks same-venue EWY and USDKRW")
         return {
             "timestamp": datetime.now(UTC).isoformat(),
             "phase": "0A_observer",
@@ -3712,10 +3781,10 @@ class Collector:
                 for venue in self.config.venues
             },
             "phase0_sample_eligible": False,
-            "phase0_sample_blockers": [
-                "A7 verified KRX/US calendar unresolved",
-                "Robinhood Lighter lacks same-venue EWY and USDKRW",
-            ],
+            "phase0_sample_blockers": blockers,
+            "trading_calendar_version": (
+                self.trading_calendar.calendar_version if self.trading_calendar else None
+            ),
             "last_health_error": self.last_health_error,
         }
 

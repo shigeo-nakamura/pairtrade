@@ -1,0 +1,4 @@
+# Offline-only: never installed on the Phase 0 observer host. Used solely by
+# scripts/engine_b_trading_calendar_freeze.py to (re)generate
+# configs/engine-b/trading_calendar.json. See that script's docstring.
+exchange_calendars==4.13.2

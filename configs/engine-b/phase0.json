@@ -1,9 +1,10 @@
 {
   "document_version": "0.3",
-  "collector_version": "phase0a-observer-v1",
+  "collector_version": "phase0a-observer-v2",
   "api_schema_version": "lighter-public-api-2026-08",
   "database_dir": "/var/lib/engine-b-phase0/data",
   "health_file": "/run/engine-b-phase0/status.json",
+  "trading_calendar_file": "/opt/engine-b-phase0/trading_calendar.json",
   "metrics_listen": "127.0.0.1:9472",
   "top_levels": 5,
   "reconstructed_snapshot_interval_ms": 1000,

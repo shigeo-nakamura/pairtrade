@@ -23,10 +23,58 @@ The observer collects two explicitly labelled venues:
   including `EWY` and `USDKRW`.
 
 Do not combine the two venues into a v0.3 primary regression without a new,
-reviewed analysis-plan version. Until A-7 has a verified KRX/US market calendar
-and Robinhood's same-venue control gap is resolved, `trading_session` rows are
-written fail-closed with `krx_is_open=0`, `us_cash_is_open=0`, and must not be
-counted as valid Phase 0A samples.
+reviewed analysis-plan version. A-7 (the verified KRX/US market calendar) is
+resolved via the frozen calendar described below, but Robinhood's same-venue
+control gap (missing `EWY`/`USDKRW`) is not: every `trading_session` row still
+carries `SAME_VENUE_REQUIRED_SYMBOLS_MISSING=robinhood:EWY,robinhood:USDKRW`
+in `validity_reason` and must not be counted as a valid Phase 0A sample until
+that gap closes too.
+
+## A-7: KRX/US cash-market trading calendar
+
+`krx_is_open`/`us_cash_is_open` in `trading_session` come from a frozen,
+pre-computed session table -- `configs/engine-b/trading_calendar.json` --
+generated offline by `scripts/engine_b_trading_calendar_freeze.py` from the
+`exchange_calendars` library (`XKRX` for Korea, `XNYS` for the US cash
+market; pinned in `scripts/engine_b_trading_calendar_freeze_requirements.txt`).
+The observer itself never imports a calendar library: it loads this JSON with
+stdlib `json` at startup (`TradingCalendar.load`) and looks up each date by
+ISO string. `Collector.health_payload()["trading_calendar_version"]` reports
+the loaded `calendar_version`, or `null` if no calendar loaded.
+
+If the frozen file is missing, unreadable, or a queried date falls outside
+its committed `range`, the observer falls back to the original fail-closed
+placeholder for that date only (`krx_is_open=0`, `us_cash_is_open=0`,
+`calendar_version=UNRESOLVED_A7_zoneinfo_only`,
+`validity_reason` includes `A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR`) --
+never a crash.
+
+KRX observes no DST (`Asia/Seoul` is a fixed UTC+9), so its session hours are
+stable; the US cash market's `America/New_York` session shifts by an hour
+across the EDT/EST boundary, which `exchange_calendars` resolves correctly
+from the IANA tzdb without any special-casing here.
+
+**Re-freezing** (extend the covered date range, pick up an
+`exchange_calendars` release, or after cross-checking a specific year against
+KRX's own published holiday notice -- rule-based generation can miss one-off
+administrative holidays):
+
+```bash
+python3 -m venv /tmp/calendar-freeze-venv
+/tmp/calendar-freeze-venv/bin/pip install -r scripts/engine_b_trading_calendar_freeze_requirements.txt
+/tmp/calendar-freeze-venv/bin/python scripts/engine_b_trading_calendar_freeze.py \
+  --start 2026-01-01 --end 2027-12-31 \
+  --out configs/engine-b/trading_calendar.json
+```
+
+Review the diff, then commit it together with the code/requirements change
+that motivated it. CI ("Verify Engine B trading calendar freeze") regenerates
+the artifact from its own committed `range` and diffs it byte-for-byte
+against the committed file, so a hand-edit or an un-recommitted
+`exchange_calendars` bump fails the build. `install_engine_b_phase0.sh`
+installs it read-only alongside `phase0.json`
+(`$INSTALL_DIR/trading_calendar.json`, mode 0440); the deploy workflow ships
+it through the same S3 release prefix as the rest of the Phase 0 release.
 
 ## Host and service
 
