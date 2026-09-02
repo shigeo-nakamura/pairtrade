@@ -1,0 +1,1042 @@
+//! Engine B live experiment binary (bot-strategy#866, KR-US memory-stock
+//! lead-lag) — PROTOTYPE, minimal-notional infrastructure smoke test.
+//!
+//! This is NOT the validated Phase 1/2 implementation the requirements
+//! doc (`engine_b_requirements_0.3.md`) describes. The user explicitly
+//! chose, on 2026-09-02, to skip Phase 0A/0B (statistical validation of
+//! the H1 hypothesis) and Phase 1 (paper trading) to reach a live trade
+//! by 2026-09-10 — see bot-strategy#866's "方針転換の記録" comment. This
+//! binary places real orders with an unvalidated signal on a minimal
+//! notional ($100/trade, 2x leverage, $1000 account equity) specifically
+//! to smoke-test the infrastructure (calendar timing, order placement,
+//! KMS credentials, risk rails), not to validate the trading strategy.
+//!
+//! Standalone binary, NOT part of the pairtrade `strategies:` engine, for
+//! the same reason bot-strategy#816's `robinhood_dipgrid.rs` is standalone:
+//! Engine B is single-symbol / once-daily discrete-signal / fixed-window
+//! exit, architecturally incompatible with pairtrade's two-leg continuous
+//! spread engine (bot-strategy#866 architecture decision). Reuses
+//! `dex-connector` wiring via `DexConnectorBox`, but re-implements the
+//! on-disk KILL_SWITCH / RISK_ACK / atomic-state-write conventions
+//! independently (pairtrade's `risk_io`/`status` modules are private to
+//! the `pairtrade` module tree, not reachable from `src/bin/`) — same
+//! reasoning and pattern as `robinhood_dipgrid.rs`.
+//!
+//! ## Strategy shape
+//!
+//! H1: the KR-session residual (KR primary return not explained by the
+//! concurrent US primary return) predicts the KRX-close -> US-cash-open
+//! forward return on the US primary. The *traded* instrument is the US
+//! primary symbol only (a directional bet on its forward return) — this
+//! is not a pair/spread trade.
+//!
+//! `t0` = KRX cash open, `t1` = KRX cash close, `t2` = US cash open (all
+//! from the frozen calendar produced by `scripts/engine_b_trading_calendar_freeze.py`,
+//! same file the Python Phase 0 observer uses — this binary reads that
+//! JSON directly rather than recomputing calendar logic in Rust).
+//!
+//! Each day: capture the KR/US primary mid price at/after `t0` and again
+//! at/after `t1`; compute `epsilon = ln(kr_t1/kr_t0) - ln(us_t1/us_t0)`
+//! (`signal_model = "diff"`, the only model implemented in this prototype
+//! -- see KNOWN GAPS). If `|epsilon| >= epsilon_threshold`, enter within
+//! `t1 .. t1 + entry_deadline_secs` in the direction `sign(epsilon) *
+//! direction_multiplier`. Exit (reduce-only) within `t2 .. t2 +
+//! exit_deadline_secs`.
+//!
+//! ## KNOWN GAPS before any live use (see bot-strategy#866, #872-879)
+//!
+//! - `signal_model = "diff"` is a two-term placeholder for the
+//!   requirements doc's 5-coefficient regression (`R_kr = a + b1*R_us +
+//!   b2*R_soxl + b3*R_nvda + b4*R_ewy + b5*R_fx + e`, §4.5.3). SOXL/NVDA/
+//!   EWY/USDKRW are subscribed and their prices tracked (for a future
+//!   `signal_model = "regression"` implementation) but not used by "diff".
+//! - `epsilon_threshold` and `direction_multiplier` are operator-supplied
+//!   guesses, not fit/frozen from Phase 0A data (that data does not exist
+//!   yet at any meaningful sample size) -- see bot-strategy#872.
+//! - Entry/exit price is the WS mid at/after the boundary, not a full
+//!   top-5-depth VWAP walk (requirements doc §4.5.2's `P_exec_entry`/
+//!   `P_exec_exit`). No slippage/partial-fill modeling beyond what
+//!   `create_order(price=None)` (Lighter-native IOC + 20% protection
+//!   price) already gives.
+//! - No out-of-sample validation (Phase 0B) or paper-trade rehearsal
+//!   (Phase 1) of this code before it places real orders.
+//! - KR/US primary symbols and `epsilon_threshold` are operator config,
+//!   not the data-driven freeze bot-strategy#872 will eventually produce.
+//! - `OpenPosition` (the in-flight entry/exit state) is in-memory only,
+//!   not persisted to `state_path` -- a crash or restart between entry and
+//!   exit loses track of the open position in this process's own state.
+//!   `RiskState.last_session_date` prevents re-entering a day already
+//!   acted on, but does not resume tracking an existing position for its
+//!   scheduled exit. After any restart, check the real Lighter account
+//!   position directly rather than trusting this process's state file.
+//! - No SIGTERM-graceful-close handling: `systemctl stop` does not
+//!   reduce-only-close an open position.
+//!
+//! DRY_RUN must stay on until a human explicitly flips the `refuse_live`
+//! gate below (mirrors `robinhood_dipgrid.rs`'s pattern: flipping
+//! `ENGINE_B_LIVE_DRY_RUN=false` alone is not enough).
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use debot::trade::execution::dex_connector_box::DexConnectorBox;
+use dex_connector::{DexConnector, OrderSide, PriceUpdate};
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn init_logger() {
+    let offset_seconds = std::env::var("TIMEZONE_OFFSET")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse::<i32>()
+        .unwrap_or(0);
+    let offset = FixedOffset::east_opt(offset_seconds).unwrap_or(FixedOffset::east_opt(0).unwrap());
+    let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
+    env_logger::Builder::from_env(env)
+        .format(move |buf, record| {
+            let utc_now: DateTime<Utc> = Utc::now();
+            let local_now = utc_now.with_timezone(&offset);
+            writeln!(
+                buf,
+                "{} [{}] - {}",
+                local_now.format("%Y-%m-%dT%H:%M:%S%z"),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+}
+
+fn now_us() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+}
+
+// ---------------------------------------------------------------------
+// Trading calendar (reads the SAME frozen JSON the Python Phase 0
+// observer uses; see scripts/engine_b_trading_calendar_freeze.py and
+// TradingCalendar.load() in scripts/engine_b_phase0.py -- calendar logic
+// lives in exactly one place, not duplicated here).
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize, Debug, Clone)]
+struct SessionEntry {
+    krx_is_open: bool,
+    krx_open_utc_us: Option<i64>,
+    krx_close_utc_us: Option<i64>,
+    us_is_open: bool,
+    us_open_utc_us: Option<i64>,
+}
+
+#[derive(Deserialize, Debug)]
+struct TradingCalendarDoc {
+    calendar_version: String,
+    sessions: HashMap<String, SessionEntry>,
+}
+
+struct TradingCalendar {
+    calendar_version: String,
+    sessions: HashMap<String, SessionEntry>,
+}
+
+impl TradingCalendar {
+    fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading trading calendar {}", path.display()))?;
+        let doc: TradingCalendarDoc =
+            serde_json::from_str(&raw).context("parsing trading calendar JSON")?;
+        for (date, entry) in &doc.sessions {
+            if entry.krx_is_open
+                && (entry.krx_open_utc_us.is_none() || entry.krx_close_utc_us.is_none())
+            {
+                anyhow::bail!("calendar entry {date} has krx_is_open=true but missing open/close");
+            }
+            if entry.us_is_open && entry.us_open_utc_us.is_none() {
+                anyhow::bail!("calendar entry {date} has us_is_open=true but missing us_open");
+            }
+        }
+        Ok(TradingCalendar {
+            calendar_version: doc.calendar_version,
+            sessions: doc.sessions,
+        })
+    }
+
+    fn resolve(&self, date: NaiveDate) -> Option<&SessionEntry> {
+        self.sessions.get(&date.format("%Y-%m-%d").to_string())
+    }
+}
+
+/// Today's t0/t1/t2 in UTC microseconds, only if both markets are open.
+fn resolve_session_window(calendar: &TradingCalendar, date: NaiveDate) -> Option<(i64, i64, i64)> {
+    let entry = calendar.resolve(date)?;
+    if !entry.krx_is_open || !entry.us_is_open {
+        return None;
+    }
+    Some((
+        entry.krx_open_utc_us?,
+        entry.krx_close_utc_us?,
+        entry.us_open_utc_us?,
+    ))
+}
+
+// ---------------------------------------------------------------------
+// Signal
+// ---------------------------------------------------------------------
+
+/// `signal_model = "diff"`: epsilon = ln(kr_t1/kr_t0) - ln(us_t1/us_t0).
+/// Returns `None` (never trades) for any other `signal_model` value, a
+/// missing price for either symbol at either timestamp, or a non-positive
+/// price. Free function (no engine/connector dependency) so it is
+/// directly unit-testable.
+fn compute_epsilon(
+    signal_model: &str,
+    kr_symbol: &str,
+    us_symbol: &str,
+    t0: &HashMap<String, f64>,
+    t1: &HashMap<String, f64>,
+) -> Option<f64> {
+    if signal_model != "diff" {
+        log::error!(
+            "[SIGNAL] signal_model={signal_model} not implemented in this prototype -- refusing to trade"
+        );
+        return None;
+    }
+    let kr0 = *t0.get(kr_symbol)?;
+    let kr1 = *t1.get(kr_symbol)?;
+    let us0 = *t0.get(us_symbol)?;
+    let us1 = *t1.get(us_symbol)?;
+    if kr0 <= 0.0 || kr1 <= 0.0 || us0 <= 0.0 || us1 <= 0.0 {
+        return None;
+    }
+    Some((kr1 / kr0).ln() - (us1 / us0).ln())
+}
+
+// ---------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct EngineBLiveConfig {
+    instance_id: String,
+    dry_run: bool,
+    kr_primary_symbol: String,
+    us_primary_symbol: String,
+    control_symbols: Vec<String>,
+    lot_usd: f64,
+    leverage: u32,
+    epsilon_threshold: f64,
+    direction_multiplier: f64,
+    signal_model: String,
+    entry_deadline_secs: i64,
+    exit_deadline_secs: i64,
+    equity_usd_reference: f64,
+    max_session_loss_bps: f64,
+    trading_calendar_path: PathBuf,
+    kill_switch_path: PathBuf,
+    risk_ack_path: PathBuf,
+    state_path: PathBuf,
+    status_path: PathBuf,
+    pnl_log_path: PathBuf,
+}
+
+fn env_string(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(default)
+}
+
+fn env_symbol_list(name: &str, default: &[&str]) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|| default.iter().map(|s| s.to_string()).collect())
+}
+
+impl EngineBLiveConfig {
+    fn from_env() -> Self {
+        let instance_id = env_string("ENGINE_B_LIVE_INSTANCE_ID", "engine-b-live");
+        // Two distinct roots, matching engine-b-phase0's split: CODE_DIR is
+        // root-owned/read-only (binary, trading_calendar.json, shipped by
+        // the installer); STATE_DIR is this process's own writable area
+        // (systemd StateDirectory=, /var/lib/... by convention). Mixing
+        // writable state into the read-only code dir would force
+        // ProtectSystem=full instead of the tighter =strict.
+        let code_dir = env_string("ENGINE_B_LIVE_CODE_DIR", "/opt/engine-b-live");
+        let base_dir = env_string("ENGINE_B_LIVE_BASE_DIR", "/var/lib/engine-b-live");
+        EngineBLiveConfig {
+            dry_run: env_bool("ENGINE_B_LIVE_DRY_RUN", true),
+            kr_primary_symbol: env_string("ENGINE_B_LIVE_KR_PRIMARY", "SKHY"),
+            us_primary_symbol: env_string("ENGINE_B_LIVE_US_PRIMARY", "SNDK"),
+            control_symbols: env_symbol_list(
+                "ENGINE_B_LIVE_CONTROL_SYMBOLS",
+                &["SOXL", "NVDA", "EWY", "USDKRW"],
+            ),
+            lot_usd: env_f64("ENGINE_B_LIVE_LOT_USD", 100.0),
+            leverage: env_u32("ENGINE_B_LIVE_LEVERAGE", 2),
+            epsilon_threshold: env_f64("ENGINE_B_LIVE_EPSILON_THRESHOLD", 0.003),
+            direction_multiplier: env_f64("ENGINE_B_LIVE_DIRECTION_MULTIPLIER", 1.0),
+            signal_model: env_string("ENGINE_B_LIVE_SIGNAL_MODEL", "diff"),
+            entry_deadline_secs: env_i64("ENGINE_B_LIVE_ENTRY_DEADLINE_SECS", 180),
+            exit_deadline_secs: env_i64("ENGINE_B_LIVE_EXIT_DEADLINE_SECS", 900),
+            equity_usd_reference: env_f64("ENGINE_B_LIVE_EQUITY_USD_REFERENCE", 1000.0),
+            max_session_loss_bps: env_f64("ENGINE_B_LIVE_MAX_SESSION_LOSS_BPS", 500.0),
+            trading_calendar_path: PathBuf::from(env_string(
+                "ENGINE_B_LIVE_TRADING_CALENDAR_PATH",
+                &format!("{code_dir}/trading_calendar.json"),
+            )),
+            kill_switch_path: PathBuf::from(env_string(
+                "ENGINE_B_LIVE_KILL_SWITCH_PATH",
+                &format!("{base_dir}/KILL_SWITCH"),
+            )),
+            risk_ack_path: PathBuf::from(env_string(
+                "ENGINE_B_LIVE_RISK_ACK_PATH",
+                &format!("{base_dir}/RISK_ACK_{}", instance_id.to_uppercase()),
+            )),
+            state_path: PathBuf::from(env_string(
+                "ENGINE_B_LIVE_STATE_PATH",
+                &format!("{base_dir}/risk_state.json"),
+            )),
+            status_path: PathBuf::from(env_string(
+                "ENGINE_B_LIVE_STATUS_PATH",
+                &format!("{base_dir}/status.json"),
+            )),
+            pnl_log_path: PathBuf::from(env_string(
+                "ENGINE_B_LIVE_PNL_LOG_PATH",
+                &format!("{base_dir}/pnl.jsonl"),
+            )),
+            instance_id,
+        }
+    }
+
+    /// All symbols this process needs price updates for.
+    fn all_symbols(&self) -> Vec<String> {
+        let mut symbols = vec![self.kr_primary_symbol.clone(), self.us_primary_symbol.clone()];
+        symbols.extend(self.control_symbols.iter().cloned());
+        symbols
+    }
+
+    /// Hard notional cap derived from equity * leverage, independent of
+    /// `lot_usd` misconfiguration -- mirrors pairtrade's
+    /// `sizing.rs::cap_leg_notional` formula (equity * max_leverage *
+    /// headroom). This is the last line of defense against a config typo
+    /// sending an oversized order, not a substitute for getting
+    /// `lot_usd`/`leverage` right in the first place.
+    fn max_notional_usd(&self) -> f64 {
+        self.equity_usd_reference * self.leverage as f64 * 0.9
+    }
+}
+
+// ---------------------------------------------------------------------
+// Risk state (same on-disk pattern as robinhood_dipgrid.rs: atomic
+// tmp+rename JSON, sticky halt cleared only by RISK_ACK)
+// ---------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+struct RiskState {
+    #[serde(default)]
+    session_start_equity: f64,
+    #[serde(default)]
+    peak_equity: f64,
+    #[serde(default)]
+    realized_pnl_session: f64,
+    #[serde(default)]
+    total_trades: u64,
+    #[serde(default)]
+    total_wins: u64,
+    #[serde(default)]
+    max_dd_bps: f64,
+    #[serde(default)]
+    session_halted: bool,
+    #[serde(default)]
+    session_halt_reason: Option<String>,
+    /// UTC date (YYYY-MM-DD) of the last session this process has already
+    /// acted on (entered, or explicitly skipped), so a restart mid-day
+    /// never re-evaluates a boundary it already passed.
+    #[serde(default)]
+    last_session_date: Option<String>,
+}
+
+fn load_state(path: &Path) -> RiskState {
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => RiskState::default(),
+    }
+}
+
+fn atomic_write_json(path: &Path, value: &impl Serialize) {
+    let Ok(json) = serde_json::to_string_pretty(value) else {
+        log::warn!("[STATE] serialize failed for {}", path.display());
+        return;
+    };
+    let Some(dir) = path.parent() else { return };
+    let tmp = dir.join(format!(
+        ".{}.tmp.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    } else {
+        log::warn!("[STATE] write failed for {}", path.display());
+    }
+}
+
+fn append_pnl_log(path: &Path, record: &serde_json::Value) {
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        log::warn!("[PNL_LOG] open failed: {}", path.display());
+        return;
+    };
+    let _ = writeln!(f, "{record}");
+}
+
+// ---------------------------------------------------------------------
+// Day-scoped state machine
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct OpenPosition {
+    side: OrderSide,
+    entry_price: f64,
+    size: f64,
+    entered_at_us: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DaySnapshot {
+    t0_prices: Option<HashMap<String, f64>>,
+    t1_prices: Option<HashMap<String, f64>>,
+    entered: bool,
+    exited: bool,
+}
+
+struct EngineBLiveEngine {
+    cfg: EngineBLiveConfig,
+    connector: std::sync::Arc<dyn DexConnector + Send + Sync>,
+    calendar: TradingCalendar,
+    latest_price: HashMap<String, f64>,
+    current_date: Option<NaiveDate>,
+    window: Option<(i64, i64, i64)>, // (t0, t1, t2) us epoch for current_date
+    day: DaySnapshot,
+    position: Option<OpenPosition>,
+    state: RiskState,
+    last_status_write_us: i64,
+}
+
+impl EngineBLiveEngine {
+    fn kill_switch_engaged(&self) -> bool {
+        self.cfg.kill_switch_path.exists()
+    }
+
+    fn maybe_clear_halt(&mut self) {
+        if self.state.session_halted && self.cfg.risk_ack_path.exists() {
+            log::warn!(
+                "[RISK_ACK] clearing session halt (reason was: {:?}) via {}",
+                self.state.session_halt_reason,
+                self.cfg.risk_ack_path.display()
+            );
+            self.state.session_halted = false;
+            self.state.session_halt_reason = None;
+            self.state.peak_equity = self.state.session_start_equity + self.state.realized_pnl_session;
+            atomic_write_json(&self.cfg.state_path, &self.state);
+            if let Err(e) = std::fs::remove_file(&self.cfg.risk_ack_path) {
+                log::warn!(
+                    "[RISK_ACK] failed to remove {} after ack: {e:?}",
+                    self.cfg.risk_ack_path.display()
+                );
+            }
+        }
+    }
+
+    fn entries_allowed(&self) -> bool {
+        !self.kill_switch_engaged() && !self.state.session_halted
+    }
+
+    /// Roll to a new UTC date's session window if the wall-clock date has
+    /// advanced. A restart mid-day resumes the same date's DaySnapshot
+    /// from scratch (in-memory only -- position/entry state does not
+    /// survive a restart in this prototype; see KNOWN GAPS) but will not
+    /// re-enter if `state.last_session_date` already covers today.
+    fn roll_day_if_needed(&mut self, now_us: i64) {
+        let today = DateTime::<Utc>::from_timestamp_micros(now_us)
+            .expect("valid timestamp")
+            .date_naive();
+        if self.current_date == Some(today) {
+            return;
+        }
+        self.current_date = Some(today);
+        self.day = DaySnapshot::default();
+        self.window = resolve_session_window(&self.calendar, today);
+        match self.window {
+            Some((t0, t1, t2)) => log::info!(
+                "[DAY] {today} calendar_version={} t0={t0} t1={t1} t2={t2}",
+                self.calendar.calendar_version
+            ),
+            None => log::info!(
+                "[DAY] {today} skipped: KRX and/or US cash market closed (calendar_version={})",
+                self.calendar.calendar_version
+            ),
+        }
+        if self.state.last_session_date.as_deref() == Some(&today.to_string()) {
+            log::info!("[DAY] {today} already acted on before a restart; not re-entering");
+            self.day.entered = true;
+        }
+    }
+
+    fn snapshot_prices(&self) -> HashMap<String, f64> {
+        self.latest_price.clone()
+    }
+
+    async fn submit_order(&self, side: OrderSide, size: f64, reduce_only: bool) -> Result<Decimal> {
+        let size_dec = Decimal::from_str(&format!("{size:.8}")).context("size to Decimal")?;
+        if self.cfg.dry_run {
+            log::info!(
+                "[DRY_RUN] would submit {side} size={size_dec} reduce_only={reduce_only} symbol={}",
+                self.cfg.us_primary_symbol
+            );
+            return Ok(size_dec);
+        }
+        let resp = self
+            .connector
+            .create_order(
+                &self.cfg.us_primary_symbol,
+                size_dec,
+                side,
+                None,
+                None,
+                reduce_only,
+                None,
+            )
+            .await
+            .context("create_order failed")?;
+        resp.ordered_size
+            .to_f64()
+            .map(|f| Decimal::from_str(&format!("{f:.8}")).unwrap_or(size_dec))
+            .ok_or_else(|| anyhow::anyhow!("ordered_size not representable"))
+    }
+
+    async fn maybe_enter(&mut self, now_us: i64) {
+        let Some((t0, t1, _t2)) = self.window else { return };
+        if self.day.entered || now_us < t1 {
+            return;
+        }
+        if now_us > t1 + self.cfg.entry_deadline_secs * 1_000_000 {
+            if !self.day.entered {
+                log::warn!("[ENTRY] entry_deadline passed without a valid signal; skipping today");
+                self.day.entered = true; // don't keep re-evaluating
+                self.state.last_session_date = self.current_date.map(|d| d.to_string());
+                atomic_write_json(&self.cfg.state_path, &self.state);
+            }
+            return;
+        }
+        if self.day.t0_prices.is_none() && now_us >= t0 {
+            self.day.t0_prices = Some(self.snapshot_prices());
+        }
+        if self.day.t1_prices.is_none() {
+            self.day.t1_prices = Some(self.snapshot_prices());
+        }
+        let (Some(t0_prices), Some(t1_prices)) = (&self.day.t0_prices, &self.day.t1_prices) else {
+            return;
+        };
+        let Some(epsilon) = compute_epsilon(
+            &self.cfg.signal_model,
+            &self.cfg.kr_primary_symbol,
+            &self.cfg.us_primary_symbol,
+            t0_prices,
+            t1_prices,
+        ) else {
+            return;
+        };
+        if epsilon.abs() < self.cfg.epsilon_threshold {
+            log::info!(
+                "[SIGNAL] |epsilon|={:.5} < threshold={:.5}; no entry today",
+                epsilon.abs(),
+                self.cfg.epsilon_threshold
+            );
+            self.day.entered = true;
+            self.state.last_session_date = self.current_date.map(|d| d.to_string());
+            atomic_write_json(&self.cfg.state_path, &self.state);
+            return;
+        }
+        if !self.entries_allowed() {
+            log::warn!("[ENTRY] signal fired but entries blocked (kill_switch or session halt)");
+            return;
+        }
+        let predicted_direction = epsilon.signum() * self.cfg.direction_multiplier.signum();
+        let side = if predicted_direction >= 0.0 { OrderSide::Long } else { OrderSide::Short };
+        let Some(price) = self.latest_price.get(&self.cfg.us_primary_symbol).copied() else {
+            log::error!("[ENTRY] no current price for {}; cannot size order", self.cfg.us_primary_symbol);
+            return;
+        };
+        if price <= 0.0 {
+            return;
+        }
+        let notional_usd = self.cfg.lot_usd.min(self.cfg.max_notional_usd());
+        if notional_usd < self.cfg.lot_usd {
+            log::warn!(
+                "[RISK_NOTIONAL_CAP] clamped lot ${:.0} -> ${:.0} (equity=${:.0} leverage={})",
+                self.cfg.lot_usd,
+                notional_usd,
+                self.cfg.equity_usd_reference,
+                self.cfg.leverage
+            );
+        }
+        let size = notional_usd / price;
+
+        if !self.cfg.dry_run {
+            if let Err(e) = self.connector.set_leverage(&self.cfg.us_primary_symbol, self.cfg.leverage).await {
+                log::error!("[ENTRY] set_leverage failed: {e:?}");
+                return;
+            }
+        }
+        match self.submit_order(side, size, false).await {
+            Ok(filled) => {
+                let filled_f = filled.to_f64().unwrap_or(size);
+                self.position = Some(OpenPosition {
+                    side,
+                    entry_price: price,
+                    size: filled_f,
+                    entered_at_us: now_us,
+                });
+                self.day.entered = true;
+                log::info!(
+                    "[ENTRY] side={side} epsilon={epsilon:.5} price={price:.4} notional=${notional_usd:.0} size={filled_f:.6}"
+                );
+                send_notification(
+                    &format!("Engine B ENTRY {} {}", self.cfg.us_primary_symbol, side),
+                    &format!(
+                        "epsilon={epsilon:.5} threshold={:.5} price={price:.4} notional=${notional_usd:.0} dry_run={}",
+                        self.cfg.epsilon_threshold, self.cfg.dry_run
+                    ),
+                );
+            }
+            Err(e) => log::error!("[ENTRY] order failed: {e:?}"),
+        }
+    }
+
+    async fn maybe_exit(&mut self, now_us: i64) {
+        let Some((_t0, _t1, t2)) = self.window else { return };
+        let Some(pos) = self.position.clone() else { return };
+        if self.day.exited || now_us < t2 {
+            return;
+        }
+        let emergency = now_us > t2 + self.cfg.exit_deadline_secs * 1_000_000;
+        if emergency {
+            log::warn!("[EXIT] exit_deadline passed; forcing emergency close");
+        }
+        let Some(price) = self.latest_price.get(&self.cfg.us_primary_symbol).copied() else {
+            return;
+        };
+        let exit_side = match pos.side {
+            OrderSide::Long => OrderSide::Short,
+            OrderSide::Short => OrderSide::Long,
+        };
+        match self.submit_order(exit_side, pos.size, true).await {
+            Ok(_) => self.on_exit(price, now_us),
+            Err(e) => log::error!("[EXIT] order failed, position still open: {e:?}"),
+        }
+    }
+
+    fn on_exit(&mut self, exit_price: f64, now_us: i64) {
+        let Some(pos) = self.position.take() else { return };
+        let sign = match pos.side {
+            OrderSide::Long => 1.0,
+            OrderSide::Short => -1.0,
+        };
+        let pnl = sign * (exit_price - pos.entry_price) * pos.size;
+        log::info!(
+            "[EXIT] side={} entry={:.4} exit={:.4} size={:.6} pnl=${:.2} held={}s",
+            pos.side,
+            pos.entry_price,
+            exit_price,
+            pos.size,
+            pnl,
+            (now_us - pos.entered_at_us) / 1_000_000
+        );
+
+        self.state.realized_pnl_session += pnl;
+        self.state.total_trades += 1;
+        if pnl > 0.0 {
+            self.state.total_wins += 1;
+        }
+        let current_equity = self.state.session_start_equity + self.state.realized_pnl_session;
+        if current_equity > self.state.peak_equity {
+            self.state.peak_equity = current_equity;
+        }
+        let dd_bps = if self.state.peak_equity > 0.0 {
+            (self.state.peak_equity - current_equity) / self.state.peak_equity * 10_000.0
+        } else {
+            0.0
+        };
+        if dd_bps > self.state.max_dd_bps {
+            self.state.max_dd_bps = dd_bps;
+        }
+        if dd_bps >= self.cfg.max_session_loss_bps && !self.state.session_halted {
+            self.state.session_halted = true;
+            self.state.session_halt_reason = Some(format!("session_dd_{dd_bps:.0}bps"));
+            log::warn!(
+                "[SESSION_DD] halt engaged: dd={:.0}bps >= {:.0}bps threshold -- clear via RISK_ACK at {}",
+                dd_bps,
+                self.cfg.max_session_loss_bps,
+                self.cfg.risk_ack_path.display()
+            );
+        }
+        self.day.exited = true;
+        self.state.last_session_date = self.current_date.map(|d| d.to_string());
+        atomic_write_json(&self.cfg.state_path, &self.state);
+
+        append_pnl_log(
+            &self.cfg.pnl_log_path,
+            &serde_json::json!({
+                "ts_us": now_us,
+                "instance_id": self.cfg.instance_id,
+                "symbol": self.cfg.us_primary_symbol,
+                "side": pos.side.to_string(),
+                "entry_price": pos.entry_price,
+                "exit_price": exit_price,
+                "size": pos.size,
+                "pnl_usd": pnl,
+                "held_secs": (now_us - pos.entered_at_us) / 1_000_000,
+                "dry_run": self.cfg.dry_run,
+            }),
+        );
+        send_notification(
+            &format!("Engine B EXIT {} pnl=${pnl:.2}", self.cfg.us_primary_symbol),
+            &format!("entry={:.4} exit={exit_price:.4} size={:.6} dry_run={}", pos.entry_price, pos.size, self.cfg.dry_run),
+        );
+    }
+
+    async fn tick(&mut self) {
+        let now = now_us();
+        self.roll_day_if_needed(now);
+        self.maybe_clear_halt();
+        self.maybe_enter(now).await;
+        self.maybe_exit(now).await;
+        self.write_status_if_due(now);
+    }
+
+    fn write_status_if_due(&mut self, now_us: i64) {
+        if now_us - self.last_status_write_us < 30_000_000 {
+            return;
+        }
+        self.last_status_write_us = now_us;
+        let status = serde_json::json!({
+            "ts_us": now_us,
+            "instance_id": self.cfg.instance_id,
+            "dry_run": self.cfg.dry_run,
+            "current_date": self.current_date.map(|d| d.to_string()),
+            "window": self.window,
+            "has_position": self.position.is_some(),
+            "day_entered": self.day.entered,
+            "day_exited": self.day.exited,
+            "session_halted": self.state.session_halted,
+            "session_halt_reason": self.state.session_halt_reason,
+            "realized_pnl_session": self.state.realized_pnl_session,
+            "total_trades": self.state.total_trades,
+            "total_wins": self.state.total_wins,
+            "max_dd_bps": self.state.max_dd_bps,
+            "kill_switch": self.kill_switch_engaged(),
+            "calendar_version": self.calendar.calendar_version,
+        });
+        atomic_write_json(&self.cfg.status_path, &status);
+    }
+}
+
+/// Fire-and-forget notification via `debot::email_client::EmailClient`
+/// (`src/email_client.rs`, `pub mod` in `src/lib.rs`). `EmailClient::new()`
+/// reads `GMAIL_USER`/`GMAIL_TO` (or legacy `TO_ADDRESS`)/`GMAIL_APP_PASSWORD`
+/// from env itself and degrades to a warning-logged no-op `send()` if any
+/// are missing -- no extra handling needed here. Those env vars are
+/// already provisioned on this host for the other bots.
+fn send_notification(subject: &str, body: &str) {
+    debot::email_client::EmailClient::new().send(subject, body);
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_logger();
+    let cfg = EngineBLiveConfig::from_env();
+    log::info!(
+        "[CONFIG] instance={} dry_run={} kr_primary={} us_primary={} lot_usd=${:.0} leverage={} \
+         epsilon_threshold={:.5} direction_multiplier={} signal_model={} entry_deadline={}s exit_deadline={}s",
+        cfg.instance_id,
+        cfg.dry_run,
+        cfg.kr_primary_symbol,
+        cfg.us_primary_symbol,
+        cfg.lot_usd,
+        cfg.leverage,
+        cfg.epsilon_threshold,
+        cfg.direction_multiplier,
+        cfg.signal_model,
+        cfg.entry_deadline_secs,
+        cfg.exit_deadline_secs,
+    );
+
+    // Mirrors robinhood_dipgrid.rs's explicit live-refusal gate: flipping
+    // ENGINE_B_LIVE_DRY_RUN=false alone is not enough. This prototype has
+    // not been reviewed for live trading beyond what this session's PR
+    // review covers -- remove this bail only as a deliberate, reviewed
+    // code change once the operator has confirmed DRY_RUN behavior on the
+    // real host and is ready to go live (bot-strategy#866).
+    if !cfg.dry_run && std::env::var("ENGINE_B_LIVE_CONFIRM_LIVE").as_deref() != Ok("yes-i-mean-it") {
+        anyhow::bail!(
+            "ENGINE_B_LIVE_DRY_RUN=false requires ENGINE_B_LIVE_CONFIRM_LIVE=yes-i-mean-it as well \
+             (deliberate double confirmation before real orders go out, bot-strategy#866)"
+        );
+    }
+
+    let calendar = TradingCalendar::load(&cfg.trading_calendar_path)
+        .context("failed to load trading calendar")?;
+    log::info!("[CALENDAR] loaded calendar_version={}", calendar.calendar_version);
+
+    let symbols = cfg.all_symbols();
+    let connector = DexConnectorBox::create("lighter", cfg.dry_run, &symbols, Some(cfg.instance_id.as_str()))
+        .await
+        .context("failed to initialize connector")?;
+    connector.start().await.context("failed to start connector")?;
+    let connector: std::sync::Arc<dyn DexConnector + Send + Sync> = std::sync::Arc::new(connector);
+
+    let mut price_rx = connector
+        .subscribe_price_updates()
+        .context("subscribe_price_updates failed")?;
+
+    let mut state = load_state(&cfg.state_path);
+    if state.session_start_equity <= 0.0 {
+        state.session_start_equity = cfg.equity_usd_reference;
+        state.peak_equity = cfg.equity_usd_reference;
+    }
+    if state.session_halted {
+        log::warn!(
+            "[STARTUP] resuming with session_halted=true (reason: {:?}) -- new entries blocked until RISK_ACK at {}",
+            state.session_halt_reason,
+            cfg.risk_ack_path.display()
+        );
+    }
+
+    let mut engine = EngineBLiveEngine {
+        cfg,
+        connector,
+        calendar,
+        latest_price: HashMap::new(),
+        current_date: None,
+        window: None,
+        day: DaySnapshot::default(),
+        position: None,
+        state,
+        last_status_write_us: 0,
+    };
+
+    let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            update = price_rx.recv() => {
+                match update {
+                    Ok(PriceUpdate { symbol, mid_price, .. }) => {
+                        if let Some(price) = mid_price.to_f64() {
+                            if price > 0.0 {
+                                engine.latest_price.insert(symbol, price);
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("[WS] price feed lagged, dropped {n} updates");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        log::error!("[WS] price feed closed, exiting");
+                        break;
+                    }
+                }
+            }
+            _ = tick_interval.tick() => {
+                engine.tick().await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_config() -> EngineBLiveConfig {
+        EngineBLiveConfig {
+            instance_id: "test".to_string(),
+            dry_run: true,
+            kr_primary_symbol: "SKHY".to_string(),
+            us_primary_symbol: "SNDK".to_string(),
+            control_symbols: vec!["SOXL".to_string(), "NVDA".to_string()],
+            lot_usd: 100.0,
+            leverage: 2,
+            epsilon_threshold: 0.003,
+            direction_multiplier: 1.0,
+            signal_model: "diff".to_string(),
+            entry_deadline_secs: 180,
+            exit_deadline_secs: 900,
+            equity_usd_reference: 1000.0,
+            max_session_loss_bps: 500.0,
+            trading_calendar_path: PathBuf::from("/nonexistent"),
+            kill_switch_path: PathBuf::from("/nonexistent/KILL_SWITCH"),
+            risk_ack_path: PathBuf::from("/nonexistent/RISK_ACK"),
+            state_path: PathBuf::from("/nonexistent/state.json"),
+            status_path: PathBuf::from("/nonexistent/status.json"),
+            pnl_log_path: PathBuf::from("/nonexistent/pnl.jsonl"),
+        }
+    }
+
+    // -------------------------------------------------------------
+    // compute_epsilon
+    // -------------------------------------------------------------
+
+    #[test]
+    fn epsilon_positive_when_kr_outperforms_us() {
+        let t0 = HashMap::from([("SKHY".to_string(), 100.0), ("SNDK".to_string(), 50.0)]);
+        let t1 = HashMap::from([("SKHY".to_string(), 102.0), ("SNDK".to_string(), 50.0)]);
+        let eps = compute_epsilon("diff", "SKHY", "SNDK", &t0, &t1).unwrap();
+        assert!(eps > 0.0, "expected positive epsilon, got {eps}");
+        // ln(102/100) - ln(50/50) == ln(1.02)
+        assert!((eps - (1.02f64).ln()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn epsilon_zero_when_returns_match() {
+        let t0 = HashMap::from([("SKHY".to_string(), 100.0), ("SNDK".to_string(), 50.0)]);
+        let t1 = HashMap::from([("SKHY".to_string(), 105.0), ("SNDK".to_string(), 52.5)]);
+        let eps = compute_epsilon("diff", "SKHY", "SNDK", &t0, &t1).unwrap();
+        assert!(eps.abs() < 1e-9, "expected ~0 epsilon, got {eps}");
+    }
+
+    #[test]
+    fn epsilon_none_for_unimplemented_signal_model() {
+        let t0 = HashMap::from([("SKHY".to_string(), 100.0), ("SNDK".to_string(), 50.0)]);
+        let t1 = HashMap::from([("SKHY".to_string(), 102.0), ("SNDK".to_string(), 50.0)]);
+        assert!(compute_epsilon("regression", "SKHY", "SNDK", &t0, &t1).is_none());
+    }
+
+    #[test]
+    fn epsilon_none_when_a_symbol_price_is_missing() {
+        let t0 = HashMap::from([("SKHY".to_string(), 100.0)]);
+        let t1 = HashMap::from([("SKHY".to_string(), 102.0), ("SNDK".to_string(), 50.0)]);
+        assert!(compute_epsilon("diff", "SKHY", "SNDK", &t0, &t1).is_none());
+    }
+
+    #[test]
+    fn epsilon_none_for_non_positive_price() {
+        let t0 = HashMap::from([("SKHY".to_string(), 0.0), ("SNDK".to_string(), 50.0)]);
+        let t1 = HashMap::from([("SKHY".to_string(), 102.0), ("SNDK".to_string(), 50.0)]);
+        assert!(compute_epsilon("diff", "SKHY", "SNDK", &t0, &t1).is_none());
+    }
+
+    // -------------------------------------------------------------
+    // TradingCalendar / resolve_session_window
+    // -------------------------------------------------------------
+
+    fn fixture_calendar() -> TradingCalendar {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "2026-09-02".to_string(),
+            SessionEntry {
+                krx_is_open: true,
+                krx_open_utc_us: Some(1),
+                krx_close_utc_us: Some(2),
+                us_is_open: true,
+                us_open_utc_us: Some(3),
+            },
+        );
+        sessions.insert(
+            "2026-09-05".to_string(),
+            SessionEntry {
+                krx_is_open: false,
+                krx_open_utc_us: None,
+                krx_close_utc_us: None,
+                us_is_open: true,
+                us_open_utc_us: Some(30),
+            },
+        );
+        TradingCalendar { calendar_version: "test-v1".to_string(), sessions }
+    }
+
+    #[test]
+    fn resolve_session_window_returns_window_for_both_open() {
+        let calendar = fixture_calendar();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+        assert_eq!(resolve_session_window(&calendar, date), Some((1, 2, 3)));
+    }
+
+    #[test]
+    fn resolve_session_window_none_when_krx_closed() {
+        let calendar = fixture_calendar();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
+        assert_eq!(resolve_session_window(&calendar, date), None);
+    }
+
+    #[test]
+    fn resolve_session_window_none_when_date_not_in_calendar() {
+        let calendar = fixture_calendar();
+        let date = NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
+        assert_eq!(resolve_session_window(&calendar, date), None);
+    }
+
+    // -------------------------------------------------------------
+    // max_notional_usd
+    // -------------------------------------------------------------
+
+    #[test]
+    fn max_notional_usd_matches_equity_leverage_headroom_formula() {
+        let cfg = fixture_config();
+        // equity=1000 * leverage=2 * headroom=0.9
+        assert!((cfg.max_notional_usd() - 1800.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lot_usd_is_clamped_by_max_notional_usd() {
+        let mut cfg = fixture_config();
+        cfg.lot_usd = 5000.0; // deliberately oversized
+        let notional = cfg.lot_usd.min(cfg.max_notional_usd());
+        assert!((notional - 1800.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lot_usd_under_cap_is_unaffected() {
+        let cfg = fixture_config();
+        let notional = cfg.lot_usd.min(cfg.max_notional_usd());
+        assert!((notional - cfg.lot_usd).abs() < 1e-9);
+    }
+}
