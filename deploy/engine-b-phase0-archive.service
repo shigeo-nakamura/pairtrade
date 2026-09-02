@@ -1,0 +1,26 @@
+[Unit]
+Description=Archive closed Engine B Phase 0 SQLite partitions to S3
+After=network-online.target engine-b-phase0.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=engine-b-phase0
+Group=engine-b-phase0
+WorkingDirectory=/opt/engine-b-phase0
+Environment=ENGINE_B_PHASE0_DATA_DIR=/var/lib/engine-b-phase0/data
+Environment=ENGINE_B_PHASE0_S3_BUCKET=debot-dashboard
+Environment=ENGINE_B_PHASE0_S3_PREFIX=debot/engine-b/phase0/raw
+Environment=ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false
+ExecStart=/bin/bash /opt/engine-b-phase0/engine_b_phase0_archive.sh
+InaccessiblePaths=/opt/debot
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/engine-b-phase0
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+UMask=0077

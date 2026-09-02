@@ -1,0 +1,48 @@
+[Unit]
+Description=Engine B Phase 0A public-data observer (bot-strategy#866)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=engine-b-phase0
+Group=engine-b-phase0
+WorkingDirectory=/opt/engine-b-phase0
+StateDirectory=engine-b-phase0
+StateDirectoryMode=0750
+RuntimeDirectory=engine-b-phase0
+RuntimeDirectoryMode=0750
+Environment=PYTHONUNBUFFERED=1
+Environment=ENGINE_B_PHASE0_CONFIG=/opt/engine-b-phase0/phase0.json
+Environment=ENGINE_B_PHASE0_REQUIREMENTS_LOCK=/opt/engine-b-phase0/requirements.txt
+EnvironmentFile=-/opt/engine-b-phase0/release.env
+# A delayed first restart may follow an installer run while the legacy
+# ec2-user collector is still creating state. Repair the complete tree only
+# after systemd has stopped that process and before the dedicated user starts.
+ExecStartPre=+/usr/bin/chgrp -R engine-b-phase0 /var/lib/engine-b-phase0
+ExecStartPre=+/usr/bin/chmod -R g+rwX,o-rwx /var/lib/engine-b-phase0
+ExecStartPre=/usr/bin/env /opt/engine-b-phase0/venv/bin/python /opt/engine-b-phase0/engine_b_phase0.py --validate-config
+ExecStart=/usr/bin/env /opt/engine-b-phase0/venv/bin/python /opt/engine-b-phase0/engine_b_phase0.py
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+
+# Phase 0 runs under a dedicated identity and cannot see /opt/debot, which
+# contains the Robinhood/freq2 credential file used by the trading service.
+InaccessiblePaths=/opt/debot
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

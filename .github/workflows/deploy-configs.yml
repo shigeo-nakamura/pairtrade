@@ -14,6 +14,10 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: deploy-configs-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   AWS_REGION: eu-central-1
   INSTALL_DIR: /opt/debot
@@ -35,9 +39,19 @@ jobs:
           bash -n debot/scripts/activate-robinhood-sidecar.sh
           bash -n debot/scripts/deploy-robinhood-config.sh
           bash -n debot/scripts/deploy-robinhood-runtime.sh
+          bash -n debot/scripts/engine_b_phase0_archive.sh
+          bash -n debot/scripts/install_engine_b_phase0.sh
+          bash -n debot/scripts/run_engine_b_phase0.sh
           bash -n debot/scripts/test_bootstrap_robinhood_sidecar.sh
           bash -n debot/scripts/test_deploy_robinhood_runtime.sh
           python3 -m py_compile debot/scripts/test_robinhood_deploy_workflows.py
+          python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
+
+      - name: Test Engine B Phase 0 observer
+        run: |
+          python3 -m pip install -r debot/scripts/engine_b_phase0_requirements.txt
+          python3 debot/scripts/test_engine_b_phase0.py
+          bash debot/scripts/test_engine_b_phase0_archive.sh
 
       - name: Test Robinhood sidecar bootstrap
         run: bash debot/scripts/test_bootstrap_robinhood_sidecar.sh
@@ -52,6 +66,9 @@ jobs:
         run: |
           systemd-analyze verify debot/deploy/debot-pair-robinhood-sidecar-activation.service
           systemd-analyze verify debot/deploy/debot-pair-robinhood-lighter.service
+          systemd-analyze verify debot/deploy/engine-b-phase0.service
+          systemd-analyze verify debot/deploy/engine-b-phase0-archive.service
+          systemd-analyze verify debot/deploy/engine-b-phase0-archive.timer
 
       - name: Validate Lighter market preflight
         run: |
@@ -129,6 +146,18 @@ jobs:
           aws s3 cp debot/deploy/debot-pair-shadow-macro.service "s3://${S3_BUCKET}/deploy/debot-pair-shadow-macro.service"
           aws s3 cp debot/deploy/debot-pair-robinhood-sidecar-activation.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service"
           aws s3 cp debot/deploy/debot-pair-robinhood-lighter.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
+          aws s3 cp debot/deploy/engine-b-phase0.service "s3://${S3_BUCKET}/deploy/engine-b-phase0.service"
+          aws s3 cp debot/deploy/engine-b-phase0-archive.service "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.service"
+          aws s3 cp debot/deploy/engine-b-phase0-archive.timer "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.timer"
+          ENGINE_B_PREFIX="debot/engine-b-phase0/releases/${GITHUB_SHA}"
+          aws s3 cp debot/scripts/engine_b_phase0.py "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/engine_b_phase0.py"
+          aws s3 cp debot/scripts/engine_b_phase0_archive.sh "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/engine_b_phase0_archive.sh"
+          aws s3 cp debot/scripts/engine_b_phase0_requirements.txt "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/engine_b_phase0_requirements.txt"
+          aws s3 cp debot/scripts/install_engine_b_phase0.sh "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/install_engine_b_phase0.sh"
+          aws s3 cp debot/configs/engine-b/phase0.json "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/configs/phase0.json"
+          aws s3 cp debot/deploy/engine-b-phase0.service "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/deploy/engine-b-phase0.service"
+          aws s3 cp debot/deploy/engine-b-phase0-archive.service "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/deploy/engine-b-phase0-archive.service"
+          aws s3 cp debot/deploy/engine-b-phase0-archive.timer "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/deploy/engine-b-phase0-archive.timer"
 
       - name: Deploy via SSM (no restart)
         env:
@@ -191,8 +220,8 @@ jobs:
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
-            --comment "Deploy Robinhood Lighter pairtrade config; no start or restart" \
-            --parameters commands="set -e,sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts --exclude *.env,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-sidecar-activation.service,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo systemd-analyze verify /tmp/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-sidecar-activation.service /etc/systemd/system/debot-pair-robinhood-sidecar-activation.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
+            --comment "Deploy Robinhood Lighter pairtrade and Engine B artifacts; no start or restart" \
+            --parameters commands="set -e,sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts --exclude *.env,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,install -d -m 0755 /tmp/engine-b-phase0-${GITHUB_SHA},aws s3 sync s3://${S3_BUCKET}/debot/engine-b-phase0/releases/${GITHUB_SHA}/ /tmp/engine-b-phase0-${GITHUB_SHA}/ --exact-timestamps,sudo env ENGINE_B_PHASE0_CODE_COMMIT=${GITHUB_SHA} ENGINE_B_PHASE0_REQUIREMENTS=/tmp/engine-b-phase0-${GITHUB_SHA}/scripts/engine_b_phase0_requirements.txt ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-${GITHUB_SHA}/scripts/engine_b_phase0.py ENGINE_B_PHASE0_ARCHIVER_SOURCE=/tmp/engine-b-phase0-${GITHUB_SHA}/scripts/engine_b_phase0_archive.sh ENGINE_B_PHASE0_CONFIG_SOURCE=/tmp/engine-b-phase0-${GITHUB_SHA}/configs/phase0.json ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/tmp/engine-b-phase0-${GITHUB_SHA}/deploy bash /tmp/engine-b-phase0-${GITHUB_SHA}/scripts/install_engine_b_phase0.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-sidecar-activation.service,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo systemd-analyze verify /tmp/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-sidecar-activation.service /etc/systemd/system/debot-pair-robinhood-sidecar-activation.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
             --query Command.CommandId --output text)
           set +e
           aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}"

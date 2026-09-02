@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly Engine B Phase 0 archive timer
+
+[Timer]
+OnCalendar=*-*-* *:10:00 UTC
+Persistent=true
+RandomizedDelaySec=60
+Unit=engine-b-phase0-archive.service
+
+[Install]
+WantedBy=timers.target
