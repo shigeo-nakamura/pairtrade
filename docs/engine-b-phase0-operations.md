@@ -170,7 +170,9 @@ the canonical archive; otherwise the full skipped interval is written
 idempotently to `sealed_gap_interval` in the next retained database so quality
 calculations retain its missing duration. Live WebSocket session segments are
 likewise carried through idle hourly partitions even when no feed payload
-arrives.
+arrives. Each session handoff is write-ahead journaled before the old segment
+is closed; after a collector crash, recovery recreates the destination segment
+and bounds it at the recovery timestamp with `collector_restart_recovery`.
 
 ## `freq2` account record
 

@@ -309,6 +309,30 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ids[0], ids[2])
         self.assertNotEqual(ids[0], ids[1])
 
+    async def test_idless_update_without_nonce_fails_closed(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        connection = {
+            "id": "trade-missing-nonce",
+            "venue": venue.name,
+            "started_us": 1_774_884_000_000_000,
+            "api_schema_version": config.api_schema_version,
+        }
+        with self.assertRaisesRegex(RuntimeError, "without exchange nonce"):
+            await collector.handle_trades(
+                venue,
+                connection,
+                {
+                    "type": "update/trade",
+                    "channel": "trade/37",
+                    "trades": [{"price": "101", "size": "2"}],
+                },
+                1_774_884_082_400_000,
+            )
+        self.assertEqual(sink.commands, [])
+
 
 class ConfigTests(unittest.TestCase):
     def test_config_records_robinhood_same_venue_blocker(self) -> None:
@@ -941,7 +965,38 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             ):
                 path.mkdir(parents=True, exist_ok=True)
             sealed_partition = engine_b.partition_for_us(sealed_start_us)
-            (sink.sealed_dir / f"{sealed_partition}.json").write_text("{}\n")
+            sealed_sha = "a" * 64
+            (sink.sealed_dir / f"{sealed_partition}.json").write_text(
+                json.dumps(
+                    {
+                        "partition": sealed_partition,
+                        "sha256": sealed_sha,
+                        "trade_index": f"{sealed_partition}.trade_ids.sqlite3",
+                    }
+                )
+                + "\n"
+            )
+            sealed_index = sqlite3.connect(
+                sink.sealed_dir / f"{sealed_partition}.trade_ids.sqlite3"
+            )
+            sealed_index.execute(
+                """CREATE TABLE sealed_metadata(
+                     partition TEXT PRIMARY KEY,
+                     canonical_db_sha256 TEXT NOT NULL
+                   )"""
+            )
+            sealed_index.execute(
+                """CREATE TABLE archived_gap_continuation(
+                     continuation_id TEXT PRIMARY KEY,
+                     gap_id INTEGER NOT NULL
+                   ) WITHOUT ROWID"""
+            )
+            sealed_index.execute(
+                "INSERT INTO sealed_metadata VALUES (?, ?)",
+                (sealed_partition, sealed_sha),
+            )
+            sealed_index.commit()
+            sealed_index.close()
             marker_path = sink.gap_continuation_dir / "sealed-target.json"
             marker_path.write_text(
                 json.dumps(
@@ -1125,6 +1180,117 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             f"partition:{first_partition}:1",
                         )
                     ],
+                )
+            finally:
+                first_db.close()
+                second_db.close()
+
+    async def test_session_marker_survives_failed_continuation_write(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            connection_started_us = hour_start_us + 3_500_000_000
+            next_hour_us = hour_start_us + 3_600_000_000
+            recovered_us = next_hour_us + 200_000_000
+            first_partition = engine_b.partition_for_us(hour_start_us)
+            second_partition = engine_b.partition_for_us(next_hour_us)
+            sink = engine_b.DatabaseSink(config, "session-crash-run", "session-crash-commit")
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            connection_meta = {
+                "id": "session-crash-connection",
+                "venue": "robinhood",
+                "started_us": connection_started_us,
+                "api_schema_version": config.api_schema_version,
+            }
+            with mock.patch.object(engine_b, "now_us", return_value=connection_started_us):
+                sink._write_batch(
+                    [
+                        (
+                            "connection_start",
+                            {"recv_us": connection_started_us, "connection": connection_meta},
+                        )
+                    ]
+                )
+
+            original_write_partition = sink._write_partition
+
+            def fail_continuation_write(
+                partition: str, commands: list[tuple[str, dict[str, object]]]
+            ) -> None:
+                if partition == second_partition:
+                    self.assertEqual(
+                        len(list(sink.session_continuation_dir.glob("*.json"))), 1
+                    )
+                    raise RuntimeError("simulated session continuation failure")
+                original_write_partition(partition, commands)
+
+            with (
+                mock.patch.object(engine_b, "now_us", return_value=next_hour_us + 1),
+                mock.patch.object(sink, "_write_partition", fail_continuation_write),
+                self.assertRaisesRegex(RuntimeError, "simulated session continuation"),
+            ):
+                sink._write_batch([])
+            self.assertEqual(
+                len(list(sink.session_continuation_dir.glob("*.json"))), 1
+            )
+            await sink.close()
+
+            recovered_sink = engine_b.DatabaseSink(
+                config, "session-recovery-run", "session-recovery-commit"
+            )
+            for path in (
+                database_dir,
+                recovered_sink.sealed_dir,
+                recovered_sink.lock_dir,
+                recovered_sink.gap_continuation_dir,
+                recovered_sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                recovered_sink._write_batch([])
+            self.assertEqual(
+                list(recovered_sink.session_continuation_dir.glob("*.json")), []
+            )
+            await recovered_sink.close()
+
+            first_db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{first_partition}.sqlite3"
+            )
+            second_db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{second_partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    first_db.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (
+                        connection_started_us,
+                        next_hour_us,
+                        "partition_rotation",
+                    ),
+                )
+                self.assertEqual(
+                    second_db.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (
+                        next_hour_us,
+                        recovered_us,
+                        "collector_restart_recovery",
+                    ),
                 )
             finally:
                 first_db.close()

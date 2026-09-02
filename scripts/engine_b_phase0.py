@@ -374,7 +374,7 @@ def trade_message_scope(
     return (
         f"{message_type}:{exchange_sequence}"
         if exchange_sequence is not None
-        else f"{message_type}:recv:{recv_us}"
+        else f"{message_type}:missing-sequence"
     )
 
 
@@ -899,6 +899,7 @@ class DatabaseSink:
         self.sealed_dir = self.state_dir / "sealed"
         self.lock_dir = self.state_dir / "locks"
         self.gap_continuation_dir = self.state_dir / "gap-continuations"
+        self.session_continuation_dir = self.state_dir / "session-continuations"
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
@@ -908,6 +909,7 @@ class DatabaseSink:
             self.sealed_dir,
             self.lock_dir,
             self.gap_continuation_dir,
+            self.session_continuation_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
             os.chmod(directory, 0o750)
@@ -1115,7 +1117,9 @@ class DatabaseSink:
         index_path = self.sealed_dir / f"{partition}.trade_ids.sqlite3"
         seal_path = self.sealed_dir / f"{partition}.json"
         if not index_path.is_file():
-            return None
+            raise RuntimeError(
+                f"sealed partition gap index is missing: {index_path}"
+            )
         try:
             seal = json.loads(seal_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
@@ -1138,7 +1142,9 @@ class DatabaseSink:
                    WHERE type = 'table' AND name = 'archived_gap_continuation'"""
             ).fetchone()
             if table is None:
-                return None
+                raise RuntimeError(
+                    f"sealed partition gap index is incompatible: {index_path}"
+                )
             row = connection.execute(
                 """SELECT gap_id FROM archived_gap_continuation
                    WHERE continuation_id = ?""",
@@ -1280,11 +1286,54 @@ class DatabaseSink:
             temporary.unlink(missing_ok=True)
         return marker_path
 
+    def _persist_session_continuation_marker(
+        self, payload: dict[str, Any]
+    ) -> Path:
+        marker = {
+            "continuation_id": payload["continuation_id"],
+            "start_us": payload["start_us"],
+            "source_partition": payload["source_partition"],
+            "connection": payload["connection"],
+        }
+        encoded = json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
+        marker_name = hashlib.sha256(
+            marker["continuation_id"].encode("utf-8")
+        ).hexdigest()
+        self.session_continuation_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.session_continuation_dir, 0o750)
+        marker_path = self.session_continuation_dir / f"{marker_name}.json"
+        if marker_path.exists():
+            if marker_path.read_text() != encoded:
+                raise RuntimeError(
+                    f"session continuation marker mismatch: {marker_path}"
+                )
+            return marker_path
+        temporary = marker_path.with_name(
+            f".{marker_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with temporary.open("w") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, 0o640)
+            os.replace(temporary, marker_path)
+            self._fsync_directory(self.session_continuation_dir)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return marker_path
+
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         gap_closes: list[dict[str, Any]] = []
         recovered_gap_markers = self._load_gap_continuations()
+        recovered_session_markers = self._load_session_continuations()
         batch = [
+            *(
+                command
+                for _, start_command, end_command in recovered_session_markers
+                for command in (start_command, end_command)
+            ),
             *(("gap", payload) for _, payload in recovered_gap_markers),
             *batch,
         ]
@@ -1334,6 +1383,9 @@ class DatabaseSink:
         write_us = now_us()
         current_partition = partition_for_us(write_us)
         marker_paths = [marker_path for marker_path, _ in recovered_gap_markers]
+        session_marker_paths = [
+            marker_path for marker_path, _, _ in recovered_session_markers
+        ]
         rotation_queue = sorted(
             partition
             for partition in self._connections
@@ -1359,18 +1411,29 @@ class DatabaseSink:
                          AND started_ts_recv_us < ?""",
                     (partition_ended_us,),
                 ):
+                    session_continuation = {
+                        "continuation_id": f"partition:{partition}:{session_id}",
+                        "start_us": partition_ended_us,
+                        "source_partition": partition,
+                        "connection": {
+                            "id": session_id,
+                            "venue": venue,
+                            "started_us": partition_ended_us,
+                            "api_schema_version": api_schema_version,
+                        },
+                    }
+                    session_marker_paths.append(
+                        self._persist_session_continuation_marker(
+                            session_continuation
+                        )
+                    )
                     continuation_commands.append(
                         (
                             "connection_start",
                             {
                                 "recv_us": partition_ended_us,
                                 "partition_us": partition_ended_us,
-                                "connection": {
-                                    "id": session_id,
-                                    "venue": venue,
-                                    "started_us": partition_ended_us,
-                                    "api_schema_version": api_schema_version,
-                                },
+                                "connection": session_continuation["connection"],
                             },
                         )
                     )
@@ -1437,6 +1500,114 @@ class DatabaseSink:
             marker_path.unlink(missing_ok=True)
         if marker_paths:
             self._fsync_directory(self.gap_continuation_dir)
+        for marker_path in dict.fromkeys(session_marker_paths):
+            marker_path.unlink(missing_ok=True)
+        if session_marker_paths:
+            self._fsync_directory(self.session_continuation_dir)
+
+    def _complete_session_source_close(self, marker: dict[str, Any]) -> None:
+        source_partition = marker.get("source_partition")
+        connection_meta = marker.get("connection")
+        if not isinstance(source_partition, str) or not isinstance(connection_meta, dict):
+            raise RuntimeError("session continuation source identity is invalid")
+        try:
+            if partition_for_us(partition_start_us(source_partition)) != source_partition:
+                raise ValueError(source_partition)
+        except ValueError as exc:
+            raise RuntimeError("session continuation source partition is invalid") from exc
+        if self._is_partition_sealed(source_partition):
+            return
+        database_path = self.config.database_dir / f"engine_b_phase0_{source_partition}.sqlite3"
+        if not database_path.is_file():
+            return
+        with self._partition_lock(source_partition):
+            connection = self._connections.get(source_partition)
+            borrowed = connection is not None
+            if connection is None:
+                connection = sqlite3.connect(
+                    f"file:{database_path}?mode=rw", uri=True, timeout=5
+                )
+            try:
+                boundary_us = int(marker["start_us"])
+                connection.execute("BEGIN")
+                connection.execute(
+                    """UPDATE ws_connection
+                       SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
+                           end_reason = 'partition_rotation'
+                       WHERE connection_session_id = ?
+                         AND ended_ts_recv_us IS NULL""",
+                    (boundary_us, connection_meta["id"]),
+                )
+                connection.commit()
+            except sqlite3.DatabaseError as exc:
+                connection.rollback()
+                raise RuntimeError(
+                    f"session continuation source is unreadable: {database_path}"
+                ) from exc
+            finally:
+                if not borrowed:
+                    connection.close()
+
+    def _load_session_continuations(
+        self,
+    ) -> list[
+        tuple[
+            Path,
+            tuple[str, dict[str, Any]],
+            tuple[str, dict[str, Any]],
+        ]
+    ]:
+        if not self.session_continuation_dir.is_dir():
+            return []
+        recovered = []
+        for marker_path in sorted(self.session_continuation_dir.glob("*.json")):
+            try:
+                marker = json.loads(marker_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"session continuation marker is unreadable: {marker_path}"
+                ) from exc
+            if (
+                not isinstance(marker, dict)
+                or not {"continuation_id", "start_us", "source_partition", "connection"}
+                <= marker.keys()
+                or not isinstance(marker["connection"], dict)
+            ):
+                raise RuntimeError(
+                    f"session continuation marker is invalid: {marker_path}"
+                )
+            self._complete_session_source_close(marker)
+            start_us = int(marker["start_us"])
+            destination_partition = partition_for_us(start_us)
+            if self._is_partition_sealed(destination_partition):
+                raise RuntimeError(
+                    "session continuation destination is sealed; restore and verify "
+                    f"the partition before recovery: {destination_partition}"
+                )
+            connection_meta = dict(marker["connection"])
+            recovered_us = now_us()
+            recovered.append(
+                (
+                    marker_path,
+                    (
+                        "connection_start",
+                        {
+                            "recv_us": start_us,
+                            "partition_us": start_us,
+                            "connection": connection_meta,
+                        },
+                    ),
+                    (
+                        "connection_end",
+                        {
+                            "recv_us": recovered_us,
+                            "reason": "collector_restart_recovery",
+                            "connection": connection_meta,
+                        },
+                    ),
+                )
+            )
+        return recovered
 
     def _complete_gap_source_close(self, marker: dict[str, Any]) -> None:
         source_partition = marker.get("source_partition")
@@ -2134,10 +2305,17 @@ class Collector:
             return
         exchange_sequence = str(message["nonce"]) if message.get("nonce") is not None else None
         message_type = str(message.get("type", "update/trade"))
+        trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
+        if message_type != "subscribed/trade" and exchange_sequence is None and any(
+            trade.get("trade_id_str", trade.get("trade_id")) is None
+            for trade in trades
+        ):
+            raise RuntimeError(
+                "refusing ID-less incremental trade message without exchange nonce"
+            )
         message_scope = trade_message_scope(
             message_type, exchange_sequence, recv_us
         )
-        trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
         stable_occurrences: defaultdict[tuple[int, str], int] = defaultdict(int)
         for trade in trades:
             price_text = canonical_decimal(trade["price"])
