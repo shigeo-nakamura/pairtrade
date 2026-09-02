@@ -761,11 +761,7 @@ fn manual_reconcile_report(
     // follow-up, pairtrade#241) -- check it here too, first, so this
     // report never claims "ready" (or any other status implying apply
     // would proceed) for a CONFIG_YAML apply would actually refuse
-    // outright (Codex P2 follow-up, same PR). Kept out of
-    // build_manual_reconcile_report itself (which stays fully
-    // tempdir-testable) because the fixed administrator-owned policy path
-    // this reads cannot be redirected in a test the way every other input
-    // here can.
+    // outright (Codex P2 follow-up, same PR).
     let config_bytes = read_private_regular_file(config_path, "config")?;
     let config = parse_config(&config_bytes, config_path)?;
     if let Err(error) = auto_execute_policy_from_admin_file()
@@ -785,8 +781,16 @@ fn manual_reconcile_report(
         return Ok(());
     }
 
+    // Pass the already-parsed, already-approved config object -- not
+    // config_path -- so build_manual_reconcile_report cannot re-read
+    // CONFIG_YAML from disk a second time. A second path-based read would
+    // reopen exactly the TOCTOU window auto_execute_policy.json exists to
+    // close: whoever can write config_path could replace it between the
+    // check above and that second read, and this report could then
+    // evaluate (and print "ready" for) a CONFIG_YAML that was never
+    // policy-approved (Codex P2 follow-up, pairtrade#241).
     let report = build_manual_reconcile_report(
-        config_path,
+        &config,
         events_jsonl_path,
         expected_sell_amount_raw,
         expected_buy_amount_raw,
@@ -811,19 +815,18 @@ fn manual_reconcile_report(
 /// Assumes the `auto_execute_policy.json` check has already passed --
 /// `manual_reconcile_report` (the CLI wrapper) checks that first and
 /// short-circuits before ever calling this, so every status this function
-/// can return is one `manual-reconcile-apply` would actually reach. Split
-/// out so this function stays testable against a tempdir config/ledger the
-/// way `build_repair_report` is; the policy check's fixed,
-/// administrator-owned path cannot be redirected in a test.
+/// can return is one `manual-reconcile-apply` would actually reach. Takes
+/// the already-parsed `config` object, not a path, so it can never re-read
+/// CONFIG_YAML itself and reopen the TOCTOU window the policy check exists
+/// to close (Codex P2 follow-up, pairtrade#241) -- tests construct/parse
+/// `config` the same way `manual_reconcile_report` does and pass it in
+/// directly, so this stays just as tempdir-testable as before.
 fn build_manual_reconcile_report(
-    config_path: &Path,
+    config: &ArcusSpotExecuteOnceConfig,
     events_jsonl_path: &Path,
     expected_sell_amount_raw: &str,
     expected_buy_amount_raw: &str,
 ) -> Result<serde_json::Value> {
-    let config_bytes = read_private_regular_file(config_path, "config")?;
-    let config = parse_config(&config_bytes, config_path)?;
-
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
     let ledger = ledger_store.load_existing()?;
@@ -841,7 +844,7 @@ fn build_manual_reconcile_report(
         "idempotency_key": active.idempotency_key,
     });
 
-    let plan = require_single_manual_reconcile_candidate(&config, &active, events_jsonl_path)?;
+    let plan = require_single_manual_reconcile_candidate(config, &active, events_jsonl_path)?;
 
     if active.phase != ArcusSpotExecutionPhase::Reconciled {
         // resume_status_and_reconcile (called by manual-reconcile-apply)
@@ -882,9 +885,9 @@ fn build_manual_reconcile_report(
     }
 
     let sell_token_decimals =
-        trusted_token_decimals_for_address(&config, &plan.sell_symbol, &active.intent.sell_token)?;
+        trusted_token_decimals_for_address(config, &plan.sell_symbol, &active.intent.sell_token)?;
     let buy_token_decimals =
-        trusted_token_decimals_for_address(&config, &plan.buy_symbol, &active.intent.buy_token)?;
+        trusted_token_decimals_for_address(config, &plan.buy_symbol, &active.intent.buy_token)?;
     let fill = match manual_reconciled_runtime_fill_for_attempt(
         &active,
         &plan,
@@ -7744,7 +7747,7 @@ runtime:
             )],
         );
 
-        let report = build_manual_reconcile_report(&config_path, &events_path, "1", "1").unwrap();
+        let report = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap();
         assert_eq!(report["status"], "not_yet_reconciled");
         assert_eq!(
             report["active_attempt"]["sequence"],
@@ -7787,7 +7790,7 @@ runtime:
             &[repair_report_would_rotate_event(101, at, plan.clone())],
         );
 
-        let report = build_manual_reconcile_report(&config_path, &events_path, "1", "1").unwrap();
+        let report = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap();
         assert_eq!(report["status"], "not_resumable");
         assert!(report["detail"]
             .as_str()
@@ -7815,8 +7818,7 @@ runtime:
         persist_repair_report_ledger_state(&config, Some(active));
         write_private_file(&events_path, b"");
 
-        let error =
-            build_manual_reconcile_report(&config_path, &events_path, "1", "1").unwrap_err();
+        let error = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap_err();
         assert!(
             error.to_string().contains("no WouldRotate event matching"),
             "{error}"
@@ -7874,8 +7876,7 @@ runtime:
         content.push('\n');
         write_private_file(&events_path, content.as_bytes());
 
-        let error =
-            build_manual_reconcile_report(&config_path, &events_path, "1", "1").unwrap_err();
+        let error = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap_err();
         assert!(
             format!("{error:#}").contains("hash-chain break"),
             "{error:#}"
@@ -7912,8 +7913,7 @@ runtime:
             ],
         );
 
-        let error =
-            build_manual_reconcile_report(&config_path, &events_path, "1", "1").unwrap_err();
+        let error = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap_err();
         assert!(
             error.to_string().contains("refusing to pick one"),
             "{error}"
@@ -7951,8 +7951,7 @@ runtime:
             &[repair_report_would_rotate_event(101, at, wrong_direction)],
         );
 
-        let error =
-            build_manual_reconcile_report(&config_path, &events_path, "1", "1").unwrap_err();
+        let error = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap_err();
         assert!(
             error.to_string().contains("configured runtime pair"),
             "{error}"
@@ -7983,7 +7982,7 @@ runtime:
         );
 
         let report = build_manual_reconcile_report(
-            &config_path,
+            &config,
             &events_path,
             "50000000000000000",
             "50000000000000000",
@@ -8051,7 +8050,7 @@ runtime:
         );
 
         let error = build_manual_reconcile_report(
-            &config_path,
+            &config,
             &events_path,
             "50000000000000000",
             "50000000000000000",
@@ -8099,7 +8098,7 @@ runtime:
         );
 
         let report = build_manual_reconcile_report(
-            &config_path,
+            &config,
             &events_path,
             "50000000000000000",
             "50000000000000000",
@@ -8153,7 +8152,7 @@ runtime:
         );
 
         let error = build_manual_reconcile_report(
-            &config_path,
+            &config,
             &events_path,
             "50000000000000000",
             "50000000000000000",
@@ -8220,7 +8219,7 @@ runtime:
         );
 
         let report = build_manual_reconcile_report(
-            &config_path,
+            &config,
             &events_path,
             "50000000000000000",
             "50000000000000000",
@@ -8261,7 +8260,7 @@ runtime:
         );
 
         let report = build_manual_reconcile_report(
-            &config_path,
+            &config,
             &events_path,
             "50000000000000000",
             "50000000000000000",
@@ -8302,8 +8301,7 @@ runtime:
         );
 
         let report =
-            build_manual_reconcile_report(&config_path, &events_path, "50000000000000000", "1")
-                .unwrap();
+            build_manual_reconcile_report(&config, &events_path, "50000000000000000", "1").unwrap();
         assert_eq!(report["status"], "would_fail");
         assert!(report["detail"]
             .as_str()
