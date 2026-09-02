@@ -385,6 +385,17 @@ import sys
 connection = sqlite3.connect(sys.argv[1])
 connection.execute("CREATE TABLE fragment(value TEXT NOT NULL)")
 connection.execute("INSERT INTO fragment VALUES ('late-only')")
+connection.execute(
+    """CREATE TABLE late_trade(
+         sealed_partition TEXT NOT NULL,
+         venue TEXT NOT NULL,
+         market_id INTEGER NOT NULL,
+         exchange_trade_id TEXT NOT NULL
+       )"""
+)
+connection.execute(
+    "INSERT INTO late_trade VALUES ('20000101_00', 'robinhood', 37, 'must-not-reconcile')"
+)
 connection.commit()
 connection.close()
 PY

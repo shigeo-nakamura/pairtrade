@@ -157,8 +157,9 @@ restores synchronization, including rows retained in an earlier hourly DB. The
 collector and archiver both fsync a write-ahead continuation marker before
 bounding an old row. The next collector batch completes any interrupted source
 close, imports the marker into its fixed destination partition idempotently,
-and only then removes it. A recovery snapshot therefore cannot undercount an
-open gap across a crash or hourly rotation.
+and carries the gap through every intervening hourly partition before removing
+the markers. A recovery snapshot therefore cannot undercount an open gap across
+a crash, long collector outage, or hourly rotation.
 
 ## `freq2` account record
 

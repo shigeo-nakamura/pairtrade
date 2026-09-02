@@ -1217,9 +1217,6 @@ class DatabaseSink:
                 if commands:
                     self._write_partition(partition, commands)
 
-        for payload in gap_closes:
-            self._close_open_gaps(payload)
-
         if late_commands:
             late_partition = partition_for_us(now_us())
             with self._partition_lock(late_partition):
@@ -1229,66 +1226,84 @@ class DatabaseSink:
 
         write_us = now_us()
         current_partition = partition_for_us(write_us)
-        gap_continuations: list[tuple[str, dict[str, Any]]] = []
-        created_gap_markers: list[Path] = []
+        marker_paths = [marker_path for marker_path, _ in recovered_gap_markers]
+        rotation_queue = sorted(
+            partition
+            for partition in self._connections
+            if partition < current_partition
+        )
+        rotated: set[str] = set()
+        while rotation_queue:
+            partition = rotation_queue.pop(0)
+            if partition in rotated:
+                continue
+            connection = self._connections.get(partition)
+            if connection is None:
+                continue
+            gap_continuations: list[tuple[str, dict[str, Any]]] = []
+            created_gap_markers: list[Path] = []
+            partition_ended_us = partition_start_us(partition) + 3_600_000_000
+            with self._partition_lock(partition):
+                self._finalize_ohlcv(connection, write_us)
+                for row in connection.execute(
+                    """SELECT gap_id, venue, market_id, symbol, channel,
+                              expected_sequence, observed_sequence, reason
+                       FROM data_gap WHERE ts_end_us IS NULL"""
+                ):
+                    gap_id, venue, market_id, symbol, channel, expected, observed, reason = row
+                    continuation = {
+                        "recv_us": write_us,
+                        "start_us": partition_ended_us,
+                        "partition_us": partition_ended_us,
+                        "connection_id": None,
+                        "venue": venue,
+                        "market_id": market_id,
+                        "symbol": symbol,
+                        "channel": channel,
+                        "expected_sequence": expected,
+                        "observed_sequence": observed,
+                        "continuation_id": f"partition:{partition}:{gap_id}",
+                        "reason": reason,
+                        "source_partition": partition,
+                        "source_gap_id": gap_id,
+                    }
+                    created_gap_markers.append(
+                        self._persist_gap_continuation_marker(continuation)
+                    )
+                    gap_continuations.append(("gap", continuation))
+                connection.execute(
+                    """UPDATE data_gap SET ts_end_us = MAX(ts_start_us, ?)
+                       WHERE ts_end_us IS NULL""",
+                    (partition_ended_us,),
+                )
+                connection.execute(
+                    """UPDATE ws_connection
+                       SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
+                           end_reason = 'partition_rotation'
+                       WHERE ended_ts_recv_us IS NULL""",
+                    (partition_ended_us,),
+                )
+                connection.commit()
+                self._connections.pop(partition).close()
+
+            destination_partition = partition_for_us(partition_ended_us)
+            if gap_continuations:
+                with self._partition_lock(destination_partition):
+                    self._write_partition(destination_partition, gap_continuations)
+            marker_paths.extend(created_gap_markers)
+            rotated.add(partition)
+            if destination_partition < current_partition:
+                rotation_queue.append(destination_partition)
+                rotation_queue.sort()
+
         for partition, connection in list(self._connections.items()):
             with self._partition_lock(partition):
                 self._finalize_ohlcv(connection, write_us)
-                if partition < current_partition:
-                    partition_ended_us = partition_start_us(partition) + 3_600_000_000
-                    for row in connection.execute(
-                        """SELECT gap_id, venue, market_id, symbol, channel,
-                                  expected_sequence, observed_sequence, reason
-                           FROM data_gap WHERE ts_end_us IS NULL"""
-                    ):
-                        gap_id, venue, market_id, symbol, channel, expected, observed, reason = row
-                        continuation = {
-                            "recv_us": write_us,
-                            "start_us": partition_ended_us,
-                            "connection_id": None,
-                            "venue": venue,
-                            "market_id": market_id,
-                            "symbol": symbol,
-                            "channel": channel,
-                            "expected_sequence": expected,
-                            "observed_sequence": observed,
-                            "continuation_id": f"partition:{partition}:{gap_id}",
-                            "reason": reason,
-                            "source_partition": partition,
-                            "source_gap_id": gap_id,
-                        }
-                        created_gap_markers.append(
-                            self._persist_gap_continuation_marker(continuation)
-                        )
-                        gap_continuations.append(
-                            (
-                                "gap",
-                                continuation,
-                            )
-                        )
-                    connection.execute(
-                        """UPDATE data_gap SET ts_end_us = MAX(ts_start_us, ?)
-                           WHERE ts_end_us IS NULL""",
-                        (partition_ended_us,),
-                    )
-                    connection.execute(
-                        """UPDATE ws_connection
-                           SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
-                               end_reason = 'partition_rotation'
-                           WHERE ended_ts_recv_us IS NULL""",
-                        (partition_ended_us,),
-                    )
                 connection.commit()
-                if partition < current_partition:
-                    self._connections.pop(partition).close()
 
-        if gap_continuations:
-            with self._partition_lock(current_partition):
-                self._write_partition(current_partition, gap_continuations)
-        marker_paths = [
-            *(marker_path for marker_path, _ in recovered_gap_markers),
-            *created_gap_markers,
-        ]
+        for payload in gap_closes:
+            self._close_open_gaps(payload)
+
         for marker_path in dict.fromkeys(marker_paths):
             marker_path.unlink(missing_ok=True)
         if marker_paths:

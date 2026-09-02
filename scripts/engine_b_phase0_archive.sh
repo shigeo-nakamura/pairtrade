@@ -15,6 +15,30 @@ LOCK_DIR="$STATE_DIR/locks"
 SEALED_DIR="$STATE_DIR/sealed"
 GAP_CONTINUATION_DIR="$STATE_DIR/gap-continuations"
 
+fsync_files_and_directory() {
+  "$PYTHON_BIN" - "$@" <<'PY'
+import os
+import sys
+
+directory = sys.argv[1]
+for path in sys.argv[2:]:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+descriptor = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+}
+
+fsync_directory() {
+  fsync_files_and_directory "$1"
+}
+
 persist_seal_sidecars() (
   set -euo pipefail
   local source_db=$1
@@ -154,13 +178,15 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
       exit 1
     fi
     trade_index_path="$SEALED_DIR/$partition.trade_ids.sqlite3"
+    "$PYTHON_BIN" "$OBSERVER_SCRIPT" --verify-sealed-partition \
+      "$db" "$trade_index_path" "$seal_path" "$partition"
     "$PYTHON_BIN" "$OBSERVER_SCRIPT" --reconcile-late-trade-identities \
       "$db" "$SEALED_DIR"
     republish_reconciled_sidecars "$db"
-    "$PYTHON_BIN" "$OBSERVER_SCRIPT" --verify-sealed-partition \
-      "$db" "$trade_index_path" "$seal_path" "$partition"
     persist_seal_sidecars "$db" "$trade_index_path" "$seal_path" "$key"
+    fsync_files_and_directory "$SEALED_DIR" "$trade_index_path" "$seal_path"
     rm -f -- "$db"
+    fsync_directory "$DATA_DIR"
     flock -u "$lock_fd"
     exec {lock_fd}>&-
     echo "Recovered and removed verified sealed partition left by an interrupted archive: $db"
@@ -369,6 +395,7 @@ PY
       "$S3_BUCKET" "$key" "$trade_identity_count" "$sealed_at" > "$seal_tmp"
     chmod 0640 "$seal_tmp"
     mv "$seal_tmp" "$seal_path"
+    fsync_files_and_directory "$SEALED_DIR" "$trade_index_path" "$seal_path"
     seal_created=true
   fi
 
@@ -380,6 +407,7 @@ PY
     if [ "$seal_created" = "true" ]; then
       rm -f -- "$seal_path"
       rm -f -- "$trade_index_path"
+      fsync_directory "$SEALED_DIR"
       seal_created=false
     fi
   fi
@@ -389,6 +417,7 @@ PY
       echo "Remote seal is committed but local deletion failed; retaining local seal for recovery: $db" >&2
       exit 1
     fi
+    fsync_directory "$DATA_DIR"
     echo "Archived, sealed, verified, and removed closed partition: $db -> s3://$S3_BUCKET/$key"
   elif [ "$source_stable" != "true" ]; then
     echo "Archived snapshot verified, but source changed during upload; local partition retained: $db" >&2

@@ -417,7 +417,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_spanning_connection_is_segmented_and_run_start_is_stable(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         with tempfile.TemporaryDirectory() as directory:
-            database_dir = Path(directory)
+            database_dir = Path(directory) / "data"
             object.__setattr__(config, "database_dir", database_dir)
             hour_start_us = 1_700_000_000_000_000
             hour_start_us -= hour_start_us % 3_600_000_000
@@ -451,7 +451,12 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             sink = engine_b.DatabaseSink(
                 config, "spanning-run", "spanning-commit", run_started_us
             )
-            for path in (database_dir, sink.sealed_dir, sink.lock_dir):
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+            ):
                 path.mkdir(parents=True, exist_ok=True)
             with mock.patch.object(
                 engine_b, "now_us", return_value=connection_ended_us
@@ -565,14 +570,19 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_resynchronization_closes_retained_connection_gaps(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         with tempfile.TemporaryDirectory() as directory:
-            database_dir = Path(directory)
+            database_dir = Path(directory) / "data"
             object.__setattr__(config, "database_dir", database_dir)
             hour_start_us = 1_700_000_000_000_000
             hour_start_us -= hour_start_us % 3_600_000_000
             gap_started_us = hour_start_us + 3_500_000_000
             recovered_us = hour_start_us + 3_700_000_000
             sink = engine_b.DatabaseSink(config, "gap-run", "gap-commit")
-            for path in (database_dir, sink.sealed_dir, sink.lock_dir):
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+            ):
                 path.mkdir(parents=True, exist_ok=True)
             with mock.patch.object(engine_b, "now_us", return_value=gap_started_us):
                 sink._write_batch(
@@ -607,18 +617,29 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             await sink.close()
 
             gap_partition = engine_b.partition_for_us(gap_started_us)
+            recovered_partition = engine_b.partition_for_us(recovered_us)
             db = sqlite3.connect(
                 database_dir / f"engine_b_phase0_{gap_partition}.sqlite3"
+            )
+            recovered_db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{recovered_partition}.sqlite3"
             )
             try:
                 self.assertEqual(
                     db.execute(
                         "SELECT ts_start_us, ts_end_us FROM data_gap"
                     ).fetchone(),
-                    (gap_started_us, recovered_us),
+                    (gap_started_us, hour_start_us + 3_600_000_000),
+                )
+                self.assertEqual(
+                    recovered_db.execute(
+                        "SELECT ts_start_us, ts_end_us FROM data_gap"
+                    ).fetchone(),
+                    (hour_start_us + 3_600_000_000, recovered_us),
                 )
             finally:
                 db.close()
+                recovered_db.close()
 
     async def test_open_gap_is_carried_into_next_partition(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
@@ -629,7 +650,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             hour_start_us -= hour_start_us % 3_600_000_000
             gap_started_us = hour_start_us + 3_500_000_000
             next_hour_us = hour_start_us + 3_600_000_000
-            recovered_us = next_hour_us + 200_000_000
+            recovered_us = hour_start_us + 3 * 3_600_000_000 + 200_000_000
             sink = engine_b.DatabaseSink(config, "carry-run", "carry-commit")
             for path in (
                 database_dir,
@@ -670,10 +691,22 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 database_dir
                 / f"engine_b_phase0_{engine_b.partition_for_us(hour_start_us)}.sqlite3"
             )
-            second_db = sqlite3.connect(
-                database_dir
-                / f"engine_b_phase0_{engine_b.partition_for_us(next_hour_us)}.sqlite3"
-            )
+            gap_rows = []
+            for offset in range(4):
+                partition_us = hour_start_us + offset * 3_600_000_000
+                db = sqlite3.connect(
+                    database_dir
+                    / f"engine_b_phase0_{engine_b.partition_for_us(partition_us)}.sqlite3"
+                )
+                try:
+                    gap_rows.append(
+                        db.execute(
+                            """SELECT ts_start_us, ts_end_us, continuation_id
+                               FROM data_gap"""
+                        ).fetchone()
+                    )
+                finally:
+                    db.close()
             try:
                 self.assertEqual(
                     first_db.execute(
@@ -682,19 +715,28 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     (gap_started_us, next_hour_us),
                 )
                 self.assertEqual(
-                    second_db.execute(
-                        """SELECT ts_start_us, ts_end_us, continuation_id
-                           FROM data_gap"""
-                    ).fetchone(),
-                    (
-                        next_hour_us,
-                        recovered_us,
-                        f"partition:{engine_b.partition_for_us(hour_start_us)}:1",
-                    ),
+                    gap_rows,
+                    [
+                        (gap_started_us, next_hour_us, None),
+                        (
+                            hour_start_us + 3_600_000_000,
+                            hour_start_us + 2 * 3_600_000_000,
+                            f"partition:{engine_b.partition_for_us(hour_start_us)}:1",
+                        ),
+                        (
+                            hour_start_us + 2 * 3_600_000_000,
+                            hour_start_us + 3 * 3_600_000_000,
+                            f"partition:{engine_b.partition_for_us(hour_start_us + 3_600_000_000)}:1",
+                        ),
+                        (
+                            hour_start_us + 3 * 3_600_000_000,
+                            recovered_us,
+                            f"partition:{engine_b.partition_for_us(hour_start_us + 2 * 3_600_000_000)}:1",
+                        ),
+                    ],
                 )
             finally:
                 first_db.close()
-                second_db.close()
 
     async def test_archive_gap_marker_is_imported_idempotently(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
