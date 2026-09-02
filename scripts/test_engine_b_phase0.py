@@ -57,13 +57,13 @@ class ReadOnlyBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_allows_only_public_control_messages(self) -> None:
         ws = FakeWebSocket()
         await engine_b.send_public_control(
-            ws, {"type": "subscribe", "channel": "order_book/37"}
+            ws, {"type": "subscribe", "channel": "order_book/216"}
         )
         await engine_b.send_public_control(ws, {"type": "pong"})
         self.assertEqual(
             ws.messages,
             [
-                {"type": "subscribe", "channel": "order_book/37"},
+                {"type": "subscribe", "channel": "order_book/216"},
                 {"type": "pong"},
             ],
         )
@@ -177,7 +177,7 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
         ws = FakeWebSocket()
@@ -195,7 +195,7 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
                 connection,
                 {
                     "type": "subscribed/order_book",
-                    "channel": "order_book/37",
+                    "channel": "order_book/216",
                     "order_book": {
                         "nonce": 10,
                         "bids": [
@@ -209,12 +209,12 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(sink.commands, [])
-        self.assertNotIn((venue.name, 37), collector.books)
+        self.assertNotIn((venue.name, 216), collector.books)
         self.assertEqual(dict(collector.local_sequences), {})
 
     async def test_missing_snapshot_nonce_never_emits_reconstruction(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         metrics = engine_b.Metrics()
         collector = engine_b.Collector(config, sink, metrics)
@@ -231,7 +231,7 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
             connection,
             {
                 "type": "subscribed/order_book",
-                "channel": "order_book/37",
+                "channel": "order_book/216",
                 "order_book": {
                     "bids": [{"price": "100", "size": "1"}],
                     "asks": [{"price": "101", "size": "1"}],
@@ -245,12 +245,12 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(books), 1)
         self.assertFalse(books[0]["complete"])
         self.assertEqual(gaps[0]["reason"], "snapshot_missing_nonce")
-        self.assertFalse(metrics.book_synced[(venue.name, 37)])
+        self.assertFalse(metrics.book_synced[(venue.name, 216)])
         self.assertEqual(
             ws.messages,
             [
-                {"type": "unsubscribe", "channel": "order_book/37"},
-                {"type": "subscribe", "channel": "order_book/37"},
+                {"type": "unsubscribe", "channel": "order_book/216"},
+                {"type": "subscribe", "channel": "order_book/216"},
             ],
         )
 
@@ -260,7 +260,7 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
             connection,
             {
                 "type": "subscribed/order_book",
-                "channel": "order_book/37",
+                "channel": "order_book/216",
                 "order_book": {"nonce": 10, "bids": [], "asks": []},
             },
             1_774_884_083_400_000,
@@ -272,7 +272,7 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "recv_us": 1_774_884_083_400_000,
                     "venue": venue.name,
-                    "market_id": 37,
+                    "market_id": 216,
                 }
             ],
         )
@@ -283,7 +283,7 @@ class MarketStatsHandlingTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
 
@@ -292,7 +292,7 @@ class MarketStatsHandlingTests(unittest.IsolatedAsyncioTestCase):
                 venue,
                 {
                     "type": "update/market_stats",
-                    "channel": "market_stats/37",
+                    "channel": "market_stats/216",
                     "timestamp": 1_774_884_082_400,
                     "market_stats": {
                         "mark_price": "159.71",
@@ -325,7 +325,7 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handshake_failure_does_not_create_websocket_session(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
 
@@ -368,7 +368,7 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_start_is_timestamped_after_handshake(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
 
@@ -414,7 +414,7 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_market_stats_message_records_connection_activity(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
 
@@ -438,7 +438,7 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
                 return json.dumps(
                     {
                         "type": "update/market_stats",
-                        "channel": "market_stats/37",
+                        "channel": "market_stats/216",
                         "market_stats": {"mark_price": "159.71"},
                     }
                 )
@@ -470,7 +470,7 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
 class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_synthetic_ids_preserve_multiset_across_overlapping_snapshots(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
         connection = {
@@ -483,14 +483,14 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
         other = {"price": "102", "size": "1", "is_maker_ask": False}
         first_message = {
             "type": "subscribed/trade",
-            "channel": "trade/37",
+            "channel": "trade/216",
             "nonce": 9001,
             "timestamp": 1_774_884_082_309,
             "trades": [trade, trade, other],
         }
         overlapping_message = {
             "type": "subscribed/trade",
-            "channel": "trade/37",
+            "channel": "trade/216",
             "nonce": 9002,
             "timestamp": 1_774_884_082_309,
             "trades": [other, trade, trade],
@@ -512,7 +512,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_synthetic_ids_preserve_identical_update_multiplicity(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
         connection = {
@@ -529,7 +529,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
         }
         first = {
             "type": "update/trade",
-            "channel": "trade/37",
+            "channel": "trade/216",
             "nonce": 9001,
             "trades": [trade],
         }
@@ -544,7 +544,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_idless_update_without_nonce_fails_closed(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
         connection = {
@@ -559,7 +559,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                 connection,
                 {
                     "type": "update/trade",
-                    "channel": "trade/37",
+                    "channel": "trade/216",
                     "trades": [{"price": "101", "size": "2"}],
                 },
                 1_774_884_082_400_000,
@@ -568,7 +568,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_to_snapshot_replay_uses_alias_multiset(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         recording = RecordingSink()
         collector = engine_b.Collector(config, recording, engine_b.Metrics())
         recv_us = 1_774_884_082_400_000
@@ -591,7 +591,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                 connection_meta,
                 {
                     "type": "update/trade",
-                    "channel": "trade/37",
+                    "channel": "trade/216",
                     "nonce": nonce,
                     "trades": [trade],
                 },
@@ -602,7 +602,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             connection_meta,
             {
                 "type": "subscribed/trade",
-                "channel": "trade/37",
+                "channel": "trade/216",
                 "nonce": 9003,
                 "trades": [trade, trade],
             },
@@ -688,7 +688,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_snapshot_without_exchange_timestamp_fails_closed(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
         connection = {
@@ -703,7 +703,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                 connection,
                 {
                     "type": "subscribed/trade",
-                    "channel": "trade/37",
+                    "channel": "trade/216",
                     "trades": [{"price": "101", "size": "2"}],
                 },
                 1_774_884_082_400_000,
@@ -714,7 +714,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
         connection = {
@@ -729,7 +729,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                 connection,
                 {
                     "type": "update/trade",
-                    "channel": "trade/37",
+                    "channel": "trade/216",
                     "nonce": 9001,
                     "trades": [
                         {
@@ -745,7 +745,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_out_of_range_exchange_timestamp_fails_closed(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         recv_us = 1_774_884_082_400_000
         for timestamp in (1_774_884_082, 10**30):
             with self.subTest(timestamp=timestamp):
@@ -765,7 +765,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                         connection,
                         {
                             "type": "subscribed/trade",
-                            "channel": "trade/37",
+                            "channel": "trade/216",
                             "trades": [
                                 {
                                     "trade_id": "invalid-time",
@@ -781,7 +781,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_positive_trade_values_fail_closed_before_enqueue(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         recv_us = 1_774_884_082_400_000
         for invalid_trade in (
             {"trade_id": "zero-price", "price": "0", "size": "2"},
@@ -808,7 +808,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                         connection,
                         {
                             "type": "subscribed/trade",
-                            "channel": "trade/37",
+                            "channel": "trade/216",
                             "trades": [
                                 valid_trade,
                                 {**invalid_trade, "timestamp": recv_us},
@@ -822,7 +822,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         recording = RecordingSink()
         collector = engine_b.Collector(config, recording, engine_b.Metrics())
         event_us = 1_774_884_082_309_000
@@ -843,7 +843,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             connection_meta,
             {
                 "type": "update/trade",
-                "channel": "trade/37",
+                "channel": "trade/216",
                 "nonce": 9001,
                 "trades": [trade],
             },
@@ -854,7 +854,7 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             connection_meta,
             {
                 "type": "subscribed/trade",
-                "channel": "trade/37",
+                "channel": "trade/216",
                 "nonce": 9002,
                 "trades": [trade],
             },
@@ -939,10 +939,10 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_config_records_robinhood_same_venue_blocker(self) -> None:
+    def test_config_lighter_venue_has_no_missing_symbols(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        robinhood = next(venue for venue in config.venues if venue.name == "robinhood")
-        self.assertEqual(set(robinhood.known_missing_symbols), {"EWY", "USDKRW"})
+        lighter = next(venue for venue in config.venues if venue.name == "lighter")
+        self.assertEqual(set(lighter.known_missing_symbols), set())
         self.assertGreaterEqual(config.top_levels, 5)
         self.assertEqual(config.min_daily_volume_usd, engine_b.Decimal("100000"))
 
@@ -1215,7 +1215,9 @@ class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["us_cash_is_open"], 0)
         self.assertEqual(payload["calendar_version"], "UNRESOLVED_A7_zoneinfo_only")
         self.assertIn("A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR", payload["validity_reason"])
-        self.assertIn("SAME_VENUE_REQUIRED_SYMBOLS_MISSING=", payload["validity_reason"])
+        # The committed config's single `lighter` venue has nothing missing;
+        # only an unresolved A-7 date produces a blocker.
+        self.assertNotIn("SAME_VENUE_REQUIRED_SYMBOLS_MISSING=", payload["validity_reason"])
 
     async def test_without_calendar_file_flags_weekend(self) -> None:
         config = self._config_without_calendar()
@@ -1240,11 +1242,9 @@ class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["krx_is_open"], 1)
             self.assertEqual(payload["us_cash_is_open"], 1)
             self.assertEqual(payload["calendar_version"], "xkrx-xnys-exchange_calendars-TEST-fixture")
-            self.assertNotIn("A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR", payload["validity_reason"] or "")
-            self.assertNotIn("KRX_CLOSED", payload["validity_reason"] or "")
-            self.assertNotIn("US_CASH_CLOSED", payload["validity_reason"] or "")
-            # Robinhood's missing EWY/USDKRW is a separate, still-open blocker.
-            self.assertIn("SAME_VENUE_REQUIRED_SYMBOLS_MISSING=", payload["validity_reason"])
+            # A-7 resolved, both markets open, and the committed config's
+            # single `lighter` venue has nothing missing -- no blocker left.
+            self.assertIsNone(payload["validity_reason"])
 
     async def test_resolved_open_day_uses_real_session_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1309,15 +1309,40 @@ class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
         payload = collector.health_payload()
         self.assertIn("A7 verified KRX/US calendar unresolved", payload["phase0_sample_blockers"])
+        self.assertFalse(payload["phase0_sample_eligible"])
         self.assertIsNone(payload["trading_calendar_version"])
 
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config_with_fixture_calendar(Path(tmp))
             collector = engine_b.Collector(config, sink, engine_b.Metrics())
             payload = collector.health_payload()
-            self.assertNotIn("A7 verified KRX/US calendar unresolved", payload["phase0_sample_blockers"])
-            self.assertIn("Robinhood Lighter lacks same-venue EWY and USDKRW", payload["phase0_sample_blockers"])
+            # A-7 resolved and the committed config's single `lighter` venue
+            # has nothing missing -- no blockers left at all.
+            self.assertEqual(payload["phase0_sample_blockers"], [])
+            self.assertTrue(payload["phase0_sample_eligible"])
             self.assertEqual(payload["trading_calendar_version"], "xkrx-xnys-exchange_calendars-TEST-fixture")
+
+    def test_health_payload_flags_any_venue_with_missing_symbols(self) -> None:
+        # Direct unit test of health_payload()'s generic per-venue blocker
+        # loop, independent of the committed config: it must name whichever
+        # venue actually has a gap, not a hardcoded venue.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config_with_fixture_calendar(Path(tmp))
+            gappy_venue = engine_b.VenueConfig(
+                name="some_other_venue",
+                rest_url="https://example.invalid",
+                ws_url="wss://example.invalid/stream",
+                role="future_execution_venue",
+                required_same_venue_symbols=("EWY", "USDKRW"),
+                known_missing_symbols=("EWY", "USDKRW"),
+                markets=(),
+            )
+            object.__setattr__(config, "venues", config.venues + (gappy_venue,))
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+            payload = collector.health_payload()
+            self.assertIn("some_other_venue lacks same-venue EWY,USDKRW", payload["phase0_sample_blockers"])
+            self.assertFalse(payload["phase0_sample_eligible"])
 
     def test_health_payload_flags_calendar_whose_range_has_expired(self) -> None:
         # A loaded calendar object that no longer covers today/tomorrow (its
@@ -1349,6 +1374,7 @@ class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
 
             payload = collector.health_payload()
             self.assertIn("A7 verified KRX/US calendar unresolved", payload["phase0_sample_blockers"])
+            self.assertFalse(payload["phase0_sample_eligible"])
             # trading_calendar_version still reports the loaded (stale) version.
             self.assertEqual(payload["trading_calendar_version"], "xkrx-xnys-exchange_calendars-TEST-expired")
 
@@ -1356,7 +1382,7 @@ class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
 class RestPollingTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_volume_is_recorded_as_poll_failure(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         metrics = engine_b.Metrics()
         collector = engine_b.Collector(config, sink, metrics)
@@ -1386,7 +1412,7 @@ class RestPollingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_market_metadata_is_recorded_as_poll_failure(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         malformed_responses = (
             {"order_book_details": [{"market_id": None}]},
             {"order_book_details": None},
@@ -1479,7 +1505,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             bucket_start_us = event_us - event_us % 60_000_000
             connection = {
                 "id": "connection-1",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": recv_us,
                 "api_schema_version": config.api_schema_version,
             }
@@ -1490,8 +1516,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "recv_us": recv_us,
                     "srv_us": recv_us - 10,
                     "connection": connection,
-                    "venue": "robinhood",
-                    "market_id": 37,
+                    "venue": "lighter",
+                    "market_id": 216,
                     "symbol": "SKHY",
                     "event_kind": "reconstructed",
                     "exchange_sequence": "10",
@@ -1511,8 +1537,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "bucket_start_us": bucket_start_us,
                     "srv_us": event_us,
                     "connection": connection,
-                    "venue": "robinhood",
-                    "market_id": 37,
+                    "venue": "lighter",
+                    "market_id": 216,
                     "symbol": "SKHY",
                     "trade_id": "123",
                     "exchange_sequence": "11",
@@ -1556,7 +1582,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             connection_ended_us = next_hour_us + 600_000_000
             connection = {
                 "id": "connection-spanning-hours",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": connection_started_us,
                 "api_schema_version": config.api_schema_version,
             }
@@ -1565,8 +1591,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 return {
                     "recv_us": recv_us,
                     "connection": connection,
-                    "venue": "robinhood",
-                    "market_id": 37,
+                    "venue": "lighter",
+                    "market_id": 216,
                     "symbol": "SKHY",
                     "event_kind": "raw",
                     "exchange_sequence": str(local_sequence),
@@ -1655,7 +1681,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             clock = [hour_start_us + 1_800_000_000]
             connection = {
                 "id": "connection-idle-at-boundary",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": clock[0],
                 "api_schema_version": config.api_schema_version,
             }
@@ -1743,8 +1769,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "recv_us": timestamp,
                         "connection_id": f"retry-{index}",
-                        "venue": "robinhood",
-                        "market_id": 37,
+                        "venue": "lighter",
+                        "market_id": 216,
                         "symbol": "SKHY",
                         "channel": "connection",
                         "reason": "connection_error:TimeoutError",
@@ -1799,8 +1825,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "recv_us": timestamp,
                         "connection_id": "book-gap-connection",
-                        "venue": "robinhood",
-                        "market_id": 37,
+                        "venue": "lighter",
+                        "market_id": 216,
                         "symbol": "SKHY",
                         "channel": "order_book",
                         "expected_sequence": "10",
@@ -1818,8 +1844,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "gap_close",
                             {
                                 "recv_us": recovered_us,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                             },
                         ),
                         gap(failed_again_us),
@@ -1869,8 +1895,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "recv_us": gap_started_us,
                                 "connection_id": None,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                                 "symbol": "SKHY",
                                 "channel": "connection",
                                 "reason": "connection_error:TimeoutError",
@@ -1885,8 +1911,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "gap_close",
                             {
                                 "recv_us": recovered_us,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                             },
                         )
                     ]
@@ -1932,7 +1958,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             later_recovered_us = recovered_us + 10_000_000
             connection = {
                 "id": "gap-close-crash",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": gap_started_us,
                 "api_schema_version": config.api_schema_version,
             }
@@ -1958,8 +1984,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "recv_us": gap_started_us,
                                 "connection_id": connection["id"],
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                                 "symbol": "SKHY",
                                 "channel": "order_book",
                                 "reason": "sequence_gap",
@@ -1974,8 +2000,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "recv_us": recovered_us,
                     "srv_us": recovered_us,
                     "connection": connection,
-                    "venue": "robinhood",
-                    "market_id": 37,
+                    "venue": "lighter",
+                    "market_id": 216,
                     "symbol": "SKHY",
                     "event_kind": "snapshot",
                     "exchange_sequence": "20",
@@ -2014,8 +2040,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "gap_close",
                             {
                                 "recv_us": recovered_us,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                             },
                         ),
                         later_replacement_snapshot,
@@ -2023,8 +2049,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "gap_close",
                             {
                                 "recv_us": later_recovered_us,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                             },
                         ),
                     ]
@@ -2085,7 +2111,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     database.execute(
                         """SELECT ts_start_us, ts_end_us FROM data_gap
                            WHERE channel = 'connection'
-                             AND market_id = 37
+                             AND market_id = 216
                              AND reason = 'collector_restart_recovery'"""
                     ).fetchone(),
                     (later_recovered_us, None),
@@ -2114,8 +2140,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "recv_us": recv_us,
                         "connection_id": None,
-                        "venue": "robinhood",
-                        "market_id": 37,
+                        "venue": "lighter",
+                        "market_id": 216,
                         "symbol": "SKHY",
                         "channel": "connection",
                         "reason": reason,
@@ -2131,8 +2157,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "gap_close",
                             {
                                 "recv_us": base_us + 20,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                             },
                         ),
                         gap(base_us + 30, "later-gap"),
@@ -2178,8 +2204,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             gap = {
                 "recv_us": gap_started_us,
                 "connection_id": None,
-                "venue": "robinhood",
-                "market_id": 37,
+                "venue": "lighter",
+                "market_id": 216,
                 "symbol": "SKHY",
                 "channel": "connection",
                 "reason": "connection_error:TimeoutError",
@@ -2195,8 +2221,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "gap_close",
                             {
                                 "recv_us": recovered_us,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                             },
                         )
                     ]
@@ -2275,8 +2301,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "continuation_id": "archive:old:7",
                         "start_us": start_us,
-                        "venue": "robinhood",
-                        "market_id": 37,
+                        "venue": "lighter",
+                        "market_id": 216,
                         "symbol": "SKHY",
                         "channel": "connection",
                         "expected_sequence": None,
@@ -2293,8 +2319,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "gap_close",
                             {
                                 "recv_us": recovered_us,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                             },
                         )
                     ]
@@ -2373,8 +2399,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "continuation_id": "partition:source:1",
                         "start_us": sealed_start_us,
-                        "venue": "robinhood",
-                        "market_id": 37,
+                        "venue": "lighter",
+                        "market_id": 216,
                         "symbol": "SKHY",
                         "channel": "connection",
                         "expected_sequence": None,
@@ -2391,8 +2417,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "gap_close",
                             {
                                 "recv_us": recovered_us,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                             },
                         )
                     ]
@@ -2469,8 +2495,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             gap = {
                 "recv_us": gap_started_us,
                 "connection_id": None,
-                "venue": "robinhood",
-                "market_id": 37,
+                "venue": "lighter",
+                "market_id": 216,
                 "symbol": "SKHY",
                 "channel": "connection",
                 "reason": "connection_error:TimeoutError",
@@ -2516,8 +2542,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "gap_close",
                             {
                                 "recv_us": recovered_us,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                             },
                         )
                     ]
@@ -2557,7 +2583,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_marker_survives_failed_continuation_write(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         with tempfile.TemporaryDirectory() as directory:
             database_dir = Path(directory) / "data"
             object.__setattr__(config, "database_dir", database_dir)
@@ -2579,7 +2605,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 path.mkdir(parents=True, exist_ok=True)
             connection_meta = {
                 "id": "session-crash-connection",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": connection_started_us,
                 "api_schema_version": config.api_schema_version,
             }
@@ -2688,7 +2714,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     second_db.execute(
                         """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_start_us),
                                   MIN(ts_end_us), MAX(ts_end_us), COUNT(DISTINCT reason)
-                           FROM data_gap WHERE venue = 'robinhood'
+                           FROM data_gap WHERE venue = 'lighter'
                              AND channel = 'connection'"""
                     ).fetchone(),
                     (
@@ -2733,7 +2759,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "source_collector_run_id": sink.collector_run_id,
                     "connection": {
                         "id": "live-session",
-                        "venue": "robinhood",
+                        "venue": "lighter",
                         "started_us": boundary_us,
                         "api_schema_version": config.api_schema_version,
                     },
@@ -2785,7 +2811,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 path.mkdir(parents=True, exist_ok=True)
             connection = {
                 "id": "marker-before-source-close",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": source_start_us + 3_500_000_000,
                 "api_schema_version": config.api_schema_version,
             }
@@ -2854,16 +2880,16 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                         "collector_restart_recovery",
                     ),
                 )
-                robinhood = next(
-                    item for item in config.venues if item.name == "robinhood"
+                lighter = next(
+                    item for item in config.venues if item.name == "lighter"
                 )
                 self.assertEqual(
                     destination.execute(
                         """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
-                           FROM data_gap WHERE venue = 'robinhood'
+                           FROM data_gap WHERE venue = 'lighter'
                              AND channel = 'connection'"""
                     ).fetchone(),
-                    (len(robinhood.markets), boundary_us, None),
+                    (len(lighter.markets), boundary_us, None),
                 )
             finally:
                 source.close()
@@ -2879,7 +2905,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             replay_end_us = actual_end_us + 300_000_000
             connection = {
                 "id": "completed-before-marker-unlink",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": started_us,
                 "api_schema_version": config.api_schema_version,
             }
@@ -2949,7 +2975,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         with tempfile.TemporaryDirectory() as directory:
             database_dir = Path(directory) / "data"
             object.__setattr__(config, "database_dir", database_dir)
@@ -2962,7 +2988,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             first_partition = engine_b.partition_for_us(hour_start_us)
             connection_meta = {
                 "id": "orphaned-before-rotation",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": connection_started_us,
                 "api_schema_version": config.api_schema_version,
             }
@@ -3121,7 +3147,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
-        venue = next(item for item in config.venues if item.name == "robinhood")
+        venue = next(item for item in config.venues if item.name == "lighter")
         with tempfile.TemporaryDirectory() as directory:
             database_dir = Path(directory) / "data"
             object.__setattr__(config, "database_dir", database_dir)
@@ -3160,7 +3186,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                                 "srv_us": book_activity_us,
                                 "connection": connection,
                                 "venue": venue.name,
-                                "market_id": 37,
+                                "market_id": 216,
                                 "symbol": "SKHY",
                                 "event_kind": "snapshot",
                                 "exchange_sequence": "10",
@@ -3192,7 +3218,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             {
                                 "recv_us": recovered_us,
                                 "venue": venue.name,
-                                "market_id": 37,
+                                "market_id": 216,
                             },
                         )
                     ]
@@ -3214,7 +3240,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     database.execute(
                         """SELECT ts_start_us, ts_end_us, reason FROM data_gap
-                           WHERE venue = 'robinhood' AND market_id = 37
+                           WHERE venue = 'lighter' AND market_id = 216
                              AND channel = 'connection'"""
                     ).fetchone(),
                     (
@@ -3244,7 +3270,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             future_received_us = future_start_us + 60_000_000
             connection = {
                 "id": "current-socket-historical-trade",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": connection_started_us,
                 "api_schema_version": config.api_schema_version,
             }
@@ -3284,8 +3310,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                                 "bucket_start_us": event_us - event_us % 60_000_000,
                                 "srv_us": event_us,
                                 "connection": connection,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                                 "symbol": "SKHY",
                                 "trade_id": "historical-trade",
                                 "replay_alias": None,
@@ -3309,8 +3335,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                                 ),
                                 "srv_us": future_event_us,
                                 "connection": connection,
-                                "venue": "robinhood",
-                                "market_id": 37,
+                                "venue": "lighter",
+                                "market_id": 216,
                                 "symbol": "SKHY",
                                 "trade_id": "future-trade",
                                 "replay_alias": None,
@@ -3488,7 +3514,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "source_partition": source_partition,
                     "connection": {
                         "id": "sealed-session",
-                        "venue": "robinhood",
+                        "venue": "lighter",
                         "started_us": sealed_start_us,
                         "api_schema_version": config.api_schema_version,
                     },
@@ -3523,8 +3549,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchone(),
                     (0,),
                 )
-                robinhood = next(
-                    item for item in config.venues if item.name == "robinhood"
+                lighter = next(
+                    item for item in config.venues if item.name == "lighter"
                 )
                 self.assertEqual(
                     recovered_db.execute(
@@ -3534,7 +3560,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                            FROM sealed_gap_interval"""
                     ).fetchone(),
                     (
-                        len(robinhood.markets),
+                        len(lighter.markets),
                         sealed_partition,
                         sealed_start_us,
                         sealed_end_us,
@@ -3544,10 +3570,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     recovered_db.execute(
                         """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
-                           FROM data_gap WHERE venue = 'robinhood'
+                           FROM data_gap WHERE venue = 'lighter'
                              AND channel = 'connection'"""
                     ).fetchone(),
-                    (len(robinhood.markets), sealed_end_us, None),
+                    (len(lighter.markets), sealed_end_us, None),
                 )
             finally:
                 recovered_db.close()
@@ -3565,7 +3591,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             receive_us = hour_start_us + 3_605_000_000
             connection = {
                 "id": "connection-late",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": receive_us,
                 "api_schema_version": config.api_schema_version,
             }
@@ -3582,8 +3608,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "bucket_start_us": event_us - event_us % 60_000_000,
                     "srv_us": event_us,
                     "connection": connection,
-                    "venue": "robinhood",
-                    "market_id": 37,
+                    "venue": "lighter",
+                    "market_id": 216,
                     "symbol": "SKHY",
                     "trade_id": trade_id,
                     "exchange_sequence": str(local_sequence),
@@ -3687,13 +3713,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             )
             index_connection.execute(
                 "INSERT INTO archived_trade_identity VALUES (?, ?, ?)",
-                ("robinhood", 37, "archived-before-seal"),
+                ("lighter", 216, "archived-before-seal"),
             )
             index_connection.commit()
             index_connection.close()
             connection = {
                 "id": "connection-sealed",
-                "venue": "robinhood",
+                "venue": "lighter",
                 "started_us": recv_us,
                 "api_schema_version": config.api_schema_version,
             }
@@ -3705,8 +3731,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "bucket_start_us": event_us - event_us % 60_000_000,
                     "srv_us": event_us,
                     "connection": connection,
-                    "venue": "robinhood",
-                    "market_id": 37,
+                    "venue": "lighter",
+                    "market_id": 216,
                     "symbol": "SKHY",
                     "trade_id": trade_id,
                     "exchange_sequence": f"late-{sequence}",

@@ -3,9 +3,10 @@
 
 This process has no account authentication, signing, or order capability.  Its
 only outbound WebSocket messages are public-data subscriptions and keepalives.
-It records Robinhood Lighter (the intended future execution venue) alongside a
-complete standard-Lighter context feed because Robinhood currently lacks EWY
-and USDKRW, two controls required by requirements v0.3.
+It records the mainnet Lighter venue (the intended future execution venue),
+which already carries every same-venue control requirements v0.3 needs
+(including EWY and USDKRW) -- there is no second, cross-venue feed to
+reconcile.
 
 The exchange calendar (A-7) is resolved from a frozen, pre-computed KRX/US
 cash-market session table (see scripts/engine_b_trading_calendar_freeze.py
@@ -13,10 +14,12 @@ and configs/engine-b/trading_calendar.json) that this process loads with
 stdlib `json` at startup -- it never imports a calendar library itself. If
 the frozen table is missing, unreadable, or does not cover a given date, the
 observer falls back to the original fail-closed placeholder for that date.
-Robinhood's missing same-venue EWY/USDKRW controls are recorded separately
-and remain a fail-closed session-invalid reason regardless of A-7. Collection
-can begin, but rows carrying any session-invalid reason must not be counted
-as valid Phase 0A samples yet.
+A configured venue missing a required same-venue symbol is recorded
+separately (`SAME_VENUE_REQUIRED_SYMBOLS_MISSING`) and remains a fail-closed
+session-invalid reason regardless of A-7 -- today's single venue has nothing
+missing, so only an unresolved A-7 date produces one. Collection can begin,
+but rows carrying any session-invalid reason must not be counted as valid
+Phase 0A samples yet.
 """
 
 from __future__ import annotations
@@ -3824,7 +3827,11 @@ class Collector:
         blockers = []
         if not self.calendar_covers_upcoming_sessions():
             blockers.append("A7 verified KRX/US calendar unresolved")
-        blockers.append("Robinhood Lighter lacks same-venue EWY and USDKRW")
+        for venue in self.config.venues:
+            if venue.known_missing_symbols:
+                blockers.append(
+                    f"{venue.name} lacks same-venue {','.join(venue.known_missing_symbols)}"
+                )
         return {
             "timestamp": datetime.now(UTC).isoformat(),
             "phase": "0A_observer",
@@ -3844,7 +3851,7 @@ class Collector:
                 }
                 for venue in self.config.venues
             },
-            "phase0_sample_eligible": False,
+            "phase0_sample_eligible": not blockers,
             "phase0_sample_blockers": blockers,
             "trading_calendar_version": (
                 self.trading_calendar.calendar_version if self.trading_calendar else None
