@@ -422,6 +422,17 @@ jobs:
           DEBOT_SHA256: ${{ steps.package.outputs.debot_sha256 }}
           LIBSIGNER_SHA256: ${{ steps.package.outputs.libsigner_sha256 }}
         run: |
+          # checksums.sha256 (downloaded below alongside manifest.json, for
+          # audit/reference on-host) now lists all 3 packaged artifacts
+          # (bin/debot, bin/engine_b_live, lib/libsigner.so) since
+          # bot-strategy#866, but this job -- the main/Frankfurt host deploy
+          # -- only downloads and needs debot+libsigner.so here (engine_b_live
+          # goes only to the Robinhood Lighter host, via the
+          # deploy-robinhood-lighter job below). A blanket `sha256sum -c
+          # checksums.sha256` here would therefore always fail on the
+          # never-downloaded engine_b_live entry; the two explicit
+          # DEBOT_SHA256/LIBSIGNER_SHA256 checks just below already verify
+          # exactly the two files this host actually stages.
           cat > /tmp/ssm-params.json <<'JSON'
           {
             "commands": [
@@ -436,7 +447,6 @@ jobs:
               "sudo chmod 644 __INSTALL_DIR__/lib/libsigner.so __INSTALL_DIR__/checksums.sha256 __INSTALL_DIR__/manifest.json",
               "echo __DEBOT_SHA256__ __INSTALL_DIR__/bin/debot | sudo sha256sum -c - || exit 1",
               "echo __LIBSIGNER_SHA256__ __INSTALL_DIR__/lib/libsigner.so | sudo sha256sum -c - || exit 1",
-              "cd __INSTALL_DIR__ && sudo sha256sum -c checksums.sha256 || exit 1",
               "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/bin/debot) = root:root:755 || exit 1",
               "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/lib/libsigner.so) = root:root:644 || exit 1",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts",

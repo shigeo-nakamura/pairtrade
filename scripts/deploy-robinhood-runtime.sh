@@ -53,7 +53,12 @@ mkdir -p "$STAGE/bin" "$STAGE/lib"
 
 echo "$EXPECTED_DEBOT_SHA  $STAGE/bin/debot" | sha256sum -c -
 echo "$EXPECTED_LIBSIGNER_SHA  $STAGE/lib/libsigner.so" | sha256sum -c -
-(cd "$STAGE" && sha256sum -c checksums.sha256)
+# checksums.sha256 (staged above, published below for on-release audit) now
+# also lists bin/engine_b_live (bot-strategy#866), which is never staged
+# here -- it is deployed separately, straight into $INSTALL_DIR/bin, by the
+# caller after this script returns. A blanket `sha256sum -c checksums.sha256`
+# would therefore always fail on that never-staged entry; the two explicit
+# checks above already verify exactly the two files this stage actually has.
 
 "$JQ_BIN" -e \
     --arg debot_sha "$EXPECTED_DEBOT_SHA" \
@@ -102,7 +107,12 @@ verify_release() {
         "$release_dir/robinhood-sidecar-bundle/manifest.json"
     cmp "$STAGE/robinhood-sidecar-bundle/lighter-ratelimit.service" \
         "$release_dir/robinhood-sidecar-bundle/lighter-ratelimit.service"
-    (cd "$release_dir" && sha256sum -c checksums.sha256)
+    # No blanket `sha256sum -c checksums.sha256` here for the same reason as
+    # the initial staging check above (checksums.sha256 lists
+    # bin/engine_b_live, never staged in this release tree) -- the `cmp`
+    # above already proves this release's checksums.sha256 is byte-for-byte
+    # identical to $STAGE's, and the per-file cmp calls already verify the
+    # two binaries this release tree actually contains.
     (cd "$release_dir/robinhood-sidecar-bundle" && \
         sha256sum -c lighter-ratelimit.sha256)
     test "$(stat -c %U:%G:%a "$release_dir")" = \
