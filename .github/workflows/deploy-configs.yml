@@ -229,11 +229,43 @@ jobs:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
         run: |
           test -n "${INSTANCE_ID}"
+          # A single shorthand `--parameters commands="cmd1,cmd2,..."` string
+          # is fragile here: AWS CLI's shorthand parser can misparse a
+          # `KEY=value` pattern embedded after whitespace inside one comma-
+          # separated command (e.g. `sudo env ENGINE_B_PHASE0_CODE_COMMIT=...`)
+          # as the start of a new top-level parameter, breaking with
+          # "Expected: '=', received: ...". A `--parameters file://` JSON
+          # array (as the "Deploy via SSM (no restart)" step above already
+          # uses) avoids that ambiguity entirely; each command is its own
+          # JSON string, quoted, no shorthand involved.
+          cat > /tmp/ssm-robinhood-params.json <<'JSON'
+          {
+            "commands": [
+              "set -e",
+              "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs __INSTALL_DIR__/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status",
+              "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exclude '*.env'",
+              "sudo bash __INSTALL_DIR__/scripts/deploy-robinhood-config.sh __S3_BUCKET__ __INSTALL_DIR__",
+              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
+              "install -d -m 0755 /tmp/engine-b-phase0-__GITHUB_SHA__",
+              "aws s3 sync s3://__S3_BUCKET__/debot/engine-b-phase0/releases/__GITHUB_SHA__/ /tmp/engine-b-phase0-__GITHUB_SHA__/ --exact-timestamps",
+              "sudo env ENGINE_B_PHASE0_CODE_COMMIT=__GITHUB_SHA__ ENGINE_B_PHASE0_REQUIREMENTS=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_requirements.txt ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0.py ENGINE_B_PHASE0_ARCHIVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_archive.sh ENGINE_B_PHASE0_CONFIG_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/phase0.json ENGINE_B_PHASE0_CALENDAR_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/trading_calendar.json ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/tmp/engine-b-phase0-__GITHUB_SHA__/deploy bash /tmp/engine-b-phase0-__GITHUB_SHA__/scripts/install_engine_b_phase0.sh",
+              "aws s3 cp s3://__S3_BUCKET__/deploy/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-sidecar-activation.service",
+              "aws s3 cp s3://__S3_BUCKET__/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service",
+              "sudo systemd-analyze verify /tmp/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-lighter.service",
+              "sudo mv /tmp/debot-pair-robinhood-sidecar-activation.service /etc/systemd/system/debot-pair-robinhood-sidecar-activation.service",
+              "sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service",
+              "sudo systemctl daemon-reload",
+              "sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status"
+            ]
+          }
+          JSON
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__GITHUB_SHA__|${GITHUB_SHA}|g" /tmp/ssm-robinhood-params.json
+
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
             --comment "Deploy Robinhood Lighter pairtrade and Engine B artifacts; no start or restart" \
-            --parameters commands="set -e,sudo install -d -o ec2-user -g ec2-user -m 0750 ${INSTALL_DIR} ${INSTALL_DIR}/scripts ${INSTALL_DIR}/configs ${INSTALL_DIR}/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status,aws s3 sync s3://${S3_BUCKET}/debot/scripts ${INSTALL_DIR}/scripts --exclude *.env,sudo bash ${INSTALL_DIR}/scripts/deploy-robinhood-config.sh ${S3_BUCKET} ${INSTALL_DIR},sudo chmod 755 ${INSTALL_DIR}/scripts/*.sh,install -d -m 0755 /tmp/engine-b-phase0-${GITHUB_SHA},aws s3 sync s3://${S3_BUCKET}/debot/engine-b-phase0/releases/${GITHUB_SHA}/ /tmp/engine-b-phase0-${GITHUB_SHA}/ --exact-timestamps,sudo env ENGINE_B_PHASE0_CODE_COMMIT=${GITHUB_SHA} ENGINE_B_PHASE0_REQUIREMENTS=/tmp/engine-b-phase0-${GITHUB_SHA}/scripts/engine_b_phase0_requirements.txt ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-${GITHUB_SHA}/scripts/engine_b_phase0.py ENGINE_B_PHASE0_ARCHIVER_SOURCE=/tmp/engine-b-phase0-${GITHUB_SHA}/scripts/engine_b_phase0_archive.sh ENGINE_B_PHASE0_CONFIG_SOURCE=/tmp/engine-b-phase0-${GITHUB_SHA}/configs/phase0.json ENGINE_B_PHASE0_CALENDAR_SOURCE=/tmp/engine-b-phase0-${GITHUB_SHA}/configs/trading_calendar.json ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/tmp/engine-b-phase0-${GITHUB_SHA}/deploy bash /tmp/engine-b-phase0-${GITHUB_SHA}/scripts/install_engine_b_phase0.sh,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-sidecar-activation.service,aws s3 cp s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service,sudo systemd-analyze verify /tmp/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-lighter.service,sudo mv /tmp/debot-pair-robinhood-sidecar-activation.service /etc/systemd/system/debot-pair-robinhood-sidecar-activation.service,sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service,sudo systemctl daemon-reload,sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status" \
+            --parameters file:///tmp/ssm-robinhood-params.json \
             --query Command.CommandId --output text)
           set +e
           aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}"
