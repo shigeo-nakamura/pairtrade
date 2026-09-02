@@ -14,21 +14,21 @@ cannot read the Robinhood `freq2` credentials owned by the trading identity.
 `collector_manifest.order_capability` and the Prometheus gauge
 `engine_b_phase0_order_capability` must both remain `0`.
 
-The observer collects two explicitly labelled venues:
+The observer collects a single venue, `lighter` (mainnet Lighter,
+`mainnet.zklighter.elliot.ai`) -- the intended future execution venue and the
+complete requirements-v0.3 context universe at once, including `EWY` and
+`USDKRW`. This replaces an earlier two-venue plan (`robinhood` +
+`lighter_mainnet_context`): Robinhood Lighter (`api.rh.lighter.xyz`) did not
+list `EWY`/`USDKRW`, which would have required either combining two venues'
+data into one regression (needing a new, reviewed analysis-plan version) or
+waiting on Robinhood to list them. Targeting mainnet Lighter directly removes
+the gap outright -- every required same-venue control is already there, so
+there is no cross-venue combination to justify or defer.
 
-- `robinhood`: intended future execution venue (`SKHY`, `SNDK`, `MU`, `SOXL`,
-  `NVDA`, `SPY`, `QQQ`). Robinhood did not list `EWY` or `USDKRW` on
-  2026-09-01.
-- `lighter_mainnet_context`: the complete requirements-v0.3 context universe,
-  including `EWY` and `USDKRW`.
-
-Do not combine the two venues into a v0.3 primary regression without a new,
-reviewed analysis-plan version. A-7 (the verified KRX/US market calendar) is
-resolved via the frozen calendar described below, but Robinhood's same-venue
-control gap (missing `EWY`/`USDKRW`) is not: every `trading_session` row still
-carries `SAME_VENUE_REQUIRED_SYMBOLS_MISSING=robinhood:EWY,robinhood:USDKRW`
-in `validity_reason` and must not be counted as a valid Phase 0A sample until
-that gap closes too.
+A-7 (the verified KRX/US market calendar) is resolved via the frozen
+calendar described below, and with mainnet Lighter as the only venue there is
+no same-venue-missing-symbols reason either: a `trading_session` row's
+`validity_reason` is `None` for a normal, fully-resolved open trading day.
 
 ## A-7: KRX/US cash-market trading calendar
 

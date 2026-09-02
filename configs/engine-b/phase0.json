@@ -15,34 +15,10 @@
   "db_flush_interval_ms": 250,
   "venues": [
     {
-      "name": "robinhood",
-      "rest_url": "https://api.rh.lighter.xyz",
-      "ws_url": "wss://api.rh.lighter.xyz/stream",
-      "role": "future_execution_venue",
-      "required_same_venue_symbols": [
-        "SKHY",
-        "SNDK",
-        "SOXL",
-        "NVDA",
-        "EWY",
-        "USDKRW"
-      ],
-      "known_missing_symbols": ["EWY", "USDKRW"],
-      "markets": [
-        {"symbol": "SKHY", "market_id": 37, "role": "kr_candidate"},
-        {"symbol": "SNDK", "market_id": 32, "role": "us_candidate"},
-        {"symbol": "MU", "market_id": 31, "role": "us_candidate"},
-        {"symbol": "SOXL", "market_id": 35, "role": "control"},
-        {"symbol": "NVDA", "market_id": 15, "role": "control"},
-        {"symbol": "SPY", "market_id": 26, "role": "exploratory"},
-        {"symbol": "QQQ", "market_id": 25, "role": "exploratory"}
-      ]
-    },
-    {
-      "name": "lighter_mainnet_context",
+      "name": "lighter",
       "rest_url": "https://mainnet.zklighter.elliot.ai",
       "ws_url": "wss://mainnet.zklighter.elliot.ai/stream?readonly=true",
-      "role": "spec_v0.3_complete_context",
+      "role": "future_execution_venue",
       "required_same_venue_symbols": [
         "SKHY",
         "SNDK",
