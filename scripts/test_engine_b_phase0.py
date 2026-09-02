@@ -565,6 +565,39 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(sink.commands, [])
 
+    async def test_incremental_trade_without_exchange_timestamp_fails_closed(
+        self,
+    ) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        connection = {
+            "id": "update-missing-timestamp",
+            "venue": venue.name,
+            "started_us": 1_774_884_000_000_000,
+            "api_schema_version": config.api_schema_version,
+        }
+        with self.assertRaisesRegex(RuntimeError, "without exchange timestamp"):
+            await collector.handle_trades(
+                venue,
+                connection,
+                {
+                    "type": "update/trade",
+                    "channel": "trade/37",
+                    "nonce": 9001,
+                    "trades": [
+                        {
+                            "trade_id": "explicit-id-without-time",
+                            "price": "101",
+                            "size": "2",
+                        }
+                    ],
+                },
+                1_774_884_082_400_000,
+            )
+        self.assertEqual(sink.commands, [])
+
     async def test_out_of_range_exchange_timestamp_fails_closed(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         venue = next(item for item in config.venues if item.name == "robinhood")

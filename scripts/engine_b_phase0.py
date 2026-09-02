@@ -2974,12 +2974,8 @@ class Collector:
         ]
         for _, srv_us in normalized_trades:
             validate_trade_timestamp_us(srv_us, recv_us)
-        if message_type == "subscribed/trade" and any(
-            srv_us is None for _, srv_us in normalized_trades
-        ):
-            raise RuntimeError(
-                "refusing trade snapshot without exchange timestamp"
-            )
+        if any(srv_us is None for _, srv_us in normalized_trades):
+            raise RuntimeError("refusing trade message without exchange timestamp")
         message_scope = trade_message_scope(
             message_type, exchange_sequence, recv_us
         )

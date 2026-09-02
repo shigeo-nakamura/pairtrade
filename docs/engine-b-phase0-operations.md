@@ -78,8 +78,8 @@ legitimate trades delivered in separate updates while deduplicating a replayed
 update. A delivery-independent replay alias is also stored as a multiset in
 each live database and seal sidecar: reconnect snapshots consume the existing
 alias count before inserting, so update-to-snapshot replays deduplicate without
-collapsing distinct nonce-scoped updates. A subscribed trade snapshot missing
-an exchange timestamp is rejected before any row is emitted. When an older
+collapsing distinct nonce-scoped updates. Any trade message missing an exchange
+timestamp is rejected before any row is emitted. When an older
 partition contains NULL IDs or obsolete synthetic IDs, the index builder
 reconstructs the current identity and replay alias from stored ordering.
 For a pre-v7 seal sidecar without replay aliases, primary IDs remain usable;
