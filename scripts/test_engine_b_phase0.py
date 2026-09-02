@@ -2229,6 +2229,41 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 connection.close()
             crashed_sink._connections.clear()
 
+            legacy_db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{first_partition}.sqlite3"
+            )
+            try:
+                legacy_db.execute("DROP INDEX idx_data_gap_open_connection")
+                legacy_db.execute("DROP INDEX idx_data_gap_open_order_book")
+                legacy_db.execute("DELETE FROM schema_metadata")
+                legacy_db.execute(
+                    "INSERT INTO schema_metadata VALUES (?, ?)",
+                    (7, connection_started_us),
+                )
+                market = venue.markets[0]
+                for channel in ("connection", "order_book"):
+                    legacy_db.executemany(
+                        """INSERT INTO data_gap(
+                             connection_session_id, venue, market_id, symbol,
+                             channel, ts_start_us, reason
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        [
+                            (
+                                connection_meta["id"],
+                                venue.name,
+                                market.market_id,
+                                market.symbol,
+                                channel,
+                                connection_started_us + offset,
+                                "legacy_duplicate",
+                            )
+                            for offset in (100, 200)
+                        ],
+                    )
+                legacy_db.commit()
+            finally:
+                legacy_db.close()
+
             recovered_sink = engine_b.DatabaseSink(
                 config, "orphan-recovery-run", "orphan-recovery-commit"
             )
@@ -2276,6 +2311,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchone(),
                     (len(venue.markets), connection_started_us, next_hour_us),
                 )
+                self.assertEqual(
+                    first_db.execute(
+                        """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
+                           FROM data_gap WHERE channel = 'order_book'"""
+                    ).fetchone(),
+                    (1, connection_started_us + 100, next_hour_us),
+                )
             finally:
                 first_db.close()
 
@@ -2297,6 +2339,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                                FROM data_gap WHERE channel = 'connection'"""
                         ).fetchone(),
                         (len(venue.markets), start_us, end_us),
+                    )
+                    self.assertEqual(
+                        database.execute(
+                            """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
+                               FROM data_gap WHERE channel = 'order_book'"""
+                        ).fetchone(),
+                        (1, start_us, end_us),
                     )
                 finally:
                     database.close()

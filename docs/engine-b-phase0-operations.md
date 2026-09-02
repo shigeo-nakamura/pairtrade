@@ -195,7 +195,9 @@ activity, and records a connection gap from that point through the replacement
 snapshot. Recovery therefore does not count crash downtime as connected and
 does not depend on the archive timer. A write-ahead continuation marker carries
 every stale open gap across each intervening retained hourly partition before
-the replacement snapshot closes it. If a journal target was already sealed,
+the replacement snapshot closes it. Legacy duplicate open connection/order-book
+gaps are coalesced before those continuation markers are created, preventing
+missing-duration overcount. If a journal target was already sealed,
 the sidecar proves whether that session segment exists; same-process live
 handoffs carry a missing sealed-hour segment into the next retained database as
 `sealed_session_interval` evidence, while restart recovery uses

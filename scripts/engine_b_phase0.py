@@ -1766,6 +1766,19 @@ class DatabaseSink:
                     ).fetchone()
                     if table is None:
                         continue
+                    connection.execute("BEGIN")
+                    connection.execute(
+                        """DELETE FROM data_gap
+                           WHERE ts_end_us IS NULL
+                             AND channel IN ('connection', 'order_book')
+                             AND gap_id NOT IN (
+                               SELECT MIN(gap_id) FROM data_gap
+                               WHERE ts_end_us IS NULL
+                                 AND channel IN ('connection', 'order_book')
+                               GROUP BY venue, market_id, channel
+                             )"""
+                    )
+                    connection.commit()
                     rows = connection.execute(
                         """SELECT connection_session_id, venue,
                                   started_ts_recv_us
