@@ -57,6 +57,23 @@ KRX_ONE_OFF_CLOSURES: dict[str, str] = {
     "2026-07-17": "kr_constitution_day_2026_reinstatement",
 }
 
+# KRX delays the cash-market open (and close) by one hour on the day of the
+# national CSAT/College Scholastic Ability Test (수능) each year, to reduce
+# noise/traffic near exam sites -- an annual practice exchange_calendars does
+# not encode. Korean CSAT naming is offset by academic year (a "2027학년도"
+# exam is administered in November 2026); each entry here is keyed by the
+# calendar date the exam -- and the delay -- actually falls on, with a
+# citable primary/government source.
+KRX_DELAYED_OPEN_ONE_HOUR: dict[str, str] = {
+    # 2027학년도 CSAT, administered 2026-11-19 (Thu).
+    # https://ko.wikipedia.org/wiki/2027학년도_대학수학능력시험
+    "2026-11-19": "kr_csat_delayed_open",
+    # 2028학년도 CSAT, administered 2027-11-18 (Thu); government-confirmed.
+    # https://www.korea.kr/briefing/pressReleaseView.do?newsId=156692078
+    "2027-11-18": "kr_csat_delayed_open",
+}
+_ONE_HOUR_US = 3_600_000_000
+
 
 def _daterange(start: date, end: date):
     current = start
@@ -108,6 +125,9 @@ def build_sessions(start: date, end: date) -> dict[str, dict[str, Any]]:
         if krx_is_open:
             entry["krx_open_utc_us"] = _to_utc_us(krx.session_open(iso))
             entry["krx_close_utc_us"] = _to_utc_us(krx.session_close(iso))
+            if iso in KRX_DELAYED_OPEN_ONE_HOUR:
+                entry["krx_open_utc_us"] += _ONE_HOUR_US
+                entry["krx_close_utc_us"] += _ONE_HOUR_US
         if us_is_open:
             entry["us_open_utc_us"] = _to_utc_us(us.session_open(iso))
             entry["us_close_utc_us"] = _to_utc_us(us.session_close(iso))
@@ -124,11 +144,9 @@ def build_document(start: date, end: date) -> dict[str, Any]:
     # (start, end, exchange_calendars version) so CI can regenerate it and
     # diff byte-for-byte against the committed file. Provenance (when/who)
     # comes from git history instead.
-    applied_overrides = {
-        iso: reason
-        for iso, reason in KRX_ONE_OFF_CLOSURES.items()
-        if start.isoformat() <= iso <= end.isoformat()
-    }
+    def _filter_to_range(overrides: dict[str, str]) -> dict[str, str]:
+        return {iso: reason for iso, reason in overrides.items() if start.isoformat() <= iso <= end.isoformat()}
+
     return {
         "schema_version": 1,
         "calendar_version": f"xkrx-xnys-exchange_calendars-{package_version}-{digest}",
@@ -139,7 +157,8 @@ def build_document(start: date, end: date) -> dict[str, Any]:
         # Not part of `digest` (that hashes only `sessions`), but still part
         # of what CI's byte-for-byte diff verifies -- an audit trail for why
         # a date disagrees with the library's own recurring-holiday rules.
-        "krx_one_off_closures": applied_overrides,
+        "krx_one_off_closures": _filter_to_range(KRX_ONE_OFF_CLOSURES),
+        "krx_delayed_open_one_hour": _filter_to_range(KRX_DELAYED_OPEN_ONE_HOUR),
         "sessions": sessions,
     }
 

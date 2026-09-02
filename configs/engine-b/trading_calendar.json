@@ -1,6 +1,10 @@
 {
-  "calendar_version": "xkrx-xnys-exchange_calendars-4.13.2-2b7c7ed4f263",
+  "calendar_version": "xkrx-xnys-exchange_calendars-4.13.2-c61efe1eb9f1",
   "krx_calendar": "XKRX",
+  "krx_delayed_open_one_hour": {
+    "2026-11-19": "kr_csat_delayed_open",
+    "2027-11-18": "kr_csat_delayed_open"
+  },
   "krx_one_off_closures": {
     "2026-06-03": "kr_local_election_day",
     "2026-07-17": "kr_constitution_day_2026_reinstatement"
@@ -2588,9 +2592,9 @@
       "us_open_utc_us": 1795012200000000
     },
     "2026-11-19": {
-      "krx_close_utc_us": 1795069800000000,
+      "krx_close_utc_us": 1795073400000000,
       "krx_is_open": true,
-      "krx_open_utc_us": 1795046400000000,
+      "krx_open_utc_us": 1795050000000000,
       "us_close_utc_us": 1795122000000000,
       "us_is_open": true,
       "us_open_utc_us": 1795098600000000
@@ -5500,9 +5504,9 @@
       "us_open_utc_us": 1826461800000000
     },
     "2027-11-18": {
-      "krx_close_utc_us": 1826519400000000,
+      "krx_close_utc_us": 1826523000000000,
       "krx_is_open": true,
-      "krx_open_utc_us": 1826496000000000,
+      "krx_open_utc_us": 1826499600000000,
       "us_close_utc_us": 1826571600000000,
       "us_is_open": true,
       "us_open_utc_us": 1826548200000000

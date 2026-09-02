@@ -925,6 +925,18 @@ class TradingCalendar:
             for entry in sessions.values():
                 if not isinstance(entry["krx_is_open"], bool) or not isinstance(entry["us_is_open"], bool):
                     raise TypeError("session entry krx_is_open/us_is_open must be bool")
+                # A NOT NULL open/close timestamp is only required -- and
+                # only meaningful -- on the side that is actually open;
+                # write_provisional_session indexes these fields directly
+                # once a date resolves, so a missing/wrong-typed value here
+                # must reject the whole load rather than surface later as a
+                # KeyError or a NULL into trading_session's NOT NULL columns.
+                if entry["krx_is_open"] and (
+                    not isinstance(entry["krx_open_utc_us"], int) or not isinstance(entry["krx_close_utc_us"], int)
+                ):
+                    raise TypeError("krx_is_open session entry missing/invalid krx_open_utc_us/krx_close_utc_us")
+                if entry["us_is_open"] and not isinstance(entry["us_open_utc_us"], int):
+                    raise TypeError("us_is_open session entry missing/invalid us_open_utc_us")
             return cls(calendar_version=calendar_version, sessions=sessions)
         except (OSError, ValueError, KeyError, TypeError):
             LOG.exception("Failed to load trading calendar from %s; A-7 remains unresolved", path)

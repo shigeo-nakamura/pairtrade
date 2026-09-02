@@ -66,16 +66,32 @@ stable; the US cash market's `America/New_York` session shifts by an hour
 across the EDT/EST boundary, which `exchange_calendars` resolves correctly
 from the IANA tzdb without any special-casing here.
 
-`exchange_calendars`' recurring-holiday rules can still miss a one-off
-administrative KRX closure announced separately (2026-06-03 Local Election
-Day and 2026-07-17 Constitution Day both required this: the library marked
-them open). `scripts/engine_b_trading_calendar_freeze.py`'s
-`KRX_ONE_OFF_CLOSURES` dict overrides specific dates with a citable source
-comment for each; the generated document's `krx_one_off_closures` field
-records which overrides applied within a given `--start`/`--end`. Before
-trusting a freeze for gate evaluation (G0-8 needs A-7 resolved), cross-check
-the covered years against KRX's own published holiday notice and extend
-`KRX_ONE_OFF_CLOSURES` for anything the library still gets wrong.
+`exchange_calendars`' recurring-holiday rules can still miss KRX-specific
+adjustments announced or scheduled separately from the library's own table.
+Two kinds are known so far, each with its own override dict in
+`scripts/engine_b_trading_calendar_freeze.py` (a citable primary source is
+required per entry, and the generated document records which overrides
+applied within a given `--start`/`--end`, in `krx_one_off_closures` /
+`krx_delayed_open_one_hour` respectively):
+
+- **Full closures** (`KRX_ONE_OFF_CLOSURES`): an administrative holiday the
+  library marked open. 2026-06-03 (Local Election Day) and 2026-07-17
+  (Constitution Day, reinstated for 2026) both required this.
+- **One-hour delayed open** (`KRX_DELAYED_OPEN_ONE_HOUR`): KRX shifts the
+  cash-market session to 10:00-16:30 KST (from the normal 09:00-15:30) on the
+  day of the national CSAT exam each year, which the library does not encode
+  at all -- it reports the normal hours. 2026-11-19 and 2027-11-18 (the CSAT
+  dates falling in the current frozen range) both required this. Korean CSAT
+  naming is offset by academic year (a "2027학년도" exam is administered in
+  November 2026); resolve the actual calendar date, not the label, before
+  adding a new year's entry.
+
+Before trusting a freeze for gate evaluation (G0-8 needs A-7 resolved),
+cross-check the covered years against KRX's own published holiday/session
+notice and extend the relevant override dict for anything the library still
+gets wrong -- both of the above were caught by review, not by this process
+catching them itself, so treat the two dicts as a known-incomplete starting
+point rather than an exhaustive audit.
 
 **Re-freezing** (extend the covered date range, pick up an
 `exchange_calendars` release, or after cross-checking a specific year against

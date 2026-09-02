@@ -59,6 +59,20 @@ class BuildSessionsTests(unittest.TestCase):
             # US cash market is unaffected by a Korean administrative holiday.
             self.assertTrue(entry["us_is_open"])
 
+    def test_csat_delayed_open_shifts_krx_hours_by_one_hour(self) -> None:
+        sessions = freeze.build_sessions(date(2026, 11, 1), date(2027, 12, 1))
+        for iso in freeze.KRX_DELAYED_OPEN_ONE_HOUR:
+            entry = sessions[iso]
+            self.assertTrue(entry["krx_is_open"], f"{iso} should still be a KRX session, just delayed")
+            open_seconds_of_day = (entry["krx_open_utc_us"] // 1_000_000) % 86_400
+            close_seconds_of_day = (entry["krx_close_utc_us"] // 1_000_000) % 86_400
+            self.assertEqual(open_seconds_of_day, 3600)  # 01:00 UTC = 10:00 KST
+            self.assertEqual(close_seconds_of_day, 7 * 3600 + 1800)  # 07:30 UTC = 16:30 KST
+            # US cash market is unaffected by a Korean exam-day adjustment
+            # (9:30am America/New_York, EST or EDT depending on the date).
+            self.assertTrue(entry["us_is_open"])
+            self.assertIn((entry["us_open_utc_us"] // 1_000_000) % 86_400, (13 * 3600 + 1800, 14 * 3600 + 1800))
+
     def test_dst_shifts_us_open_hour_but_not_krx(self) -> None:
         sessions = freeze.build_sessions(date(2026, 1, 5), date(2026, 7, 6))
         winter_us_open = sessions["2026-01-05"]["us_open_utc_us"]
@@ -91,6 +105,15 @@ class BuildDocumentTests(unittest.TestCase):
         )
         before = freeze.build_document(date(2026, 1, 1), date(2026, 5, 31))
         self.assertEqual(before["krx_one_off_closures"], {})
+
+    def test_krx_delayed_open_field_is_range_filtered(self) -> None:
+        containing = freeze.build_document(date(2026, 1, 1), date(2027, 12, 31))
+        self.assertEqual(
+            containing["krx_delayed_open_one_hour"],
+            {"2026-11-19": "kr_csat_delayed_open", "2027-11-18": "kr_csat_delayed_open"},
+        )
+        only_2026 = freeze.build_document(date(2026, 1, 1), date(2026, 12, 31))
+        self.assertEqual(only_2026["krx_delayed_open_one_hour"], {"2026-11-19": "kr_csat_delayed_open"})
 
     def test_range_shrink_changes_calendar_version(self) -> None:
         wide = freeze.build_document(date(2026, 1, 1), date(2026, 12, 31))

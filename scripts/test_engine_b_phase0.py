@@ -961,9 +961,30 @@ class TradingCalendarLoadTests(unittest.TestCase):
             "schema_version": 1,
             "calendar_version": "xkrx-xnys-exchange_calendars-TEST-abc123",
             "sessions": {
-                "2026-09-02": {"krx_is_open": True, "us_is_open": True},
-                "2026-09-07": {"krx_is_open": True, "us_is_open": False},
-                "2026-01-01": {"krx_is_open": False, "us_is_open": False},
+                "2026-09-02": {
+                    "krx_is_open": True,
+                    "krx_open_utc_us": 1788307200000000,
+                    "krx_close_utc_us": 1788330600000000,
+                    "us_is_open": True,
+                    "us_open_utc_us": 1788355800000000,
+                    "us_close_utc_us": 1788379200000000,
+                },
+                "2026-09-07": {
+                    "krx_is_open": True,
+                    "krx_open_utc_us": 1788739200000000,
+                    "krx_close_utc_us": 1788762600000000,
+                    "us_is_open": False,
+                    "us_open_utc_us": None,
+                    "us_close_utc_us": None,
+                },
+                "2026-01-01": {
+                    "krx_is_open": False,
+                    "krx_open_utc_us": None,
+                    "krx_close_utc_us": None,
+                    "us_is_open": False,
+                    "us_open_utc_us": None,
+                    "us_close_utc_us": None,
+                },
             },
         }
         path = tmp_path / "trading_calendar.json"
@@ -998,13 +1019,82 @@ class TradingCalendarLoadTests(unittest.TestCase):
             )
             self.assertIsNone(engine_b.TradingCalendar.load(path))
 
+    def test_load_rejects_open_krx_session_missing_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "calendar_version": "xkrx-xnys-exchange_calendars-TEST-bad",
+                        "sessions": {
+                            "2026-09-02": {
+                                "krx_is_open": True,
+                                "krx_open_utc_us": None,
+                                "krx_close_utc_us": None,
+                                "us_is_open": True,
+                                "us_open_utc_us": 1,
+                                "us_close_utc_us": 2,
+                            }
+                        },
+                    }
+                )
+            )
+            self.assertIsNone(engine_b.TradingCalendar.load(path))
+
+    def test_load_rejects_open_us_session_missing_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "calendar_version": "xkrx-xnys-exchange_calendars-TEST-bad",
+                        "sessions": {
+                            "2026-09-02": {
+                                "krx_is_open": False,
+                                "krx_open_utc_us": None,
+                                "krx_close_utc_us": None,
+                                "us_is_open": True,
+                                "us_open_utc_us": None,
+                                "us_close_utc_us": None,
+                            }
+                        },
+                    }
+                )
+            )
+            self.assertIsNone(engine_b.TradingCalendar.load(path))
+
+    def test_load_accepts_closed_session_with_null_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "calendar_version": "xkrx-xnys-exchange_calendars-TEST-ok",
+                        "sessions": {
+                            "2026-01-01": {
+                                "krx_is_open": False,
+                                "krx_open_utc_us": None,
+                                "krx_close_utc_us": None,
+                                "us_is_open": False,
+                                "us_open_utc_us": None,
+                                "us_close_utc_us": None,
+                            }
+                        },
+                    }
+                )
+            )
+            self.assertIsNotNone(engine_b.TradingCalendar.load(path))
+
     def test_load_and_resolve_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_fixture(Path(tmp))
             calendar = engine_b.TradingCalendar.load(path)
             self.assertIsNotNone(calendar)
             self.assertEqual(calendar.calendar_version, "xkrx-xnys-exchange_calendars-TEST-abc123")
-            self.assertEqual(calendar.resolve(date(2026, 9, 2)), {"krx_is_open": True, "us_is_open": True})
+            resolved = calendar.resolve(date(2026, 9, 2))
+            self.assertIsNotNone(resolved)
+            self.assertTrue(resolved["krx_is_open"])
+            self.assertTrue(resolved["us_is_open"])
             self.assertIsNone(calendar.resolve(date(2030, 1, 1)))
 
 
@@ -1195,7 +1285,16 @@ class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
         fixture = {
             "schema_version": 1,
             "calendar_version": "xkrx-xnys-exchange_calendars-TEST-expired",
-            "sessions": {"2020-01-01": {"krx_is_open": True, "us_is_open": True}},
+            "sessions": {
+                "2020-01-01": {
+                    "krx_is_open": True,
+                    "krx_open_utc_us": 0,
+                    "krx_close_utc_us": 1,
+                    "us_is_open": True,
+                    "us_open_utc_us": 0,
+                    "us_close_utc_us": 1,
+                }
+            },
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "trading_calendar.json"
