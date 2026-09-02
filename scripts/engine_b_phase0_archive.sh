@@ -210,7 +210,7 @@ try:
         ).fetchall()
         for gap_id, venue, market_id, symbol, channel, expected, observed, reason in rows:
             marker = {
-                "continuation_id": f"archive:{sys.argv[2]}:{gap_id}",
+                "continuation_id": f"partition:{sys.argv[2]}:{gap_id}",
                 "start_us": partition_end_us,
                 "venue": venue,
                 "market_id": market_id,
@@ -219,6 +219,8 @@ try:
                 "expected_sequence": expected,
                 "observed_sequence": observed,
                 "reason": reason,
+                "source_partition": sys.argv[2],
+                "source_gap_id": gap_id,
             }
             marker_path = marker_dir / f"{sys.argv[2]}-{gap_id}.json"
             encoded = json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
@@ -233,6 +235,11 @@ try:
                     os.fsync(output.fileno())
                 os.chmod(temporary, 0o640)
                 os.replace(temporary, marker_path)
+                directory_fd = os.open(marker_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         connection.execute(
             """UPDATE data_gap
                SET ts_end_us = MAX(ts_start_us, ?)

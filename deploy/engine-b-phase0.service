@@ -16,6 +16,11 @@ Environment=PYTHONUNBUFFERED=1
 Environment=ENGINE_B_PHASE0_CONFIG=/opt/engine-b-phase0/phase0.json
 Environment=ENGINE_B_PHASE0_REQUIREMENTS_LOCK=/opt/engine-b-phase0/requirements.txt
 EnvironmentFile=-/opt/engine-b-phase0/release.env
+# A delayed first restart may follow an installer run while the legacy
+# ec2-user collector is still creating state. Repair the complete tree only
+# after systemd has stopped that process and before the dedicated user starts.
+ExecStartPre=+/usr/bin/chgrp -R engine-b-phase0 /var/lib/engine-b-phase0
+ExecStartPre=+/usr/bin/chmod -R g+rwX,o-rwx /var/lib/engine-b-phase0
 ExecStartPre=/usr/bin/env /opt/engine-b-phase0/venv/bin/python /opt/engine-b-phase0/engine_b_phase0.py --validate-config
 ExecStart=/usr/bin/env /opt/engine-b-phase0/venv/bin/python /opt/engine-b-phase0/engine_b_phase0.py
 Restart=on-failure

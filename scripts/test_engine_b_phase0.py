@@ -323,6 +323,14 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn("InaccessiblePaths=/opt/debot", unit)
             self.assertNotIn("User=ec2-user", unit)
         self.assertIn("ProtectProc=invisible", observer)
+        self.assertIn(
+            "ExecStartPre=+/usr/bin/chgrp -R engine-b-phase0 /var/lib/engine-b-phase0",
+            observer,
+        )
+        self.assertIn(
+            "ExecStartPre=+/usr/bin/chmod -R g+rwX,o-rwx /var/lib/engine-b-phase0",
+            observer,
+        )
         self.assertNotIn("ExecStart=/bin/bash /opt/debot/", observer)
         self.assertNotIn("ExecStart=/bin/bash /opt/debot/", archive)
         self.assertIn('useradd --system --gid "$SERVICE_GROUP"', installer)
@@ -750,6 +758,115 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 db.close()
+
+    async def test_partition_gap_marker_survives_failed_continuation_write(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            gap_started_us = hour_start_us + 3_500_000_000
+            next_hour_us = hour_start_us + 3_600_000_000
+            recovered_us = next_hour_us + 200_000_000
+            first_partition = engine_b.partition_for_us(hour_start_us)
+            second_partition = engine_b.partition_for_us(next_hour_us)
+            sink = engine_b.DatabaseSink(config, "crash-run", "crash-commit")
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            gap = {
+                "recv_us": gap_started_us,
+                "connection_id": None,
+                "venue": "robinhood",
+                "market_id": 37,
+                "symbol": "SKHY",
+                "channel": "connection",
+                "reason": "connection_error:TimeoutError",
+            }
+            with mock.patch.object(engine_b, "now_us", return_value=gap_started_us):
+                sink._write_batch([("gap", gap)])
+
+            original_write_partition = sink._write_partition
+
+            def fail_continuation_write(
+                partition: str, commands: list[tuple[str, dict[str, object]]]
+            ) -> None:
+                if partition == second_partition:
+                    self.assertEqual(
+                        len(list(sink.gap_continuation_dir.glob("*.json"))), 1
+                    )
+                    raise RuntimeError("simulated continuation write failure")
+                original_write_partition(partition, commands)
+
+            with (
+                mock.patch.object(engine_b, "now_us", return_value=next_hour_us + 1),
+                mock.patch.object(sink, "_write_partition", fail_continuation_write),
+                self.assertRaisesRegex(RuntimeError, "simulated continuation"),
+            ):
+                sink._write_batch([])
+            self.assertEqual(len(list(sink.gap_continuation_dir.glob("*.json"))), 1)
+            await sink.close()
+
+            recovered_sink = engine_b.DatabaseSink(
+                config, "recovered-run", "recovered-commit"
+            )
+            for path in (
+                database_dir,
+                recovered_sink.sealed_dir,
+                recovered_sink.lock_dir,
+                recovered_sink.gap_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                recovered_sink._write_batch(
+                    [
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                            },
+                        )
+                    ]
+                )
+            self.assertEqual(list(recovered_sink.gap_continuation_dir.glob("*.json")), [])
+            await recovered_sink.close()
+
+            first_db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{first_partition}.sqlite3"
+            )
+            second_db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{second_partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    first_db.execute(
+                        "SELECT ts_start_us, ts_end_us FROM data_gap"
+                    ).fetchall(),
+                    [(gap_started_us, next_hour_us)],
+                )
+                self.assertEqual(
+                    second_db.execute(
+                        """SELECT ts_start_us, ts_end_us, continuation_id
+                           FROM data_gap"""
+                    ).fetchall(),
+                    [
+                        (
+                            next_hour_us,
+                            recovered_us,
+                            f"partition:{first_partition}:1",
+                        )
+                    ],
+                )
+            finally:
+                first_db.close()
+                second_db.close()
 
 
     async def test_deduplicates_and_merges_late_trades_in_event_partition(self) -> None:

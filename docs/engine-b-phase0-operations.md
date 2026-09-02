@@ -115,6 +115,13 @@ full Git commit to `/opt/engine-b-phase0/release.env`. It runs
 Robinhood deploy workflow stages the units and passes `GITHUB_SHA`; for a
 manual install, provide both values explicitly.
 
+The first operator-controlled restart also completes the identity handoff.
+After systemd stops the legacy `ec2-user` observer, root-privileged pre-start
+commands repair the group and mode of the entire state tree before config
+validation runs as `engine-b-phase0`. This covers files created by the legacy
+process after the installer ran; do not remove those pre-start commands until
+the handoff has completed.
+
 ```bash
 sudo dnf install -y python3.11 python3.11-pip
 sudo env \
@@ -147,10 +154,11 @@ recorded as incomplete sequence gaps and force a public-channel resubscribe;
 they never produce reconstructed top-of-book rows.
 Open connection/order-book gap rows are closed when a replacement snapshot
 restores synchronization, including rows retained in an earlier hourly DB. The
-collector carries an open gap into each new hourly partition. If the collector
-is unavailable, the archiver writes a durable continuation marker before it
-bounds the old row; the next collector batch imports that marker idempotently
-before processing a recovery snapshot.
+collector and archiver both fsync a write-ahead continuation marker before
+bounding an old row. The next collector batch completes any interrupted source
+close, imports the marker into its fixed destination partition idempotently,
+and only then removes it. A recovery snapshot therefore cannot undercount an
+open gap across a crash or hourly rotation.
 
 ## `freq2` account record
 

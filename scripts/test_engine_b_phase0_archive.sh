@@ -272,8 +272,10 @@ python3 - "$continuation_marker" <<'PY'
 import json
 import sys
 marker = json.load(open(sys.argv[1]))
-assert marker["continuation_id"] == "archive:20000101_00:1"
+assert marker["continuation_id"] == "partition:20000101_00:1"
 assert marker["start_us"] == 946_688_400_000_000
+assert marker["source_partition"] == "20000101_00"
+assert marker["source_gap_id"] == 1
 PY
 python3 - "$seal" "$trade_index" "$expected_sha" <<'PY'
 import json

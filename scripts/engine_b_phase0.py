@@ -1123,6 +1123,56 @@ class DatabaseSink:
             connection.rollback()
             raise
 
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _persist_gap_continuation_marker(
+        self, payload: dict[str, Any]
+    ) -> Path:
+        marker = {
+            "continuation_id": payload["continuation_id"],
+            "start_us": payload["start_us"],
+            "venue": payload["venue"],
+            "market_id": payload["market_id"],
+            "symbol": payload["symbol"],
+            "channel": payload["channel"],
+            "expected_sequence": payload.get("expected_sequence"),
+            "observed_sequence": payload.get("observed_sequence"),
+            "reason": payload["reason"],
+            "source_partition": payload["source_partition"],
+            "source_gap_id": payload["source_gap_id"],
+        }
+        encoded = json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
+        marker_name = hashlib.sha256(
+            marker["continuation_id"].encode("utf-8")
+        ).hexdigest()
+        marker_path = self.gap_continuation_dir / f"{marker_name}.json"
+        if marker_path.exists():
+            if marker_path.read_text() != encoded:
+                raise RuntimeError(
+                    f"gap continuation marker mismatch: {marker_path}"
+                )
+            return marker_path
+        temporary = marker_path.with_name(
+            f".{marker_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with temporary.open("w") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, 0o640)
+            os.replace(temporary, marker_path)
+            self._fsync_directory(self.gap_continuation_dir)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return marker_path
+
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         gap_closes: list[dict[str, Any]] = []
@@ -1177,11 +1227,13 @@ class DatabaseSink:
                     raise RuntimeError(f"active late-trade partition is sealed: {late_partition}")
                 self._write_partition(late_partition, late_commands)
 
-        current_partition = partition_for_us(now_us())
+        write_us = now_us()
+        current_partition = partition_for_us(write_us)
         gap_continuations: list[tuple[str, dict[str, Any]]] = []
+        created_gap_markers: list[Path] = []
         for partition, connection in list(self._connections.items()):
             with self._partition_lock(partition):
-                self._finalize_ohlcv(connection, now_us())
+                self._finalize_ohlcv(connection, write_us)
                 if partition < current_partition:
                     partition_ended_us = partition_start_us(partition) + 3_600_000_000
                     for row in connection.execute(
@@ -1190,22 +1242,28 @@ class DatabaseSink:
                            FROM data_gap WHERE ts_end_us IS NULL"""
                     ):
                         gap_id, venue, market_id, symbol, channel, expected, observed, reason = row
+                        continuation = {
+                            "recv_us": write_us,
+                            "start_us": partition_ended_us,
+                            "connection_id": None,
+                            "venue": venue,
+                            "market_id": market_id,
+                            "symbol": symbol,
+                            "channel": channel,
+                            "expected_sequence": expected,
+                            "observed_sequence": observed,
+                            "continuation_id": f"partition:{partition}:{gap_id}",
+                            "reason": reason,
+                            "source_partition": partition,
+                            "source_gap_id": gap_id,
+                        }
+                        created_gap_markers.append(
+                            self._persist_gap_continuation_marker(continuation)
+                        )
                         gap_continuations.append(
                             (
                                 "gap",
-                                {
-                                    "recv_us": now_us(),
-                                    "start_us": partition_ended_us,
-                                    "connection_id": None,
-                                    "venue": venue,
-                                    "market_id": market_id,
-                                    "symbol": symbol,
-                                    "channel": channel,
-                                    "expected_sequence": expected,
-                                    "observed_sequence": observed,
-                                    "continuation_id": f"partition:{partition}:{gap_id}",
-                                    "reason": reason,
-                                },
+                                continuation,
                             )
                         )
                     connection.execute(
@@ -1227,8 +1285,73 @@ class DatabaseSink:
         if gap_continuations:
             with self._partition_lock(current_partition):
                 self._write_partition(current_partition, gap_continuations)
-        for marker_path, _ in recovered_gap_markers:
+        marker_paths = [
+            *(marker_path for marker_path, _ in recovered_gap_markers),
+            *created_gap_markers,
+        ]
+        for marker_path in dict.fromkeys(marker_paths):
             marker_path.unlink(missing_ok=True)
+        if marker_paths:
+            self._fsync_directory(self.gap_continuation_dir)
+
+    def _complete_gap_source_close(self, marker: dict[str, Any]) -> None:
+        source_partition = marker.get("source_partition")
+        source_gap_id = marker.get("source_gap_id")
+        if source_partition is None and source_gap_id is None:
+            return
+        if not isinstance(source_partition, str) or not isinstance(source_gap_id, int):
+            raise RuntimeError("gap continuation source identity is invalid")
+        try:
+            if partition_for_us(partition_start_us(source_partition)) != source_partition:
+                raise ValueError(source_partition)
+        except ValueError as exc:
+            raise RuntimeError("gap continuation source partition is invalid") from exc
+        if self._is_partition_sealed(source_partition):
+            return
+        database_path = (
+            self.config.database_dir
+            / f"engine_b_phase0_{source_partition}.sqlite3"
+        )
+        if not database_path.is_file():
+            return
+        with self._partition_lock(source_partition):
+            connection = self._connections.get(source_partition)
+            borrowed = connection is not None
+            if connection is None:
+                try:
+                    connection = sqlite3.connect(
+                        f"file:{database_path}?mode=rw", uri=True, timeout=5
+                    )
+                except sqlite3.OperationalError as exc:
+                    if not database_path.exists():
+                        return
+                    raise RuntimeError(
+                        f"gap continuation source is unreadable: {database_path}"
+                    ) from exc
+            try:
+                boundary_us = int(marker["start_us"])
+                connection.execute("BEGIN")
+                connection.execute(
+                    """UPDATE data_gap SET ts_end_us = MAX(ts_start_us, ?)
+                       WHERE gap_id = ? AND ts_end_us IS NULL""",
+                    (boundary_us, source_gap_id),
+                )
+                connection.execute(
+                    """UPDATE ws_connection
+                       SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
+                           end_reason = 'partition_rotation'
+                       WHERE ended_ts_recv_us IS NULL""",
+                    (boundary_us,),
+                )
+                connection.commit()
+            except sqlite3.DatabaseError as exc:
+                connection.rollback()
+                raise RuntimeError(
+                    f"gap continuation source is unreadable: {database_path}"
+                ) from exc
+            finally:
+                if not borrowed:
+                    connection.close()
 
     def _load_gap_continuations(self) -> list[tuple[Path, dict[str, Any]]]:
         if not self.gap_continuation_dir.is_dir():
@@ -1254,9 +1377,11 @@ class DatabaseSink:
                 raise RuntimeError(
                     f"gap continuation marker is invalid: {marker_path}"
                 )
+            self._complete_gap_source_close(marker)
             payload = dict(marker)
             payload["recv_us"] = now_us()
             payload["connection_id"] = None
+            payload["partition_us"] = int(marker["start_us"])
             recovered.append((marker_path, payload))
         return recovered
 
