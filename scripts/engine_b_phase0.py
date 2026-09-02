@@ -2453,7 +2453,8 @@ class DatabaseSink:
         elif kind == "connection_end":
             connection.execute(
                 """UPDATE ws_connection SET ended_ts_recv_us = ?, end_reason = ?
-                   WHERE connection_session_id = ?""",
+                   WHERE connection_session_id = ?
+                     AND ended_ts_recv_us IS NULL""",
                 (payload["recv_us"], payload["reason"], payload["connection"]["id"]),
             )
         elif kind == "book":

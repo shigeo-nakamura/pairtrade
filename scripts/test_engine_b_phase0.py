@@ -2026,6 +2026,82 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 source.close()
                 destination.close()
 
+    async def test_replayed_session_end_preserves_actual_close(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            started_us = 1_700_000_000_000_000
+            actual_end_us = started_us + 10_000_000
+            replay_end_us = actual_end_us + 300_000_000
+            connection = {
+                "id": "completed-before-marker-unlink",
+                "venue": "robinhood",
+                "started_us": started_us,
+                "api_schema_version": config.api_schema_version,
+            }
+            sink = engine_b.DatabaseSink(
+                config, "completed-handoff-run", "completed-handoff-commit"
+            )
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(
+                engine_b, "now_us", return_value=actual_end_us
+            ):
+                sink._write_batch(
+                    [
+                        (
+                            "connection_start",
+                            {"recv_us": started_us, "connection": connection},
+                        ),
+                        (
+                            "connection_end",
+                            {
+                                "recv_us": actual_end_us,
+                                "reason": "normal_stop",
+                                "connection": connection,
+                            },
+                        ),
+                    ]
+                )
+            with mock.patch.object(
+                engine_b, "now_us", return_value=replay_end_us
+            ):
+                sink._write_batch(
+                    [
+                        (
+                            "connection_end",
+                            {
+                                "recv_us": replay_end_us,
+                                "reason": "collector_restart_recovery",
+                                "connection": connection,
+                            },
+                        )
+                    ]
+                )
+            await sink.close()
+
+            database = sqlite3.connect(
+                database_dir
+                / f"engine_b_phase0_{engine_b.partition_for_us(started_us)}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    database.execute(
+                        """SELECT ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (actual_end_us, "normal_stop"),
+                )
+            finally:
+                database.close()
+
     async def test_startup_discovers_orphaned_session_without_archive_timer(
         self,
     ) -> None:
