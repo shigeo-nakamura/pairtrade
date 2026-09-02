@@ -572,7 +572,11 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-fn event_record(
+/// Build a self-consistent record for `event`, chained onto
+/// `previous_chain_sha256`. `verify_record` is this function's inverse.
+/// Exposed alongside it so tests/tools building a standalone or exported
+/// record don't have to duplicate the hashing scheme.
+pub fn event_record(
     event: &ArcusSpotRuntimeEvent,
     previous_chain_sha256: Option<String>,
 ) -> Result<ArcusSpotLiveTickEventRecord> {
@@ -639,7 +643,13 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn verify_record(record: &ArcusSpotLiveTickEventRecord) -> Result<ArcusSpotRuntimeEvent> {
+/// Verify one record's self-consistency (event hash, chain-link hash, schema
+/// version) and parse its payload. Exposed for standalone verification of an
+/// exported/archived record outside the append-only on-host stream, where
+/// there is no adjacent record to check chain continuity against -- callers
+/// needing full continuity across a range still go through
+/// `ArcusSpotLiveTickEventStream`/the archive fetch-and-verify pipeline.
+pub fn verify_record(record: &ArcusSpotLiveTickEventRecord) -> Result<ArcusSpotRuntimeEvent> {
     if record.schema_version != EVENT_STREAM_SCHEMA_VERSION {
         bail!(
             "unsupported Arcus event-stream schema {}",
