@@ -947,9 +947,13 @@ class BookState:
         rows: list[tuple[str, int, str, str]] = []
         for side_key, side in (("bids", "bid"), ("asks", "ask")):
             for index, level in enumerate(payload.get(side_key, [])):
-                rows.append(
-                    (side, index, canonical_decimal(level["price"]), canonical_decimal(level["size"]))
-                )
+                price = canonical_decimal(level["price"])
+                size = canonical_decimal(level["size"])
+                if Decimal(price) <= 0 or Decimal(size) < 0:
+                    raise RuntimeError(
+                        "non-positive book price or negative book size"
+                    )
+                rows.append((side, index, price, size))
         return rows
 
     @staticmethod
@@ -1052,6 +1056,7 @@ class DatabaseSink:
         self.sealed_dir = self.state_dir / "sealed"
         self.lock_dir = self.state_dir / "locks"
         self.gap_continuation_dir = self.state_dir / "gap-continuations"
+        self.gap_close_dir = self.state_dir / "gap-closes"
         self.session_continuation_dir = self.state_dir / "session-continuations"
         self._startup_recovery_pending = True
         self._task: asyncio.Task[None] | None = None
@@ -1063,6 +1068,7 @@ class DatabaseSink:
             self.sealed_dir,
             self.lock_dir,
             self.gap_continuation_dir,
+            self.gap_close_dir,
             self.session_continuation_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -1289,11 +1295,22 @@ class DatabaseSink:
             partition_ended_us,
         )
         connection.execute(
-            """INSERT OR IGNORE INTO ws_connection(
+            """INSERT INTO ws_connection(
                  connection_session_id, venue, channel, started_ts_recv_us,
                  last_activity_ts_recv_us, ended_ts_recv_us,
                  api_schema_version, end_reason, is_physical
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(connection_session_id) DO UPDATE SET
+                 venue = excluded.venue,
+                 channel = excluded.channel,
+                 started_ts_recv_us = excluded.started_ts_recv_us,
+                 last_activity_ts_recv_us = excluded.last_activity_ts_recv_us,
+                 ended_ts_recv_us = NULL,
+                 api_schema_version = excluded.api_schema_version,
+                 end_reason = NULL,
+                 is_physical = 1
+               WHERE ws_connection.is_physical = 0
+                 AND excluded.is_physical = 1""",
             (
                 meta["id"],
                 meta["venue"],
@@ -1741,6 +1758,58 @@ class DatabaseSink:
             temporary.unlink(missing_ok=True)
         return marker_path
 
+    def _persist_gap_close_marker(self, payload: dict[str, Any]) -> Path:
+        marker = {
+            "recv_us": int(payload["recv_us"]),
+            "venue": str(payload["venue"]),
+            "market_id": int(payload["market_id"]),
+        }
+        encoded = json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
+        marker_name = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        self.gap_close_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.gap_close_dir, 0o750)
+        marker_path = self.gap_close_dir / f"{marker_name}.json"
+        if marker_path.exists():
+            if marker_path.read_text() != encoded:
+                raise RuntimeError(f"gap-close marker mismatch: {marker_path}")
+            return marker_path
+        temporary = marker_path.with_name(
+            f".{marker_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with temporary.open("w") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, 0o640)
+            os.replace(temporary, marker_path)
+            self._fsync_directory(self.gap_close_dir)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return marker_path
+
+    def _load_gap_closes(self) -> list[tuple[Path, dict[str, Any]]]:
+        if not self.gap_close_dir.is_dir():
+            return []
+        recovered: list[tuple[Path, dict[str, Any]]] = []
+        for marker_path in sorted(self.gap_close_dir.glob("*.json")):
+            try:
+                marker = json.loads(marker_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"gap-close marker is unreadable: {marker_path}"
+                ) from exc
+            if (
+                not isinstance(marker, dict)
+                or set(marker) != {"recv_us", "venue", "market_id"}
+                or not isinstance(marker["recv_us"], int)
+                or not isinstance(marker["venue"], str)
+                or not isinstance(marker["market_id"], int)
+            ):
+                raise RuntimeError(f"gap-close marker is invalid: {marker_path}")
+            recovered.append((marker_path, marker))
+        return recovered
+
     def _persist_session_continuation_marker(
         self, payload: dict[str, Any]
     ) -> Path:
@@ -2026,7 +2095,11 @@ class DatabaseSink:
 
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
-        gap_closes: list[dict[str, Any]] = []
+        recovered_gap_close_markers = dict(self._load_gap_closes())
+        gap_close_markers = dict(recovered_gap_close_markers)
+        for kind, payload in batch:
+            if kind == "gap_close":
+                gap_close_markers[self._persist_gap_close_marker(payload)] = payload
         recovered_session_markers = self._load_session_continuations()
         if self._startup_recovery_pending:
             recovered_us = now_us()
@@ -2059,11 +2132,16 @@ class DatabaseSink:
             *batch,
         ]
         ordered_gap_close_us: dict[tuple[str, int], int] = {}
+        for payload in recovered_gap_close_markers.values():
+            key = (payload["venue"], payload["market_id"])
+            ordered_gap_close_us[key] = max(
+                ordered_gap_close_us.get(key, int(payload["recv_us"])),
+                int(payload["recv_us"]),
+            )
         for kind, payload in batch:
             if kind == "__stop__":
                 continue
             if kind == "gap_close":
-                gap_closes.append(payload)
                 ordered_gap_close_us[
                     (payload["venue"], payload["market_id"])
                 ] = int(payload["recv_us"])
@@ -2284,9 +2362,13 @@ class DatabaseSink:
                 self._finalize_ohlcv(connection, write_us)
                 connection.commit()
 
-        for payload in gap_closes:
+        for payload in gap_close_markers.values():
             self._close_open_gaps(payload)
 
+        for marker_path in gap_close_markers:
+            marker_path.unlink(missing_ok=True)
+        if gap_close_markers:
+            self._fsync_directory(self.gap_close_dir)
         for marker_path in dict.fromkeys(marker_paths):
             marker_path.unlink(missing_ok=True)
         if marker_paths:
@@ -3192,6 +3274,7 @@ class Collector:
         if market is None:
             return
         payload = message.get("order_book", {})
+        levels = BookState.raw_levels(payload)
         state = self.books.setdefault((venue.name, market_id), BookState())
         message_type = message["type"]
         local_sequence = self.next_sequence(venue.name, "order_book", market_id)
@@ -3215,7 +3298,7 @@ class Collector:
                 "exchange_offset": str(payload["offset"]) if payload.get("offset") is not None else None,
                 "local_sequence": local_sequence,
                 "complete": complete,
-                "levels": BookState.raw_levels(payload),
+                "levels": levels,
             },
         )
         if event_kind == "snapshot":

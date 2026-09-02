@@ -169,6 +169,45 @@ class BookStateTests(unittest.TestCase):
 
 
 class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_negative_book_size_rejects_entire_message_before_enqueue(
+        self,
+    ) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        ws = FakeWebSocket()
+        connection = {
+            "id": "negative-book-size",
+            "venue": venue.name,
+            "started_us": 1_774_884_000_000_000,
+            "api_schema_version": config.api_schema_version,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "negative book size"):
+            await collector.handle_book(
+                ws,
+                venue,
+                connection,
+                {
+                    "type": "subscribed/order_book",
+                    "channel": "order_book/37",
+                    "order_book": {
+                        "nonce": 10,
+                        "bids": [
+                            {"price": "100", "size": "1"},
+                            {"price": "99", "size": "-0.1"},
+                        ],
+                        "asks": [{"price": "101", "size": "1"}],
+                    },
+                },
+                1_774_884_082_400_000,
+            )
+
+        self.assertEqual(sink.commands, [])
+        self.assertNotIn((venue.name, 37), collector.books)
+        self.assertEqual(dict(collector.local_sequences), {})
+
     async def test_missing_snapshot_nonce_never_emits_reconstruction(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         venue = next(item for item in config.venues if item.name == "robinhood")
@@ -1439,6 +1478,147 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 db.close()
                 recovered_db.close()
 
+    async def test_gap_close_intent_survives_crash_after_snapshot_commit(
+        self,
+    ) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            gap_started_us = hour_start_us + 10_000_000
+            recovered_us = gap_started_us + 20_000_000
+            connection = {
+                "id": "gap-close-crash",
+                "venue": "robinhood",
+                "started_us": gap_started_us,
+                "api_schema_version": config.api_schema_version,
+            }
+            crashed_sink = engine_b.DatabaseSink(
+                config, "gap-close-source", "gap-close-commit"
+            )
+            crashed_sink._startup_recovery_pending = False
+            for path in (
+                database_dir,
+                crashed_sink.sealed_dir,
+                crashed_sink.lock_dir,
+                crashed_sink.gap_continuation_dir,
+                crashed_sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(
+                engine_b, "now_us", return_value=gap_started_us + 1
+            ):
+                crashed_sink._write_batch(
+                    [
+                        (
+                            "gap",
+                            {
+                                "recv_us": gap_started_us,
+                                "connection_id": connection["id"],
+                                "venue": "robinhood",
+                                "market_id": 37,
+                                "symbol": "SKHY",
+                                "channel": "order_book",
+                                "reason": "sequence_gap",
+                            },
+                        )
+                    ]
+                )
+
+            replacement_snapshot = (
+                "book",
+                {
+                    "recv_us": recovered_us,
+                    "srv_us": recovered_us,
+                    "connection": connection,
+                    "venue": "robinhood",
+                    "market_id": 37,
+                    "symbol": "SKHY",
+                    "event_kind": "snapshot",
+                    "exchange_sequence": "20",
+                    "begin_sequence": None,
+                    "exchange_offset": None,
+                    "local_sequence": 1,
+                    "complete": True,
+                    "levels": [],
+                },
+            )
+            with (
+                mock.patch.object(
+                    engine_b, "now_us", return_value=recovered_us + 1
+                ),
+                mock.patch.object(
+                    crashed_sink,
+                    "_close_open_gaps",
+                    side_effect=RuntimeError("simulated crash"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "simulated crash"),
+            ):
+                crashed_sink._write_batch(
+                    [
+                        replacement_snapshot,
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                            },
+                        ),
+                    ]
+                )
+
+            partition = engine_b.partition_for_us(gap_started_us)
+            database_path = (
+                database_dir / f"engine_b_phase0_{partition}.sqlite3"
+            )
+            database = sqlite3.connect(database_path)
+            try:
+                self.assertEqual(
+                    database.execute("SELECT COUNT(*) FROM book_event").fetchone(),
+                    (1,),
+                )
+                self.assertEqual(
+                    database.execute(
+                        "SELECT ts_start_us, ts_end_us FROM data_gap"
+                    ).fetchone(),
+                    (gap_started_us, None),
+                )
+            finally:
+                database.close()
+            self.assertEqual(
+                len(list(crashed_sink.gap_close_dir.glob("*.json"))), 1
+            )
+            for connection_handle in crashed_sink._connections.values():
+                connection_handle.close()
+            crashed_sink._connections.clear()
+
+            recovered_sink = engine_b.DatabaseSink(
+                config, "gap-close-recovery", "gap-close-commit"
+            )
+            recovered_sink._startup_recovery_pending = False
+            with mock.patch.object(
+                engine_b, "now_us", return_value=recovered_us + 10_000_000
+            ):
+                recovered_sink._write_batch([])
+            self.assertEqual(
+                list(recovered_sink.gap_close_dir.glob("*.json")), []
+            )
+            await recovered_sink.close()
+
+            database = sqlite3.connect(database_path)
+            try:
+                self.assertEqual(
+                    database.execute(
+                        "SELECT ts_start_us, ts_end_us FROM data_gap"
+                    ).fetchone(),
+                    (gap_started_us, recovered_us),
+                )
+            finally:
+                database.close()
+
     async def test_gap_close_does_not_close_later_gap_in_same_batch(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         with tempfile.TemporaryDirectory() as directory:
@@ -2587,6 +2767,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             received_us = current_start_us + 3_510_000_000
             event_us = historical_start_us + 30_000_000
             future_event_us = future_start_us + 30_000_000
+            future_received_us = future_start_us + 60_000_000
             connection = {
                 "id": "current-socket-historical-trade",
                 "venue": "robinhood",
@@ -2670,6 +2851,20 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     ]
                 )
+            with mock.patch.object(
+                engine_b, "now_us", return_value=future_received_us + 1
+            ):
+                sink._write_batch(
+                    [
+                        (
+                            "connection_activity",
+                            {
+                                "recv_us": future_received_us,
+                                "connection": connection,
+                            },
+                        )
+                    ]
+                )
             self.assertEqual(list(sink.session_continuation_dir.glob("*.json")), [])
             await sink.close()
 
@@ -2715,22 +2910,29 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     current_db.execute(
                         """SELECT started_ts_recv_us, last_activity_ts_recv_us,
-                                  ended_ts_recv_us, is_physical
+                                  ended_ts_recv_us, end_reason, is_physical
                            FROM ws_connection"""
                     ).fetchone(),
-                    (connection_started_us, received_us, None, 1),
+                    (
+                        connection_started_us,
+                        received_us,
+                        future_start_us,
+                        "partition_rotation",
+                        1,
+                    ),
                 )
                 self.assertEqual(
                     future_db.execute(
-                        """SELECT started_ts_recv_us, ended_ts_recv_us,
-                                  end_reason, is_physical
+                        """SELECT started_ts_recv_us, last_activity_ts_recv_us,
+                                  ended_ts_recv_us, end_reason, is_physical
                            FROM ws_connection"""
                     ).fetchone(),
                     (
                         future_start_us,
-                        future_start_us,
-                        "event_time_reference",
-                        0,
+                        future_received_us,
+                        None,
+                        None,
+                        1,
                     ),
                 )
                 self.assertEqual(
