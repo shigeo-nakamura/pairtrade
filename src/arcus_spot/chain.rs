@@ -1095,6 +1095,15 @@ fn is_retryable_canonical_block_error(code: i64, message: &str) -> bool {
         "header not found",
         "cannot find block",
         "could not find block",
+        // Observed live from rpc.mainnet.chain.robinhood.com (bot-strategy#880):
+        // "metadata is not found, <id>" for an EIP-1898-pinned eth_call whose
+        // block had already left this node's retention window -- the same
+        // "this node cannot serve state at that historical block" condition
+        // the other needles above cover, just phrased differently by this
+        // vendor. Observed within *minutes* of the block being mined, not
+        // days, so treating it as Fatal made every reconciliation attempt
+        // effectively unrecoverable without ever trying a fallback provider.
+        "metadata is not found",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -1675,6 +1684,13 @@ mod tests {
         assert!(!is_retryable_canonical_block_error(
             -32000,
             "resource not found"
+        ));
+        // bot-strategy#880: rpc.mainnet.chain.robinhood.com's actual observed
+        // wording for an EIP-1898-pinned block outside its retention window,
+        // including the vendor's trailing numeric id.
+        assert!(is_retryable_canonical_block_error(
+            -32000,
+            "metadata is not found, 52754548"
         ));
     }
 
