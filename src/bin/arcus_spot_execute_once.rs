@@ -813,11 +813,17 @@ fn build_manual_reconcile_report(
     let plan = require_single_manual_reconcile_candidate(&config, &active, events_jsonl_path)?;
 
     if active.phase != ArcusSpotExecutionPhase::Reconciled {
-        return Ok(serde_json::json!({
-            "status": "not_yet_reconciled",
-            "active_attempt": active_summary,
-            "candidate_plan": plan,
-            "detail": format!(
+        // resume_status_and_reconcile (called by manual-reconcile-apply)
+        // only accepts Submitted/Confirmed/Reconciled; every other phase
+        // bails immediately without advancing or committing anything
+        // (Codex P2 follow-up, pairtrade#241, mirroring the same
+        // resumable-phase distinction build_repair_report already makes).
+        let resumable = matches!(
+            active.phase,
+            ArcusSpotExecutionPhase::Submitted | ArcusSpotExecutionPhase::Confirmed
+        );
+        let detail = if resumable {
+            format!(
                 "the active attempt is in phase {:?}; manual-reconcile-apply will first call \
                  resume_status_and_reconcile (pure on-chain status/balance reads -- never signs or \
                  submits a transaction) to advance it, then commit using this candidate plan and \
@@ -825,7 +831,22 @@ fn build_manual_reconcile_report(
                  because post-swap balances are not recorded until the attempt reaches Reconciled; \
                  re-run this report after apply's resume step lands there.",
                 active.phase,
-            ),
+            )
+        } else {
+            format!(
+                "the active attempt is in phase {:?}, which resume_status_and_reconcile does not \
+                 accept (only Submitted/Confirmed/Reconciled) -- manual-reconcile-apply would fail \
+                 immediately without advancing or committing anything for this phase. This needs a \
+                 manual operator decision (e.g. clear-risk-halt-style administrator action), not \
+                 this tool.",
+                active.phase,
+            )
+        };
+        return Ok(serde_json::json!({
+            "status": if resumable { "not_yet_reconciled" } else { "not_resumable" },
+            "active_attempt": active_summary,
+            "candidate_plan": plan,
+            "detail": detail,
         }));
     }
 
@@ -7533,6 +7554,45 @@ runtime:
             report["candidate_plan"]["buy_amount_raw"],
             serde_json::json!(near_miss.buy_amount_raw)
         );
+    }
+
+    #[test]
+    fn manual_reconcile_report_flags_a_non_resumable_phase_instead_of_pointing_at_apply() {
+        // Codex P2 follow-up, pairtrade#241: resume_status_and_reconcile
+        // only accepts Submitted/Confirmed/Reconciled. For every other
+        // phase (Prepared/Dispatching/Rejected/Failed/Unknown/
+        // OperatorHold), manual-reconcile-apply's first call would bail
+        // immediately -- the report must say so plainly instead of telling
+        // the operator apply will "advance" it.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let mut active = repair_report_active_submitted_attempt(&config, &plan, at);
+        active.phase = ArcusSpotExecutionPhase::OperatorHold;
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_manual_reconcile_report(&config_path, &events_path, "1", "1").unwrap();
+        assert_eq!(report["status"], "not_resumable");
+        assert!(report["detail"]
+            .as_str()
+            .unwrap()
+            .contains("manual operator decision"));
     }
 
     #[test]
