@@ -297,7 +297,12 @@ where
             &observation.buy_token.address,
         )?;
         let minimum_buy = quote.minimum_received()?;
-        require_fresh_quote_matches_approved_plan(plan, minimum_buy, self.config.slippage_bps)?;
+        let fresh_buy_amount = parse_amount("fresh quote buy_amount", &quote.buy_amount)?;
+        require_fresh_quote_matches_approved_plan(
+            plan,
+            fresh_buy_amount,
+            self.config.slippage_bps,
+        )?;
         let deadline = quote.expires_at()?;
         let sell_floor = symbol_amount(
             "inventory_floor_raw",
@@ -736,25 +741,35 @@ fn persist_reconciliation_read(
     mutation
 }
 
+// Compares the fresh quote's own *target* buy amount (`quote.buy_amount`,
+// pre-slippage) against the plan's target, discounted by `slippage_bps`
+// exactly once. Comparing `fresh_minimum_buy` (the venue's own post-slippage
+// floor, computed by the venue from the fresh quote using this same
+// `slippage_bps`) against `approved_minimum` (the plan's target similarly
+// discounted) applies the configured tolerance on *both* sides against each
+// side's own base amount -- the tolerance cancels out of the comparison
+// instead of bounding the plan-to-dispatch price drift it was meant to
+// bound, so the check would reject on real-world drift far smaller than
+// `slippage_bps` (bot-strategy#880). The venue's own post-slippage floor
+// (`fresh_minimum_buy` / `quote.minimum_received()`) still fully governs the
+// actual on-chain execution via `minimum_buy_amount_raw` -- this check only
+// gates whether the plan is still fresh enough to dispatch at all.
 fn require_fresh_quote_matches_approved_plan(
     plan: &ArcusSpotRotationPlan,
-    fresh_minimum_buy: U256,
+    fresh_buy_amount: U256,
     slippage_bps: u32,
 ) -> Result<()> {
     let approved_buy = parse_amount("plan buy_amount_raw", &plan.buy_amount_raw)?;
     let retained_bps = 10_000_u32
         .checked_sub(slippage_bps)
         .context("Arcus slippage exceeds 10000 bps")?;
-    let numerator = approved_buy
+    let approved_floor = approved_buy
         .checked_mul(U256::from(retained_bps))
-        .context("Arcus approved minimum buy calculation overflow")?;
-    let approved_minimum = numerator
-        .checked_add(U256::from(9_999_u32))
-        .context("Arcus approved minimum buy rounding overflow")?
+        .context("Arcus approved plan floor calculation overflow")?
         / U256::from(10_000_u32);
-    if fresh_minimum_buy < approved_minimum {
+    if fresh_buy_amount < approved_floor {
         bail!(
-            "fresh Arcus minimum buy {fresh_minimum_buy} undercuts approved plan floor {approved_minimum}"
+            "fresh Arcus buy amount {fresh_buy_amount} undercuts approved plan floor {approved_floor} (approved target {approved_buy}, slippage_bps={slippage_bps})"
         );
     }
     Ok(())
@@ -1174,8 +1189,26 @@ mod tests {
     #[test]
     fn fresh_quote_cannot_undercut_approved_plan_floor() {
         let plan = plan_with_buy_amount("1000");
+        // 50 bps = 0.5% of 1000 = 5, so 995 is the exact floor.
         require_fresh_quote_matches_approved_plan(&plan, U256::from(995_u64), 50).unwrap();
         assert!(require_fresh_quote_matches_approved_plan(&plan, U256::from(994_u64), 50).is_err());
+    }
+
+    // bot-strategy#880: a fresh quote whose *target* buy amount exactly
+    // matches the plan's (zero real plan-to-dispatch drift) must never fail
+    // this check. The old comparison (venue-computed post-slippage minimum
+    // vs. a second, independently-discounted approved minimum) failed this
+    // exact case by 1 wei every time due to ceil/floor rounding asymmetry,
+    // and more generally consumed the entire configured slippage_bps
+    // tolerance via double application, rejecting real dispatches on drift
+    // far under slippage_bps (observed live: 6/6 consecutive dispatch
+    // attempts failed here, two of them by exactly 1 wei with no real price
+    // movement).
+    #[test]
+    fn fresh_quote_matching_plan_target_exactly_always_passes() {
+        let plan = plan_with_buy_amount("20619978006781357");
+        require_fresh_quote_matches_approved_plan(&plan, U256::from(20619978006781357_u64), 50)
+            .unwrap();
     }
 
     #[test]
