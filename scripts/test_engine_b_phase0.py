@@ -641,6 +641,70 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 db.close()
                 recovered_db.close()
 
+    async def test_gap_close_does_not_close_later_gap_in_same_batch(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            base_us = 1_700_000_000_000_000
+            sink = engine_b.DatabaseSink(config, "ordered-gap-run", "ordered-gap-commit")
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+
+            def gap(recv_us: int, reason: str) -> tuple[str, dict[str, object]]:
+                return (
+                    "gap",
+                    {
+                        "recv_us": recv_us,
+                        "connection_id": None,
+                        "venue": "robinhood",
+                        "market_id": 37,
+                        "symbol": "SKHY",
+                        "channel": "connection",
+                        "reason": reason,
+                    },
+                )
+
+            with mock.patch.object(engine_b, "now_us", return_value=base_us + 10):
+                sink._write_batch([gap(base_us + 10, "old-gap")])
+            with mock.patch.object(engine_b, "now_us", return_value=base_us + 30):
+                sink._write_batch(
+                    [
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": base_us + 20,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                            },
+                        ),
+                        gap(base_us + 30, "later-gap"),
+                    ]
+                )
+            await sink.close()
+
+            partition = engine_b.partition_for_us(base_us)
+            db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    db.execute(
+                        "SELECT ts_start_us, ts_end_us, reason FROM data_gap ORDER BY gap_id"
+                    ).fetchall(),
+                    [
+                        (base_us + 10, base_us + 20, "old-gap"),
+                        (base_us + 30, None, "later-gap"),
+                    ],
+                )
+            finally:
+                db.close()
+
     async def test_open_gap_is_carried_into_next_partition(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         with tempfile.TemporaryDirectory() as directory:

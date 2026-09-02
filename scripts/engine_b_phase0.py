@@ -1430,11 +1430,13 @@ class DatabaseSink:
                                SET ts_end_us = MAX(ts_start_us, ?)
                                WHERE ts_end_us IS NULL AND venue = ?
                                  AND market_id = ?
+                                 AND ts_start_us <= ?
                                  AND channel IN ('connection', 'order_book')""",
                             (
                                 payload["recv_us"],
                                 payload["venue"],
                                 payload["market_id"],
+                                payload["recv_us"],
                             ),
                         )
                         connection.commit()

@@ -159,7 +159,9 @@ bounding an old row. The next collector batch completes any interrupted source
 close, imports the marker into its fixed destination partition idempotently,
 and carries the gap through every intervening hourly partition before removing
 the markers. A recovery snapshot therefore cannot undercount an open gap across
-a crash, long collector outage, or hourly rotation.
+a crash, long collector outage, or hourly rotation. Gap recovery only closes
+rows that began at or before the snapshot timestamp, so a later disconnect in
+the same database flush remains open.
 
 ## `freq2` account record
 
