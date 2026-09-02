@@ -2787,6 +2787,80 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 destination.close()
 
+    async def test_session_continuation_skips_unknown_venue_without_raising(
+        self,
+    ) -> None:
+        # bot-strategy#866 P2 follow-up on pairtrade#244: a session
+        # continuation marker persisted under a venue name later
+        # renamed/removed out of config.venues must still be recovered
+        # (connection closed, no restart-gap bookkeeping) rather than
+        # raising and blocking startup.
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            source_start_us = 1_700_000_000_000_000
+            source_start_us -= source_start_us % 3_600_000_000
+            boundary_us = source_start_us + 3_600_000_000
+            recovered_us = boundary_us + 200_000_000
+            destination_partition = engine_b.partition_for_us(boundary_us)
+            source_sink = engine_b.DatabaseSink(
+                config, "retired-venue-marker-source-run", "retired-venue-marker-source-commit"
+            )
+            for path in (
+                database_dir,
+                source_sink.sealed_dir,
+                source_sink.lock_dir,
+                source_sink.gap_continuation_dir,
+                source_sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            source_sink._persist_session_continuation_marker(
+                {
+                    "continuation_id": "retired-venue-marker",
+                    "start_us": boundary_us,
+                    "source_partition": engine_b.partition_for_us(source_start_us),
+                    "source_collector_run_id": source_sink.collector_run_id,
+                    "connection": {
+                        "id": "retired-venue-session",
+                        "venue": "robinhood",  # not in config.venues after the rename
+                        "started_us": boundary_us,
+                        "api_schema_version": config.api_schema_version,
+                    },
+                }
+            )
+            for database in source_sink._connections.values():
+                database.close()
+            source_sink._connections.clear()
+
+            recovered_sink = engine_b.DatabaseSink(
+                config, "retired-venue-marker-recovery-run", "retired-venue-marker-recovery-commit"
+            )
+            # Must not raise even though "robinhood" is absent from config.venues.
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                recovered_sink._write_batch([])
+            await recovered_sink.close()
+
+            destination = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{destination_partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    destination.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (boundary_us, boundary_us, "collector_restart_recovery"),
+                )
+                self.assertEqual(
+                    destination.execute(
+                        "SELECT COUNT(*) FROM data_gap WHERE venue = 'robinhood'"
+                    ).fetchone(),
+                    (0,),
+                )
+            finally:
+                destination.close()
+
     async def test_existing_session_marker_precedes_orphan_discovery(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         with tempfile.TemporaryDirectory() as directory:
@@ -2970,6 +3044,69 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 database.close()
+
+    async def test_recover_orphaned_sessions_skips_unknown_venue_without_raising(
+        self,
+    ) -> None:
+        # bot-strategy#866 P2 follow-up on pairtrade#244: a venue
+        # rename/removal (robinhood/lighter_mainnet_context -> lighter)
+        # leaves persisted ws_connection rows under a venue name no longer
+        # in config.venues. Startup recovery must close the orphaned
+        # session and move on, not raise and prevent the process from
+        # starting at all.
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            connection_started_us = hour_start_us + 1_000_000_000
+            recovered_us = hour_start_us + 2_000_000_000
+            connection_meta = {
+                "id": "orphan-retired-venue",
+                "venue": "robinhood",  # not in config.venues after the rename
+                "started_us": connection_started_us,
+                "api_schema_version": config.api_schema_version,
+            }
+
+            sink = engine_b.DatabaseSink(config, "run-retired-venue", "commit-retired-venue")
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(engine_b, "now_us", return_value=connection_started_us):
+                sink._write_batch(
+                    [
+                        (
+                            "connection_start",
+                            {"recv_us": connection_started_us, "connection": connection_meta},
+                        )
+                    ]
+                )
+            for connection in sink._connections.values():
+                connection.close()
+            sink._connections.clear()
+
+            # Must not raise even though "robinhood" is absent from config.venues.
+            sink._recover_orphaned_sessions(recovered_us)
+
+            partition = engine_b.partition_for_us(connection_started_us)
+            database = sqlite3.connect(database_dir / f"engine_b_phase0_{partition}.sqlite3")
+            try:
+                row = database.execute(
+                    """SELECT ended_ts_recv_us, end_reason FROM ws_connection
+                       WHERE connection_session_id = ?""",
+                    (connection_meta["id"],),
+                ).fetchone()
+            finally:
+                database.close()
+            self.assertIsNotNone(row)
+            self.assertIsNotNone(row[0], "orphaned session should still be closed")
+            self.assertEqual(row[1], "collector_restart_recovery")
 
     async def test_startup_discovers_orphaned_session_without_archive_timer(
         self,

@@ -2027,9 +2027,24 @@ class DatabaseSink:
                         )
                         venue_config = venues.get(venue)
                         if venue_config is None:
-                            raise RuntimeError(
-                                f"orphaned session has unknown venue: {venue}"
+                            # A venue rename/removal (e.g. bot-strategy#866's
+                            # robinhood/lighter_mainnet_context -> lighter
+                            # consolidation) leaves persisted ws_connection
+                            # rows under the old venue name. The session was
+                            # already closed above; there is no current
+                            # market list to bookkeep a data_gap against for
+                            # a venue this process no longer collects, so
+                            # skip that part rather than fail the whole
+                            # startup recovery over a deliberate config
+                            # change.
+                            LOG.warning(
+                                "Orphaned session %s references venue=%s, not in current "
+                                "config (renamed/removed); session closed, skipping "
+                                "data_gap bookkeeping for it",
+                                session_id,
+                                venue,
                             )
+                            continue
                         for market in venue_config.markets:
                             open_gap = connection.execute(
                                 """SELECT MIN(gap_id) FROM data_gap
@@ -2605,49 +2620,62 @@ class DatabaseSink:
                     None,
                 )
                 if venue_config is None:
-                    raise RuntimeError(
-                        "session continuation has unknown venue: "
-                        f"{connection_meta['venue']}"
+                    # Same reasoning as _recover_orphaned_sessions: a venue
+                    # rename/removal leaves continuation markers referencing
+                    # a name no longer in the current config. The
+                    # connection_start/connection_end pair below is built
+                    # from connection_meta alone and does not need
+                    # venue_config; only restart-gap bookkeeping per current
+                    # market does, so leave restart_gaps empty for this
+                    # marker instead of failing the whole startup.
+                    LOG.warning(
+                        "Session continuation marker %s references venue=%s, not in "
+                        "current config (renamed/removed); recovering the connection "
+                        "without restart-gap bookkeeping for it",
+                        marker_path,
+                        connection_meta["venue"],
                     )
-                for market in venue_config.markets:
-                    continuation_hash = hashlib.sha256(
-                        (
-                            f"{marker['continuation_id']}:restart-gap:"
-                            f"{destination_partition}:{market.market_id}"
-                        ).encode("utf-8")
-                    ).hexdigest()
-                    gap_intervals = [
-                        {
-                            "interval_id": "sealed-session-gap:"
-                            + hashlib.sha256(
-                                (
-                                    f"{marker['continuation_id']}:"
-                                    f"{interval['sealed_partition']}:"
-                                    f"{market.market_id}"
-                                ).encode("utf-8")
-                            ).hexdigest(),
-                            **interval,
-                        }
-                        for interval in sealed_restart_gap_intervals
-                    ]
-                    restart_gaps.append(
-                        {
-                            "recv_us": recovered_us,
-                            "partition_us": start_us,
-                            "connection_id": connection_meta["id"],
-                            "venue": venue_config.name,
-                            "market_id": market.market_id,
-                            "symbol": market.symbol,
-                            "channel": "connection",
-                            "start_us": start_us,
-                            "end_us": start_us if destination_exists else None,
-                            "continuation_id": (
-                                f"session-restart:{continuation_hash}"
-                            ),
-                            "reason": recovery_reason,
-                            "sealed_intervals": gap_intervals,
-                        }
-                    )
+                    venue_config = None
+                else:
+                    for market in venue_config.markets:
+                        continuation_hash = hashlib.sha256(
+                            (
+                                f"{marker['continuation_id']}:restart-gap:"
+                                f"{destination_partition}:{market.market_id}"
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        gap_intervals = [
+                            {
+                                "interval_id": "sealed-session-gap:"
+                                + hashlib.sha256(
+                                    (
+                                        f"{marker['continuation_id']}:"
+                                        f"{interval['sealed_partition']}:"
+                                        f"{market.market_id}"
+                                    ).encode("utf-8")
+                                ).hexdigest(),
+                                **interval,
+                            }
+                            for interval in sealed_restart_gap_intervals
+                        ]
+                        restart_gaps.append(
+                            {
+                                "recv_us": recovered_us,
+                                "partition_us": start_us,
+                                "connection_id": connection_meta["id"],
+                                "venue": venue_config.name,
+                                "market_id": market.market_id,
+                                "symbol": market.symbol,
+                                "channel": "connection",
+                                "start_us": start_us,
+                                "end_us": start_us if destination_exists else None,
+                                "continuation_id": (
+                                    f"session-restart:{continuation_hash}"
+                                ),
+                                "reason": recovery_reason,
+                                "sealed_intervals": gap_intervals,
+                            }
+                        )
             recovered.append(
                 (
                     marker_path,
