@@ -1808,7 +1808,10 @@ class DatabaseSink:
             ):
                 raise RuntimeError(f"gap-close marker is invalid: {marker_path}")
             recovered.append((marker_path, marker))
-        return recovered
+        return sorted(
+            recovered,
+            key=lambda item: (int(item[1]["recv_us"]), item[0].name),
+        )
 
     def _persist_session_continuation_marker(
         self, payload: dict[str, Any]
@@ -2362,7 +2365,10 @@ class DatabaseSink:
                 self._finalize_ohlcv(connection, write_us)
                 connection.commit()
 
-        for payload in gap_close_markers.values():
+        for payload in sorted(
+            gap_close_markers.values(),
+            key=lambda marker: int(marker["recv_us"]),
+        ):
             self._close_open_gaps(payload)
 
         for marker_path in gap_close_markers:
@@ -3494,6 +3500,7 @@ class Collector:
             return
         stats = message.get("market_stats", {})
         srv_us = normalize_exchange_timestamp_us(message.get("timestamp"))
+        prices: list[tuple[str, str]] = []
         for field_name, price_type in (
             ("mark_price", "mark"),
             ("index_price", "index"),
@@ -3502,19 +3509,24 @@ class Collector:
         ):
             value = stats.get(field_name)
             if value not in (None, ""):
-                await self.sink.put(
-                    "price",
-                    {
-                        "recv_us": recv_us,
-                        "srv_us": srv_us,
-                        "venue": venue.name,
-                        "market_id": market_id,
-                        "symbol": market.symbol,
-                        "price_type": price_type,
-                        "price": canonical_decimal(value),
-                        "source": "ws_market_stats",
-                    },
-                )
+                price = canonical_decimal(value)
+                if Decimal(price) <= 0:
+                    raise RuntimeError("non-positive market-stat price")
+                prices.append((price_type, price))
+        for price_type, price in prices:
+            await self.sink.put(
+                "price",
+                {
+                    "recv_us": recv_us,
+                    "srv_us": srv_us,
+                    "venue": venue.name,
+                    "market_id": market_id,
+                    "symbol": market.symbol,
+                    "price_type": price_type,
+                    "price": price,
+                    "source": "ws_market_stats",
+                },
+            )
         rate = stats.get("funding_rate")
         if rate not in (None, ""):
             await self.sink.put(

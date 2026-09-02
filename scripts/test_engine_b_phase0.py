@@ -274,6 +274,34 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class MarketStatsHandlingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_positive_price_rejects_entire_message_before_enqueue(
+        self,
+    ) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+        with self.assertRaisesRegex(RuntimeError, "non-positive market-stat price"):
+            await collector.handle_market_stats(
+                venue,
+                {
+                    "type": "update/market_stats",
+                    "channel": "market_stats/37",
+                    "timestamp": 1_774_884_082_400,
+                    "market_stats": {
+                        "mark_price": "159.71",
+                        "index_price": "0",
+                        "last_trade_price": "159.70",
+                    },
+                },
+                1_774_884_082_400_000,
+            )
+
+        self.assertEqual(sink.commands, [])
+
+
 class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def websocket_modules(connect: object) -> dict[str, types.ModuleType]:
@@ -1489,6 +1517,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             hour_start_us -= hour_start_us % 3_600_000_000
             gap_started_us = hour_start_us + 10_000_000
             recovered_us = gap_started_us + 20_000_000
+            later_recovered_us = recovered_us + 10_000_000
             connection = {
                 "id": "gap-close-crash",
                 "venue": "robinhood",
@@ -1545,9 +1574,19 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     "levels": [],
                 },
             )
+            later_replacement_snapshot = (
+                "book",
+                {
+                    **replacement_snapshot[1],
+                    "recv_us": later_recovered_us,
+                    "srv_us": later_recovered_us,
+                    "exchange_sequence": "21",
+                    "local_sequence": 2,
+                },
+            )
             with (
                 mock.patch.object(
-                    engine_b, "now_us", return_value=recovered_us + 1
+                    engine_b, "now_us", return_value=later_recovered_us + 1
                 ),
                 mock.patch.object(
                     crashed_sink,
@@ -1567,6 +1606,15 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                                 "market_id": 37,
                             },
                         ),
+                        later_replacement_snapshot,
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": later_recovered_us,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                            },
+                        ),
                     ]
                 )
 
@@ -1578,7 +1626,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             try:
                 self.assertEqual(
                     database.execute("SELECT COUNT(*) FROM book_event").fetchone(),
-                    (1,),
+                    (2,),
                 )
                 self.assertEqual(
                     database.execute(
@@ -1589,7 +1637,11 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 database.close()
             self.assertEqual(
-                len(list(crashed_sink.gap_close_dir.glob("*.json"))), 1
+                [
+                    payload["recv_us"]
+                    for _, payload in crashed_sink._load_gap_closes()
+                ],
+                [recovered_us, later_recovered_us],
             )
             for connection_handle in crashed_sink._connections.values():
                 connection_handle.close()
@@ -1600,7 +1652,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             )
             recovered_sink._startup_recovery_pending = False
             with mock.patch.object(
-                engine_b, "now_us", return_value=recovered_us + 10_000_000
+                engine_b, "now_us", return_value=later_recovered_us + 10_000_000
             ):
                 recovered_sink._write_batch([])
             self.assertEqual(
