@@ -7,9 +7,16 @@ It records Robinhood Lighter (the intended future execution venue) alongside a
 complete standard-Lighter context feed because Robinhood currently lacks EWY
 and USDKRW, two controls required by requirements v0.3.
 
-The absence of those same-venue controls and the unresolved exchange calendar
-are recorded as fail-closed session-invalid reasons.  Collection can begin,
-but these rows must not be counted as valid Phase 0A samples yet.
+The exchange calendar (A-7) is resolved from a frozen, pre-computed KRX/US
+cash-market session table (see scripts/engine_b_trading_calendar_freeze.py
+and configs/engine-b/trading_calendar.json) that this process loads with
+stdlib `json` at startup -- it never imports a calendar library itself. If
+the frozen table is missing, unreadable, or does not cover a given date, the
+observer falls back to the original fail-closed placeholder for that date.
+Robinhood's missing same-venue EWY/USDKRW controls are recorded separately
+and remain a fail-closed session-invalid reason regardless of A-7. Collection
+can begin, but rows carrying any session-invalid reason must not be counted
+as valid Phase 0A samples yet.
 """
 
 from __future__ import annotations
@@ -820,6 +827,7 @@ class AppConfig:
     api_schema_version: str
     database_dir: Path
     health_file: Path
+    trading_calendar_file: Path | None
     metrics_host: str
     metrics_port: int
     top_levels: int
@@ -879,6 +887,7 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         api_schema_version=str(raw["api_schema_version"]),
         database_dir=Path(raw["database_dir"]),
         health_file=Path(raw["health_file"]),
+        trading_calendar_file=Path(raw["trading_calendar_file"]) if raw.get("trading_calendar_file") else None,
         metrics_host=host,
         metrics_port=int(port_text),
         top_levels=int(raw["top_levels"]),
@@ -890,6 +899,68 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         db_flush_interval_ms=int(raw["db_flush_interval_ms"]),
         venues=tuple(venues),
     )
+
+
+@dataclass(frozen=True)
+class TradingCalendar:
+    """Frozen KRX/US cash-market session table (A-7).
+
+    Loaded once from a static JSON artifact produced offline by
+    scripts/engine_b_trading_calendar_freeze.py. This module never imports a
+    calendar library itself: `load` only ever calls stdlib `json`, and any
+    failure to load or parse the file degrades to `None` (fail-closed,
+    A-7-unresolved for every date) rather than raising, since a calendar
+    load problem must not take down the observer.
+    """
+
+    calendar_version: str
+    sessions: dict[str, dict[str, Any]]
+
+    # SQLite INTEGER's positive bound (signed 64-bit); sqlite3 raises
+    # OverflowError above it, which _write_partition's
+    # `except Exception: rollback(); raise` propagates straight through the
+    # database watchdog, terminating the whole observer.
+    _SQLITE_INT_MAX = 2**63 - 1
+
+    @classmethod
+    def _valid_timestamp_us(cls, value: Any) -> bool:
+        # bool is a subclass of int in Python, so isinstance(value, int)
+        # alone would accept True/False here. A pre-epoch (negative)
+        # microsecond value is never a legitimate KRX/US session boundary.
+        return type(value) is int and 0 <= value <= cls._SQLITE_INT_MAX
+
+    @classmethod
+    def load(cls, path: Path) -> "TradingCalendar | None":
+        try:
+            raw = json.loads(path.read_bytes())
+            calendar_version = str(raw["calendar_version"])
+            sessions = dict(raw["sessions"])
+            for entry in sessions.values():
+                if not isinstance(entry["krx_is_open"], bool) or not isinstance(entry["us_is_open"], bool):
+                    raise TypeError("session entry krx_is_open/us_is_open must be bool")
+                # A valid, SQLite-safe, correctly ordered open/close pair is
+                # only required -- and only meaningful -- on the side that is
+                # actually open; write_provisional_session indexes these
+                # fields directly once a date resolves, so anything wrong
+                # here must reject the whole load rather than surface later
+                # as a KeyError, a NULL into trading_session's NOT NULL
+                # columns, an OverflowError from an out-of-range int, or a
+                # session end before its own start.
+                if entry["krx_is_open"]:
+                    krx_open, krx_close = entry["krx_open_utc_us"], entry["krx_close_utc_us"]
+                    if not cls._valid_timestamp_us(krx_open) or not cls._valid_timestamp_us(krx_close):
+                        raise TypeError("krx_is_open session entry missing/invalid krx_open_utc_us/krx_close_utc_us")
+                    if krx_open >= krx_close:
+                        raise ValueError("krx_open_utc_us must be before krx_close_utc_us")
+                if entry["us_is_open"] and not cls._valid_timestamp_us(entry["us_open_utc_us"]):
+                    raise TypeError("us_is_open session entry missing/invalid us_open_utc_us")
+            return cls(calendar_version=calendar_version, sessions=sessions)
+        except (OSError, ValueError, KeyError, TypeError):
+            LOG.exception("Failed to load trading calendar from %s; A-7 remains unresolved", path)
+            return None
+
+    def resolve(self, session_date: date) -> dict[str, Any] | None:
+        return self.sessions.get(session_date.isoformat())
 
 
 @dataclass
@@ -3097,6 +3168,13 @@ class Collector:
         self.books: dict[tuple[str, int], BookState] = {}
         self.local_sequences: defaultdict[tuple[str, str, int], int] = defaultdict(int)
         self.last_health_error: str | None = None
+        self.trading_calendar = (
+            TradingCalendar.load(config.trading_calendar_file)
+            if config.trading_calendar_file is not None
+            else None
+        )
+        if self.trading_calendar is None:
+            LOG.warning("A-7 trading calendar not loaded; session rows remain fail-closed")
 
     def request_stop(self) -> None:
         self.stop_event.set()
@@ -3645,10 +3723,23 @@ class Collector:
             except TimeoutError:
                 pass
 
-    async def write_provisional_session(self, session_date: date) -> None:
+    @staticmethod
+    def _placeholder_krx_open_close_us(session_date: date) -> tuple[int, int]:
+        # Standard-schedule placeholder (09:00-15:30 KST, no DST): used only
+        # when the frozen calendar has no entry for this date, or the market
+        # is closed and there is no real open/close to report.
         t0 = datetime.combine(session_date, datetime_time(0, 0), UTC)
         t1 = datetime.combine(session_date, datetime_time(6, 30), UTC)
+        return int(t0.timestamp() * 1_000_000), int(t1.timestamp() * 1_000_000)
+
+    @staticmethod
+    def _placeholder_us_open_us(session_date: date) -> int:
+        # Standard-schedule placeholder (9:30am America/New_York); tz-aware
+        # so DST still shifts it correctly even without a resolved entry.
         t2_ny = datetime.combine(session_date, datetime_time(9, 30), ZoneInfo("America/New_York"))
+        return int(t2_ny.astimezone(UTC).timestamp() * 1_000_000)
+
+    async def write_provisional_session(self, session_date: date) -> None:
         missing = sorted(
             {
                 f"{venue.name}:{symbol}"
@@ -3656,24 +3747,47 @@ class Collector:
                 for symbol in venue.known_missing_symbols
             }
         )
-        reasons = ["A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR"]
+
+        resolved = self.trading_calendar.resolve(session_date) if self.trading_calendar else None
+        reasons: list[str] = []
+        placeholder_t0_us, placeholder_t1_us = self._placeholder_krx_open_close_us(session_date)
+        placeholder_t2_us = self._placeholder_us_open_us(session_date)
+        if resolved is None:
+            krx_is_open = 0
+            us_cash_is_open = 0
+            calendar_version = "UNRESOLVED_A7_zoneinfo_only"
+            t0_us, t1_us, t2_us = placeholder_t0_us, placeholder_t1_us, placeholder_t2_us
+            reasons.append("A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR")
+            if session_date.weekday() >= 5:
+                reasons.append("PROVISIONAL_WEEKEND")
+        else:
+            krx_is_open = 1 if resolved["krx_is_open"] else 0
+            us_cash_is_open = 1 if resolved["us_is_open"] else 0
+            calendar_version = self.trading_calendar.calendar_version
+            if resolved["krx_is_open"]:
+                t0_us, t1_us = resolved["krx_open_utc_us"], resolved["krx_close_utc_us"]
+            else:
+                t0_us, t1_us = placeholder_t0_us, placeholder_t1_us
+                reasons.append("KRX_CLOSED")
+            t2_us = resolved["us_open_utc_us"] if resolved["us_is_open"] else placeholder_t2_us
+            if not resolved["us_is_open"]:
+                reasons.append("US_CASH_CLOSED")
         if missing:
             reasons.append("SAME_VENUE_REQUIRED_SYMBOLS_MISSING=" + ",".join(missing))
-        if session_date.weekday() >= 5:
-            reasons.append("PROVISIONAL_WEEKEND")
+
         await self.sink.put(
             "session",
             {
                 "recv_us": now_us(),
                 "session_id": f"provisional-{session_date.isoformat()}",
                 "krx_business_date": session_date.isoformat(),
-                "t0_us": int(t0.timestamp() * 1_000_000),
-                "t1_us": int(t1.timestamp() * 1_000_000),
-                "t2_us": int(t2_ny.astimezone(UTC).timestamp() * 1_000_000),
-                "krx_is_open": 0,
-                "us_cash_is_open": 0,
-                "calendar_version": "UNRESOLVED_A7_zoneinfo_only",
-                "validity_reason": ";".join(reasons),
+                "t0_us": t0_us,
+                "t1_us": t1_us,
+                "t2_us": t2_us,
+                "krx_is_open": krx_is_open,
+                "us_cash_is_open": us_cash_is_open,
+                "calendar_version": calendar_version,
+                "validity_reason": ";".join(reasons) if reasons else None,
             },
         )
 
@@ -3690,8 +3804,27 @@ class Collector:
             except TimeoutError:
                 pass
 
+    def calendar_covers_upcoming_sessions(self) -> bool:
+        # Object presence alone is not enough: the frozen file's committed
+        # date range eventually runs out (configs/engine-b/trading_calendar.json
+        # currently ends 2027-12-31), after which every new session_loop date
+        # silently falls back to fail-closed even though a calendar object is
+        # still loaded. Check the dates session_loop actually writes (today,
+        # tomorrow) rather than just whether `self.trading_calendar` is set.
+        if self.trading_calendar is None:
+            return False
+        today = datetime.now(UTC).date()
+        return (
+            self.trading_calendar.resolve(today) is not None
+            and self.trading_calendar.resolve(today + timedelta(days=1)) is not None
+        )
+
     def health_payload(self) -> dict[str, Any]:
         current_us = now_us()
+        blockers = []
+        if not self.calendar_covers_upcoming_sessions():
+            blockers.append("A7 verified KRX/US calendar unresolved")
+        blockers.append("Robinhood Lighter lacks same-venue EWY and USDKRW")
         return {
             "timestamp": datetime.now(UTC).isoformat(),
             "phase": "0A_observer",
@@ -3712,10 +3845,10 @@ class Collector:
                 for venue in self.config.venues
             },
             "phase0_sample_eligible": False,
-            "phase0_sample_blockers": [
-                "A7 verified KRX/US calendar unresolved",
-                "Robinhood Lighter lacks same-venue EWY and USDKRW",
-            ],
+            "phase0_sample_blockers": blockers,
+            "trading_calendar_version": (
+                self.trading_calendar.calendar_version if self.trading_calendar else None
+            ),
             "last_health_error": self.last_health_error,
         }
 

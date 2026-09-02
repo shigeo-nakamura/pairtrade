@@ -23,6 +23,15 @@ jobs:
         run: python3 scripts/test_engine_b_phase0.py
       - name: Run Engine B Phase 0 archive test
         run: bash scripts/test_engine_b_phase0_archive.sh
+      - name: Verify Engine B trading calendar freeze (A-7)
+        run: |
+          python3 -m pip install -r scripts/engine_b_trading_calendar_freeze_requirements.txt
+          python3 scripts/test_engine_b_trading_calendar_freeze.py
+          RANGE_START=$(python3 -c "import json; print(json.load(open('configs/engine-b/trading_calendar.json'))['range']['start'])")
+          RANGE_END=$(python3 -c "import json; print(json.load(open('configs/engine-b/trading_calendar.json'))['range']['end'])")
+          python3 scripts/engine_b_trading_calendar_freeze.py \
+            --start "$RANGE_START" --end "$RANGE_END" --out /tmp/trading_calendar_check.json
+          diff configs/engine-b/trading_calendar.json /tmp/trading_calendar_check.json
       - name: Run canary_diff_report.py unit tests
         run: python3 scripts/test_canary_diff_report.py -v
       - name: Run round_performance_report.py unit tests

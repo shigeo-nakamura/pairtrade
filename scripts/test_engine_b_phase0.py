@@ -12,6 +12,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -44,6 +45,9 @@ class FakeWebSocket:
 class RecordingSink:
     def __init__(self) -> None:
         self.commands: list[tuple[str, dict[str, object]]] = []
+        # health_payload() reads sink.queue.qsize(); this fixture has no real
+        # asyncio.Queue, so stand in with the recorded-command count.
+        self.queue = types.SimpleNamespace(qsize=lambda: len(self.commands))
 
     async def put(self, kind: str, payload: dict[str, object]) -> None:
         self.commands.append((kind, payload))
@@ -942,9 +946,411 @@ class ConfigTests(unittest.TestCase):
         self.assertGreaterEqual(config.top_levels, 5)
         self.assertEqual(config.min_daily_volume_usd, engine_b.Decimal("100000"))
 
+    def test_config_records_trading_calendar_file(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        self.assertEqual(config.trading_calendar_file, Path("/opt/engine-b-phase0/trading_calendar.json"))
+
     def test_timestamp_normalization(self) -> None:
         self.assertEqual(engine_b.normalize_exchange_timestamp_us(1_773_854_156_654), 1_773_854_156_654_000)
         self.assertEqual(engine_b.normalize_exchange_timestamp_us(1_774_884_082_309_144), 1_774_884_082_309_144)
+
+
+class TradingCalendarLoadTests(unittest.TestCase):
+    def _write_fixture(self, tmp_path: Path) -> Path:
+        fixture = {
+            "schema_version": 1,
+            "calendar_version": "xkrx-xnys-exchange_calendars-TEST-abc123",
+            "sessions": {
+                "2026-09-02": {
+                    "krx_is_open": True,
+                    "krx_open_utc_us": 1788307200000000,
+                    "krx_close_utc_us": 1788330600000000,
+                    "us_is_open": True,
+                    "us_open_utc_us": 1788355800000000,
+                    "us_close_utc_us": 1788379200000000,
+                },
+                "2026-09-07": {
+                    "krx_is_open": True,
+                    "krx_open_utc_us": 1788739200000000,
+                    "krx_close_utc_us": 1788762600000000,
+                    "us_is_open": False,
+                    "us_open_utc_us": None,
+                    "us_close_utc_us": None,
+                },
+                "2026-01-01": {
+                    "krx_is_open": False,
+                    "krx_open_utc_us": None,
+                    "krx_close_utc_us": None,
+                    "us_is_open": False,
+                    "us_open_utc_us": None,
+                    "us_close_utc_us": None,
+                },
+            },
+        }
+        path = tmp_path / "trading_calendar.json"
+        path.write_text(json.dumps(fixture))
+        return path
+
+    def test_load_missing_file_returns_none(self) -> None:
+        self.assertIsNone(engine_b.TradingCalendar.load(Path("/nonexistent/trading_calendar.json")))
+
+    def test_load_malformed_json_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text("not json")
+            self.assertIsNone(engine_b.TradingCalendar.load(path))
+
+    def test_load_missing_required_key_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(json.dumps({"sessions": {}}))
+            self.assertIsNone(engine_b.TradingCalendar.load(path))
+
+    def test_load_malformed_session_entry_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "calendar_version": "xkrx-xnys-exchange_calendars-TEST-bad",
+                        "sessions": {"2026-09-02": {"krx_is_open": "yes", "us_is_open": True}},
+                    }
+                )
+            )
+            self.assertIsNone(engine_b.TradingCalendar.load(path))
+
+    def test_load_rejects_open_krx_session_missing_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "calendar_version": "xkrx-xnys-exchange_calendars-TEST-bad",
+                        "sessions": {
+                            "2026-09-02": {
+                                "krx_is_open": True,
+                                "krx_open_utc_us": None,
+                                "krx_close_utc_us": None,
+                                "us_is_open": True,
+                                "us_open_utc_us": 1,
+                                "us_close_utc_us": 2,
+                            }
+                        },
+                    }
+                )
+            )
+            self.assertIsNone(engine_b.TradingCalendar.load(path))
+
+    def test_load_rejects_open_us_session_missing_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "calendar_version": "xkrx-xnys-exchange_calendars-TEST-bad",
+                        "sessions": {
+                            "2026-09-02": {
+                                "krx_is_open": False,
+                                "krx_open_utc_us": None,
+                                "krx_close_utc_us": None,
+                                "us_is_open": True,
+                                "us_open_utc_us": None,
+                                "us_close_utc_us": None,
+                            }
+                        },
+                    }
+                )
+            )
+            self.assertIsNone(engine_b.TradingCalendar.load(path))
+
+    def _load_with_krx_session(self, **overrides: object) -> "engine_b.TradingCalendar | None":
+        session = {
+            "krx_is_open": True,
+            "krx_open_utc_us": 1788307200000000,
+            "krx_close_utc_us": 1788330600000000,
+            "us_is_open": False,
+            "us_open_utc_us": None,
+            "us_close_utc_us": None,
+        }
+        session.update(overrides)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "calendar_version": "xkrx-xnys-exchange_calendars-TEST-bad",
+                        "sessions": {"2026-09-02": session},
+                    }
+                )
+            )
+            return engine_b.TradingCalendar.load(path)
+
+    def test_load_rejects_bool_timestamp(self) -> None:
+        self.assertIsNone(self._load_with_krx_session(krx_open_utc_us=True))
+
+    def test_load_rejects_negative_timestamp(self) -> None:
+        self.assertIsNone(self._load_with_krx_session(krx_open_utc_us=-1))
+
+    def test_load_rejects_timestamp_outside_sqlite_int64_range(self) -> None:
+        self.assertIsNone(self._load_with_krx_session(krx_close_utc_us=2**63))
+
+    def test_load_rejects_reversed_open_close_ordering(self) -> None:
+        self.assertIsNone(
+            self._load_with_krx_session(krx_open_utc_us=1788330600000000, krx_close_utc_us=1788307200000000)
+        )
+
+    def test_load_rejects_equal_open_close(self) -> None:
+        self.assertIsNone(
+            self._load_with_krx_session(krx_open_utc_us=1788307200000000, krx_close_utc_us=1788307200000000)
+        )
+
+    def test_load_accepts_closed_session_with_null_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "calendar_version": "xkrx-xnys-exchange_calendars-TEST-ok",
+                        "sessions": {
+                            "2026-01-01": {
+                                "krx_is_open": False,
+                                "krx_open_utc_us": None,
+                                "krx_close_utc_us": None,
+                                "us_is_open": False,
+                                "us_open_utc_us": None,
+                                "us_close_utc_us": None,
+                            }
+                        },
+                    }
+                )
+            )
+            self.assertIsNotNone(engine_b.TradingCalendar.load(path))
+
+    def test_load_and_resolve_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_fixture(Path(tmp))
+            calendar = engine_b.TradingCalendar.load(path)
+            self.assertIsNotNone(calendar)
+            self.assertEqual(calendar.calendar_version, "xkrx-xnys-exchange_calendars-TEST-abc123")
+            resolved = calendar.resolve(date(2026, 9, 2))
+            self.assertIsNotNone(resolved)
+            self.assertTrue(resolved["krx_is_open"])
+            self.assertTrue(resolved["us_is_open"])
+            self.assertIsNone(calendar.resolve(date(2030, 1, 1)))
+
+
+class ProvisionalSessionTests(unittest.IsolatedAsyncioTestCase):
+    def _config_without_calendar(self) -> engine_b.AppConfig:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        object.__setattr__(config, "trading_calendar_file", None)
+        return config
+
+    def _config_with_fixture_calendar(self, tmp_path: Path) -> engine_b.AppConfig:
+        sessions = {
+            "2026-09-02": {
+                "krx_is_open": True,
+                "krx_open_utc_us": 1788307200000000,
+                "krx_close_utc_us": 1788330600000000,
+                "us_is_open": True,
+                "us_open_utc_us": 1788355800000000,
+                "us_close_utc_us": 1788379200000000,
+            },
+            "2026-09-07": {
+                "krx_is_open": True,
+                "krx_open_utc_us": 1788739200000000,
+                "krx_close_utc_us": 1788762600000000,
+                "us_is_open": False,
+                "us_open_utc_us": None,
+                "us_close_utc_us": None,
+            },
+            # A resolved-but-closed KRX day (e.g. a one-off administrative
+            # holiday override), distinct from an unresolved/absent date.
+            "2026-06-03": {
+                "krx_is_open": False,
+                "krx_open_utc_us": None,
+                "krx_close_utc_us": None,
+                "us_is_open": True,
+                "us_open_utc_us": 1780493400000000,
+                "us_close_utc_us": 1780516800000000,
+            },
+        }
+        # health_payload() checks calendar coverage for "today"/"tomorrow" by
+        # wall-clock time, not just object presence -- extend the fixture to
+        # always cover those two dates too so that check stays meaningful
+        # regardless of when this test happens to run.
+        today = engine_b.datetime.now(engine_b.UTC).date()
+        for offset in (0, 1):
+            iso = (today + engine_b.timedelta(days=offset)).isoformat()
+            sessions.setdefault(
+                iso,
+                {
+                    "krx_is_open": True,
+                    "krx_open_utc_us": 0,
+                    "krx_close_utc_us": 1,
+                    "us_is_open": True,
+                    "us_open_utc_us": 0,
+                    "us_close_utc_us": 1,
+                },
+            )
+        fixture = {
+            "schema_version": 1,
+            "calendar_version": "xkrx-xnys-exchange_calendars-TEST-fixture",
+            "sessions": sessions,
+        }
+        path = tmp_path / "trading_calendar.json"
+        path.write_text(json.dumps(fixture))
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        object.__setattr__(config, "trading_calendar_file", path)
+        return config
+
+    async def test_without_calendar_file_is_fail_closed(self) -> None:
+        config = self._config_without_calendar()
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        self.assertIsNone(collector.trading_calendar)
+
+        await collector.write_provisional_session(date(2026, 9, 2))
+        _, payload = sink.commands[-1]
+        self.assertEqual(payload["krx_is_open"], 0)
+        self.assertEqual(payload["us_cash_is_open"], 0)
+        self.assertEqual(payload["calendar_version"], "UNRESOLVED_A7_zoneinfo_only")
+        self.assertIn("A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR", payload["validity_reason"])
+        self.assertIn("SAME_VENUE_REQUIRED_SYMBOLS_MISSING=", payload["validity_reason"])
+
+    async def test_without_calendar_file_flags_weekend(self) -> None:
+        config = self._config_without_calendar()
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+        saturday = date(2026, 9, 5)
+        self.assertEqual(saturday.weekday(), 5)
+        await collector.write_provisional_session(saturday)
+        _, payload = sink.commands[-1]
+        self.assertIn("PROVISIONAL_WEEKEND", payload["validity_reason"])
+
+    async def test_resolved_open_day_drops_a7_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config_with_fixture_calendar(Path(tmp))
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+            self.assertIsNotNone(collector.trading_calendar)
+
+            await collector.write_provisional_session(date(2026, 9, 2))
+            _, payload = sink.commands[-1]
+            self.assertEqual(payload["krx_is_open"], 1)
+            self.assertEqual(payload["us_cash_is_open"], 1)
+            self.assertEqual(payload["calendar_version"], "xkrx-xnys-exchange_calendars-TEST-fixture")
+            self.assertNotIn("A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR", payload["validity_reason"] or "")
+            self.assertNotIn("KRX_CLOSED", payload["validity_reason"] or "")
+            self.assertNotIn("US_CASH_CLOSED", payload["validity_reason"] or "")
+            # Robinhood's missing EWY/USDKRW is a separate, still-open blocker.
+            self.assertIn("SAME_VENUE_REQUIRED_SYMBOLS_MISSING=", payload["validity_reason"])
+
+    async def test_resolved_open_day_uses_real_session_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config_with_fixture_calendar(Path(tmp))
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+            await collector.write_provisional_session(date(2026, 9, 2))
+            _, payload = sink.commands[-1]
+            self.assertEqual(payload["t0_us"], 1788307200000000)  # real krx_open_utc_us
+            self.assertEqual(payload["t1_us"], 1788330600000000)  # real krx_close_utc_us
+            self.assertEqual(payload["t2_us"], 1788355800000000)  # real us_open_utc_us
+
+    async def test_resolved_closed_krx_day_falls_back_to_placeholder_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config_with_fixture_calendar(Path(tmp))
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+            election_day = date(2026, 6, 3)
+            await collector.write_provisional_session(election_day)
+            _, payload = sink.commands[-1]
+            placeholder_t0, placeholder_t1 = collector._placeholder_krx_open_close_us(election_day)
+            self.assertEqual(payload["t0_us"], placeholder_t0)
+            self.assertEqual(payload["t1_us"], placeholder_t1)
+            self.assertEqual(payload["t2_us"], 1780493400000000)  # real us_open_utc_us, US unaffected
+            self.assertEqual(payload["krx_is_open"], 0)
+            self.assertEqual(payload["us_cash_is_open"], 1)
+            self.assertIn("KRX_CLOSED", payload["validity_reason"])
+            self.assertNotIn("US_CASH_CLOSED", payload["validity_reason"])
+
+    async def test_resolved_asymmetric_closed_day_reports_us_cash_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config_with_fixture_calendar(Path(tmp))
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+            await collector.write_provisional_session(date(2026, 9, 7))
+            _, payload = sink.commands[-1]
+            self.assertEqual(payload["krx_is_open"], 1)
+            self.assertEqual(payload["us_cash_is_open"], 0)
+            self.assertIn("US_CASH_CLOSED", payload["validity_reason"])
+            self.assertNotIn("KRX_CLOSED", payload["validity_reason"])
+            self.assertNotIn("A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR", payload["validity_reason"])
+
+    async def test_date_outside_frozen_range_falls_back_to_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config_with_fixture_calendar(Path(tmp))
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+            await collector.write_provisional_session(date(2030, 1, 1))
+            _, payload = sink.commands[-1]
+            self.assertEqual(payload["krx_is_open"], 0)
+            self.assertEqual(payload["us_cash_is_open"], 0)
+            self.assertEqual(payload["calendar_version"], "UNRESOLVED_A7_zoneinfo_only")
+            self.assertIn("A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR", payload["validity_reason"])
+
+    def test_health_payload_blockers_reflect_calendar_state(self) -> None:
+        config = self._config_without_calendar()
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        payload = collector.health_payload()
+        self.assertIn("A7 verified KRX/US calendar unresolved", payload["phase0_sample_blockers"])
+        self.assertIsNone(payload["trading_calendar_version"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config_with_fixture_calendar(Path(tmp))
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+            payload = collector.health_payload()
+            self.assertNotIn("A7 verified KRX/US calendar unresolved", payload["phase0_sample_blockers"])
+            self.assertIn("Robinhood Lighter lacks same-venue EWY and USDKRW", payload["phase0_sample_blockers"])
+            self.assertEqual(payload["trading_calendar_version"], "xkrx-xnys-exchange_calendars-TEST-fixture")
+
+    def test_health_payload_flags_calendar_whose_range_has_expired(self) -> None:
+        # A loaded calendar object that no longer covers today/tomorrow (its
+        # committed range ran out) must still report the A-7 blocker -- not
+        # just "was a calendar ever loaded".
+        fixture = {
+            "schema_version": 1,
+            "calendar_version": "xkrx-xnys-exchange_calendars-TEST-expired",
+            "sessions": {
+                "2020-01-01": {
+                    "krx_is_open": True,
+                    "krx_open_utc_us": 0,
+                    "krx_close_utc_us": 1,
+                    "us_is_open": True,
+                    "us_open_utc_us": 0,
+                    "us_close_utc_us": 1,
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(json.dumps(fixture))
+            config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+            object.__setattr__(config, "trading_calendar_file", path)
+            sink = RecordingSink()
+            collector = engine_b.Collector(config, sink, engine_b.Metrics())
+            self.assertIsNotNone(collector.trading_calendar)
+            self.assertFalse(collector.calendar_covers_upcoming_sessions())
+
+            payload = collector.health_payload()
+            self.assertIn("A7 verified KRX/US calendar unresolved", payload["phase0_sample_blockers"])
+            # trading_calendar_version still reports the loaded (stale) version.
+            self.assertEqual(payload["trading_calendar_version"], "xkrx-xnys-exchange_calendars-TEST-expired")
 
 
 class RestPollingTests(unittest.IsolatedAsyncioTestCase):

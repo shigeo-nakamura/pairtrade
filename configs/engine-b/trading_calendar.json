@@ -1,0 +1,5861 @@
+{
+  "calendar_version": "xkrx-xnys-exchange_calendars-4.13.2-c61efe1eb9f1",
+  "krx_calendar": "XKRX",
+  "krx_delayed_open_one_hour": {
+    "2026-11-19": "kr_csat_delayed_open",
+    "2027-11-18": "kr_csat_delayed_open"
+  },
+  "krx_one_off_closures": {
+    "2026-06-03": "kr_local_election_day",
+    "2026-07-17": "kr_constitution_day_2026_reinstatement"
+  },
+  "range": {
+    "end": "2027-12-31",
+    "start": "2026-01-01"
+  },
+  "schema_version": 1,
+  "sessions": {
+    "2026-01-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-02": {
+      "krx_close_utc_us": 1767335400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1767315600000000,
+      "us_close_utc_us": 1767387600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1767364200000000
+    },
+    "2026-01-03": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-04": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-05": {
+      "krx_close_utc_us": 1767594600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1767571200000000,
+      "us_close_utc_us": 1767646800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1767623400000000
+    },
+    "2026-01-06": {
+      "krx_close_utc_us": 1767681000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1767657600000000,
+      "us_close_utc_us": 1767733200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1767709800000000
+    },
+    "2026-01-07": {
+      "krx_close_utc_us": 1767767400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1767744000000000,
+      "us_close_utc_us": 1767819600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1767796200000000
+    },
+    "2026-01-08": {
+      "krx_close_utc_us": 1767853800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1767830400000000,
+      "us_close_utc_us": 1767906000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1767882600000000
+    },
+    "2026-01-09": {
+      "krx_close_utc_us": 1767940200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1767916800000000,
+      "us_close_utc_us": 1767992400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1767969000000000
+    },
+    "2026-01-10": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-11": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-12": {
+      "krx_close_utc_us": 1768199400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1768176000000000,
+      "us_close_utc_us": 1768251600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1768228200000000
+    },
+    "2026-01-13": {
+      "krx_close_utc_us": 1768285800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1768262400000000,
+      "us_close_utc_us": 1768338000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1768314600000000
+    },
+    "2026-01-14": {
+      "krx_close_utc_us": 1768372200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1768348800000000,
+      "us_close_utc_us": 1768424400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1768401000000000
+    },
+    "2026-01-15": {
+      "krx_close_utc_us": 1768458600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1768435200000000,
+      "us_close_utc_us": 1768510800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1768487400000000
+    },
+    "2026-01-16": {
+      "krx_close_utc_us": 1768545000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1768521600000000,
+      "us_close_utc_us": 1768597200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1768573800000000
+    },
+    "2026-01-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-18": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-19": {
+      "krx_close_utc_us": 1768804200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1768780800000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-20": {
+      "krx_close_utc_us": 1768890600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1768867200000000,
+      "us_close_utc_us": 1768942800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1768919400000000
+    },
+    "2026-01-21": {
+      "krx_close_utc_us": 1768977000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1768953600000000,
+      "us_close_utc_us": 1769029200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1769005800000000
+    },
+    "2026-01-22": {
+      "krx_close_utc_us": 1769063400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1769040000000000,
+      "us_close_utc_us": 1769115600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1769092200000000
+    },
+    "2026-01-23": {
+      "krx_close_utc_us": 1769149800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1769126400000000,
+      "us_close_utc_us": 1769202000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1769178600000000
+    },
+    "2026-01-24": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-01-26": {
+      "krx_close_utc_us": 1769409000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1769385600000000,
+      "us_close_utc_us": 1769461200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1769437800000000
+    },
+    "2026-01-27": {
+      "krx_close_utc_us": 1769495400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1769472000000000,
+      "us_close_utc_us": 1769547600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1769524200000000
+    },
+    "2026-01-28": {
+      "krx_close_utc_us": 1769581800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1769558400000000,
+      "us_close_utc_us": 1769634000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1769610600000000
+    },
+    "2026-01-29": {
+      "krx_close_utc_us": 1769668200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1769644800000000,
+      "us_close_utc_us": 1769720400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1769697000000000
+    },
+    "2026-01-30": {
+      "krx_close_utc_us": 1769754600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1769731200000000,
+      "us_close_utc_us": 1769806800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1769783400000000
+    },
+    "2026-01-31": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-02-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-02-02": {
+      "krx_close_utc_us": 1770013800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1769990400000000,
+      "us_close_utc_us": 1770066000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770042600000000
+    },
+    "2026-02-03": {
+      "krx_close_utc_us": 1770100200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1770076800000000,
+      "us_close_utc_us": 1770152400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770129000000000
+    },
+    "2026-02-04": {
+      "krx_close_utc_us": 1770186600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1770163200000000,
+      "us_close_utc_us": 1770238800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770215400000000
+    },
+    "2026-02-05": {
+      "krx_close_utc_us": 1770273000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1770249600000000,
+      "us_close_utc_us": 1770325200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770301800000000
+    },
+    "2026-02-06": {
+      "krx_close_utc_us": 1770359400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1770336000000000,
+      "us_close_utc_us": 1770411600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770388200000000
+    },
+    "2026-02-07": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-02-08": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-02-09": {
+      "krx_close_utc_us": 1770618600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1770595200000000,
+      "us_close_utc_us": 1770670800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770647400000000
+    },
+    "2026-02-10": {
+      "krx_close_utc_us": 1770705000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1770681600000000,
+      "us_close_utc_us": 1770757200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770733800000000
+    },
+    "2026-02-11": {
+      "krx_close_utc_us": 1770791400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1770768000000000,
+      "us_close_utc_us": 1770843600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770820200000000
+    },
+    "2026-02-12": {
+      "krx_close_utc_us": 1770877800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1770854400000000,
+      "us_close_utc_us": 1770930000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770906600000000
+    },
+    "2026-02-13": {
+      "krx_close_utc_us": 1770964200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1770940800000000,
+      "us_close_utc_us": 1771016400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1770993000000000
+    },
+    "2026-02-14": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-02-15": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-02-16": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-02-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1771362000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1771338600000000
+    },
+    "2026-02-18": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1771448400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1771425000000000
+    },
+    "2026-02-19": {
+      "krx_close_utc_us": 1771482600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1771459200000000,
+      "us_close_utc_us": 1771534800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1771511400000000
+    },
+    "2026-02-20": {
+      "krx_close_utc_us": 1771569000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1771545600000000,
+      "us_close_utc_us": 1771621200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1771597800000000
+    },
+    "2026-02-21": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-02-22": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-02-23": {
+      "krx_close_utc_us": 1771828200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1771804800000000,
+      "us_close_utc_us": 1771880400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1771857000000000
+    },
+    "2026-02-24": {
+      "krx_close_utc_us": 1771914600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1771891200000000,
+      "us_close_utc_us": 1771966800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1771943400000000
+    },
+    "2026-02-25": {
+      "krx_close_utc_us": 1772001000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1771977600000000,
+      "us_close_utc_us": 1772053200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1772029800000000
+    },
+    "2026-02-26": {
+      "krx_close_utc_us": 1772087400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1772064000000000,
+      "us_close_utc_us": 1772139600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1772116200000000
+    },
+    "2026-02-27": {
+      "krx_close_utc_us": 1772173800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1772150400000000,
+      "us_close_utc_us": 1772226000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1772202600000000
+    },
+    "2026-02-28": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-02": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1772485200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1772461800000000
+    },
+    "2026-03-03": {
+      "krx_close_utc_us": 1772519400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1772496000000000,
+      "us_close_utc_us": 1772571600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1772548200000000
+    },
+    "2026-03-04": {
+      "krx_close_utc_us": 1772605800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1772582400000000,
+      "us_close_utc_us": 1772658000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1772634600000000
+    },
+    "2026-03-05": {
+      "krx_close_utc_us": 1772692200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1772668800000000,
+      "us_close_utc_us": 1772744400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1772721000000000
+    },
+    "2026-03-06": {
+      "krx_close_utc_us": 1772778600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1772755200000000,
+      "us_close_utc_us": 1772830800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1772807400000000
+    },
+    "2026-03-07": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-08": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-09": {
+      "krx_close_utc_us": 1773037800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773014400000000,
+      "us_close_utc_us": 1773086400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1773063000000000
+    },
+    "2026-03-10": {
+      "krx_close_utc_us": 1773124200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773100800000000,
+      "us_close_utc_us": 1773172800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1773149400000000
+    },
+    "2026-03-11": {
+      "krx_close_utc_us": 1773210600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773187200000000,
+      "us_close_utc_us": 1773259200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1773235800000000
+    },
+    "2026-03-12": {
+      "krx_close_utc_us": 1773297000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773273600000000,
+      "us_close_utc_us": 1773345600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1773322200000000
+    },
+    "2026-03-13": {
+      "krx_close_utc_us": 1773383400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773360000000000,
+      "us_close_utc_us": 1773432000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1773408600000000
+    },
+    "2026-03-14": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-15": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-16": {
+      "krx_close_utc_us": 1773642600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773619200000000,
+      "us_close_utc_us": 1773691200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1773667800000000
+    },
+    "2026-03-17": {
+      "krx_close_utc_us": 1773729000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773705600000000,
+      "us_close_utc_us": 1773777600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1773754200000000
+    },
+    "2026-03-18": {
+      "krx_close_utc_us": 1773815400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773792000000000,
+      "us_close_utc_us": 1773864000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1773840600000000
+    },
+    "2026-03-19": {
+      "krx_close_utc_us": 1773901800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773878400000000,
+      "us_close_utc_us": 1773950400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1773927000000000
+    },
+    "2026-03-20": {
+      "krx_close_utc_us": 1773988200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1773964800000000,
+      "us_close_utc_us": 1774036800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1774013400000000
+    },
+    "2026-03-21": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-22": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-23": {
+      "krx_close_utc_us": 1774247400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1774224000000000,
+      "us_close_utc_us": 1774296000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1774272600000000
+    },
+    "2026-03-24": {
+      "krx_close_utc_us": 1774333800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1774310400000000,
+      "us_close_utc_us": 1774382400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1774359000000000
+    },
+    "2026-03-25": {
+      "krx_close_utc_us": 1774420200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1774396800000000,
+      "us_close_utc_us": 1774468800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1774445400000000
+    },
+    "2026-03-26": {
+      "krx_close_utc_us": 1774506600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1774483200000000,
+      "us_close_utc_us": 1774555200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1774531800000000
+    },
+    "2026-03-27": {
+      "krx_close_utc_us": 1774593000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1774569600000000,
+      "us_close_utc_us": 1774641600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1774618200000000
+    },
+    "2026-03-28": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-29": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-03-30": {
+      "krx_close_utc_us": 1774852200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1774828800000000,
+      "us_close_utc_us": 1774900800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1774877400000000
+    },
+    "2026-03-31": {
+      "krx_close_utc_us": 1774938600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1774915200000000,
+      "us_close_utc_us": 1774987200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1774963800000000
+    },
+    "2026-04-01": {
+      "krx_close_utc_us": 1775025000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1775001600000000,
+      "us_close_utc_us": 1775073600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1775050200000000
+    },
+    "2026-04-02": {
+      "krx_close_utc_us": 1775111400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1775088000000000,
+      "us_close_utc_us": 1775160000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1775136600000000
+    },
+    "2026-04-03": {
+      "krx_close_utc_us": 1775197800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1775174400000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-04-04": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-04-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-04-06": {
+      "krx_close_utc_us": 1775457000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1775433600000000,
+      "us_close_utc_us": 1775505600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1775482200000000
+    },
+    "2026-04-07": {
+      "krx_close_utc_us": 1775543400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1775520000000000,
+      "us_close_utc_us": 1775592000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1775568600000000
+    },
+    "2026-04-08": {
+      "krx_close_utc_us": 1775629800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1775606400000000,
+      "us_close_utc_us": 1775678400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1775655000000000
+    },
+    "2026-04-09": {
+      "krx_close_utc_us": 1775716200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1775692800000000,
+      "us_close_utc_us": 1775764800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1775741400000000
+    },
+    "2026-04-10": {
+      "krx_close_utc_us": 1775802600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1775779200000000,
+      "us_close_utc_us": 1775851200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1775827800000000
+    },
+    "2026-04-11": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-04-12": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-04-13": {
+      "krx_close_utc_us": 1776061800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776038400000000,
+      "us_close_utc_us": 1776110400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1776087000000000
+    },
+    "2026-04-14": {
+      "krx_close_utc_us": 1776148200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776124800000000,
+      "us_close_utc_us": 1776196800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1776173400000000
+    },
+    "2026-04-15": {
+      "krx_close_utc_us": 1776234600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776211200000000,
+      "us_close_utc_us": 1776283200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1776259800000000
+    },
+    "2026-04-16": {
+      "krx_close_utc_us": 1776321000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776297600000000,
+      "us_close_utc_us": 1776369600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1776346200000000
+    },
+    "2026-04-17": {
+      "krx_close_utc_us": 1776407400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776384000000000,
+      "us_close_utc_us": 1776456000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1776432600000000
+    },
+    "2026-04-18": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-04-19": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-04-20": {
+      "krx_close_utc_us": 1776666600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776643200000000,
+      "us_close_utc_us": 1776715200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1776691800000000
+    },
+    "2026-04-21": {
+      "krx_close_utc_us": 1776753000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776729600000000,
+      "us_close_utc_us": 1776801600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1776778200000000
+    },
+    "2026-04-22": {
+      "krx_close_utc_us": 1776839400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776816000000000,
+      "us_close_utc_us": 1776888000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1776864600000000
+    },
+    "2026-04-23": {
+      "krx_close_utc_us": 1776925800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776902400000000,
+      "us_close_utc_us": 1776974400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1776951000000000
+    },
+    "2026-04-24": {
+      "krx_close_utc_us": 1777012200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1776988800000000,
+      "us_close_utc_us": 1777060800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1777037400000000
+    },
+    "2026-04-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-04-26": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-04-27": {
+      "krx_close_utc_us": 1777271400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1777248000000000,
+      "us_close_utc_us": 1777320000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1777296600000000
+    },
+    "2026-04-28": {
+      "krx_close_utc_us": 1777357800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1777334400000000,
+      "us_close_utc_us": 1777406400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1777383000000000
+    },
+    "2026-04-29": {
+      "krx_close_utc_us": 1777444200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1777420800000000,
+      "us_close_utc_us": 1777492800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1777469400000000
+    },
+    "2026-04-30": {
+      "krx_close_utc_us": 1777530600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1777507200000000,
+      "us_close_utc_us": 1777579200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1777555800000000
+    },
+    "2026-05-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1777665600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1777642200000000
+    },
+    "2026-05-02": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-03": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-04": {
+      "krx_close_utc_us": 1777876200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1777852800000000,
+      "us_close_utc_us": 1777924800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1777901400000000
+    },
+    "2026-05-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1778011200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1777987800000000
+    },
+    "2026-05-06": {
+      "krx_close_utc_us": 1778049000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1778025600000000,
+      "us_close_utc_us": 1778097600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1778074200000000
+    },
+    "2026-05-07": {
+      "krx_close_utc_us": 1778135400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1778112000000000,
+      "us_close_utc_us": 1778184000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1778160600000000
+    },
+    "2026-05-08": {
+      "krx_close_utc_us": 1778221800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1778198400000000,
+      "us_close_utc_us": 1778270400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1778247000000000
+    },
+    "2026-05-09": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-10": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-11": {
+      "krx_close_utc_us": 1778481000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1778457600000000,
+      "us_close_utc_us": 1778529600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1778506200000000
+    },
+    "2026-05-12": {
+      "krx_close_utc_us": 1778567400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1778544000000000,
+      "us_close_utc_us": 1778616000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1778592600000000
+    },
+    "2026-05-13": {
+      "krx_close_utc_us": 1778653800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1778630400000000,
+      "us_close_utc_us": 1778702400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1778679000000000
+    },
+    "2026-05-14": {
+      "krx_close_utc_us": 1778740200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1778716800000000,
+      "us_close_utc_us": 1778788800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1778765400000000
+    },
+    "2026-05-15": {
+      "krx_close_utc_us": 1778826600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1778803200000000,
+      "us_close_utc_us": 1778875200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1778851800000000
+    },
+    "2026-05-16": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-18": {
+      "krx_close_utc_us": 1779085800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1779062400000000,
+      "us_close_utc_us": 1779134400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1779111000000000
+    },
+    "2026-05-19": {
+      "krx_close_utc_us": 1779172200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1779148800000000,
+      "us_close_utc_us": 1779220800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1779197400000000
+    },
+    "2026-05-20": {
+      "krx_close_utc_us": 1779258600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1779235200000000,
+      "us_close_utc_us": 1779307200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1779283800000000
+    },
+    "2026-05-21": {
+      "krx_close_utc_us": 1779345000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1779321600000000,
+      "us_close_utc_us": 1779393600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1779370200000000
+    },
+    "2026-05-22": {
+      "krx_close_utc_us": 1779431400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1779408000000000,
+      "us_close_utc_us": 1779480000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1779456600000000
+    },
+    "2026-05-23": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-24": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-26": {
+      "krx_close_utc_us": 1779777000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1779753600000000,
+      "us_close_utc_us": 1779825600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1779802200000000
+    },
+    "2026-05-27": {
+      "krx_close_utc_us": 1779863400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1779840000000000,
+      "us_close_utc_us": 1779912000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1779888600000000
+    },
+    "2026-05-28": {
+      "krx_close_utc_us": 1779949800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1779926400000000,
+      "us_close_utc_us": 1779998400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1779975000000000
+    },
+    "2026-05-29": {
+      "krx_close_utc_us": 1780036200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1780012800000000,
+      "us_close_utc_us": 1780084800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1780061400000000
+    },
+    "2026-05-30": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-05-31": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-01": {
+      "krx_close_utc_us": 1780295400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1780272000000000,
+      "us_close_utc_us": 1780344000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1780320600000000
+    },
+    "2026-06-02": {
+      "krx_close_utc_us": 1780381800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1780358400000000,
+      "us_close_utc_us": 1780430400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1780407000000000
+    },
+    "2026-06-03": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1780516800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1780493400000000
+    },
+    "2026-06-04": {
+      "krx_close_utc_us": 1780554600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1780531200000000,
+      "us_close_utc_us": 1780603200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1780579800000000
+    },
+    "2026-06-05": {
+      "krx_close_utc_us": 1780641000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1780617600000000,
+      "us_close_utc_us": 1780689600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1780666200000000
+    },
+    "2026-06-06": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-07": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-08": {
+      "krx_close_utc_us": 1780900200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1780876800000000,
+      "us_close_utc_us": 1780948800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1780925400000000
+    },
+    "2026-06-09": {
+      "krx_close_utc_us": 1780986600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1780963200000000,
+      "us_close_utc_us": 1781035200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1781011800000000
+    },
+    "2026-06-10": {
+      "krx_close_utc_us": 1781073000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1781049600000000,
+      "us_close_utc_us": 1781121600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1781098200000000
+    },
+    "2026-06-11": {
+      "krx_close_utc_us": 1781159400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1781136000000000,
+      "us_close_utc_us": 1781208000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1781184600000000
+    },
+    "2026-06-12": {
+      "krx_close_utc_us": 1781245800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1781222400000000,
+      "us_close_utc_us": 1781294400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1781271000000000
+    },
+    "2026-06-13": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-14": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-15": {
+      "krx_close_utc_us": 1781505000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1781481600000000,
+      "us_close_utc_us": 1781553600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1781530200000000
+    },
+    "2026-06-16": {
+      "krx_close_utc_us": 1781591400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1781568000000000,
+      "us_close_utc_us": 1781640000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1781616600000000
+    },
+    "2026-06-17": {
+      "krx_close_utc_us": 1781677800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1781654400000000,
+      "us_close_utc_us": 1781726400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1781703000000000
+    },
+    "2026-06-18": {
+      "krx_close_utc_us": 1781764200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1781740800000000,
+      "us_close_utc_us": 1781812800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1781789400000000
+    },
+    "2026-06-19": {
+      "krx_close_utc_us": 1781850600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1781827200000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-20": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-21": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-22": {
+      "krx_close_utc_us": 1782109800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1782086400000000,
+      "us_close_utc_us": 1782158400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1782135000000000
+    },
+    "2026-06-23": {
+      "krx_close_utc_us": 1782196200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1782172800000000,
+      "us_close_utc_us": 1782244800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1782221400000000
+    },
+    "2026-06-24": {
+      "krx_close_utc_us": 1782282600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1782259200000000,
+      "us_close_utc_us": 1782331200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1782307800000000
+    },
+    "2026-06-25": {
+      "krx_close_utc_us": 1782369000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1782345600000000,
+      "us_close_utc_us": 1782417600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1782394200000000
+    },
+    "2026-06-26": {
+      "krx_close_utc_us": 1782455400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1782432000000000,
+      "us_close_utc_us": 1782504000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1782480600000000
+    },
+    "2026-06-27": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-28": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-06-29": {
+      "krx_close_utc_us": 1782714600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1782691200000000,
+      "us_close_utc_us": 1782763200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1782739800000000
+    },
+    "2026-06-30": {
+      "krx_close_utc_us": 1782801000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1782777600000000,
+      "us_close_utc_us": 1782849600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1782826200000000
+    },
+    "2026-07-01": {
+      "krx_close_utc_us": 1782887400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1782864000000000,
+      "us_close_utc_us": 1782936000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1782912600000000
+    },
+    "2026-07-02": {
+      "krx_close_utc_us": 1782973800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1782950400000000,
+      "us_close_utc_us": 1783022400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1782999000000000
+    },
+    "2026-07-03": {
+      "krx_close_utc_us": 1783060200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1783036800000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-07-04": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-07-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-07-06": {
+      "krx_close_utc_us": 1783319400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1783296000000000,
+      "us_close_utc_us": 1783368000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1783344600000000
+    },
+    "2026-07-07": {
+      "krx_close_utc_us": 1783405800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1783382400000000,
+      "us_close_utc_us": 1783454400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1783431000000000
+    },
+    "2026-07-08": {
+      "krx_close_utc_us": 1783492200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1783468800000000,
+      "us_close_utc_us": 1783540800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1783517400000000
+    },
+    "2026-07-09": {
+      "krx_close_utc_us": 1783578600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1783555200000000,
+      "us_close_utc_us": 1783627200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1783603800000000
+    },
+    "2026-07-10": {
+      "krx_close_utc_us": 1783665000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1783641600000000,
+      "us_close_utc_us": 1783713600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1783690200000000
+    },
+    "2026-07-11": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-07-12": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-07-13": {
+      "krx_close_utc_us": 1783924200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1783900800000000,
+      "us_close_utc_us": 1783972800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1783949400000000
+    },
+    "2026-07-14": {
+      "krx_close_utc_us": 1784010600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1783987200000000,
+      "us_close_utc_us": 1784059200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1784035800000000
+    },
+    "2026-07-15": {
+      "krx_close_utc_us": 1784097000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1784073600000000,
+      "us_close_utc_us": 1784145600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1784122200000000
+    },
+    "2026-07-16": {
+      "krx_close_utc_us": 1784183400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1784160000000000,
+      "us_close_utc_us": 1784232000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1784208600000000
+    },
+    "2026-07-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1784318400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1784295000000000
+    },
+    "2026-07-18": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-07-19": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-07-20": {
+      "krx_close_utc_us": 1784529000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1784505600000000,
+      "us_close_utc_us": 1784577600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1784554200000000
+    },
+    "2026-07-21": {
+      "krx_close_utc_us": 1784615400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1784592000000000,
+      "us_close_utc_us": 1784664000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1784640600000000
+    },
+    "2026-07-22": {
+      "krx_close_utc_us": 1784701800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1784678400000000,
+      "us_close_utc_us": 1784750400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1784727000000000
+    },
+    "2026-07-23": {
+      "krx_close_utc_us": 1784788200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1784764800000000,
+      "us_close_utc_us": 1784836800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1784813400000000
+    },
+    "2026-07-24": {
+      "krx_close_utc_us": 1784874600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1784851200000000,
+      "us_close_utc_us": 1784923200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1784899800000000
+    },
+    "2026-07-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-07-26": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-07-27": {
+      "krx_close_utc_us": 1785133800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1785110400000000,
+      "us_close_utc_us": 1785182400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1785159000000000
+    },
+    "2026-07-28": {
+      "krx_close_utc_us": 1785220200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1785196800000000,
+      "us_close_utc_us": 1785268800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1785245400000000
+    },
+    "2026-07-29": {
+      "krx_close_utc_us": 1785306600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1785283200000000,
+      "us_close_utc_us": 1785355200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1785331800000000
+    },
+    "2026-07-30": {
+      "krx_close_utc_us": 1785393000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1785369600000000,
+      "us_close_utc_us": 1785441600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1785418200000000
+    },
+    "2026-07-31": {
+      "krx_close_utc_us": 1785479400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1785456000000000,
+      "us_close_utc_us": 1785528000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1785504600000000
+    },
+    "2026-08-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-02": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-03": {
+      "krx_close_utc_us": 1785738600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1785715200000000,
+      "us_close_utc_us": 1785787200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1785763800000000
+    },
+    "2026-08-04": {
+      "krx_close_utc_us": 1785825000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1785801600000000,
+      "us_close_utc_us": 1785873600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1785850200000000
+    },
+    "2026-08-05": {
+      "krx_close_utc_us": 1785911400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1785888000000000,
+      "us_close_utc_us": 1785960000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1785936600000000
+    },
+    "2026-08-06": {
+      "krx_close_utc_us": 1785997800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1785974400000000,
+      "us_close_utc_us": 1786046400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1786023000000000
+    },
+    "2026-08-07": {
+      "krx_close_utc_us": 1786084200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1786060800000000,
+      "us_close_utc_us": 1786132800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1786109400000000
+    },
+    "2026-08-08": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-09": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-10": {
+      "krx_close_utc_us": 1786343400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1786320000000000,
+      "us_close_utc_us": 1786392000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1786368600000000
+    },
+    "2026-08-11": {
+      "krx_close_utc_us": 1786429800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1786406400000000,
+      "us_close_utc_us": 1786478400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1786455000000000
+    },
+    "2026-08-12": {
+      "krx_close_utc_us": 1786516200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1786492800000000,
+      "us_close_utc_us": 1786564800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1786541400000000
+    },
+    "2026-08-13": {
+      "krx_close_utc_us": 1786602600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1786579200000000,
+      "us_close_utc_us": 1786651200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1786627800000000
+    },
+    "2026-08-14": {
+      "krx_close_utc_us": 1786689000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1786665600000000,
+      "us_close_utc_us": 1786737600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1786714200000000
+    },
+    "2026-08-15": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-16": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1786996800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1786973400000000
+    },
+    "2026-08-18": {
+      "krx_close_utc_us": 1787034600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1787011200000000,
+      "us_close_utc_us": 1787083200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1787059800000000
+    },
+    "2026-08-19": {
+      "krx_close_utc_us": 1787121000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1787097600000000,
+      "us_close_utc_us": 1787169600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1787146200000000
+    },
+    "2026-08-20": {
+      "krx_close_utc_us": 1787207400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1787184000000000,
+      "us_close_utc_us": 1787256000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1787232600000000
+    },
+    "2026-08-21": {
+      "krx_close_utc_us": 1787293800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1787270400000000,
+      "us_close_utc_us": 1787342400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1787319000000000
+    },
+    "2026-08-22": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-23": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-24": {
+      "krx_close_utc_us": 1787553000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1787529600000000,
+      "us_close_utc_us": 1787601600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1787578200000000
+    },
+    "2026-08-25": {
+      "krx_close_utc_us": 1787639400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1787616000000000,
+      "us_close_utc_us": 1787688000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1787664600000000
+    },
+    "2026-08-26": {
+      "krx_close_utc_us": 1787725800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1787702400000000,
+      "us_close_utc_us": 1787774400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1787751000000000
+    },
+    "2026-08-27": {
+      "krx_close_utc_us": 1787812200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1787788800000000,
+      "us_close_utc_us": 1787860800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1787837400000000
+    },
+    "2026-08-28": {
+      "krx_close_utc_us": 1787898600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1787875200000000,
+      "us_close_utc_us": 1787947200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1787923800000000
+    },
+    "2026-08-29": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-30": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-08-31": {
+      "krx_close_utc_us": 1788157800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1788134400000000,
+      "us_close_utc_us": 1788206400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1788183000000000
+    },
+    "2026-09-01": {
+      "krx_close_utc_us": 1788244200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1788220800000000,
+      "us_close_utc_us": 1788292800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1788269400000000
+    },
+    "2026-09-02": {
+      "krx_close_utc_us": 1788330600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1788307200000000,
+      "us_close_utc_us": 1788379200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1788355800000000
+    },
+    "2026-09-03": {
+      "krx_close_utc_us": 1788417000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1788393600000000,
+      "us_close_utc_us": 1788465600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1788442200000000
+    },
+    "2026-09-04": {
+      "krx_close_utc_us": 1788503400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1788480000000000,
+      "us_close_utc_us": 1788552000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1788528600000000
+    },
+    "2026-09-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-09-06": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-09-07": {
+      "krx_close_utc_us": 1788762600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1788739200000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-09-08": {
+      "krx_close_utc_us": 1788849000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1788825600000000,
+      "us_close_utc_us": 1788897600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1788874200000000
+    },
+    "2026-09-09": {
+      "krx_close_utc_us": 1788935400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1788912000000000,
+      "us_close_utc_us": 1788984000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1788960600000000
+    },
+    "2026-09-10": {
+      "krx_close_utc_us": 1789021800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1788998400000000,
+      "us_close_utc_us": 1789070400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1789047000000000
+    },
+    "2026-09-11": {
+      "krx_close_utc_us": 1789108200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1789084800000000,
+      "us_close_utc_us": 1789156800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1789133400000000
+    },
+    "2026-09-12": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-09-13": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-09-14": {
+      "krx_close_utc_us": 1789367400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1789344000000000,
+      "us_close_utc_us": 1789416000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1789392600000000
+    },
+    "2026-09-15": {
+      "krx_close_utc_us": 1789453800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1789430400000000,
+      "us_close_utc_us": 1789502400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1789479000000000
+    },
+    "2026-09-16": {
+      "krx_close_utc_us": 1789540200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1789516800000000,
+      "us_close_utc_us": 1789588800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1789565400000000
+    },
+    "2026-09-17": {
+      "krx_close_utc_us": 1789626600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1789603200000000,
+      "us_close_utc_us": 1789675200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1789651800000000
+    },
+    "2026-09-18": {
+      "krx_close_utc_us": 1789713000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1789689600000000,
+      "us_close_utc_us": 1789761600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1789738200000000
+    },
+    "2026-09-19": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-09-20": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-09-21": {
+      "krx_close_utc_us": 1789972200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1789948800000000,
+      "us_close_utc_us": 1790020800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1789997400000000
+    },
+    "2026-09-22": {
+      "krx_close_utc_us": 1790058600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1790035200000000,
+      "us_close_utc_us": 1790107200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1790083800000000
+    },
+    "2026-09-23": {
+      "krx_close_utc_us": 1790145000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1790121600000000,
+      "us_close_utc_us": 1790193600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1790170200000000
+    },
+    "2026-09-24": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1790280000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1790256600000000
+    },
+    "2026-09-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1790366400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1790343000000000
+    },
+    "2026-09-26": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-09-27": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-09-28": {
+      "krx_close_utc_us": 1790577000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1790553600000000,
+      "us_close_utc_us": 1790625600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1790602200000000
+    },
+    "2026-09-29": {
+      "krx_close_utc_us": 1790663400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1790640000000000,
+      "us_close_utc_us": 1790712000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1790688600000000
+    },
+    "2026-09-30": {
+      "krx_close_utc_us": 1790749800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1790726400000000,
+      "us_close_utc_us": 1790798400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1790775000000000
+    },
+    "2026-10-01": {
+      "krx_close_utc_us": 1790836200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1790812800000000,
+      "us_close_utc_us": 1790884800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1790861400000000
+    },
+    "2026-10-02": {
+      "krx_close_utc_us": 1790922600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1790899200000000,
+      "us_close_utc_us": 1790971200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1790947800000000
+    },
+    "2026-10-03": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-10-04": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-10-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1791230400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1791207000000000
+    },
+    "2026-10-06": {
+      "krx_close_utc_us": 1791268200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1791244800000000,
+      "us_close_utc_us": 1791316800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1791293400000000
+    },
+    "2026-10-07": {
+      "krx_close_utc_us": 1791354600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1791331200000000,
+      "us_close_utc_us": 1791403200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1791379800000000
+    },
+    "2026-10-08": {
+      "krx_close_utc_us": 1791441000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1791417600000000,
+      "us_close_utc_us": 1791489600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1791466200000000
+    },
+    "2026-10-09": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1791576000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1791552600000000
+    },
+    "2026-10-10": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-10-11": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-10-12": {
+      "krx_close_utc_us": 1791786600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1791763200000000,
+      "us_close_utc_us": 1791835200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1791811800000000
+    },
+    "2026-10-13": {
+      "krx_close_utc_us": 1791873000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1791849600000000,
+      "us_close_utc_us": 1791921600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1791898200000000
+    },
+    "2026-10-14": {
+      "krx_close_utc_us": 1791959400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1791936000000000,
+      "us_close_utc_us": 1792008000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1791984600000000
+    },
+    "2026-10-15": {
+      "krx_close_utc_us": 1792045800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1792022400000000,
+      "us_close_utc_us": 1792094400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1792071000000000
+    },
+    "2026-10-16": {
+      "krx_close_utc_us": 1792132200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1792108800000000,
+      "us_close_utc_us": 1792180800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1792157400000000
+    },
+    "2026-10-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-10-18": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-10-19": {
+      "krx_close_utc_us": 1792391400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1792368000000000,
+      "us_close_utc_us": 1792440000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1792416600000000
+    },
+    "2026-10-20": {
+      "krx_close_utc_us": 1792477800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1792454400000000,
+      "us_close_utc_us": 1792526400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1792503000000000
+    },
+    "2026-10-21": {
+      "krx_close_utc_us": 1792564200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1792540800000000,
+      "us_close_utc_us": 1792612800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1792589400000000
+    },
+    "2026-10-22": {
+      "krx_close_utc_us": 1792650600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1792627200000000,
+      "us_close_utc_us": 1792699200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1792675800000000
+    },
+    "2026-10-23": {
+      "krx_close_utc_us": 1792737000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1792713600000000,
+      "us_close_utc_us": 1792785600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1792762200000000
+    },
+    "2026-10-24": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-10-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-10-26": {
+      "krx_close_utc_us": 1792996200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1792972800000000,
+      "us_close_utc_us": 1793044800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793021400000000
+    },
+    "2026-10-27": {
+      "krx_close_utc_us": 1793082600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1793059200000000,
+      "us_close_utc_us": 1793131200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793107800000000
+    },
+    "2026-10-28": {
+      "krx_close_utc_us": 1793169000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1793145600000000,
+      "us_close_utc_us": 1793217600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793194200000000
+    },
+    "2026-10-29": {
+      "krx_close_utc_us": 1793255400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1793232000000000,
+      "us_close_utc_us": 1793304000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793280600000000
+    },
+    "2026-10-30": {
+      "krx_close_utc_us": 1793341800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1793318400000000,
+      "us_close_utc_us": 1793390400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793367000000000
+    },
+    "2026-10-31": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-02": {
+      "krx_close_utc_us": 1793601000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1793577600000000,
+      "us_close_utc_us": 1793653200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793629800000000
+    },
+    "2026-11-03": {
+      "krx_close_utc_us": 1793687400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1793664000000000,
+      "us_close_utc_us": 1793739600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793716200000000
+    },
+    "2026-11-04": {
+      "krx_close_utc_us": 1793773800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1793750400000000,
+      "us_close_utc_us": 1793826000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793802600000000
+    },
+    "2026-11-05": {
+      "krx_close_utc_us": 1793860200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1793836800000000,
+      "us_close_utc_us": 1793912400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793889000000000
+    },
+    "2026-11-06": {
+      "krx_close_utc_us": 1793946600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1793923200000000,
+      "us_close_utc_us": 1793998800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1793975400000000
+    },
+    "2026-11-07": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-08": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-09": {
+      "krx_close_utc_us": 1794205800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1794182400000000,
+      "us_close_utc_us": 1794258000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1794234600000000
+    },
+    "2026-11-10": {
+      "krx_close_utc_us": 1794292200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1794268800000000,
+      "us_close_utc_us": 1794344400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1794321000000000
+    },
+    "2026-11-11": {
+      "krx_close_utc_us": 1794378600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1794355200000000,
+      "us_close_utc_us": 1794430800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1794407400000000
+    },
+    "2026-11-12": {
+      "krx_close_utc_us": 1794465000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1794441600000000,
+      "us_close_utc_us": 1794517200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1794493800000000
+    },
+    "2026-11-13": {
+      "krx_close_utc_us": 1794551400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1794528000000000,
+      "us_close_utc_us": 1794603600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1794580200000000
+    },
+    "2026-11-14": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-15": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-16": {
+      "krx_close_utc_us": 1794810600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1794787200000000,
+      "us_close_utc_us": 1794862800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1794839400000000
+    },
+    "2026-11-17": {
+      "krx_close_utc_us": 1794897000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1794873600000000,
+      "us_close_utc_us": 1794949200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1794925800000000
+    },
+    "2026-11-18": {
+      "krx_close_utc_us": 1794983400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1794960000000000,
+      "us_close_utc_us": 1795035600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1795012200000000
+    },
+    "2026-11-19": {
+      "krx_close_utc_us": 1795073400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1795050000000000,
+      "us_close_utc_us": 1795122000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1795098600000000
+    },
+    "2026-11-20": {
+      "krx_close_utc_us": 1795156200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1795132800000000,
+      "us_close_utc_us": 1795208400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1795185000000000
+    },
+    "2026-11-21": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-22": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-23": {
+      "krx_close_utc_us": 1795415400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1795392000000000,
+      "us_close_utc_us": 1795467600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1795444200000000
+    },
+    "2026-11-24": {
+      "krx_close_utc_us": 1795501800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1795478400000000,
+      "us_close_utc_us": 1795554000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1795530600000000
+    },
+    "2026-11-25": {
+      "krx_close_utc_us": 1795588200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1795564800000000,
+      "us_close_utc_us": 1795640400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1795617000000000
+    },
+    "2026-11-26": {
+      "krx_close_utc_us": 1795674600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1795651200000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-27": {
+      "krx_close_utc_us": 1795761000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1795737600000000,
+      "us_close_utc_us": 1795802400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1795789800000000
+    },
+    "2026-11-28": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-29": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-11-30": {
+      "krx_close_utc_us": 1796020200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1795996800000000,
+      "us_close_utc_us": 1796072400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796049000000000
+    },
+    "2026-12-01": {
+      "krx_close_utc_us": 1796106600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1796083200000000,
+      "us_close_utc_us": 1796158800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796135400000000
+    },
+    "2026-12-02": {
+      "krx_close_utc_us": 1796193000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1796169600000000,
+      "us_close_utc_us": 1796245200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796221800000000
+    },
+    "2026-12-03": {
+      "krx_close_utc_us": 1796279400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1796256000000000,
+      "us_close_utc_us": 1796331600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796308200000000
+    },
+    "2026-12-04": {
+      "krx_close_utc_us": 1796365800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1796342400000000,
+      "us_close_utc_us": 1796418000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796394600000000
+    },
+    "2026-12-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-12-06": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-12-07": {
+      "krx_close_utc_us": 1796625000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1796601600000000,
+      "us_close_utc_us": 1796677200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796653800000000
+    },
+    "2026-12-08": {
+      "krx_close_utc_us": 1796711400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1796688000000000,
+      "us_close_utc_us": 1796763600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796740200000000
+    },
+    "2026-12-09": {
+      "krx_close_utc_us": 1796797800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1796774400000000,
+      "us_close_utc_us": 1796850000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796826600000000
+    },
+    "2026-12-10": {
+      "krx_close_utc_us": 1796884200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1796860800000000,
+      "us_close_utc_us": 1796936400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796913000000000
+    },
+    "2026-12-11": {
+      "krx_close_utc_us": 1796970600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1796947200000000,
+      "us_close_utc_us": 1797022800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1796999400000000
+    },
+    "2026-12-12": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-12-13": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-12-14": {
+      "krx_close_utc_us": 1797229800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1797206400000000,
+      "us_close_utc_us": 1797282000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1797258600000000
+    },
+    "2026-12-15": {
+      "krx_close_utc_us": 1797316200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1797292800000000,
+      "us_close_utc_us": 1797368400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1797345000000000
+    },
+    "2026-12-16": {
+      "krx_close_utc_us": 1797402600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1797379200000000,
+      "us_close_utc_us": 1797454800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1797431400000000
+    },
+    "2026-12-17": {
+      "krx_close_utc_us": 1797489000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1797465600000000,
+      "us_close_utc_us": 1797541200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1797517800000000
+    },
+    "2026-12-18": {
+      "krx_close_utc_us": 1797575400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1797552000000000,
+      "us_close_utc_us": 1797627600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1797604200000000
+    },
+    "2026-12-19": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-12-20": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-12-21": {
+      "krx_close_utc_us": 1797834600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1797811200000000,
+      "us_close_utc_us": 1797886800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1797863400000000
+    },
+    "2026-12-22": {
+      "krx_close_utc_us": 1797921000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1797897600000000,
+      "us_close_utc_us": 1797973200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1797949800000000
+    },
+    "2026-12-23": {
+      "krx_close_utc_us": 1798007400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1797984000000000,
+      "us_close_utc_us": 1798059600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1798036200000000
+    },
+    "2026-12-24": {
+      "krx_close_utc_us": 1798093800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1798070400000000,
+      "us_close_utc_us": 1798135200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1798122600000000
+    },
+    "2026-12-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-12-26": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-12-27": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2026-12-28": {
+      "krx_close_utc_us": 1798439400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1798416000000000,
+      "us_close_utc_us": 1798491600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1798468200000000
+    },
+    "2026-12-29": {
+      "krx_close_utc_us": 1798525800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1798502400000000,
+      "us_close_utc_us": 1798578000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1798554600000000
+    },
+    "2026-12-30": {
+      "krx_close_utc_us": 1798612200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1798588800000000,
+      "us_close_utc_us": 1798664400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1798641000000000
+    },
+    "2026-12-31": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1798750800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1798727400000000
+    },
+    "2027-01-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-02": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-03": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-04": {
+      "krx_close_utc_us": 1799044200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799024400000000,
+      "us_close_utc_us": 1799096400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1799073000000000
+    },
+    "2027-01-05": {
+      "krx_close_utc_us": 1799130600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799107200000000,
+      "us_close_utc_us": 1799182800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1799159400000000
+    },
+    "2027-01-06": {
+      "krx_close_utc_us": 1799217000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799193600000000,
+      "us_close_utc_us": 1799269200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1799245800000000
+    },
+    "2027-01-07": {
+      "krx_close_utc_us": 1799303400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799280000000000,
+      "us_close_utc_us": 1799355600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1799332200000000
+    },
+    "2027-01-08": {
+      "krx_close_utc_us": 1799389800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799366400000000,
+      "us_close_utc_us": 1799442000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1799418600000000
+    },
+    "2027-01-09": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-10": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-11": {
+      "krx_close_utc_us": 1799649000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799625600000000,
+      "us_close_utc_us": 1799701200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1799677800000000
+    },
+    "2027-01-12": {
+      "krx_close_utc_us": 1799735400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799712000000000,
+      "us_close_utc_us": 1799787600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1799764200000000
+    },
+    "2027-01-13": {
+      "krx_close_utc_us": 1799821800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799798400000000,
+      "us_close_utc_us": 1799874000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1799850600000000
+    },
+    "2027-01-14": {
+      "krx_close_utc_us": 1799908200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799884800000000,
+      "us_close_utc_us": 1799960400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1799937000000000
+    },
+    "2027-01-15": {
+      "krx_close_utc_us": 1799994600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1799971200000000,
+      "us_close_utc_us": 1800046800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1800023400000000
+    },
+    "2027-01-16": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-18": {
+      "krx_close_utc_us": 1800253800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1800230400000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-19": {
+      "krx_close_utc_us": 1800340200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1800316800000000,
+      "us_close_utc_us": 1800392400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1800369000000000
+    },
+    "2027-01-20": {
+      "krx_close_utc_us": 1800426600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1800403200000000,
+      "us_close_utc_us": 1800478800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1800455400000000
+    },
+    "2027-01-21": {
+      "krx_close_utc_us": 1800513000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1800489600000000,
+      "us_close_utc_us": 1800565200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1800541800000000
+    },
+    "2027-01-22": {
+      "krx_close_utc_us": 1800599400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1800576000000000,
+      "us_close_utc_us": 1800651600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1800628200000000
+    },
+    "2027-01-23": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-24": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-25": {
+      "krx_close_utc_us": 1800858600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1800835200000000,
+      "us_close_utc_us": 1800910800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1800887400000000
+    },
+    "2027-01-26": {
+      "krx_close_utc_us": 1800945000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1800921600000000,
+      "us_close_utc_us": 1800997200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1800973800000000
+    },
+    "2027-01-27": {
+      "krx_close_utc_us": 1801031400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1801008000000000,
+      "us_close_utc_us": 1801083600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1801060200000000
+    },
+    "2027-01-28": {
+      "krx_close_utc_us": 1801117800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1801094400000000,
+      "us_close_utc_us": 1801170000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1801146600000000
+    },
+    "2027-01-29": {
+      "krx_close_utc_us": 1801204200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1801180800000000,
+      "us_close_utc_us": 1801256400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1801233000000000
+    },
+    "2027-01-30": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-01-31": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-02-01": {
+      "krx_close_utc_us": 1801463400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1801440000000000,
+      "us_close_utc_us": 1801515600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1801492200000000
+    },
+    "2027-02-02": {
+      "krx_close_utc_us": 1801549800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1801526400000000,
+      "us_close_utc_us": 1801602000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1801578600000000
+    },
+    "2027-02-03": {
+      "krx_close_utc_us": 1801636200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1801612800000000,
+      "us_close_utc_us": 1801688400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1801665000000000
+    },
+    "2027-02-04": {
+      "krx_close_utc_us": 1801722600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1801699200000000,
+      "us_close_utc_us": 1801774800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1801751400000000
+    },
+    "2027-02-05": {
+      "krx_close_utc_us": 1801809000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1801785600000000,
+      "us_close_utc_us": 1801861200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1801837800000000
+    },
+    "2027-02-06": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-02-07": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-02-08": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1802120400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1802097000000000
+    },
+    "2027-02-09": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1802206800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1802183400000000
+    },
+    "2027-02-10": {
+      "krx_close_utc_us": 1802241000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1802217600000000,
+      "us_close_utc_us": 1802293200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1802269800000000
+    },
+    "2027-02-11": {
+      "krx_close_utc_us": 1802327400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1802304000000000,
+      "us_close_utc_us": 1802379600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1802356200000000
+    },
+    "2027-02-12": {
+      "krx_close_utc_us": 1802413800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1802390400000000,
+      "us_close_utc_us": 1802466000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1802442600000000
+    },
+    "2027-02-13": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-02-14": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-02-15": {
+      "krx_close_utc_us": 1802673000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1802649600000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-02-16": {
+      "krx_close_utc_us": 1802759400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1802736000000000,
+      "us_close_utc_us": 1802811600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1802788200000000
+    },
+    "2027-02-17": {
+      "krx_close_utc_us": 1802845800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1802822400000000,
+      "us_close_utc_us": 1802898000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1802874600000000
+    },
+    "2027-02-18": {
+      "krx_close_utc_us": 1802932200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1802908800000000,
+      "us_close_utc_us": 1802984400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1802961000000000
+    },
+    "2027-02-19": {
+      "krx_close_utc_us": 1803018600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1802995200000000,
+      "us_close_utc_us": 1803070800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1803047400000000
+    },
+    "2027-02-20": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-02-21": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-02-22": {
+      "krx_close_utc_us": 1803277800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1803254400000000,
+      "us_close_utc_us": 1803330000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1803306600000000
+    },
+    "2027-02-23": {
+      "krx_close_utc_us": 1803364200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1803340800000000,
+      "us_close_utc_us": 1803416400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1803393000000000
+    },
+    "2027-02-24": {
+      "krx_close_utc_us": 1803450600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1803427200000000,
+      "us_close_utc_us": 1803502800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1803479400000000
+    },
+    "2027-02-25": {
+      "krx_close_utc_us": 1803537000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1803513600000000,
+      "us_close_utc_us": 1803589200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1803565800000000
+    },
+    "2027-02-26": {
+      "krx_close_utc_us": 1803623400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1803600000000000,
+      "us_close_utc_us": 1803675600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1803652200000000
+    },
+    "2027-02-27": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-02-28": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1803934800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1803911400000000
+    },
+    "2027-03-02": {
+      "krx_close_utc_us": 1803969000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1803945600000000,
+      "us_close_utc_us": 1804021200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1803997800000000
+    },
+    "2027-03-03": {
+      "krx_close_utc_us": 1804055400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1804032000000000,
+      "us_close_utc_us": 1804107600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1804084200000000
+    },
+    "2027-03-04": {
+      "krx_close_utc_us": 1804141800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1804118400000000,
+      "us_close_utc_us": 1804194000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1804170600000000
+    },
+    "2027-03-05": {
+      "krx_close_utc_us": 1804228200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1804204800000000,
+      "us_close_utc_us": 1804280400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1804257000000000
+    },
+    "2027-03-06": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-07": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-08": {
+      "krx_close_utc_us": 1804487400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1804464000000000,
+      "us_close_utc_us": 1804539600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1804516200000000
+    },
+    "2027-03-09": {
+      "krx_close_utc_us": 1804573800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1804550400000000,
+      "us_close_utc_us": 1804626000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1804602600000000
+    },
+    "2027-03-10": {
+      "krx_close_utc_us": 1804660200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1804636800000000,
+      "us_close_utc_us": 1804712400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1804689000000000
+    },
+    "2027-03-11": {
+      "krx_close_utc_us": 1804746600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1804723200000000,
+      "us_close_utc_us": 1804798800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1804775400000000
+    },
+    "2027-03-12": {
+      "krx_close_utc_us": 1804833000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1804809600000000,
+      "us_close_utc_us": 1804885200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1804861800000000
+    },
+    "2027-03-13": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-14": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-15": {
+      "krx_close_utc_us": 1805092200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1805068800000000,
+      "us_close_utc_us": 1805140800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1805117400000000
+    },
+    "2027-03-16": {
+      "krx_close_utc_us": 1805178600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1805155200000000,
+      "us_close_utc_us": 1805227200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1805203800000000
+    },
+    "2027-03-17": {
+      "krx_close_utc_us": 1805265000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1805241600000000,
+      "us_close_utc_us": 1805313600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1805290200000000
+    },
+    "2027-03-18": {
+      "krx_close_utc_us": 1805351400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1805328000000000,
+      "us_close_utc_us": 1805400000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1805376600000000
+    },
+    "2027-03-19": {
+      "krx_close_utc_us": 1805437800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1805414400000000,
+      "us_close_utc_us": 1805486400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1805463000000000
+    },
+    "2027-03-20": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-21": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-22": {
+      "krx_close_utc_us": 1805697000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1805673600000000,
+      "us_close_utc_us": 1805745600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1805722200000000
+    },
+    "2027-03-23": {
+      "krx_close_utc_us": 1805783400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1805760000000000,
+      "us_close_utc_us": 1805832000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1805808600000000
+    },
+    "2027-03-24": {
+      "krx_close_utc_us": 1805869800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1805846400000000,
+      "us_close_utc_us": 1805918400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1805895000000000
+    },
+    "2027-03-25": {
+      "krx_close_utc_us": 1805956200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1805932800000000,
+      "us_close_utc_us": 1806004800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1805981400000000
+    },
+    "2027-03-26": {
+      "krx_close_utc_us": 1806042600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1806019200000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-27": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-28": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-03-29": {
+      "krx_close_utc_us": 1806301800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1806278400000000,
+      "us_close_utc_us": 1806350400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1806327000000000
+    },
+    "2027-03-30": {
+      "krx_close_utc_us": 1806388200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1806364800000000,
+      "us_close_utc_us": 1806436800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1806413400000000
+    },
+    "2027-03-31": {
+      "krx_close_utc_us": 1806474600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1806451200000000,
+      "us_close_utc_us": 1806523200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1806499800000000
+    },
+    "2027-04-01": {
+      "krx_close_utc_us": 1806561000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1806537600000000,
+      "us_close_utc_us": 1806609600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1806586200000000
+    },
+    "2027-04-02": {
+      "krx_close_utc_us": 1806647400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1806624000000000,
+      "us_close_utc_us": 1806696000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1806672600000000
+    },
+    "2027-04-03": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-04-04": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-04-05": {
+      "krx_close_utc_us": 1806906600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1806883200000000,
+      "us_close_utc_us": 1806955200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1806931800000000
+    },
+    "2027-04-06": {
+      "krx_close_utc_us": 1806993000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1806969600000000,
+      "us_close_utc_us": 1807041600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1807018200000000
+    },
+    "2027-04-07": {
+      "krx_close_utc_us": 1807079400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1807056000000000,
+      "us_close_utc_us": 1807128000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1807104600000000
+    },
+    "2027-04-08": {
+      "krx_close_utc_us": 1807165800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1807142400000000,
+      "us_close_utc_us": 1807214400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1807191000000000
+    },
+    "2027-04-09": {
+      "krx_close_utc_us": 1807252200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1807228800000000,
+      "us_close_utc_us": 1807300800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1807277400000000
+    },
+    "2027-04-10": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-04-11": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-04-12": {
+      "krx_close_utc_us": 1807511400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1807488000000000,
+      "us_close_utc_us": 1807560000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1807536600000000
+    },
+    "2027-04-13": {
+      "krx_close_utc_us": 1807597800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1807574400000000,
+      "us_close_utc_us": 1807646400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1807623000000000
+    },
+    "2027-04-14": {
+      "krx_close_utc_us": 1807684200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1807660800000000,
+      "us_close_utc_us": 1807732800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1807709400000000
+    },
+    "2027-04-15": {
+      "krx_close_utc_us": 1807770600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1807747200000000,
+      "us_close_utc_us": 1807819200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1807795800000000
+    },
+    "2027-04-16": {
+      "krx_close_utc_us": 1807857000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1807833600000000,
+      "us_close_utc_us": 1807905600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1807882200000000
+    },
+    "2027-04-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-04-18": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-04-19": {
+      "krx_close_utc_us": 1808116200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1808092800000000,
+      "us_close_utc_us": 1808164800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1808141400000000
+    },
+    "2027-04-20": {
+      "krx_close_utc_us": 1808202600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1808179200000000,
+      "us_close_utc_us": 1808251200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1808227800000000
+    },
+    "2027-04-21": {
+      "krx_close_utc_us": 1808289000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1808265600000000,
+      "us_close_utc_us": 1808337600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1808314200000000
+    },
+    "2027-04-22": {
+      "krx_close_utc_us": 1808375400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1808352000000000,
+      "us_close_utc_us": 1808424000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1808400600000000
+    },
+    "2027-04-23": {
+      "krx_close_utc_us": 1808461800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1808438400000000,
+      "us_close_utc_us": 1808510400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1808487000000000
+    },
+    "2027-04-24": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-04-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-04-26": {
+      "krx_close_utc_us": 1808721000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1808697600000000,
+      "us_close_utc_us": 1808769600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1808746200000000
+    },
+    "2027-04-27": {
+      "krx_close_utc_us": 1808807400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1808784000000000,
+      "us_close_utc_us": 1808856000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1808832600000000
+    },
+    "2027-04-28": {
+      "krx_close_utc_us": 1808893800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1808870400000000,
+      "us_close_utc_us": 1808942400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1808919000000000
+    },
+    "2027-04-29": {
+      "krx_close_utc_us": 1808980200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1808956800000000,
+      "us_close_utc_us": 1809028800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1809005400000000
+    },
+    "2027-04-30": {
+      "krx_close_utc_us": 1809066600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1809043200000000,
+      "us_close_utc_us": 1809115200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1809091800000000
+    },
+    "2027-05-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-02": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-03": {
+      "krx_close_utc_us": 1809325800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1809302400000000,
+      "us_close_utc_us": 1809374400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1809351000000000
+    },
+    "2027-05-04": {
+      "krx_close_utc_us": 1809412200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1809388800000000,
+      "us_close_utc_us": 1809460800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1809437400000000
+    },
+    "2027-05-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1809547200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1809523800000000
+    },
+    "2027-05-06": {
+      "krx_close_utc_us": 1809585000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1809561600000000,
+      "us_close_utc_us": 1809633600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1809610200000000
+    },
+    "2027-05-07": {
+      "krx_close_utc_us": 1809671400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1809648000000000,
+      "us_close_utc_us": 1809720000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1809696600000000
+    },
+    "2027-05-08": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-09": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-10": {
+      "krx_close_utc_us": 1809930600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1809907200000000,
+      "us_close_utc_us": 1809979200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1809955800000000
+    },
+    "2027-05-11": {
+      "krx_close_utc_us": 1810017000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1809993600000000,
+      "us_close_utc_us": 1810065600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1810042200000000
+    },
+    "2027-05-12": {
+      "krx_close_utc_us": 1810103400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1810080000000000,
+      "us_close_utc_us": 1810152000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1810128600000000
+    },
+    "2027-05-13": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1810238400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1810215000000000
+    },
+    "2027-05-14": {
+      "krx_close_utc_us": 1810276200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1810252800000000,
+      "us_close_utc_us": 1810324800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1810301400000000
+    },
+    "2027-05-15": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-16": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-17": {
+      "krx_close_utc_us": 1810535400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1810512000000000,
+      "us_close_utc_us": 1810584000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1810560600000000
+    },
+    "2027-05-18": {
+      "krx_close_utc_us": 1810621800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1810598400000000,
+      "us_close_utc_us": 1810670400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1810647000000000
+    },
+    "2027-05-19": {
+      "krx_close_utc_us": 1810708200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1810684800000000,
+      "us_close_utc_us": 1810756800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1810733400000000
+    },
+    "2027-05-20": {
+      "krx_close_utc_us": 1810794600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1810771200000000,
+      "us_close_utc_us": 1810843200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1810819800000000
+    },
+    "2027-05-21": {
+      "krx_close_utc_us": 1810881000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1810857600000000,
+      "us_close_utc_us": 1810929600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1810906200000000
+    },
+    "2027-05-22": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-23": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-24": {
+      "krx_close_utc_us": 1811140200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1811116800000000,
+      "us_close_utc_us": 1811188800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1811165400000000
+    },
+    "2027-05-25": {
+      "krx_close_utc_us": 1811226600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1811203200000000,
+      "us_close_utc_us": 1811275200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1811251800000000
+    },
+    "2027-05-26": {
+      "krx_close_utc_us": 1811313000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1811289600000000,
+      "us_close_utc_us": 1811361600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1811338200000000
+    },
+    "2027-05-27": {
+      "krx_close_utc_us": 1811399400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1811376000000000,
+      "us_close_utc_us": 1811448000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1811424600000000
+    },
+    "2027-05-28": {
+      "krx_close_utc_us": 1811485800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1811462400000000,
+      "us_close_utc_us": 1811534400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1811511000000000
+    },
+    "2027-05-29": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-30": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-05-31": {
+      "krx_close_utc_us": 1811745000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1811721600000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-01": {
+      "krx_close_utc_us": 1811831400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1811808000000000,
+      "us_close_utc_us": 1811880000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1811856600000000
+    },
+    "2027-06-02": {
+      "krx_close_utc_us": 1811917800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1811894400000000,
+      "us_close_utc_us": 1811966400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1811943000000000
+    },
+    "2027-06-03": {
+      "krx_close_utc_us": 1812004200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1811980800000000,
+      "us_close_utc_us": 1812052800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1812029400000000
+    },
+    "2027-06-04": {
+      "krx_close_utc_us": 1812090600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1812067200000000,
+      "us_close_utc_us": 1812139200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1812115800000000
+    },
+    "2027-06-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-06": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-07": {
+      "krx_close_utc_us": 1812349800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1812326400000000,
+      "us_close_utc_us": 1812398400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1812375000000000
+    },
+    "2027-06-08": {
+      "krx_close_utc_us": 1812436200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1812412800000000,
+      "us_close_utc_us": 1812484800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1812461400000000
+    },
+    "2027-06-09": {
+      "krx_close_utc_us": 1812522600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1812499200000000,
+      "us_close_utc_us": 1812571200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1812547800000000
+    },
+    "2027-06-10": {
+      "krx_close_utc_us": 1812609000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1812585600000000,
+      "us_close_utc_us": 1812657600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1812634200000000
+    },
+    "2027-06-11": {
+      "krx_close_utc_us": 1812695400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1812672000000000,
+      "us_close_utc_us": 1812744000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1812720600000000
+    },
+    "2027-06-12": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-13": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-14": {
+      "krx_close_utc_us": 1812954600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1812931200000000,
+      "us_close_utc_us": 1813003200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1812979800000000
+    },
+    "2027-06-15": {
+      "krx_close_utc_us": 1813041000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1813017600000000,
+      "us_close_utc_us": 1813089600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1813066200000000
+    },
+    "2027-06-16": {
+      "krx_close_utc_us": 1813127400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1813104000000000,
+      "us_close_utc_us": 1813176000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1813152600000000
+    },
+    "2027-06-17": {
+      "krx_close_utc_us": 1813213800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1813190400000000,
+      "us_close_utc_us": 1813262400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1813239000000000
+    },
+    "2027-06-18": {
+      "krx_close_utc_us": 1813300200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1813276800000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-19": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-20": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-21": {
+      "krx_close_utc_us": 1813559400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1813536000000000,
+      "us_close_utc_us": 1813608000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1813584600000000
+    },
+    "2027-06-22": {
+      "krx_close_utc_us": 1813645800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1813622400000000,
+      "us_close_utc_us": 1813694400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1813671000000000
+    },
+    "2027-06-23": {
+      "krx_close_utc_us": 1813732200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1813708800000000,
+      "us_close_utc_us": 1813780800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1813757400000000
+    },
+    "2027-06-24": {
+      "krx_close_utc_us": 1813818600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1813795200000000,
+      "us_close_utc_us": 1813867200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1813843800000000
+    },
+    "2027-06-25": {
+      "krx_close_utc_us": 1813905000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1813881600000000,
+      "us_close_utc_us": 1813953600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1813930200000000
+    },
+    "2027-06-26": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-27": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-06-28": {
+      "krx_close_utc_us": 1814164200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1814140800000000,
+      "us_close_utc_us": 1814212800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1814189400000000
+    },
+    "2027-06-29": {
+      "krx_close_utc_us": 1814250600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1814227200000000,
+      "us_close_utc_us": 1814299200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1814275800000000
+    },
+    "2027-06-30": {
+      "krx_close_utc_us": 1814337000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1814313600000000,
+      "us_close_utc_us": 1814385600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1814362200000000
+    },
+    "2027-07-01": {
+      "krx_close_utc_us": 1814423400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1814400000000000,
+      "us_close_utc_us": 1814472000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1814448600000000
+    },
+    "2027-07-02": {
+      "krx_close_utc_us": 1814509800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1814486400000000,
+      "us_close_utc_us": 1814558400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1814535000000000
+    },
+    "2027-07-03": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-07-04": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-07-05": {
+      "krx_close_utc_us": 1814769000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1814745600000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-07-06": {
+      "krx_close_utc_us": 1814855400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1814832000000000,
+      "us_close_utc_us": 1814904000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1814880600000000
+    },
+    "2027-07-07": {
+      "krx_close_utc_us": 1814941800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1814918400000000,
+      "us_close_utc_us": 1814990400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1814967000000000
+    },
+    "2027-07-08": {
+      "krx_close_utc_us": 1815028200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1815004800000000,
+      "us_close_utc_us": 1815076800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1815053400000000
+    },
+    "2027-07-09": {
+      "krx_close_utc_us": 1815114600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1815091200000000,
+      "us_close_utc_us": 1815163200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1815139800000000
+    },
+    "2027-07-10": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-07-11": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-07-12": {
+      "krx_close_utc_us": 1815373800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1815350400000000,
+      "us_close_utc_us": 1815422400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1815399000000000
+    },
+    "2027-07-13": {
+      "krx_close_utc_us": 1815460200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1815436800000000,
+      "us_close_utc_us": 1815508800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1815485400000000
+    },
+    "2027-07-14": {
+      "krx_close_utc_us": 1815546600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1815523200000000,
+      "us_close_utc_us": 1815595200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1815571800000000
+    },
+    "2027-07-15": {
+      "krx_close_utc_us": 1815633000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1815609600000000,
+      "us_close_utc_us": 1815681600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1815658200000000
+    },
+    "2027-07-16": {
+      "krx_close_utc_us": 1815719400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1815696000000000,
+      "us_close_utc_us": 1815768000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1815744600000000
+    },
+    "2027-07-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-07-18": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-07-19": {
+      "krx_close_utc_us": 1815978600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1815955200000000,
+      "us_close_utc_us": 1816027200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816003800000000
+    },
+    "2027-07-20": {
+      "krx_close_utc_us": 1816065000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1816041600000000,
+      "us_close_utc_us": 1816113600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816090200000000
+    },
+    "2027-07-21": {
+      "krx_close_utc_us": 1816151400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1816128000000000,
+      "us_close_utc_us": 1816200000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816176600000000
+    },
+    "2027-07-22": {
+      "krx_close_utc_us": 1816237800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1816214400000000,
+      "us_close_utc_us": 1816286400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816263000000000
+    },
+    "2027-07-23": {
+      "krx_close_utc_us": 1816324200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1816300800000000,
+      "us_close_utc_us": 1816372800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816349400000000
+    },
+    "2027-07-24": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-07-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-07-26": {
+      "krx_close_utc_us": 1816583400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1816560000000000,
+      "us_close_utc_us": 1816632000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816608600000000
+    },
+    "2027-07-27": {
+      "krx_close_utc_us": 1816669800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1816646400000000,
+      "us_close_utc_us": 1816718400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816695000000000
+    },
+    "2027-07-28": {
+      "krx_close_utc_us": 1816756200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1816732800000000,
+      "us_close_utc_us": 1816804800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816781400000000
+    },
+    "2027-07-29": {
+      "krx_close_utc_us": 1816842600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1816819200000000,
+      "us_close_utc_us": 1816891200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816867800000000
+    },
+    "2027-07-30": {
+      "krx_close_utc_us": 1816929000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1816905600000000,
+      "us_close_utc_us": 1816977600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1816954200000000
+    },
+    "2027-07-31": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-01": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-02": {
+      "krx_close_utc_us": 1817188200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1817164800000000,
+      "us_close_utc_us": 1817236800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1817213400000000
+    },
+    "2027-08-03": {
+      "krx_close_utc_us": 1817274600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1817251200000000,
+      "us_close_utc_us": 1817323200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1817299800000000
+    },
+    "2027-08-04": {
+      "krx_close_utc_us": 1817361000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1817337600000000,
+      "us_close_utc_us": 1817409600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1817386200000000
+    },
+    "2027-08-05": {
+      "krx_close_utc_us": 1817447400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1817424000000000,
+      "us_close_utc_us": 1817496000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1817472600000000
+    },
+    "2027-08-06": {
+      "krx_close_utc_us": 1817533800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1817510400000000,
+      "us_close_utc_us": 1817582400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1817559000000000
+    },
+    "2027-08-07": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-08": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-09": {
+      "krx_close_utc_us": 1817793000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1817769600000000,
+      "us_close_utc_us": 1817841600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1817818200000000
+    },
+    "2027-08-10": {
+      "krx_close_utc_us": 1817879400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1817856000000000,
+      "us_close_utc_us": 1817928000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1817904600000000
+    },
+    "2027-08-11": {
+      "krx_close_utc_us": 1817965800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1817942400000000,
+      "us_close_utc_us": 1818014400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1817991000000000
+    },
+    "2027-08-12": {
+      "krx_close_utc_us": 1818052200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1818028800000000,
+      "us_close_utc_us": 1818100800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1818077400000000
+    },
+    "2027-08-13": {
+      "krx_close_utc_us": 1818138600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1818115200000000,
+      "us_close_utc_us": 1818187200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1818163800000000
+    },
+    "2027-08-14": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-15": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-16": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1818446400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1818423000000000
+    },
+    "2027-08-17": {
+      "krx_close_utc_us": 1818484200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1818460800000000,
+      "us_close_utc_us": 1818532800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1818509400000000
+    },
+    "2027-08-18": {
+      "krx_close_utc_us": 1818570600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1818547200000000,
+      "us_close_utc_us": 1818619200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1818595800000000
+    },
+    "2027-08-19": {
+      "krx_close_utc_us": 1818657000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1818633600000000,
+      "us_close_utc_us": 1818705600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1818682200000000
+    },
+    "2027-08-20": {
+      "krx_close_utc_us": 1818743400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1818720000000000,
+      "us_close_utc_us": 1818792000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1818768600000000
+    },
+    "2027-08-21": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-22": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-23": {
+      "krx_close_utc_us": 1819002600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1818979200000000,
+      "us_close_utc_us": 1819051200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819027800000000
+    },
+    "2027-08-24": {
+      "krx_close_utc_us": 1819089000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1819065600000000,
+      "us_close_utc_us": 1819137600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819114200000000
+    },
+    "2027-08-25": {
+      "krx_close_utc_us": 1819175400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1819152000000000,
+      "us_close_utc_us": 1819224000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819200600000000
+    },
+    "2027-08-26": {
+      "krx_close_utc_us": 1819261800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1819238400000000,
+      "us_close_utc_us": 1819310400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819287000000000
+    },
+    "2027-08-27": {
+      "krx_close_utc_us": 1819348200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1819324800000000,
+      "us_close_utc_us": 1819396800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819373400000000
+    },
+    "2027-08-28": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-29": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-08-30": {
+      "krx_close_utc_us": 1819607400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1819584000000000,
+      "us_close_utc_us": 1819656000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819632600000000
+    },
+    "2027-08-31": {
+      "krx_close_utc_us": 1819693800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1819670400000000,
+      "us_close_utc_us": 1819742400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819719000000000
+    },
+    "2027-09-01": {
+      "krx_close_utc_us": 1819780200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1819756800000000,
+      "us_close_utc_us": 1819828800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819805400000000
+    },
+    "2027-09-02": {
+      "krx_close_utc_us": 1819866600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1819843200000000,
+      "us_close_utc_us": 1819915200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819891800000000
+    },
+    "2027-09-03": {
+      "krx_close_utc_us": 1819953000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1819929600000000,
+      "us_close_utc_us": 1820001600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1819978200000000
+    },
+    "2027-09-04": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-09-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-09-06": {
+      "krx_close_utc_us": 1820212200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1820188800000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-09-07": {
+      "krx_close_utc_us": 1820298600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1820275200000000,
+      "us_close_utc_us": 1820347200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1820323800000000
+    },
+    "2027-09-08": {
+      "krx_close_utc_us": 1820385000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1820361600000000,
+      "us_close_utc_us": 1820433600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1820410200000000
+    },
+    "2027-09-09": {
+      "krx_close_utc_us": 1820471400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1820448000000000,
+      "us_close_utc_us": 1820520000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1820496600000000
+    },
+    "2027-09-10": {
+      "krx_close_utc_us": 1820557800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1820534400000000,
+      "us_close_utc_us": 1820606400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1820583000000000
+    },
+    "2027-09-11": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-09-12": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-09-13": {
+      "krx_close_utc_us": 1820817000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1820793600000000,
+      "us_close_utc_us": 1820865600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1820842200000000
+    },
+    "2027-09-14": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1820952000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1820928600000000
+    },
+    "2027-09-15": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1821038400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1821015000000000
+    },
+    "2027-09-16": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1821124800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1821101400000000
+    },
+    "2027-09-17": {
+      "krx_close_utc_us": 1821162600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1821139200000000,
+      "us_close_utc_us": 1821211200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1821187800000000
+    },
+    "2027-09-18": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-09-19": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-09-20": {
+      "krx_close_utc_us": 1821421800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1821398400000000,
+      "us_close_utc_us": 1821470400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1821447000000000
+    },
+    "2027-09-21": {
+      "krx_close_utc_us": 1821508200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1821484800000000,
+      "us_close_utc_us": 1821556800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1821533400000000
+    },
+    "2027-09-22": {
+      "krx_close_utc_us": 1821594600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1821571200000000,
+      "us_close_utc_us": 1821643200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1821619800000000
+    },
+    "2027-09-23": {
+      "krx_close_utc_us": 1821681000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1821657600000000,
+      "us_close_utc_us": 1821729600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1821706200000000
+    },
+    "2027-09-24": {
+      "krx_close_utc_us": 1821767400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1821744000000000,
+      "us_close_utc_us": 1821816000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1821792600000000
+    },
+    "2027-09-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-09-26": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-09-27": {
+      "krx_close_utc_us": 1822026600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1822003200000000,
+      "us_close_utc_us": 1822075200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1822051800000000
+    },
+    "2027-09-28": {
+      "krx_close_utc_us": 1822113000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1822089600000000,
+      "us_close_utc_us": 1822161600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1822138200000000
+    },
+    "2027-09-29": {
+      "krx_close_utc_us": 1822199400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1822176000000000,
+      "us_close_utc_us": 1822248000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1822224600000000
+    },
+    "2027-09-30": {
+      "krx_close_utc_us": 1822285800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1822262400000000,
+      "us_close_utc_us": 1822334400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1822311000000000
+    },
+    "2027-10-01": {
+      "krx_close_utc_us": 1822372200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1822348800000000,
+      "us_close_utc_us": 1822420800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1822397400000000
+    },
+    "2027-10-02": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-10-03": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-10-04": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1822680000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1822656600000000
+    },
+    "2027-10-05": {
+      "krx_close_utc_us": 1822717800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1822694400000000,
+      "us_close_utc_us": 1822766400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1822743000000000
+    },
+    "2027-10-06": {
+      "krx_close_utc_us": 1822804200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1822780800000000,
+      "us_close_utc_us": 1822852800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1822829400000000
+    },
+    "2027-10-07": {
+      "krx_close_utc_us": 1822890600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1822867200000000,
+      "us_close_utc_us": 1822939200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1822915800000000
+    },
+    "2027-10-08": {
+      "krx_close_utc_us": 1822977000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1822953600000000,
+      "us_close_utc_us": 1823025600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1823002200000000
+    },
+    "2027-10-09": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-10-10": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-10-11": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1823284800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1823261400000000
+    },
+    "2027-10-12": {
+      "krx_close_utc_us": 1823322600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1823299200000000,
+      "us_close_utc_us": 1823371200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1823347800000000
+    },
+    "2027-10-13": {
+      "krx_close_utc_us": 1823409000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1823385600000000,
+      "us_close_utc_us": 1823457600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1823434200000000
+    },
+    "2027-10-14": {
+      "krx_close_utc_us": 1823495400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1823472000000000,
+      "us_close_utc_us": 1823544000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1823520600000000
+    },
+    "2027-10-15": {
+      "krx_close_utc_us": 1823581800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1823558400000000,
+      "us_close_utc_us": 1823630400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1823607000000000
+    },
+    "2027-10-16": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-10-17": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-10-18": {
+      "krx_close_utc_us": 1823841000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1823817600000000,
+      "us_close_utc_us": 1823889600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1823866200000000
+    },
+    "2027-10-19": {
+      "krx_close_utc_us": 1823927400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1823904000000000,
+      "us_close_utc_us": 1823976000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1823952600000000
+    },
+    "2027-10-20": {
+      "krx_close_utc_us": 1824013800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1823990400000000,
+      "us_close_utc_us": 1824062400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1824039000000000
+    },
+    "2027-10-21": {
+      "krx_close_utc_us": 1824100200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1824076800000000,
+      "us_close_utc_us": 1824148800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1824125400000000
+    },
+    "2027-10-22": {
+      "krx_close_utc_us": 1824186600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1824163200000000,
+      "us_close_utc_us": 1824235200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1824211800000000
+    },
+    "2027-10-23": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-10-24": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-10-25": {
+      "krx_close_utc_us": 1824445800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1824422400000000,
+      "us_close_utc_us": 1824494400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1824471000000000
+    },
+    "2027-10-26": {
+      "krx_close_utc_us": 1824532200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1824508800000000,
+      "us_close_utc_us": 1824580800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1824557400000000
+    },
+    "2027-10-27": {
+      "krx_close_utc_us": 1824618600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1824595200000000,
+      "us_close_utc_us": 1824667200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1824643800000000
+    },
+    "2027-10-28": {
+      "krx_close_utc_us": 1824705000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1824681600000000,
+      "us_close_utc_us": 1824753600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1824730200000000
+    },
+    "2027-10-29": {
+      "krx_close_utc_us": 1824791400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1824768000000000,
+      "us_close_utc_us": 1824840000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1824816600000000
+    },
+    "2027-10-30": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-10-31": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-01": {
+      "krx_close_utc_us": 1825050600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825027200000000,
+      "us_close_utc_us": 1825099200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1825075800000000
+    },
+    "2027-11-02": {
+      "krx_close_utc_us": 1825137000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825113600000000,
+      "us_close_utc_us": 1825185600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1825162200000000
+    },
+    "2027-11-03": {
+      "krx_close_utc_us": 1825223400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825200000000000,
+      "us_close_utc_us": 1825272000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1825248600000000
+    },
+    "2027-11-04": {
+      "krx_close_utc_us": 1825309800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825286400000000,
+      "us_close_utc_us": 1825358400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1825335000000000
+    },
+    "2027-11-05": {
+      "krx_close_utc_us": 1825396200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825372800000000,
+      "us_close_utc_us": 1825444800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1825421400000000
+    },
+    "2027-11-06": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-07": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-08": {
+      "krx_close_utc_us": 1825655400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825632000000000,
+      "us_close_utc_us": 1825707600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1825684200000000
+    },
+    "2027-11-09": {
+      "krx_close_utc_us": 1825741800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825718400000000,
+      "us_close_utc_us": 1825794000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1825770600000000
+    },
+    "2027-11-10": {
+      "krx_close_utc_us": 1825828200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825804800000000,
+      "us_close_utc_us": 1825880400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1825857000000000
+    },
+    "2027-11-11": {
+      "krx_close_utc_us": 1825914600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825891200000000,
+      "us_close_utc_us": 1825966800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1825943400000000
+    },
+    "2027-11-12": {
+      "krx_close_utc_us": 1826001000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1825977600000000,
+      "us_close_utc_us": 1826053200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1826029800000000
+    },
+    "2027-11-13": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-14": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-15": {
+      "krx_close_utc_us": 1826260200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1826236800000000,
+      "us_close_utc_us": 1826312400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1826289000000000
+    },
+    "2027-11-16": {
+      "krx_close_utc_us": 1826346600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1826323200000000,
+      "us_close_utc_us": 1826398800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1826375400000000
+    },
+    "2027-11-17": {
+      "krx_close_utc_us": 1826433000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1826409600000000,
+      "us_close_utc_us": 1826485200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1826461800000000
+    },
+    "2027-11-18": {
+      "krx_close_utc_us": 1826523000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1826499600000000,
+      "us_close_utc_us": 1826571600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1826548200000000
+    },
+    "2027-11-19": {
+      "krx_close_utc_us": 1826605800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1826582400000000,
+      "us_close_utc_us": 1826658000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1826634600000000
+    },
+    "2027-11-20": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-21": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-22": {
+      "krx_close_utc_us": 1826865000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1826841600000000,
+      "us_close_utc_us": 1826917200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1826893800000000
+    },
+    "2027-11-23": {
+      "krx_close_utc_us": 1826951400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1826928000000000,
+      "us_close_utc_us": 1827003600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1826980200000000
+    },
+    "2027-11-24": {
+      "krx_close_utc_us": 1827037800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1827014400000000,
+      "us_close_utc_us": 1827090000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1827066600000000
+    },
+    "2027-11-25": {
+      "krx_close_utc_us": 1827124200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1827100800000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-26": {
+      "krx_close_utc_us": 1827210600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1827187200000000,
+      "us_close_utc_us": 1827252000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1827239400000000
+    },
+    "2027-11-27": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-28": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-11-29": {
+      "krx_close_utc_us": 1827469800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1827446400000000,
+      "us_close_utc_us": 1827522000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1827498600000000
+    },
+    "2027-11-30": {
+      "krx_close_utc_us": 1827556200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1827532800000000,
+      "us_close_utc_us": 1827608400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1827585000000000
+    },
+    "2027-12-01": {
+      "krx_close_utc_us": 1827642600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1827619200000000,
+      "us_close_utc_us": 1827694800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1827671400000000
+    },
+    "2027-12-02": {
+      "krx_close_utc_us": 1827729000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1827705600000000,
+      "us_close_utc_us": 1827781200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1827757800000000
+    },
+    "2027-12-03": {
+      "krx_close_utc_us": 1827815400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1827792000000000,
+      "us_close_utc_us": 1827867600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1827844200000000
+    },
+    "2027-12-04": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-12-05": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-12-06": {
+      "krx_close_utc_us": 1828074600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1828051200000000,
+      "us_close_utc_us": 1828126800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1828103400000000
+    },
+    "2027-12-07": {
+      "krx_close_utc_us": 1828161000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1828137600000000,
+      "us_close_utc_us": 1828213200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1828189800000000
+    },
+    "2027-12-08": {
+      "krx_close_utc_us": 1828247400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1828224000000000,
+      "us_close_utc_us": 1828299600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1828276200000000
+    },
+    "2027-12-09": {
+      "krx_close_utc_us": 1828333800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1828310400000000,
+      "us_close_utc_us": 1828386000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1828362600000000
+    },
+    "2027-12-10": {
+      "krx_close_utc_us": 1828420200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1828396800000000,
+      "us_close_utc_us": 1828472400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1828449000000000
+    },
+    "2027-12-11": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-12-12": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-12-13": {
+      "krx_close_utc_us": 1828679400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1828656000000000,
+      "us_close_utc_us": 1828731600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1828708200000000
+    },
+    "2027-12-14": {
+      "krx_close_utc_us": 1828765800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1828742400000000,
+      "us_close_utc_us": 1828818000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1828794600000000
+    },
+    "2027-12-15": {
+      "krx_close_utc_us": 1828852200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1828828800000000,
+      "us_close_utc_us": 1828904400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1828881000000000
+    },
+    "2027-12-16": {
+      "krx_close_utc_us": 1828938600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1828915200000000,
+      "us_close_utc_us": 1828990800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1828967400000000
+    },
+    "2027-12-17": {
+      "krx_close_utc_us": 1829025000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1829001600000000,
+      "us_close_utc_us": 1829077200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1829053800000000
+    },
+    "2027-12-18": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-12-19": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-12-20": {
+      "krx_close_utc_us": 1829284200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1829260800000000,
+      "us_close_utc_us": 1829336400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1829313000000000
+    },
+    "2027-12-21": {
+      "krx_close_utc_us": 1829370600000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1829347200000000,
+      "us_close_utc_us": 1829422800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1829399400000000
+    },
+    "2027-12-22": {
+      "krx_close_utc_us": 1829457000000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1829433600000000,
+      "us_close_utc_us": 1829509200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1829485800000000
+    },
+    "2027-12-23": {
+      "krx_close_utc_us": 1829543400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1829520000000000,
+      "us_close_utc_us": 1829595600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1829572200000000
+    },
+    "2027-12-24": {
+      "krx_close_utc_us": 1829629800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1829606400000000,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-12-25": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-12-26": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": null,
+      "us_is_open": false,
+      "us_open_utc_us": null
+    },
+    "2027-12-27": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1829941200000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1829917800000000
+    },
+    "2027-12-28": {
+      "krx_close_utc_us": 1829975400000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1829952000000000,
+      "us_close_utc_us": 1830027600000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1830004200000000
+    },
+    "2027-12-29": {
+      "krx_close_utc_us": 1830061800000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1830038400000000,
+      "us_close_utc_us": 1830114000000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1830090600000000
+    },
+    "2027-12-30": {
+      "krx_close_utc_us": 1830148200000000,
+      "krx_is_open": true,
+      "krx_open_utc_us": 1830124800000000,
+      "us_close_utc_us": 1830200400000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1830177000000000
+    },
+    "2027-12-31": {
+      "krx_close_utc_us": null,
+      "krx_is_open": false,
+      "krx_open_utc_us": null,
+      "us_close_utc_us": 1830286800000000,
+      "us_is_open": true,
+      "us_open_utc_us": 1830263400000000
+    }
+  },
+  "source_package": "exchange_calendars==4.13.2",
+  "us_calendar": "XNYS"
+}

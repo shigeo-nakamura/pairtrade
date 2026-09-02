@@ -8,6 +8,7 @@ REQUIREMENTS=${ENGINE_B_PHASE0_REQUIREMENTS:-/opt/debot/scripts/engine_b_phase0_
 OBSERVER_SOURCE=${ENGINE_B_PHASE0_OBSERVER_SOURCE:-/opt/debot/scripts/engine_b_phase0.py}
 ARCHIVER_SOURCE=${ENGINE_B_PHASE0_ARCHIVER_SOURCE:-/opt/debot/scripts/engine_b_phase0_archive.sh}
 CONFIG_SOURCE=${ENGINE_B_PHASE0_CONFIG_SOURCE:-/opt/debot/configs/engine-b/phase0.json}
+CALENDAR_SOURCE=${ENGINE_B_PHASE0_CALENDAR_SOURCE:-/opt/debot/configs/engine-b/trading_calendar.json}
 UNIT_SOURCE_DIR=${ENGINE_B_PHASE0_UNIT_SOURCE_DIR:-/opt/debot/deploy}
 CODE_COMMIT=${ENGINE_B_PHASE0_CODE_COMMIT:-}
 SERVICE_USER=engine-b-phase0
@@ -22,7 +23,7 @@ if [ ! -f "$REQUIREMENTS" ]; then
   echo "Requirements lock is missing: $REQUIREMENTS" >&2
   exit 1
 fi
-for source in "$OBSERVER_SOURCE" "$ARCHIVER_SOURCE" "$CONFIG_SOURCE"; do
+for source in "$OBSERVER_SOURCE" "$ARCHIVER_SOURCE" "$CONFIG_SOURCE" "$CALENDAR_SOURCE"; do
   if [ ! -f "$source" ]; then
     echo "Engine B runtime source is missing: $source" >&2
     exit 1
@@ -67,6 +68,8 @@ install -o root -g "$SERVICE_GROUP" -m 0550 "$ARCHIVER_SOURCE" \
   "$INSTALL_DIR/engine_b_phase0_archive.sh"
 install -o root -g "$SERVICE_GROUP" -m 0440 "$CONFIG_SOURCE" \
   "$INSTALL_DIR/phase0.json"
+install -o root -g "$SERVICE_GROUP" -m 0440 "$CALENDAR_SOURCE" \
+  "$INSTALL_DIR/trading_calendar.json"
 install -o root -g "$SERVICE_GROUP" -m 0440 "$REQUIREMENTS" \
   "$INSTALL_DIR/requirements.txt"
 

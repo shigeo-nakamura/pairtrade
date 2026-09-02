@@ -23,10 +23,97 @@ The observer collects two explicitly labelled venues:
   including `EWY` and `USDKRW`.
 
 Do not combine the two venues into a v0.3 primary regression without a new,
-reviewed analysis-plan version. Until A-7 has a verified KRX/US market calendar
-and Robinhood's same-venue control gap is resolved, `trading_session` rows are
-written fail-closed with `krx_is_open=0`, `us_cash_is_open=0`, and must not be
-counted as valid Phase 0A samples.
+reviewed analysis-plan version. A-7 (the verified KRX/US market calendar) is
+resolved via the frozen calendar described below, but Robinhood's same-venue
+control gap (missing `EWY`/`USDKRW`) is not: every `trading_session` row still
+carries `SAME_VENUE_REQUIRED_SYMBOLS_MISSING=robinhood:EWY,robinhood:USDKRW`
+in `validity_reason` and must not be counted as a valid Phase 0A sample until
+that gap closes too.
+
+## A-7: KRX/US cash-market trading calendar
+
+`krx_is_open`/`us_cash_is_open` in `trading_session` come from a frozen,
+pre-computed session table -- `configs/engine-b/trading_calendar.json` --
+generated offline by `scripts/engine_b_trading_calendar_freeze.py` from the
+`exchange_calendars` library (`XKRX` for Korea, `XNYS` for the US cash
+market; pinned in `scripts/engine_b_trading_calendar_freeze_requirements.txt`).
+The observer itself never imports a calendar library: it loads this JSON with
+stdlib `json` at startup (`TradingCalendar.load`) and looks up each date by
+ISO string. When a date resolves, `trading_session.t0_us`/`t1_us`/`t2_us`
+(KRX open, KRX close, US cash open) come from that date's real
+`krx_open_utc_us`/`krx_close_utc_us`/`us_open_utc_us`, not a fixed
+09:00/15:30 KST or 9:30am America/New_York placeholder -- this matters on
+irregular-schedule days such as the delayed open on the first trading day of
+a year. `Collector.health_payload()["trading_calendar_version"]` reports the
+loaded `calendar_version`, or `null` if no calendar loaded.
+
+`health_payload()["phase0_sample_blockers"]` drops the A-7 line only when
+`Collector.calendar_covers_upcoming_sessions()` is true, i.e. the loaded
+calendar actually resolves both today and tomorrow (the two dates
+`session_loop` writes) -- a calendar object being loaded is not enough once
+its committed `range` runs out (currently 2027-12-31); re-freeze with an
+extended range before then.
+
+If the frozen file is missing, unreadable, a session entry is malformed, or a
+queried date falls outside its committed `range`, the observer falls back to
+the original fail-closed placeholder for that date only (`krx_is_open=0`,
+`us_cash_is_open=0`, `calendar_version=UNRESOLVED_A7_zoneinfo_only`,
+`validity_reason` includes `A7_UNRESOLVED_VERIFIED_KRX_US_CALENDAR`) --
+never a crash.
+
+KRX observes no DST (`Asia/Seoul` is a fixed UTC+9), so its session hours are
+stable; the US cash market's `America/New_York` session shifts by an hour
+across the EDT/EST boundary, which `exchange_calendars` resolves correctly
+from the IANA tzdb without any special-casing here.
+
+`exchange_calendars`' recurring-holiday rules can still miss KRX-specific
+adjustments announced or scheduled separately from the library's own table.
+Two kinds are known so far, each with its own override dict in
+`scripts/engine_b_trading_calendar_freeze.py` (a citable primary source is
+required per entry, and the generated document records which overrides
+applied within a given `--start`/`--end`, in `krx_one_off_closures` /
+`krx_delayed_open_one_hour` respectively):
+
+- **Full closures** (`KRX_ONE_OFF_CLOSURES`): an administrative holiday the
+  library marked open. 2026-06-03 (Local Election Day) and 2026-07-17
+  (Constitution Day, reinstated for 2026) both required this.
+- **One-hour delayed open** (`KRX_DELAYED_OPEN_ONE_HOUR`): KRX shifts the
+  cash-market session to 10:00-16:30 KST (from the normal 09:00-15:30) on the
+  day of the national CSAT exam each year, which the library does not encode
+  at all -- it reports the normal hours. 2026-11-19 and 2027-11-18 (the CSAT
+  dates falling in the current frozen range) both required this. Korean CSAT
+  naming is offset by academic year (a "2027학년도" exam is administered in
+  November 2026); resolve the actual calendar date, not the label, before
+  adding a new year's entry.
+
+Before trusting a freeze for gate evaluation (G0-8 needs A-7 resolved),
+cross-check the covered years against KRX's own published holiday/session
+notice and extend the relevant override dict for anything the library still
+gets wrong -- both of the above were caught by review, not by this process
+catching them itself, so treat the two dicts as a known-incomplete starting
+point rather than an exhaustive audit.
+
+**Re-freezing** (extend the covered date range, pick up an
+`exchange_calendars` release, or after cross-checking a specific year against
+KRX's own published holiday notice -- rule-based generation can miss one-off
+administrative holidays):
+
+```bash
+python3 -m venv /tmp/calendar-freeze-venv
+/tmp/calendar-freeze-venv/bin/pip install -r scripts/engine_b_trading_calendar_freeze_requirements.txt
+/tmp/calendar-freeze-venv/bin/python scripts/engine_b_trading_calendar_freeze.py \
+  --start 2026-01-01 --end 2027-12-31 \
+  --out configs/engine-b/trading_calendar.json
+```
+
+Review the diff, then commit it together with the code/requirements change
+that motivated it. CI ("Verify Engine B trading calendar freeze") regenerates
+the artifact from its own committed `range` and diffs it byte-for-byte
+against the committed file, so a hand-edit or an un-recommitted
+`exchange_calendars` bump fails the build. `install_engine_b_phase0.sh`
+installs it read-only alongside `phase0.json`
+(`$INSTALL_DIR/trading_calendar.json`, mode 0440); the deploy workflow ships
+it through the same S3 release prefix as the rest of the Phase 0 release.
 
 ## Host and service
 
