@@ -39,8 +39,16 @@ connection.execute(
 )
 connection.execute(
     """CREATE TABLE data_gap(
+         gap_id INTEGER PRIMARY KEY AUTOINCREMENT,
+         venue TEXT NOT NULL,
+         market_id INTEGER,
+         symbol TEXT,
+         channel TEXT NOT NULL,
          ts_start_us INTEGER NOT NULL,
-         ts_end_us INTEGER
+         ts_end_us INTEGER,
+         expected_sequence TEXT,
+         observed_sequence TEXT,
+         reason TEXT NOT NULL
        )"""
 )
 connection.execute(
@@ -63,7 +71,12 @@ connection.execute(
     "INSERT INTO ws_connection VALUES (?, NULL, NULL)",
     (946_684_800_000_000,),
 )
-connection.execute("INSERT INTO data_gap VALUES (?, NULL)", (946_684_800_000_000,))
+connection.execute(
+    """INSERT INTO data_gap(
+         venue, market_id, symbol, channel, ts_start_us, reason
+       ) VALUES ('robinhood', 37, 'SKHY', 'connection', ?, 'test_outage')""",
+    (946_684_800_000_000,),
+)
 connection.execute(
     """INSERT INTO trade(
          connection_session_id, venue, market_id, exchange_trade_id,
@@ -253,6 +266,15 @@ test -n "$remote_trade_index"
 test -n "$remote_seal"
 cmp -s "$trade_index" "$remote_trade_index"
 cmp -s "$seal" "$remote_seal"
+continuation_marker="$ROOT/gap-continuations/20000101_00-1.json"
+test -f "$continuation_marker"
+python3 - "$continuation_marker" <<'PY'
+import json
+import sys
+marker = json.load(open(sys.argv[1]))
+assert marker["continuation_id"] == "archive:20000101_00:1"
+assert marker["start_us"] == 946_688_400_000_000
+PY
 python3 - "$seal" "$trade_index" "$expected_sha" <<'PY'
 import json
 import hashlib
@@ -296,6 +318,47 @@ try:
     assert not any(row[2] == "synthetic:obsolete-hash" for row in identities)
     assert connection.execute("SELECT COUNT(*) FROM late_trade_identity").fetchone() == (0,)
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+finally:
+    connection.close()
+PY
+late_db="$DATA_DIR/engine_b_phase0_20000101_02.sqlite3"
+python3 - "$late_db" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute(
+    """CREATE TABLE late_trade(
+         sealed_partition TEXT NOT NULL,
+         venue TEXT NOT NULL,
+         market_id INTEGER NOT NULL,
+         exchange_trade_id TEXT NOT NULL
+       )"""
+)
+connection.execute(
+    "INSERT INTO late_trade VALUES ('20000101_00', 'robinhood', 37, 'late-republish')"
+)
+connection.commit()
+connection.close()
+PY
+FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
+ENGINE_B_PHASE0_DATA_DIR="$DATA_DIR" \
+ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
+ENGINE_B_PHASE0_S3_PREFIX=test-prefix \
+ENGINE_B_PHASE0_PYTHON=python3 \
+ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true \
+bash "$(dirname "$0")/engine_b_phase0_archive.sh"
+test ! -e "$late_db"
+cmp -s "$trade_index" "$remote_trade_index"
+python3 - "$remote_trade_index" <<'PY'
+import sqlite3
+import sys
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    assert connection.execute(
+        """SELECT 1 FROM late_trade_identity
+           WHERE exchange_trade_id = 'late-republish'"""
+    ).fetchone() == (1,)
 finally:
     connection.close()
 PY

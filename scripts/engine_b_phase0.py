@@ -41,7 +41,7 @@ LOG = logging.getLogger("engine_b_phase0")
 UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 OHLCV_FINALIZE_GRACE_US = 120_000_000
 
 
@@ -211,6 +211,7 @@ CREATE TABLE IF NOT EXISTS data_gap (
   ts_end_us INTEGER,
   expected_sequence TEXT,
   observed_sequence TEXT,
+  continuation_id TEXT,
   reason TEXT NOT NULL
 );
 
@@ -833,11 +834,17 @@ class DatabaseSink:
         self.state_dir = config.database_dir.parent
         self.sealed_dir = self.state_dir / "sealed"
         self.lock_dir = self.state_dir / "locks"
+        self.gap_continuation_dir = self.state_dir / "gap-continuations"
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
 
     def start(self) -> None:
-        for directory in (self.config.database_dir, self.sealed_dir, self.lock_dir):
+        for directory in (
+            self.config.database_dir,
+            self.sealed_dir,
+            self.lock_dir,
+            self.gap_continuation_dir,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
             os.chmod(directory, 0o750)
         self._task = asyncio.create_task(self._run(), name="sqlite-writer")
@@ -937,6 +944,15 @@ class DatabaseSink:
             connection.execute("ALTER TABLE ohlcv_1m ADD COLUMN first_trade_ts_us INTEGER")
         if "last_trade_ts_us" not in columns:
             connection.execute("ALTER TABLE ohlcv_1m ADD COLUMN last_trade_ts_us INTEGER")
+        gap_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(data_gap)")
+        }
+        if "continuation_id" not in gap_columns:
+            connection.execute("ALTER TABLE data_gap ADD COLUMN continuation_id TEXT")
+        connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_data_gap_continuation
+               ON data_gap(continuation_id) WHERE continuation_id IS NOT NULL"""
+        )
         connection.execute(
             """UPDATE ohlcv_1m
                SET first_trade_ts_us = COALESCE(first_trade_ts_us, bucket_start_us),
@@ -1110,6 +1126,11 @@ class DatabaseSink:
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         gap_closes: list[dict[str, Any]] = []
+        recovered_gap_markers = self._load_gap_continuations()
+        batch = [
+            *(("gap", payload) for _, payload in recovered_gap_markers),
+            *batch,
+        ]
         for kind, payload in batch:
             if kind == "__stop__":
                 continue
@@ -1157,11 +1178,41 @@ class DatabaseSink:
                 self._write_partition(late_partition, late_commands)
 
         current_partition = partition_for_us(now_us())
+        gap_continuations: list[tuple[str, dict[str, Any]]] = []
         for partition, connection in list(self._connections.items()):
             with self._partition_lock(partition):
                 self._finalize_ohlcv(connection, now_us())
                 if partition < current_partition:
                     partition_ended_us = partition_start_us(partition) + 3_600_000_000
+                    for row in connection.execute(
+                        """SELECT gap_id, venue, market_id, symbol, channel,
+                                  expected_sequence, observed_sequence, reason
+                           FROM data_gap WHERE ts_end_us IS NULL"""
+                    ):
+                        gap_id, venue, market_id, symbol, channel, expected, observed, reason = row
+                        gap_continuations.append(
+                            (
+                                "gap",
+                                {
+                                    "recv_us": now_us(),
+                                    "start_us": partition_ended_us,
+                                    "connection_id": None,
+                                    "venue": venue,
+                                    "market_id": market_id,
+                                    "symbol": symbol,
+                                    "channel": channel,
+                                    "expected_sequence": expected,
+                                    "observed_sequence": observed,
+                                    "continuation_id": f"partition:{partition}:{gap_id}",
+                                    "reason": reason,
+                                },
+                            )
+                        )
+                    connection.execute(
+                        """UPDATE data_gap SET ts_end_us = MAX(ts_start_us, ?)
+                           WHERE ts_end_us IS NULL""",
+                        (partition_ended_us,),
+                    )
                     connection.execute(
                         """UPDATE ws_connection
                            SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
@@ -1172,6 +1223,42 @@ class DatabaseSink:
                 connection.commit()
                 if partition < current_partition:
                     self._connections.pop(partition).close()
+
+        if gap_continuations:
+            with self._partition_lock(current_partition):
+                self._write_partition(current_partition, gap_continuations)
+        for marker_path, _ in recovered_gap_markers:
+            marker_path.unlink(missing_ok=True)
+
+    def _load_gap_continuations(self) -> list[tuple[Path, dict[str, Any]]]:
+        if not self.gap_continuation_dir.is_dir():
+            return []
+        recovered: list[tuple[Path, dict[str, Any]]] = []
+        required = {
+            "continuation_id",
+            "start_us",
+            "venue",
+            "market_id",
+            "symbol",
+            "channel",
+            "reason",
+        }
+        for marker_path in sorted(self.gap_continuation_dir.glob("*.json")):
+            try:
+                marker = json.loads(marker_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"gap continuation marker is unreadable: {marker_path}"
+                ) from exc
+            if not isinstance(marker, dict) or not required <= marker.keys():
+                raise RuntimeError(
+                    f"gap continuation marker is invalid: {marker_path}"
+                )
+            payload = dict(marker)
+            payload["recv_us"] = now_us()
+            payload["connection_id"] = None
+            recovered.append((marker_path, payload))
+        return recovered
 
     def _close_open_gaps(self, payload: dict[str, Any]) -> None:
         for database_path in sorted(
@@ -1373,15 +1460,18 @@ class DatabaseSink:
             )
         elif kind == "gap":
             connection.execute(
-                """INSERT INTO data_gap(
+                """INSERT OR IGNORE INTO data_gap(
                      connection_session_id, venue, market_id, symbol, channel, ts_start_us,
-                     ts_end_us, expected_sequence, observed_sequence, reason
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     ts_end_us, expected_sequence, observed_sequence, continuation_id,
+                     reason
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     payload.get("connection_id"), payload["venue"], payload.get("market_id"),
-                    payload.get("symbol"), payload["channel"], payload["recv_us"],
+                    payload.get("symbol"), payload["channel"],
+                    payload.get("start_us", payload["recv_us"]),
                     payload.get("end_us"), payload.get("expected_sequence"),
-                    payload.get("observed_sequence"), payload["reason"],
+                    payload.get("observed_sequence"), payload.get("continuation_id"),
+                    payload["reason"],
                 ),
             )
         elif kind == "market_status":

@@ -612,6 +612,145 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 db.close()
 
+    async def test_open_gap_is_carried_into_next_partition(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            gap_started_us = hour_start_us + 3_500_000_000
+            next_hour_us = hour_start_us + 3_600_000_000
+            recovered_us = next_hour_us + 200_000_000
+            sink = engine_b.DatabaseSink(config, "carry-run", "carry-commit")
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            gap = {
+                "recv_us": gap_started_us,
+                "connection_id": None,
+                "venue": "robinhood",
+                "market_id": 37,
+                "symbol": "SKHY",
+                "channel": "connection",
+                "reason": "connection_error:TimeoutError",
+            }
+            with mock.patch.object(engine_b, "now_us", return_value=gap_started_us):
+                sink._write_batch([("gap", gap)])
+            with mock.patch.object(engine_b, "now_us", return_value=next_hour_us + 1):
+                sink._write_batch([])
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                sink._write_batch(
+                    [
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                            },
+                        )
+                    ]
+                )
+            await sink.close()
+
+            first_db = sqlite3.connect(
+                database_dir
+                / f"engine_b_phase0_{engine_b.partition_for_us(hour_start_us)}.sqlite3"
+            )
+            second_db = sqlite3.connect(
+                database_dir
+                / f"engine_b_phase0_{engine_b.partition_for_us(next_hour_us)}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    first_db.execute(
+                        "SELECT ts_start_us, ts_end_us FROM data_gap"
+                    ).fetchone(),
+                    (gap_started_us, next_hour_us),
+                )
+                self.assertEqual(
+                    second_db.execute(
+                        """SELECT ts_start_us, ts_end_us, continuation_id
+                           FROM data_gap"""
+                    ).fetchone(),
+                    (
+                        next_hour_us,
+                        recovered_us,
+                        f"partition:{engine_b.partition_for_us(hour_start_us)}:1",
+                    ),
+                )
+            finally:
+                first_db.close()
+                second_db.close()
+
+    async def test_archive_gap_marker_is_imported_idempotently(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            recovered_us = 1_700_003_800_000_000
+            start_us = recovered_us - 300_000_000
+            sink = engine_b.DatabaseSink(config, "marker-run", "marker-commit")
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            marker_path = sink.gap_continuation_dir / "old-gap.json"
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "continuation_id": "archive:old:7",
+                        "start_us": start_us,
+                        "venue": "robinhood",
+                        "market_id": 37,
+                        "symbol": "SKHY",
+                        "channel": "connection",
+                        "expected_sequence": None,
+                        "observed_sequence": None,
+                        "reason": "connection_error:TimeoutError",
+                    }
+                )
+                + "\n"
+            )
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                sink._write_batch(
+                    [
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                            },
+                        )
+                    ]
+                )
+            self.assertFalse(marker_path.exists())
+            await sink.close()
+
+            db_path = database_dir / (
+                f"engine_b_phase0_{engine_b.partition_for_us(recovered_us)}.sqlite3"
+            )
+            db = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(
+                    db.execute(
+                        """SELECT ts_start_us, ts_end_us, continuation_id
+                           FROM data_gap"""
+                    ).fetchall(),
+                    [(start_us, recovered_us, "archive:old:7")],
+                )
+            finally:
+                db.close()
+
 
     async def test_deduplicates_and_merges_late_trades_in_event_partition(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)

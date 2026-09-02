@@ -82,7 +82,8 @@ journaled identity into its referenced sealed sidecar before the source hour
 can be archived or deleted. Once copied, a replay in a later active hour is
 discarded from the sidecar. There is no separate sidecar transaction on the
 collector write path, so a process stop cannot strand a committed late trade
-between two writes.
+between two writes. Every older index changed by reconciliation is republished
+and verified in S3 before the source journal DB can be deleted.
 If the source changes or WAL sidecars reappear during upload, the seal is rolled
 back and the local partition is retained.
 If the archiver is interrupted after sealing but before deletion, the next run
@@ -146,7 +147,10 @@ recorded as incomplete sequence gaps and force a public-channel resubscribe;
 they never produce reconstructed top-of-book rows.
 Open connection/order-book gap rows are closed when a replacement snapshot
 restores synchronization, including rows retained in an earlier hourly DB. The
-archiver bounds any still-open gap at the partition boundary before upload.
+collector carries an open gap into each new hourly partition. If the collector
+is unavailable, the archiver writes a durable continuation marker before it
+bounds the old row; the next collector batch imports that marker idempotently
+before processing a recovery snapshot.
 
 ## `freq2` account record
 

@@ -13,6 +13,7 @@ HOST_ID=$(hostname -s)
 STATE_DIR=${ENGINE_B_PHASE0_STATE_DIR:-$(dirname "$DATA_DIR")}
 LOCK_DIR="$STATE_DIR/locks"
 SEALED_DIR="$STATE_DIR/sealed"
+GAP_CONTINUATION_DIR="$STATE_DIR/gap-continuations"
 
 persist_seal_sidecars() (
   set -euo pipefail
@@ -28,8 +29,26 @@ persist_seal_sidecars() (
   remote_seal=$(mktemp "$DATA_DIR/.seal.remote.XXXXXX.json")
   trap 'rm -f -- "$remote_trade_index" "$remote_seal"' EXIT
 
-  "$PYTHON_BIN" "$OBSERVER_SCRIPT" --verify-sealed-partition \
-    "$source_db" "$trade_index" "$seal" "$(basename "$seal" .json)"
+  if [ "$source_db" != "-" ]; then
+    "$PYTHON_BIN" "$OBSERVER_SCRIPT" --verify-sealed-partition \
+      "$source_db" "$trade_index" "$seal" "$(basename "$seal" .json)"
+  else
+    "$PYTHON_BIN" - "$trade_index" "$seal" <<'PY'
+import json
+import sqlite3
+import sys
+
+seal = json.load(open(sys.argv[2]))
+index = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    assert index.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    assert index.execute(
+        "SELECT partition, canonical_db_sha256 FROM sealed_metadata"
+    ).fetchone() == (seal["partition"], seal["sha256"])
+finally:
+    index.close()
+PY
+  fi
   aws s3 cp "$trade_index" "s3://$S3_BUCKET/$trade_index_key" \
     --sse AES256 --content-type application/vnd.sqlite3 --no-progress
   aws s3 cp "$seal" "s3://$S3_BUCKET/$seal_key" \
@@ -59,11 +78,53 @@ persist_seal_sidecars() (
   fi
 )
 
+republish_reconciled_sidecars() (
+  set -euo pipefail
+  local source_db=$1
+  local partitions
+  partitions=$("$PYTHON_BIN" - "$source_db" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    tables = {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    )}
+    if "late_trade" in tables:
+        for row in connection.execute(
+            "SELECT DISTINCT sealed_partition FROM late_trade ORDER BY sealed_partition"
+        ):
+            print(row[0])
+finally:
+    connection.close()
+PY
+  )
+  while IFS= read -r sealed_partition; do
+    [ -n "$sealed_partition" ] || continue
+    local seal="$SEALED_DIR/$sealed_partition.json"
+    local index="$SEALED_DIR/$sealed_partition.trade_ids.sqlite3"
+    local canonical_uri
+    local canonical_prefix="s3://$S3_BUCKET/"
+    canonical_uri=$("$PYTHON_BIN" - "$seal" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["s3_key"])
+PY
+    )
+    if [[ "$canonical_uri" != "$canonical_prefix"* ]]; then
+      echo "Sealed archive belongs to an unexpected bucket: $canonical_uri" >&2
+      exit 1
+    fi
+    persist_seal_sidecars - "$index" "$seal" "${canonical_uri#"$canonical_prefix"}"
+  done <<< "$partitions"
+)
+
 if [ ! -d "$DATA_DIR" ]; then
   echo "No Engine B data directory yet: $DATA_DIR"
   exit 0
 fi
-install -d -m 0750 "$LOCK_DIR" "$SEALED_DIR"
+install -d -m 0750 "$LOCK_DIR" "$SEALED_DIR" "$GAP_CONTINUATION_DIR"
 
 shopt -s nullglob
 for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
@@ -95,6 +156,7 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
     trade_index_path="$SEALED_DIR/$partition.trade_ids.sqlite3"
     "$PYTHON_BIN" "$OBSERVER_SCRIPT" --reconcile-late-trade-identities \
       "$db" "$SEALED_DIR"
+    republish_reconciled_sidecars "$db"
     "$PYTHON_BIN" "$OBSERVER_SCRIPT" --verify-sealed-partition \
       "$db" "$trade_index_path" "$seal_path" "$partition"
     persist_seal_sidecars "$db" "$trade_index_path" "$seal_path" "$key"
@@ -105,8 +167,11 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
     continue
   fi
   set +e
-  "$PYTHON_BIN" - "$db" "$partition" <<'PY'
+  "$PYTHON_BIN" - "$db" "$partition" "$GAP_CONTINUATION_DIR" <<'PY'
 from datetime import datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
 import sqlite3
 import sys
 
@@ -137,6 +202,37 @@ try:
             (partition_end_us,),
         )
     if "data_gap" in tables:
+        marker_dir = Path(sys.argv[3])
+        rows = connection.execute(
+            """SELECT gap_id, venue, market_id, symbol, channel,
+                      expected_sequence, observed_sequence, reason
+               FROM data_gap WHERE ts_end_us IS NULL"""
+        ).fetchall()
+        for gap_id, venue, market_id, symbol, channel, expected, observed, reason in rows:
+            marker = {
+                "continuation_id": f"archive:{sys.argv[2]}:{gap_id}",
+                "start_us": partition_end_us,
+                "venue": venue,
+                "market_id": market_id,
+                "symbol": symbol,
+                "channel": channel,
+                "expected_sequence": expected,
+                "observed_sequence": observed,
+                "reason": reason,
+            }
+            marker_path = marker_dir / f"{sys.argv[2]}-{gap_id}.json"
+            encoded = json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
+            if marker_path.exists():
+                if marker_path.read_text() != encoded:
+                    raise RuntimeError(f"gap continuation marker mismatch: {marker_path}")
+            else:
+                temporary = marker_path.with_suffix(".tmp")
+                with temporary.open("w") as output:
+                    output.write(encoded)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.chmod(temporary, 0o640)
+                os.replace(temporary, marker_path)
         connection.execute(
             """UPDATE data_gap
                SET ts_end_us = MAX(ts_start_us, ?)
@@ -181,6 +277,7 @@ PY
   # until every referenced sidecar has accepted the identity.
   "$PYTHON_BIN" "$OBSERVER_SCRIPT" --reconcile-late-trade-identities \
     "$db" "$SEALED_DIR"
+  republish_reconciled_sidecars "$db"
 
   source_fingerprint=$(stat -c '%s:%Y:%y' "$db")
   checksum_key="$key.sha256"
