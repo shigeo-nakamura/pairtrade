@@ -2572,7 +2572,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 database.close()
 
-    async def test_historical_trade_uses_non_physical_connection_reference(
+    async def test_event_time_trades_use_non_physical_connection_references(
         self,
     ) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
@@ -2582,9 +2582,11 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             historical_start_us = 1_774_880_400_000_000
             historical_start_us -= historical_start_us % 3_600_000_000
             current_start_us = historical_start_us + 3_600_000_000
-            connection_started_us = current_start_us + 10_000_000
-            received_us = current_start_us + 20_000_000
+            future_start_us = current_start_us + 3_600_000_000
+            connection_started_us = current_start_us + 3_500_000_000
+            received_us = current_start_us + 3_510_000_000
             event_us = historical_start_us + 30_000_000
+            future_event_us = future_start_us + 30_000_000
             connection = {
                 "id": "current-socket-historical-trade",
                 "venue": "robinhood",
@@ -2603,7 +2605,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             ):
                 path.mkdir(parents=True, exist_ok=True)
             with mock.patch.object(
-                engine_b, "now_us", return_value=current_start_us + 30_000_000
+                engine_b, "now_us", return_value=received_us + 1
             ):
                 sink._write_batch(
                     [
@@ -2641,6 +2643,31 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                                 "raw_public_json": "{}",
                             },
                         ),
+                        (
+                            "trade",
+                            {
+                                "recv_us": received_us,
+                                "partition_us": future_event_us,
+                                "event_ts_us": future_event_us,
+                                "bucket_start_us": (
+                                    future_event_us - future_event_us % 60_000_000
+                                ),
+                                "srv_us": future_event_us,
+                                "connection": connection,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                                "symbol": "SKHY",
+                                "trade_id": "future-trade",
+                                "replay_alias": None,
+                                "snapshot_occurrence": None,
+                                "exchange_sequence": "2",
+                                "local_sequence": 2,
+                                "price": "159.72",
+                                "size": "1",
+                                "aggressor_side": "sell",
+                                "raw_public_json": "{}",
+                            },
+                        ),
                     ]
                 )
             self.assertEqual(list(sink.session_continuation_dir.glob("*.json")), [])
@@ -2658,6 +2685,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 / (
                     "engine_b_phase0_"
                     f"{engine_b.partition_for_us(received_us)}.sqlite3"
+                )
+            )
+            future_db = sqlite3.connect(
+                database_dir
+                / (
+                    "engine_b_phase0_"
+                    f"{engine_b.partition_for_us(future_event_us)}.sqlite3"
                 )
             )
             try:
@@ -2686,9 +2720,27 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchone(),
                     (connection_started_us, received_us, None, 1),
                 )
+                self.assertEqual(
+                    future_db.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us,
+                                  end_reason, is_physical
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (
+                        future_start_us,
+                        future_start_us,
+                        "event_time_reference",
+                        0,
+                    ),
+                )
+                self.assertEqual(
+                    future_db.execute("SELECT COUNT(*) FROM trade").fetchone(),
+                    (1,),
+                )
             finally:
                 historical_db.close()
                 current_db.close()
+                future_db.close()
 
     async def test_session_marker_advances_past_sealed_destination(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)

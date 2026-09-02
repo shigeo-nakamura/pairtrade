@@ -1279,7 +1279,11 @@ class DatabaseSink:
         partition_started_us = partition_start_us(partition)
         partition_ended_us = partition_started_us + 3_600_000_000
         connection_started_us = int(meta["started_us"])
-        is_physical = connection_started_us < partition_ended_us
+        payload_received_us = int(payload.get("recv_us", connection_started_us))
+        is_physical = (
+            connection_started_us < partition_ended_us
+            and partition_started_us <= payload_received_us
+        )
         segment_started_us = min(
             max(connection_started_us, partition_started_us),
             partition_ended_us,
