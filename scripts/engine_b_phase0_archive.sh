@@ -45,11 +45,21 @@ persist_seal_sidecars() (
   local source_db=$1
   local trade_index=$2
   local seal=$3
-  local canonical_key=$4
+  local canonical_uri=$4
+  local canonical_bucket_and_key=${canonical_uri#s3://}
+  local canonical_bucket=${canonical_bucket_and_key%%/*}
+  local canonical_key=${canonical_bucket_and_key#*/}
   local trade_index_key="${canonical_key}.trade_ids.sqlite3"
   local seal_key="${canonical_key}.seal.json"
   local remote_trade_index
   local remote_seal
+  if [[ "$canonical_uri" != s3://*/* ]] \
+      || [ -z "$canonical_bucket" ] \
+      || [ -z "$canonical_key" ] \
+      || [ "$canonical_bucket_and_key" = "$canonical_key" ]; then
+    echo "Invalid canonical archive URI in seal: $canonical_uri" >&2
+    exit 1
+  fi
   remote_trade_index=$(mktemp "$DATA_DIR/.seal-index.remote.XXXXXX.sqlite3")
   remote_seal=$(mktemp "$DATA_DIR/.seal.remote.XXXXXX.json")
   trap 'rm -f -- "$remote_trade_index" "$remote_seal"' EXIT
@@ -74,24 +84,24 @@ finally:
     index.close()
 PY
   fi
-  aws s3 cp "$trade_index" "s3://$S3_BUCKET/$trade_index_key" \
+  aws s3 cp "$trade_index" "s3://$canonical_bucket/$trade_index_key" \
     --sse AES256 --content-type application/vnd.sqlite3 --no-progress
-  aws s3 cp "$seal" "s3://$S3_BUCKET/$seal_key" \
+  aws s3 cp "$seal" "s3://$canonical_bucket/$seal_key" \
     --sse AES256 --content-type application/json --no-progress
-  aws s3 cp "s3://$S3_BUCKET/$trade_index_key" "$remote_trade_index" --no-progress
-  aws s3 cp "s3://$S3_BUCKET/$seal_key" "$remote_seal" --no-progress
+  aws s3 cp "s3://$canonical_bucket/$trade_index_key" "$remote_trade_index" --no-progress
+  aws s3 cp "s3://$canonical_bucket/$seal_key" "$remote_seal" --no-progress
 
   local index_sse
   local seal_sse
   local index_size
   local seal_size
-  index_sse=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$trade_index_key" \
+  index_sse=$(aws s3api head-object --bucket "$canonical_bucket" --key "$trade_index_key" \
     --query ServerSideEncryption --output text)
-  seal_sse=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$seal_key" \
+  seal_sse=$(aws s3api head-object --bucket "$canonical_bucket" --key "$seal_key" \
     --query ServerSideEncryption --output text)
-  index_size=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$trade_index_key" \
+  index_size=$(aws s3api head-object --bucket "$canonical_bucket" --key "$trade_index_key" \
     --query ContentLength --output text)
-  seal_size=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$seal_key" \
+  seal_size=$(aws s3api head-object --bucket "$canonical_bucket" --key "$seal_key" \
     --query ContentLength --output text)
   if [ "$index_sse" != "AES256" ] || [ "$seal_sse" != "AES256" ] \
       || [[ ! "$index_size" =~ ^[1-9][0-9]*$ ]] \
@@ -130,18 +140,13 @@ PY
     local seal="$SEALED_DIR/$sealed_partition.json"
     local index="$SEALED_DIR/$sealed_partition.trade_ids.sqlite3"
     local canonical_uri
-    local canonical_prefix="s3://$S3_BUCKET/"
     canonical_uri=$("$PYTHON_BIN" - "$seal" <<'PY'
 import json
 import sys
 print(json.load(open(sys.argv[1]))["s3_key"])
 PY
     )
-    if [[ "$canonical_uri" != "$canonical_prefix"* ]]; then
-      echo "Sealed archive belongs to an unexpected bucket: $canonical_uri" >&2
-      exit 1
-    fi
-    persist_seal_sidecars - "$index" "$seal" "${canonical_uri#"$canonical_prefix"}"
+    persist_seal_sidecars - "$index" "$seal" "$canonical_uri"
   done <<< "$partitions"
 )
 
@@ -184,7 +189,13 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
     "$PYTHON_BIN" "$OBSERVER_SCRIPT" --reconcile-late-trade-identities \
       "$db" "$SEALED_DIR"
     republish_reconciled_sidecars "$db"
-    persist_seal_sidecars "$db" "$trade_index_path" "$seal_path" "$key"
+    canonical_uri=$("$PYTHON_BIN" - "$seal_path" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["s3_key"])
+PY
+    )
+    persist_seal_sidecars "$db" "$trade_index_path" "$seal_path" "$canonical_uri"
     fsync_files_and_directory "$SEALED_DIR" "$trade_index_path" "$seal_path"
     rm -f -- "$db"
     fsync_directory "$DATA_DIR"
@@ -467,7 +478,8 @@ PY
     fi
   fi
   if [ "$DELETE_VERIFIED_LOCAL" = "true" ] && [ "$source_stable" = "true" ]; then
-    persist_seal_sidecars "$db" "$trade_index_path" "$seal_path" "$key"
+    persist_seal_sidecars \
+      "$db" "$trade_index_path" "$seal_path" "s3://$S3_BUCKET/$key"
     if ! rm -f -- "$db"; then
       echo "Remote seal is committed but local deletion failed; retaining local seal for recovery: $db" >&2
       exit 1
