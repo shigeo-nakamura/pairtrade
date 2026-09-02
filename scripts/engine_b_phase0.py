@@ -41,7 +41,7 @@ LOG = logging.getLogger("engine_b_phase0")
 UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 OHLCV_FINALIZE_GRACE_US = 120_000_000
 
 
@@ -146,6 +146,17 @@ CREATE TABLE IF NOT EXISTS trade (
 CREATE INDEX IF NOT EXISTS idx_trade_venue_symbol_time
   ON trade(venue, symbol, ts_recv_us);
 
+CREATE TABLE IF NOT EXISTS trade_replay_alias (
+  venue TEXT NOT NULL,
+  market_id INTEGER NOT NULL,
+  replay_alias TEXT NOT NULL,
+  exchange_trade_id TEXT NOT NULL,
+  PRIMARY KEY(venue, market_id, exchange_trade_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_replay_alias_lookup
+  ON trade_replay_alias(venue, market_id, replay_alias);
+
 CREATE TABLE IF NOT EXISTS late_trade (
   late_trade_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
   connection_session_id TEXT NOT NULL,
@@ -163,6 +174,7 @@ CREATE TABLE IF NOT EXISTS late_trade (
   size TEXT NOT NULL,
   aggressor_side TEXT,
   raw_public_json TEXT NOT NULL,
+  replay_alias TEXT,
   UNIQUE(venue, market_id, exchange_trade_id, sealed_partition),
   FOREIGN KEY(connection_session_id)
     REFERENCES ws_connection(connection_session_id)
@@ -378,6 +390,25 @@ def synthetic_trade_id(
     return "synthetic:v3:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
+def synthetic_trade_replay_alias(
+    venue: str,
+    market_id: int,
+    event_ts_us: int,
+    raw_public_json: str,
+) -> str:
+    identity = json.dumps(
+        {
+            "venue": venue,
+            "market_id": market_id,
+            "event_ts_us": event_ts_us,
+            "raw_public_json": raw_public_json,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "synthetic-replay:v1:" + hashlib.sha256(identity.encode()).hexdigest()
+
+
 def trade_message_scope(
     message_type: str, exchange_sequence: str | None, recv_us: int
 ) -> str | None:
@@ -420,6 +451,19 @@ def build_sealed_trade_index(
                  exchange_trade_id TEXT NOT NULL,
                  PRIMARY KEY(venue, market_id, exchange_trade_id)
                ) WITHOUT ROWID"""
+        )
+        index.execute(
+            """CREATE TABLE archived_trade_replay_alias(
+                 venue TEXT NOT NULL,
+                 market_id INTEGER NOT NULL,
+                 replay_alias TEXT NOT NULL,
+                 exchange_trade_id TEXT NOT NULL,
+                 PRIMARY KEY(venue, market_id, exchange_trade_id)
+               ) WITHOUT ROWID"""
+        )
+        index.execute(
+            """CREATE INDEX idx_archived_trade_replay_alias_lookup
+               ON archived_trade_replay_alias(venue, market_id, replay_alias)"""
         )
         index.execute(
             """CREATE TABLE archived_gap_continuation(
@@ -514,6 +558,25 @@ def build_sealed_trade_index(
                         for stable_trade_id in stable_trade_ids
                     ),
                 )
+                if exchange_trade_id is None or exchange_trade_id.startswith(
+                    "synthetic:"
+                ):
+                    index.execute(
+                        """INSERT OR IGNORE INTO archived_trade_replay_alias
+                           VALUES (?, ?, ?, ?)""",
+                        (
+                            venue,
+                            market_id,
+                            synthetic_trade_replay_alias(
+                                venue, market_id, event_ts_us, raw_public_json
+                            ),
+                            (
+                                exchange_trade_id
+                                if exchange_trade_id is not None
+                                else stable_trade_ids[0]
+                            ),
+                        ),
+                    )
         gap_columns = (
             {
                 row[1]
@@ -605,17 +668,28 @@ def reconcile_late_trade_identities(source_path: Path, sealed_dir: Path) -> int:
         }
         if "late_trade" not in tables:
             return 0
+        late_columns = {
+            row[1] for row in source.execute("PRAGMA table_info(late_trade)")
+        }
+        replay_alias_expression = (
+            "replay_alias" if "replay_alias" in late_columns else "NULL"
+        )
         rows = source.execute(
-            """SELECT DISTINCT sealed_partition, venue, market_id, exchange_trade_id
-               FROM late_trade ORDER BY sealed_partition, venue, market_id,
-                                        exchange_trade_id"""
+            f"""SELECT DISTINCT sealed_partition, venue, market_id,
+                       exchange_trade_id, {replay_alias_expression}
+                FROM late_trade ORDER BY sealed_partition, venue, market_id,
+                                         exchange_trade_id"""
         ).fetchall()
     finally:
         source.close()
 
-    by_partition: defaultdict[str, list[tuple[str, int, str]]] = defaultdict(list)
-    for partition, venue, market_id, trade_id in rows:
-        by_partition[partition].append((venue, market_id, trade_id))
+    by_partition: defaultdict[
+        str, list[tuple[str, int, str, str | None]]
+    ] = defaultdict(list)
+    for partition, venue, market_id, trade_id, replay_alias in rows:
+        by_partition[partition].append(
+            (venue, market_id, trade_id, replay_alias)
+        )
 
     for partition, identities in by_partition.items():
         seal_path = sealed_dir / f"{partition}.json"
@@ -647,7 +721,16 @@ def reconcile_late_trade_identities(source_path: Path, sealed_dir: Path) -> int:
                 )
             index.executemany(
                 "INSERT OR IGNORE INTO late_trade_identity VALUES (?, ?, ?)",
-                identities,
+                (identity[:3] for identity in identities),
+            )
+            index.executemany(
+                """INSERT OR IGNORE INTO archived_trade_replay_alias
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    (venue, market_id, replay_alias, trade_id)
+                    for venue, market_id, trade_id, replay_alias in identities
+                    if replay_alias is not None
+                ),
             )
             index.commit()
         except Exception:
@@ -1045,6 +1128,11 @@ class DatabaseSink:
         }
         if "continuation_id" not in gap_columns:
             connection.execute("ALTER TABLE data_gap ADD COLUMN continuation_id TEXT")
+        late_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(late_trade)")
+        }
+        if "replay_alias" not in late_columns:
+            connection.execute("ALTER TABLE late_trade ADD COLUMN replay_alias TEXT")
         connection.execute(
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_data_gap_continuation
                ON data_gap(continuation_id) WHERE continuation_id IS NOT NULL"""
@@ -1055,6 +1143,45 @@ class DatabaseSink:
                    last_trade_ts_us = COALESCE(last_trade_ts_us, bucket_start_us)
                WHERE first_trade_ts_us IS NULL OR last_trade_ts_us IS NULL"""
         )
+        for venue, market_id, trade_id, recv_us, srv_us, raw_public_json in (
+            connection.execute(
+                """SELECT venue, market_id, exchange_trade_id, ts_recv_us,
+                          ts_srv_us, raw_public_json
+                   FROM trade
+                   WHERE exchange_trade_id LIKE 'synthetic:%'"""
+            )
+        ):
+            connection.execute(
+                """INSERT OR IGNORE INTO trade_replay_alias(
+                     venue, market_id, replay_alias, exchange_trade_id
+                   ) VALUES (?, ?, ?, ?)""",
+                (
+                    venue,
+                    market_id,
+                    synthetic_trade_replay_alias(
+                        venue, market_id, srv_us or recv_us, raw_public_json
+                    ),
+                    trade_id,
+                ),
+            )
+        for row_id, venue, market_id, event_ts_us, raw_public_json in (
+            connection.execute(
+                """SELECT late_trade_row_id, venue, market_id, event_ts_us,
+                          raw_public_json
+                   FROM late_trade
+                   WHERE replay_alias IS NULL
+                     AND exchange_trade_id LIKE 'synthetic:%'"""
+            )
+        ):
+            connection.execute(
+                "UPDATE late_trade SET replay_alias = ? WHERE late_trade_row_id = ?",
+                (
+                    synthetic_trade_replay_alias(
+                        venue, market_id, event_ts_us, raw_public_json
+                    ),
+                    row_id,
+                ),
+            )
 
     @staticmethod
     def _ensure_connection(
@@ -1188,6 +1315,56 @@ class DatabaseSink:
         finally:
             connection.close()
 
+    def _sealed_trade_replay_alias_ids(
+        self, partition: str, payload: dict[str, Any]
+    ) -> set[str]:
+        replay_alias = payload.get("replay_alias")
+        if replay_alias is None or payload.get("snapshot_occurrence") is None:
+            return set()
+        index_path = self.sealed_dir / f"{partition}.trade_ids.sqlite3"
+        seal_path = self.sealed_dir / f"{partition}.json"
+        try:
+            seal = json.loads(seal_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"sealed partition metadata is unreadable: {seal_path}"
+            ) from exc
+        connection = sqlite3.connect(
+            f"file:{index_path}?mode=ro", uri=True, timeout=5
+        )
+        try:
+            metadata = connection.execute(
+                "SELECT partition, canonical_db_sha256 FROM sealed_metadata"
+            ).fetchone()
+            if metadata != (partition, seal.get("sha256")):
+                raise RuntimeError(
+                    f"sealed trade replay index metadata mismatch: {index_path}"
+                )
+            table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type = 'table'
+                     AND name = 'archived_trade_replay_alias'"""
+            ).fetchone()
+            if table is None:
+                raise RuntimeError(
+                    f"sealed trade replay index is incompatible: {index_path}"
+                )
+            return {
+                str(row[0])
+                for row in connection.execute(
+                    """SELECT exchange_trade_id
+                       FROM archived_trade_replay_alias
+                       WHERE venue = ? AND market_id = ? AND replay_alias = ?""",
+                    (payload["venue"], payload["market_id"], replay_alias),
+                )
+            }
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(
+                f"sealed trade replay index is unreadable: {index_path}"
+            ) from exc
+        finally:
+            connection.close()
+
     def _sealed_connection_session_exists(
         self, partition: str, connection_session_id: str
     ) -> bool:
@@ -1235,15 +1412,17 @@ class DatabaseSink:
         finally:
             connection.close()
 
-    def _local_late_trade_exists(
+    def _local_late_trade_state(
         self, sealed_partition: str, payload: dict[str, Any]
-    ) -> bool:
+    ) -> tuple[bool, set[str]]:
         identity = (
             sealed_partition,
             payload["venue"],
             payload["market_id"],
             payload["trade_id"],
         )
+        primary_exists = False
+        alias_ids: set[str] = set()
         for database_path in sorted(
             self.config.database_dir.glob("engine_b_phase0_*.sqlite3")
         ):
@@ -1270,23 +1449,62 @@ class DatabaseSink:
                          AND exchange_trade_id = ?""",
                     identity,
                 ).fetchone() is not None:
-                    return True
+                    primary_exists = True
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(late_trade)")
+                }
+                if (
+                    payload.get("replay_alias") is not None
+                    and payload.get("snapshot_occurrence") is not None
+                    and "replay_alias" in columns
+                ):
+                    alias_ids.update(
+                        str(row[0])
+                        for row in connection.execute(
+                            """SELECT exchange_trade_id FROM late_trade
+                               WHERE sealed_partition = ? AND venue = ?
+                                 AND market_id = ? AND replay_alias = ?""",
+                            (
+                                sealed_partition,
+                                payload["venue"],
+                                payload["market_id"],
+                                payload["replay_alias"],
+                            ),
+                        )
+                    )
             except sqlite3.DatabaseError as exc:
                 raise RuntimeError(
                     f"late-trade journal is unreadable: {database_path}"
                 ) from exc
             finally:
                 connection.close()
-        return False
+        return primary_exists, alias_ids
 
     def _archived_trade_exists(self, partition: str, payload: dict[str, Any]) -> bool:
         if self._sealed_trade_index_contains(partition, payload):
             return True
-        if self._local_late_trade_exists(partition, payload):
+        sealed_alias_ids = self._sealed_trade_replay_alias_ids(partition, payload)
+        local_primary, local_alias_ids = self._local_late_trade_state(
+            partition, payload
+        )
+        if local_primary:
+            return True
+        snapshot_occurrence = payload.get("snapshot_occurrence")
+        if (
+            snapshot_occurrence is not None
+            and len(sealed_alias_ids | local_alias_ids) > int(snapshot_occurrence)
+        ):
             return True
         # An archiver may have reconciled and removed the local journal between
         # the local scan and this point. Recheck the sidecar to close that race.
-        return self._sealed_trade_index_contains(partition, payload)
+        if self._sealed_trade_index_contains(partition, payload):
+            return True
+        sealed_alias_ids = self._sealed_trade_replay_alias_ids(partition, payload)
+        return (
+            snapshot_occurrence is not None
+            and len(sealed_alias_ids | local_alias_ids) > int(snapshot_occurrence)
+        )
 
     @contextmanager
     def _partition_lock(self, partition: str):
@@ -2099,17 +2317,28 @@ class DatabaseSink:
                      connection_session_id, venue, market_id, symbol, exchange_trade_id,
                      exchange_sequence, local_sequence, ts_recv_us, ts_srv_us,
                      event_ts_us, sealed_partition, price, size, aggressor_side,
-                     raw_public_json
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     raw_public_json, replay_alias
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     payload["connection"]["id"], payload["venue"], payload["market_id"],
                     payload["symbol"], payload["trade_id"], payload.get("exchange_sequence"),
                     payload["local_sequence"], payload["recv_us"], payload.get("srv_us"),
                     payload["event_ts_us"], payload["sealed_partition"], payload["price"],
                     payload["size"], payload.get("aggressor_side"), payload["raw_public_json"],
+                    payload.get("replay_alias"),
                 ),
             )
         elif kind == "trade":
+            replay_alias = payload.get("replay_alias")
+            snapshot_occurrence = payload.get("snapshot_occurrence")
+            if replay_alias is not None and snapshot_occurrence is not None:
+                existing_alias_count = connection.execute(
+                    """SELECT COUNT(*) FROM trade_replay_alias
+                       WHERE venue = ? AND market_id = ? AND replay_alias = ?""",
+                    (payload["venue"], payload["market_id"], replay_alias),
+                ).fetchone()[0]
+                if int(existing_alias_count) > int(snapshot_occurrence):
+                    return
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO trade(
                      connection_session_id, venue, market_id, symbol, exchange_trade_id,
@@ -2125,6 +2354,18 @@ class DatabaseSink:
                 ),
             )
             if cursor.rowcount == 1:
+                if replay_alias is not None:
+                    connection.execute(
+                        """INSERT INTO trade_replay_alias(
+                             venue, market_id, replay_alias, exchange_trade_id
+                           ) VALUES (?, ?, ?, ?)""",
+                        (
+                            payload["venue"],
+                            payload["market_id"],
+                            replay_alias,
+                            payload["trade_id"],
+                        ),
+                    )
                 self._merge_ohlcv_trade(connection, payload)
         elif kind == "funding":
             connection.execute(
@@ -2524,14 +2765,32 @@ class Collector:
             raise RuntimeError(
                 "refusing ID-less incremental trade message without exchange nonce"
             )
+        normalized_trades = [
+            (
+                trade,
+                normalize_exchange_timestamp_us(
+                    (
+                        trade.get("timestamp")
+                        if trade.get("timestamp") is not None
+                        else message.get("timestamp")
+                    )
+                ),
+            )
+            for trade in trades
+        ]
+        if message_type == "subscribed/trade" and any(
+            srv_us is None for _, srv_us in normalized_trades
+        ):
+            raise RuntimeError(
+                "refusing trade snapshot without exchange timestamp"
+            )
         message_scope = trade_message_scope(
             message_type, exchange_sequence, recv_us
         )
         stable_occurrences: defaultdict[tuple[int, str], int] = defaultdict(int)
-        for trade in trades:
+        for trade, srv_us in normalized_trades:
             price_text = canonical_decimal(trade["price"])
             size_text = canonical_decimal(trade["size"])
-            srv_us = normalize_exchange_timestamp_us(trade.get("timestamp", message.get("timestamp")))
             event_ts_us = srv_us or recv_us
             bucket_start_us = event_ts_us - event_ts_us % 60_000_000
             is_maker_ask = trade.get("is_maker_ask")
@@ -2541,6 +2800,16 @@ class Collector:
             stable_occurrence = stable_occurrences[occurrence_key]
             stable_occurrences[occurrence_key] += 1
             raw_trade_id = trade.get("trade_id_str", trade.get("trade_id"))
+            replay_alias = (
+                None
+                if raw_trade_id is not None
+                else synthetic_trade_replay_alias(
+                    venue.name,
+                    market_id,
+                    event_ts_us,
+                    raw_public_json,
+                )
+            )
             trade_id = (
                 str(raw_trade_id)
                 if raw_trade_id is not None
@@ -2566,6 +2835,13 @@ class Collector:
                     "market_id": market_id,
                     "symbol": market.symbol,
                     "trade_id": trade_id,
+                    "replay_alias": replay_alias,
+                    "snapshot_occurrence": (
+                        stable_occurrence
+                        if raw_trade_id is None
+                        and message_type == "subscribed/trade"
+                        else None
+                    ),
                     "exchange_sequence": exchange_sequence,
                     "local_sequence": self.next_sequence(venue.name, "trade", market_id),
                     "price": price_text,

@@ -333,6 +333,143 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(sink.commands, [])
 
+    async def test_update_to_snapshot_replay_uses_alias_multiset(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        recording = RecordingSink()
+        collector = engine_b.Collector(config, recording, engine_b.Metrics())
+        recv_us = 1_774_884_082_400_000
+        event_ms = 1_774_884_082_309
+        connection_meta = {
+            "id": "trade-update-snapshot-alias",
+            "venue": venue.name,
+            "started_us": recv_us,
+            "api_schema_version": config.api_schema_version,
+        }
+        trade = {
+            "price": "101",
+            "size": "2",
+            "is_maker_ask": True,
+            "timestamp": event_ms,
+        }
+        for nonce in (9001, 9002):
+            await collector.handle_trades(
+                venue,
+                connection_meta,
+                {
+                    "type": "update/trade",
+                    "channel": "trade/37",
+                    "nonce": nonce,
+                    "trades": [trade],
+                },
+                recv_us + nonce,
+            )
+        await collector.handle_trades(
+            venue,
+            connection_meta,
+            {
+                "type": "subscribed/trade",
+                "channel": "trade/37",
+                "nonce": 9003,
+                "trades": [trade, trade],
+            },
+            recv_us + 20_000,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            sink = engine_b.DatabaseSink(config, "alias-run", "alias-commit")
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(engine_b, "now_us", return_value=recv_us + 30_000):
+                sink._write_batch(recording.commands)
+            await sink.close()
+            database = sqlite3.connect(
+                database_dir
+                / f"engine_b_phase0_{engine_b.partition_for_us(event_ms * 1_000)}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    database.execute("SELECT COUNT(*) FROM trade").fetchone(),
+                    (2,),
+                )
+                self.assertEqual(
+                    database.execute(
+                        "SELECT COUNT(*) FROM trade_replay_alias"
+                    ).fetchone(),
+                    (2,),
+                )
+                self.assertEqual(
+                    database.execute(
+                        "SELECT volume, trade_count FROM ohlcv_1m"
+                    ).fetchone(),
+                    ("4", 2),
+                )
+            finally:
+                database.close()
+            partition = engine_b.partition_for_us(event_ms * 1_000)
+            database_path = (
+                database_dir / f"engine_b_phase0_{partition}.sqlite3"
+            )
+            canonical_sha = "c" * 64
+            index_path = sink.sealed_dir / f"{partition}.trade_ids.sqlite3"
+            engine_b.build_sealed_trade_index(
+                database_path, index_path, partition, canonical_sha
+            )
+            (sink.sealed_dir / f"{partition}.json").write_text(
+                json.dumps(
+                    {
+                        "partition": partition,
+                        "sha256": canonical_sha,
+                        "trade_index": index_path.name,
+                    }
+                )
+                + "\n"
+            )
+            snapshot_payloads = [
+                payload
+                for kind, payload in recording.commands[-2:]
+                if kind == "trade"
+            ]
+            self.assertEqual(len(snapshot_payloads), 2)
+            self.assertTrue(
+                all(
+                    sink._archived_trade_exists(partition, payload)
+                    for payload in snapshot_payloads
+                )
+            )
+
+    async def test_snapshot_without_exchange_timestamp_fails_closed(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        connection = {
+            "id": "snapshot-missing-timestamp",
+            "venue": venue.name,
+            "started_us": 1_774_884_000_000_000,
+            "api_schema_version": config.api_schema_version,
+        }
+        with self.assertRaisesRegex(RuntimeError, "without exchange timestamp"):
+            await collector.handle_trades(
+                venue,
+                connection,
+                {
+                    "type": "subscribed/trade",
+                    "channel": "trade/37",
+                    "trades": [{"price": "101", "size": "2"}],
+                },
+                1_774_884_082_400_000,
+            )
+        self.assertEqual(sink.commands, [])
+
 
 class ConfigTests(unittest.TestCase):
     def test_config_records_robinhood_same_venue_blocker(self) -> None:
@@ -1612,6 +1749,15 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 """CREATE TABLE late_trade_identity(
                      venue TEXT NOT NULL,
                      market_id INTEGER NOT NULL,
+                     exchange_trade_id TEXT NOT NULL,
+                     PRIMARY KEY(venue, market_id, exchange_trade_id)
+                   ) WITHOUT ROWID"""
+            )
+            index_connection.execute(
+                """CREATE TABLE archived_trade_replay_alias(
+                     venue TEXT NOT NULL,
+                     market_id INTEGER NOT NULL,
+                     replay_alias TEXT NOT NULL,
                      exchange_trade_id TEXT NOT NULL,
                      PRIMARY KEY(venue, market_id, exchange_trade_id)
                    ) WITHOUT ROWID"""

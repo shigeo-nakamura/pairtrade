@@ -75,9 +75,13 @@ nonce and absolute array position so overlapping reconnect snapshots retain
 the same multiset identities. Incremental `update/trade` messages additionally
 scope ID-less identities by exchange nonce, preserving indistinguishable
 legitimate trades delivered in separate updates while deduplicating a replayed
-update. When an older partition contains NULL IDs or the obsolete unversioned
-synthetic IDs, the index builder reconstructs the current identity from its
-stored receive/message ordering.
+update. A delivery-independent replay alias is also stored as a multiset in
+each live database and seal sidecar: reconnect snapshots consume the existing
+alias count before inserting, so update-to-snapshot replays deduplicate without
+collapsing distinct nonce-scoped updates. A subscribed trade snapshot missing
+an exchange timestamp is rejected before any row is emitted. When an older
+partition contains NULL IDs or obsolete synthetic IDs, the index builder
+reconstructs the current identity and replay alias from stored ordering.
 The committed `late_trade` row is the durable reconciliation journal: replay
 checks consult all retained hourly databases, and the archiver copies every
 journaled identity into its referenced sealed sidecar before the source hour

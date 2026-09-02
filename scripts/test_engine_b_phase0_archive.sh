@@ -361,6 +361,9 @@ try:
     assert connection.execute(
         "SELECT connection_session_id FROM archived_connection_session"
     ).fetchone() == ("legacy-connection",)
+    assert connection.execute(
+        "SELECT COUNT(*) FROM archived_trade_replay_alias"
+    ).fetchone()[0] >= 1
     assert connection.execute("SELECT COUNT(*) FROM late_trade_identity").fetchone() == (0,)
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 finally:
@@ -377,11 +380,15 @@ connection.execute(
          sealed_partition TEXT NOT NULL,
          venue TEXT NOT NULL,
          market_id INTEGER NOT NULL,
-         exchange_trade_id TEXT NOT NULL
+         exchange_trade_id TEXT NOT NULL,
+         replay_alias TEXT
        )"""
 )
 connection.execute(
-    "INSERT INTO late_trade VALUES ('20000101_00', 'robinhood', 37, 'late-republish')"
+    """INSERT INTO late_trade VALUES(
+         '20000101_00', 'robinhood', 37, 'late-republish',
+         'synthetic-replay:v1:late-republish'
+       )"""
 )
 connection.commit()
 connection.close()
@@ -404,6 +411,10 @@ try:
         """SELECT 1 FROM late_trade_identity
            WHERE exchange_trade_id = 'late-republish'"""
     ).fetchone() == (1,)
+    assert connection.execute(
+        """SELECT exchange_trade_id FROM archived_trade_replay_alias
+           WHERE replay_alias = 'synthetic-replay:v1:late-republish'"""
+    ).fetchone() == ("late-republish",)
 finally:
     connection.close()
 PY
