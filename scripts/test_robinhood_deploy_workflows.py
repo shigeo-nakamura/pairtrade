@@ -23,6 +23,10 @@ assert "bootstrap-robinhood-sidecar.sh" not in config_job, (
     "config-only Robinhood deploy must not bootstrap or restart the sidecar"
 )
 assert "deploy-robinhood-config.sh" in config_job
+assert "debot/engine-b-phase0/releases/${GITHUB_SHA}" in config_workflow
+assert "ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-${GITHUB_SHA}" in config_job
+assert "bash /tmp/engine-b-phase0-${GITHUB_SHA}/scripts/install_engine_b_phase0.sh" in config_job
+assert "cancel-in-progress: false" in config_workflow
 assert activation_name in config_job
 assert config_job.index(activation_name) < config_job.index(bot_name)
 assert "systemd-analyze verify /tmp/debot-pair-robinhood-sidecar-activation.service " \

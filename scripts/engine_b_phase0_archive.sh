@@ -14,6 +14,51 @@ STATE_DIR=${ENGINE_B_PHASE0_STATE_DIR:-$(dirname "$DATA_DIR")}
 LOCK_DIR="$STATE_DIR/locks"
 SEALED_DIR="$STATE_DIR/sealed"
 
+persist_seal_sidecars() (
+  set -euo pipefail
+  local source_db=$1
+  local trade_index=$2
+  local seal=$3
+  local canonical_key=$4
+  local trade_index_key="${canonical_key}.trade_ids.sqlite3"
+  local seal_key="${canonical_key}.seal.json"
+  local remote_trade_index
+  local remote_seal
+  remote_trade_index=$(mktemp "$DATA_DIR/.seal-index.remote.XXXXXX.sqlite3")
+  remote_seal=$(mktemp "$DATA_DIR/.seal.remote.XXXXXX.json")
+  trap 'rm -f -- "$remote_trade_index" "$remote_seal"' EXIT
+
+  "$PYTHON_BIN" "$OBSERVER_SCRIPT" --verify-sealed-partition \
+    "$source_db" "$trade_index" "$seal" "$(basename "$seal" .json)"
+  aws s3 cp "$trade_index" "s3://$S3_BUCKET/$trade_index_key" \
+    --sse AES256 --content-type application/vnd.sqlite3 --no-progress
+  aws s3 cp "$seal" "s3://$S3_BUCKET/$seal_key" \
+    --sse AES256 --content-type application/json --no-progress
+  aws s3 cp "s3://$S3_BUCKET/$trade_index_key" "$remote_trade_index" --no-progress
+  aws s3 cp "s3://$S3_BUCKET/$seal_key" "$remote_seal" --no-progress
+
+  local index_sse
+  local seal_sse
+  local index_size
+  local seal_size
+  index_sse=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$trade_index_key" \
+    --query ServerSideEncryption --output text)
+  seal_sse=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$seal_key" \
+    --query ServerSideEncryption --output text)
+  index_size=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$trade_index_key" \
+    --query ContentLength --output text)
+  seal_size=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$seal_key" \
+    --query ContentLength --output text)
+  if [ "$index_sse" != "AES256" ] || [ "$seal_sse" != "AES256" ] \
+      || [[ ! "$index_size" =~ ^[1-9][0-9]*$ ]] \
+      || [[ ! "$seal_size" =~ ^[1-9][0-9]*$ ]] \
+      || ! cmp -s "$trade_index" "$remote_trade_index" \
+      || ! cmp -s "$seal" "$remote_seal"; then
+    echo "Remote seal sidecar verification failed for $source_db" >&2
+    exit 1
+  fi
+)
+
 if [ ! -d "$DATA_DIR" ]; then
   echo "No Engine B data directory yet: $DATA_DIR"
   exit 0
@@ -29,6 +74,9 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
     continue
   fi
   seal_path="$SEALED_DIR/$partition.json"
+  year=${partition:0:4}
+  month=${partition:4:2}
+  key="$S3_PREFIX/$HOST_ID/$year/$month/$base.gz"
   lock_file="$LOCK_DIR/$partition.lock"
   exec {lock_fd}> "$lock_file"
   chmod 0640 "$lock_file"
@@ -49,6 +97,7 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
       "$db" "$SEALED_DIR"
     "$PYTHON_BIN" "$OBSERVER_SCRIPT" --verify-sealed-partition \
       "$db" "$trade_index_path" "$seal_path" "$partition"
+    persist_seal_sidecars "$db" "$trade_index_path" "$seal_path" "$key"
     rm -f -- "$db"
     flock -u "$lock_fd"
     exec {lock_fd}>&-
@@ -72,14 +121,14 @@ try:
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
     }
+    partition_end = (
+        datetime.strptime(sys.argv[2], "%Y%m%d_%H").replace(tzinfo=timezone.utc)
+        + timedelta(hours=1)
+    )
+    partition_end_us = int(partition_end.timestamp() * 1_000_000)
     if "ohlcv_1m" in tables:
         connection.execute("UPDATE ohlcv_1m SET is_complete = 1 WHERE is_complete = 0")
     if "ws_connection" in tables:
-        partition_end = (
-            datetime.strptime(sys.argv[2], "%Y%m%d_%H").replace(tzinfo=timezone.utc)
-            + timedelta(hours=1)
-        )
-        partition_end_us = int(partition_end.timestamp() * 1_000_000)
         connection.execute(
             """UPDATE ws_connection
                SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
@@ -87,7 +136,14 @@ try:
                WHERE ended_ts_recv_us IS NULL""",
             (partition_end_us,),
         )
-    if "ohlcv_1m" in tables or "ws_connection" in tables:
+    if "data_gap" in tables:
+        connection.execute(
+            """UPDATE data_gap
+               SET ts_end_us = MAX(ts_start_us, ?)
+               WHERE ts_end_us IS NULL""",
+            (partition_end_us,),
+        )
+    if "ohlcv_1m" in tables or "ws_connection" in tables or "data_gap" in tables:
         connection.commit()
     mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
     if mode.lower() != "delete":
@@ -127,9 +183,6 @@ PY
     "$db" "$SEALED_DIR"
 
   source_fingerprint=$(stat -c '%s:%Y:%y' "$db")
-  year=${partition:0:4}
-  month=${partition:4:2}
-  key="$S3_PREFIX/$HOST_ID/$year/$month/$base.gz"
   checksum_key="$key.sha256"
   archive_tmp=$(mktemp "$DATA_DIR/.${base}.archive.XXXXXX.gz")
   checksum_tmp=$(mktemp "$DATA_DIR/.${base}.checksum.XXXXXX")
@@ -206,9 +259,10 @@ PY
     mv "$trade_index_tmp" "$trade_index_path"
     seal_tmp=$(mktemp "$SEALED_DIR/.${partition}.XXXXXX")
     sealed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    printf '{"partition":"%s","s3_key":"s3://%s/%s","sha256":"%s","trade_index":"%s","trade_identity_count":%s,"sealed_at":"%s"}\n' \
+    printf '{"partition":"%s","s3_key":"s3://%s/%s","sha256":"%s","trade_index":"%s","trade_index_s3_key":"s3://%s/%s.trade_ids.sqlite3","seal_s3_key":"s3://%s/%s.seal.json","trade_identity_count":%s,"sealed_at":"%s"}\n' \
       "$partition" "$S3_BUCKET" "$key" "$expected_db_sha" \
-      "$(basename "$trade_index_path")" "$trade_identity_count" "$sealed_at" > "$seal_tmp"
+      "$(basename "$trade_index_path")" "$S3_BUCKET" "$key" \
+      "$S3_BUCKET" "$key" "$trade_identity_count" "$sealed_at" > "$seal_tmp"
     chmod 0640 "$seal_tmp"
     mv "$seal_tmp" "$seal_path"
     seal_created=true
@@ -226,9 +280,9 @@ PY
     fi
   fi
   if [ "$DELETE_VERIFIED_LOCAL" = "true" ] && [ "$source_stable" = "true" ]; then
+    persist_seal_sidecars "$db" "$trade_index_path" "$seal_path" "$key"
     if ! rm -f -- "$db"; then
-      rm -f -- "$seal_path"
-      rm -f -- "$trade_index_path"
+      echo "Remote seal is committed but local deletion failed; retaining local seal for recovery: $db" >&2
       exit 1
     fi
     echo "Archived, sealed, verified, and removed closed partition: $db -> s3://$S3_BUCKET/$key"

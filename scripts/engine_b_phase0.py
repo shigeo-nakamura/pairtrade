@@ -1109,8 +1109,12 @@ class DatabaseSink:
 
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+        gap_closes: list[dict[str, Any]] = []
         for kind, payload in batch:
             if kind == "__stop__":
+                continue
+            if kind == "gap_close":
+                gap_closes.append(payload)
                 continue
             partition_us = int(payload.get("partition_us", payload["recv_us"]))
             grouped[partition_for_us(partition_us)].append((kind, payload))
@@ -1142,6 +1146,9 @@ class DatabaseSink:
                 if commands:
                     self._write_partition(partition, commands)
 
+        for payload in gap_closes:
+            self._close_open_gaps(payload)
+
         if late_commands:
             late_partition = partition_for_us(now_us())
             with self._partition_lock(late_partition):
@@ -1165,6 +1172,53 @@ class DatabaseSink:
                 connection.commit()
                 if partition < current_partition:
                     self._connections.pop(partition).close()
+
+    def _close_open_gaps(self, payload: dict[str, Any]) -> None:
+        for database_path in sorted(
+            self.config.database_dir.glob("engine_b_phase0_*.sqlite3")
+        ):
+            partition = database_path.stem.removeprefix("engine_b_phase0_")
+            with self._partition_lock(partition):
+                connection = self._connections.get(partition)
+                borrowed = connection is not None
+                if connection is None:
+                    try:
+                        connection = sqlite3.connect(
+                            f"file:{database_path}?mode=rw", uri=True, timeout=5
+                        )
+                    except sqlite3.OperationalError as exc:
+                        if not database_path.exists():
+                            continue
+                        raise RuntimeError(
+                            f"data-gap journal is unreadable: {database_path}"
+                        ) from exc
+                try:
+                    table = connection.execute(
+                        """SELECT 1 FROM sqlite_master
+                           WHERE type = 'table' AND name = 'data_gap'"""
+                    ).fetchone()
+                    if table is not None:
+                        connection.execute(
+                            """UPDATE data_gap
+                               SET ts_end_us = MAX(ts_start_us, ?)
+                               WHERE ts_end_us IS NULL AND venue = ?
+                                 AND market_id = ?
+                                 AND channel IN ('connection', 'order_book')""",
+                            (
+                                payload["recv_us"],
+                                payload["venue"],
+                                payload["market_id"],
+                            ),
+                        )
+                        connection.commit()
+                except sqlite3.DatabaseError as exc:
+                    connection.rollback()
+                    raise RuntimeError(
+                        f"data-gap journal is unreadable: {database_path}"
+                    ) from exc
+                finally:
+                    if not borrowed:
+                        connection.close()
 
     @staticmethod
     def _finalize_ohlcv(connection: sqlite3.Connection, observed_us: int) -> None:
@@ -1623,6 +1677,15 @@ class Collector:
             self.metrics.book_synced[(venue.name, market_id)] = False
             return
         self.metrics.book_synced[(venue.name, market_id)] = state.synced
+        if event_kind == "snapshot" and state.synced:
+            await self.sink.put(
+                "gap_close",
+                {
+                    "recv_us": recv_us,
+                    "venue": venue.name,
+                    "market_id": market_id,
+                },
+            )
         if state.synced and recv_us - state.last_reconstructed_us >= self.config.reconstructed_snapshot_interval_ms * 1_000:
             state.last_reconstructed_us = recv_us
             await self.sink.put(

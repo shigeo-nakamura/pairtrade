@@ -210,6 +210,29 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+        await collector.handle_book(
+            ws,
+            venue,
+            connection,
+            {
+                "type": "subscribed/order_book",
+                "channel": "order_book/37",
+                "order_book": {"nonce": 10, "bids": [], "asks": []},
+            },
+            1_774_884_083_400_000,
+        )
+        closes = [payload for kind, payload in sink.commands if kind == "gap_close"]
+        self.assertEqual(
+            closes,
+            [
+                {
+                    "recv_us": 1_774_884_083_400_000,
+                    "venue": venue.name,
+                    "market_id": 37,
+                }
+            ],
+        )
+
 
 class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_synthetic_ids_preserve_multiset_across_overlapping_snapshots(self) -> None:
@@ -276,7 +299,7 @@ class DeploymentTests(unittest.TestCase):
             "engine-b-phase0-archive.timer",
         ):
             self.assertIn(unit, installer)
-            self.assertIn(f"/tmp/engine-b-phase0-units/{unit}", workflow)
+            self.assertIn(f"${{ENGINE_B_PREFIX}}/deploy/{unit}", workflow)
         self.assertIn("ENGINE_B_PHASE0_CODE_COMMIT", installer)
         self.assertIn('"$INSTALL_DIR/release.env"', installer)
         self.assertIn("ENGINE_B_PHASE0_CODE_COMMIT=${GITHUB_SHA}", workflow)
@@ -527,6 +550,64 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                         "SELECT ended_ts_recv_us, end_reason FROM ws_connection"
                     ).fetchone(),
                     (hour_start_us + 3_600_000_000, "partition_rotation"),
+                )
+            finally:
+                db.close()
+
+    async def test_resynchronization_closes_retained_connection_gaps(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory)
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            gap_started_us = hour_start_us + 3_500_000_000
+            recovered_us = hour_start_us + 3_700_000_000
+            sink = engine_b.DatabaseSink(config, "gap-run", "gap-commit")
+            for path in (database_dir, sink.sealed_dir, sink.lock_dir):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(engine_b, "now_us", return_value=gap_started_us):
+                sink._write_batch(
+                    [
+                        (
+                            "gap",
+                            {
+                                "recv_us": gap_started_us,
+                                "connection_id": None,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                                "symbol": "SKHY",
+                                "channel": "connection",
+                                "reason": "connection_error:TimeoutError",
+                            },
+                        )
+                    ]
+                )
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                sink._write_batch(
+                    [
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                            },
+                        )
+                    ]
+                )
+            await sink.close()
+
+            gap_partition = engine_b.partition_for_us(gap_started_us)
+            db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{gap_partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    db.execute(
+                        "SELECT ts_start_us, ts_end_us FROM data_gap"
+                    ).fetchone(),
+                    (gap_started_us, recovered_us),
                 )
             finally:
                 db.close()

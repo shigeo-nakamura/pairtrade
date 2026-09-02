@@ -90,6 +90,14 @@ removes the residual database only after its SHA-256, SQLite integrity, seal,
 and trade-index metadata all match. A mismatched fragment is retained
 fail-closed.
 
+Before any verified local deletion, the trade-identity index and seal JSON are
+also uploaded beside the canonical archive as `.trade_ids.sqlite3` and
+`.seal.json` objects with AES256 encryption, downloaded again, and compared
+byte-for-byte. The seal is the remote commit marker. After host/state-volume
+replacement, restore both sidecars to `/var/lib/engine-b-phase0/sealed/` and
+verify their binding before starting collection; do not resume from only the
+hourly gzip objects.
+
 Archive prefix:
 
 ```text
@@ -136,6 +144,9 @@ the DB queue remains bounded, SQLite `PRAGMA integrity_check` returns `ok`, and
 Book snapshots without a nonce, and deltas without both begin/end nonces, are
 recorded as incomplete sequence gaps and force a public-channel resubscribe;
 they never produce reconstructed top-of-book rows.
+Open connection/order-book gap rows are closed when a replacement snapshot
+restores synchronization, including rows retained in an earlier hourly DB. The
+archiver bounds any still-open gap at the partition boundary before upload.
 
 ## `freq2` account record
 

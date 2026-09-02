@@ -38,6 +38,12 @@ connection.execute(
        )"""
 )
 connection.execute(
+    """CREATE TABLE data_gap(
+         ts_start_us INTEGER NOT NULL,
+         ts_end_us INTEGER
+       )"""
+)
+connection.execute(
     """CREATE TABLE trade(
          trade_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
          connection_session_id TEXT NOT NULL,
@@ -57,6 +63,7 @@ connection.execute(
     "INSERT INTO ws_connection VALUES (?, NULL, NULL)",
     (946_684_800_000_000,),
 )
+connection.execute("INSERT INTO data_gap VALUES (?, NULL)", (946_684_800_000_000,))
 connection.execute(
     """INSERT INTO trade(
          connection_session_id, venue, market_id, exchange_trade_id,
@@ -225,6 +232,9 @@ try:
         int(partition_end.timestamp() * 1_000_000),
         "partition_rotation",
     )
+    assert connection.execute("SELECT ts_end_us FROM data_gap").fetchone() == (
+        int(partition_end.timestamp() * 1_000_000),
+    )
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 finally:
     connection.close()
@@ -237,6 +247,12 @@ seal="$ROOT/sealed/20000101_00.json"
 trade_index="$ROOT/sealed/20000101_00.trade_ids.sqlite3"
 test -f "$seal"
 test -f "$trade_index"
+remote_trade_index=$(find "$FAKE_S3" -type f -name '*.trade_ids.sqlite3')
+remote_seal=$(find "$FAKE_S3" -type f -name '*.seal.json')
+test -n "$remote_trade_index"
+test -n "$remote_seal"
+cmp -s "$trade_index" "$remote_trade_index"
+cmp -s "$seal" "$remote_seal"
 python3 - "$seal" "$trade_index" "$expected_sha" <<'PY'
 import json
 import hashlib
@@ -248,6 +264,8 @@ assert seal["partition"] == "20000101_00"
 assert seal["trade_index"] == "20000101_00.trade_ids.sqlite3"
 assert seal["trade_identity_count"] == 4
 assert seal["sha256"] == sys.argv[3]
+assert seal["trade_index_s3_key"].endswith(".trade_ids.sqlite3")
+assert seal["seal_s3_key"].endswith(".seal.json")
 connection = sqlite3.connect(f"file:{sys.argv[2]}?mode=ro", uri=True)
 try:
     assert connection.execute("SELECT partition FROM sealed_metadata").fetchone() == (
