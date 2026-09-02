@@ -178,8 +178,10 @@ idempotently to `sealed_gap_interval` in the next retained database so quality
 calculations retain its missing duration. Live WebSocket session segments are
 likewise carried through idle hourly partitions even when no feed payload
 arrives. Each session handoff is write-ahead journaled before the old segment
-is closed; after a collector crash, recovery recreates the destination segment
-and bounds it at the recovery timestamp with `collector_restart_recovery`.
+is closed. The marker records the source collector run ID: the same live
+collector preserves the destination segment as open, while a different process
+recreates the segment and bounds it at the recovery timestamp with
+`collector_restart_recovery`.
 Startup also discovers open rows left in retained databases by an earlier
 process, so recovery does not depend on the archive timer. If a journal target
 was already sealed, the sidecar proves whether that session segment exists;

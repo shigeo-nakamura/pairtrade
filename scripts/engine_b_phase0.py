@@ -1655,6 +1655,7 @@ class DatabaseSink:
             "continuation_id": payload["continuation_id"],
             "start_us": payload["start_us"],
             "source_partition": payload["source_partition"],
+            "source_collector_run_id": payload.get("source_collector_run_id"),
             "connection": payload["connection"],
         }
         encoded = json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
@@ -1785,6 +1786,7 @@ class DatabaseSink:
                 command
                 for _, start_command, end_command in recovered_session_markers
                 for command in (start_command, end_command)
+                if command is not None
             ),
             *(("gap", payload) for _, payload in recovered_gap_markers),
             *batch,
@@ -1935,6 +1937,7 @@ class DatabaseSink:
                         "continuation_id": f"partition:{partition}:{session_id}",
                         "start_us": partition_ended_us,
                         "source_partition": partition,
+                        "source_collector_run_id": self.collector_run_id,
                         "connection": {
                             "id": session_id,
                             "venue": venue,
@@ -2074,7 +2077,7 @@ class DatabaseSink:
         tuple[
             Path,
             tuple[str, dict[str, Any]],
-            tuple[str, dict[str, Any]],
+            tuple[str, dict[str, Any]] | None,
         ]
     ]:
         if not self.session_continuation_dir.is_dir():
@@ -2092,6 +2095,10 @@ class DatabaseSink:
                 or not {"continuation_id", "start_us", "source_partition", "connection"}
                 <= marker.keys()
                 or not isinstance(marker["connection"], dict)
+                or (
+                    marker.get("source_collector_run_id") is not None
+                    and not isinstance(marker["source_collector_run_id"], str)
+                )
             ):
                 raise RuntimeError(
                     f"session continuation marker is invalid: {marker_path}"
@@ -2133,6 +2140,14 @@ class DatabaseSink:
                 destination_partition = partition_for_us(start_us)
             connection_meta["started_us"] = start_us
             recovered_us = now_us()
+            preserve_open = (
+                marker.get("source_collector_run_id") == self.collector_run_id
+            )
+            recovery_reason = (
+                "partition_rotation"
+                if preserve_open
+                else "collector_restart_recovery"
+            )
             recovered.append(
                 (
                     marker_path,
@@ -2143,13 +2158,16 @@ class DatabaseSink:
                             "partition_us": start_us,
                             "connection": connection_meta,
                             "sealed_intervals": sealed_intervals,
+                            "recovery_reason": recovery_reason,
                         },
                     ),
-                    (
+                    None
+                    if preserve_open
+                    else (
                         "connection_end",
                         {
                             "recv_us": recovered_us,
-                            "reason": "collector_restart_recovery",
+                            "reason": recovery_reason,
                             "connection": connection_meta,
                         },
                     ),
@@ -2417,7 +2435,9 @@ class DatabaseSink:
                         interval["start_us"],
                         interval["end_us"],
                         payload["connection"]["api_schema_version"],
-                        "collector_restart_recovery",
+                        payload.get(
+                            "recovery_reason", "collector_restart_recovery"
+                        ),
                     ),
                 )
         elif kind == "connection_end":

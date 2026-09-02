@@ -1725,6 +1725,12 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 len(list(sink.session_continuation_dir.glob("*.json"))), 1
             )
+            marker = json.loads(
+                next(sink.session_continuation_dir.glob("*.json")).read_text()
+            )
+            self.assertEqual(
+                marker["source_collector_run_id"], sink.collector_run_id
+            )
             await sink.close()
 
             recovered_sink = engine_b.DatabaseSink(
@@ -1777,6 +1783,63 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 first_db.close()
                 second_db.close()
+
+    async def test_same_collector_session_handoff_stays_open(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            boundary_us = 1_700_000_000_000_000
+            boundary_us -= boundary_us % 3_600_000_000
+            source_partition = engine_b.partition_for_us(
+                boundary_us - 3_600_000_000
+            )
+            sink = engine_b.DatabaseSink(
+                config, "live-handoff-run", "live-handoff-commit"
+            )
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            sink._persist_session_continuation_marker(
+                {
+                    "continuation_id": "live-archive-handoff",
+                    "start_us": boundary_us,
+                    "source_partition": source_partition,
+                    "source_collector_run_id": sink.collector_run_id,
+                    "connection": {
+                        "id": "live-session",
+                        "venue": "robinhood",
+                        "started_us": boundary_us,
+                        "api_schema_version": config.api_schema_version,
+                    },
+                }
+            )
+
+            with mock.patch.object(
+                engine_b, "now_us", return_value=boundary_us + 200_000_000
+            ):
+                sink._write_batch([])
+            await sink.close()
+
+            destination = sqlite3.connect(
+                database_dir
+                / f"engine_b_phase0_{engine_b.partition_for_us(boundary_us)}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    destination.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (boundary_us, None, None),
+                )
+            finally:
+                destination.close()
 
     async def test_startup_discovers_orphaned_session_without_archive_timer(
         self,

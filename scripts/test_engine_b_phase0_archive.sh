@@ -31,6 +31,12 @@ connection.execute("PRAGMA journal_mode=WAL")
 connection.execute("CREATE TABLE sample(value TEXT NOT NULL)")
 connection.execute("CREATE TABLE ohlcv_1m(is_complete INTEGER NOT NULL)")
 connection.execute(
+    """CREATE TABLE collector_manifest(
+         collector_run_id TEXT PRIMARY KEY,
+         started_ts_us INTEGER NOT NULL
+       )"""
+)
+connection.execute(
     """CREATE TABLE ws_connection(
          connection_session_id TEXT PRIMARY KEY,
          venue TEXT NOT NULL,
@@ -71,6 +77,10 @@ connection.execute(
 )
 connection.execute("INSERT INTO sample VALUES ('recovered-from-wal')")
 connection.execute("INSERT INTO ohlcv_1m VALUES (0)")
+connection.execute(
+    "INSERT INTO collector_manifest VALUES ('archive-live-run', ?)",
+    (946_684_700_000_000,),
+)
 connection.execute(
     "INSERT INTO ws_connection VALUES (?, ?, ?, ?, NULL, ?, NULL)",
     (
@@ -330,6 +340,7 @@ marker = json.load(open(sys.argv[1]))
 assert marker["continuation_id"] == "partition:20000101_00:legacy-connection"
 assert marker["start_us"] == 946_688_400_000_000
 assert marker["source_partition"] == "20000101_00"
+assert marker["source_collector_run_id"] == "archive-live-run"
 assert marker["connection"] == {
     "id": "legacy-connection",
     "venue": "robinhood",

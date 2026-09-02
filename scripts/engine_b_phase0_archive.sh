@@ -237,16 +237,32 @@ try:
         connection.execute("UPDATE ohlcv_1m SET is_complete = 1 WHERE is_complete = 0")
     if "ws_connection" in tables:
         marker_dir = Path(sys.argv[4])
-        rows = connection.execute(
-            """SELECT connection_session_id, venue, api_schema_version
-               FROM ws_connection WHERE ended_ts_recv_us IS NULL"""
-        ).fetchall()
-        for session_id, venue, api_schema_version in rows:
+        if "collector_manifest" in tables:
+            rows = connection.execute(
+                """SELECT w.connection_session_id, w.venue,
+                          w.api_schema_version,
+                          (SELECT m.collector_run_id
+                           FROM collector_manifest AS m
+                           WHERE m.started_ts_us <= w.started_ts_recv_us
+                           ORDER BY m.started_ts_us DESC LIMIT 1)
+                   FROM ws_connection AS w
+                   WHERE w.ended_ts_recv_us IS NULL"""
+            ).fetchall()
+        else:
+            rows = [
+                (*row, None)
+                for row in connection.execute(
+                    """SELECT connection_session_id, venue, api_schema_version
+                       FROM ws_connection WHERE ended_ts_recv_us IS NULL"""
+                )
+            ]
+        for session_id, venue, api_schema_version, collector_run_id in rows:
             continuation_id = f"partition:{sys.argv[2]}:{session_id}"
             marker = {
                 "continuation_id": continuation_id,
                 "start_us": partition_end_us,
                 "source_partition": sys.argv[2],
+                "source_collector_run_id": collector_run_id,
                 "connection": {
                     "id": session_id,
                     "venue": venue,
@@ -258,7 +274,13 @@ try:
             marker_path = marker_dir / f"{marker_name}.json"
             encoded = json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
             if marker_path.exists():
-                if marker_path.read_text() != encoded:
+                existing = json.loads(marker_path.read_text())
+                legacy_marker = {
+                    key: value
+                    for key, value in marker.items()
+                    if key != "source_collector_run_id"
+                }
+                if existing not in (marker, legacy_marker):
                     raise RuntimeError(
                         f"session continuation marker mismatch: {marker_path}"
                     )
