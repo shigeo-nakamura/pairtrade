@@ -1424,7 +1424,13 @@ class DeploymentTests(unittest.TestCase):
             self.assertIn(f"${{ENGINE_B_PREFIX}}/deploy/{unit}", workflow)
         self.assertIn("ENGINE_B_PHASE0_CODE_COMMIT", installer)
         self.assertIn('"$INSTALL_DIR/release.env"', installer)
-        self.assertIn("ENGINE_B_PHASE0_CODE_COMMIT=${GITHUB_SHA}", workflow)
+        # The Robinhood host's SSM command is JSON (--parameters file://),
+        # not inline shorthand: __GITHUB_SHA__ is a placeholder in the
+        # commands array, substituted by the sed line right after the
+        # heredoc -- assert both halves rather than one literal
+        # "KEY=${GITHUB_SHA}" substring.
+        self.assertIn("ENGINE_B_PHASE0_CODE_COMMIT=__GITHUB_SHA__", workflow)
+        self.assertIn("__GITHUB_SHA__|${GITHUB_SHA}", workflow)
         self.assertIn("systemctl daemon-reload", installer)
         self.assertNotIn("systemctl restart", installer)
         self.assertNotIn("systemctl start", installer)
