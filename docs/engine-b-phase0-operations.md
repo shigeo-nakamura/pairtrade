@@ -165,8 +165,12 @@ a crash, long collector outage, or hourly rotation. Gap recovery only closes
 rows that began at or before the snapshot timestamp, so a later disconnect in
 the same database flush remains open. If a marker's fixed destination was
 already sealed, recovery advances it from that hour's end rather than entering
-a restart loop. Live WebSocket session segments are likewise carried through
-idle hourly partitions even when no feed payload arrives.
+a restart loop. The seal index proves whether that continuation was already in
+the canonical archive; otherwise the full skipped interval is written
+idempotently to `sealed_gap_interval` in the next retained database so quality
+calculations retain its missing duration. Live WebSocket session segments are
+likewise carried through idle hourly partitions even when no feed payload
+arrives.
 
 ## `freq2` account record
 

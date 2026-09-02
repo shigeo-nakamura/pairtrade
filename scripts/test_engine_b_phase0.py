@@ -979,6 +979,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 (database_dir / f"engine_b_phase0_{sealed_partition}.sqlite3").exists()
             )
             expected = []
+            sealed_intervals = []
             for offset in (2, 3):
                 start_us = hour_start_us + offset * 3_600_000_000
                 partition = engine_b.partition_for_us(start_us)
@@ -991,6 +992,12 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             "SELECT ts_start_us, ts_end_us FROM data_gap"
                         ).fetchone()
                     )
+                    sealed_intervals.extend(
+                        db.execute(
+                            """SELECT sealed_partition, ts_start_us, ts_end_us
+                               FROM sealed_gap_interval"""
+                        ).fetchall()
+                    )
                 finally:
                     db.close()
             self.assertEqual(
@@ -1001,6 +1008,16 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                         hour_start_us + 3 * 3_600_000_000,
                     ),
                     (hour_start_us + 3 * 3_600_000_000, recovered_us),
+                ],
+            )
+            self.assertEqual(
+                sealed_intervals,
+                [
+                    (
+                        sealed_partition,
+                        sealed_start_us,
+                        hour_start_us + 2 * 3_600_000_000,
+                    )
                 ],
             )
 

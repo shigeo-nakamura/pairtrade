@@ -41,7 +41,7 @@ LOG = logging.getLogger("engine_b_phase0")
 UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OHLCV_FINALIZE_GRACE_US = 120_000_000
 
 
@@ -215,6 +215,21 @@ CREATE TABLE IF NOT EXISTS data_gap (
   reason TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sealed_gap_interval (
+  interval_id TEXT PRIMARY KEY,
+  sealed_partition TEXT NOT NULL,
+  venue TEXT NOT NULL,
+  market_id INTEGER,
+  symbol TEXT,
+  channel TEXT NOT NULL,
+  ts_start_us INTEGER NOT NULL,
+  ts_end_us INTEGER NOT NULL,
+  expected_sequence TEXT,
+  observed_sequence TEXT,
+  reason TEXT NOT NULL,
+  CHECK(ts_end_us >= ts_start_us)
+);
+
 CREATE TABLE IF NOT EXISTS market_status (
   observed_ts_us INTEGER NOT NULL,
   venue TEXT NOT NULL,
@@ -351,6 +366,18 @@ def synthetic_trade_id(
     return "synthetic:v3:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
+def trade_message_scope(
+    message_type: str, exchange_sequence: str | None, recv_us: int
+) -> str | None:
+    if message_type == "subscribed/trade":
+        return None
+    return (
+        f"{message_type}:{exchange_sequence}"
+        if exchange_sequence is not None
+        else f"{message_type}:recv:{recv_us}"
+    )
+
+
 def build_sealed_trade_index(
     source_path: Path,
     index_path: Path,
@@ -380,6 +407,12 @@ def build_sealed_trade_index(
                  market_id INTEGER NOT NULL,
                  exchange_trade_id TEXT NOT NULL,
                  PRIMARY KEY(venue, market_id, exchange_trade_id)
+               ) WITHOUT ROWID"""
+        )
+        index.execute(
+            """CREATE TABLE archived_gap_continuation(
+                 continuation_id TEXT PRIMARY KEY,
+                 gap_id INTEGER NOT NULL
                ) WITHOUT ROWID"""
         )
         tables = {
@@ -427,25 +460,56 @@ def build_sealed_trade_index(
                 occurrence_key = (event_ts_us, raw_public_json)
                 stable_occurrence = stable_occurrences[occurrence_key]
                 stable_occurrences[occurrence_key] += 1
-                stable_trade_id = (
-                    exchange_trade_id
-                    if exchange_trade_id is not None
-                    and (
-                        not exchange_trade_id.startswith("synthetic:")
-                        or exchange_trade_id.startswith("synthetic:v3:")
-                    )
-                    else synthetic_trade_id(
+                if exchange_trade_id is not None and not exchange_trade_id.startswith(
+                    "synthetic:"
+                ):
+                    stable_trade_ids = [exchange_trade_id]
+                else:
+                    unscoped_id = synthetic_trade_id(
                         venue,
                         market_id,
                         event_ts_us,
                         stable_occurrence,
                         raw_public_json,
                     )
-                )
-                index.execute(
+                    scoped_id = synthetic_trade_id(
+                        venue,
+                        market_id,
+                        event_ts_us,
+                        stable_occurrence,
+                        raw_public_json,
+                        trade_message_scope(
+                            "update/trade", exchange_sequence, ts_recv_us
+                        ),
+                    )
+                    stable_trade_ids = [unscoped_id, scoped_id]
+                    if exchange_trade_id is not None and exchange_trade_id.startswith(
+                        "synthetic:v3:"
+                    ):
+                        stable_trade_ids[0] = exchange_trade_id
+                index.executemany(
                     "INSERT OR IGNORE INTO archived_trade_identity VALUES (?, ?, ?)",
-                    (venue, market_id, stable_trade_id),
+                    (
+                        (venue, market_id, stable_trade_id)
+                        for stable_trade_id in stable_trade_ids
+                    ),
                 )
+        gap_columns = (
+            {
+                row[1]
+                for row in source.execute("PRAGMA table_info(data_gap)")
+            }
+            if "data_gap" in tables
+            else set()
+        )
+        if "continuation_id" in gap_columns:
+            index.executemany(
+                "INSERT OR IGNORE INTO archived_gap_continuation VALUES (?, ?)",
+                source.execute(
+                    """SELECT continuation_id, gap_id FROM data_gap
+                       WHERE continuation_id IS NOT NULL"""
+                ),
+            )
         index.execute(
             "INSERT INTO sealed_metadata VALUES (?, ?)",
             (partition, canonical_sha256),
@@ -1045,6 +1109,49 @@ class DatabaseSink:
         finally:
             connection.close()
 
+    def _sealed_gap_continuation_gap_id(
+        self, partition: str, continuation_id: str
+    ) -> int | None:
+        index_path = self.sealed_dir / f"{partition}.trade_ids.sqlite3"
+        seal_path = self.sealed_dir / f"{partition}.json"
+        if not index_path.is_file():
+            return None
+        try:
+            seal = json.loads(seal_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"sealed partition metadata is unreadable: {seal_path}"
+            ) from exc
+        connection = sqlite3.connect(
+            f"file:{index_path}?mode=ro", uri=True, timeout=5
+        )
+        try:
+            metadata = connection.execute(
+                "SELECT partition, canonical_db_sha256 FROM sealed_metadata"
+            ).fetchone()
+            if metadata != (partition, seal.get("sha256")):
+                raise RuntimeError(
+                    f"sealed trade identity index metadata mismatch: {index_path}"
+                )
+            table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type = 'table' AND name = 'archived_gap_continuation'"""
+            ).fetchone()
+            if table is None:
+                return None
+            row = connection.execute(
+                """SELECT gap_id FROM archived_gap_continuation
+                   WHERE continuation_id = ?""",
+                (continuation_id,),
+            ).fetchone()
+            return None if row is None else int(row[0])
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(
+                f"sealed trade identity index is unreadable: {index_path}"
+            ) from exc
+        finally:
+            connection.close()
+
     def _local_late_trade_exists(
         self, sealed_partition: str, payload: dict[str, Any]
     ) -> bool:
@@ -1420,19 +1527,41 @@ class DatabaseSink:
             payload["connection_id"] = None
             destination_us = int(marker["start_us"])
             continuation_id = str(marker["continuation_id"])
+            sealed_intervals: list[dict[str, Any]] = []
             while self._is_partition_sealed(partition_for_us(destination_us)):
                 sealed_partition = partition_for_us(destination_us)
+                archived_gap_id = self._sealed_gap_continuation_gap_id(
+                    sealed_partition, continuation_id
+                )
                 LOG.warning(
                     "Advancing recovered gap continuation past sealed partition %s",
                     sealed_partition,
                 )
-                continuation_id = "sealed-skip:" + hashlib.sha256(
-                    f"{continuation_id}:{sealed_partition}".encode("utf-8")
-                ).hexdigest()
-                destination_us = partition_start_us(sealed_partition) + 3_600_000_000
+                sealed_end_us = partition_start_us(sealed_partition) + 3_600_000_000
+                if archived_gap_id is not None:
+                    continuation_id = (
+                        f"partition:{sealed_partition}:{archived_gap_id}"
+                    )
+                else:
+                    interval_id = "sealed-missing:" + hashlib.sha256(
+                        f"{continuation_id}:{sealed_partition}".encode("utf-8")
+                    ).hexdigest()
+                    sealed_intervals.append(
+                        {
+                            "interval_id": interval_id,
+                            "sealed_partition": sealed_partition,
+                            "start_us": destination_us,
+                            "end_us": sealed_end_us,
+                        }
+                    )
+                    continuation_id = "sealed-skip:" + hashlib.sha256(
+                        f"{continuation_id}:{sealed_partition}".encode("utf-8")
+                    ).hexdigest()
+                destination_us = sealed_end_us
             payload["continuation_id"] = continuation_id
             payload["start_us"] = destination_us
             payload["partition_us"] = destination_us
+            payload["sealed_intervals"] = sealed_intervals
             recovered.append((marker_path, payload))
         return recovered
 
@@ -1637,6 +1766,22 @@ class DatabaseSink:
                 ),
             )
         elif kind == "gap":
+            for interval in payload.get("sealed_intervals", []):
+                connection.execute(
+                    """INSERT OR IGNORE INTO sealed_gap_interval(
+                         interval_id, sealed_partition, venue, market_id, symbol,
+                         channel, ts_start_us, ts_end_us, expected_sequence,
+                         observed_sequence, reason
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        interval["interval_id"], interval["sealed_partition"],
+                        payload["venue"], payload.get("market_id"),
+                        payload.get("symbol"), payload["channel"],
+                        interval["start_us"], interval["end_us"],
+                        payload.get("expected_sequence"),
+                        payload.get("observed_sequence"), payload["reason"],
+                    ),
+                )
             connection.execute(
                 """INSERT OR IGNORE INTO data_gap(
                      connection_session_id, venue, market_id, symbol, channel, ts_start_us,
@@ -1989,13 +2134,9 @@ class Collector:
             return
         exchange_sequence = str(message["nonce"]) if message.get("nonce") is not None else None
         message_type = str(message.get("type", "update/trade"))
-        message_scope = None
-        if message_type != "subscribed/trade":
-            message_scope = (
-                f"{message_type}:{exchange_sequence}"
-                if exchange_sequence is not None
-                else f"{message_type}:recv:{recv_us}"
-            )
+        message_scope = trade_message_scope(
+            message_type, exchange_sequence, recv_us
+        )
         trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
         stable_occurrences: defaultdict[tuple[int, str], int] = defaultdict(int)
         for trade in trades:
