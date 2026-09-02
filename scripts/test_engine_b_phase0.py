@@ -641,6 +641,32 @@ class RestPollingTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
 
+    async def test_malformed_market_metadata_is_recorded_as_poll_failure(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        malformed_responses = (
+            {"order_book_details": [{"market_id": None}]},
+            {"order_book_details": None},
+            [],
+        )
+        for response in malformed_responses:
+            with self.subTest(response=response):
+                sink = RecordingSink()
+                metrics = engine_b.Metrics()
+                collector = engine_b.Collector(config, sink, metrics)
+                with mock.patch.object(engine_b, "fetch_json", return_value=response):
+                    await collector.poll_venue(venue)
+                self.assertEqual(sink.commands, [])
+                self.assertEqual(
+                    metrics.gauges[
+                        (
+                            "engine_b_phase0_rest_poll_success",
+                            (("venue", venue.name),),
+                        )
+                    ],
+                    0,
+                )
+
 
 class DeploymentTests(unittest.TestCase):
     def test_installer_records_commit_and_installs_all_units(self) -> None:
@@ -991,6 +1017,75 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                            FROM data_gap WHERE channel = 'connection'"""
                     ).fetchone(),
                     (1, started_us, None),
+                )
+            finally:
+                database.close()
+
+    async def test_unsynchronized_book_deltas_keep_one_open_gap(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            started_us = 1_700_000_000_000_000
+            started_us -= started_us % 3_600_000_000
+            started_us += 1_000_000
+            retried_us = started_us + 1_000_000
+            recovered_us = retried_us + 1_000_000
+            sink = engine_b.DatabaseSink(
+                config, "book-gap-run", "book-gap-commit"
+            )
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+
+            def gap(timestamp: int) -> tuple[str, dict[str, object]]:
+                return (
+                    "gap",
+                    {
+                        "recv_us": timestamp,
+                        "connection_id": "book-gap-connection",
+                        "venue": "robinhood",
+                        "market_id": 37,
+                        "symbol": "SKHY",
+                        "channel": "order_book",
+                        "expected_sequence": "10",
+                        "observed_sequence": "12",
+                        "reason": "begin_nonce_mismatch_or_unsynced_delta",
+                    },
+                )
+
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                sink._write_batch(
+                    [
+                        gap(started_us),
+                        gap(retried_us),
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                            },
+                        ),
+                    ]
+                )
+            await sink.close()
+            partition = engine_b.partition_for_us(started_us)
+            database = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    database.execute(
+                        """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
+                           FROM data_gap WHERE channel = 'order_book'"""
+                    ).fetchone(),
+                    (1, started_us, recovered_us),
                 )
             finally:
                 database.close()
@@ -2050,6 +2145,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             )
             active_partition = engine_b.partition_for_us(recv_us)
             active_db = database_dir / f"engine_b_phase0_{active_partition}.sqlite3"
+            index_connection = sqlite3.connect(trade_index)
+            index_connection.execute("DROP TABLE archived_trade_replay_alias")
+            index_connection.commit()
+            index_connection.close()
             self.assertEqual(
                 engine_b.reconcile_late_trade_identities(active_db, sink.sealed_dir),
                 1,
@@ -2062,6 +2161,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                            ORDER BY exchange_trade_id"""
                     ).fetchall(),
                     [("late-after-seal",)],
+                )
+                self.assertEqual(
+                    index_connection.execute(
+                        """SELECT COUNT(*) FROM sqlite_master
+                           WHERE type = 'table'
+                             AND name = 'archived_trade_replay_alias'"""
+                    ).fetchone(),
+                    (1,),
                 )
             finally:
                 index_connection.close()

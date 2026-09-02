@@ -719,6 +719,19 @@ def reconcile_late_trade_identities(source_path: Path, sealed_dir: Path) -> int:
                 raise RuntimeError(
                     f"late-trade identity index metadata mismatch: {index_path}"
                 )
+            index.execute(
+                """CREATE TABLE IF NOT EXISTS archived_trade_replay_alias(
+                     venue TEXT NOT NULL,
+                     market_id INTEGER NOT NULL,
+                     replay_alias TEXT NOT NULL,
+                     exchange_trade_id TEXT NOT NULL,
+                     PRIMARY KEY(venue, market_id, exchange_trade_id)
+                   ) WITHOUT ROWID"""
+            )
+            index.execute(
+                """CREATE INDEX IF NOT EXISTS idx_archived_trade_replay_alias_lookup
+                   ON archived_trade_replay_alias(venue, market_id, replay_alias)"""
+            )
             index.executemany(
                 "INSERT OR IGNORE INTO late_trade_identity VALUES (?, ?, ?)",
                 (identity[:3] for identity in identities),
@@ -1150,6 +1163,20 @@ class DatabaseSink:
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_data_gap_open_connection
                ON data_gap(venue, market_id, channel)
                WHERE ts_end_us IS NULL AND channel = 'connection'"""
+        )
+        connection.execute(
+            """DELETE FROM data_gap
+               WHERE ts_end_us IS NULL AND channel = 'order_book'
+                 AND gap_id NOT IN (
+                   SELECT MIN(gap_id) FROM data_gap
+                   WHERE ts_end_us IS NULL AND channel = 'order_book'
+                   GROUP BY venue, market_id, channel
+                 )"""
+        )
+        connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_data_gap_open_order_book
+               ON data_gap(venue, market_id, channel)
+               WHERE ts_end_us IS NULL AND channel = 'order_book'"""
         )
         connection.execute(
             """UPDATE ohlcv_1m
@@ -3084,7 +3111,15 @@ class Collector:
                 )
             self.metrics.last_rest_success_us[venue.name] = observed_us
             self.metrics.set_gauge("engine_b_phase0_rest_poll_success", {"venue": venue.name}, 1)
-        except (OSError, URLError, ValueError, RuntimeError, KeyError):
+        except (
+            OSError,
+            URLError,
+            ValueError,
+            RuntimeError,
+            KeyError,
+            TypeError,
+            AttributeError,
+        ):
             self.metrics.set_gauge("engine_b_phase0_rest_poll_success", {"venue": venue.name}, 0)
             self.metrics.inc("engine_b_phase0_rest_poll_error_total", {"venue": venue.name})
             LOG.exception("REST market metadata poll failed venue=%s", venue.name)
