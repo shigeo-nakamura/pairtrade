@@ -1063,6 +1063,47 @@ class TradingCalendarLoadTests(unittest.TestCase):
             )
             self.assertIsNone(engine_b.TradingCalendar.load(path))
 
+    def _load_with_krx_session(self, **overrides: object) -> "engine_b.TradingCalendar | None":
+        session = {
+            "krx_is_open": True,
+            "krx_open_utc_us": 1788307200000000,
+            "krx_close_utc_us": 1788330600000000,
+            "us_is_open": False,
+            "us_open_utc_us": None,
+            "us_close_utc_us": None,
+        }
+        session.update(overrides)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trading_calendar.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "calendar_version": "xkrx-xnys-exchange_calendars-TEST-bad",
+                        "sessions": {"2026-09-02": session},
+                    }
+                )
+            )
+            return engine_b.TradingCalendar.load(path)
+
+    def test_load_rejects_bool_timestamp(self) -> None:
+        self.assertIsNone(self._load_with_krx_session(krx_open_utc_us=True))
+
+    def test_load_rejects_negative_timestamp(self) -> None:
+        self.assertIsNone(self._load_with_krx_session(krx_open_utc_us=-1))
+
+    def test_load_rejects_timestamp_outside_sqlite_int64_range(self) -> None:
+        self.assertIsNone(self._load_with_krx_session(krx_close_utc_us=2**63))
+
+    def test_load_rejects_reversed_open_close_ordering(self) -> None:
+        self.assertIsNone(
+            self._load_with_krx_session(krx_open_utc_us=1788330600000000, krx_close_utc_us=1788307200000000)
+        )
+
+    def test_load_rejects_equal_open_close(self) -> None:
+        self.assertIsNone(
+            self._load_with_krx_session(krx_open_utc_us=1788307200000000, krx_close_utc_us=1788307200000000)
+        )
+
     def test_load_accepts_closed_session_with_null_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "trading_calendar.json"

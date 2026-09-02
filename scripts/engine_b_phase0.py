@@ -916,6 +916,19 @@ class TradingCalendar:
     calendar_version: str
     sessions: dict[str, dict[str, Any]]
 
+    # SQLite INTEGER's positive bound (signed 64-bit); sqlite3 raises
+    # OverflowError above it, which _write_partition's
+    # `except Exception: rollback(); raise` propagates straight through the
+    # database watchdog, terminating the whole observer.
+    _SQLITE_INT_MAX = 2**63 - 1
+
+    @classmethod
+    def _valid_timestamp_us(cls, value: Any) -> bool:
+        # bool is a subclass of int in Python, so isinstance(value, int)
+        # alone would accept True/False here. A pre-epoch (negative)
+        # microsecond value is never a legitimate KRX/US session boundary.
+        return type(value) is int and 0 <= value <= cls._SQLITE_INT_MAX
+
     @classmethod
     def load(cls, path: Path) -> "TradingCalendar | None":
         try:
@@ -925,17 +938,21 @@ class TradingCalendar:
             for entry in sessions.values():
                 if not isinstance(entry["krx_is_open"], bool) or not isinstance(entry["us_is_open"], bool):
                     raise TypeError("session entry krx_is_open/us_is_open must be bool")
-                # A NOT NULL open/close timestamp is only required -- and
-                # only meaningful -- on the side that is actually open;
-                # write_provisional_session indexes these fields directly
-                # once a date resolves, so a missing/wrong-typed value here
-                # must reject the whole load rather than surface later as a
-                # KeyError or a NULL into trading_session's NOT NULL columns.
-                if entry["krx_is_open"] and (
-                    not isinstance(entry["krx_open_utc_us"], int) or not isinstance(entry["krx_close_utc_us"], int)
-                ):
-                    raise TypeError("krx_is_open session entry missing/invalid krx_open_utc_us/krx_close_utc_us")
-                if entry["us_is_open"] and not isinstance(entry["us_open_utc_us"], int):
+                # A valid, SQLite-safe, correctly ordered open/close pair is
+                # only required -- and only meaningful -- on the side that is
+                # actually open; write_provisional_session indexes these
+                # fields directly once a date resolves, so anything wrong
+                # here must reject the whole load rather than surface later
+                # as a KeyError, a NULL into trading_session's NOT NULL
+                # columns, an OverflowError from an out-of-range int, or a
+                # session end before its own start.
+                if entry["krx_is_open"]:
+                    krx_open, krx_close = entry["krx_open_utc_us"], entry["krx_close_utc_us"]
+                    if not cls._valid_timestamp_us(krx_open) or not cls._valid_timestamp_us(krx_close):
+                        raise TypeError("krx_is_open session entry missing/invalid krx_open_utc_us/krx_close_utc_us")
+                    if krx_open >= krx_close:
+                        raise ValueError("krx_open_utc_us must be before krx_close_utc_us")
+                if entry["us_is_open"] and not cls._valid_timestamp_us(entry["us_open_utc_us"]):
                     raise TypeError("us_is_open session entry missing/invalid us_open_utc_us")
             return cls(calendar_version=calendar_version, sessions=sessions)
         except (OSError, ValueError, KeyError, TypeError):
