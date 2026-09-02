@@ -1650,7 +1650,6 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             recovered_sink = engine_b.DatabaseSink(
                 config, "gap-close-recovery", "gap-close-commit"
             )
-            recovered_sink._startup_recovery_pending = False
             with mock.patch.object(
                 engine_b, "now_us", return_value=later_recovered_us + 10_000_000
             ):
@@ -1664,9 +1663,20 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             try:
                 self.assertEqual(
                     database.execute(
-                        "SELECT ts_start_us, ts_end_us FROM data_gap"
+                        """SELECT ts_start_us, ts_end_us FROM data_gap
+                           WHERE channel = 'order_book'
+                             AND reason = 'sequence_gap'"""
                     ).fetchone(),
                     (gap_started_us, recovered_us),
+                )
+                self.assertEqual(
+                    database.execute(
+                        """SELECT ts_start_us, ts_end_us FROM data_gap
+                           WHERE channel = 'connection'
+                             AND market_id = 37
+                             AND reason = 'collector_restart_recovery'"""
+                    ).fetchone(),
+                    (later_recovered_us, None),
                 )
             finally:
                 database.close()

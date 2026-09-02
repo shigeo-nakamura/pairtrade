@@ -2099,7 +2099,14 @@ class DatabaseSink:
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         recovered_gap_close_markers = dict(self._load_gap_closes())
-        gap_close_markers = dict(recovered_gap_close_markers)
+        for payload in recovered_gap_close_markers.values():
+            self._close_open_gaps(payload)
+        for marker_path in recovered_gap_close_markers:
+            marker_path.unlink(missing_ok=True)
+        if recovered_gap_close_markers:
+            self._fsync_directory(self.gap_close_dir)
+
+        gap_close_markers: dict[Path, dict[str, Any]] = {}
         for kind, payload in batch:
             if kind == "gap_close":
                 gap_close_markers[self._persist_gap_close_marker(payload)] = payload
@@ -2135,12 +2142,6 @@ class DatabaseSink:
             *batch,
         ]
         ordered_gap_close_us: dict[tuple[str, int], int] = {}
-        for payload in recovered_gap_close_markers.values():
-            key = (payload["venue"], payload["market_id"])
-            ordered_gap_close_us[key] = max(
-                ordered_gap_close_us.get(key, int(payload["recv_us"])),
-                int(payload["recv_us"]),
-            )
         for kind, payload in batch:
             if kind == "__stop__":
                 continue
