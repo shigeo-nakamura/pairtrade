@@ -249,12 +249,14 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
         trade = {"price": "101", "size": "2", "is_maker_ask": True}
         other = {"price": "102", "size": "1", "is_maker_ask": False}
         first_message = {
+            "type": "subscribed/trade",
             "channel": "trade/37",
             "nonce": 9001,
             "timestamp": 1_774_884_082_309,
             "trades": [trade, trade, other],
         }
         overlapping_message = {
+            "type": "subscribed/trade",
             "channel": "trade/37",
             "nonce": 9002,
             "timestamp": 1_774_884_082_309,
@@ -274,6 +276,38 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ids[:2], ids[4:])
         self.assertEqual(ids[2], ids[3])
         self.assertTrue(all(str(value).startswith("synthetic:v3:") for value in ids))
+
+    async def test_synthetic_ids_preserve_identical_update_multiplicity(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        connection = {
+            "id": "trade-update-connection",
+            "venue": venue.name,
+            "started_us": 1_774_884_000_000_000,
+            "api_schema_version": config.api_schema_version,
+        }
+        trade = {
+            "price": "101",
+            "size": "2",
+            "is_maker_ask": True,
+            "timestamp": 1_774_884_082_309,
+        }
+        first = {
+            "type": "update/trade",
+            "channel": "trade/37",
+            "nonce": 9001,
+            "trades": [trade],
+        }
+        second = {**first, "nonce": 9002}
+        await collector.handle_trades(venue, connection, first, 1_774_884_082_400_000)
+        await collector.handle_trades(venue, connection, second, 1_774_884_082_500_000)
+        await collector.handle_trades(venue, connection, first, 1_774_884_082_600_000)
+
+        ids = [payload["trade_id"] for kind, payload in sink.commands if kind == "trade"]
+        self.assertEqual(ids[0], ids[2])
+        self.assertNotEqual(ids[0], ids[1])
 
 
 class ConfigTests(unittest.TestCase):
@@ -342,10 +376,11 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_normalized_public_data_is_persisted(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         with tempfile.TemporaryDirectory() as directory:
-            object.__setattr__(config, "database_dir", Path(directory))
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
             sink = engine_b.DatabaseSink(config, "test-run", "test-commit")
+            recv_us = engine_b.now_us()
             sink.start()
-            recv_us = 1_774_884_082_309_144
             event_us = recv_us - 5
             bucket_start_us = event_us - event_us % 60_000_000
             connection = {
@@ -397,7 +432,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             await sink.queue.join()
             await sink.close()
 
-            db_path = next(Path(directory).glob("engine_b_phase0_*.sqlite3"))
+            db_path = next(database_dir.glob("engine_b_phase0_*.sqlite3"))
             connection_db = sqlite3.connect(db_path)
             try:
                 self.assertEqual(connection_db.execute("SELECT order_capability FROM collector_manifest").fetchone(), (0,))
@@ -408,7 +443,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     connection_db.execute(
                         "SELECT open, high, low, close, volume, trade_count, is_complete FROM ohlcv_1m"
                     ).fetchone(),
-                    ("159.71", "159.71", "159.71", "159.71", "1.25", 1, 1),
+                    ("159.71", "159.71", "159.71", "159.71", "1.25", 1, 0),
                 )
                 self.assertEqual(connection_db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
             finally:
@@ -519,7 +554,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_idle_writer_rotates_partition_without_another_event(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         with tempfile.TemporaryDirectory() as directory:
-            database_dir = Path(directory)
+            database_dir = Path(directory) / "data"
             object.__setattr__(config, "database_dir", database_dir)
             hour_start_us = 1_700_000_000_000_000
             hour_start_us -= hour_start_us % 3_600_000_000
@@ -546,7 +581,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await sink.queue.join()
                 self.assertIn(partition, sink._connections)
-                clock[0] = hour_start_us + 3_600_000_000 + 1_000_000
+                clock[0] = hour_start_us + 3 * 3_600_000_000 + 1_000_000
                 for _ in range(20):
                     if partition not in sink._connections:
                         break
@@ -554,18 +589,41 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(partition, sink._connections)
                 await sink.close()
 
-            db = sqlite3.connect(
-                database_dir / f"engine_b_phase0_{partition}.sqlite3"
-            )
-            try:
-                self.assertEqual(
-                    db.execute(
-                        "SELECT ended_ts_recv_us, end_reason FROM ws_connection"
-                    ).fetchone(),
-                    (hour_start_us + 3_600_000_000, "partition_rotation"),
+            expected_sessions = [
+                (
+                    hour_start_us + 1_800_000_000,
+                    hour_start_us + 3_600_000_000,
+                    "partition_rotation",
+                ),
+                (
+                    hour_start_us + 3_600_000_000,
+                    hour_start_us + 2 * 3_600_000_000,
+                    "partition_rotation",
+                ),
+                (
+                    hour_start_us + 2 * 3_600_000_000,
+                    hour_start_us + 3 * 3_600_000_000,
+                    "partition_rotation",
+                ),
+                (hour_start_us + 3 * 3_600_000_000, None, None),
+            ]
+            for offset, expected in enumerate(expected_sessions):
+                partition = engine_b.partition_for_us(
+                    hour_start_us + offset * 3_600_000_000
                 )
-            finally:
-                db.close()
+                db = sqlite3.connect(
+                    database_dir / f"engine_b_phase0_{partition}.sqlite3"
+                )
+                try:
+                    self.assertEqual(
+                        db.execute(
+                            """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                               FROM ws_connection"""
+                        ).fetchone(),
+                        expected,
+                    )
+                finally:
+                    db.close()
 
     async def test_resynchronization_closes_retained_connection_gaps(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
@@ -864,6 +922,87 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 db.close()
+
+    async def test_gap_marker_advances_past_sealed_destination(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            sealed_start_us = hour_start_us + 3_600_000_000
+            recovered_us = hour_start_us + 3 * 3_600_000_000 + 200_000_000
+            sink = engine_b.DatabaseSink(config, "sealed-gap-run", "sealed-gap-commit")
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            sealed_partition = engine_b.partition_for_us(sealed_start_us)
+            (sink.sealed_dir / f"{sealed_partition}.json").write_text("{}\n")
+            marker_path = sink.gap_continuation_dir / "sealed-target.json"
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "continuation_id": "partition:source:1",
+                        "start_us": sealed_start_us,
+                        "venue": "robinhood",
+                        "market_id": 37,
+                        "symbol": "SKHY",
+                        "channel": "connection",
+                        "expected_sequence": None,
+                        "observed_sequence": None,
+                        "reason": "connection_error:TimeoutError",
+                    }
+                )
+                + "\n"
+            )
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                sink._write_batch(
+                    [
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": "robinhood",
+                                "market_id": 37,
+                            },
+                        )
+                    ]
+                )
+            self.assertFalse(marker_path.exists())
+            await sink.close()
+
+            self.assertFalse(
+                (database_dir / f"engine_b_phase0_{sealed_partition}.sqlite3").exists()
+            )
+            expected = []
+            for offset in (2, 3):
+                start_us = hour_start_us + offset * 3_600_000_000
+                partition = engine_b.partition_for_us(start_us)
+                db = sqlite3.connect(
+                    database_dir / f"engine_b_phase0_{partition}.sqlite3"
+                )
+                try:
+                    expected.append(
+                        db.execute(
+                            "SELECT ts_start_us, ts_end_us FROM data_gap"
+                        ).fetchone()
+                    )
+                finally:
+                    db.close()
+            self.assertEqual(
+                expected,
+                [
+                    (
+                        hour_start_us + 2 * 3_600_000_000,
+                        hour_start_us + 3 * 3_600_000_000,
+                    ),
+                    (hour_start_us + 3 * 3_600_000_000, recovered_us),
+                ],
+            )
 
     async def test_partition_gap_marker_survives_failed_continuation_write(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)

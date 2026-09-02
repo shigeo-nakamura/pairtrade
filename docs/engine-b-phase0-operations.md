@@ -70,12 +70,14 @@ index, while genuinely new events for that exchange hour are stored in the
 active partition's `late_trade` table with the original sealed partition
 recorded. ID-less trades receive a versioned stable synthetic identity using
 the exchange event timestamp, canonical raw trade, and its occurrence number
-within identical trades in the message. Message nonce and absolute array
-position are deliberately excluded, so overlapping reconnect snapshots retain
-the same multiset identities. When an older
-partition contains NULL IDs or the obsolete unversioned synthetic IDs, the
-index builder reconstructs the current identity from its stored
-receive/message ordering.
+within identical trades in the message. Subscribed snapshots exclude message
+nonce and absolute array position so overlapping reconnect snapshots retain
+the same multiset identities. Incremental `update/trade` messages additionally
+scope ID-less identities by exchange nonce, preserving indistinguishable
+legitimate trades delivered in separate updates while deduplicating a replayed
+update. When an older partition contains NULL IDs or the obsolete unversioned
+synthetic IDs, the index builder reconstructs the current identity from its
+stored receive/message ordering.
 The committed `late_trade` row is the durable reconciliation journal: replay
 checks consult all retained hourly databases, and the archiver copies every
 journaled identity into its referenced sealed sidecar before the source hour
@@ -161,7 +163,10 @@ and carries the gap through every intervening hourly partition before removing
 the markers. A recovery snapshot therefore cannot undercount an open gap across
 a crash, long collector outage, or hourly rotation. Gap recovery only closes
 rows that began at or before the snapshot timestamp, so a later disconnect in
-the same database flush remains open.
+the same database flush remains open. If a marker's fixed destination was
+already sealed, recovery advances it from that hour's end rather than entering
+a restart loop. Live WebSocket session segments are likewise carried through
+idle hourly partitions even when no feed payload arrives.
 
 ## `freq2` account record
 

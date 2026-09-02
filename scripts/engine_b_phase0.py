@@ -336,18 +336,18 @@ def synthetic_trade_id(
     event_ts_us: int,
     stable_occurrence: int,
     raw_public_json: str,
+    message_scope: str | None = None,
 ) -> str:
-    identity = json.dumps(
-        {
-            "venue": venue,
-            "market_id": market_id,
-            "event_ts_us": event_ts_us,
-            "stable_occurrence": stable_occurrence,
-            "raw_public_json": raw_public_json,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    identity_fields: dict[str, Any] = {
+        "venue": venue,
+        "market_id": market_id,
+        "event_ts_us": event_ts_us,
+        "stable_occurrence": stable_occurrence,
+        "raw_public_json": raw_public_json,
+    }
+    if message_scope is not None:
+        identity_fields["message_scope"] = message_scope
+    identity = json.dumps(identity_fields, sort_keys=True, separators=(",", ":"))
     return "synthetic:v3:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
@@ -1240,11 +1240,33 @@ class DatabaseSink:
             connection = self._connections.get(partition)
             if connection is None:
                 continue
-            gap_continuations: list[tuple[str, dict[str, Any]]] = []
+            continuation_commands: list[tuple[str, dict[str, Any]]] = []
             created_gap_markers: list[Path] = []
             partition_ended_us = partition_start_us(partition) + 3_600_000_000
             with self._partition_lock(partition):
                 self._finalize_ohlcv(connection, write_us)
+                for session_id, venue, api_schema_version in connection.execute(
+                    """SELECT connection_session_id, venue, api_schema_version
+                       FROM ws_connection
+                       WHERE ended_ts_recv_us IS NULL
+                         AND started_ts_recv_us < ?""",
+                    (partition_ended_us,),
+                ):
+                    continuation_commands.append(
+                        (
+                            "connection_start",
+                            {
+                                "recv_us": partition_ended_us,
+                                "partition_us": partition_ended_us,
+                                "connection": {
+                                    "id": session_id,
+                                    "venue": venue,
+                                    "started_us": partition_ended_us,
+                                    "api_schema_version": api_schema_version,
+                                },
+                            },
+                        )
+                    )
                 for row in connection.execute(
                     """SELECT gap_id, venue, market_id, symbol, channel,
                               expected_sequence, observed_sequence, reason
@@ -1270,7 +1292,7 @@ class DatabaseSink:
                     created_gap_markers.append(
                         self._persist_gap_continuation_marker(continuation)
                     )
-                    gap_continuations.append(("gap", continuation))
+                    continuation_commands.append(("gap", continuation))
                 connection.execute(
                     """UPDATE data_gap SET ts_end_us = MAX(ts_start_us, ?)
                        WHERE ts_end_us IS NULL""",
@@ -1287,9 +1309,9 @@ class DatabaseSink:
                 self._connections.pop(partition).close()
 
             destination_partition = partition_for_us(partition_ended_us)
-            if gap_continuations:
+            if continuation_commands:
                 with self._partition_lock(destination_partition):
-                    self._write_partition(destination_partition, gap_continuations)
+                    self._write_partition(destination_partition, continuation_commands)
             marker_paths.extend(created_gap_markers)
             rotated.add(partition)
             if destination_partition < current_partition:
@@ -1396,7 +1418,21 @@ class DatabaseSink:
             payload = dict(marker)
             payload["recv_us"] = now_us()
             payload["connection_id"] = None
-            payload["partition_us"] = int(marker["start_us"])
+            destination_us = int(marker["start_us"])
+            continuation_id = str(marker["continuation_id"])
+            while self._is_partition_sealed(partition_for_us(destination_us)):
+                sealed_partition = partition_for_us(destination_us)
+                LOG.warning(
+                    "Advancing recovered gap continuation past sealed partition %s",
+                    sealed_partition,
+                )
+                continuation_id = "sealed-skip:" + hashlib.sha256(
+                    f"{continuation_id}:{sealed_partition}".encode("utf-8")
+                ).hexdigest()
+                destination_us = partition_start_us(sealed_partition) + 3_600_000_000
+            payload["continuation_id"] = continuation_id
+            payload["start_us"] = destination_us
+            payload["partition_us"] = destination_us
             recovered.append((marker_path, payload))
         return recovered
 
@@ -1952,6 +1988,14 @@ class Collector:
         if market is None:
             return
         exchange_sequence = str(message["nonce"]) if message.get("nonce") is not None else None
+        message_type = str(message.get("type", "update/trade"))
+        message_scope = None
+        if message_type != "subscribed/trade":
+            message_scope = (
+                f"{message_type}:{exchange_sequence}"
+                if exchange_sequence is not None
+                else f"{message_type}:recv:{recv_us}"
+            )
         trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
         stable_occurrences: defaultdict[tuple[int, str], int] = defaultdict(int)
         for trade in trades:
@@ -1976,6 +2020,7 @@ class Collector:
                     event_ts_us,
                     stable_occurrence,
                     raw_public_json,
+                    message_scope,
                 )
             )
             await self.sink.put(
