@@ -881,11 +881,15 @@ fn build_manual_reconcile_report(
         }));
     }
 
+    let sell_token_decimals = trusted_token_decimals(&config, &plan.sell_symbol)?;
+    let buy_token_decimals = trusted_token_decimals(&config, &plan.buy_symbol)?;
     match manual_reconciled_runtime_fill_for_attempt(
         &active,
         &plan,
         expected_sell_amount_raw,
         expected_buy_amount_raw,
+        sell_token_decimals,
+        buy_token_decimals,
     ) {
         Ok(fill) => Ok(serde_json::json!({
             "status": "ready",
@@ -933,6 +937,22 @@ fn build_manual_reconcile_report(
 /// the automated `execute`/`auto-execute`/`resume`/`auto-resume`/`live-tick`
 /// flow should be able to reach the digest bypass by construction, not just
 /// by which arguments happen to be passed.
+/// The administrator-pinned decimals for `symbol`, from
+/// `CONFIG_YAML.router.trusted_token_decimals` -- covered by the same
+/// `auto_execute_policy.json` digest `manual-reconcile-apply`/
+/// `manual-reconcile-report` already require, so it is trustworthy
+/// independent of anything an archive candidate plan claims (Codex P2
+/// follow-up, pairtrade#241).
+fn trusted_token_decimals(config: &ArcusSpotExecuteOnceConfig, symbol: &str) -> Result<u32> {
+    config
+        .router
+        .trusted_token_decimals
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
+        .map(|(_, decimals)| *decimals)
+        .with_context(|| format!("Arcus manual-reconcile has no decimals pin for {symbol}"))
+}
+
 fn finalize_manual_reconciled_attempt(
     config: &ArcusSpotExecuteOnceConfig,
     executor: &mut ArcusSpotLiveExecutor<ArcusSpotKmsSigner>,
@@ -944,10 +964,14 @@ fn finalize_manual_reconciled_attempt(
     if attempt.phase != ArcusSpotExecutionPhase::Reconciled {
         return Ok(attempt);
     }
+    let sell_token_decimals = trusted_token_decimals(config, &plan.sell_symbol)?;
+    let buy_token_decimals = trusted_token_decimals(config, &plan.buy_symbol)?;
     let fill = executor.manual_reconciled_runtime_fill(
         plan,
         expected_sell_amount_raw,
         expected_buy_amount_raw,
+        sell_token_decimals,
+        buy_token_decimals,
     )?;
     let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
     let mut runtime = store.load_or_create(&config.runtime)?;
@@ -2983,22 +3007,28 @@ dispatched plan cannot be reproduced byte-exact from the durable event
 archive (a fresher quote at dispatch time diverged it from its logged
 WouldRotate observation), so the ordinary digest-checked resume path can
 never resolve it. They resolve the same single archive-matching WouldRotate
-candidate repair-report would (refusing on zero or more than one match) for
-its direction/trigger/sell_quantity, but instead of requiring that
-candidate's plan_config_digest to match the ledger, they require the caller
-to independently attest the settled sell/buy raw amounts (from the
+candidate repair-report would (refusing on zero or more than one match,
+verified as a hash-chain-continuous, monotonic-sequence slice of the real
+event stream, not just each record's own self-consistency) for its
+direction/trigger only. Committed sell/buy quantities never come from that
+candidate's own sell_quantity/buy_quantity/buy_amount_raw fields -- instead
+the caller independently attests the settled sell/buy raw amounts (from the
 caller's own chain verification, e.g. eth_getTransactionReceipt logs plus
-balanceOf deltas) and cross-check them against the deltas the ledger's own
-EIP-1898-pinned reconciliation already computed -- refusing if either
-disagrees. -report only ever loads the ledger file and never mutates
-anything, including when the preview looks correct; run it first, then
--apply with the exact same arguments plus this attempt's
-sequence/idempotency_key/tx_hash pinned explicitly. -apply requires
-CONFIG_YAML to match auto_execute_policy.json's administrator-approved
-digest (same gate as auto-execute/auto-resume/clear-risk-halt), then
-resumes the attempt toward Reconciled (pure on-chain status/balance reads,
-exactly like auto-resume) and only then commits, archiving the attempt
-afterward. Neither command is reachable from
+balanceOf deltas), cross-checked against the deltas the ledger's own
+EIP-1898-pinned reconciliation already computed, and those raw amounts are
+converted to quantities using CONFIG_YAML's own router.trusted_token_decimals
+pin -- so nothing about the committed quantities can be steered by a forged
+or spliced archive candidate, only by CONFIG_YAML itself (administrator-gated,
+see below) and the caller's own attestation (cross-checked against the
+ledger). -report only ever loads the ledger file and never mutates anything,
+including when the preview looks correct; run it first, then -apply with the
+exact same arguments plus this attempt's sequence/idempotency_key/tx_hash
+pinned explicitly. Both require CONFIG_YAML to match
+auto_execute_policy.json's administrator-approved digest (same gate as
+auto-execute/auto-resume/clear-risk-halt) before doing anything else. -apply
+then resumes the attempt toward Reconciled (pure on-chain status/balance
+reads, exactly like auto-resume) and only then commits, archiving the
+attempt afterward. Neither command is reachable from
 execute/auto-execute/resume/auto-resume/live-tick.
 
 state-backup and state-verify-* are offline operator commands. They never
@@ -7850,19 +7880,77 @@ runtime:
         )
         .unwrap();
         assert_eq!(report["status"], "ready");
-        assert_eq!(
-            report["proposed_fill"]["actual_sell_quantity"],
-            serde_json::json!(plan.sell_quantity)
-        );
-        assert_eq!(
-            report["proposed_fill"]["actual_buy_quantity"],
-            serde_json::json!(plan.buy_quantity)
-        );
+        // Computed from the operator-attested raw amounts and the
+        // config-pinned decimals (18 for both NVDA/AMD in execute_once_config),
+        // not copied from plan.sell_quantity/buy_quantity -- so it is
+        // numerically equal but not necessarily the identical Decimal scale
+        // (Codex P2 follow-up, pairtrade#241).
+        let actual_sell_quantity: Decimal = report["proposed_fill"]["actual_sell_quantity"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let actual_buy_quantity: Decimal = report["proposed_fill"]["actual_buy_quantity"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(actual_sell_quantity, plan.sell_quantity);
+        assert_eq!(actual_buy_quantity, plan.buy_quantity);
         assert!(report["next_steps"]
             .as_array()
             .unwrap()
             .iter()
             .any(|step| step.as_str().unwrap().contains("manual-reconcile-apply")));
+    }
+
+    #[test]
+    fn manual_reconcile_report_ignores_the_candidate_plans_own_quantities() {
+        // Codex P2 follow-up, pairtrade#241: proposed_fill must come from
+        // the operator-attested raw amounts and the config-pinned
+        // trusted_token_decimals, never from the archived candidate's own
+        // sell_quantity/buy_quantity/buy_amount_raw -- a forged or spliced
+        // candidate claiming wildly different quantities for the same real
+        // settled amounts must produce the identical proposed_fill.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let mut plan = rotation_plan("entry_signal");
+        plan.buy_quantity = Decimal::new(999_999, 0);
+        plan.buy_amount_raw = "1".to_string();
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_manual_reconcile_report(
+            &config_path,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap();
+        assert_eq!(report["status"], "ready");
+        let actual_buy_quantity: Decimal = report["proposed_fill"]["actual_buy_quantity"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // Not plan.buy_quantity (999999) -- the real settled amount at the
+        // config-pinned 18 decimals.
+        assert_eq!(actual_buy_quantity, Decimal::new(5, 2));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use super::{
-    ArcusSpotBalanceSnapshot, ArcusSpotChainClient, ArcusSpotChainPreflightRequest,
-    ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionIntent,
-    ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock, ArcusSpotExecutionLedgerStore,
-    ArcusSpotExecutionPhase, ArcusSpotRotationPlan, ArcusSpotSettlementReceiptExpectation,
+    raw_amount_to_quantity, ArcusSpotBalanceSnapshot, ArcusSpotChainClient,
+    ArcusSpotChainPreflightRequest, ArcusSpotDirection, ArcusSpotExecutionAttempt,
+    ArcusSpotExecutionIntent, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock,
+    ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotRotationPlan,
+    ArcusSpotSettlementReceiptExpectation,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -561,6 +562,8 @@ where
         plan: &ArcusSpotRotationPlan,
         expected_sell_amount_raw: &str,
         expected_buy_amount_raw: &str,
+        sell_token_decimals: u32,
+        buy_token_decimals: u32,
     ) -> Result<ArcusSpotReconciledRuntimeFill> {
         let active = self.active_attempt()?;
         manual_reconciled_runtime_fill_for_attempt(
@@ -568,6 +571,8 @@ where
             plan,
             expected_sell_amount_raw,
             expected_buy_amount_raw,
+            sell_token_decimals,
+            buy_token_decimals,
         )
     }
 
@@ -918,11 +923,28 @@ fn reconciled_fill_time(active: &ArcusSpotExecutionAttempt) -> Result<DateTime<U
 /// taking the attempt directly so a read-only report tool (loaded ledger,
 /// no chain/KMS client) can preview the exact outcome without constructing
 /// a full executor. See the method's doc comment for the full rationale.
+///
+/// `sell_token_decimals`/`buy_token_decimals` must come from a trust anchor
+/// independent of `plan` -- the caller (the `manual-reconcile-*` CLI
+/// commands) sources them from `CONFIG_YAML`'s own
+/// `router.trusted_token_decimals` pin, which is itself covered by the
+/// `auto_execute_policy.json` digest these commands already require. Both
+/// `actual_sell_quantity` and `actual_buy_quantity` are computed directly
+/// from the operator-attested raw amounts and these decimals -- never from
+/// `plan.sell_quantity`/`plan.buy_quantity`/`plan.buy_amount_raw` -- so a
+/// forged or spliced archive candidate cannot mis-scale the committed
+/// inventory no matter what quantities it claims (Codex P2 follow-up,
+/// pairtrade#241, closing the gap `verify_archive_events` above narrows but
+/// does not eliminate). `apply_confirmed_live_fill` still separately
+/// requires `actual_sell_quantity == plan.sell_quantity` exactly, so the
+/// archive-sourced and decimals-derived sell quantities must agree anyway.
 pub fn manual_reconciled_runtime_fill_for_attempt(
     active: &ArcusSpotExecutionAttempt,
     plan: &ArcusSpotRotationPlan,
     expected_sell_amount_raw: &str,
     expected_buy_amount_raw: &str,
+    sell_token_decimals: u32,
+    buy_token_decimals: u32,
 ) -> Result<ArcusSpotReconciledRuntimeFill> {
     if active.phase != ArcusSpotExecutionPhase::Reconciled {
         bail!("Arcus runtime fill requires a reconciled execution attempt");
@@ -948,15 +970,16 @@ pub fn manual_reconciled_runtime_fill_for_attempt(
     if sold_raw != parse_amount("intent sell amount", &active.intent.sell_amount_raw)? {
         bail!("reconciled Arcus sell delta no longer matches the signed intent");
     }
-    if plan.sell_quantity <= Decimal::ZERO {
-        bail!("approved Arcus plan has an invalid sell quantity");
-    }
-    let actual_buy_quantity = reconciled_actual_buy_quantity(plan, bought_raw)?;
-    if actual_buy_quantity <= Decimal::ZERO {
+    let actual_sell_quantity =
+        raw_amount_to_quantity(expected_sell_amount_raw, sell_token_decimals)
+            .map_err(|error| anyhow!("Arcus sell token decimals: {error}"))?;
+    let actual_buy_quantity = raw_amount_to_quantity(expected_buy_amount_raw, buy_token_decimals)
+        .map_err(|error| anyhow!("Arcus buy token decimals: {error}"))?;
+    if actual_sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
         bail!("reconciled Arcus runtime quantities must be positive");
     }
     Ok(ArcusSpotReconciledRuntimeFill {
-        actual_sell_quantity: plan.sell_quantity,
+        actual_sell_quantity,
         actual_buy_quantity,
         reconciled_at: reconciled_fill_time(active)?,
         idempotency_key: active.idempotency_key.clone(),
@@ -1362,40 +1385,68 @@ mod tests {
     }
 
     #[test]
-    fn manual_reconciled_fill_matches_operator_attested_amounts() {
+    fn manual_reconciled_fill_computes_quantities_from_raw_amounts_and_decimals() {
+        // decimals=3 turns raw "1000" into exactly 1.000, matching what the
+        // old plan.sell_quantity/buy_quantity=ONE fixtures used to assert.
         let now = Utc::now();
         let active = reconciled_attempt(now);
         let plan = plan_with_buy_amount("1000");
 
-        let fill =
-            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000").unwrap();
+        let fill = manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+            .unwrap();
         assert_eq!(fill.actual_sell_quantity, Decimal::ONE);
         assert_eq!(fill.actual_buy_quantity, Decimal::ONE);
         assert_eq!(fill.idempotency_key, active.idempotency_key);
     }
 
     #[test]
-    fn manual_reconciled_fill_is_quote_invariant_across_candidate_plans() {
-        // bot-strategy#869 investigation: any plan with the buy token's real
-        // decimals invariant (buy_quantity == buy_amount_raw at those
-        // decimals) yields the same actual_buy_quantity for the same
-        // bought_raw, regardless of which specific quote its
-        // buy_quantity/buy_amount_raw pair came from. This is what makes it
-        // safe to source the candidate plan from an archived WouldRotate
-        // event whose *own* quote never matched the dispatched one.
+    fn manual_reconciled_fill_ignores_the_candidate_plans_own_quantities() {
+        // Codex P2 follow-up, pairtrade#241: verify_archive_events narrows
+        // but cannot eliminate the risk of a forged or spliced candidate
+        // (a single-record file has no trusted chain anchor at all). The
+        // real fix is that actual_sell_quantity/actual_buy_quantity never
+        // come from the candidate plan's own sell_quantity/buy_quantity/
+        // buy_amount_raw fields -- only from the operator-attested raw
+        // amounts (already proven equal to the ledger's own EIP-1898-pinned
+        // balance deltas) and the config-pinned decimals. A candidate
+        // claiming wildly different quantities/ratios must produce the
+        // exact same fill as one with sane ones, for the same raw amounts
+        // and decimals.
         let now = Utc::now();
         let active = reconciled_attempt(now);
-        let one_to_one = plan_with_buy_amount("1000");
-        let mut rescaled = one_to_one.clone();
-        rescaled.buy_amount_raw = "2000".to_string();
-        rescaled.buy_quantity = Decimal::TWO;
+        let sane = plan_with_buy_amount("1000");
+        let mut forged = sane.clone();
+        forged.sell_quantity = Decimal::new(999_999, 0);
+        forged.buy_quantity = Decimal::new(1, 0);
+        forged.buy_amount_raw = "1".to_string();
 
-        let fill_a =
-            manual_reconciled_runtime_fill_for_attempt(&active, &one_to_one, "1000", "1000")
+        let fill_sane =
+            manual_reconciled_runtime_fill_for_attempt(&active, &sane, "1000", "1000", 3, 3)
                 .unwrap();
-        let fill_b =
-            manual_reconciled_runtime_fill_for_attempt(&active, &rescaled, "1000", "1000").unwrap();
-        assert_eq!(fill_a.actual_buy_quantity, fill_b.actual_buy_quantity);
+        let fill_forged =
+            manual_reconciled_runtime_fill_for_attempt(&active, &forged, "1000", "1000", 3, 3)
+                .unwrap();
+        assert_eq!(
+            fill_sane.actual_sell_quantity,
+            fill_forged.actual_sell_quantity
+        );
+        assert_eq!(
+            fill_sane.actual_buy_quantity,
+            fill_forged.actual_buy_quantity
+        );
+    }
+
+    #[test]
+    fn manual_reconciled_fill_rejects_a_grossly_wrong_decimals_pin() {
+        // decimals so large relative to the raw amount that it rounds away
+        // to nothing under Decimal's scale limit -- proves a bad decimals
+        // pin fails closed (as either a parse error or a non-positive
+        // quantity) rather than silently producing a wrong quantity.
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let plan = plan_with_buy_amount("1000");
+        manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 40)
+            .unwrap_err();
     }
 
     #[test]
@@ -1405,7 +1456,8 @@ mod tests {
         assert_eq!(active.phase, ArcusSpotExecutionPhase::Confirmed);
         let plan = plan_with_buy_amount("1000");
         let error =
-            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000").unwrap_err();
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+                .unwrap_err();
         assert!(error.to_string().contains("reconciled execution attempt"));
     }
 
@@ -1416,7 +1468,8 @@ mod tests {
         let mut plan = plan_with_buy_amount("1000");
         plan.sell_symbol = "MSFT".to_string();
         let error =
-            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000").unwrap_err();
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+                .unwrap_err();
         assert!(error
             .to_string()
             .contains("does not match the approved runtime plan"));
@@ -1426,16 +1479,14 @@ mod tests {
     fn manual_reconciled_fill_rejects_a_plan_whose_buy_token_address_was_remapped() {
         // Codex P1 follow-up, pairtrade#241: symbols/venue/sell_amount_raw
         // alone don't prove the candidate resolves to the same ERC-20
-        // contracts the ledger's intent actually signed against. Without
-        // this check, a remapped buy_token (different decimals) would still
-        // pass the coarse shape match and mis-scale the real settled
-        // bought_raw via the candidate's buy_quantity/buy_amount_raw ratio.
+        // contracts the ledger's intent actually signed against.
         let now = Utc::now();
         let active = reconciled_attempt(now);
         let mut plan = plan_with_buy_amount("1000");
         plan.buy_token_address = "0x0000000000000000000000000000000000000099".to_string();
         let error =
-            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000").unwrap_err();
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+                .unwrap_err();
         assert!(error
             .to_string()
             .contains("does not match the approved runtime plan"));
@@ -1448,7 +1499,8 @@ mod tests {
         let mut plan = plan_with_buy_amount("1000");
         plan.sell_token_address = "0x0000000000000000000000000000000000000099".to_string();
         let error =
-            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000").unwrap_err();
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+                .unwrap_err();
         assert!(error
             .to_string()
             .contains("does not match the approved runtime plan"));
@@ -1459,8 +1511,8 @@ mod tests {
         let now = Utc::now();
         let active = reconciled_attempt(now);
         let plan = plan_with_buy_amount("1000");
-        let error =
-            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "999", "1000").unwrap_err();
+        let error = manual_reconciled_runtime_fill_for_attempt(&active, &plan, "999", "1000", 3, 3)
+            .unwrap_err();
         assert!(
             error.to_string().contains("reconciled sell delta"),
             "{error}"
@@ -1472,22 +1524,11 @@ mod tests {
         let now = Utc::now();
         let active = reconciled_attempt(now);
         let plan = plan_with_buy_amount("1000");
-        let error =
-            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "999").unwrap_err();
+        let error = manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "999", 3, 3)
+            .unwrap_err();
         assert!(
             error.to_string().contains("reconciled buy delta"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn manual_reconciled_fill_rejects_a_non_positive_plan_sell_quantity() {
-        let now = Utc::now();
-        let active = reconciled_attempt(now);
-        let mut plan = plan_with_buy_amount("1000");
-        plan.sell_quantity = Decimal::ZERO;
-        let error =
-            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000").unwrap_err();
-        assert!(error.to_string().contains("invalid sell quantity"));
     }
 }
