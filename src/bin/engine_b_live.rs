@@ -446,6 +446,25 @@ struct DaySnapshot {
     exited: bool,
 }
 
+/// Snapshot `prices` into `day.t0_prices` the first time `now_us` reaches
+/// `t0` (KRX open), and never again for the same `DaySnapshot`. Free
+/// function (no engine/connector dependency) so this timing-critical
+/// capture is directly unit-testable independent of `maybe_enter`'s
+/// entry-window gating -- see `EngineBLiveEngine::maybe_capture_t0`'s doc
+/// comment for why this must never run only as a side effect of the
+/// entry-window check.
+fn capture_t0_if_due(
+    window: Option<(i64, i64, i64)>,
+    day: &mut DaySnapshot,
+    now_us: i64,
+    prices: &HashMap<String, f64>,
+) {
+    let Some((t0, _t1, _t2)) = window else { return };
+    if day.t0_prices.is_none() && now_us >= t0 {
+        day.t0_prices = Some(prices.clone());
+    }
+}
+
 struct EngineBLiveEngine {
     cfg: EngineBLiveConfig,
     connector: std::sync::Arc<dyn DexConnector + Send + Sync>,
@@ -551,8 +570,21 @@ impl EngineBLiveEngine {
             .ok_or_else(|| anyhow::anyhow!("ordered_size not representable"))
     }
 
+    /// Snapshot each subscribed symbol's current mid price once, the first
+    /// tick at/after `t0` (KRX open) each day. Deliberately unconditional
+    /// on the entry-window check in `maybe_enter` (`now_us < t1` gate) --
+    /// t0 is normally hours before t1 (KRX open to close), and pulling this
+    /// capture inside a function that returns early before t1 would mean
+    /// it only ever runs once we are already at/past t1, collapsing the
+    /// t0 and t1 snapshots into the same instant and making
+    /// `compute_epsilon` return ~0.0 every day. Must run every tick
+    /// regardless of `self.day.entered`/entry-window state.
+    fn maybe_capture_t0(&mut self, now_us: i64) {
+        capture_t0_if_due(self.window, &mut self.day, now_us, &self.latest_price);
+    }
+
     async fn maybe_enter(&mut self, now_us: i64) {
-        let Some((t0, t1, _t2)) = self.window else { return };
+        let Some((_t0, t1, _t2)) = self.window else { return };
         if self.day.entered || now_us < t1 {
             return;
         }
@@ -565,13 +597,11 @@ impl EngineBLiveEngine {
             }
             return;
         }
-        if self.day.t0_prices.is_none() && now_us >= t0 {
-            self.day.t0_prices = Some(self.snapshot_prices());
-        }
         if self.day.t1_prices.is_none() {
             self.day.t1_prices = Some(self.snapshot_prices());
         }
         let (Some(t0_prices), Some(t1_prices)) = (&self.day.t0_prices, &self.day.t1_prices) else {
+            log::warn!("[ENTRY] t1 reached but t0 snapshot missing (process started after t0?); skipping today");
             return;
         };
         let Some(epsilon) = compute_epsilon(
@@ -635,12 +665,23 @@ impl EngineBLiveEngine {
                     entered_at_us: now_us,
                 });
                 self.day.entered = true;
+                // Persist immediately, matching the no-entry and exit
+                // paths: without this, a restart between entry and exit
+                // finds state.last_session_date still pointing at a prior
+                // day, so roll_day_if_needed does not set day.entered and
+                // maybe_enter would re-evaluate and potentially re-enter
+                // the same day, doubling notional exposure. This does not
+                // by itself recover the in-memory OpenPosition after a
+                // restart (see docs/engine-b-live-operations.md's Stop and
+                // recovery section) -- it only prevents a second entry.
+                self.state.last_session_date = self.current_date.map(|d| d.to_string());
+                atomic_write_json(&self.cfg.state_path, &self.state);
                 log::info!(
                     "[ENTRY] side={side} epsilon={epsilon:.5} price={price:.4} notional=${notional_usd:.0} size={filled_f:.6}"
                 );
                 send_notification(
-                    &format!("Engine B ENTRY {} {}", self.cfg.us_primary_symbol, side),
-                    &format!(
+                    format!("Engine B ENTRY {} {}", self.cfg.us_primary_symbol, side),
+                    format!(
                         "epsilon={epsilon:.5} threshold={:.5} price={price:.4} notional=${notional_usd:.0} dry_run={}",
                         self.cfg.epsilon_threshold, self.cfg.dry_run
                     ),
@@ -737,8 +778,8 @@ impl EngineBLiveEngine {
             }),
         );
         send_notification(
-            &format!("Engine B EXIT {} pnl=${pnl:.2}", self.cfg.us_primary_symbol),
-            &format!("entry={:.4} exit={exit_price:.4} size={:.6} dry_run={}", pos.entry_price, pos.size, self.cfg.dry_run),
+            format!("Engine B EXIT {} pnl=${pnl:.2}", self.cfg.us_primary_symbol),
+            format!("entry={:.4} exit={exit_price:.4} size={:.6} dry_run={}", pos.entry_price, pos.size, self.cfg.dry_run),
         );
     }
 
@@ -746,6 +787,7 @@ impl EngineBLiveEngine {
         let now = now_us();
         self.roll_day_if_needed(now);
         self.maybe_clear_halt();
+        self.maybe_capture_t0(now);
         self.maybe_enter(now).await;
         self.maybe_exit(now).await;
         self.write_status_if_due(now);
@@ -782,10 +824,19 @@ impl EngineBLiveEngine {
 /// (`src/email_client.rs`, `pub mod` in `src/lib.rs`). `EmailClient::new()`
 /// reads `GMAIL_USER`/`GMAIL_TO` (or legacy `TO_ADDRESS`)/`GMAIL_APP_PASSWORD`
 /// from env itself and degrades to a warning-logged no-op `send()` if any
-/// are missing -- no extra handling needed here. Those env vars are
-/// already provisioned on this host for the other bots.
-fn send_notification(subject: &str, body: &str) {
-    debot::email_client::EmailClient::new().send(subject, body);
+/// are missing. `EmailClient::send()` is a synchronous, blocking SMTP call
+/// (`lettre::SmtpTransport::send`) -- run it on the blocking-task pool via
+/// `spawn_blocking` rather than inline, so a slow/unreachable SMTP server
+/// cannot stall the single `tokio::select!` loop that also drains price
+/// updates and evaluates the entry/exit deadlines. Genuinely
+/// fire-and-forget: the spawned task's JoinHandle is intentionally
+/// dropped, matching EmailClient::send()'s own no-return-value contract.
+fn send_notification(subject: impl Into<String>, body: impl Into<String>) {
+    let subject = subject.into();
+    let body = body.into();
+    tokio::task::spawn_blocking(move || {
+        debot::email_client::EmailClient::new().send(&subject, &body);
+    });
 }
 
 #[tokio::main]
@@ -818,6 +869,20 @@ async fn main() -> Result<()> {
         anyhow::bail!(
             "ENGINE_B_LIVE_DRY_RUN=false requires ENGINE_B_LIVE_CONFIRM_LIVE=yes-i-mean-it as well \
              (deliberate double confirmation before real orders go out, bot-strategy#866)"
+        );
+    }
+
+    // direction_multiplier only ever means "same as epsilon's sign" (1.0)
+    // or "opposite" (-1.0) -- f64::signum() returns 1.0 for 0.0 (never
+    // 0.0), so a mistyped ENGINE_B_LIVE_DIRECTION_MULTIPLIER=0 would
+    // silently trade as if it were 1.0 instead of the operator's evident
+    // intent to disable directional bias. Reject anything else outright
+    // rather than guess.
+    if cfg.direction_multiplier != 1.0 && cfg.direction_multiplier != -1.0 {
+        anyhow::bail!(
+            "ENGINE_B_LIVE_DIRECTION_MULTIPLIER must be exactly 1.0 or -1.0, got {} \
+             (0.0 would silently behave as 1.0 via f64::signum(), not \"disabled\")",
+            cfg.direction_multiplier
         );
     }
 
@@ -1012,6 +1077,71 @@ mod tests {
         let calendar = fixture_calendar();
         let date = NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
         assert_eq!(resolve_session_window(&calendar, date), None);
+    }
+
+    // -------------------------------------------------------------
+    // capture_t0_if_due -- regression coverage for the bug caught by
+    // review: t0 capture must happen independently of (well before) the
+    // t1/entry-window check, otherwise both snapshots collapse into the
+    // same instant and epsilon is always ~0.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn capture_t0_if_due_captures_at_t0_before_t1_is_reached() {
+        let window = Some((100, 200, 300)); // (t0, t1, t2)
+        let mut day = DaySnapshot::default();
+        let prices_at_t0 = HashMap::from([("SKHY".to_string(), 100.0)]);
+        // now_us is between t0 and t1 -- must still capture.
+        capture_t0_if_due(window, &mut day, 150, &prices_at_t0);
+        assert_eq!(day.t0_prices, Some(prices_at_t0));
+        assert!(day.t1_prices.is_none(), "t0 capture must not touch t1_prices");
+    }
+
+    #[test]
+    fn capture_t0_if_due_does_nothing_before_t0() {
+        let window = Some((100, 200, 300));
+        let mut day = DaySnapshot::default();
+        let prices = HashMap::from([("SKHY".to_string(), 100.0)]);
+        capture_t0_if_due(window, &mut day, 50, &prices);
+        assert!(day.t0_prices.is_none());
+    }
+
+    #[test]
+    fn capture_t0_if_due_never_overwrites_an_existing_snapshot() {
+        let window = Some((100, 200, 300));
+        let mut day = DaySnapshot::default();
+        let early_prices = HashMap::from([("SKHY".to_string(), 100.0)]);
+        let later_prices = HashMap::from([("SKHY".to_string(), 999.0)]);
+        capture_t0_if_due(window, &mut day, 100, &early_prices);
+        capture_t0_if_due(window, &mut day, 250, &later_prices);
+        assert_eq!(
+            day.t0_prices,
+            Some(early_prices),
+            "a second call (e.g. at/after t1) must not clobber the real t0 snapshot with a later price"
+        );
+    }
+
+    #[test]
+    fn t0_and_t1_snapshots_stay_genuinely_distinct_across_a_price_move() {
+        // End-to-end reproduction of the bug: t0 is captured on its own
+        // tick while the price is still 100.0; the price then moves to
+        // 105.0 before t1 is reached and captured separately (mirroring
+        // how `tick()` now calls maybe_capture_t0 unconditionally, before
+        // maybe_enter's t1-gated capture). epsilon over this pair must be
+        // nonzero, unlike the pre-fix behavior where both ended up equal.
+        let window = Some((100, 200, 300));
+        let mut day = DaySnapshot::default();
+        let t0_prices = HashMap::from([("SKHY".to_string(), 100.0), ("SNDK".to_string(), 50.0)]);
+        capture_t0_if_due(window, &mut day, 100, &t0_prices);
+
+        // Price moves between t0 and t1 (the whole point of the KR session).
+        let t1_prices = HashMap::from([("SKHY".to_string(), 105.0), ("SNDK".to_string(), 50.0)]);
+        // t1 capture is unconditional-once, mirroring maybe_enter's own
+        // `if self.day.t1_prices.is_none() { ... }` line.
+        day.t1_prices = Some(t1_prices.clone());
+
+        let epsilon = compute_epsilon("diff", "SKHY", "SNDK", day.t0_prices.as_ref().unwrap(), &t1_prices).unwrap();
+        assert!(epsilon.abs() > 1e-6, "epsilon must not collapse to ~0 when t0 and t1 prices genuinely differ");
     }
 
     // -------------------------------------------------------------
