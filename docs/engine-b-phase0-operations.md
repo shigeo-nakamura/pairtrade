@@ -71,8 +71,13 @@ the same multiset identities. When an older
 partition contains NULL IDs or the obsolete unversioned synthetic IDs, the
 index builder reconstructs the current identity from its stored
 receive/message ordering.
-New verified late-trade identities are also persisted in the sealed sidecar,
-so the same correction replayed in a later active hour is discarded.
+The committed `late_trade` row is the durable reconciliation journal: replay
+checks consult all retained hourly databases, and the archiver copies every
+journaled identity into its referenced sealed sidecar before the source hour
+can be archived or deleted. Once copied, a replay in a later active hour is
+discarded from the sidecar. There is no separate sidecar transaction on the
+collector write path, so a process stop cannot strand a committed late trade
+between two writes.
 If the source changes or WAL sidecars reappear during upload, the seal is rolled
 back and the local partition is retained.
 If the archiver is interrupted after sealing but before deletion, the next run

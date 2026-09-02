@@ -286,7 +286,9 @@ class DeploymentTests(unittest.TestCase):
 
     def test_archive_deletion_is_disabled_in_unit(self) -> None:
         unit = ARCHIVE_UNIT_PATH.read_text()
+        archive_script = (SCRIPT_DIR / "engine_b_phase0_archive.sh").read_text()
         self.assertIn("ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false", unit)
+        self.assertIn("--reconcile-late-trade-identities", archive_script)
 
     def test_services_use_credential_isolated_identity(self) -> None:
         observer = OBSERVER_UNIT_PATH.read_text()
@@ -645,7 +647,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     index_connection.execute(
                         "SELECT exchange_trade_id FROM late_trade_identity"
                     ).fetchall(),
-                    [("late-after-seal",)],
+                    [],
                 )
             finally:
                 index_connection.close()
@@ -669,15 +671,31 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             )
             active_partition = engine_b.partition_for_us(recv_us)
             active_db = database_dir / f"engine_b_phase0_{active_partition}.sqlite3"
+            self.assertEqual(
+                engine_b.reconcile_late_trade_identities(active_db, sink.sealed_dir),
+                1,
+            )
+            index_connection = sqlite3.connect(trade_index)
+            try:
+                self.assertEqual(
+                    index_connection.execute(
+                        """SELECT exchange_trade_id FROM late_trade_identity
+                           ORDER BY exchange_trade_id"""
+                    ).fetchall(),
+                    [("late-after-seal",)],
+                )
+            finally:
+                index_connection.close()
             connection_db = sqlite3.connect(active_db)
             try:
                 self.assertEqual(connection_db.execute("SELECT COUNT(*) FROM trade").fetchone(), (0,))
                 self.assertEqual(connection_db.execute("SELECT COUNT(*) FROM ohlcv_1m").fetchone(), (0,))
                 self.assertEqual(
                     connection_db.execute(
-                        "SELECT exchange_trade_id, sealed_partition FROM late_trade"
-                    ).fetchone(),
-                    ("late-after-seal", event_partition),
+                        """SELECT exchange_trade_id, sealed_partition FROM late_trade
+                           ORDER BY exchange_trade_id"""
+                    ).fetchall(),
+                    [("late-after-seal", event_partition)],
                 )
                 self.assertEqual(connection_db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
             finally:

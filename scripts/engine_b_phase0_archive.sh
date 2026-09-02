@@ -45,6 +45,8 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
       exit 1
     fi
     trade_index_path="$SEALED_DIR/$partition.trade_ids.sqlite3"
+    "$PYTHON_BIN" "$OBSERVER_SCRIPT" --reconcile-late-trade-identities \
+      "$db" "$SEALED_DIR"
     "$PYTHON_BIN" "$OBSERVER_SCRIPT" --verify-sealed-partition \
       "$db" "$trade_index_path" "$seal_path" "$partition"
     rm -f -- "$db"
@@ -102,6 +104,12 @@ PY
     exec {lock_fd}>&-
     continue
   fi
+
+  # A committed late_trade row is the durable journal for its separately
+  # maintained sealed-hour identity. Never archive or delete that journal
+  # until every referenced sidecar has accepted the identity.
+  "$PYTHON_BIN" "$OBSERVER_SCRIPT" --reconcile-late-trade-identities \
+    "$db" "$SEALED_DIR"
 
   source_fingerprint=$(stat -c '%s:%Y:%y' "$db")
   year=${partition:0:4}

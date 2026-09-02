@@ -499,6 +499,71 @@ def verify_sealed_partition(
         source.close()
 
 
+def reconcile_late_trade_identities(source_path: Path, sealed_dir: Path) -> int:
+    """Copy the durable late-trade journal into each canonical seal sidecar."""
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=5)
+    try:
+        tables = {
+            row[0]
+            for row in source.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "late_trade" not in tables:
+            return 0
+        rows = source.execute(
+            """SELECT DISTINCT sealed_partition, venue, market_id, exchange_trade_id
+               FROM late_trade ORDER BY sealed_partition, venue, market_id,
+                                        exchange_trade_id"""
+        ).fetchall()
+    finally:
+        source.close()
+
+    by_partition: defaultdict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    for partition, venue, market_id, trade_id in rows:
+        by_partition[partition].append((venue, market_id, trade_id))
+
+    for partition, identities in by_partition.items():
+        seal_path = sealed_dir / f"{partition}.json"
+        index_path = sealed_dir / f"{partition}.trade_ids.sqlite3"
+        try:
+            seal = json.loads(seal_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"late-trade seal metadata is unreadable: {seal_path}"
+            ) from exc
+        if (
+            seal.get("partition") != partition
+            or seal.get("trade_index") != index_path.name
+            or not isinstance(seal.get("sha256"), str)
+        ):
+            raise RuntimeError(f"late-trade seal metadata is invalid: {seal_path}")
+        if not index_path.is_file():
+            raise RuntimeError(
+                f"late-trade identity index is missing: {index_path}"
+            )
+        index = sqlite3.connect(index_path, timeout=5)
+        try:
+            metadata = index.execute(
+                "SELECT partition, canonical_db_sha256 FROM sealed_metadata"
+            ).fetchone()
+            if metadata != (partition, seal["sha256"]):
+                raise RuntimeError(
+                    f"late-trade identity index metadata mismatch: {index_path}"
+                )
+            index.executemany(
+                "INSERT OR IGNORE INTO late_trade_identity VALUES (?, ?, ?)",
+                identities,
+            )
+            index.commit()
+        except Exception:
+            index.rollback()
+            raise
+        finally:
+            index.close()
+    return len(rows)
+
+
 def parse_market_id(channel: str) -> int:
     tail = channel.rsplit(":", 1)[-1] if ":" in channel else channel.rsplit("/", 1)[-1]
     return int(tail)
@@ -897,7 +962,9 @@ class DatabaseSink:
     def _is_partition_sealed(self, partition: str) -> bool:
         return (self.sealed_dir / f"{partition}.json").is_file()
 
-    def _archived_trade_exists(self, partition: str, payload: dict[str, Any]) -> bool:
+    def _sealed_trade_index_contains(
+        self, partition: str, payload: dict[str, Any]
+    ) -> bool:
         index_path = self.sealed_dir / f"{partition}.trade_ids.sqlite3"
         seal_path = self.sealed_dir / f"{partition}.json"
         try:
@@ -950,30 +1017,58 @@ class DatabaseSink:
         finally:
             connection.close()
 
-    def _record_late_trade_identities(
-        self, partition: str, payloads: list[dict[str, Any]]
-    ) -> None:
-        index_path = self.sealed_dir / f"{partition}.trade_ids.sqlite3"
-        connection = sqlite3.connect(index_path, timeout=5)
-        try:
-            connection.executemany(
-                """INSERT OR IGNORE INTO late_trade_identity
-                   VALUES (?, ?, ?)""",
-                [
-                    (
-                        payload["venue"],
-                        payload["market_id"],
-                        payload["trade_id"],
-                    )
-                    for payload in payloads
-                ],
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+    def _local_late_trade_exists(
+        self, sealed_partition: str, payload: dict[str, Any]
+    ) -> bool:
+        identity = (
+            sealed_partition,
+            payload["venue"],
+            payload["market_id"],
+            payload["trade_id"],
+        )
+        for database_path in sorted(
+            self.config.database_dir.glob("engine_b_phase0_*.sqlite3")
+        ):
+            try:
+                connection = sqlite3.connect(
+                    f"file:{database_path}?mode=ro", uri=True, timeout=5
+                )
+            except sqlite3.OperationalError as exc:
+                if not database_path.exists():
+                    continue
+                raise RuntimeError(
+                    f"late-trade journal is unreadable: {database_path}"
+                ) from exc
+            try:
+                table = connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                       WHERE type = 'table' AND name = 'late_trade'"""
+                ).fetchone()
+                if table is None:
+                    continue
+                if connection.execute(
+                    """SELECT 1 FROM late_trade
+                       WHERE sealed_partition = ? AND venue = ? AND market_id = ?
+                         AND exchange_trade_id = ?""",
+                    identity,
+                ).fetchone() is not None:
+                    return True
+            except sqlite3.DatabaseError as exc:
+                raise RuntimeError(
+                    f"late-trade journal is unreadable: {database_path}"
+                ) from exc
+            finally:
+                connection.close()
+        return False
+
+    def _archived_trade_exists(self, partition: str, payload: dict[str, Any]) -> bool:
+        if self._sealed_trade_index_contains(partition, payload):
+            return True
+        if self._local_late_trade_exists(partition, payload):
+            return True
+        # An archiver may have reconciled and removed the local journal between
+        # the local scan and this point. Recheck the sidecar to close that race.
+        return self._sealed_trade_index_contains(partition, payload)
 
     @contextmanager
     def _partition_lock(self, partition: str):
@@ -1041,12 +1136,6 @@ class DatabaseSink:
                 if self._is_partition_sealed(late_partition):
                     raise RuntimeError(f"active late-trade partition is sealed: {late_partition}")
                 self._write_partition(late_partition, late_commands)
-            late_by_sealed: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
-            for _, payload in late_commands:
-                late_by_sealed[payload["sealed_partition"]].append(payload)
-            for sealed_partition, payloads in late_by_sealed.items():
-                with self._partition_lock(sealed_partition):
-                    self._record_late_trade_identities(sealed_partition, payloads)
 
         current_partition = partition_for_us(now_us())
         for partition, connection in list(self._connections.items()):
@@ -1903,6 +1992,11 @@ def parse_args() -> argparse.Namespace:
         nargs=4,
         metavar=("SOURCE_DB", "INDEX_DB", "SEAL_JSON", "PARTITION"),
     )
+    parser.add_argument(
+        "--reconcile-late-trade-identities",
+        nargs=2,
+        metavar=("SOURCE_DB", "SEALED_DIR"),
+    )
     return parser.parse_args()
 
 
@@ -1980,6 +2074,10 @@ def main() -> int:
         verify_sealed_partition(
             Path(source), Path(index), Path(seal), partition
         )
+        return 0
+    if args.reconcile_late_trade_identities is not None:
+        source, sealed_dir = args.reconcile_late_trade_identities
+        reconcile_late_trade_identities(Path(source), Path(sealed_dir))
         return 0
     if args.smoke_seconds is not None and args.smoke_seconds <= 0:
         raise SystemExit("--smoke-seconds must be positive")
