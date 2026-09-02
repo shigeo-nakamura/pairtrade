@@ -913,40 +913,65 @@ fn build_manual_reconcile_report(
     // persisted, so "ready" means apply's commit step would actually
     // succeed, not just that a fill could be computed (Codex P2 follow-up,
     // pairtrade#241).
+    // load_existing, not load_or_create: this attempt was dispatched
+    // against a checkpoint that must already exist. Silently constructing
+    // a fresh one from initial_inventory on a missing/lost checkpoint file
+    // would validate and (in apply) persist a commit against the wrong
+    // starting state, discarding whatever real tracked inventory/regime/
+    // signal history/risk state the checkpoint held -- checkpoint loss
+    // must surface as an explicit recovery condition, never an implicit
+    // reset (Codex P1 follow-up, pairtrade#241).
     let mut dry_run_runtime =
         ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
-            .load_or_create(&config.runtime)?;
-    if let Err(error) = dry_run_runtime.validate_plan_consistent_with_state(&plan) {
-        return Ok(serde_json::json!({
-            "status": "would_fail",
-            "active_attempt": active_summary,
-            "candidate_plan": plan,
-            "detail": format!(
-                "manual-reconcile-apply would refuse this: plan is inconsistent with the current \
-                 runtime checkpoint: {error}"
-            ),
-        }));
+            .load_existing(&config.runtime)?;
+    // apply_confirmed_live_fill_once short-circuits to Ok(false) without
+    // any further validation when last_live_execution_idempotency_key
+    // already equals this fill's key (a prior invocation crashed after
+    // committing the runtime fill but before archiving the ledger
+    // attempt -- a safe, already-applied no-op apply's real commit step
+    // handles). Only run the consistency/commit dry-run when that is not
+    // the case; running it unconditionally would incorrectly reject that
+    // recovery case, since the checkpoint's regime has already moved on
+    // from what the plan describes (Codex P2 follow-up, pairtrade#241).
+    let already_committed = dry_run_runtime
+        .state()
+        .last_live_execution_idempotency_key
+        .as_deref()
+        == Some(fill.idempotency_key.as_str());
+    if !already_committed {
+        if let Err(error) = dry_run_runtime.validate_plan_consistent_with_state(&plan) {
+            return Ok(serde_json::json!({
+                "status": "would_fail",
+                "active_attempt": active_summary,
+                "candidate_plan": plan,
+                "detail": format!(
+                    "manual-reconcile-apply would refuse this: plan is inconsistent with the \
+                     current runtime checkpoint: {error}"
+                ),
+            }));
+        }
+        if let Err(error) = dry_run_runtime.apply_confirmed_live_fill_once(
+            &plan,
+            fill.actual_sell_quantity,
+            fill.actual_buy_quantity,
+            fill.reconciled_at,
+            &fill.idempotency_key,
+        ) {
+            return Ok(serde_json::json!({
+                "status": "would_fail",
+                "active_attempt": active_summary,
+                "candidate_plan": plan,
+                "detail": format!(
+                    "manual-reconcile-apply would refuse this: failed to commit the reconciled \
+                     fill to runtime state: {error}"
+                ),
+            }));
+        }
     }
-    if let Err(error) = dry_run_runtime.apply_confirmed_live_fill_once(
-        &plan,
-        fill.actual_sell_quantity,
-        fill.actual_buy_quantity,
-        fill.reconciled_at,
-        &fill.idempotency_key,
-    ) {
-        return Ok(serde_json::json!({
-            "status": "would_fail",
-            "active_attempt": active_summary,
-            "candidate_plan": plan,
-            "detail": format!(
-                "manual-reconcile-apply would refuse this: failed to commit the reconciled fill \
-                 to runtime state: {error}"
-            ),
-        }));
-    }
-    // dry_run_runtime committed cleanly above and is discarded here without
-    // ever being persisted -- apply's real commit (finalize_manual_reconciled_attempt)
-    // runs the identical two calls against the real, persisted checkpoint.
+    // dry_run_runtime committed cleanly above (or was already committed by
+    // an earlier crashed invocation) and is discarded here without ever
+    // being persisted -- apply's real commit (finalize_manual_reconciled_attempt)
+    // runs the identical calls against the real, persisted checkpoint.
     Ok(serde_json::json!({
         "status": "ready",
         "active_attempt": active_summary,
@@ -1056,8 +1081,10 @@ fn finalize_manual_reconciled_attempt(
         sell_token_decimals,
         buy_token_decimals,
     )?;
+    // load_existing, not load_or_create (Codex P1 follow-up, pairtrade#241):
+    // see build_manual_reconcile_report's identical dry-run for why.
     let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
-    let mut runtime = store.load_or_create(&config.runtime)?;
+    let mut runtime = store.load_existing(&config.runtime)?;
     runtime
         .apply_confirmed_live_fill_once(
             plan,
@@ -8083,6 +8110,123 @@ runtime:
             .as_str()
             .unwrap()
             .contains("inconsistent with the current runtime checkpoint"));
+    }
+
+    #[test]
+    fn manual_reconcile_report_refuses_when_the_runtime_checkpoint_is_missing() {
+        // Codex P1 follow-up, pairtrade#241: load_or_create would silently
+        // construct a fresh runtime from initial_inventory on a
+        // missing/lost checkpoint file, discarding whatever real tracked
+        // inventory/regime/signal history/risk state it held. Checkpoint
+        // loss must surface as an explicit error, not an implicit reset.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+
+        // Persist only the ledger (with its lock); never write the runtime
+        // checkpoint file -- simulating checkpoint loss.
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger.next_sequence = 3;
+        ledger.active = Some(active);
+        let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        ledger_store.persist(&ledger).unwrap();
+        drop(
+            ledger_store
+                .acquire_exclusive_lock(&config.runtime_state_path)
+                .unwrap(),
+        );
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let error = build_manual_reconcile_report(
+            &config_path,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn manual_reconcile_report_is_ready_when_the_fill_was_already_committed_by_a_crashed_invocation(
+    ) {
+        // Codex P2 follow-up, pairtrade#241: if a prior invocation
+        // persisted the runtime fill but crashed before archiving the
+        // ledger attempt, apply_confirmed_live_fill_once short-circuits to
+        // Ok(false) on the matching idempotency key without re-validating
+        // regime consistency -- the checkpoint has already moved on from
+        // what the plan describes (Neutral -> RotatedAToB for this
+        // entry_signal plan), which would otherwise make
+        // validate_plan_consistent_with_state fail. The report must
+        // recognize this as already-safe, not would_fail.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+
+        let mut runtime = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
+        runtime
+            .apply_confirmed_live_fill_once(
+                &plan,
+                plan.sell_quantity,
+                plan.buy_quantity,
+                at,
+                &active.idempotency_key,
+            )
+            .unwrap();
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&runtime)
+            .unwrap();
+
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger.next_sequence = 3;
+        ledger.active = Some(active);
+        let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        ledger_store.persist(&ledger).unwrap();
+        drop(
+            ledger_store
+                .acquire_exclusive_lock(&config.runtime_state_path)
+                .unwrap(),
+        );
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_manual_reconcile_report(
+            &config_path,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap();
+        assert_eq!(report["status"], "ready", "{report}");
     }
 
     #[test]
