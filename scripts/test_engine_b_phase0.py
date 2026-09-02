@@ -2148,7 +2148,6 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             recovered_us = next_hour_us + 300_000_000
             connection_started_us = hour_start_us + 3_000_000_000
             first_partition = engine_b.partition_for_us(hour_start_us)
-            second_partition = engine_b.partition_for_us(next_hour_us)
             connection_meta = {
                 "id": "orphaned-before-rotation",
                 "venue": "robinhood",
@@ -2198,9 +2197,6 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             first_db = sqlite3.connect(
                 database_dir / f"engine_b_phase0_{first_partition}.sqlite3"
             )
-            second_db = sqlite3.connect(
-                database_dir / f"engine_b_phase0_{second_partition}.sqlite3"
-            )
             try:
                 self.assertEqual(
                     first_db.execute(
@@ -2209,24 +2205,123 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchone(),
                     (
                         connection_started_us,
-                        next_hour_us,
-                        "partition_rotation",
+                        connection_started_us,
+                        "collector_restart_recovery",
                     ),
                 )
                 self.assertEqual(
-                    second_db.execute(
-                        """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                    first_db.execute(
+                        """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
+                           FROM data_gap WHERE channel = 'connection'"""
+                    ).fetchone(),
+                    (len(config.venues[0].markets), connection_started_us, None),
+                )
+            finally:
+                first_db.close()
+
+    async def test_crash_gap_runs_from_last_activity_to_replacement_snapshot(
+        self,
+    ) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            started_us = 1_774_884_000_000_000
+            activity_us = started_us + 10_000_000
+            recovered_us = activity_us + 120_000_000
+            connection = {
+                "id": "crashed-after-book",
+                "venue": venue.name,
+                "started_us": started_us,
+                "api_schema_version": config.api_schema_version,
+            }
+            crashed_sink = engine_b.DatabaseSink(
+                config, "crash-gap-source", "crash-gap-commit"
+            )
+            for path in (
+                database_dir,
+                crashed_sink.sealed_dir,
+                crashed_sink.lock_dir,
+                crashed_sink.gap_continuation_dir,
+                crashed_sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(engine_b, "now_us", return_value=activity_us):
+                crashed_sink._write_batch(
+                    [
+                        (
+                            "connection_start",
+                            {"recv_us": started_us, "connection": connection},
+                        ),
+                        (
+                            "book",
+                            {
+                                "recv_us": activity_us,
+                                "srv_us": activity_us,
+                                "connection": connection,
+                                "venue": venue.name,
+                                "market_id": 37,
+                                "symbol": "SKHY",
+                                "event_kind": "snapshot",
+                                "exchange_sequence": "10",
+                                "begin_sequence": None,
+                                "exchange_offset": None,
+                                "local_sequence": 1,
+                                "complete": True,
+                                "levels": [],
+                            },
+                        ),
+                    ]
+                )
+            for database in crashed_sink._connections.values():
+                database.close()
+            crashed_sink._connections.clear()
+
+            recovered_sink = engine_b.DatabaseSink(
+                config, "crash-gap-recovery", "crash-gap-commit"
+            )
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                recovered_sink._write_batch(
+                    [
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": venue.name,
+                                "market_id": 37,
+                            },
+                        )
+                    ]
+                )
+            await recovered_sink.close()
+
+            database = sqlite3.connect(
+                database_dir
+                / f"engine_b_phase0_{engine_b.partition_for_us(started_us)}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    database.execute(
+                        """SELECT ended_ts_recv_us, end_reason
                            FROM ws_connection"""
                     ).fetchone(),
+                    (activity_us, "collector_restart_recovery"),
+                )
+                self.assertEqual(
+                    database.execute(
+                        """SELECT ts_start_us, ts_end_us, reason FROM data_gap
+                           WHERE venue = 'robinhood' AND market_id = 37
+                             AND channel = 'connection'"""
+                    ).fetchone(),
                     (
-                        next_hour_us,
+                        activity_us,
                         recovered_us,
                         "collector_restart_recovery",
                     ),
                 )
             finally:
-                first_db.close()
-                second_db.close()
+                database.close()
 
     async def test_session_marker_advances_past_sealed_destination(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)

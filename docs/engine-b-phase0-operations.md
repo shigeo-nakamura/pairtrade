@@ -183,7 +183,10 @@ collector preserves the destination segment as open, while a different process
 recreates the segment and bounds it at the recovery timestamp with
 `collector_restart_recovery`.
 Startup also discovers open rows left in retained databases by an earlier
-process, so recovery does not depend on the archive timer. If a journal target
+process, bounds each orphaned physical session at its last durable book/trade
+activity, and records a connection gap from that point through the replacement
+snapshot. Recovery therefore does not count crash downtime as connected and
+does not depend on the archive timer. If a journal target
 was already sealed, the sidecar proves whether that session segment exists;
 any missing sealed-hour interval is carried into the next retained database as
 `sealed_session_interval` evidence before recovery advances.

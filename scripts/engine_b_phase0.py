@@ -1722,48 +1722,87 @@ class DatabaseSink:
                     if table is None:
                         continue
                     rows = connection.execute(
-                        """SELECT connection_session_id, venue, api_schema_version
+                        """SELECT connection_session_id, venue,
+                                  started_ts_recv_us
                            FROM ws_connection
                            WHERE ended_ts_recv_us IS NULL"""
                     ).fetchall()
                     if not rows:
                         continue
                     connection.execute("BEGIN")
-                    if partition == current_partition:
+                    tables = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                    venues = {venue.name: venue for venue in self.config.venues}
+                    for session_id, venue, started_us in rows:
+                        last_activity_us = int(started_us)
+                        if "book_event" in tables:
+                            book_activity = connection.execute(
+                                """SELECT MAX(ts_recv_us) FROM book_event
+                                   WHERE connection_session_id = ?""",
+                                (session_id,),
+                            ).fetchone()[0]
+                            if book_activity is not None:
+                                last_activity_us = max(
+                                    last_activity_us, int(book_activity)
+                                )
+                        if "trade" in tables:
+                            trade_activity = connection.execute(
+                                """SELECT MAX(ts_recv_us) FROM trade
+                                   WHERE connection_session_id = ?""",
+                                (session_id,),
+                            ).fetchone()[0]
+                            if trade_activity is not None:
+                                last_activity_us = max(
+                                    last_activity_us, int(trade_activity)
+                                )
+                        last_activity_us = min(last_activity_us, recovered_us)
                         connection.execute(
                             """UPDATE ws_connection
                                SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
                                    end_reason = 'collector_restart_recovery'
-                               WHERE ended_ts_recv_us IS NULL""",
-                            (recovered_us,),
+                               WHERE connection_session_id = ?
+                                 AND ended_ts_recv_us IS NULL""",
+                            (last_activity_us, session_id),
                         )
-                    else:
-                        partition_ended_us = (
-                            partition_start_us(partition) + 3_600_000_000
-                        )
-                        for session_id, venue, api_schema_version in rows:
-                            self._persist_session_continuation_marker(
-                                {
-                                    "continuation_id": (
-                                        f"partition:{partition}:{session_id}"
-                                    ),
-                                    "start_us": partition_ended_us,
-                                    "source_partition": partition,
-                                    "connection": {
-                                        "id": session_id,
-                                        "venue": venue,
-                                        "started_us": partition_ended_us,
-                                        "api_schema_version": api_schema_version,
-                                    },
-                                }
+                        venue_config = venues.get(venue)
+                        if venue_config is None:
+                            raise RuntimeError(
+                                f"orphaned session has unknown venue: {venue}"
                             )
-                        connection.execute(
-                            """UPDATE ws_connection
-                               SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
-                                   end_reason = 'partition_rotation'
-                               WHERE ended_ts_recv_us IS NULL""",
-                            (partition_ended_us,),
-                        )
+                        for market in venue_config.markets:
+                            open_gap = connection.execute(
+                                """SELECT MIN(gap_id) FROM data_gap
+                                   WHERE ts_end_us IS NULL AND venue = ?
+                                     AND market_id = ?
+                                     AND channel = 'connection'""",
+                                (venue, market.market_id),
+                            ).fetchone()[0]
+                            if open_gap is None:
+                                connection.execute(
+                                    """INSERT INTO data_gap(
+                                         connection_session_id, venue, market_id,
+                                         symbol, channel, ts_start_us, reason
+                                       ) VALUES (?, ?, ?, ?, 'connection', ?, ?)""",
+                                    (
+                                        session_id,
+                                        venue,
+                                        market.market_id,
+                                        market.symbol,
+                                        last_activity_us,
+                                        "collector_restart_recovery",
+                                    ),
+                                )
+                            else:
+                                connection.execute(
+                                    """UPDATE data_gap
+                                       SET ts_start_us = MIN(ts_start_us, ?)
+                                       WHERE gap_id = ?""",
+                                    (last_activity_us, open_gap),
+                                )
                     connection.commit()
                 except sqlite3.DatabaseError as exc:
                     connection.rollback()
