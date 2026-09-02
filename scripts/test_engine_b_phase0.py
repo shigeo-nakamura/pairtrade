@@ -10,6 +10,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -232,6 +233,93 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         )
+
+
+class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def websocket_modules(connect: object) -> dict[str, types.ModuleType]:
+        websockets = types.ModuleType("websockets")
+        websockets.__path__ = []
+        asyncio_module = types.ModuleType("websockets.asyncio")
+        asyncio_module.__path__ = []
+        client = types.ModuleType("websockets.asyncio.client")
+        client.connect = connect
+        websockets.asyncio = asyncio_module
+        asyncio_module.client = client
+        return {
+            "websockets": websockets,
+            "websockets.asyncio": asyncio_module,
+            "websockets.asyncio.client": client,
+        }
+
+    async def test_handshake_failure_does_not_create_websocket_session(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+        class FailedHandshake:
+            async def __aenter__(self) -> object:
+                collector.stop_event.set()
+                raise OSError("simulated handshake failure")
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+        with mock.patch.dict(
+            sys.modules,
+            self.websocket_modules(lambda *args, **kwargs: FailedHandshake()),
+        ):
+            await collector.feed_loop(venue)
+
+        kinds = [kind for kind, _ in sink.commands]
+        self.assertNotIn("connection_start", kinds)
+        self.assertNotIn("connection_end", kinds)
+        self.assertEqual(kinds.count("gap"), len(venue.markets))
+
+    async def test_session_start_is_timestamped_after_handshake(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+
+        class EmptyWebSocket:
+            def __aiter__(self) -> EmptyWebSocket:
+                return self
+
+            async def __anext__(self) -> str:
+                raise StopAsyncIteration
+
+        class ConnectedWebSocket:
+            entered = False
+
+            async def __aenter__(self) -> EmptyWebSocket:
+                self.entered = True
+                collector.stop_event.set()
+                return EmptyWebSocket()
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+        context = ConnectedWebSocket()
+        timestamps = iter((1_774_884_082_400_000, 1_774_884_082_500_000))
+
+        def connected_clock() -> int:
+            self.assertTrue(context.entered)
+            return next(timestamps)
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                self.websocket_modules(lambda *args, **kwargs: context),
+            ),
+            mock.patch.object(engine_b, "now_us", side_effect=connected_clock),
+        ):
+            await collector.feed_loop(venue)
+
+        starts = [payload for kind, payload in sink.commands if kind == "connection_start"]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["recv_us"], 1_774_884_082_400_000)
 
 
 class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
@@ -1839,6 +1927,103 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     (boundary_us, None, None),
                 )
             finally:
+                destination.close()
+
+    async def test_existing_session_marker_precedes_orphan_discovery(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            source_start_us = 1_700_000_000_000_000
+            source_start_us -= source_start_us % 3_600_000_000
+            boundary_us = source_start_us + 3_600_000_000
+            recovered_us = boundary_us + 200_000_000
+            source_partition = engine_b.partition_for_us(source_start_us)
+            destination_partition = engine_b.partition_for_us(boundary_us)
+            source_sink = engine_b.DatabaseSink(
+                config, "marker-source-run", "marker-source-commit"
+            )
+            for path in (
+                database_dir,
+                source_sink.sealed_dir,
+                source_sink.lock_dir,
+                source_sink.gap_continuation_dir,
+                source_sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            connection = {
+                "id": "marker-before-source-close",
+                "venue": "robinhood",
+                "started_us": source_start_us + 3_500_000_000,
+                "api_schema_version": config.api_schema_version,
+            }
+            with mock.patch.object(
+                engine_b, "now_us", return_value=connection["started_us"]
+            ):
+                source_sink._write_batch(
+                    [
+                        (
+                            "connection_start",
+                            {
+                                "recv_us": connection["started_us"],
+                                "connection": connection,
+                            },
+                        )
+                    ]
+                )
+            source_sink._persist_session_continuation_marker(
+                {
+                    "continuation_id": (
+                        f"partition:{source_partition}:{connection['id']}"
+                    ),
+                    "start_us": boundary_us,
+                    "source_partition": source_partition,
+                    "source_collector_run_id": source_sink.collector_run_id,
+                    "connection": {
+                        **connection,
+                        "started_us": boundary_us,
+                    },
+                }
+            )
+            for database in source_sink._connections.values():
+                database.close()
+            source_sink._connections.clear()
+
+            recovered_sink = engine_b.DatabaseSink(
+                config, "marker-recovery-run", "marker-recovery-commit"
+            )
+            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+                recovered_sink._write_batch([])
+            await recovered_sink.close()
+
+            source = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{source_partition}.sqlite3"
+            )
+            destination = sqlite3.connect(
+                database_dir
+                / f"engine_b_phase0_{destination_partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    source.execute(
+                        """SELECT ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (boundary_us, "partition_rotation"),
+                )
+                self.assertEqual(
+                    destination.execute(
+                        """SELECT started_ts_recv_us, ended_ts_recv_us, end_reason
+                           FROM ws_connection"""
+                    ).fetchone(),
+                    (
+                        boundary_us,
+                        recovered_us,
+                        "collector_restart_recovery",
+                    ),
+                )
+            finally:
+                source.close()
                 destination.close()
 
     async def test_startup_discovers_orphaned_session_without_archive_timer(

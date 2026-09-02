@@ -1776,11 +1776,19 @@ class DatabaseSink:
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         gap_closes: list[dict[str, Any]] = []
+        recovered_session_markers = self._load_session_continuations()
         if self._startup_recovery_pending:
             self._recover_orphaned_sessions(now_us())
             self._startup_recovery_pending = False
+            recovered_session_markers.extend(
+                self._load_session_continuations(
+                    {
+                        marker_path
+                        for marker_path, _, _ in recovered_session_markers
+                    }
+                )
+            )
         recovered_gap_markers = self._load_gap_continuations()
-        recovered_session_markers = self._load_session_continuations()
         batch = [
             *(
                 command
@@ -2072,7 +2080,7 @@ class DatabaseSink:
                     connection.close()
 
     def _load_session_continuations(
-        self,
+        self, excluded_paths: set[Path] | None = None,
     ) -> list[
         tuple[
             Path,
@@ -2084,6 +2092,8 @@ class DatabaseSink:
             return []
         recovered = []
         for marker_path in sorted(self.session_continuation_dir.glob("*.json")):
+            if excluded_paths is not None and marker_path in excluded_paths:
+                continue
             try:
                 marker = json.loads(marker_path.read_text())
             except (OSError, json.JSONDecodeError) as exc:
@@ -2723,10 +2733,9 @@ class Collector:
             connection = {
                 "id": str(uuid.uuid4()),
                 "venue": venue.name,
-                "started_us": now_us(),
                 "api_schema_version": self.config.api_schema_version,
             }
-            await self.sink.put("connection_start", {"recv_us": connection["started_us"], "connection": connection})
+            connected = False
             reason = "normal_stop"
             try:
                 async with connect(
@@ -2737,6 +2746,15 @@ class Collector:
                     max_queue=4096,
                     open_timeout=20,
                 ) as ws:
+                    connection["started_us"] = now_us()
+                    await self.sink.put(
+                        "connection_start",
+                        {
+                            "recv_us": connection["started_us"],
+                            "connection": connection,
+                        },
+                    )
+                    connected = True
                     LOG.info("WebSocket connected venue=%s url=%s", venue.name, venue.ws_url)
                     self.metrics.feed_connected[venue.name] = True
                     backoff = 1
@@ -2772,10 +2790,15 @@ class Collector:
             finally:
                 self.metrics.feed_connected[venue.name] = False
                 ended_us = now_us()
-                await self.sink.put(
-                    "connection_end",
-                    {"recv_us": ended_us, "connection": connection, "reason": reason},
-                )
+                if connected:
+                    await self.sink.put(
+                        "connection_end",
+                        {
+                            "recv_us": ended_us,
+                            "connection": connection,
+                            "reason": reason,
+                        },
+                    )
                 for market in venue.markets:
                     state = self.books.setdefault((venue.name, market.market_id), BookState())
                     state.synced = False

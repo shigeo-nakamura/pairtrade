@@ -187,6 +187,9 @@ process, so recovery does not depend on the archive timer. If a journal target
 was already sealed, the sidecar proves whether that session segment exists;
 any missing sealed-hour interval is carried into the next retained database as
 `sealed_session_interval` evidence before recovery advances.
+`ws_connection` starts only after the WebSocket handshake succeeds. DNS,
+TCP/TLS, and handshake failures contribute connection-gap evidence but never
+create a physical session row or inflate session duration.
 Repeated connection failures before a successful replacement snapshot share
 one open `connection` gap per venue/market, preventing retry backoff from
 counting the same outage more than once.
