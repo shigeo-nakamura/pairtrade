@@ -881,9 +881,11 @@ fn build_manual_reconcile_report(
         }));
     }
 
-    let sell_token_decimals = trusted_token_decimals(&config, &plan.sell_symbol)?;
-    let buy_token_decimals = trusted_token_decimals(&config, &plan.buy_symbol)?;
-    match manual_reconciled_runtime_fill_for_attempt(
+    let sell_token_decimals =
+        trusted_token_decimals_for_address(&config, &plan.sell_symbol, &active.intent.sell_token)?;
+    let buy_token_decimals =
+        trusted_token_decimals_for_address(&config, &plan.buy_symbol, &active.intent.buy_token)?;
+    let fill = match manual_reconciled_runtime_fill_for_attempt(
         &active,
         &plan,
         expected_sell_amount_raw,
@@ -891,43 +893,90 @@ fn build_manual_reconcile_report(
         sell_token_decimals,
         buy_token_decimals,
     ) {
-        Ok(fill) => Ok(serde_json::json!({
-            "status": "ready",
-            "active_attempt": active_summary,
-            "candidate_plan": plan,
-            "proposed_fill": {
-                "actual_sell_quantity": fill.actual_sell_quantity,
-                "actual_buy_quantity": fill.actual_buy_quantity,
-                "reconciled_at": fill.reconciled_at,
-                "idempotency_key": fill.idempotency_key,
-            },
-            "next_steps": [
-                "This command wrote nothing -- the ledger, runtime checkpoint, and pending-plan \
-                 file are all untouched.",
-                format!(
-                    "Confirm arcus-spot-live-tick.timer (and any manual execute/auto-execute/\
-                     auto-resume/live-tick/manual-reconcile-apply invocation) stays stopped until \
-                     you run manual-reconcile-apply -- a concurrent invocation could otherwise \
-                     archive this exact attempt before apply runs.",
-                ),
-                format!(
-                    "Immediately before running manual-reconcile-apply, re-run this report and \
-                     confirm active_attempt still has the same sequence ({}), idempotency_key, and \
-                     tx_hash printed here; abort if any differ.",
-                    active_summary["sequence"],
-                ),
-                "Then run manual-reconcile-apply with this attempt's exact sequence/idempotency_key/\
-                 tx_hash and the same EVENTS_JSONL/EXPECTED_*_AMOUNT_RAW to commit proposed_fill \
-                 above and archive the attempt.".to_string(),
-            ],
-        })),
-        Err(error) => Ok(serde_json::json!({
+        Ok(fill) => fill,
+        Err(error) => {
+            return Ok(serde_json::json!({
+                "status": "would_fail",
+                "active_attempt": active_summary,
+                "candidate_plan": plan,
+                "detail": format!("manual-reconcile-apply would refuse this: {error:#}"),
+            }));
+        }
+    };
+    // manual_reconciled_runtime_fill_for_attempt only derives quantities and
+    // checks ledger/balance deltas -- it does not run the further checks
+    // apply_confirmed_live_fill_once itself enforces at commit time (exact
+    // sell-quantity equality against the candidate plan, fill-predates-quote
+    // ordering, regime/trigger consistency, open-quantity for an exit,
+    // inventory floors). Run the real commit function here too, against a
+    // throwaway clone of the actual runtime checkpoint that is never
+    // persisted, so "ready" means apply's commit step would actually
+    // succeed, not just that a fill could be computed (Codex P2 follow-up,
+    // pairtrade#241).
+    let mut dry_run_runtime =
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .load_or_create(&config.runtime)?;
+    if let Err(error) = dry_run_runtime.validate_plan_consistent_with_state(&plan) {
+        return Ok(serde_json::json!({
             "status": "would_fail",
             "active_attempt": active_summary,
             "candidate_plan": plan,
-            "detail": format!("manual-reconcile-apply would refuse this: {error:#}"),
-        })),
+            "detail": format!(
+                "manual-reconcile-apply would refuse this: plan is inconsistent with the current \
+                 runtime checkpoint: {error}"
+            ),
+        }));
     }
+    if let Err(error) = dry_run_runtime.apply_confirmed_live_fill_once(
+        &plan,
+        fill.actual_sell_quantity,
+        fill.actual_buy_quantity,
+        fill.reconciled_at,
+        &fill.idempotency_key,
+    ) {
+        return Ok(serde_json::json!({
+            "status": "would_fail",
+            "active_attempt": active_summary,
+            "candidate_plan": plan,
+            "detail": format!(
+                "manual-reconcile-apply would refuse this: failed to commit the reconciled fill \
+                 to runtime state: {error}"
+            ),
+        }));
+    }
+    // dry_run_runtime committed cleanly above and is discarded here without
+    // ever being persisted -- apply's real commit (finalize_manual_reconciled_attempt)
+    // runs the identical two calls against the real, persisted checkpoint.
+    Ok(serde_json::json!({
+        "status": "ready",
+        "active_attempt": active_summary,
+        "candidate_plan": plan,
+        "proposed_fill": {
+            "actual_sell_quantity": fill.actual_sell_quantity,
+            "actual_buy_quantity": fill.actual_buy_quantity,
+            "reconciled_at": fill.reconciled_at,
+            "idempotency_key": fill.idempotency_key,
+        },
+        "next_steps": [
+            "This command wrote nothing -- the ledger, runtime checkpoint, and pending-plan \
+             file are all untouched.",
+            format!(
+                "Confirm arcus-spot-live-tick.timer (and any manual execute/auto-execute/\
+                 auto-resume/live-tick/manual-reconcile-apply invocation) stays stopped until \
+                 you run manual-reconcile-apply -- a concurrent invocation could otherwise \
+                 archive this exact attempt before apply runs.",
+            ),
+            format!(
+                "Immediately before running manual-reconcile-apply, re-run this report and \
+                 confirm active_attempt still has the same sequence ({}), idempotency_key, and \
+                 tx_hash printed here; abort if any differ.",
+                active_summary["sequence"],
+            ),
+            "Then run manual-reconcile-apply with this attempt's exact sequence/idempotency_key/\
+             tx_hash and the same EVENTS_JSONL/EXPECTED_*_AMOUNT_RAW to commit proposed_fill \
+             above and archive the attempt.".to_string(),
+        ],
+    }))
 }
 
 /// Commit an already-`Reconciled` attempt's runtime fill via
@@ -943,7 +992,39 @@ fn build_manual_reconcile_report(
 /// `manual-reconcile-report` already require, so it is trustworthy
 /// independent of anything an archive candidate plan claims (Codex P2
 /// follow-up, pairtrade#241).
-fn trusted_token_decimals(config: &ArcusSpotExecuteOnceConfig, symbol: &str) -> Result<u32> {
+/// `symbol` alone is not enough to trust `config`'s decimals pin for it:
+/// if CONFIG_YAML has been legitimately updated (a new
+/// auto_execute_policy.json-approved config) since this attempt was
+/// dispatched -- e.g. the symbol registry now resolves `symbol` to a
+/// different ERC-20 contract with different decimals -- a symbol-only
+/// lookup would silently return the *new* contract's decimals while
+/// `active.intent`/`plan` still describe the swap against the *old* one,
+/// converting the real settled raw amount at the wrong scale.
+/// `apply_confirmed_live_fill_once` does not itself catch this (it never
+/// re-derives quantities from raw amounts), so this must be checked here:
+/// require the symbol's *currently configured* address to match the
+/// address the attempt was actually signed and dispatched against before
+/// trusting its decimals pin (Codex P1 follow-up, pairtrade#241).
+fn trusted_token_decimals_for_address(
+    config: &ArcusSpotExecuteOnceConfig,
+    symbol: &str,
+    expected_address: &str,
+) -> Result<u32> {
+    let configured_address = config
+        .router
+        .trusted_token_addresses
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
+        .map(|(_, address)| address)
+        .with_context(|| format!("Arcus manual-reconcile has no address pin for {symbol}"))?;
+    if !configured_address.eq_ignore_ascii_case(expected_address) {
+        bail!(
+            "Arcus manual-reconcile decimals pin for {symbol} ({configured_address}) does not \
+             match the address this attempt was actually dispatched against \
+             ({expected_address}) -- the symbol registry has moved since this attempt was \
+             signed; refusing to guess its decimals"
+        );
+    }
     config
         .router
         .trusted_token_decimals
@@ -964,8 +1045,10 @@ fn finalize_manual_reconciled_attempt(
     if attempt.phase != ArcusSpotExecutionPhase::Reconciled {
         return Ok(attempt);
     }
-    let sell_token_decimals = trusted_token_decimals(config, &plan.sell_symbol)?;
-    let buy_token_decimals = trusted_token_decimals(config, &plan.buy_symbol)?;
+    let sell_token_decimals =
+        trusted_token_decimals_for_address(config, &plan.sell_symbol, &attempt.intent.sell_token)?;
+    let buy_token_decimals =
+        trusted_token_decimals_for_address(config, &plan.buy_symbol, &attempt.intent.buy_token)?;
     let fill = executor.manual_reconciled_runtime_fill(
         plan,
         expected_sell_amount_raw,
@@ -7902,6 +7985,104 @@ runtime:
             .unwrap()
             .iter()
             .any(|step| step.as_str().unwrap().contains("manual-reconcile-apply")));
+    }
+
+    #[test]
+    fn manual_reconcile_report_refuses_a_decimals_pin_whose_address_moved_since_dispatch() {
+        // Codex P1 follow-up, pairtrade#241: if CONFIG_YAML's symbol->address
+        // pin for the buy symbol has changed since this attempt was
+        // dispatched (a legitimate, later administrator-approved config
+        // update, unrelated to this specific attempt), its decimals must
+        // not be trusted for an attempt signed against the *old* address --
+        // converting the real raw amount at the new contract's decimals
+        // could silently produce the wrong quantity.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let mut config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+        // The config now resolves AMD (the buy symbol) to a different
+        // contract than active.intent.buy_token / plan.buy_token_address.
+        config.router.trusted_token_addresses.insert(
+            "AMD".to_string(),
+            "0x0000000000000000000000000000000000000099".to_string(),
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let error = build_manual_reconcile_report(
+            &config_path,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not match the address"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn manual_reconcile_report_dry_runs_the_commit_before_reporting_ready() {
+        // Codex P2 follow-up, pairtrade#241: manual_reconciled_runtime_fill_for_attempt
+        // only derives quantities and checks ledger/balance deltas; it does
+        // not run apply_confirmed_live_fill_once's own checks (regime/
+        // trigger consistency, in this case). A mean_reversion_exit plan
+        // against a checkpoint that is still Neutral (no open rotated
+        // position) would compute a fine-looking fill here but fail at
+        // apply's real commit step -- the report must catch that and say
+        // would_fail, not ready.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("mean_reversion_exit");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+        // persist_repair_report_ledger_state always persists a fresh,
+        // Neutral-regime checkpoint -- inconsistent with a
+        // mean_reversion_exit plan, which requires an already-rotated
+        // regime with tracked open quantity.
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_manual_reconcile_report(
+            &config_path,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap();
+        assert_eq!(report["status"], "would_fail", "{report}");
+        assert!(report["detail"]
+            .as_str()
+            .unwrap()
+            .contains("inconsistent with the current runtime checkpoint"));
     }
 
     #[test]
