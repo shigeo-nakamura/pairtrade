@@ -291,10 +291,12 @@ try:
         marker_dir = Path(sys.argv[3])
         connection.execute(
             """DELETE FROM data_gap
-               WHERE ts_end_us IS NULL AND channel = 'connection'
+               WHERE ts_end_us IS NULL
+                 AND channel IN ('connection', 'order_book')
                  AND gap_id NOT IN (
                    SELECT MIN(gap_id) FROM data_gap
-                   WHERE ts_end_us IS NULL AND channel = 'connection'
+                   WHERE ts_end_us IS NULL
+                     AND channel IN ('connection', 'order_book')
                    GROUP BY venue, market_id, channel
                  )"""
         )

@@ -1783,7 +1783,10 @@ class DatabaseSink:
                     (payload["venue"], payload["market_id"])
                 ] = int(payload["recv_us"])
                 continue
-            if kind == "gap" and payload.get("channel") == "connection":
+            if kind == "gap" and payload.get("channel") in {
+                "connection",
+                "order_book",
+            }:
                 prior_gap_close_us = ordered_gap_close_us.get(
                     (payload["venue"], payload["market_id"])
                 )
@@ -2521,20 +2524,18 @@ class DatabaseSink:
                         payload.get("observed_sequence"), payload["reason"],
                     ),
                 )
-            if (
-                payload["channel"] == "connection"
-                and payload.get("prior_gap_close_us") is not None
-            ):
+            if payload.get("prior_gap_close_us") is not None:
                 connection.execute(
                     """UPDATE data_gap
                        SET ts_end_us = MAX(ts_start_us, ?)
                        WHERE ts_end_us IS NULL AND venue = ?
-                         AND market_id = ? AND channel = 'connection'
+                         AND market_id = ? AND channel = ?
                          AND ts_start_us <= ?""",
                     (
                         payload["prior_gap_close_us"],
                         payload["venue"],
                         payload["market_id"],
+                        payload["channel"],
                         payload["prior_gap_close_us"],
                     ),
                 )

@@ -1031,6 +1031,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             started_us += 1_000_000
             retried_us = started_us + 1_000_000
             recovered_us = retried_us + 1_000_000
+            failed_again_us = recovered_us + 1_000_000
             sink = engine_b.DatabaseSink(
                 config, "book-gap-run", "book-gap-commit"
             )
@@ -1059,11 +1060,11 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
-            with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
+            with mock.patch.object(engine_b, "now_us", return_value=retried_us):
+                sink._write_batch([gap(started_us), gap(retried_us)])
+            with mock.patch.object(engine_b, "now_us", return_value=failed_again_us):
                 sink._write_batch(
                     [
-                        gap(started_us),
-                        gap(retried_us),
                         (
                             "gap_close",
                             {
@@ -1072,6 +1073,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                                 "market_id": 37,
                             },
                         ),
+                        gap(failed_again_us),
                     ]
                 )
             await sink.close()
@@ -1082,10 +1084,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             try:
                 self.assertEqual(
                     database.execute(
-                        """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
-                           FROM data_gap WHERE channel = 'order_book'"""
-                    ).fetchone(),
-                    (1, started_us, recovered_us),
+                        """SELECT ts_start_us, ts_end_us FROM data_gap
+                           WHERE channel = 'order_book' ORDER BY gap_id"""
+                    ).fetchall(),
+                    [
+                        (started_us, recovered_us),
+                        (failed_again_us, None),
+                    ],
                 )
             finally:
                 database.close()

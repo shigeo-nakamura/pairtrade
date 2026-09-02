@@ -94,6 +94,18 @@ connection.execute(
     (946_684_860_000_000,),
 )
 connection.execute(
+    """INSERT INTO data_gap(
+         venue, market_id, symbol, channel, ts_start_us, reason
+       ) VALUES ('robinhood', 37, 'SKHY', 'order_book', ?, 'book_outage')""",
+    (946_684_920_000_000,),
+)
+connection.execute(
+    """INSERT INTO data_gap(
+         venue, market_id, symbol, channel, ts_start_us, reason
+       ) VALUES ('robinhood', 37, 'SKHY', 'order_book', ?, 'book_retry_outage')""",
+    (946_684_980_000_000,),
+)
+connection.execute(
     """INSERT INTO trade(
          connection_session_id, venue, market_id, exchange_trade_id,
          exchange_sequence, local_sequence, ts_recv_us, ts_srv_us,
@@ -267,6 +279,9 @@ try:
     assert connection.execute(
         "SELECT COUNT(*) FROM data_gap WHERE channel = 'connection'"
     ).fetchone() == (1,)
+    assert connection.execute(
+        "SELECT COUNT(*) FROM data_gap WHERE channel = 'order_book'"
+    ).fetchone() == (1,)
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 finally:
     connection.close()
@@ -295,6 +310,16 @@ assert marker["continuation_id"] == "partition:20000101_00:1"
 assert marker["start_us"] == 946_688_400_000_000
 assert marker["source_partition"] == "20000101_00"
 assert marker["source_gap_id"] == 1
+PY
+book_continuation_marker="$ROOT/gap-continuations/20000101_00-3.json"
+test -f "$book_continuation_marker"
+python3 - "$book_continuation_marker" <<'PY'
+import json
+import sys
+marker = json.load(open(sys.argv[1]))
+assert marker["continuation_id"] == "partition:20000101_00:3"
+assert marker["channel"] == "order_book"
+assert marker["source_gap_id"] == 3
 PY
 session_marker=$(find "$ROOT/session-continuations" -type f -name '*.json')
 test -n "$session_marker"
