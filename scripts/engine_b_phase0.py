@@ -1857,12 +1857,102 @@ class DatabaseSink:
                 finally:
                     connection.close()
 
+    def _journal_stale_open_gaps(self, recovered_us: int) -> None:
+        current_partition = partition_for_us(recovered_us)
+        for database_path in sorted(
+            self.config.database_dir.glob("engine_b_phase0_*.sqlite3")
+        ):
+            partition = database_path.stem.removeprefix("engine_b_phase0_")
+            try:
+                if (
+                    partition_for_us(partition_start_us(partition)) != partition
+                    or partition >= current_partition
+                    or self._is_partition_sealed(partition)
+                ):
+                    continue
+            except ValueError:
+                continue
+            with self._partition_lock(partition):
+                if self._is_partition_sealed(partition) or not database_path.is_file():
+                    continue
+                connection = self._connections.get(partition)
+                borrowed = connection is not None
+                if connection is None:
+                    try:
+                        connection = sqlite3.connect(
+                            f"file:{database_path}?mode=rw", uri=True, timeout=5
+                        )
+                    except sqlite3.OperationalError as exc:
+                        if not database_path.exists():
+                            continue
+                        raise RuntimeError(
+                            f"stale data-gap database is unreadable: {database_path}"
+                        ) from exc
+                try:
+                    table = connection.execute(
+                        """SELECT 1 FROM sqlite_master
+                           WHERE type = 'table' AND name = 'data_gap'"""
+                    ).fetchone()
+                    if table is None:
+                        continue
+                    rows = connection.execute(
+                        """SELECT gap_id, venue, market_id, symbol, channel,
+                                  expected_sequence, observed_sequence, reason
+                           FROM data_gap WHERE ts_end_us IS NULL
+                           ORDER BY gap_id"""
+                    ).fetchall()
+                    if not rows:
+                        continue
+                    boundary_us = partition_start_us(partition) + 3_600_000_000
+                    for (
+                        gap_id,
+                        venue,
+                        market_id,
+                        symbol,
+                        channel,
+                        expected,
+                        observed,
+                        reason,
+                    ) in rows:
+                        self._persist_gap_continuation_marker(
+                            {
+                                "continuation_id": f"partition:{partition}:{gap_id}",
+                                "start_us": boundary_us,
+                                "venue": venue,
+                                "market_id": market_id,
+                                "symbol": symbol,
+                                "channel": channel,
+                                "expected_sequence": expected,
+                                "observed_sequence": observed,
+                                "reason": reason,
+                                "source_partition": partition,
+                                "source_gap_id": gap_id,
+                            }
+                        )
+                    connection.execute("BEGIN")
+                    connection.executemany(
+                        """UPDATE data_gap SET ts_end_us = MAX(ts_start_us, ?)
+                           WHERE gap_id = ? AND ts_end_us IS NULL""",
+                        ((boundary_us, row[0]) for row in rows),
+                    )
+                    connection.commit()
+                except sqlite3.DatabaseError as exc:
+                    connection.rollback()
+                    raise RuntimeError(
+                        f"stale data-gap database is unreadable: {database_path}"
+                    ) from exc
+                finally:
+                    if not borrowed:
+                        connection.close()
+
     def _write_batch(self, batch: list[tuple[str, dict[str, Any]]]) -> None:
         grouped: defaultdict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
         gap_closes: list[dict[str, Any]] = []
         recovered_session_markers = self._load_session_continuations()
         if self._startup_recovery_pending:
-            self._recover_orphaned_sessions(now_us())
+            recovered_us = now_us()
+            self._recover_orphaned_sessions(recovered_us)
+            self._journal_stale_open_gaps(recovered_us)
             self._startup_recovery_pending = False
             recovered_session_markers.extend(
                 self._load_session_continuations(
@@ -2226,13 +2316,13 @@ class DatabaseSink:
                     destination_partition,
                     archived,
                 )
-                if not archived:
-                    interval = {
-                        "sealed_partition": destination_partition,
-                        "start_us": start_us,
-                        "end_us": destination_end_us,
-                    }
-                    if preserve_open:
+                interval = {
+                    "sealed_partition": destination_partition,
+                    "start_us": start_us,
+                    "end_us": destination_end_us,
+                }
+                if preserve_open:
+                    if not archived:
                         interval_id = "sealed-session-missing:" + hashlib.sha256(
                             (
                                 f"{marker['continuation_id']}:"
@@ -2242,8 +2332,8 @@ class DatabaseSink:
                         sealed_intervals.append(
                             {"interval_id": interval_id, **interval}
                         )
-                    else:
-                        sealed_restart_gap_intervals.append(interval)
+                else:
+                    sealed_restart_gap_intervals.append(interval)
                 start_us = destination_end_us
                 destination_partition = partition_for_us(start_us)
             connection_meta["started_us"] = start_us

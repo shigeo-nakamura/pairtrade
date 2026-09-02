@@ -1883,6 +1883,9 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 list(recovered_sink.session_continuation_dir.glob("*.json")), []
             )
+            self.assertEqual(
+                list(recovered_sink.gap_continuation_dir.glob("*.json")), []
+            )
             await recovered_sink.close()
 
             first_db = sqlite3.connect(
@@ -2179,13 +2182,15 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
         with tempfile.TemporaryDirectory() as directory:
             database_dir = Path(directory) / "data"
             object.__setattr__(config, "database_dir", database_dir)
             hour_start_us = 1_700_000_000_000_000
             hour_start_us -= hour_start_us % 3_600_000_000
             next_hour_us = hour_start_us + 3_600_000_000
-            recovered_us = next_hour_us + 300_000_000
+            second_hour_us = next_hour_us + 3_600_000_000
+            recovered_us = second_hour_us + 300_000_000
             connection_started_us = hour_start_us + 3_000_000_000
             first_partition = engine_b.partition_for_us(hour_start_us)
             connection_meta = {
@@ -2228,9 +2233,24 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 config, "orphan-recovery-run", "orphan-recovery-commit"
             )
             with mock.patch.object(engine_b, "now_us", return_value=recovered_us):
-                recovered_sink._write_batch([])
+                recovered_sink._write_batch(
+                    [
+                        (
+                            "gap_close",
+                            {
+                                "recv_us": recovered_us,
+                                "venue": venue.name,
+                                "market_id": market.market_id,
+                            },
+                        )
+                        for market in venue.markets
+                    ]
+                )
             self.assertEqual(
                 list(recovered_sink.session_continuation_dir.glob("*.json")), []
+            )
+            self.assertEqual(
+                list(recovered_sink.gap_continuation_dir.glob("*.json")), []
             )
             await recovered_sink.close()
 
@@ -2254,10 +2274,32 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                         """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
                            FROM data_gap WHERE channel = 'connection'"""
                     ).fetchone(),
-                    (len(config.venues[0].markets), connection_started_us, None),
+                    (len(venue.markets), connection_started_us, next_hour_us),
                 )
             finally:
                 first_db.close()
+
+            for start_us, end_us in (
+                (next_hour_us, second_hour_us),
+                (second_hour_us, recovered_us),
+            ):
+                database = sqlite3.connect(
+                    database_dir
+                    / (
+                        "engine_b_phase0_"
+                        f"{engine_b.partition_for_us(start_us)}.sqlite3"
+                    )
+                )
+                try:
+                    self.assertEqual(
+                        database.execute(
+                            """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
+                               FROM data_gap WHERE channel = 'connection'"""
+                        ).fetchone(),
+                        (len(venue.markets), start_us, end_us),
+                    )
+                finally:
+                    database.close()
 
     async def test_crash_gap_runs_from_last_activity_to_replacement_snapshot(
         self,
@@ -2408,6 +2450,15 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                      ended_ts_recv_us INTEGER,
                      end_reason TEXT
                    ) WITHOUT ROWID"""
+            )
+            sealed_index.execute(
+                "INSERT INTO archived_connection_session VALUES (?, ?, ?, ?)",
+                (
+                    "sealed-session",
+                    sealed_start_us,
+                    sealed_end_us,
+                    "partition_rotation",
+                ),
             )
             sealed_index.execute(
                 "INSERT INTO sealed_metadata VALUES (?, ?)",
