@@ -56,7 +56,8 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
     continue
   fi
   set +e
-  "$PYTHON_BIN" - "$db" <<'PY'
+  "$PYTHON_BIN" - "$db" "$partition" <<'PY'
+from datetime import datetime, timedelta, timezone
 import sqlite3
 import sys
 
@@ -73,6 +74,20 @@ try:
     }
     if "ohlcv_1m" in tables:
         connection.execute("UPDATE ohlcv_1m SET is_complete = 1 WHERE is_complete = 0")
+    if "ws_connection" in tables:
+        partition_end = (
+            datetime.strptime(sys.argv[2], "%Y%m%d_%H").replace(tzinfo=timezone.utc)
+            + timedelta(hours=1)
+        )
+        partition_end_us = int(partition_end.timestamp() * 1_000_000)
+        connection.execute(
+            """UPDATE ws_connection
+               SET ended_ts_recv_us = MAX(started_ts_recv_us, ?),
+                   end_reason = 'partition_rotation'
+               WHERE ended_ts_recv_us IS NULL""",
+            (partition_end_us,),
+        )
+    if "ohlcv_1m" in tables or "ws_connection" in tables:
         connection.commit()
     mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
     if mode.lower() != "delete":

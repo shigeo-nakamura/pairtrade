@@ -31,6 +31,13 @@ connection.execute("PRAGMA journal_mode=WAL")
 connection.execute("CREATE TABLE sample(value TEXT NOT NULL)")
 connection.execute("CREATE TABLE ohlcv_1m(is_complete INTEGER NOT NULL)")
 connection.execute(
+    """CREATE TABLE ws_connection(
+         started_ts_recv_us INTEGER NOT NULL,
+         ended_ts_recv_us INTEGER,
+         end_reason TEXT
+       )"""
+)
+connection.execute(
     """CREATE TABLE trade(
          trade_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
          connection_session_id TEXT NOT NULL,
@@ -46,6 +53,10 @@ connection.execute(
 )
 connection.execute("INSERT INTO sample VALUES ('recovered-from-wal')")
 connection.execute("INSERT INTO ohlcv_1m VALUES (0)")
+connection.execute(
+    "INSERT INTO ws_connection VALUES (?, NULL, NULL)",
+    (946_684_800_000_000,),
+)
 connection.execute(
     """INSERT INTO trade(
          connection_session_id, venue, market_id, exchange_trade_id,
@@ -198,11 +209,22 @@ gzip -dc "$archive" > "$restored_db"
 python3 - "$restored_db" <<'PY'
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 
 connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 try:
     assert connection.execute("SELECT value FROM sample").fetchone() == ("recovered-from-wal",)
     assert connection.execute("SELECT is_complete FROM ohlcv_1m").fetchone() == (1,)
+    partition_end = (
+        datetime.strptime("20000101_00", "%Y%m%d_%H").replace(tzinfo=timezone.utc)
+        + timedelta(hours=1)
+    )
+    assert connection.execute(
+        "SELECT ended_ts_recv_us, end_reason FROM ws_connection"
+    ).fetchone() == (
+        int(partition_end.timestamp() * 1_000_000),
+        "partition_rotation",
+    )
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 finally:
     connection.close()

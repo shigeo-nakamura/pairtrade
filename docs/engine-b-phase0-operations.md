@@ -52,7 +52,9 @@ partitions end their open segments at the hour boundary with
 `end_reason=partition_rotation`; the active partition records the real close
 time and reason. Every partition for one collector process preserves the same
 `collector_manifest.started_ts_us`, so database rotation is not mistaken for a
-collector restart.
+collector restart. The archiver applies the same partition-boundary closure
+under the shared lock before upload, covering a completely quiet feed that
+produces no collector batch after the hour changes.
 
 Local deletion is disabled by default through
 `ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false`; the active hour is never an
