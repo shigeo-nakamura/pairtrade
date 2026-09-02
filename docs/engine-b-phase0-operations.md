@@ -86,7 +86,10 @@ update. A delivery-independent replay alias is also stored as a multiset in
 each live database and seal sidecar: reconnect snapshots consume the existing
 alias count before inserting, so update-to-snapshot replays deduplicate without
 collapsing distinct nonce-scoped updates. Any trade message missing an exchange
-timestamp is rejected before any row is emitted. When an older
+timestamp is rejected before any row is emitted. Trade price and size must also
+both be strictly positive; one invalid element
+rejects the entire received trade message before any of its rows are queued.
+When an older
 partition contains NULL IDs or obsolete synthetic IDs, the index builder
 reconstructs the current identity and replay alias from stored ordering.
 For a pre-v7 seal sidecar without replay aliases, primary IDs remain usable;
@@ -211,7 +214,8 @@ handoffs carry a missing sealed-hour segment into the next retained database as
 `sealed_gap_interval` so crash downtime cannot look connected.
 `ws_connection` starts only after the WebSocket handshake succeeds. DNS,
 TCP/TLS, and handshake failures contribute connection-gap evidence but never
-create a physical session row or inflate session duration.
+create a physical session row or inflate session duration. Their gap starts at
+the connection-attempt timestamp, not after the handshake timeout returns.
 Repeated connection failures before a successful replacement snapshot share
 one open `connection` gap per venue/market, preventing retry backoff from
 counting the same outage more than once.

@@ -266,9 +266,18 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *args: object) -> None:
                 return None
 
-        with mock.patch.dict(
-            sys.modules,
-            self.websocket_modules(lambda *args, **kwargs: FailedHandshake()),
+        attempt_started_us = 1_774_884_082_400_000
+        ended_us = attempt_started_us + 20_000_000
+        with (
+            mock.patch.dict(
+                sys.modules,
+                self.websocket_modules(lambda *args, **kwargs: FailedHandshake()),
+            ),
+            mock.patch.object(
+                engine_b,
+                "now_us",
+                side_effect=(attempt_started_us, ended_us),
+            ),
         ):
             await collector.feed_loop(venue)
 
@@ -276,6 +285,15 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("connection_start", kinds)
         self.assertNotIn("connection_end", kinds)
         self.assertEqual(kinds.count("gap"), len(venue.markets))
+        gaps = [payload for kind, payload in sink.commands if kind == "gap"]
+        self.assertTrue(
+            all(
+                gap["start_us"] == attempt_started_us
+                and gap["recv_us"] == ended_us
+                and gap["partition_us"] == attempt_started_us
+                for gap in gaps
+            )
+        )
 
     async def test_session_start_is_timestamped_after_handshake(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
@@ -302,18 +320,20 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         context = ConnectedWebSocket()
-        timestamps = iter((1_774_884_082_400_000, 1_774_884_082_500_000))
-
-        def connected_clock() -> int:
-            self.assertTrue(context.entered)
-            return next(timestamps)
+        timestamps = iter(
+            (
+                1_774_884_082_300_000,
+                1_774_884_082_400_000,
+                1_774_884_082_500_000,
+            )
+        )
 
         with (
             mock.patch.dict(
                 sys.modules,
                 self.websocket_modules(lambda *args, **kwargs: context),
             ),
-            mock.patch.object(engine_b, "now_us", side_effect=connected_clock),
+            mock.patch.object(engine_b, "now_us", side_effect=lambda: next(timestamps)),
         ):
             await collector.feed_loop(venue)
 
@@ -354,6 +374,7 @@ class FeedLoopTests(unittest.IsolatedAsyncioTestCase):
 
         timestamps = iter(
             (
+                1_774_884_082_300_000,
                 1_774_884_082_400_000,
                 1_774_884_082_500_000,
                 1_774_884_082_600_000,
@@ -681,6 +702,45 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                                     "price": "101",
                                     "size": "2",
                                 }
+                            ],
+                        },
+                        recv_us,
+                    )
+                self.assertEqual(sink.commands, [])
+
+    async def test_non_positive_trade_values_fail_closed_before_enqueue(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        recv_us = 1_774_884_082_400_000
+        for invalid_trade in (
+            {"trade_id": "zero-price", "price": "0", "size": "2"},
+            {"trade_id": "negative-size", "price": "101", "size": "-1"},
+        ):
+            with self.subTest(trade_id=invalid_trade["trade_id"]):
+                sink = RecordingSink()
+                collector = engine_b.Collector(config, sink, engine_b.Metrics())
+                connection = {
+                    "id": f"invalid-{invalid_trade['trade_id']}",
+                    "venue": venue.name,
+                    "started_us": recv_us,
+                    "api_schema_version": config.api_schema_version,
+                }
+                valid_trade = {
+                    "trade_id": "valid-before-invalid",
+                    "timestamp": recv_us,
+                    "price": "101",
+                    "size": "2",
+                }
+                with self.assertRaisesRegex(RuntimeError, "non-positive"):
+                    await collector.handle_trades(
+                        venue,
+                        connection,
+                        {
+                            "type": "subscribed/trade",
+                            "channel": "trade/37",
+                            "trades": [
+                                valid_trade,
+                                {**invalid_trade, "timestamp": recv_us},
                             ],
                         },
                         recv_us,

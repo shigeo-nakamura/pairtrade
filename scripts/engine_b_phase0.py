@@ -3064,6 +3064,7 @@ class Collector:
 
         backoff = 1
         while not self.stop_event.is_set():
+            attempt_started_us = now_us()
             connection = {
                 "id": str(uuid.uuid4()),
                 "venue": venue.name,
@@ -3145,6 +3146,12 @@ class Collector:
                         "gap",
                         {
                             "recv_us": ended_us,
+                            "start_us": (
+                                ended_us if connected else attempt_started_us
+                            ),
+                            "partition_us": (
+                                ended_us if connected else attempt_started_us
+                            ),
                             "connection_id": connection["id"],
                             "venue": venue.name,
                             "market_id": market.market_id,
@@ -3313,13 +3320,18 @@ class Collector:
             validate_trade_timestamp_us(srv_us, recv_us)
         if any(srv_us is None for _, srv_us in normalized_trades):
             raise RuntimeError("refusing trade message without exchange timestamp")
+        parsed_trades: list[tuple[dict[str, Any], int | None, str, str]] = []
+        for trade, srv_us in normalized_trades:
+            price_text = canonical_decimal(trade["price"])
+            size_text = canonical_decimal(trade["size"])
+            if Decimal(price_text) <= 0 or Decimal(size_text) <= 0:
+                raise RuntimeError("refusing trade with non-positive price or size")
+            parsed_trades.append((trade, srv_us, price_text, size_text))
         message_scope = trade_message_scope(
             message_type, exchange_sequence, recv_us
         )
         stable_occurrences: defaultdict[tuple[int, str], int] = defaultdict(int)
-        for trade, srv_us in normalized_trades:
-            price_text = canonical_decimal(trade["price"])
-            size_text = canonical_decimal(trade["size"])
+        for trade, srv_us, price_text, size_text in parsed_trades:
             event_ts_us = srv_us or recv_us
             bucket_start_us = event_ts_us - event_ts_us % 60_000_000
             is_maker_ask = trade.get("is_maker_ask")
