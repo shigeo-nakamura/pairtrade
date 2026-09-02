@@ -756,6 +756,35 @@ fn manual_reconcile_report(
     expected_sell_amount_raw: &str,
     expected_buy_amount_raw: &str,
 ) -> Result<()> {
+    // manual-reconcile-apply always checks CONFIG_YAML against
+    // auto_execute_policy.json before doing anything else (Codex P1
+    // follow-up, pairtrade#241) -- check it here too, first, so this
+    // report never claims "ready" (or any other status implying apply
+    // would proceed) for a CONFIG_YAML apply would actually refuse
+    // outright (Codex P2 follow-up, same PR). Kept out of
+    // build_manual_reconcile_report itself (which stays fully
+    // tempdir-testable) because the fixed administrator-owned policy path
+    // this reads cannot be redirected in a test the way every other input
+    // here can.
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+    if let Err(error) = auto_execute_policy_from_admin_file()
+        .and_then(|policy| require_config_within_auto_execute_policy(&config, &policy))
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "policy_rejected",
+                "detail": format!(
+                    "manual-reconcile-apply would refuse this CONFIG_YAML before doing anything \
+                     else (auto_execute_policy.json check): {error:#}"
+                ),
+            }))
+            .context("failed to serialize Arcus manual-reconcile report")?
+        );
+        return Ok(());
+    }
+
     let report = build_manual_reconcile_report(
         config_path,
         events_jsonl_path,
@@ -778,6 +807,14 @@ fn manual_reconcile_report(
 /// already reached `Reconciled` -- runs the exact pure computation
 /// `manual-reconcile-apply` would commit, without writing anything. Never
 /// polls chain status and never touches the runtime checkpoint or ledger.
+///
+/// Assumes the `auto_execute_policy.json` check has already passed --
+/// `manual_reconcile_report` (the CLI wrapper) checks that first and
+/// short-circuits before ever calling this, so every status this function
+/// can return is one `manual-reconcile-apply` would actually reach. Split
+/// out so this function stays testable against a tempdir config/ledger the
+/// way `build_repair_report` is; the policy check's fixed,
+/// administrator-owned path cannot be redirected in a test.
 fn build_manual_reconcile_report(
     config_path: &Path,
     events_jsonl_path: &Path,
