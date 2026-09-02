@@ -907,15 +907,34 @@ fn build_manual_reconcile_report(
         }
     };
     // manual_reconciled_runtime_fill_for_attempt only derives quantities and
-    // checks ledger/balance deltas -- it does not run the further checks
-    // apply_confirmed_live_fill_once itself enforces at commit time (exact
+    // checks ledger/balance deltas -- it does not run
+    // apply_confirmed_live_fill_once's own further checks (exact
     // sell-quantity equality against the candidate plan, fill-predates-quote
     // ordering, regime/trigger consistency, open-quantity for an exit,
     // inventory floors). Run the real commit function here too, against a
     // throwaway clone of the actual runtime checkpoint that is never
     // persisted, so "ready" means apply's commit step would actually
-    // succeed, not just that a fill could be computed (Codex P2 follow-up,
-    // pairtrade#241).
+    // succeed, not just that a fill could be computed.
+    //
+    // Deliberately the *only* call dry-run here, exactly matching what
+    // finalize_manual_reconciled_attempt itself calls for real. An earlier
+    // round of this fix also pre-checked validate_plan_consistent_with_state,
+    // which is wrong: that function's risk-halt guard exists to block a
+    // *new* EntrySignal dispatch while a halt is engaged, but this attempt
+    // already executed on-chain -- a halt engaged afterward (while the
+    // checkpoint still shows Neutral because the fill was never committed)
+    // must not block reconciling it, and finalize_manual_reconciled_attempt
+    // never checked for that halt either. apply_confirmed_live_fill_once
+    // already enforces every check that legitimately applies to a commit
+    // (regime/trigger consistency and open-quantity-for-an-exit included)
+    // on its own, and separately short-circuits safely to Ok(false) without
+    // any further validation when last_live_execution_idempotency_key
+    // already equals this fill's key -- the crashed-invocation recovery
+    // case a prior round of this fix needed its own extra check for is
+    // handled by that short-circuit alone now (Codex P2 follow-up,
+    // pairtrade#241, correcting the over-restrictive check added in an
+    // earlier round).
+    //
     // load_existing, not load_or_create: this attempt was dispatched
     // against a checkpoint that must already exist. Silently constructing
     // a fresh one from initial_inventory on a missing/lost checkpoint file
@@ -927,49 +946,22 @@ fn build_manual_reconcile_report(
     let mut dry_run_runtime =
         ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
             .load_existing(&config.runtime)?;
-    // apply_confirmed_live_fill_once short-circuits to Ok(false) without
-    // any further validation when last_live_execution_idempotency_key
-    // already equals this fill's key (a prior invocation crashed after
-    // committing the runtime fill but before archiving the ledger
-    // attempt -- a safe, already-applied no-op apply's real commit step
-    // handles). Only run the consistency/commit dry-run when that is not
-    // the case; running it unconditionally would incorrectly reject that
-    // recovery case, since the checkpoint's regime has already moved on
-    // from what the plan describes (Codex P2 follow-up, pairtrade#241).
-    let already_committed = dry_run_runtime
-        .state()
-        .last_live_execution_idempotency_key
-        .as_deref()
-        == Some(fill.idempotency_key.as_str());
-    if !already_committed {
-        if let Err(error) = dry_run_runtime.validate_plan_consistent_with_state(&plan) {
-            return Ok(serde_json::json!({
-                "status": "would_fail",
-                "active_attempt": active_summary,
-                "candidate_plan": plan,
-                "detail": format!(
-                    "manual-reconcile-apply would refuse this: plan is inconsistent with the \
-                     current runtime checkpoint: {error}"
-                ),
-            }));
-        }
-        if let Err(error) = dry_run_runtime.apply_confirmed_live_fill_once(
-            &plan,
-            fill.actual_sell_quantity,
-            fill.actual_buy_quantity,
-            fill.reconciled_at,
-            &fill.idempotency_key,
-        ) {
-            return Ok(serde_json::json!({
-                "status": "would_fail",
-                "active_attempt": active_summary,
-                "candidate_plan": plan,
-                "detail": format!(
-                    "manual-reconcile-apply would refuse this: failed to commit the reconciled \
-                     fill to runtime state: {error}"
-                ),
-            }));
-        }
+    if let Err(error) = dry_run_runtime.apply_confirmed_live_fill_once(
+        &plan,
+        fill.actual_sell_quantity,
+        fill.actual_buy_quantity,
+        fill.reconciled_at,
+        &fill.idempotency_key,
+    ) {
+        return Ok(serde_json::json!({
+            "status": "would_fail",
+            "active_attempt": active_summary,
+            "candidate_plan": plan,
+            "detail": format!(
+                "manual-reconcile-apply would refuse this: failed to commit the reconciled fill \
+                 to runtime state: {error}"
+            ),
+        }));
     }
     // dry_run_runtime committed cleanly above (or was already committed by
     // an earlier crashed invocation) and is discarded here without ever
@@ -8108,7 +8100,7 @@ runtime:
         assert!(report["detail"]
             .as_str()
             .unwrap()
-            .contains("inconsistent with the current runtime checkpoint"));
+            .contains("failed to commit the reconciled fill"));
     }
 
     #[test]
