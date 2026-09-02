@@ -477,6 +477,42 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(sink.commands, [])
 
+    async def test_out_of_range_exchange_timestamp_fails_closed(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "robinhood")
+        recv_us = 1_774_884_082_400_000
+        for timestamp in (1_774_884_082, 10**30):
+            with self.subTest(timestamp=timestamp):
+                sink = RecordingSink()
+                collector = engine_b.Collector(config, sink, engine_b.Metrics())
+                connection = {
+                    "id": f"out-of-range-{timestamp}",
+                    "venue": venue.name,
+                    "started_us": recv_us,
+                    "api_schema_version": config.api_schema_version,
+                }
+                with self.assertRaisesRegex(
+                    RuntimeError, "out-of-range exchange timestamp"
+                ):
+                    await collector.handle_trades(
+                        venue,
+                        connection,
+                        {
+                            "type": "subscribed/trade",
+                            "channel": "trade/37",
+                            "trades": [
+                                {
+                                    "trade_id": "invalid-time",
+                                    "timestamp": timestamp,
+                                    "price": "101",
+                                    "size": "2",
+                                }
+                            ],
+                        },
+                        recv_us,
+                    )
+                self.assertEqual(sink.commands, [])
+
     async def test_sealed_same_batch_update_snapshot_uses_pending_alias(
         self,
     ) -> None:

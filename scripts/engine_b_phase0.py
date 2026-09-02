@@ -42,6 +42,8 @@ UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
 SCHEMA_VERSION = 8
+MAX_TRADE_EVENT_AGE_US = 7 * 24 * 60 * 60 * 1_000_000
+MAX_TRADE_EVENT_FUTURE_US = 5 * 60 * 1_000_000
 OHLCV_FINALIZE_GRACE_US = 120_000_000
 
 
@@ -352,6 +354,20 @@ def normalize_exchange_timestamp_us(value: Any) -> int | None:
     if raw < 100_000_000_000_000:
         return raw * 1_000
     return raw
+
+
+def validate_trade_timestamp_us(timestamp_us: int | None, recv_us: int) -> None:
+    if timestamp_us is None:
+        return
+    if not (
+        recv_us - MAX_TRADE_EVENT_AGE_US
+        <= timestamp_us
+        <= recv_us + MAX_TRADE_EVENT_FUTURE_US
+    ):
+        raise RuntimeError(
+            "refusing trade with out-of-range exchange timestamp "
+            f"timestamp_us={timestamp_us} recv_us={recv_us}"
+        )
 
 
 def canonical_decimal(value: Any) -> str:
@@ -2912,6 +2928,8 @@ class Collector:
             )
             for trade in trades
         ]
+        for _, srv_us in normalized_trades:
+            validate_trade_timestamp_us(srv_us, recv_us)
         if message_type == "subscribed/trade" and any(
             srv_us is None for _, srv_us in normalized_trades
         ):
