@@ -14,14 +14,16 @@ use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(test)]
 use debot::arcus_spot::event_record;
 use debot::arcus_spot::{
-    build_arcus_spot_kms_signer, is_supported_live_route, verify_record, ArcusSpotChainClient,
-    ArcusSpotChainConfig, ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt,
-    ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase,
-    ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner, ArcusSpotLiveExecutor,
-    ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventRecord,
-    ArcusSpotLiveTickEventStream, ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan,
-    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
-    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    build_arcus_spot_kms_signer, is_supported_live_route,
+    manual_reconciled_runtime_fill_for_attempt, verify_archive_events, verify_record,
+    ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision, ArcusSpotDirection,
+    ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore,
+    ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner,
+    ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventPublisher,
+    ArcusSpotLiveTickEventRecord, ArcusSpotLiveTickEventStream, ArcusSpotRegime,
+    ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntime,
+    ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent,
+    ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
 use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
@@ -618,6 +620,582 @@ fn build_repair_report(config_path: &Path, events_jsonl_path: &Path) -> Result<s
         }),
     };
     Ok(report)
+}
+
+#[derive(Serialize)]
+struct ManualReconcileCandidate {
+    sequence: u64,
+    observed_at: DateTime<Utc>,
+    plan: ArcusSpotRotationPlan,
+}
+
+/// Coarse-match `WouldRotate` events for `manual-reconcile-*`
+/// (bot-strategy#869), identically to `build_repair_report`'s own scan but
+/// without computing or requiring a `plan_config_digest` match --
+/// `manual-reconcile-*` exists precisely because that digest cannot be
+/// reproduced for this incident class. Deliberately not shared code with
+/// `build_repair_report`: the two paths must stay independently reviewable,
+/// and neither should change behavior as a side effect of editing the
+/// other.
+fn scan_manual_reconcile_candidates(
+    active: &ArcusSpotExecutionAttempt,
+    events_jsonl_path: &Path,
+) -> Result<Vec<ManualReconcileCandidate>> {
+    let events_bytes = fs::read(events_jsonl_path).with_context(|| {
+        format!(
+            "failed to read Arcus event export {}",
+            events_jsonl_path.display()
+        )
+    })?;
+    if events_bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Unlike repair-report's per-line verify_record scan, this must prove
+    // the whole file is an unbroken, genuine slice of the real event
+    // stream, not just that each line's own hashes are self-consistent:
+    // there is no plan_config_digest downstream here to catch a spliced or
+    // partially-forged file the way repair-report's digest match would
+    // (Codex P2 follow-up, pairtrade#241). verify_archive_events requires a
+    // continuous hash chain and a monotonic, gap-free sequence across every
+    // record in the file, exactly like the on-host event stream's own
+    // segment verification.
+    let events = verify_archive_events(events_jsonl_path, &events_bytes).with_context(|| {
+        format!(
+            "{} failed archive verification",
+            events_jsonl_path.display()
+        )
+    })?;
+    let mut candidates = Vec::new();
+    for event in events {
+        let ArcusSpotDecision::WouldRotate { plan } = event.decision else {
+            continue;
+        };
+        if !plan.venue.eq_ignore_ascii_case(&active.intent.venue)
+            || !plan
+                .sell_symbol
+                .eq_ignore_ascii_case(&active.intent.sell_symbol)
+            || !plan
+                .buy_symbol
+                .eq_ignore_ascii_case(&active.intent.buy_symbol)
+            || plan.sell_amount_raw != active.intent.sell_amount_raw
+        {
+            continue;
+        }
+        candidates.push(ManualReconcileCandidate {
+            sequence: event.sequence,
+            observed_at: event.observed_at,
+            plan,
+        });
+    }
+    Ok(candidates)
+}
+
+/// `plan.direction`'s only other cross-check (`validate_plan`, at ordinary
+/// dispatch time) never runs for a plan recovered from the archive after
+/// the fact -- this is the manual-reconcile-only equivalent, re-derived
+/// here rather than exposed from the library, so a hand-typed or
+/// mis-scanned candidate whose direction is inconsistent with the
+/// configured pair is rejected before it can flip the runtime regime the
+/// wrong way.
+fn require_plan_direction_matches_configured_pair(
+    plan: &ArcusSpotRotationPlan,
+    config: &ArcusSpotExecuteOnceConfig,
+) -> Result<()> {
+    let pair = &config.runtime.pair;
+    let (expected_sell, expected_buy) = match plan.direction {
+        ArcusSpotDirection::TokenAToTokenB => (pair.sell_symbol.as_str(), pair.buy_symbol.as_str()),
+        ArcusSpotDirection::TokenBToTokenA => (pair.buy_symbol.as_str(), pair.sell_symbol.as_str()),
+    };
+    if !plan.sell_symbol.eq_ignore_ascii_case(expected_sell)
+        || !plan.buy_symbol.eq_ignore_ascii_case(expected_buy)
+    {
+        bail!(
+            "candidate plan symbols {}/{} do not match the configured runtime pair {}/{} for \
+             direction {:?}",
+            plan.sell_symbol,
+            plan.buy_symbol,
+            pair.sell_symbol,
+            pair.buy_symbol,
+            plan.direction,
+        );
+    }
+    Ok(())
+}
+
+/// Resolve exactly one archive-matching `WouldRotate` plan for `active`.
+/// Refuses on zero or more than one match, exactly like `repair-report`'s
+/// digest-based resolution refuses ambiguity, and additionally requires the
+/// resolved plan's direction to agree with the configured runtime pair.
+fn require_single_manual_reconcile_candidate(
+    config: &ArcusSpotExecuteOnceConfig,
+    active: &ArcusSpotExecutionAttempt,
+    events_jsonl_path: &Path,
+) -> Result<ArcusSpotRotationPlan> {
+    let candidates = scan_manual_reconcile_candidates(active, events_jsonl_path)?;
+    let plan = match candidates.as_slice() {
+        [candidate] => candidate.plan.clone(),
+        [] => bail!(
+            "no WouldRotate event matching this attempt's venue/symbols/sell_amount_raw was found \
+             in {} -- fetch a wider archive window before proceeding",
+            events_jsonl_path.display(),
+        ),
+        many => bail!(
+            "{} candidate WouldRotate events matched this attempt's venue/symbols/sell_amount_raw \
+             in {}; refusing to pick one -- this needs manual review, not this tool",
+            many.len(),
+            events_jsonl_path.display(),
+        ),
+    };
+    require_plan_direction_matches_configured_pair(&plan, config)?;
+    Ok(plan)
+}
+
+fn manual_reconcile_report(
+    config_path: &Path,
+    events_jsonl_path: &Path,
+    expected_sell_amount_raw: &str,
+    expected_buy_amount_raw: &str,
+) -> Result<()> {
+    // manual-reconcile-apply always checks CONFIG_YAML against
+    // auto_execute_policy.json before doing anything else (Codex P1
+    // follow-up, pairtrade#241) -- check it here too, first, so this
+    // report never claims "ready" (or any other status implying apply
+    // would proceed) for a CONFIG_YAML apply would actually refuse
+    // outright (Codex P2 follow-up, same PR).
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+    if let Err(error) = auto_execute_policy_from_admin_file()
+        .and_then(|policy| require_config_within_auto_execute_policy(&config, &policy))
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "policy_rejected",
+                "detail": format!(
+                    "manual-reconcile-apply would refuse this CONFIG_YAML before doing anything \
+                     else (auto_execute_policy.json check): {error:#}"
+                ),
+            }))
+            .context("failed to serialize Arcus manual-reconcile report")?
+        );
+        return Ok(());
+    }
+
+    // Pass the already-parsed, already-approved config object -- not
+    // config_path -- so build_manual_reconcile_report cannot re-read
+    // CONFIG_YAML from disk a second time. A second path-based read would
+    // reopen exactly the TOCTOU window auto_execute_policy.json exists to
+    // close: whoever can write config_path could replace it between the
+    // check above and that second read, and this report could then
+    // evaluate (and print "ready" for) a CONFIG_YAML that was never
+    // policy-approved (Codex P2 follow-up, pairtrade#241).
+    let report = build_manual_reconcile_report(
+        &config,
+        events_jsonl_path,
+        expected_sell_amount_raw,
+        expected_buy_amount_raw,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .context("failed to serialize Arcus manual-reconcile report")?
+    );
+    Ok(())
+}
+
+/// Read-only preview for `manual-reconcile-apply` (bot-strategy#869): loads
+/// the ledger under its exclusive lock (released once this prints, same
+/// caveat as `repair-report` -- re-run immediately before `apply` and
+/// confirm `active_attempt` is unchanged), resolves the one archive-matching
+/// `WouldRotate` candidate for the active attempt, and -- if the attempt has
+/// already reached `Reconciled` -- runs the exact pure computation
+/// `manual-reconcile-apply` would commit, without writing anything. Never
+/// polls chain status and never touches the runtime checkpoint or ledger.
+///
+/// Assumes the `auto_execute_policy.json` check has already passed --
+/// `manual_reconcile_report` (the CLI wrapper) checks that first and
+/// short-circuits before ever calling this, so every status this function
+/// can return is one `manual-reconcile-apply` would actually reach. Takes
+/// the already-parsed `config` object, not a path, so it can never re-read
+/// CONFIG_YAML itself and reopen the TOCTOU window the policy check exists
+/// to close (Codex P2 follow-up, pairtrade#241) -- tests construct/parse
+/// `config` the same way `manual_reconcile_report` does and pass it in
+/// directly, so this stays just as tempdir-testable as before.
+fn build_manual_reconcile_report(
+    config: &ArcusSpotExecuteOnceConfig,
+    events_jsonl_path: &Path,
+    expected_sell_amount_raw: &str,
+    expected_buy_amount_raw: &str,
+) -> Result<serde_json::Value> {
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+    let ledger = ledger_store.load_existing()?;
+
+    let Some(active) = ledger.active.clone() else {
+        return Ok(serde_json::json!({
+            "status": "no_active_attempt",
+            "detail": "the ledger has no active attempt; there is nothing to reconcile",
+        }));
+    };
+    let active_summary = serde_json::json!({
+        "sequence": active.sequence,
+        "phase": active.phase,
+        "tx_hash": active.tx_hash,
+        "idempotency_key": active.idempotency_key,
+    });
+
+    let plan = require_single_manual_reconcile_candidate(config, &active, events_jsonl_path)?;
+
+    if active.phase != ArcusSpotExecutionPhase::Reconciled {
+        // resume_status_and_reconcile (called by manual-reconcile-apply)
+        // only accepts Submitted/Confirmed/Reconciled; every other phase
+        // bails immediately without advancing or committing anything
+        // (Codex P2 follow-up, pairtrade#241, mirroring the same
+        // resumable-phase distinction build_repair_report already makes).
+        let resumable = matches!(
+            active.phase,
+            ArcusSpotExecutionPhase::Submitted | ArcusSpotExecutionPhase::Confirmed
+        );
+        let detail = if resumable {
+            format!(
+                "the active attempt is in phase {:?}; manual-reconcile-apply will first call \
+                 resume_status_and_reconcile (pure on-chain status/balance reads -- never signs or \
+                 submits a transaction) to advance it, then commit using this candidate plan and \
+                 the amounts you supply. This report cannot cross-check your expected amounts yet \
+                 because post-swap balances are not recorded until the attempt reaches Reconciled; \
+                 re-run this report after apply's resume step lands there.",
+                active.phase,
+            )
+        } else {
+            format!(
+                "the active attempt is in phase {:?}, which resume_status_and_reconcile does not \
+                 accept (only Submitted/Confirmed/Reconciled) -- manual-reconcile-apply would fail \
+                 immediately without advancing or committing anything for this phase. This needs a \
+                 manual operator decision (e.g. clear-risk-halt-style administrator action), not \
+                 this tool.",
+                active.phase,
+            )
+        };
+        return Ok(serde_json::json!({
+            "status": if resumable { "not_yet_reconciled" } else { "not_resumable" },
+            "active_attempt": active_summary,
+            "candidate_plan": plan,
+            "detail": detail,
+        }));
+    }
+
+    let sell_token_decimals =
+        trusted_token_decimals_for_address(config, &plan.sell_symbol, &active.intent.sell_token)?;
+    let buy_token_decimals =
+        trusted_token_decimals_for_address(config, &plan.buy_symbol, &active.intent.buy_token)?;
+    let fill = match manual_reconciled_runtime_fill_for_attempt(
+        &active,
+        &plan,
+        expected_sell_amount_raw,
+        expected_buy_amount_raw,
+        sell_token_decimals,
+        buy_token_decimals,
+    ) {
+        Ok(fill) => fill,
+        Err(error) => {
+            return Ok(serde_json::json!({
+                "status": "would_fail",
+                "active_attempt": active_summary,
+                "candidate_plan": plan,
+                "detail": format!("manual-reconcile-apply would refuse this: {error:#}"),
+            }));
+        }
+    };
+    // manual_reconciled_runtime_fill_for_attempt only derives quantities and
+    // checks ledger/balance deltas -- it does not run
+    // apply_confirmed_live_fill_once's own further checks (exact
+    // sell-quantity equality against the candidate plan, fill-predates-quote
+    // ordering, regime/trigger consistency, open-quantity for an exit,
+    // inventory floors). Run the real commit function here too, against a
+    // throwaway clone of the actual runtime checkpoint that is never
+    // persisted, so "ready" means apply's commit step would actually
+    // succeed, not just that a fill could be computed.
+    //
+    // Deliberately the *only* call dry-run here, exactly matching what
+    // finalize_manual_reconciled_attempt itself calls for real. An earlier
+    // round of this fix also pre-checked validate_plan_consistent_with_state,
+    // which is wrong: that function's risk-halt guard exists to block a
+    // *new* EntrySignal dispatch while a halt is engaged, but this attempt
+    // already executed on-chain -- a halt engaged afterward (while the
+    // checkpoint still shows Neutral because the fill was never committed)
+    // must not block reconciling it, and finalize_manual_reconciled_attempt
+    // never checked for that halt either. apply_confirmed_live_fill_once
+    // already enforces every check that legitimately applies to a commit
+    // (regime/trigger consistency and open-quantity-for-an-exit included)
+    // on its own, and separately short-circuits safely to Ok(false) without
+    // any further validation when last_live_execution_idempotency_key
+    // already equals this fill's key -- the crashed-invocation recovery
+    // case a prior round of this fix needed its own extra check for is
+    // handled by that short-circuit alone now (Codex P2 follow-up,
+    // pairtrade#241, correcting the over-restrictive check added in an
+    // earlier round).
+    //
+    // load_existing, not load_or_create: this attempt was dispatched
+    // against a checkpoint that must already exist. Silently constructing
+    // a fresh one from initial_inventory on a missing/lost checkpoint file
+    // would validate and (in apply) persist a commit against the wrong
+    // starting state, discarding whatever real tracked inventory/regime/
+    // signal history/risk state the checkpoint held -- checkpoint loss
+    // must surface as an explicit recovery condition, never an implicit
+    // reset (Codex P1 follow-up, pairtrade#241).
+    let mut dry_run_runtime =
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .load_existing(&config.runtime)?;
+    if let Err(error) = dry_run_runtime.apply_confirmed_live_fill_once(
+        &plan,
+        fill.actual_sell_quantity,
+        fill.actual_buy_quantity,
+        fill.reconciled_at,
+        &fill.idempotency_key,
+    ) {
+        return Ok(serde_json::json!({
+            "status": "would_fail",
+            "active_attempt": active_summary,
+            "candidate_plan": plan,
+            "detail": format!(
+                "manual-reconcile-apply would refuse this: failed to commit the reconciled fill \
+                 to runtime state: {error}"
+            ),
+        }));
+    }
+    // dry_run_runtime committed cleanly above (or was already committed by
+    // an earlier crashed invocation) and is discarded here without ever
+    // being persisted -- apply's real commit (finalize_manual_reconciled_attempt)
+    // runs the identical calls against the real, persisted checkpoint.
+    Ok(serde_json::json!({
+        "status": "ready",
+        "active_attempt": active_summary,
+        "candidate_plan": plan,
+        "proposed_fill": {
+            "actual_sell_quantity": fill.actual_sell_quantity,
+            "actual_buy_quantity": fill.actual_buy_quantity,
+            "reconciled_at": fill.reconciled_at,
+            "idempotency_key": fill.idempotency_key,
+        },
+        "next_steps": [
+            "This command wrote nothing -- the ledger, runtime checkpoint, and pending-plan \
+             file are all untouched.",
+            format!(
+                "Confirm arcus-spot-live-tick.timer (and any manual execute/auto-execute/\
+                 auto-resume/live-tick/manual-reconcile-apply invocation) stays stopped until \
+                 you run manual-reconcile-apply -- a concurrent invocation could otherwise \
+                 archive this exact attempt before apply runs.",
+            ),
+            format!(
+                "Immediately before running manual-reconcile-apply, re-run this report and \
+                 confirm active_attempt still has the same sequence ({}), idempotency_key, and \
+                 tx_hash printed here; abort if any differ.",
+                active_summary["sequence"],
+            ),
+            "Then run manual-reconcile-apply with this attempt's exact sequence/idempotency_key/\
+             tx_hash and the same EVENTS_JSONL/EXPECTED_*_AMOUNT_RAW to commit proposed_fill \
+             above and archive the attempt.".to_string(),
+        ],
+    }))
+}
+
+/// Commit an already-`Reconciled` attempt's runtime fill via
+/// `manual_reconciled_runtime_fill` (the digest-bypass path), mirroring
+/// `finalize_reconciled_attempt` exactly except for that one substitution.
+/// Deliberately not shared with `finalize_reconciled_attempt`: nothing in
+/// the automated `execute`/`auto-execute`/`resume`/`auto-resume`/`live-tick`
+/// flow should be able to reach the digest bypass by construction, not just
+/// by which arguments happen to be passed.
+/// The administrator-pinned decimals for `symbol`, from
+/// `CONFIG_YAML.router.trusted_token_decimals` -- covered by the same
+/// `auto_execute_policy.json` digest `manual-reconcile-apply`/
+/// `manual-reconcile-report` already require, so it is trustworthy
+/// independent of anything an archive candidate plan claims (Codex P2
+/// follow-up, pairtrade#241).
+/// `symbol` alone is not enough to trust `config`'s decimals pin for it:
+/// if CONFIG_YAML has been legitimately updated (a new
+/// auto_execute_policy.json-approved config) since this attempt was
+/// dispatched -- e.g. the symbol registry now resolves `symbol` to a
+/// different ERC-20 contract with different decimals -- a symbol-only
+/// lookup would silently return the *new* contract's decimals while
+/// `active.intent`/`plan` still describe the swap against the *old* one,
+/// converting the real settled raw amount at the wrong scale.
+/// `apply_confirmed_live_fill_once` does not itself catch this (it never
+/// re-derives quantities from raw amounts), so this must be checked here:
+/// require the symbol's *currently configured* address to match the
+/// address the attempt was actually signed and dispatched against before
+/// trusting its decimals pin (Codex P1 follow-up, pairtrade#241).
+fn trusted_token_decimals_for_address(
+    config: &ArcusSpotExecuteOnceConfig,
+    symbol: &str,
+    expected_address: &str,
+) -> Result<u32> {
+    let configured_address = config
+        .router
+        .trusted_token_addresses
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
+        .map(|(_, address)| address)
+        .with_context(|| format!("Arcus manual-reconcile has no address pin for {symbol}"))?;
+    if !configured_address.eq_ignore_ascii_case(expected_address) {
+        bail!(
+            "Arcus manual-reconcile decimals pin for {symbol} ({configured_address}) does not \
+             match the address this attempt was actually dispatched against \
+             ({expected_address}) -- the symbol registry has moved since this attempt was \
+             signed; refusing to guess its decimals"
+        );
+    }
+    config
+        .router
+        .trusted_token_decimals
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
+        .map(|(_, decimals)| *decimals)
+        .with_context(|| format!("Arcus manual-reconcile has no decimals pin for {symbol}"))
+}
+
+fn finalize_manual_reconciled_attempt(
+    config: &ArcusSpotExecuteOnceConfig,
+    executor: &mut ArcusSpotLiveExecutor<ArcusSpotKmsSigner>,
+    plan: &ArcusSpotRotationPlan,
+    expected_sell_amount_raw: &str,
+    expected_buy_amount_raw: &str,
+    attempt: ArcusSpotExecutionAttempt,
+) -> Result<ArcusSpotExecutionAttempt> {
+    if attempt.phase != ArcusSpotExecutionPhase::Reconciled {
+        return Ok(attempt);
+    }
+    let sell_token_decimals =
+        trusted_token_decimals_for_address(config, &plan.sell_symbol, &attempt.intent.sell_token)?;
+    let buy_token_decimals =
+        trusted_token_decimals_for_address(config, &plan.buy_symbol, &attempt.intent.buy_token)?;
+    let fill = executor.manual_reconciled_runtime_fill(
+        plan,
+        expected_sell_amount_raw,
+        expected_buy_amount_raw,
+        sell_token_decimals,
+        buy_token_decimals,
+    )?;
+    // load_existing, not load_or_create (Codex P1 follow-up, pairtrade#241):
+    // see build_manual_reconcile_report's identical dry-run for why.
+    let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+    let mut runtime = store.load_existing(&config.runtime)?;
+    runtime
+        .apply_confirmed_live_fill_once(
+            plan,
+            fill.actual_sell_quantity,
+            fill.actual_buy_quantity,
+            fill.reconciled_at,
+            &fill.idempotency_key,
+        )
+        .map_err(anyhow::Error::msg)
+        .context("failed to commit manually reconciled Arcus fill to runtime state")?;
+    store.persist(&runtime)?;
+    executor.archive_reconciled_after_runtime_commit()?;
+    Ok(attempt)
+}
+
+/// Requires `active` to be exactly the attempt the caller intends to touch,
+/// pinned by sequence/idempotency_key/tx_hash, before `manual-reconcile-apply`
+/// resumes or commits anything -- a stale invocation against an attempt that
+/// already moved on (archived and replaced by a fresh one, for instance)
+/// must fail closed instead of acting on the wrong attempt.
+fn require_active_attempt_matches_pins(
+    active: &ArcusSpotExecutionAttempt,
+    expected_sequence: u64,
+    expected_idempotency_key: &str,
+    expected_tx_hash: &str,
+) -> Result<()> {
+    let tx_hash_matches = active
+        .tx_hash
+        .as_deref()
+        .map(|hash| hash.eq_ignore_ascii_case(expected_tx_hash.trim()))
+        .unwrap_or(false);
+    if active.sequence != expected_sequence
+        || active.idempotency_key != expected_idempotency_key.trim()
+        || !tx_hash_matches
+    {
+        bail!(
+            "the ledger's active attempt (sequence {}, idempotency_key {}, tx_hash {:?}) does not \
+             match the SEQUENCE/IDEMPOTENCY_KEY/TX_HASH given on the command line -- this attempt \
+             already moved on, or the wrong attempt was targeted; re-run manual-reconcile-report \
+             and confirm before retrying",
+            active.sequence,
+            active.idempotency_key,
+            active.tx_hash,
+        );
+    }
+    Ok(())
+}
+
+/// The write path for `manual-reconcile-apply` (bot-strategy#869). Requires
+/// CONFIG_YAML to match `auto_execute_policy.json`'s administrator-approved
+/// digest -- the same gate `auto-execute`/`auto-resume`/`clear-risk-halt`
+/// enforce, and load-bearing here for the same reason: this path skips both
+/// the offline signature and the plan_config_digest match, so nothing else
+/// proves `ledger_path`/`runtime_state_path` are the genuine production
+/// paths rather than a caller-fabricated ledger paired with the real
+/// checkpoint (Codex P1 follow-up, pairtrade#241). Also requires the caller
+/// to pin the exact attempt (`expected_sequence`/`expected_idempotency_key`/
+/// `expected_tx_hash`) so a stale invocation against an attempt that
+/// already moved on fails closed instead of acting on the wrong one. Calls
+/// `resume_status_and_reconcile` (pure on-chain status/balance reads, never
+/// a new signature or submission) to advance Submitted/Confirmed toward
+/// Reconciled exactly like `auto-resume` does, then -- only once Reconciled
+/// -- commits via the digest-bypass path instead of the ordinary
+/// digest-checked one.
+async fn manual_reconcile_apply(
+    config_path: &Path,
+    events_jsonl_path: &Path,
+    expected_sell_amount_raw: &str,
+    expected_buy_amount_raw: &str,
+    expected_sequence: &str,
+    expected_idempotency_key: &str,
+    expected_tx_hash: &str,
+) -> Result<()> {
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+    // Same administrator-approval gate as auto-execute/auto-resume/
+    // clear-risk-halt (Codex P1 follow-up, pairtrade#241): this path skips
+    // both the offline Ed25519 signature *and* the plan_config_digest match
+    // by design, so nothing else here proves CONFIG_YAML itself -- in
+    // particular ledger_path and runtime_state_path -- is the genuine
+    // production config rather than one redirecting ledger_path at a
+    // caller-fabricated, already-Reconciled ledger while keeping the real
+    // production runtime_state_path, which would let this command commit a
+    // wholly fictitious fill to the real checkpoint without ever reading
+    // the chain.
+    let policy = auto_execute_policy_from_admin_file()?;
+    require_config_within_auto_execute_policy(&config, &policy)?;
+    let expected_sequence: u64 = expected_sequence
+        .trim()
+        .parse()
+        .context("SEQUENCE must be a non-negative integer")?;
+
+    let mut executor = executor_from_config(&config).await?;
+    let active = executor
+        .ledger()
+        .active
+        .clone()
+        .context("Arcus execution ledger has no active attempt to manually reconcile")?;
+    require_active_attempt_matches_pins(
+        &active,
+        expected_sequence,
+        expected_idempotency_key,
+        expected_tx_hash,
+    )?;
+    let plan = require_single_manual_reconcile_candidate(&config, &active, events_jsonl_path)?;
+
+    let attempt = executor.resume_status_and_reconcile().await?;
+    let attempt = finalize_manual_reconciled_attempt(
+        &config,
+        &mut executor,
+        &plan,
+        expected_sell_amount_raw,
+        expected_buy_amount_raw,
+        attempt,
+    )?;
+    write_attempt(&attempt)
 }
 
 fn declined_route_log_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
@@ -2522,6 +3100,41 @@ fn usage() -> &'static str {
   arcus-spot-execute-once live-tick CONFIG_YAML
   arcus-spot-execute-once clear-risk-halt CONFIG_YAML
   arcus-spot-execute-once repair-report CONFIG_YAML EVENTS_JSONL
+  arcus-spot-execute-once manual-reconcile-report CONFIG_YAML EVENTS_JSONL \
+      EXPECTED_SELL_AMOUNT_RAW EXPECTED_BUY_AMOUNT_RAW
+  arcus-spot-execute-once manual-reconcile-apply CONFIG_YAML EVENTS_JSONL \
+      EXPECTED_SELL_AMOUNT_RAW EXPECTED_BUY_AMOUNT_RAW SEQUENCE IDEMPOTENCY_KEY TX_HASH
+
+manual-reconcile-report/manual-reconcile-apply are the last-resort recovery
+path for exactly the incident class repair-report's own report describes as
+no_digest_match: an active Submitted/Confirmed/Reconciled attempt whose
+dispatched plan cannot be reproduced byte-exact from the durable event
+archive (a fresher quote at dispatch time diverged it from its logged
+WouldRotate observation), so the ordinary digest-checked resume path can
+never resolve it. They resolve the same single archive-matching WouldRotate
+candidate repair-report would (refusing on zero or more than one match,
+verified as a hash-chain-continuous, monotonic-sequence slice of the real
+event stream, not just each record's own self-consistency) for its
+direction/trigger only. Committed sell/buy quantities never come from that
+candidate's own sell_quantity/buy_quantity/buy_amount_raw fields -- instead
+the caller independently attests the settled sell/buy raw amounts (from the
+caller's own chain verification, e.g. eth_getTransactionReceipt logs plus
+balanceOf deltas), cross-checked against the deltas the ledger's own
+EIP-1898-pinned reconciliation already computed, and those raw amounts are
+converted to quantities using CONFIG_YAML's own router.trusted_token_decimals
+pin -- so nothing about the committed quantities can be steered by a forged
+or spliced archive candidate, only by CONFIG_YAML itself (administrator-gated,
+see below) and the caller's own attestation (cross-checked against the
+ledger). -report only ever loads the ledger file and never mutates anything,
+including when the preview looks correct; run it first, then -apply with the
+exact same arguments plus this attempt's sequence/idempotency_key/tx_hash
+pinned explicitly. Both require CONFIG_YAML to match
+auto_execute_policy.json's administrator-approved digest (same gate as
+auto-execute/auto-resume/clear-risk-halt) before doing anything else. -apply
+then resumes the attempt toward Reconciled (pure on-chain status/balance
+reads, exactly like auto-resume) and only then commits, archiving the
+attempt afterward. Neither command is reachable from
+execute/auto-execute/resume/auto-resume/live-tick.
 
 state-backup and state-verify-* are offline operator commands. They never
 construct an RPC/router client, KMS signer, approval policy, or executor and
@@ -3211,6 +3824,30 @@ async fn main() -> Result<()> {
         }
         [command, config_path, events_jsonl_path] if command == "repair-report" => {
             repair_report(Path::new(config_path), Path::new(events_jsonl_path))
+        }
+        [command, config_path, events_jsonl_path, expected_sell_amount_raw, expected_buy_amount_raw]
+            if command == "manual-reconcile-report" =>
+        {
+            manual_reconcile_report(
+                Path::new(config_path),
+                Path::new(events_jsonl_path),
+                expected_sell_amount_raw,
+                expected_buy_amount_raw,
+            )
+        }
+        [command, config_path, events_jsonl_path, expected_sell_amount_raw, expected_buy_amount_raw, sequence, idempotency_key, tx_hash]
+            if command == "manual-reconcile-apply" =>
+        {
+            manual_reconcile_apply(
+                Path::new(config_path),
+                Path::new(events_jsonl_path),
+                expected_sell_amount_raw,
+                expected_buy_amount_raw,
+                sequence,
+                idempotency_key,
+                tx_hash,
+            )
+            .await
         }
         [command, digest, key_path] if command == "sign-approval" => {
             let signing_key = read_ed25519_signing_key(Path::new(key_path))?;
@@ -6836,7 +7473,14 @@ runtime:
             previous = Some(record.chain_sha256.clone());
             lines.push(serde_json::to_string(&record).unwrap());
         }
-        write_private_file(path, lines.join("\n").as_bytes());
+        // verify_archive_events (manual-reconcile-*'s stricter archive
+        // check, unlike repair-report's own per-line scan) requires a
+        // trailing newline, matching a genuine on-host segment file.
+        let mut content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        write_private_file(path, content.as_bytes());
     }
 
     #[test]
@@ -7032,6 +7676,676 @@ runtime:
 
         let report = build_repair_report(&config_path, &events_path).unwrap();
         assert_eq!(report["status"], "no_active_attempt");
+    }
+
+    /// `repair_report_active_submitted_attempt` plus a `Reconciled` phase
+    /// and real post-swap balances: sells `plan.sell_amount_raw` and buys
+    /// `plan.buy_amount_raw` exactly, so `sell_balance_raw`/`buy_balance_raw`
+    /// deltas equal those two raw amounts precisely.
+    fn manual_reconcile_reconciled_attempt(
+        config: &ArcusSpotExecuteOnceConfig,
+        plan: &ArcusSpotRotationPlan,
+        at: DateTime<Utc>,
+    ) -> ArcusSpotExecutionAttempt {
+        let mut active = repair_report_active_submitted_attempt(config, plan, at);
+        active.phase = ArcusSpotExecutionPhase::Reconciled;
+        active.post_balances = Some(ArcusSpotBalanceSnapshot {
+            observed_at: at,
+            sell_token: plan.sell_token_address.clone(),
+            buy_token: plan.buy_token_address.clone(),
+            sell_balance_raw: "950000000000000000".to_string(),
+            buy_balance_raw: "150000000000000000".to_string(),
+            gas_balance_wei: "1000000000000000".to_string(),
+        });
+        active
+    }
+
+    #[test]
+    fn manual_reconcile_report_previews_a_not_yet_reconciled_attempt_from_a_digest_mismatching_candidate(
+    ) {
+        // The gap manual-reconcile-* exists for: exactly the same
+        // digest-mismatching event that
+        // repair_report_refuses_a_same_shaped_plan_that_does_not_reproduce_the_digest
+        // makes repair-report refuse must still resolve to a usable
+        // candidate here, since this path never computes or checks a
+        // plan_config_digest at all.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = repair_report_active_submitted_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active.clone()));
+
+        let mut near_miss = plan.clone();
+        near_miss.buy_quantity = plan.buy_quantity + Decimal::new(1, 6);
+        near_miss.buy_amount_raw = "50000000000001000".to_string();
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(
+                101,
+                at - chrono::Duration::seconds(2),
+                near_miss.clone(),
+            )],
+        );
+
+        let report = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap();
+        assert_eq!(report["status"], "not_yet_reconciled");
+        assert_eq!(
+            report["active_attempt"]["sequence"],
+            serde_json::json!(active.sequence)
+        );
+        assert_eq!(
+            report["candidate_plan"]["buy_amount_raw"],
+            serde_json::json!(near_miss.buy_amount_raw)
+        );
+    }
+
+    #[test]
+    fn manual_reconcile_report_flags_a_non_resumable_phase_instead_of_pointing_at_apply() {
+        // Codex P2 follow-up, pairtrade#241: resume_status_and_reconcile
+        // only accepts Submitted/Confirmed/Reconciled. For every other
+        // phase (Prepared/Dispatching/Rejected/Failed/Unknown/
+        // OperatorHold), manual-reconcile-apply's first call would bail
+        // immediately -- the report must say so plainly instead of telling
+        // the operator apply will "advance" it.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let mut active = repair_report_active_submitted_attempt(&config, &plan, at);
+        active.phase = ArcusSpotExecutionPhase::OperatorHold;
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap();
+        assert_eq!(report["status"], "not_resumable");
+        assert!(report["detail"]
+            .as_str()
+            .unwrap()
+            .contains("manual operator decision"));
+    }
+
+    #[test]
+    fn manual_reconcile_report_errs_when_no_would_rotate_event_matches() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = repair_report_active_submitted_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_private_file(&events_path, b"");
+
+        let error = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap_err();
+        assert!(
+            error.to_string().contains("no WouldRotate event matching"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn manual_reconcile_report_rejects_an_archive_with_a_broken_hash_chain() {
+        // Codex P2 follow-up, pairtrade#241: verify_record alone proves
+        // only that a single record's own hashes are self-consistent -- it
+        // says nothing about whether the record is a genuine, unmodified
+        // part of the real event stream. A forged record can carry
+        // perfectly self-consistent hashes of its own while breaking the
+        // chain to its neighbor. repair-report catches this downstream via
+        // plan_config_digest; manual-reconcile-* has no such backstop, so
+        // it must catch it here instead (verify_archive_events).
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = repair_report_active_submitted_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+
+        // A genuine two-event chain, plus a third record whose own hashes
+        // are internally self-consistent (it would pass verify_record on
+        // its own) but whose previous_chain_sha256 does not chain from the
+        // second event -- exactly what splicing a forged record into an
+        // otherwise real export looks like.
+        let genuine = [
+            repair_report_would_rotate_event(101, at, plan.clone()),
+            repair_report_would_rotate_event(102, at + chrono::Duration::seconds(1), plan.clone()),
+        ];
+        let mut lines = Vec::new();
+        let mut previous = None;
+        for event in &genuine {
+            let record = event_record(event, previous.clone()).unwrap();
+            previous = Some(record.chain_sha256.clone());
+            lines.push(serde_json::to_string(&record).unwrap());
+        }
+        let forged_event =
+            repair_report_would_rotate_event(103, at + chrono::Duration::seconds(2), plan.clone());
+        let forged_record = event_record(&forged_event, None).unwrap();
+        lines.push(serde_json::to_string(&forged_record).unwrap());
+        let mut content = lines.join("\n");
+        content.push('\n');
+        write_private_file(&events_path, content.as_bytes());
+
+        let error = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("hash-chain break"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn manual_reconcile_report_errs_when_multiple_would_rotate_events_match() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = repair_report_active_submitted_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[
+                repair_report_would_rotate_event(101, at, plan.clone()),
+                repair_report_would_rotate_event(
+                    102,
+                    at + chrono::Duration::seconds(1),
+                    plan.clone(),
+                ),
+            ],
+        );
+
+        let error = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to pick one"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn manual_reconcile_report_errs_when_the_candidate_direction_disagrees_with_the_configured_pair(
+    ) {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = repair_report_active_submitted_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+
+        // sell_symbol/buy_symbol (NVDA/AMD) still coarse-match the active
+        // intent, but the flipped direction is inconsistent with those
+        // symbols under the configured pair (sell_symbol=NVDA/buy_symbol=AMD):
+        // TokenBToTokenA requires selling AMD and buying NVDA.
+        let mut wrong_direction = plan.clone();
+        wrong_direction.direction = ArcusSpotDirection::TokenBToTokenA;
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, wrong_direction)],
+        );
+
+        let error = build_manual_reconcile_report(&config, &events_path, "1", "1").unwrap_err();
+        assert!(
+            error.to_string().contains("configured runtime pair"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn manual_reconcile_report_is_ready_for_a_reconciled_attempt_with_correct_expected_amounts() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_manual_reconcile_report(
+            &config,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap();
+        assert_eq!(report["status"], "ready");
+        // Computed from the operator-attested raw amounts and the
+        // config-pinned decimals (18 for both NVDA/AMD in execute_once_config),
+        // not copied from plan.sell_quantity/buy_quantity -- so it is
+        // numerically equal but not necessarily the identical Decimal scale
+        // (Codex P2 follow-up, pairtrade#241).
+        let actual_sell_quantity: Decimal = report["proposed_fill"]["actual_sell_quantity"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let actual_buy_quantity: Decimal = report["proposed_fill"]["actual_buy_quantity"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(actual_sell_quantity, plan.sell_quantity);
+        assert_eq!(actual_buy_quantity, plan.buy_quantity);
+        assert!(report["next_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step.as_str().unwrap().contains("manual-reconcile-apply")));
+    }
+
+    #[test]
+    fn manual_reconcile_report_refuses_a_decimals_pin_whose_address_moved_since_dispatch() {
+        // Codex P1 follow-up, pairtrade#241: if CONFIG_YAML's symbol->address
+        // pin for the buy symbol has changed since this attempt was
+        // dispatched (a legitimate, later administrator-approved config
+        // update, unrelated to this specific attempt), its decimals must
+        // not be trusted for an attempt signed against the *old* address --
+        // converting the real raw amount at the new contract's decimals
+        // could silently produce the wrong quantity.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let mut config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+        // The config now resolves AMD (the buy symbol) to a different
+        // contract than active.intent.buy_token / plan.buy_token_address.
+        config.router.trusted_token_addresses.insert(
+            "AMD".to_string(),
+            "0x0000000000000000000000000000000000000099".to_string(),
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let error = build_manual_reconcile_report(
+            &config,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not match the address"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn manual_reconcile_report_dry_runs_the_commit_before_reporting_ready() {
+        // Codex P2 follow-up, pairtrade#241: manual_reconciled_runtime_fill_for_attempt
+        // only derives quantities and checks ledger/balance deltas; it does
+        // not run apply_confirmed_live_fill_once's own checks (regime/
+        // trigger consistency, in this case). A mean_reversion_exit plan
+        // against a checkpoint that is still Neutral (no open rotated
+        // position) would compute a fine-looking fill here but fail at
+        // apply's real commit step -- the report must catch that and say
+        // would_fail, not ready.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("mean_reversion_exit");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+        // persist_repair_report_ledger_state always persists a fresh,
+        // Neutral-regime checkpoint -- inconsistent with a
+        // mean_reversion_exit plan, which requires an already-rotated
+        // regime with tracked open quantity.
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_manual_reconcile_report(
+            &config,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap();
+        assert_eq!(report["status"], "would_fail", "{report}");
+        assert!(report["detail"]
+            .as_str()
+            .unwrap()
+            .contains("failed to commit the reconciled fill"));
+    }
+
+    #[test]
+    fn manual_reconcile_report_refuses_when_the_runtime_checkpoint_is_missing() {
+        // Codex P1 follow-up, pairtrade#241: load_or_create would silently
+        // construct a fresh runtime from initial_inventory on a
+        // missing/lost checkpoint file, discarding whatever real tracked
+        // inventory/regime/signal history/risk state it held. Checkpoint
+        // loss must surface as an explicit error, not an implicit reset.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+
+        // Persist only the ledger (with its lock); never write the runtime
+        // checkpoint file -- simulating checkpoint loss.
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger.next_sequence = 3;
+        ledger.active = Some(active);
+        let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        ledger_store.persist(&ledger).unwrap();
+        drop(
+            ledger_store
+                .acquire_exclusive_lock(&config.runtime_state_path)
+                .unwrap(),
+        );
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let error = build_manual_reconcile_report(
+            &config,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn manual_reconcile_report_is_ready_when_the_fill_was_already_committed_by_a_crashed_invocation(
+    ) {
+        // Codex P2 follow-up, pairtrade#241: if a prior invocation
+        // persisted the runtime fill but crashed before archiving the
+        // ledger attempt, apply_confirmed_live_fill_once short-circuits to
+        // Ok(false) on the matching idempotency key without re-validating
+        // regime consistency -- the checkpoint has already moved on from
+        // what the plan describes (Neutral -> RotatedAToB for this
+        // entry_signal plan), which would otherwise make
+        // validate_plan_consistent_with_state fail. The report must
+        // recognize this as already-safe, not would_fail.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+
+        let mut runtime = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
+        runtime
+            .apply_confirmed_live_fill_once(
+                &plan,
+                plan.sell_quantity,
+                plan.buy_quantity,
+                at,
+                &active.idempotency_key,
+            )
+            .unwrap();
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&runtime)
+            .unwrap();
+
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger.next_sequence = 3;
+        ledger.active = Some(active);
+        let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        ledger_store.persist(&ledger).unwrap();
+        drop(
+            ledger_store
+                .acquire_exclusive_lock(&config.runtime_state_path)
+                .unwrap(),
+        );
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_manual_reconcile_report(
+            &config,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap();
+        assert_eq!(report["status"], "ready", "{report}");
+    }
+
+    #[test]
+    fn manual_reconcile_report_ignores_the_candidate_plans_own_quantities() {
+        // Codex P2 follow-up, pairtrade#241: proposed_fill must come from
+        // the operator-attested raw amounts and the config-pinned
+        // trusted_token_decimals, never from the archived candidate's own
+        // sell_quantity/buy_quantity/buy_amount_raw -- a forged or spliced
+        // candidate claiming wildly different quantities for the same real
+        // settled amounts must produce the identical proposed_fill.
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let mut plan = rotation_plan("entry_signal");
+        plan.buy_quantity = Decimal::new(999_999, 0);
+        plan.buy_amount_raw = "1".to_string();
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report = build_manual_reconcile_report(
+            &config,
+            &events_path,
+            "50000000000000000",
+            "50000000000000000",
+        )
+        .unwrap();
+        assert_eq!(report["status"], "ready");
+        let actual_buy_quantity: Decimal = report["proposed_fill"]["actual_buy_quantity"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // Not plan.buy_quantity (999999) -- the real settled amount at the
+        // config-pinned 18 decimals.
+        assert_eq!(actual_buy_quantity, Decimal::new(5, 2));
+    }
+
+    #[test]
+    fn manual_reconcile_report_would_fail_when_the_expected_buy_amount_is_wrong() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let events_path = dir.path().join("events.jsonl");
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        write_private_file(
+            &config_path,
+            serde_yaml::to_string(&config).unwrap().as_bytes(),
+        );
+        let plan = rotation_plan("entry_signal");
+        let at = fixture_now();
+        let active = manual_reconcile_reconciled_attempt(&config, &plan, at);
+        persist_repair_report_ledger_state(&config, Some(active));
+        write_repair_report_event_archive(
+            &events_path,
+            &[repair_report_would_rotate_event(101, at, plan.clone())],
+        );
+
+        let report =
+            build_manual_reconcile_report(&config, &events_path, "50000000000000000", "1").unwrap();
+        assert_eq!(report["status"], "would_fail");
+        assert!(report["detail"]
+            .as_str()
+            .unwrap()
+            .contains("reconciled buy delta"));
+    }
+
+    #[test]
+    fn manual_reconcile_apply_pins_reject_a_sequence_mismatch() {
+        let plan = rotation_plan("entry_signal");
+        let config =
+            execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let active = repair_report_active_submitted_attempt(&config, &plan, fixture_now());
+        let error = require_active_attempt_matches_pins(
+            &active,
+            active.sequence + 1,
+            &active.idempotency_key,
+            active.tx_hash.as_deref().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn manual_reconcile_apply_pins_reject_a_tx_hash_mismatch() {
+        let plan = rotation_plan("entry_signal");
+        let config =
+            execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let active = repair_report_active_submitted_attempt(&config, &plan, fixture_now());
+        let error = require_active_attempt_matches_pins(
+            &active,
+            active.sequence,
+            &active.idempotency_key,
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn manual_reconcile_apply_pins_accept_the_exact_active_attempt() {
+        let plan = rotation_plan("entry_signal");
+        let config =
+            execute_once_config("/var/lib/x/ledger.json", "/var/lib/x/runtime.json", "1000");
+        let active = repair_report_active_submitted_attempt(&config, &plan, fixture_now());
+        require_active_attempt_matches_pins(
+            &active,
+            active.sequence,
+            &active.idempotency_key,
+            active.tx_hash.as_deref().unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]

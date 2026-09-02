@@ -648,7 +648,8 @@ fn valid_sha256(value: &str) -> bool {
 /// exported/archived record outside the append-only on-host stream, where
 /// there is no adjacent record to check chain continuity against -- callers
 /// needing full continuity across a range still go through
-/// `ArcusSpotLiveTickEventStream`/the archive fetch-and-verify pipeline.
+/// `ArcusSpotLiveTickEventStream`/the archive fetch-and-verify pipeline, or
+/// `verify_archive_events` below.
 pub fn verify_record(record: &ArcusSpotLiveTickEventRecord) -> Result<ArcusSpotRuntimeEvent> {
     if record.schema_version != EVENT_STREAM_SCHEMA_VERSION {
         bail!(
@@ -685,6 +686,41 @@ pub fn verify_record(record: &ArcusSpotLiveTickEventRecord) -> Result<ArcusSpotR
     }
     serde_json::from_str(&record.event_json)
         .context("Arcus event-stream payload is not a runtime event")
+}
+
+/// Full-file counterpart to `verify_record`: verifies every record's own
+/// self-consistency *and* that consecutive records form an unbroken hash
+/// chain and a monotonic, gap-free event sequence -- exactly the continuity
+/// `verify_segment` already enforces reading a genuine on-host segment file,
+/// exposed here for a standalone exported/archived multi-record file (e.g.
+/// the combined output of `scripts/fetch_arcus_live_tick_events.sh`).
+///
+/// `verify_record` alone proves only that a single record's hashes are
+/// internally self-consistent; it says nothing about whether the record
+/// actually came from the real event stream rather than being fabricated
+/// or spliced into an otherwise-genuine file. For most standalone-record
+/// callers that gap is closed downstream by their own further proof (e.g.
+/// `repair-report`'s `plan_config_digest` match, which a forged event
+/// cannot satisfy without already knowing the ledger's committed digest).
+/// A caller with no such downstream proof -- `manual-reconcile-*`
+/// (bot-strategy#869/pairtrade#241), which exists specifically because that
+/// digest cannot be reproduced -- needs this stronger check instead: an
+/// attacker splicing or hand-editing one record without correctly
+/// recomputing every hash after it, or without keeping the whole file's
+/// sequence numbers exactly contiguous, gets caught here rather than
+/// silently accepted.
+///
+/// Not a substitute for the fetch pipeline's own S3 manifest verification
+/// (comparing the fetched archive's hash against what a trusted process
+/// recorded at upload time) -- this only proves internal consistency of
+/// whatever bytes it is handed, the same way `verify_record` does for one
+/// record. Only the caller can know whether those bytes came from a
+/// genuinely fetched-and-verified archive.
+pub fn verify_archive_events(path: &Path, bytes: &[u8]) -> Result<Vec<ArcusSpotRuntimeEvent>> {
+    Ok(verify_segment_bytes(path, bytes)?
+        .into_iter()
+        .map(|verified| verified.event)
+        .collect())
 }
 
 fn validate_event_continuity(

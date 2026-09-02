@@ -1,8 +1,9 @@
 use super::{
-    ArcusSpotBalanceSnapshot, ArcusSpotChainClient, ArcusSpotChainPreflightRequest,
-    ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionIntent,
-    ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock, ArcusSpotExecutionLedgerStore,
-    ArcusSpotExecutionPhase, ArcusSpotRotationPlan, ArcusSpotSettlementReceiptExpectation,
+    raw_amount_to_quantity, ArcusSpotBalanceSnapshot, ArcusSpotChainClient,
+    ArcusSpotChainPreflightRequest, ArcusSpotDirection, ArcusSpotExecutionAttempt,
+    ArcusSpotExecutionIntent, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock,
+    ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotRotationPlan,
+    ArcusSpotSettlementReceiptExpectation,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -479,10 +480,7 @@ where
         plan: &ArcusSpotRotationPlan,
         plan_config_digest: &str,
     ) -> Result<ArcusSpotReconciledRuntimeFill> {
-        let active = self.active_attempt()?;
-        if active.phase != ArcusSpotExecutionPhase::Reconciled {
-            bail!("Arcus runtime fill requires a reconciled execution attempt");
-        }
+        let active = self.require_reconciled_attempt()?;
         // Venue/symbols/sell_amount_raw alone don't prove `resume` (or a
         // fresh `execute` racing an existing attempt) was given the exact
         // plan that was actually prepared and dispatched: a different plan
@@ -495,68 +493,87 @@ where
         if active.intent.plan_config_digest != plan_config_digest {
             bail!("Arcus reconciled attempt was prepared under a different approved plan/config");
         }
-        if !active.intent.venue.eq_ignore_ascii_case(&plan.venue)
-            || !active
-                .intent
-                .sell_symbol
-                .eq_ignore_ascii_case(&plan.sell_symbol)
-            || !active
-                .intent
-                .buy_symbol
-                .eq_ignore_ascii_case(&plan.buy_symbol)
-            || active.intent.sell_amount_raw != plan.sell_amount_raw
-        {
-            bail!("Arcus reconciled attempt does not match the approved runtime plan");
-        }
-        let post = active
-            .post_balances
-            .as_ref()
-            .context("reconciled Arcus attempt omitted post balances")?;
-        let pre_sell = parse_amount("pre sell balance", &active.pre_balances.sell_balance_raw)?;
-        let pre_buy = parse_amount("pre buy balance", &active.pre_balances.buy_balance_raw)?;
-        let post_sell = parse_amount("post sell balance", &post.sell_balance_raw)?;
-        let post_buy = parse_amount("post buy balance", &post.buy_balance_raw)?;
-        let sold_raw = pre_sell
-            .checked_sub(post_sell)
-            .context("reconciled Arcus sell balance increased")?;
-        let bought_raw = post_buy
-            .checked_sub(pre_buy)
-            .context("reconciled Arcus buy balance decreased")?;
+        require_intent_matches_plan_shape(&active, plan)?;
+        let (sold_raw, bought_raw) = reconciled_balance_deltas(&active)?;
         if sold_raw != parse_amount("intent sell amount", &active.intent.sell_amount_raw)? {
             bail!("reconciled Arcus sell delta no longer matches the signed intent");
         }
-        let planned_buy_raw = parse_amount("plan buy amount", &plan.buy_amount_raw)?;
-        if planned_buy_raw.is_zero() || plan.buy_quantity <= Decimal::ZERO {
-            bail!("approved Arcus plan has an invalid buy quantity");
+        if plan.sell_quantity <= Decimal::ZERO {
+            bail!("approved Arcus plan has an invalid sell quantity");
         }
-        let bought_decimal = u256_decimal("reconciled buy amount", bought_raw)?;
-        let planned_buy_decimal = u256_decimal("planned buy amount", planned_buy_raw)?;
-        let actual_buy_quantity = plan
-            .buy_quantity
-            .checked_mul(bought_decimal)
-            .and_then(|value| value.checked_div(planned_buy_decimal))
-            .context("reconciled Arcus buy quantity exceeds Decimal range")?;
-        if plan.sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
+        let actual_buy_quantity = reconciled_actual_buy_quantity(plan, bought_raw)?;
+        if actual_buy_quantity <= Decimal::ZERO {
             bail!("reconciled Arcus runtime quantities must be positive");
         }
-        // `updated_at` is bumped on every status transition, including a
-        // `resume` that reconciles long after the swap actually confirmed
-        // on-chain -- using it here would make the runtime's
-        // `last_rotation_at` (and therefore `max_hold_secs`) start counting
-        // from whenever resume happened to run instead of from the real
-        // fill, letting a rotated position sit open arbitrarily longer than
-        // configured. `dispatched_at` is set once, at submission, and never
-        // overwritten afterward, so it is the right (conservative) fill
-        // time to report (Codex P1 follow-up, pairtrade#181).
-        let filled_at = active
-            .dispatched_at
-            .context("reconciled Arcus attempt is missing its dispatch time")?;
         Ok(ArcusSpotReconciledRuntimeFill {
             actual_sell_quantity: plan.sell_quantity,
             actual_buy_quantity,
-            reconciled_at: filled_at,
+            reconciled_at: reconciled_fill_time(&active)?,
             idempotency_key: active.idempotency_key,
         })
+    }
+
+    /// Commit a `Reconciled` attempt's runtime fill without a matching
+    /// `plan_config_digest` -- the one documented incident class this exists
+    /// for is an unattended `live-tick` dispatch whose
+    /// `live-tick-pending-plan.json` evidence was overwritten by a later
+    /// signal before the attempt could be resumed (bot-strategy#869).
+    /// `reconciled_runtime_fill` refuses that outright by design: the digest
+    /// is the only proof that a caller-supplied plan is the one actually
+    /// dispatched, and there is no way to reconstruct it byte-exact from the
+    /// durable event archive once a fresher quote at dispatch time diverged
+    /// the signed plan from its logged `WouldRotate` observation
+    /// (`repair-report`, pairtrade#240, reports `no_digest_match` for
+    /// exactly this reason).
+    ///
+    /// This method exists to make that gap survivable without weakening the
+    /// digest check for the ordinary automated path --
+    /// `reconciled_runtime_fill` above keeps requiring it unconditionally,
+    /// and nothing in the automated `execute`/`resume`/`live-tick` flow ever
+    /// calls this method. In place of the digest, the caller must supply the
+    /// settled sell/buy raw amounts from their own independent verification
+    /// against the chain (e.g. `eth_getTransactionReceipt` logs plus
+    /// `balanceOf` deltas, not derived from this process or this ledger).
+    /// Both must equal the deltas this attempt's own `reconcile_confirmed`
+    /// already computed from EIP-1898-pinned canonical post-swap balances --
+    /// if either disagrees, this is not the incident the caller thinks it
+    /// is, and this method refuses rather than guess.
+    ///
+    /// `plan.direction`/`plan.trigger`/`plan.sell_quantity` still drive the
+    /// runtime commit (`apply_confirmed_live_fill_once`), and
+    /// `plan.buy_quantity`/`plan.buy_amount_raw` still drive the
+    /// actual-buy-quantity ratio, exactly as in `reconciled_runtime_fill`.
+    /// Callers must source `plan` the same way `repair-report` does: a
+    /// `verify_record`-authenticated `WouldRotate` event scanned from the
+    /// durable archive whose venue/symbols/`sell_amount_raw` coarse-match
+    /// this attempt, never a hand-typed plan. This method does not itself
+    /// re-verify that provenance or re-derive direction from the runtime
+    /// pair -- the `manual-reconcile-*` CLI commands do both before calling
+    /// it.
+    ///
+    /// The actual computation is the free function
+    /// `manual_reconciled_runtime_fill_for_attempt` below, which takes the
+    /// attempt directly instead of `&self`: a report/preview tool that has
+    /// only loaded the ledger file (no chain RPC client, no KMS signer, the
+    /// same filesystem-only footprint as `repair-report`) can call it too,
+    /// without constructing a full executor just to run a pure computation.
+    pub fn manual_reconciled_runtime_fill(
+        &self,
+        plan: &ArcusSpotRotationPlan,
+        expected_sell_amount_raw: &str,
+        expected_buy_amount_raw: &str,
+        sell_token_decimals: u32,
+        buy_token_decimals: u32,
+    ) -> Result<ArcusSpotReconciledRuntimeFill> {
+        let active = self.active_attempt()?;
+        manual_reconciled_runtime_fill_for_attempt(
+            &active,
+            plan,
+            expected_sell_amount_raw,
+            expected_buy_amount_raw,
+            sell_token_decimals,
+            buy_token_decimals,
+        )
     }
 
     pub fn archive_reconciled_after_runtime_commit(&mut self) -> Result<()> {
@@ -681,6 +698,14 @@ where
             .context("Arcus execution ledger has no active attempt")
     }
 
+    fn require_reconciled_attempt(&self) -> Result<ArcusSpotExecutionAttempt> {
+        let active = self.active_attempt()?;
+        if active.phase != ArcusSpotExecutionPhase::Reconciled {
+            bail!("Arcus runtime fill requires a reconciled execution attempt");
+        }
+        Ok(active)
+    }
+
     fn require_non_terminal_failure(&self) -> Result<()> {
         match self.active_phase() {
             Some(ArcusSpotExecutionPhase::Unknown) => {
@@ -782,6 +807,183 @@ fn parse_amount(label: &str, raw: &str) -> Result<U256> {
 fn u256_decimal(label: &str, value: U256) -> Result<Decimal> {
     Decimal::from_str(&value.to_string())
         .with_context(|| format!("Arcus {label} exceeds Decimal range"))
+}
+
+/// Shared by `reconciled_runtime_fill` and `manual_reconciled_runtime_fill`:
+/// venue/symbols/`sell_amount_raw` alone don't prove the caller's `plan` is
+/// the one actually dispatched (each caller adds its own further proof --
+/// the plan digest, or an operator-attested settled-amount cross-check --
+/// on top of this), but a plan that doesn't even match this coarse shape is
+/// certainly not the same swap.
+///
+/// Token addresses are checked here too, not just symbols: a symbol
+/// registry can resolve the same symbol to a different ERC-20 contract at a
+/// later time than it did when the actual intent was signed and dispatched
+/// (the same risk `require_fresh_quote_token_addresses_match_plan` guards
+/// against for a fresh quote). For `reconciled_runtime_fill` this is
+/// already implied by the digest match, so the check is redundant there and
+/// changes nothing. For `manual_reconciled_runtime_fill`, which has no
+/// digest to fall back on, it is load-bearing: without it, an
+/// archive-authenticated candidate with the right symbols but a remapped
+/// contract (and therefore a different token decimals count) would still
+/// pass, and its `buy_quantity`/`buy_amount_raw` ratio would silently
+/// mis-scale the real settled `bought_raw` into the wrong decimals before
+/// committing it to the runtime checkpoint (Codex P1 follow-up,
+/// pairtrade#241).
+fn require_intent_matches_plan_shape(
+    active: &ArcusSpotExecutionAttempt,
+    plan: &ArcusSpotRotationPlan,
+) -> Result<()> {
+    if !active.intent.venue.eq_ignore_ascii_case(&plan.venue)
+        || !active
+            .intent
+            .sell_symbol
+            .eq_ignore_ascii_case(&plan.sell_symbol)
+        || !active
+            .intent
+            .buy_symbol
+            .eq_ignore_ascii_case(&plan.buy_symbol)
+        || active.intent.sell_amount_raw != plan.sell_amount_raw
+        || !active
+            .intent
+            .sell_token
+            .eq_ignore_ascii_case(&plan.sell_token_address)
+        || !active
+            .intent
+            .buy_token
+            .eq_ignore_ascii_case(&plan.buy_token_address)
+    {
+        bail!("Arcus reconciled attempt does not match the approved runtime plan");
+    }
+    Ok(())
+}
+
+/// The real settled sell/buy deltas for a `Reconciled` attempt, from its own
+/// pre/post balance snapshots (`reconcile_confirmed` populates `post_balances`
+/// from an EIP-1898-pinned canonical read at the confirmed tx's block --
+/// this never depends on any caller-supplied plan).
+fn reconciled_balance_deltas(active: &ArcusSpotExecutionAttempt) -> Result<(U256, U256)> {
+    let post = active
+        .post_balances
+        .as_ref()
+        .context("reconciled Arcus attempt omitted post balances")?;
+    let pre_sell = parse_amount("pre sell balance", &active.pre_balances.sell_balance_raw)?;
+    let pre_buy = parse_amount("pre buy balance", &active.pre_balances.buy_balance_raw)?;
+    let post_sell = parse_amount("post sell balance", &post.sell_balance_raw)?;
+    let post_buy = parse_amount("post buy balance", &post.buy_balance_raw)?;
+    let sold_raw = pre_sell
+        .checked_sub(post_sell)
+        .context("reconciled Arcus sell balance increased")?;
+    let bought_raw = post_buy
+        .checked_sub(pre_buy)
+        .context("reconciled Arcus buy balance decreased")?;
+    Ok((sold_raw, bought_raw))
+}
+
+/// `bought_raw` scaled to the buy token's real decimals via
+/// `plan.buy_quantity`/`plan.buy_amount_raw`'s own ratio, rather than a
+/// second, independently-sourced decimals count. Because every
+/// `ArcusSpotRotationPlan` satisfies `buy_quantity == buy_amount_raw` at the
+/// buy token's decimals by construction, this ratio is exactly
+/// `bought_raw` rescaled to those decimals regardless of *which* valid
+/// plan for the same buy token supplies `buy_quantity`/`buy_amount_raw` --
+/// it does not require `plan` to be the exact dispatched plan, only a
+/// same-buy-token one (bot-strategy#869 investigation).
+fn reconciled_actual_buy_quantity(
+    plan: &ArcusSpotRotationPlan,
+    bought_raw: U256,
+) -> Result<Decimal> {
+    let planned_buy_raw = parse_amount("plan buy amount", &plan.buy_amount_raw)?;
+    if planned_buy_raw.is_zero() || plan.buy_quantity <= Decimal::ZERO {
+        bail!("approved Arcus plan has an invalid buy quantity");
+    }
+    let bought_decimal = u256_decimal("reconciled buy amount", bought_raw)?;
+    let planned_buy_decimal = u256_decimal("planned buy amount", planned_buy_raw)?;
+    plan.buy_quantity
+        .checked_mul(bought_decimal)
+        .and_then(|value| value.checked_div(planned_buy_decimal))
+        .context("reconciled Arcus buy quantity exceeds Decimal range")
+}
+
+/// `updated_at` is bumped on every status transition, including a `resume`
+/// that reconciles long after the swap actually confirmed on-chain -- using
+/// it here would make the runtime's `last_rotation_at` (and therefore
+/// `max_hold_secs`) start counting from whenever resume happened to run
+/// instead of from the real fill, letting a rotated position sit open
+/// arbitrarily longer than configured. `dispatched_at` is set once, at
+/// submission, and never overwritten afterward, so it is the right
+/// (conservative) fill time to report (Codex P1 follow-up, pairtrade#181).
+fn reconciled_fill_time(active: &ArcusSpotExecutionAttempt) -> Result<DateTime<Utc>> {
+    active
+        .dispatched_at
+        .context("reconciled Arcus attempt is missing its dispatch time")
+}
+
+/// The pure computation behind `ArcusSpotLiveExecutor::manual_reconciled_runtime_fill`,
+/// taking the attempt directly so a read-only report tool (loaded ledger,
+/// no chain/KMS client) can preview the exact outcome without constructing
+/// a full executor. See the method's doc comment for the full rationale.
+///
+/// `sell_token_decimals`/`buy_token_decimals` must come from a trust anchor
+/// independent of `plan` -- the caller (the `manual-reconcile-*` CLI
+/// commands) sources them from `CONFIG_YAML`'s own
+/// `router.trusted_token_decimals` pin, which is itself covered by the
+/// `auto_execute_policy.json` digest these commands already require. Both
+/// `actual_sell_quantity` and `actual_buy_quantity` are computed directly
+/// from the operator-attested raw amounts and these decimals -- never from
+/// `plan.sell_quantity`/`plan.buy_quantity`/`plan.buy_amount_raw` -- so a
+/// forged or spliced archive candidate cannot mis-scale the committed
+/// inventory no matter what quantities it claims (Codex P2 follow-up,
+/// pairtrade#241, closing the gap `verify_archive_events` above narrows but
+/// does not eliminate). `apply_confirmed_live_fill` still separately
+/// requires `actual_sell_quantity == plan.sell_quantity` exactly, so the
+/// archive-sourced and decimals-derived sell quantities must agree anyway.
+pub fn manual_reconciled_runtime_fill_for_attempt(
+    active: &ArcusSpotExecutionAttempt,
+    plan: &ArcusSpotRotationPlan,
+    expected_sell_amount_raw: &str,
+    expected_buy_amount_raw: &str,
+    sell_token_decimals: u32,
+    buy_token_decimals: u32,
+) -> Result<ArcusSpotReconciledRuntimeFill> {
+    if active.phase != ArcusSpotExecutionPhase::Reconciled {
+        bail!("Arcus runtime fill requires a reconciled execution attempt");
+    }
+    require_intent_matches_plan_shape(active, plan)?;
+    let (sold_raw, bought_raw) = reconciled_balance_deltas(active)?;
+    let expected_sell = parse_amount("operator-attested sell amount", expected_sell_amount_raw)?;
+    let expected_buy = parse_amount("operator-attested buy amount", expected_buy_amount_raw)?;
+    if expected_sell != sold_raw {
+        bail!(
+            "operator-attested sell amount {expected_sell} does not match this attempt's \
+             reconciled sell delta {sold_raw} -- this is not the incident being recovered, \
+             refusing to proceed"
+        );
+    }
+    if expected_buy != bought_raw {
+        bail!(
+            "operator-attested buy amount {expected_buy} does not match this attempt's \
+             reconciled buy delta {bought_raw} -- this is not the incident being recovered, \
+             refusing to proceed"
+        );
+    }
+    if sold_raw != parse_amount("intent sell amount", &active.intent.sell_amount_raw)? {
+        bail!("reconciled Arcus sell delta no longer matches the signed intent");
+    }
+    let actual_sell_quantity =
+        raw_amount_to_quantity(expected_sell_amount_raw, sell_token_decimals)
+            .map_err(|error| anyhow!("Arcus sell token decimals: {error}"))?;
+    let actual_buy_quantity = raw_amount_to_quantity(expected_buy_amount_raw, buy_token_decimals)
+        .map_err(|error| anyhow!("Arcus buy token decimals: {error}"))?;
+    if actual_sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
+        bail!("reconciled Arcus runtime quantities must be positive");
+    }
+    Ok(ArcusSpotReconciledRuntimeFill {
+        actual_sell_quantity,
+        actual_buy_quantity,
+        reconciled_at: reconciled_fill_time(active)?,
+        idempotency_key: active.idempotency_key.clone(),
+    })
 }
 
 /// Require a plan's raw (on-chain base units) and decimal (human/runtime)
@@ -1167,5 +1369,166 @@ mod tests {
             &plan.buy_token_address,
         )
         .is_err());
+    }
+
+    /// `confirmed_ledger` plus a balance reconciliation that sells 1000 and
+    /// buys 1000 (>= the fixture intent's minimum_buy_amount_raw of 980),
+    /// landing the active attempt in `Reconciled` with real pre/post
+    /// balances -- the state `manual_reconciled_runtime_fill_for_attempt`
+    /// requires.
+    fn reconciled_attempt(now: DateTime<Utc>) -> ArcusSpotExecutionAttempt {
+        let mut ledger = confirmed_ledger(now);
+        ledger
+            .reconcile_balances(execution_balances("4000", "3000", now), now)
+            .unwrap();
+        ledger.active.unwrap()
+    }
+
+    #[test]
+    fn manual_reconciled_fill_computes_quantities_from_raw_amounts_and_decimals() {
+        // decimals=3 turns raw "1000" into exactly 1.000, matching what the
+        // old plan.sell_quantity/buy_quantity=ONE fixtures used to assert.
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let plan = plan_with_buy_amount("1000");
+
+        let fill = manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+            .unwrap();
+        assert_eq!(fill.actual_sell_quantity, Decimal::ONE);
+        assert_eq!(fill.actual_buy_quantity, Decimal::ONE);
+        assert_eq!(fill.idempotency_key, active.idempotency_key);
+    }
+
+    #[test]
+    fn manual_reconciled_fill_ignores_the_candidate_plans_own_quantities() {
+        // Codex P2 follow-up, pairtrade#241: verify_archive_events narrows
+        // but cannot eliminate the risk of a forged or spliced candidate
+        // (a single-record file has no trusted chain anchor at all). The
+        // real fix is that actual_sell_quantity/actual_buy_quantity never
+        // come from the candidate plan's own sell_quantity/buy_quantity/
+        // buy_amount_raw fields -- only from the operator-attested raw
+        // amounts (already proven equal to the ledger's own EIP-1898-pinned
+        // balance deltas) and the config-pinned decimals. A candidate
+        // claiming wildly different quantities/ratios must produce the
+        // exact same fill as one with sane ones, for the same raw amounts
+        // and decimals.
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let sane = plan_with_buy_amount("1000");
+        let mut forged = sane.clone();
+        forged.sell_quantity = Decimal::new(999_999, 0);
+        forged.buy_quantity = Decimal::new(1, 0);
+        forged.buy_amount_raw = "1".to_string();
+
+        let fill_sane =
+            manual_reconciled_runtime_fill_for_attempt(&active, &sane, "1000", "1000", 3, 3)
+                .unwrap();
+        let fill_forged =
+            manual_reconciled_runtime_fill_for_attempt(&active, &forged, "1000", "1000", 3, 3)
+                .unwrap();
+        assert_eq!(
+            fill_sane.actual_sell_quantity,
+            fill_forged.actual_sell_quantity
+        );
+        assert_eq!(
+            fill_sane.actual_buy_quantity,
+            fill_forged.actual_buy_quantity
+        );
+    }
+
+    #[test]
+    fn manual_reconciled_fill_rejects_a_grossly_wrong_decimals_pin() {
+        // decimals so large relative to the raw amount that it rounds away
+        // to nothing under Decimal's scale limit -- proves a bad decimals
+        // pin fails closed (as either a parse error or a non-positive
+        // quantity) rather than silently producing a wrong quantity.
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let plan = plan_with_buy_amount("1000");
+        manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 40)
+            .unwrap_err();
+    }
+
+    #[test]
+    fn manual_reconciled_fill_requires_the_reconciled_phase() {
+        let now = Utc::now();
+        let active = confirmed_ledger(now).active.unwrap();
+        assert_eq!(active.phase, ArcusSpotExecutionPhase::Confirmed);
+        let plan = plan_with_buy_amount("1000");
+        let error =
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+                .unwrap_err();
+        assert!(error.to_string().contains("reconciled execution attempt"));
+    }
+
+    #[test]
+    fn manual_reconciled_fill_rejects_a_plan_with_the_wrong_shape() {
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let mut plan = plan_with_buy_amount("1000");
+        plan.sell_symbol = "MSFT".to_string();
+        let error =
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the approved runtime plan"));
+    }
+
+    #[test]
+    fn manual_reconciled_fill_rejects_a_plan_whose_buy_token_address_was_remapped() {
+        // Codex P1 follow-up, pairtrade#241: symbols/venue/sell_amount_raw
+        // alone don't prove the candidate resolves to the same ERC-20
+        // contracts the ledger's intent actually signed against.
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let mut plan = plan_with_buy_amount("1000");
+        plan.buy_token_address = "0x0000000000000000000000000000000000000099".to_string();
+        let error =
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the approved runtime plan"));
+    }
+
+    #[test]
+    fn manual_reconciled_fill_rejects_a_plan_whose_sell_token_address_was_remapped() {
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let mut plan = plan_with_buy_amount("1000");
+        plan.sell_token_address = "0x0000000000000000000000000000000000000099".to_string();
+        let error =
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the approved runtime plan"));
+    }
+
+    #[test]
+    fn manual_reconciled_fill_rejects_a_mismatched_operator_attested_sell_amount() {
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let plan = plan_with_buy_amount("1000");
+        let error = manual_reconciled_runtime_fill_for_attempt(&active, &plan, "999", "1000", 3, 3)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("reconciled sell delta"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn manual_reconciled_fill_rejects_a_mismatched_operator_attested_buy_amount() {
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        let plan = plan_with_buy_amount("1000");
+        let error = manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "999", 3, 3)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("reconciled buy delta"),
+            "{error}"
+        );
     }
 }
