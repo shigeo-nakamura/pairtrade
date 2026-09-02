@@ -445,6 +445,13 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                     for payload in snapshot_payloads
                 )
             )
+            legacy_index = sqlite3.connect(index_path)
+            legacy_index.execute("DROP TABLE archived_trade_replay_alias")
+            legacy_index.commit()
+            legacy_index.close()
+            self.assertTrue(
+                sink._archived_trade_exists(partition, snapshot_payloads[1])
+            )
 
     async def test_snapshot_without_exchange_timestamp_fails_closed(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
@@ -936,6 +943,57 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                     )
                 finally:
                     db.close()
+
+    async def test_connection_retries_keep_one_open_gap(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory) / "data"
+            object.__setattr__(config, "database_dir", database_dir)
+            started_us = 1_700_000_000_000_000
+            started_us -= started_us % 3_600_000_000
+            started_us += 1_000_000
+            retried_us = started_us + 60_000_000
+            sink = engine_b.DatabaseSink(config, "retry-gap-run", "retry-gap-commit")
+            for path in (
+                database_dir,
+                sink.sealed_dir,
+                sink.lock_dir,
+                sink.gap_continuation_dir,
+                sink.session_continuation_dir,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            gaps = [
+                (
+                    "gap",
+                    {
+                        "recv_us": timestamp,
+                        "connection_id": f"retry-{index}",
+                        "venue": "robinhood",
+                        "market_id": 37,
+                        "symbol": "SKHY",
+                        "channel": "connection",
+                        "reason": "connection_error:TimeoutError",
+                    },
+                )
+                for index, timestamp in enumerate((started_us, retried_us))
+            ]
+            with mock.patch.object(engine_b, "now_us", return_value=retried_us):
+                sink._write_batch(gaps)
+            await sink.close()
+            partition = engine_b.partition_for_us(started_us)
+            database = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    database.execute(
+                        """SELECT COUNT(*), MIN(ts_start_us), MAX(ts_end_us)
+                           FROM data_gap WHERE channel = 'connection'"""
+                    ).fetchone(),
+                    (1, started_us, None),
+                )
+            finally:
+                database.close()
 
     async def test_resynchronization_closes_retained_connection_gaps(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)

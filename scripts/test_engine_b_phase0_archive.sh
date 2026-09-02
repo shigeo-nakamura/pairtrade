@@ -88,6 +88,12 @@ connection.execute(
     (946_684_800_000_000,),
 )
 connection.execute(
+    """INSERT INTO data_gap(
+         venue, market_id, symbol, channel, ts_start_us, reason
+       ) VALUES ('robinhood', 37, 'SKHY', 'connection', ?, 'retry_outage')""",
+    (946_684_860_000_000,),
+)
+connection.execute(
     """INSERT INTO trade(
          connection_session_id, venue, market_id, exchange_trade_id,
          exchange_sequence, local_sequence, ts_recv_us, ts_srv_us,
@@ -258,6 +264,9 @@ try:
     assert connection.execute("SELECT ts_end_us FROM data_gap").fetchone() == (
         int(partition_end.timestamp() * 1_000_000),
     )
+    assert connection.execute(
+        "SELECT COUNT(*) FROM data_gap WHERE channel = 'connection'"
+    ).fetchone() == (1,)
     assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 finally:
     connection.close()

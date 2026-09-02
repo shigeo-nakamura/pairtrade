@@ -82,6 +82,9 @@ collapsing distinct nonce-scoped updates. A subscribed trade snapshot missing
 an exchange timestamp is rejected before any row is emitted. When an older
 partition contains NULL IDs or obsolete synthetic IDs, the index builder
 reconstructs the current identity and replay alias from stored ordering.
+For a pre-v7 seal sidecar without replay aliases, primary IDs remain usable;
+an otherwise unverifiable ID-less snapshot for that sealed hour is
+conservatively discarded instead of crashing the writer or duplicating data.
 The committed `late_trade` row is the durable reconciliation journal: replay
 checks consult all retained hourly databases, and the archiver copies every
 journaled identity into its referenced sealed sidecar before the source hour
@@ -182,6 +185,9 @@ process, so recovery does not depend on the archive timer. If a journal target
 was already sealed, the sidecar proves whether that session segment exists;
 any missing sealed-hour interval is carried into the next retained database as
 `sealed_session_interval` evidence before recovery advances.
+Repeated connection failures before a successful replacement snapshot share
+one open `connection` gap per venue/market, preventing retry backoff from
+counting the same outage more than once.
 
 ## `freq2` account record
 

@@ -278,6 +278,15 @@ try:
         )
     if "data_gap" in tables:
         marker_dir = Path(sys.argv[3])
+        connection.execute(
+            """DELETE FROM data_gap
+               WHERE ts_end_us IS NULL AND channel = 'connection'
+                 AND gap_id NOT IN (
+                   SELECT MIN(gap_id) FROM data_gap
+                   WHERE ts_end_us IS NULL AND channel = 'connection'
+                   GROUP BY venue, market_id, channel
+                 )"""
+        )
         rows = connection.execute(
             """SELECT gap_id, venue, market_id, symbol, channel,
                       expected_sequence, observed_sequence, reason

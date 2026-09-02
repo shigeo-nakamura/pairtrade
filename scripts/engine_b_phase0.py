@@ -41,7 +41,7 @@ LOG = logging.getLogger("engine_b_phase0")
 UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 OHLCV_FINALIZE_GRACE_US = 120_000_000
 
 
@@ -1138,6 +1138,20 @@ class DatabaseSink:
                ON data_gap(continuation_id) WHERE continuation_id IS NOT NULL"""
         )
         connection.execute(
+            """DELETE FROM data_gap
+               WHERE ts_end_us IS NULL AND channel = 'connection'
+                 AND gap_id NOT IN (
+                   SELECT MIN(gap_id) FROM data_gap
+                   WHERE ts_end_us IS NULL AND channel = 'connection'
+                   GROUP BY venue, market_id, channel
+                 )"""
+        )
+        connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_data_gap_open_connection
+               ON data_gap(venue, market_id, channel)
+               WHERE ts_end_us IS NULL AND channel = 'connection'"""
+        )
+        connection.execute(
             """UPDATE ohlcv_1m
                SET first_trade_ts_us = COALESCE(first_trade_ts_us, bucket_start_us),
                    last_trade_ts_us = COALESCE(last_trade_ts_us, bucket_start_us)
@@ -1317,7 +1331,7 @@ class DatabaseSink:
 
     def _sealed_trade_replay_alias_ids(
         self, partition: str, payload: dict[str, Any]
-    ) -> set[str]:
+    ) -> set[str] | None:
         replay_alias = payload.get("replay_alias")
         if replay_alias is None or payload.get("snapshot_occurrence") is None:
             return set()
@@ -1346,9 +1360,15 @@ class DatabaseSink:
                      AND name = 'archived_trade_replay_alias'"""
             ).fetchone()
             if table is None:
-                raise RuntimeError(
-                    f"sealed trade replay index is incompatible: {index_path}"
+                LOG.warning(
+                    "Legacy sealed trade index has no replay aliases; "
+                    "discarding unverifiable ID-less snapshot partition=%s "
+                    "venue=%s market_id=%s",
+                    partition,
+                    payload["venue"],
+                    payload["market_id"],
                 )
+                return None
             return {
                 str(row[0])
                 for row in connection.execute(
@@ -1485,6 +1505,8 @@ class DatabaseSink:
         if self._sealed_trade_index_contains(partition, payload):
             return True
         sealed_alias_ids = self._sealed_trade_replay_alias_ids(partition, payload)
+        if sealed_alias_ids is None:
+            return True
         local_primary, local_alias_ids = self._local_late_trade_state(
             partition, payload
         )
@@ -1501,6 +1523,8 @@ class DatabaseSink:
         if self._sealed_trade_index_contains(partition, payload):
             return True
         sealed_alias_ids = self._sealed_trade_replay_alias_ids(partition, payload)
+        if sealed_alias_ids is None:
+            return True
         return (
             snapshot_occurrence is not None
             and len(sealed_alias_ids | local_alias_ids) > int(snapshot_occurrence)
@@ -1722,12 +1746,25 @@ class DatabaseSink:
             *(("gap", payload) for _, payload in recovered_gap_markers),
             *batch,
         ]
+        ordered_gap_close_us: dict[tuple[str, int], int] = {}
         for kind, payload in batch:
             if kind == "__stop__":
                 continue
             if kind == "gap_close":
                 gap_closes.append(payload)
+                ordered_gap_close_us[
+                    (payload["venue"], payload["market_id"])
+                ] = int(payload["recv_us"])
                 continue
+            if kind == "gap" and payload.get("channel") == "connection":
+                prior_gap_close_us = ordered_gap_close_us.get(
+                    (payload["venue"], payload["market_id"])
+                )
+                if prior_gap_close_us is not None:
+                    payload = {
+                        **payload,
+                        "prior_gap_close_us": prior_gap_close_us,
+                    }
             partition_us = int(payload.get("partition_us", payload["recv_us"]))
             grouped[partition_for_us(partition_us)].append((kind, payload))
 
@@ -1775,11 +1812,15 @@ class DatabaseSink:
                             _, local_alias_ids = self._local_late_trade_state(
                                 partition, payload
                             )
-                            pending_alias_replay = len(
-                                sealed_alias_ids
-                                | local_alias_ids
-                                | pending_late_aliases[alias_key]
-                            ) > int(payload["snapshot_occurrence"])
+                            pending_alias_replay = (
+                                sealed_alias_ids is None
+                                or len(
+                                    sealed_alias_ids
+                                    | local_alias_ids
+                                    | pending_late_aliases[alias_key]
+                                )
+                                > int(payload["snapshot_occurrence"])
+                            )
                         if (
                             archived
                             or primary_key in pending_late_primary
@@ -2451,6 +2492,23 @@ class DatabaseSink:
                         interval["start_us"], interval["end_us"],
                         payload.get("expected_sequence"),
                         payload.get("observed_sequence"), payload["reason"],
+                    ),
+                )
+            if (
+                payload["channel"] == "connection"
+                and payload.get("prior_gap_close_us") is not None
+            ):
+                connection.execute(
+                    """UPDATE data_gap
+                       SET ts_end_us = MAX(ts_start_us, ?)
+                       WHERE ts_end_us IS NULL AND venue = ?
+                         AND market_id = ? AND channel = 'connection'
+                         AND ts_start_us <= ?""",
+                    (
+                        payload["prior_gap_close_us"],
+                        payload["venue"],
+                        payload["market_id"],
+                        payload["prior_gap_close_us"],
                     ),
                 )
             connection.execute(
