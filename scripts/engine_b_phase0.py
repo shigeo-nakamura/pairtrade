@@ -862,7 +862,13 @@ class DatabaseSink:
     async def _run(self) -> None:
         stop_after_batch = False
         while not stop_after_batch:
-            first = await self.queue.get()
+            try:
+                first = await asyncio.wait_for(
+                    self.queue.get(), self._rotation_timeout_seconds()
+                )
+            except TimeoutError:
+                await asyncio.to_thread(self._write_batch, [])
+                continue
             batch = [first]
             stop_after_batch = first[0] == "__stop__"
             deadline = asyncio.get_running_loop().time() + self.config.db_flush_interval_ms / 1000
@@ -879,6 +885,12 @@ class DatabaseSink:
             await asyncio.to_thread(self._write_batch, batch)
             for _ in batch:
                 self.queue.task_done()
+
+    @staticmethod
+    def _rotation_timeout_seconds() -> float:
+        current_us = now_us()
+        next_hour_us = (current_us // 3_600_000_000 + 1) * 3_600_000_000
+        return max(0.05, (next_hour_us - current_us) / 1_000_000 + 0.05)
 
     def _connection(self, partition: str) -> sqlite3.Connection:
         if self._is_partition_sealed(partition):

@@ -54,7 +54,10 @@ time and reason. Every partition for one collector process preserves the same
 `collector_manifest.started_ts_us`, so database rotation is not mistaken for a
 collector restart. The archiver applies the same partition-boundary closure
 under the shared lock before upload, covering a completely quiet feed that
-produces no collector batch after the hour changes.
+produces no collector batch after the hour changes. The SQLite writer also
+self-wakes just after each UTC hour boundary to close old cached handles, so
+the minute-10 archiver does not mistake an idle collector connection for a
+live transaction.
 
 Local deletion is disabled by default through
 `ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false`; the active hour is never an

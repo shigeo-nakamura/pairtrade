@@ -480,6 +480,57 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     db.close()
 
+    async def test_idle_writer_rotates_partition_without_another_event(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            database_dir = Path(directory)
+            object.__setattr__(config, "database_dir", database_dir)
+            hour_start_us = 1_700_000_000_000_000
+            hour_start_us -= hour_start_us % 3_600_000_000
+            clock = [hour_start_us + 1_800_000_000]
+            connection = {
+                "id": "connection-idle-at-boundary",
+                "venue": "robinhood",
+                "started_us": clock[0],
+                "api_schema_version": config.api_schema_version,
+            }
+            partition = engine_b.partition_for_us(clock[0])
+            sink = engine_b.DatabaseSink(
+                config, "idle-rotation-run", "idle-rotation-commit", clock[0]
+            )
+            with mock.patch.object(engine_b, "now_us", side_effect=lambda: clock[0]), \
+                 mock.patch.object(
+                     engine_b.DatabaseSink,
+                     "_rotation_timeout_seconds",
+                     return_value=0.01,
+                 ):
+                sink.start()
+                await sink.put(
+                    "connection_start", {"recv_us": clock[0], "connection": connection}
+                )
+                await sink.queue.join()
+                self.assertIn(partition, sink._connections)
+                clock[0] = hour_start_us + 3_600_000_000 + 1_000_000
+                for _ in range(20):
+                    if partition not in sink._connections:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertNotIn(partition, sink._connections)
+                await sink.close()
+
+            db = sqlite3.connect(
+                database_dir / f"engine_b_phase0_{partition}.sqlite3"
+            )
+            try:
+                self.assertEqual(
+                    db.execute(
+                        "SELECT ended_ts_recv_us, end_reason FROM ws_connection"
+                    ).fetchone(),
+                    (hour_start_us + 3_600_000_000, "partition_rotation"),
+                )
+            finally:
+                db.close()
+
 
     async def test_deduplicates_and_merges_late_trades_in_event_partition(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
