@@ -22,6 +22,12 @@ RuntimeDirectoryMode=0750
 EnvironmentFile=/opt/engine-b-live/live-config.env
 EnvironmentFile=/etc/engine-b-live/live-secrets.env
 Environment=RUST_LOG=info
+# The Lighter SDK signer shared library (libsigner.so) lives under
+# /opt/debot/lib on this host for the Robinhood trading bot, but
+# InaccessiblePaths=/opt/debot below means this identity can never load it
+# from there -- scripts/install_engine_b_live.sh installs this unit's own
+# copy at /opt/engine-b-live/lib/libsigner.so instead.
+Environment=LD_LIBRARY_PATH=/opt/engine-b-live/lib
 ExecStart=/opt/engine-b-live/bin/engine_b_live
 Restart=on-failure
 RestartSec=15

@@ -59,7 +59,13 @@ GAPS section -- do not duplicate that list here; read it there.
 - Service: `engine-b-live.service`
 - Code/config (root-owned, read-only): `/opt/engine-b-live/` (binary at
   `bin/engine_b_live`, `trading_calendar.json`, `live-config.env` generated
-  from `configs/engine-b/live.json` by `scripts/install_engine_b_live.sh`)
+  from `configs/engine-b/live.json` by `scripts/install_engine_b_live.sh`,
+  and this identity's own copy of the Lighter SDK signer library at
+  `lib/libsigner.so` -- `InaccessiblePaths=/opt/debot` means this process
+  can never load the Robinhood trading bot's `/opt/debot/lib/libsigner.so`
+  at runtime, so `engine-b-live.service` sets
+  `LD_LIBRARY_PATH=/opt/engine-b-live/lib` and points at this dedicated
+  copy instead)
 - Secrets (root:engine-b-live, this identity only): `/etc/engine-b-live/live-secrets.env`
 - State (this identity, writable): `/var/lib/engine-b-live/` (`risk_state.json`,
   `status.json`, `pnl.jsonl`, `KILL_SWITCH`, `RISK_ACK_ENGINE-B-LIVE`)
