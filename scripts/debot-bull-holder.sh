@@ -26,4 +26,12 @@ mkdir -p "$STATE_DIR/bull_holder"
 export BULL_HOLDER_BASE_DIR="$STATE_DIR"
 export BULL_HOLDER_DRY_RUN="${BULL_HOLDER_DRY_RUN:-true}"
 
+# libsigner.so for Lighter Go bindings (same convention as
+# debot-pair-canary.sh / debot-pair-btceth.sh, but from this bot's own
+# isolated lib/ dir rather than the shared /opt/debot/lib/).
+if [ -f "$STATE_DIR/lib/libsigner.so" ]; then
+    export LIGHTER_GO_PATH="$STATE_DIR/lib"
+    export LD_LIBRARY_PATH="${LIGHTER_GO_PATH}:${LD_LIBRARY_PATH:-}"
+fi
+
 exec "$STATE_DIR/bin/bull-holder"
