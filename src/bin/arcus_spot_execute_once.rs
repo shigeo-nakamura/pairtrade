@@ -422,22 +422,6 @@ async fn resume_active_live_tick_attempt(
     ))
 }
 
-/// Read-only diagnostic for an active execution attempt whose live-tick
-/// pending-plan evidence was lost or overwritten (bot-strategy#869): scans an
-/// operator-supplied, already fetch-and-verified durable event export
-/// (`scripts/fetch_arcus_live_tick_events.sh`) for the `WouldRotate` plan
-/// that produced the attempt, and reports it if -- and only if -- recomputing
-/// `approval_digest` against the *current* config reproduces exactly the
-/// digest the ledger recorded at dispatch time. That digest match is the same
-/// check `live_tick_active_recovery_plan` performs; passing it here is proof
-/// this is genuinely the plan that was signed and dispatched, not a
-/// same-shaped guess.
-///
-/// This command never writes the ledger, the runtime checkpoint, or the
-/// pending-plan file. On a confirmed match it prints the plan JSON an
-/// operator can choose to write to the pending-plan path themselves, after
-/// review, to let the ordinary resume path (auto-resume / next live-tick)
-/// finish reconciliation on its own.
 /// Read-only preview for `archive-rejected-apply` (bot-strategy#898):
 /// reports the ledger's active attempt and whether it is eligible to be
 /// archived, without mutating anything. Run this first, then pass the
@@ -478,24 +462,24 @@ fn build_archive_rejected_report(config: &ArcusSpotExecuteOnceConfig) -> Result<
         }));
     };
 
-    let eligible = active.phase == ArcusSpotExecutionPhase::Rejected && active.tx_hash.is_none();
+    // Dry-run the real guard on a throwaway clone rather than hand-duplicating
+    // archive_rejected()'s phase/tx_hash conditions here: if that method's
+    // eligibility rule ever changes, this report (both the status and the
+    // reason) follows automatically instead of silently drifting into
+    // telling an operator something is "eligible_to_archive" that apply
+    // would then refuse (matching how manual_reconcile_report runs the real
+    // commit logic against a clone to derive "ready", not a hand-written
+    // approximation of it).
+    let ineligible_reason = ledger.clone().archive_rejected().err();
+    let eligible = ineligible_reason.is_none();
     Ok(serde_json::json!({
         "status": if eligible { "eligible_to_archive" } else { "not_eligible" },
         "sequence": active.sequence,
-        "phase": format!("{:?}", active.phase),
+        "phase": active.phase,
         "tx_hash": active.tx_hash,
         "detail": active.detail,
         "intent": active.intent,
-        "reason_if_ineligible": if eligible {
-            None
-        } else {
-            Some(
-                "only a Rejected attempt with no tx_hash (nothing ever dispatched on-chain) can \
-                 be archived by archive-rejected-apply; Dispatching/Unknown/Failed attempts, or \
-                 a Rejected one with a tx_hash, need repair-report/manual-reconcile instead"
-                    .to_string(),
-            )
-        },
+        "reason_if_ineligible": ineligible_reason.map(|error| format!("{error:#}")),
     }))
 }
 
@@ -558,7 +542,11 @@ fn commit_archive_rejected(
     Ok(serde_json::json!({
         "archived": {
             "sequence": active.sequence,
-            "phase": format!("{:?}", active.phase),
+            "idempotency_key": active.idempotency_key,
+            "phase": active.phase,
+            "prepared_at": active.prepared_at,
+            "dispatched_at": active.dispatched_at,
+            "updated_at": active.updated_at,
             "detail": active.detail,
             "intent": active.intent,
         },
@@ -566,6 +554,22 @@ fn commit_archive_rejected(
     }))
 }
 
+/// Read-only diagnostic for an active execution attempt whose live-tick
+/// pending-plan evidence was lost or overwritten (bot-strategy#869): scans an
+/// operator-supplied, already fetch-and-verified durable event export
+/// (`scripts/fetch_arcus_live_tick_events.sh`) for the `WouldRotate` plan
+/// that produced the attempt, and reports it if -- and only if -- recomputing
+/// `approval_digest` against the *current* config reproduces exactly the
+/// digest the ledger recorded at dispatch time. That digest match is the same
+/// check `live_tick_active_recovery_plan` performs; passing it here is proof
+/// this is genuinely the plan that was signed and dispatched, not a
+/// same-shaped guess.
+///
+/// This command never writes the ledger, the runtime checkpoint, or the
+/// pending-plan file. On a confirmed match it prints the plan JSON an
+/// operator can choose to write to the pending-plan path themselves, after
+/// review, to let the ordinary resume path (auto-resume / next live-tick)
+/// finish reconciliation on its own.
 fn repair_report(config_path: &Path, events_jsonl_path: &Path) -> Result<()> {
     let report = build_repair_report(config_path, events_jsonl_path)?;
     println!(
@@ -7891,6 +7895,10 @@ runtime:
         let report = build_archive_rejected_report(&config).unwrap();
         assert_eq!(report["status"], "eligible_to_archive");
         assert_eq!(report["reason_if_ineligible"], serde_json::Value::Null);
+        // Must serialize via ArcusSpotExecutionPhase's own snake_case
+        // Serialize impl, not Debug's PascalCase spelling, to match every
+        // other report's "phase" convention (build_repair_report et al.).
+        assert_eq!(report["phase"], "rejected");
     }
 
     #[test]
