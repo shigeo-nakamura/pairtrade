@@ -25,7 +25,7 @@ pub(crate) mod prom;
 mod regime;
 mod rehedge;
 mod risk_io;
-mod s3_mirror;
+pub mod s3_mirror;
 mod sentinel;
 mod sizing;
 mod state;

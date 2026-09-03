@@ -87,7 +87,10 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use debot::pairtrade::s3_mirror::S3Mirror;
 
 fn init_logger() {
     let offset_seconds = std::env::var("TIMEZONE_OFFSET")
@@ -376,12 +379,36 @@ struct RiskState {
     peak_equity: f64,
     #[serde(default)]
     realized_pnl_session: f64,
+    /// Realized PnL since the last `roll_day_if_needed` date change, reset
+    /// to 0.0 there -- unlike `realized_pnl_session` (lifetime-since-halt-
+    /// clear, never reset by a day roll), this is what the dashboard's
+    /// `pnl_today` field means. Fixed after review caught it defaulting to
+    /// a copy of the lifetime total (bot-strategy#866 PR #255 review) --
+    /// same bug class `pairtrade::status.rs`'s `pnl_today`/`pnl_today_date`
+    /// split was introduced to fix (single-instance -> A/B/C cutover
+    /// incident referenced there).
+    #[serde(default)]
+    pnl_today: f64,
+    /// UTC date (YYYY-MM-DD) `pnl_today` was last reset for. Persisted
+    /// (unlike the engine's in-memory-only `current_date`) so a same-day
+    /// restart can tell "still today" apart from a genuine day change --
+    /// see `roll_day_if_needed`.
+    #[serde(default)]
+    pnl_today_date: Option<String>,
     #[serde(default)]
     total_trades: u64,
     #[serde(default)]
     total_wins: u64,
     #[serde(default)]
     max_dd_bps: f64,
+    /// Same running-max-drawdown as `max_dd_bps`, in USD instead of bps
+    /// (peak_equity - current_equity at each new max) -- the dashboard's
+    /// `trade_stats.max_dd` expects a dollar amount, matching
+    /// `pairtrade::mod.rs`'s `peak_pnl - total_pnl` convention.
+    /// `max_dd_bps` stays authoritative for the `max_session_loss_bps`
+    /// halt gate below; this field exists purely for dashboard display.
+    #[serde(default)]
+    max_dd_usd: f64,
     #[serde(default)]
     session_halted: bool,
     #[serde(default)]
@@ -444,6 +471,15 @@ struct DaySnapshot {
     t1_prices: Option<HashMap<String, f64>>,
     entered: bool,
     exited: bool,
+    /// True when `entered` was restored from `RiskState.last_session_date`
+    /// after a restart (roll_day_if_needed's recovery branch), rather than
+    /// decided by this process's own `maybe_enter` this run. `position` is
+    /// in-memory only and never persisted/reconciled with the real
+    /// exchange (see this file's KNOWN GAPS), so it cannot be trusted for
+    /// the rest of the day once this is true -- drives `positions_ready`
+    /// in the dashboard status payload (bot-strategy#866 PR #255 review
+    /// round 2).
+    restart_recovered: bool,
 }
 
 /// Snapshot `prices` into `day.t0_prices` the first time `now_us` reaches
@@ -476,6 +512,7 @@ struct EngineBLiveEngine {
     position: Option<OpenPosition>,
     state: RiskState,
     last_status_write_us: i64,
+    status_s3_mirror: Option<Arc<S3Mirror>>,
 }
 
 impl EngineBLiveEngine {
@@ -521,6 +558,17 @@ impl EngineBLiveEngine {
         }
         self.current_date = Some(today);
         self.day = DaySnapshot::default();
+        // Keyed off the *persisted* pnl_today_date, not the in-memory
+        // current_date this function just reset -- current_date is always
+        // None right after process start (main() initializes it that way),
+        // so comparing against it would treat a same-day restart as a new
+        // day and wipe pnl_today back to 0.0 for the rest of the day
+        // (bot-strategy#866 PR #255 review round 2, bug 1).
+        let today_str = today.to_string();
+        if self.state.pnl_today_date.as_deref() != Some(today_str.as_str()) {
+            self.state.pnl_today = 0.0;
+            self.state.pnl_today_date = Some(today_str.clone());
+        }
         self.window = resolve_session_window(&self.calendar, today);
         match self.window {
             Some((t0, t1, t2)) => log::info!(
@@ -532,9 +580,10 @@ impl EngineBLiveEngine {
                 self.calendar.calendar_version
             ),
         }
-        if self.state.last_session_date.as_deref() == Some(&today.to_string()) {
+        if self.state.last_session_date.as_deref() == Some(today_str.as_str()) {
             log::info!("[DAY] {today} already acted on before a restart; not re-entering");
             self.day.entered = true;
+            self.day.restart_recovered = true;
         }
     }
 
@@ -732,6 +781,7 @@ impl EngineBLiveEngine {
         );
 
         self.state.realized_pnl_session += pnl;
+        self.state.pnl_today += pnl;
         self.state.total_trades += 1;
         if pnl > 0.0 {
             self.state.total_wins += 1;
@@ -740,8 +790,12 @@ impl EngineBLiveEngine {
         if current_equity > self.state.peak_equity {
             self.state.peak_equity = current_equity;
         }
+        let dd_usd = self.state.peak_equity - current_equity;
+        if dd_usd > self.state.max_dd_usd {
+            self.state.max_dd_usd = dd_usd;
+        }
         let dd_bps = if self.state.peak_equity > 0.0 {
-            (self.state.peak_equity - current_equity) / self.state.peak_equity * 10_000.0
+            dd_usd / self.state.peak_equity * 10_000.0
         } else {
             0.0
         };
@@ -798,25 +852,84 @@ impl EngineBLiveEngine {
             return;
         }
         self.last_status_write_us = now_us;
+        // 0-100 scale, not 0.0-1.0 -- debot-dashboard's web/app.js renders
+        // this as `${win_rate.toFixed(0)}%` with no *100 on the frontend,
+        // matching pairtrade::status.rs::set_trade_stats_totals.
+        let win_rate = if self.state.total_trades > 0 {
+            self.state.total_wins as f64 / self.state.total_trades as f64 * 100.0
+        } else {
+            0.0
+        };
+        let positions = match &self.position {
+            Some(pos) => vec![serde_json::json!({
+                "symbol": self.cfg.us_primary_symbol,
+                "side": match pos.side {
+                    dex_connector::OrderSide::Long => "long",
+                    dex_connector::OrderSide::Short => "short",
+                },
+                "size": pos.size.to_string(),
+                "entry_price": pos.entry_price.to_string(),
+            })],
+            None => vec![],
+        };
         let status = serde_json::json!({
+            // debot-dashboard's StatusData (main.go) fields -- kept in
+            // sync manually since that struct lives in a different repo;
+            // unknown extra fields below are ignored by Go's
+            // json.Unmarshal, so the engine_b_live-specific fields and
+            // the dashboard-shaped fields coexist in one document.
+            "ts": now_us / 1_000_000,
+            "updated_at": Utc::now().to_rfc3339(),
+            "id": self.cfg.instance_id,
+            "dex": "lighter",
+            "dry_run": self.cfg.dry_run,
+            "has_position": self.position.is_some(),
+            "position_count": self.position.is_some() as i32,
+            // false exactly when today's `entered` flag was restored from
+            // persisted state after a restart -- our own in-memory
+            // `position` was lost in that case (never persisted, see
+            // KNOWN GAPS), so debot-dashboard's "positions_ready !==
+            // false means trustworthy" read must not be told otherwise.
+            "positions_ready": !self.day.restart_recovered,
+            "positions": positions,
+            "pnl_total": self.state.realized_pnl_session,
+            "pnl_today": self.state.pnl_today,
+            "pnl_source": "engine_b_live_risk_state",
+            "kill_switch_active": self.kill_switch_engaged(),
+            "trade_stats": {
+                "trades": self.state.total_trades,
+                "wins": self.state.total_wins,
+                "win_rate": win_rate,
+                "max_dd": self.state.max_dd_usd,
+                "pnl": self.state.realized_pnl_session,
+            },
+            // engine_b_live-specific fields, not part of debot-dashboard's
+            // schema -- ignored by the Go backend, useful for
+            // journalctl/manual inspection and any future dedicated panel.
             "ts_us": now_us,
             "instance_id": self.cfg.instance_id,
-            "dry_run": self.cfg.dry_run,
             "current_date": self.current_date.map(|d| d.to_string()),
             "window": self.window,
-            "has_position": self.position.is_some(),
             "day_entered": self.day.entered,
             "day_exited": self.day.exited,
+            "restart_recovered": self.day.restart_recovered,
             "session_halted": self.state.session_halted,
             "session_halt_reason": self.state.session_halt_reason,
             "realized_pnl_session": self.state.realized_pnl_session,
+            "pnl_today_date": self.state.pnl_today_date,
             "total_trades": self.state.total_trades,
             "total_wins": self.state.total_wins,
             "max_dd_bps": self.state.max_dd_bps,
+            "max_dd_usd": self.state.max_dd_usd,
             "kill_switch": self.kill_switch_engaged(),
             "calendar_version": self.calendar.calendar_version,
         });
         atomic_write_json(&self.cfg.status_path, &status);
+        if let Some(mirror) = &self.status_s3_mirror {
+            if let Ok(body) = serde_json::to_vec(&status) {
+                mirror.put_async("status.json", body);
+            }
+        }
     }
 }
 
@@ -925,6 +1038,7 @@ async fn main() -> Result<()> {
         position: None,
         state,
         last_status_write_us: 0,
+        status_s3_mirror: S3Mirror::from_env(),
     };
 
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(5));

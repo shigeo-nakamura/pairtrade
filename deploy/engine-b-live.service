@@ -22,6 +22,12 @@ RuntimeDirectoryMode=0750
 EnvironmentFile=/opt/engine-b-live/live-config.env
 EnvironmentFile=/etc/engine-b-live/live-secrets.env
 Environment=RUST_LOG=info
+# Mirrors status.json to the same debot-dashboard S3 bucket freq/b use
+# (bot-strategy#866 dashboard panel), under its own key prefix so it
+# never collides with their status files. Non-secret -- see
+# src/bin/engine_b_live.rs's StatusS3Mirror for the write path.
+Environment=STATUS_S3_BUCKET=debot-dashboard
+Environment=STATUS_S3_KEY_PREFIX=debot/status/engine-b-live
 # The Lighter SDK signer shared library (libsigner.so) lives under
 # /opt/debot/lib on this host for the Robinhood trading bot, but
 # InaccessiblePaths=/opt/debot below means this identity can never load it
