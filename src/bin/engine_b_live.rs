@@ -832,7 +832,7 @@ impl EngineBLiveEngine {
                     "[ENTRY] side={side} epsilon={epsilon:.5} price={price:.4} notional=${notional_usd:.0} size={filled_f:.6}"
                 );
                 send_notification(
-                    format!("Engine B ENTRY {} {}", self.cfg.us_primary_symbol, side),
+                    format!("Han Bridge ENTRY {} {}", self.cfg.us_primary_symbol, side),
                     format!(
                         "epsilon={epsilon:.5} threshold={:.5} price={price:.4} notional=${notional_usd:.0} dry_run={}",
                         self.cfg.epsilon_threshold, self.cfg.dry_run
@@ -941,7 +941,7 @@ impl EngineBLiveEngine {
             }),
         );
         send_notification(
-            format!("Engine B EXIT {} pnl=${pnl:.2}", self.cfg.us_primary_symbol),
+            format!("Han Bridge EXIT {} pnl=${pnl:.2}", self.cfg.us_primary_symbol),
             format!(
                 "entry={:.4} exit={exit_price:.4} size={:.6} dry_run={}",
                 pos.entry_price, pos.size, self.cfg.dry_run
