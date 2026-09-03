@@ -598,7 +598,9 @@ jobs:
               "echo '__ENGINE_B_LIVE_SHA256__  __INSTALL_DIR__/bin/engine_b_live' | sha256sum -c -",
               "sudo chmod 755 __INSTALL_DIR__/bin/engine_b_live",
               "aws s3 cp s3://__S3_BUCKET__/deploy/engine-b-live.service __INSTALL_DIR__/deploy/engine-b-live.service",
-              "sudo bash __INSTALL_DIR__/scripts/install_engine_b_live.sh"
+              "aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so __INSTALL_DIR__/deploy/engine-b-live-libsigner.so",
+              "echo '__LIBSIGNER_SHA256__  __INSTALL_DIR__/deploy/engine-b-live-libsigner.so' | sha256sum -c -",
+              "sudo env ENGINE_B_LIVE_LIBSIGNER_SOURCE=__INSTALL_DIR__/deploy/engine-b-live-libsigner.so bash __INSTALL_DIR__/scripts/install_engine_b_live.sh"
             ]
           }
           JSON

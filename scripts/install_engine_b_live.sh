@@ -10,6 +10,12 @@ set -euo pipefail
 INSTALL_DIR=${ENGINE_B_LIVE_INSTALL_DIR:-/opt/engine-b-live}
 SECRETS_DIR=${ENGINE_B_LIVE_SECRETS_DIR:-/etc/engine-b-live}
 BINARY_SOURCE=${ENGINE_B_LIVE_BINARY_SOURCE:-/opt/debot/bin/engine_b_live}
+# The Lighter SDK's signer shared library. engine_b_live links against it
+# (via dex-connector's lighter-sdk feature) exactly like the main `debot`
+# binary does, but this unit's own InaccessiblePaths=/opt/debot means it
+# can never load /opt/debot/lib/libsigner.so at runtime -- it needs its own
+# copy plus LD_LIBRARY_PATH pointed at it (see deploy/engine-b-live.service).
+LIBSIGNER_SOURCE=${ENGINE_B_LIVE_LIBSIGNER_SOURCE:-/opt/debot/lib/libsigner.so}
 CALENDAR_SOURCE=${ENGINE_B_LIVE_CALENDAR_SOURCE:-/opt/debot/configs/engine-b/trading_calendar.json}
 CONFIG_SOURCE=${ENGINE_B_LIVE_CONFIG_SOURCE:-/opt/debot/configs/engine-b/live.json}
 UNIT_SOURCE_DIR=${ENGINE_B_LIVE_UNIT_SOURCE_DIR:-/opt/debot/deploy}
@@ -17,7 +23,7 @@ SERVICE_USER=engine-b-live
 SERVICE_GROUP=engine-b-live
 STATE_DIR=/var/lib/engine-b-live
 
-for source in "$BINARY_SOURCE" "$CALENDAR_SOURCE" "$CONFIG_SOURCE" "$UNIT_SOURCE_DIR/engine-b-live.service"; do
+for source in "$BINARY_SOURCE" "$LIBSIGNER_SOURCE" "$CALENDAR_SOURCE" "$CONFIG_SOURCE" "$UNIT_SOURCE_DIR/engine-b-live.service"; do
   if [ ! -f "$source" ]; then
     echo "Engine B live runtime source is missing: $source" >&2
     exit 1
@@ -32,8 +38,9 @@ if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     --shell /sbin/nologin --no-create-home "$SERVICE_USER"
 fi
 
-install -d -o root -g "$SERVICE_GROUP" -m 0750 "$INSTALL_DIR" "$INSTALL_DIR/bin"
+install -d -o root -g "$SERVICE_GROUP" -m 0750 "$INSTALL_DIR" "$INSTALL_DIR/bin" "$INSTALL_DIR/lib"
 install -o root -g "$SERVICE_GROUP" -m 0550 "$BINARY_SOURCE" "$INSTALL_DIR/bin/engine_b_live"
+install -o root -g "$SERVICE_GROUP" -m 0440 "$LIBSIGNER_SOURCE" "$INSTALL_DIR/lib/libsigner.so"
 install -o root -g "$SERVICE_GROUP" -m 0440 "$CALENDAR_SOURCE" "$INSTALL_DIR/trading_calendar.json"
 
 # Non-secret tuning config: configs/engine-b/live.json (git-committed) ->
