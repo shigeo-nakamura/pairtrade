@@ -1,7 +1,11 @@
 #[cfg(any(feature = "lighter-sdk", feature = "hyperliquid-sdk"))]
 use debot_utils::decrypt_data_with_kms;
 use rust_decimal::Error as DecimalParseError;
-#[cfg(any(feature = "lighter-sdk", feature = "extended-sdk", feature = "hyperliquid-sdk"))]
+#[cfg(any(
+    feature = "lighter-sdk",
+    feature = "extended-sdk",
+    feature = "hyperliquid-sdk"
+))]
 use std::env;
 use std::fmt;
 use std::num::{ParseFloatError, ParseIntError};

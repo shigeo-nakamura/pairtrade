@@ -19,7 +19,8 @@
 //! insurance, P3 no whipsaw). Phase 0 script:
 //! bot-strategy `scripts/strategy_probes/bull_holder_893/`.
 //!
-//! Operator surface (files under `BULL_HOLDER_BASE_DIR`, default /opt/debot):
+//! Operator surface (files under `BULL_HOLDER_BASE_DIR`, default
+//! /opt/debot-bull-holder — isolated from the pairtrade A/B/C tree):
 //! - `bull_holder/ARM`        touch → arm (consumed)
 //! - `bull_holder/KILL_SWITCH` exists → no arming / no stop re-placement
 //!   (protective exits still run)
@@ -151,7 +152,7 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         let instance_id = env_string("BULL_HOLDER_INSTANCE_ID", "bull-holder");
-        let base_dir = PathBuf::from(env_string("BULL_HOLDER_BASE_DIR", "/opt/debot"));
+        let base_dir = PathBuf::from(env_string("BULL_HOLDER_BASE_DIR", "/opt/debot-bull-holder"));
         let dir = base_dir.join("bull_holder");
         let symbols: Vec<String> = env_string("BULL_HOLDER_SYMBOLS", "BTC,ETH")
             .split(',')

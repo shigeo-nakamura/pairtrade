@@ -1,0 +1,438 @@
+name: Deploy Bull-Mode Holder
+
+# bot-strategy#893/#894/#895: builds the bull-holder binary, which needs
+# BOTH lighter-sdk (default, for the Lighter perp leg + its Go libsigner
+# dependency) AND hyperliquid-sdk (for the Hyperliquid spot leg) — a feature
+# combination the main ci.yml pipeline does not build, since its shared
+# /opt/debot/bin/debot artifact stays on default features only. Kept as its
+# own workflow (same reasoning as deploy-hyperliquid-observer.yml) so this
+# prototype's build/deploy never touches the artifact A/B/C/canary run.
+#
+# workflow_dispatch only — not part of the ci.yml push pipeline, and the
+# deploy step never starts or restarts the systemd unit: the operator starts
+# it manually (bot-strategy#269 pattern), and only after placing real
+# Hyperliquid/Lighter credentials in debot-bull-holder.env on the host (this
+# workflow deploys the binary, service unit, and .env.example only — never a
+# real credentials file).
+
+on:
+  workflow_dispatch:
+    inputs:
+      dex_connector_ref:
+        description: "Dex-connector ref/tag (default: follow the latest tag)"
+        required: false
+        type: string
+      target:
+        description: "build only or deploy the verified artifact"
+        required: true
+        default: build-only
+        type: choice
+        options:
+          - build-only
+          - deploy
+
+concurrency:
+  group: debot-bull-holder
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+  INSTALL_DIR: /opt/debot-bull-holder
+  # Kept in sync with ci.yml's pin by resolve-ref below (falls back to this
+  # only if the tag-discovery API call fails) — not a static pin to forget
+  # on a dex-connector bump (bot-strategy#865 lesson).
+  DEX_CONNECTOR_REF: v4.7.18
+  LIGHTER_GO_REF: v1.0.2
+  AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
+  RUST_TOOLCHAIN: 1.94.1
+  # S3 keys below deliberately stay under the "debot/" prefix: the
+  # Frankfurt instance role (EC2-SSM, inline policy
+  # EC2-SSM-DebotDashboard-Access) only allows s3:GetObject/PutObject on
+  # debot/*, debot-extended/*, debot-mm-extended/*, debot-xvenue-arb/*,
+  # slow-mm/*, deploy/*, stock-signal-bot/* -- a new top-level prefix
+  # would need an IAM change on that shared role before the host-side
+  # `aws s3 cp` in the deploy step could work.
+
+jobs:
+  resolve-ref:
+    runs-on: ubuntu-latest
+    outputs:
+      dex_connector_ref: ${{ steps.resolve.outputs.dex_connector_ref }}
+    steps:
+      - name: Resolve dex-connector ref
+        id: resolve
+        env:
+          DEFAULT_REF: ${{ env.DEX_CONNECTOR_REF }}
+          INPUT_REF: ${{ github.event.inputs.dex_connector_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          default_ref = os.environ.get("DEFAULT_REF", "").strip()
+          input_ref = (os.environ.get("INPUT_REF") or "").strip()
+          token = os.environ.get("GH_TOKEN", "")
+
+          ref = input_ref or default_ref
+          if not input_ref and default_ref.startswith("v"):
+              try:
+                  req = urllib.request.Request(
+                      "https://api.github.com/repos/shigeo-nakamura/dex-connector/tags?per_page=1",
+                      headers={
+                          "Accept": "application/vnd.github+json",
+                          "Authorization": f"Bearer {token}",
+                      },
+                  )
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      data = json.load(resp)
+                  if data and "name" in data[0]:
+                      ref = data[0]["name"]
+              except Exception:
+                  pass
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"dex_connector_ref={ref}\n")
+          PY
+
+  test:
+    name: Test bull-holder (x86_64)
+    needs: resolve-ref
+    runs-on: ubuntu-latest
+    env:
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+      LIGHTER_GO_PATH: ${{ github.workspace }}/lighter-go
+      LD_LIBRARY_PATH: ${{ github.workspace }}/lighter-go
+    defaults:
+      run:
+        working-directory: debot
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Checkout dex-connector
+        uses: actions/checkout@v5
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ env.DEX_CONNECTOR_REF }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Checkout lighter-go
+        uses: actions/checkout@v5
+        with:
+          repository: elliottech/lighter-go
+          ref: ${{ env.LIGHTER_GO_REF }}
+          path: lighter-go
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.23.x"
+          cache: true
+          cache-dependency-path: lighter-go/go.sum
+
+      - name: Build libsigner
+        run: go build -buildmode=c-shared -trimpath -o libsigner.so ./sharedlib
+        working-directory: ${{ github.workspace }}/lighter-go
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            debot -> target
+          key: bull-holder
+
+      - name: Cargo check (bull-holder, lib + bin)
+        run: cargo check --locked --features hyperliquid-sdk --lib --bin bull-holder
+
+      - name: Cargo test (lib)
+        run: cargo test --locked --features hyperliquid-sdk --lib
+
+      - name: Cargo test (bull-holder)
+        run: cargo test --locked --features hyperliquid-sdk --bin bull-holder
+
+  build:
+    name: Build bull-holder (native arm64)
+    needs: [resolve-ref, test]
+    runs-on: ubuntu-24.04-arm
+    # A feature branch may benchmark build-only, but only a protected branch
+    # may publish or deploy.
+    if: github.event_name != 'workflow_dispatch' || inputs.target == 'build-only' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    timeout-minutes: 60
+    env:
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+    outputs:
+      binary_sha256: ${{ steps.package.outputs.binary_sha256 }}
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Checkout dex-connector
+        uses: actions/checkout@v5
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ env.DEX_CONNECTOR_REF }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Checkout lighter-go
+        uses: actions/checkout@v5
+        with:
+          repository: elliottech/lighter-go
+          ref: ${{ env.LIGHTER_GO_REF }}
+          path: lighter-go
+
+      - name: Resolve build image
+        id: build_image
+        run: |
+          docker pull --platform linux/arm64 "${AL2023_IMAGE}"
+          AL2023_IMAGE_RESOLVED=$(docker image inspect --format="{{index .RepoDigests 0}}" "${AL2023_IMAGE}")
+          echo "AL2023_IMAGE_RESOLVED=${AL2023_IMAGE_RESOLVED}" >> "${GITHUB_ENV}"
+          BUILD_IMAGE_CACHE_KEY=$(printf "%s" "${AL2023_IMAGE_RESOLVED}" | sha256sum)
+          echo "cache_key=${BUILD_IMAGE_CACHE_KEY%% *}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache libsigner (native arm64)
+        id: cache_libsigner
+        uses: actions/cache@v5
+        with:
+          path: lighter-go/build/libsigner.so
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('lighter-go/go.sum') }}
+
+      - name: Build libsigner in AL2023 (native arm64)
+        if: steps.cache_libsigner.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p lighter-go/build
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}/lighter-go:/go/src/sdk" \
+            -w /go/src/sdk \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; dnf -y install golang gcc; CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib; chown -R \${HOST_UID}:\${HOST_GID} /go/src/sdk/build"
+
+      - name: Save libsigner cache (native arm64)
+        if: steps.cache_libsigner.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: lighter-go/build/libsigner.so
+          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('lighter-go/go.sum') }}
+
+      - name: Cache cargo (native arm64, bull-holder feature set)
+        id: cache_cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            debot/target
+          # Distinct from ci.yml's cargo-arm64-* keys and the hl-observer's
+          # cargo-hl-* keys: this feature set (lighter-sdk + hyperliquid-sdk
+          # together) builds a different target/ than either.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-bull-holder-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('debot/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-bull-holder-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-
+
+      - name: Build bull-holder in AL2023 (native arm64)
+        id: build_bull_holder
+        run: |
+          mkdir -p .cache/cargo/registry .cache/cargo/git .cache/cargo/bin .cache/rustup debot/target
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e CARGO_HOME=/workspace/.cache/cargo \
+            -e RUSTUP_HOME=/workspace/.cache/rustup \
+            -e CARGO_INCREMENTAL=0 \
+            -e LIGHTER_GO_PATH=/workspace/lighter-go/build \
+            -e LD_LIBRARY_PATH=/workspace/lighter-go/build \
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; grep VERSION_ID /etc/os-release; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN}; else /workspace/.cache/cargo/bin/rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal; /workspace/.cache/cargo/bin/rustup default ${RUST_TOOLCHAIN}; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --features hyperliquid-sdk --bin bull-holder; chown -R \${HOST_UID}:\${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+
+      - name: Verify and package artifact
+        id: package
+        run: |
+          set -euo pipefail
+          BINARY=debot/target/release/bull-holder
+          file "${BINARY}"
+          file "${BINARY}" | grep -q aarch64
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}/${BINARY}:/artifacts/bull-holder:ro" \
+            ${AL2023_IMAGE_RESOLVED} \
+            /bin/bash -lc "set -euo pipefail; if ldd /artifacts/bull-holder | grep -q not.found; then exit 1; fi; ldd /artifacts/bull-holder"
+
+          mkdir -p dist
+          install -m 0755 "${BINARY}" dist/bull-holder
+          test "$(stat -c %a dist/bull-holder)" = 755
+          BINARY_SHA256=$(sha256sum dist/bull-holder | cut -d " " -f1)
+          CARGO_LOCK_SHA256=$(sha256sum debot/Cargo.lock | cut -d " " -f1)
+          DEX_CONNECTOR_SHA=$(git -C dex-connector rev-parse HEAD)
+          (cd dist && sha256sum bull-holder > bull-holder.sha256)
+          jq -n \
+            --arg source_sha "${GITHUB_SHA}" \
+            --arg dex_connector_sha "${DEX_CONNECTOR_SHA}" \
+            --arg binary_sha256 "${BINARY_SHA256}" \
+            --arg cargo_lock_sha256 "${CARGO_LOCK_SHA256}" \
+            --arg rust_toolchain "${RUST_TOOLCHAIN}" \
+            --arg build_image "${AL2023_IMAGE_RESOLVED}" \
+            --arg github_run_id "${GITHUB_RUN_ID}" \
+            --arg github_run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            '{schema_version: 1, artifact: "bull-holder", architecture: "aarch64", feature_set: "lighter-sdk+hyperliquid-sdk", source_sha: $source_sha, dex_connector_sha: $dex_connector_sha, cargo_lock_sha256: $cargo_lock_sha256, binary_sha256: $binary_sha256, mode: "0755", rust_toolchain: $rust_toolchain, build_image: $build_image, github_run_id: $github_run_id, github_run_attempt: $github_run_attempt}' > dist/manifest.json
+          echo "binary_sha256=${BINARY_SHA256}" >> "${GITHUB_OUTPUT}"
+          (cd dist && sha256sum -c bull-holder.sha256)
+          jq . dist/manifest.json
+
+      - name: Fix cargo cache permissions
+        if: steps.build_bull_holder.outcome == 'success'
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
+            sudo chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
+          else
+            chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target
+            chmod -R u+rwX,go+rX .cache/cargo .cache/rustup debot/target
+          fi
+
+      - name: Save cargo cache (native arm64)
+        if: steps.build_bull_holder.outcome == 'success' && steps.cache_cargo.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .cache/cargo/registry
+            .cache/cargo/git
+            .cache/cargo/bin
+            .cache/rustup
+            debot/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-bull-holder-${{ env.RUST_TOOLCHAIN }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('debot/Cargo.lock') }}
+
+      - name: Upload verified deploy bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bull-holder-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            dist/bull-holder
+            dist/bull-holder.sha256
+            dist/manifest.json
+            debot/scripts/debot-bull-holder.sh
+            debot/scripts/debot-bull-holder.env.example
+            debot/deploy/debot-bull-holder.service
+
+  deploy:
+    name: Deploy verified bull-holder
+    needs: build
+    if: inputs.target == 'deploy' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    environment: debot
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download verified deploy bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: bull-holder-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload artifacts to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+        run: |
+          aws s3 cp dist/bull-holder "s3://${S3_BUCKET}/debot/bull-holder/bull-holder"
+          aws s3 cp dist/bull-holder.sha256 "s3://${S3_BUCKET}/debot/bull-holder/bull-holder.sha256"
+          aws s3 cp dist/manifest.json "s3://${S3_BUCKET}/debot/bull-holder/manifest.json"
+          # Self-contained deploy: ship the wrapper + example env + unit too
+          # so a dispatch run does not depend on a prior ci.yml scripts sync.
+          # The REAL credentials env file is never touched by this workflow.
+          aws s3 cp debot/scripts/debot-bull-holder.sh "s3://${S3_BUCKET}/debot/scripts/debot-bull-holder.sh"
+          aws s3 cp debot/scripts/debot-bull-holder.env.example "s3://${S3_BUCKET}/debot/scripts/debot-bull-holder.env.example"
+          aws s3 cp debot/deploy/debot-bull-holder.service "s3://${S3_BUCKET}/deploy/debot-bull-holder.service"
+
+      - name: Deploy via SSM (no service start)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
+          INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
+          BINARY_SHA256: ${{ needs.build.outputs.binary_sha256 }}
+        run: |
+          cat > /tmp/ssm-params.json <<'JSON'
+          {
+            "commands": [
+              "set -e",
+              "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/bull_holder",
+              "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/bull-holder /tmp/bull-holder",
+              "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/bull-holder.sha256 /tmp/bull-holder.sha256",
+              "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/manifest.json /tmp/bull-holder-manifest.json",
+              "echo __BINARY_SHA256__ /tmp/bull-holder | sha256sum -c - || exit 1",
+              "(cd /tmp && sha256sum -c bull-holder.sha256) || exit 1",
+              "sudo install -o root -g root -m 0755 /tmp/bull-holder __INSTALL_DIR__/bin/bull-holder",
+              "sudo install -o root -g root -m 0644 /tmp/bull-holder-manifest.json __INSTALL_DIR__/manifest.json",
+              "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/bin/bull-holder) = root:root:755 || exit 1",
+              "echo __BINARY_SHA256__ __INSTALL_DIR__/bin/bull-holder | sudo sha256sum -c - || exit 1",
+              "aws s3 cp s3://__S3_BUCKET__/debot/scripts/debot-bull-holder.sh /opt/debot/scripts/debot-bull-holder.sh",
+              "sudo chmod 755 /opt/debot/scripts/debot-bull-holder.sh",
+              "aws s3 cp s3://__S3_BUCKET__/debot/scripts/debot-bull-holder.env.example /opt/debot/scripts/debot-bull-holder.env.example",
+              "/bin/bash -lc 'set -e; svc=debot-bull-holder; aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; sudo systemctl daemon-reload; else rm /tmp/$svc.service; fi'",
+              "test -f /opt/debot/scripts/debot-bull-holder.env || echo 'NOTE: /opt/debot/scripts/debot-bull-holder.env does not exist yet -- the operator must create it from debot-bull-holder.env.example with real Hyperliquid/Lighter credentials before starting the service (bot-strategy#895).'"
+            ]
+          }
+          JSON
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__BINARY_SHA256__|${BINARY_SHA256}|g" /tmp/ssm-params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy debot bull-holder" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          # No service start/restart above, so the command finishes as soon
+          # as the S3 pulls + daemon-reload complete.
+          SSM_DEPLOY_TIMEOUT_SECS=${SSM_DEPLOY_TIMEOUT_SECS:-1800}
+          POLL_INTERVAL_SECS=30
+          deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))
+          while :; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${INSTANCE_ID}" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            case "${STATUS}" in
+              Success)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
+                exit 0 ;;
+              Cancelled|TimedOut|Failed)
+                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
+                echo "##[error]SSM command finished with status ${STATUS}"
+                exit 1 ;;
+              Pending|InProgress|Delayed)
+                : ;;
+              *)
+                echo "Unexpected SSM status: ${STATUS}" ;;
+            esac
+            if [ $(date +%s) -ge ${deadline} ]; then
+              aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text || true
+              echo "##[error]Deploy polling timed out after ${SSM_DEPLOY_TIMEOUT_SECS}s (last status: ${STATUS})"
+              exit 1
+            fi
+            echo "deploy in progress (status=${STATUS}), sleeping ${POLL_INTERVAL_SECS}s..."
+            sleep ${POLL_INTERVAL_SECS}
+          done
