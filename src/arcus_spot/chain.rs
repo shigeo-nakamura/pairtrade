@@ -797,10 +797,17 @@ impl ArcusSpotChainClient {
         let chain_id = self.config.chain_id;
         let (raw, _provider) = self
             .try_providers(|provider| async move {
-                let receipt = provider
-                    .get_transaction_receipt(confirmed_tx_hash)
-                    .await
-                    .context("Arcus confirmed-transaction receipt read failed")?;
+                // Neither read depends on the other's *result* (only on
+                // each having answered before the freshness check below),
+                // so fetch them concurrently rather than paying two
+                // sequential round trips against a provider this whole
+                // change is trying to make reconciliation less latency-
+                // sensitive to.
+                let (receipt, current_block_number) = tokio::join!(
+                    provider.get_transaction_receipt(confirmed_tx_hash),
+                    provider.get_block_number(),
+                );
+                let receipt = receipt.context("Arcus confirmed-transaction receipt read failed")?;
                 let Some(receipt) = receipt else {
                     return Err(ProviderAttemptError::Transient(anyhow::anyhow!(
                         "Arcus provider has not yet indexed confirmed tx {confirmed_tx_hash:#x}"
@@ -859,9 +866,7 @@ impl ArcusSpotChainClient {
                 // context, not the chained source, so this stays safe to
                 // log/propagate unredacted the same way every other error
                 // in this function already is.
-                let current_block_number = provider
-                    .get_block_number()
-                    .await
+                let current_block_number = current_block_number
                     .context("Arcus current block number read failed")
                     .map_err(ProviderAttemptError::Transient)?;
                 if current_block_number < receipt_block_number {
@@ -943,19 +948,30 @@ async fn read_latest_balances_from_provider(
         )));
     }
 
-    let mut transient_error: Option<anyhow::Error> = None;
-    for outcome in [
-        &sell_balance_outcome,
-        &buy_balance_outcome,
-        &gas_balance_outcome,
-    ] {
-        if let ContractCallOutcome::Transport(_) = outcome {
-            transient_error
-                .get_or_insert_with(|| anyhow::anyhow!("Arcus balance read failed (transport)"));
-        }
-    }
-    if let Some(error) = transient_error {
-        return Err(ProviderAttemptError::Transient(error));
+    // Label which field(s) transport-failed rather than collapsing to one
+    // generic message: this is the only signal reconciliation gets once
+    // every configured provider has failed the same way (try_providers
+    // surfaces only the *last* attempt's error) and gas balance reads in
+    // particular have no sell/buy-style Fatal path of their own to narrow
+    // it down otherwise. Deliberately not interpolating the underlying
+    // error's own Display here -- `ProviderError::HTTPError` can carry the
+    // failing request URL, and a bare field label is enough to point an
+    // operator at which read to investigate without risking a leak.
+    let transient_fields: Vec<&str> = [
+        ("sell", &sell_balance_outcome),
+        ("buy", &buy_balance_outcome),
+        ("gas", &gas_balance_outcome),
+    ]
+    .into_iter()
+    .filter_map(|(label, outcome)| {
+        matches!(outcome, ContractCallOutcome::Transport(_)).then_some(label)
+    })
+    .collect();
+    if !transient_fields.is_empty() {
+        return Err(ProviderAttemptError::Transient(anyhow::anyhow!(
+            "Arcus balance read failed (transport): {}",
+            transient_fields.join(", ")
+        )));
     }
 
     Ok(RawBalanceReads {
