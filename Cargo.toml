@@ -66,6 +66,8 @@ debot-utils = "1.0.*"
 
 dex-connector = { path = "../dex-connector", default-features = false }
 
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -99,6 +101,11 @@ hyperliquid-sdk = ["dex-connector/hyperliquid-sdk"]
 [[bin]]
 name = "debot"
 path = "src/main.rs"
+
+[[bin]]
+name = "bull-holder"
+path = "src/bin/bull_holder.rs"
+required-features = ["lighter-sdk", "hyperliquid-sdk"]
 
 [[bin]]
 name = "convert-data"

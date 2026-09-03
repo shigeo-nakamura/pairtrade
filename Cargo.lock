@@ -1369,6 +1369,7 @@ dependencies = [
  "once_cell",
  "prometheus",
  "rand 0.8.5",
+ "reqwest 0.11.27",
  "rpassword",
  "rusoto_core",
  "rusoto_kms",

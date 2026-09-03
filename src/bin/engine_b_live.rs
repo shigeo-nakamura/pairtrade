@@ -347,7 +347,10 @@ impl EngineBLiveConfig {
 
     /// All symbols this process needs price updates for.
     fn all_symbols(&self) -> Vec<String> {
-        let mut symbols = vec![self.kr_primary_symbol.clone(), self.us_primary_symbol.clone()];
+        let mut symbols = vec![
+            self.kr_primary_symbol.clone(),
+            self.us_primary_symbol.clone(),
+        ];
         symbols.extend(self.control_symbols.iter().cloned());
         symbols
     }
@@ -419,7 +422,11 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) {
 }
 
 fn append_pnl_log(path: &Path, record: &serde_json::Value) {
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
         log::warn!("[PNL_LOG] open failed: {}", path.display());
         return;
     };
@@ -492,7 +499,8 @@ impl EngineBLiveEngine {
             );
             self.state.session_halted = false;
             self.state.session_halt_reason = None;
-            self.state.peak_equity = self.state.session_start_equity + self.state.realized_pnl_session;
+            self.state.peak_equity =
+                self.state.session_start_equity + self.state.realized_pnl_session;
             atomic_write_json(&self.cfg.state_path, &self.state);
             if let Err(e) = std::fs::remove_file(&self.cfg.risk_ack_path) {
                 log::warn!(
@@ -584,7 +592,9 @@ impl EngineBLiveEngine {
     }
 
     async fn maybe_enter(&mut self, now_us: i64) {
-        let Some((_t0, t1, _t2)) = self.window else { return };
+        let Some((_t0, t1, _t2)) = self.window else {
+            return;
+        };
         if self.day.entered || now_us < t1 {
             return;
         }
@@ -629,9 +639,16 @@ impl EngineBLiveEngine {
             return;
         }
         let predicted_direction = epsilon.signum() * self.cfg.direction_multiplier.signum();
-        let side = if predicted_direction >= 0.0 { OrderSide::Long } else { OrderSide::Short };
+        let side = if predicted_direction >= 0.0 {
+            OrderSide::Long
+        } else {
+            OrderSide::Short
+        };
         let Some(price) = self.latest_price.get(&self.cfg.us_primary_symbol).copied() else {
-            log::error!("[ENTRY] no current price for {}; cannot size order", self.cfg.us_primary_symbol);
+            log::error!(
+                "[ENTRY] no current price for {}; cannot size order",
+                self.cfg.us_primary_symbol
+            );
             return;
         };
         if price <= 0.0 {
@@ -650,7 +667,11 @@ impl EngineBLiveEngine {
         let size = notional_usd / price;
 
         if !self.cfg.dry_run {
-            if let Err(e) = self.connector.set_leverage(&self.cfg.us_primary_symbol, self.cfg.leverage).await {
+            if let Err(e) = self
+                .connector
+                .set_leverage(&self.cfg.us_primary_symbol, self.cfg.leverage)
+                .await
+            {
                 log::error!("[ENTRY] set_leverage failed: {e:?}");
                 return;
             }
@@ -692,8 +713,12 @@ impl EngineBLiveEngine {
     }
 
     async fn maybe_exit(&mut self, now_us: i64) {
-        let Some((_t0, _t1, t2)) = self.window else { return };
-        let Some(pos) = self.position.clone() else { return };
+        let Some((_t0, _t1, t2)) = self.window else {
+            return;
+        };
+        let Some(pos) = self.position.clone() else {
+            return;
+        };
         if self.day.exited || now_us < t2 {
             return;
         }
@@ -715,7 +740,9 @@ impl EngineBLiveEngine {
     }
 
     fn on_exit(&mut self, exit_price: f64, now_us: i64) {
-        let Some(pos) = self.position.take() else { return };
+        let Some(pos) = self.position.take() else {
+            return;
+        };
         let sign = match pos.side {
             OrderSide::Long => 1.0,
             OrderSide::Short => -1.0,
@@ -779,7 +806,10 @@ impl EngineBLiveEngine {
         );
         send_notification(
             format!("Engine B EXIT {} pnl=${pnl:.2}", self.cfg.us_primary_symbol),
-            format!("entry={:.4} exit={exit_price:.4} size={:.6} dry_run={}", pos.entry_price, pos.size, self.cfg.dry_run),
+            format!(
+                "entry={:.4} exit={exit_price:.4} size={:.6} dry_run={}",
+                pos.entry_price, pos.size, self.cfg.dry_run
+            ),
         );
     }
 
@@ -865,7 +895,8 @@ async fn main() -> Result<()> {
     // review covers -- remove this bail only as a deliberate, reviewed
     // code change once the operator has confirmed DRY_RUN behavior on the
     // real host and is ready to go live (bot-strategy#866).
-    if !cfg.dry_run && std::env::var("ENGINE_B_LIVE_CONFIRM_LIVE").as_deref() != Ok("yes-i-mean-it") {
+    if !cfg.dry_run && std::env::var("ENGINE_B_LIVE_CONFIRM_LIVE").as_deref() != Ok("yes-i-mean-it")
+    {
         anyhow::bail!(
             "ENGINE_B_LIVE_DRY_RUN=false requires ENGINE_B_LIVE_CONFIRM_LIVE=yes-i-mean-it as well \
              (deliberate double confirmation before real orders go out, bot-strategy#866)"
@@ -888,13 +919,24 @@ async fn main() -> Result<()> {
 
     let calendar = TradingCalendar::load(&cfg.trading_calendar_path)
         .context("failed to load trading calendar")?;
-    log::info!("[CALENDAR] loaded calendar_version={}", calendar.calendar_version);
+    log::info!(
+        "[CALENDAR] loaded calendar_version={}",
+        calendar.calendar_version
+    );
 
     let symbols = cfg.all_symbols();
-    let connector = DexConnectorBox::create("lighter", cfg.dry_run, &symbols, Some(cfg.instance_id.as_str()))
+    let connector = DexConnectorBox::create(
+        "lighter",
+        cfg.dry_run,
+        &symbols,
+        Some(cfg.instance_id.as_str()),
+    )
+    .await
+    .context("failed to initialize connector")?;
+    connector
+        .start()
         .await
-        .context("failed to initialize connector")?;
-    connector.start().await.context("failed to start connector")?;
+        .context("failed to start connector")?;
     let connector: std::sync::Arc<dyn DexConnector + Send + Sync> = std::sync::Arc::new(connector);
 
     let mut price_rx = connector
@@ -1055,7 +1097,10 @@ mod tests {
                 us_open_utc_us: Some(30),
             },
         );
-        TradingCalendar { calendar_version: "test-v1".to_string(), sessions }
+        TradingCalendar {
+            calendar_version: "test-v1".to_string(),
+            sessions,
+        }
     }
 
     #[test]
@@ -1094,7 +1139,10 @@ mod tests {
         // now_us is between t0 and t1 -- must still capture.
         capture_t0_if_due(window, &mut day, 150, &prices_at_t0);
         assert_eq!(day.t0_prices, Some(prices_at_t0));
-        assert!(day.t1_prices.is_none(), "t0 capture must not touch t1_prices");
+        assert!(
+            day.t1_prices.is_none(),
+            "t0 capture must not touch t1_prices"
+        );
     }
 
     #[test]
@@ -1140,8 +1188,18 @@ mod tests {
         // `if self.day.t1_prices.is_none() { ... }` line.
         day.t1_prices = Some(t1_prices.clone());
 
-        let epsilon = compute_epsilon("diff", "SKHY", "SNDK", day.t0_prices.as_ref().unwrap(), &t1_prices).unwrap();
-        assert!(epsilon.abs() > 1e-6, "epsilon must not collapse to ~0 when t0 and t1 prices genuinely differ");
+        let epsilon = compute_epsilon(
+            "diff",
+            "SKHY",
+            "SNDK",
+            day.t0_prices.as_ref().unwrap(),
+            &t1_prices,
+        )
+        .unwrap();
+        assert!(
+            epsilon.abs() > 1e-6,
+            "epsilon must not collapse to ~0 when t0 and t1 prices genuinely differ"
+        );
     }
 
     // -------------------------------------------------------------
