@@ -301,6 +301,7 @@ jobs:
           file "${BINARY}"
           file "${BINARY}" | grep -q aarch64
           test -f "${LIBSIGNER}"
+          file "${LIBSIGNER}" | grep -q aarch64
           # bull-holder needs libsigner.so at runtime (lighter-sdk), resolved
           # via LD_LIBRARY_PATH like every other pairtrade launch script --
           # mount it alongside the binary here too, or ldd reports it
@@ -429,14 +430,15 @@ jobs:
               "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/lib __INSTALL_DIR__/bull_holder",
               "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/bull-holder /tmp/bull-holder",
               "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/bull-holder.sha256 /tmp/bull-holder.sha256",
-              "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/libsigner.so /tmp/bull-holder-libsigner.so",
-              "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/libsigner.so.sha256 /tmp/bull-holder-libsigner.so.sha256",
+              "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/libsigner.so /tmp/libsigner.so",
+              "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/libsigner.so.sha256 /tmp/libsigner.so.sha256",
               "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/manifest.json /tmp/bull-holder-manifest.json",
               "echo __BINARY_SHA256__ /tmp/bull-holder | sha256sum -c - || exit 1",
               "(cd /tmp && sha256sum -c bull-holder.sha256) || exit 1",
-              "echo __LIBSIGNER_SHA256__ /tmp/bull-holder-libsigner.so | sha256sum -c - || exit 1",
+              "echo __LIBSIGNER_SHA256__ /tmp/libsigner.so | sha256sum -c - || exit 1",
+              "(cd /tmp && sha256sum -c libsigner.so.sha256) || exit 1",
               "sudo install -o root -g root -m 0755 /tmp/bull-holder __INSTALL_DIR__/bin/bull-holder",
-              "sudo install -o root -g root -m 0644 /tmp/bull-holder-libsigner.so __INSTALL_DIR__/lib/libsigner.so",
+              "sudo install -o root -g root -m 0644 /tmp/libsigner.so __INSTALL_DIR__/lib/libsigner.so",
               "sudo install -o root -g root -m 0644 /tmp/bull-holder-manifest.json __INSTALL_DIR__/manifest.json",
               "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/bin/bull-holder) = root:root:755 || exit 1",
               "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/lib/libsigner.so) = root:root:644 || exit 1",
