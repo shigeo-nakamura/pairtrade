@@ -431,17 +431,25 @@ fn load_state(path: &Path) -> RiskState {
 }
 
 fn atomic_write_json(path: &Path, value: &impl Serialize) {
-    let Ok(json) = serde_json::to_string_pretty(value) else {
-        log::warn!("[STATE] serialize failed for {}", path.display());
-        return;
-    };
+    match serde_json::to_string_pretty(value) {
+        Ok(json) => atomic_write_bytes(path, json.as_bytes()),
+        Err(_) => log::warn!("[STATE] serialize failed for {}", path.display()),
+    }
+}
+
+/// Shared tmp+rename atomic-write primitive. Split out from
+/// `atomic_write_json` so `write_status_if_due` can serialize the status
+/// document exactly once and reuse the same bytes for both this local
+/// write and the S3 mirror `put_async` call, instead of serializing twice
+/// per tick (bot-strategy#866 PR #255 review round 2, nit 4).
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) {
     let Some(dir) = path.parent() else { return };
     let tmp = dir.join(format!(
         ".{}.tmp.{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id()
     ));
-    if std::fs::write(&tmp, json).is_ok() {
+    if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     } else {
         log::warn!("[STATE] write failed for {}", path.display());
@@ -506,6 +514,80 @@ fn capture_t0_if_due(
     if day.t0_prices.is_none() && now_us >= t0 {
         day.t0_prices = Some(prices.clone());
     }
+}
+
+#[derive(Serialize)]
+struct DashboardPosition {
+    symbol: String,
+    side: &'static str,
+    size: String,
+    entry_price: String,
+}
+
+#[derive(Serialize)]
+struct DashboardTradeStats {
+    trades: u64,
+    wins: u64,
+    win_rate: f64,
+    max_dd: f64,
+    pnl: f64,
+}
+
+/// debot-dashboard's `StatusData` (`main.go`) fields this binary
+/// populates. That struct lives in a different repo, so this is still a
+/// by-hand sync, but a typed struct at least catches a field-name typo
+/// at compile time instead of `serde_json::json!()`'s stringly-typed
+/// keys silently producing a field the dashboard never reads
+/// (bot-strategy#866 PR #255 review round 2, nit 3).
+#[derive(Serialize)]
+struct DashboardStatus {
+    ts: i64,
+    updated_at: String,
+    id: String,
+    dex: &'static str,
+    dry_run: bool,
+    has_position: bool,
+    position_count: i32,
+    positions_ready: bool,
+    positions: Vec<DashboardPosition>,
+    pnl_total: f64,
+    pnl_today: f64,
+    pnl_source: &'static str,
+    kill_switch_active: bool,
+    trade_stats: DashboardTradeStats,
+}
+
+/// engine_b_live-specific fields, not part of debot-dashboard's schema --
+/// ignored by its Go `json.Unmarshal`, useful for journalctl/manual
+/// inspection. Flattened into the same document as `DashboardStatus` via
+/// `#[serde(flatten)]` so both shapes coexist in one `status.json`.
+#[derive(Serialize)]
+struct EngineStatusExtra {
+    ts_us: i64,
+    instance_id: String,
+    current_date: Option<String>,
+    window: Option<(i64, i64, i64)>,
+    day_entered: bool,
+    day_exited: bool,
+    restart_recovered: bool,
+    session_halted: bool,
+    session_halt_reason: Option<String>,
+    realized_pnl_session: f64,
+    pnl_today_date: Option<String>,
+    total_trades: u64,
+    total_wins: u64,
+    max_dd_bps: f64,
+    max_dd_usd: f64,
+    kill_switch: bool,
+    calendar_version: String,
+}
+
+#[derive(Serialize)]
+struct FullStatus {
+    #[serde(flatten)]
+    dashboard: DashboardStatus,
+    #[serde(flatten)]
+    extra: EngineStatusExtra,
 }
 
 struct EngineBLiveEngine {
@@ -890,75 +972,99 @@ impl EngineBLiveEngine {
         } else {
             0.0
         };
-        let positions = match &self.position {
-            Some(pos) => vec![serde_json::json!({
-                "symbol": self.cfg.us_primary_symbol,
-                "side": match pos.side {
+        let positions: Vec<DashboardPosition> = match &self.position {
+            Some(pos) => vec![DashboardPosition {
+                symbol: self.cfg.us_primary_symbol.clone(),
+                side: match pos.side {
                     dex_connector::OrderSide::Long => "long",
                     dex_connector::OrderSide::Short => "short",
                 },
-                "size": pos.size.to_string(),
-                "entry_price": pos.entry_price.to_string(),
-            })],
+                size: pos.size.to_string(),
+                entry_price: pos.entry_price.to_string(),
+            }],
             None => vec![],
         };
-        let status = serde_json::json!({
-            // debot-dashboard's StatusData (main.go) fields -- kept in
-            // sync manually since that struct lives in a different repo;
-            // unknown extra fields below are ignored by Go's
-            // json.Unmarshal, so the engine_b_live-specific fields and
-            // the dashboard-shaped fields coexist in one document.
-            "ts": now_us / 1_000_000,
-            "updated_at": Utc::now().to_rfc3339(),
-            "id": self.cfg.instance_id,
-            "dex": "lighter",
-            "dry_run": self.cfg.dry_run,
-            "has_position": self.position.is_some(),
-            "position_count": self.position.is_some() as i32,
-            // false exactly when today's `entered` flag was restored from
-            // persisted state after a restart -- our own in-memory
-            // `position` was lost in that case (never persisted, see
-            // KNOWN GAPS), so debot-dashboard's "positions_ready !==
-            // false means trustworthy" read must not be told otherwise.
-            "positions_ready": !self.day.restart_recovered,
-            "positions": positions,
-            "pnl_total": self.state.realized_pnl_session,
-            "pnl_today": self.state.pnl_today,
-            "pnl_source": "engine_b_live_risk_state",
-            "kill_switch_active": self.kill_switch_engaged(),
-            "trade_stats": {
-                "trades": self.state.total_trades,
-                "wins": self.state.total_wins,
-                "win_rate": win_rate,
-                "max_dd": self.state.max_dd_usd,
-                "pnl": self.state.realized_pnl_session,
+        // Derived from `positions` itself rather than re-reading
+        // `self.position` independently for each field -- one source of
+        // truth for "do we think we're holding" (bot-strategy#866 PR #255
+        // review round 2, nit 5).
+        let has_position = !positions.is_empty();
+        let position_count = positions.len() as i32;
+        // Same one-source-of-truth treatment as `positions` above: a
+        // fresh Path::exists() check, read once instead of independently
+        // for kill_switch_active and kill_switch, so the two can't
+        // disagree within a single status.json snapshot if the sentinel
+        // file is created/removed between the two reads (review round 3
+        // on this same PR, self-review finding).
+        let kill_switch = self.kill_switch_engaged();
+        let status = FullStatus {
+            dashboard: DashboardStatus {
+                ts: now_us / 1_000_000,
+                updated_at: Utc::now().to_rfc3339(),
+                id: self.cfg.instance_id.clone(),
+                dex: "lighter",
+                dry_run: self.cfg.dry_run,
+                has_position,
+                position_count,
+                // false exactly when today's `entered` flag was restored
+                // from persisted state after a restart -- our own
+                // in-memory `position` was lost in that case (never
+                // persisted, see KNOWN GAPS), so debot-dashboard's
+                // "positions_ready !== false means trustworthy" read must
+                // not be told otherwise.
+                positions_ready: !self.day.restart_recovered,
+                positions,
+                pnl_total: self.state.realized_pnl_session,
+                pnl_today: self.state.pnl_today,
+                pnl_source: "engine_b_live_risk_state",
+                kill_switch_active: kill_switch,
+                trade_stats: DashboardTradeStats {
+                    trades: self.state.total_trades,
+                    wins: self.state.total_wins,
+                    win_rate,
+                    max_dd: self.state.max_dd_usd,
+                    pnl: self.state.realized_pnl_session,
+                },
             },
-            // engine_b_live-specific fields, not part of debot-dashboard's
-            // schema -- ignored by the Go backend, useful for
-            // journalctl/manual inspection and any future dedicated panel.
-            "ts_us": now_us,
-            "instance_id": self.cfg.instance_id,
-            "current_date": self.current_date.map(|d| d.to_string()),
-            "window": self.window,
-            "day_entered": self.day.entered,
-            "day_exited": self.day.exited,
-            "restart_recovered": self.day.restart_recovered,
-            "session_halted": self.state.session_halted,
-            "session_halt_reason": self.state.session_halt_reason,
-            "realized_pnl_session": self.state.realized_pnl_session,
-            "pnl_today_date": self.state.pnl_today_date,
-            "total_trades": self.state.total_trades,
-            "total_wins": self.state.total_wins,
-            "max_dd_bps": self.state.max_dd_bps,
-            "max_dd_usd": self.state.max_dd_usd,
-            "kill_switch": self.kill_switch_engaged(),
-            "calendar_version": self.calendar.calendar_version,
-        });
-        atomic_write_json(&self.cfg.status_path, &status);
+            extra: EngineStatusExtra {
+                ts_us: now_us,
+                instance_id: self.cfg.instance_id.clone(),
+                current_date: self.current_date.map(|d| d.to_string()),
+                window: self.window,
+                day_entered: self.day.entered,
+                day_exited: self.day.exited,
+                restart_recovered: self.day.restart_recovered,
+                session_halted: self.state.session_halted,
+                session_halt_reason: self.state.session_halt_reason.clone(),
+                realized_pnl_session: self.state.realized_pnl_session,
+                pnl_today_date: self.state.pnl_today_date.clone(),
+                total_trades: self.state.total_trades,
+                total_wins: self.state.total_wins,
+                max_dd_bps: self.state.max_dd_bps,
+                max_dd_usd: self.state.max_dd_usd,
+                kill_switch,
+                calendar_version: self.calendar.calendar_version.clone(),
+            },
+        };
+        // Serialized once and reused for both destinations (previously
+        // two separate serde_json calls per tick -- bot-strategy#866 PR
+        // #255 review round 2, nit 4). Compact, not to_vec_pretty: the
+        // shared bytes go to the S3 mirror on every 30s tick for the life
+        // of the process, and nobody reads that copy by eye (the Go
+        // consumer's json.Unmarshal is whitespace-agnostic) -- pretty-
+        // printing it would have been a silent ~25%+ size regression on
+        // every PutObject with no benefit (self-review round on this PR
+        // caught this; matches src/pairtrade/status.rs's own convention
+        // of reusing compact serde_json::to_string for both destinations).
+        // The local status.json file trades away pretty-printing for
+        // this; inspect it with `python3 -m json.tool` or `jq` if needed.
+        let Ok(body) = serde_json::to_vec(&status) else {
+            log::warn!("[STATUS] serialize failed for {}", self.cfg.status_path.display());
+            return;
+        };
+        atomic_write_bytes(&self.cfg.status_path, &body);
         if let Some(mirror) = &self.status_s3_mirror {
-            if let Ok(body) = serde_json::to_vec(&status) {
-                mirror.put_async("status.json", body);
-            }
+            mirror.put_async("status.json", body);
         }
     }
 }
@@ -1340,5 +1446,91 @@ mod tests {
         let cfg = fixture_config();
         let notional = cfg.lot_usd.min(cfg.max_notional_usd());
         assert!((notional - cfg.lot_usd).abs() < 1e-9);
+    }
+
+    // -------------------------------------------------------------
+    // FullStatus / dashboard JSON shape (bot-strategy#866 PR #255
+    // review round 2, nit 3 -- guards the flatten actually merging both
+    // structs into one flat document, and pins the exact key names
+    // debot-dashboard's web/app.js and main.go's StatusData expect).
+    // -------------------------------------------------------------
+
+    fn fixture_status() -> FullStatus {
+        FullStatus {
+            dashboard: DashboardStatus {
+                ts: 1_000,
+                updated_at: "2026-09-03T00:00:00+00:00".to_string(),
+                id: "engine-b-live".to_string(),
+                dex: "lighter",
+                dry_run: true,
+                has_position: false,
+                position_count: 0,
+                positions_ready: true,
+                positions: vec![],
+                pnl_total: 0.0,
+                pnl_today: 0.0,
+                pnl_source: "engine_b_live_risk_state",
+                kill_switch_active: false,
+                trade_stats: DashboardTradeStats {
+                    trades: 0,
+                    wins: 0,
+                    win_rate: 0.0,
+                    max_dd: 0.0,
+                    pnl: 0.0,
+                },
+            },
+            extra: EngineStatusExtra {
+                ts_us: 1_000_000,
+                instance_id: "engine-b-live".to_string(),
+                current_date: None,
+                window: None,
+                day_entered: false,
+                day_exited: false,
+                restart_recovered: false,
+                session_halted: false,
+                session_halt_reason: None,
+                realized_pnl_session: 0.0,
+                pnl_today_date: None,
+                total_trades: 0,
+                total_wins: 0,
+                max_dd_bps: 0.0,
+                max_dd_usd: 0.0,
+                kill_switch: false,
+                calendar_version: "test".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn full_status_flattens_both_structs_into_one_flat_object() {
+        let value = serde_json::to_value(fixture_status()).unwrap();
+        let obj = value.as_object().expect("status must serialize to a JSON object");
+
+        // debot-dashboard's StatusData (main.go) field names.
+        for key in [
+            "ts", "updated_at", "id", "dex", "dry_run", "has_position",
+            "position_count", "positions_ready", "positions", "pnl_total",
+            "pnl_today", "pnl_source", "kill_switch_active", "trade_stats",
+        ] {
+            assert!(obj.contains_key(key), "missing dashboard field: {key}");
+        }
+        let trade_stats = obj["trade_stats"].as_object().unwrap();
+        for key in ["trades", "wins", "win_rate", "max_dd", "pnl"] {
+            assert!(trade_stats.contains_key(key), "missing trade_stats field: {key}");
+        }
+
+        // engine_b_live-specific fields, flattened alongside the above,
+        // not nested under a separate "extra" key.
+        for key in [
+            "ts_us", "instance_id", "current_date", "window", "day_entered",
+            "day_exited", "restart_recovered", "session_halted",
+            "session_halt_reason", "realized_pnl_session", "pnl_today_date",
+            "total_trades", "total_wins", "max_dd_bps", "max_dd_usd",
+            "kill_switch", "calendar_version",
+        ] {
+            assert!(obj.contains_key(key), "missing engine_b_live field: {key}");
+        }
+        assert!(!obj.contains_key("dashboard"), "flatten must not leave a nested \"dashboard\" key");
+        assert!(!obj.contains_key("extra"), "flatten must not leave a nested \"extra\" key");
     }
 }
