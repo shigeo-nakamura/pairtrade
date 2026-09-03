@@ -84,39 +84,64 @@ jobs:
       dex_connector_ref: ${{ steps.resolve.outputs.dex_connector_ref }}
       should_deploy: ${{ steps.resolve.outputs.should_deploy }}
     steps:
+      - name: Checkout debot
+        uses: actions/checkout@v5
+        with:
+          path: debot
+          sparse-checkout: |
+            Cargo.lock
+          sparse-checkout-cone-mode: false
+
       - name: Resolve dex-connector ref
         id: resolve
         env:
           DEFAULT_REF: ${{ env.DEX_CONNECTOR_REF }}
           INPUT_REF: ${{ github.event.inputs.dex_connector_ref }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 - <<'PY'
-          import json, os, urllib.request
+          import os, re
 
           default_ref = os.environ.get("DEFAULT_REF", "").strip()
           input_ref = (os.environ.get("INPUT_REF") or "").strip()
-          token = os.environ.get("GH_TOKEN", "")
 
-          ref = input_ref or default_ref
-          # Release pins continue to float to the latest published tag. A
-          # non-release ref is an intentional draft integration pin and must
-          # not be overwritten by tag discovery.
-          if not input_ref and default_ref.startswith("v"):
-              try:
-                  req = urllib.request.Request(
-                      "https://api.github.com/repos/shigeo-nakamura/dex-connector/tags?per_page=1",
-                      headers={
-                          "Accept": "application/vnd.github+json",
-                          "Authorization": f"Bearer {token}",
-                      },
+          # An explicit workflow_dispatch input is a deliberate draft/test
+          # pin and always wins.
+          #
+          # Otherwise, resolve against debot/Cargo.lock's own pinned
+          # dex-connector version -- NOT the latest published dex-connector
+          # tag. The two used to diverge silently: any dex-connector tag
+          # push (even for unrelated work) made resolve-ref check out a
+          # newer dex-connector than Cargo.lock's pin, and `cargo check
+          # --all-targets --locked` in build-test would then fail with a
+          # generic "cannot update the lock file ... --locked was passed"
+          # error that gave no hint the real cause was a stale Cargo.lock
+          # relative to a tag nobody here had bumped to yet
+          # (bot-strategy#892 -- three dex-connector tags landed within
+          # about an hour on 2026-09-03 and broke build-test on multiple
+          # unrelated PRs before this fix). Pinning to Cargo.lock makes a
+          # new dex-connector tag a no-op for CI until someone deliberately
+          # runs `cargo update -p dex-connector` (scripts/bump.sh's
+          # documented step) to pick it up.
+          ref = input_ref
+          if not ref:
+              with open("debot/Cargo.lock") as f:
+                  lockfile = f.read()
+              m = re.search(
+                  r'name = "dex-connector"\nversion = "([^"]+)"', lockfile
+              )
+              if m:
+                  ref = f"v{m.group(1)}"
+              elif default_ref:
+                  print(
+                      "resolve-ref: no dex-connector entry found in "
+                      f"debot/Cargo.lock, falling back to DEX_CONNECTOR_REF={default_ref}"
                   )
-                  with urllib.request.urlopen(req, timeout=10) as resp:
-                      data = json.load(resp)
-                  if data and "name" in data[0]:
-                      ref = data[0]["name"]
-              except Exception:
-                  pass
+                  ref = default_ref
+              else:
+                  raise SystemExit(
+                      "resolve-ref: no dex-connector entry in debot/Cargo.lock "
+                      "and no DEX_CONNECTOR_REF default to fall back to"
+                  )
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"dex_connector_ref={ref}\n")
