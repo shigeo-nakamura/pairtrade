@@ -1,7 +1,7 @@
-#[cfg(feature = "lighter-sdk")]
+#[cfg(any(feature = "lighter-sdk", feature = "hyperliquid-sdk"))]
 use debot_utils::decrypt_data_with_kms;
 use rust_decimal::Error as DecimalParseError;
-#[cfg(any(feature = "lighter-sdk", feature = "extended-sdk"))]
+#[cfg(any(feature = "lighter-sdk", feature = "extended-sdk", feature = "hyperliquid-sdk"))]
 use std::env;
 use std::fmt;
 use std::num::{ParseFloatError, ParseIntError};
@@ -45,7 +45,7 @@ impl fmt::Display for ConfigError {
             ConfigError::ParseIntError(e) => write!(f, "Parse int error: {}", e),
             ConfigError::ParseFloatError(e) => write!(f, "Parse float error: {}", e),
             ConfigError::DecimalParseError(e) => write!(f, "Decimal parse error: {}", e),
-            #[cfg(feature = "lighter-sdk")]
+            #[cfg(any(feature = "lighter-sdk", feature = "hyperliquid-sdk"))]
             ConfigError::OtherError(e) => write!(f, "Other error: {}", e),
         }
     }

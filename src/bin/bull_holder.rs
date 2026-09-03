@@ -105,7 +105,7 @@ fn env_u32(name: &str, default: u32) -> u32 {
 fn env_bool(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(default)
 }
 
@@ -243,6 +243,12 @@ impl Config {
         }
         if self.hl_taker_slippage_bps == 0 || self.hl_taker_slippage_bps > 1_000 {
             bail!("BULL_HOLDER_HL_TAKER_SLIPPAGE_BPS must be in 1..=1000");
+        }
+        // `daily_eval_due` compares against `num_seconds_from_midnight()`,
+        // which only ever returns 0..86_400; a value at or above that would
+        // make the daily-close exit rule silently never fire again.
+        if self.daily_eval_after_utc_secs >= 86_400 {
+            bail!("BULL_HOLDER_DAILY_EVAL_AFTER_UTC_SECS must be < 86400 (seconds after UTC midnight)");
         }
         Ok(())
     }
@@ -390,8 +396,19 @@ struct LegState {
     spot_cost_usd: f64,
     perp_size: f64,
     perp_cost_usd: f64,
+    /// Peak Hyperliquid daily close since ARM — drives the daily exit rule
+    /// (`exit_level`) per the module doc.
     peak_close: f64,
     exit_level: f64,
+    /// Peak Lighter mark/index price observed at stop-placement time. The
+    /// Lighter exchange-side stop's trigger price is derived from THIS, not
+    /// from `peak_close`, because the stop fires against Lighter's own
+    /// price: pricing it off the Hyperliquid close would drift with any
+    /// cross-venue basis (liquidity crunch, funding-driven divergence) and
+    /// fire at an unintended level relative to the safety margin it is
+    /// meant to provide (see pairtrade#258 review).
+    #[serde(default)]
+    lighter_peak: f64,
     stop_level: Option<f64>,
     stop_order_id: Option<String>,
     /// Date (UTC) of the last completed daily close that was evaluated.
@@ -519,23 +536,49 @@ impl Engine {
 
     /// Rest (or move) the Lighter exchange-side stop for the perp leg.
     async fn place_stop(&mut self, symbol: &str) -> Result<()> {
-        let Some(leg) = self.state.legs.get(symbol).cloned() else {
+        let Some(mut leg) = self.state.legs.get(symbol).cloned() else {
             return Ok(());
         };
         if leg.perp_size <= 0.0 {
             return Ok(());
         }
-        let level = level_below_peak(leg.peak_close, self.cfg.stop_dd_pct);
+        // The stop must fire against Lighter's own price, not Hyperliquid's
+        // daily close — refresh the Lighter-native peak here.
+        let lighter_price = self.quote(&self.lt, symbol).await?.price;
+        leg.lighter_peak = leg.lighter_peak.max(lighter_price);
+        let level = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
         if leg.stop_level.is_some_and(|l| (l - level).abs() < 1e-9) && leg.stop_order_id.is_some() {
+            if let Some(l) = self.state.legs.get_mut(symbol) {
+                l.lighter_peak = leg.lighter_peak;
+            }
+            self.persist();
             return Ok(());
         }
-        // Cancel the previous stop first so we never rest two.
+        // Cancel the previous stop first so we never rest two. Only clear the
+        // old id/level once the cancel actually succeeds (or there was
+        // nothing to cancel) — on a failed cancel the old order may still be
+        // resting, and forgetting its id here would make it permanently
+        // untracked (this guard could no longer detect and retry it).
+        let mut prior_cancel_failed = false;
         if let Some(old) = &leg.stop_order_id {
             if !self.cfg.dry_run {
                 if let Err(e) = self.lt.cancel_order(symbol, old).await {
-                    log::warn!("[STOP] cancel previous stop {old} failed (continuing): {e:?}");
+                    log::warn!(
+                        "[STOP] cancel previous stop {old} failed, keeping it tracked for retry: {e:?}"
+                    );
+                    prior_cancel_failed = true;
                 }
             }
+        }
+        if prior_cancel_failed {
+            // Persist the refreshed peak but leave the old stop_order_id/
+            // stop_level in place so the next call retries the cancel before
+            // resting a new one.
+            if let Some(l) = self.state.legs.get_mut(symbol) {
+                l.lighter_peak = leg.lighter_peak;
+            }
+            self.persist();
+            bail!("Lighter stop {symbol}: could not cancel the previous stop, deferring re-place");
         }
         let size = Decimal::from_f64(leg.perp_size).unwrap_or(Decimal::ZERO);
         let trigger = Decimal::from_f64(level).unwrap_or(Decimal::ZERO);
@@ -563,11 +606,12 @@ impl Engine {
             resp.order_id
         };
         log::info!(
-            "[STOP] {symbol} stop-loss resting at {level:.2} (peak {:.2}, {}%) id={order_id}",
-            leg.peak_close,
+            "[STOP] {symbol} stop-loss resting at {level:.2} (lighter_peak {:.2}, {}%) id={order_id}",
+            leg.lighter_peak,
             self.cfg.stop_dd_pct
         );
         if let Some(l) = self.state.legs.get_mut(symbol) {
+            l.lighter_peak = leg.lighter_peak;
             l.stop_level = Some(level);
             l.stop_order_id = Some(order_id);
         }
@@ -579,16 +623,20 @@ impl Engine {
         let Some(leg) = self.state.legs.get(symbol).cloned() else {
             return;
         };
-        if let Some(id) = leg.stop_order_id {
-            if !self.cfg.dry_run {
-                if let Err(e) = self.lt.cancel_order(symbol, &id).await {
-                    log::warn!("[STOP] cancel {id} failed: {e:?}");
-                }
+        let Some(id) = leg.stop_order_id else {
+            return;
+        };
+        if !self.cfg.dry_run {
+            if let Err(e) = self.lt.cancel_order(symbol, &id).await {
+                log::warn!(
+                    "[STOP] cancel {id} failed, leaving it tracked in state (order may still be resting): {e:?}"
+                );
+                return;
             }
-            if let Some(l) = self.state.legs.get_mut(symbol) {
-                l.stop_order_id = None;
-                l.stop_level = None;
-            }
+        }
+        if let Some(l) = self.state.legs.get_mut(symbol) {
+            l.stop_order_id = None;
+            l.stop_level = None;
         }
     }
 
@@ -606,9 +654,18 @@ impl Engine {
             "[ARM] arming {} symbols: spot ${spot_notional:.0} + perp ${perp_notional:.0} each",
             n
         );
-        let mut legs = BTreeMap::new();
+        // Fresh arm: any legs from a previous, unrelated cycle must already be
+        // gone (mode is only Off/Exited here). Clear defensively so a retry
+        // after a failed arm never mixes stale sizes into the new attempt.
+        // `mode` stays Off until the first order actually fills below —
+        // flipping it to On here (before any exposure exists) would strand
+        // the bot in On with zero legs and no way to re-ARM if a read-only
+        // quote fails before any order is sent.
+        self.state.legs.clear();
+        self.persist();
         for sym in self.cfg.symbols.clone() {
             let market = self.cfg.hl_spot_market[&sym].clone();
+            // Read-only: safe to bail before any order for this symbol is sent.
             let hq = self.quote(&self.hl, &market).await?;
             let lq = self.quote(&self.lt, &sym).await?;
             let spot_size = size_from_notional(spot_notional, hq.price, hq.size_decimals);
@@ -625,43 +682,63 @@ impl Engine {
                     lq.min_order
                 );
             }
-            let filled_spot = self
-                .hl_spot_ioc(&market, spot_size, OrderSide::Long)
-                .await?;
-            let filled_perp = if perp_notional > 0.0 {
-                self.lt_perp_taker(&sym, perp_size, OrderSide::Long, false)
-                    .await?
-            } else {
-                Decimal::ZERO
-            };
             let peak = hq.price.max(lq.price);
-            let leg = LegState {
-                spot_size: filled_spot.to_f64().unwrap_or(0.0),
-                spot_cost_usd: filled_spot.to_f64().unwrap_or(0.0) * hq.price,
-                perp_size: filled_perp.to_f64().unwrap_or(0.0),
-                perp_cost_usd: filled_perp.to_f64().unwrap_or(0.0) * lq.price,
+            // Record the leg BEFORE/AS EACH order fills so a failure partway
+            // through this symbol (or the next one) never leaves a filled
+            // position invisible to state, the daily exit rule, or the stop.
+            // A stray re-ARM after such a failure must never double the
+            // position it already holds.
+            let mut leg = LegState {
+                spot_size: 0.0,
+                spot_cost_usd: 0.0,
+                perp_size: 0.0,
+                perp_cost_usd: 0.0,
                 peak_close: peak,
                 exit_level: level_below_peak(peak, self.cfg.exit_dd_pct),
+                lighter_peak: lq.price,
                 stop_level: None,
                 stop_order_id: None,
                 last_close_date: None,
                 last_close: None,
                 close_fetch_failures: 0,
             };
+            let filled_spot = self
+                .hl_spot_ioc(&market, spot_size, OrderSide::Long)
+                .await
+                .with_context(|| format!("{sym}: spot entry failed (no exposure taken yet)"))?;
+            leg.spot_size = filled_spot.to_f64().unwrap_or(0.0);
+            leg.spot_cost_usd = leg.spot_size * hq.price;
+            self.state.legs.insert(sym.clone(), leg.clone());
+            // Real exposure now exists: flip to On (only once) so a crash or
+            // a later error in this loop never leaves a filled position
+            // recorded under Off/Exited, where a stray re-ARM would double it.
+            if self.state.mode != Mode::On {
+                self.state.mode = Mode::On;
+                self.state.armed_at = Some(now_secs());
+                self.state.exited_at = None;
+                self.state.exit_reason = None;
+                self.state.cycles += 1;
+            }
+            self.persist();
+            if perp_notional > 0.0 {
+                let filled_perp = self
+                    .lt_perp_taker(&sym, perp_size, OrderSide::Long, false)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "{sym}: perp entry failed AFTER spot filled ({} @ {:.2}) — spot-only leg is recorded in state, do not re-ARM without checking it",
+                            leg.spot_size, hq.price
+                        )
+                    })?;
+                leg.perp_size = filled_perp.to_f64().unwrap_or(0.0);
+                leg.perp_cost_usd = leg.perp_size * lq.price;
+                self.state.legs.insert(sym.clone(), leg.clone());
+                self.persist();
+            }
             log::info!(
                 "[ENTRY] {sym}: spot {} @ {:.2} (${:.0}) + perp {} @ {:.2} (${:.0}); peak={:.2} exit_level={:.2}",
                 leg.spot_size, hq.price, leg.spot_cost_usd, leg.perp_size, lq.price, leg.perp_cost_usd, leg.peak_close, leg.exit_level
             );
-            legs.insert(sym, leg);
-        }
-        self.state.legs = legs;
-        self.state.mode = Mode::On;
-        self.state.armed_at = Some(now_secs());
-        self.state.exited_at = None;
-        self.state.exit_reason = None;
-        self.state.cycles += 1;
-        self.persist();
-        for sym in self.cfg.symbols.clone() {
             if let Err(e) = self.place_stop(&sym).await {
                 log::error!("[STOP] initial stop for {sym} failed: {e:?}");
             }
@@ -669,68 +746,152 @@ impl Engine {
         Ok(())
     }
 
+    /// Best-effort reference price for PnL accounting: a live quote, falling
+    /// back to the last known daily close from state. Returns `None` (never
+    /// `0.0`) when nothing trustworthy is available, so a leg that closed
+    /// without a known price is recorded as pnl_known=false rather than a
+    /// fabricated large loss. The exit order itself never depends on this —
+    /// it is placed regardless of whether a price could be found.
+    async fn exit_reference_price(
+        &self,
+        venue: &Arc<dyn DexConnector + Send + Sync>,
+        symbol: &str,
+        fallback: Option<f64>,
+    ) -> (Option<f64>, &'static str) {
+        match self.quote(venue, symbol).await {
+            Ok(q) if q.price > 0.0 => (Some(q.price), "quote"),
+            Ok(_) => (fallback.filter(|f| *f > 0.0), "fallback_last_close"),
+            Err(e) => {
+                log::warn!(
+                    "[EXIT] {symbol} pre-exit quote failed, PnL will use a fallback price if any: {e:?}"
+                );
+                (fallback.filter(|f| *f > 0.0), "fallback_last_close")
+            }
+        }
+    }
+
     async fn exit_all(&mut self, reason: &str) {
         log::warn!("[EXIT] closing all legs: {reason}");
         let mut total = 0.0;
+        let mut any_leg_still_open = false;
         for sym in self.cfg.symbols.clone() {
-            let Some(leg) = self.state.legs.get(&sym).cloned() else {
+            let Some(mut leg) = self.state.legs.get(&sym).cloned() else {
                 continue;
             };
             self.cancel_stop(&sym).await;
             let market = self.cfg.hl_spot_market[&sym].clone();
-            let mut spot_px = 0.0;
-            let mut perp_px = 0.0;
-            if leg.spot_size > 0.0 {
-                match self.quote(&self.hl, &market).await {
-                    Ok(q) => spot_px = q.price,
-                    Err(e) => log::error!("[EXIT] {market} quote failed: {e:?}"),
-                }
-                let size = Decimal::from_f64(leg.spot_size).unwrap_or(Decimal::ZERO);
+            let orig_spot_size = leg.spot_size;
+            let orig_perp_size = leg.perp_size;
+            let mut spot_pnl: Option<f64> = None;
+            let mut spot_px_source = "n/a";
+            let mut perp_pnl: Option<f64> = None;
+            let mut perp_px_source = "n/a";
+
+            if orig_spot_size > 0.0 {
+                let (px, src) = self
+                    .exit_reference_price(&self.hl, &market, leg.last_close)
+                    .await;
+                let size = Decimal::from_f64(orig_spot_size).unwrap_or(Decimal::ZERO);
                 match self.hl_spot_ioc(&market, size, OrderSide::Short).await {
-                    Ok(f) => log::info!("[EXIT] {market} spot sold {f}"),
+                    Ok(f) => {
+                        log::info!("[EXIT] {market} spot sold {f}");
+                        leg.spot_size = 0.0; // closed regardless of whether we could price it
+                        spot_px_source = src;
+                        spot_pnl = px.map(|p| p * orig_spot_size - leg.spot_cost_usd);
+                        if px.is_none() {
+                            log::warn!(
+                                "[EXIT] {market} closed but no trustworthy price available — PnL for this leg is unknown, not zero"
+                            );
+                        }
+                    }
                     Err(e) => {
-                        log::error!("[EXIT] {market} spot sell FAILED: {e:?}");
+                        log::error!(
+                            "[EXIT] {market} spot sell FAILED, leg remains OPEN in state: {e:?}"
+                        );
                         self.halt(format!("spot exit failed for {market}: {e}"));
+                        any_leg_still_open = true;
                     }
                 }
             }
-            if leg.perp_size > 0.0 {
-                match self.quote(&self.lt, &sym).await {
-                    Ok(q) => perp_px = q.price,
-                    Err(e) => log::error!("[EXIT] {sym} quote failed: {e:?}"),
-                }
-                let size = Decimal::from_f64(leg.perp_size).unwrap_or(Decimal::ZERO);
+            if orig_perp_size > 0.0 {
+                let (px, src) = self
+                    .exit_reference_price(&self.lt, &sym, leg.last_close)
+                    .await;
+                let size = Decimal::from_f64(orig_perp_size).unwrap_or(Decimal::ZERO);
                 match self.lt_perp_taker(&sym, size, OrderSide::Short, true).await {
-                    Ok(f) => log::info!("[EXIT] {sym} perp closed {f}"),
+                    Ok(f) => {
+                        log::info!("[EXIT] {sym} perp closed {f}");
+                        leg.perp_size = 0.0;
+                        perp_px_source = src;
+                        perp_pnl = px.map(|p| p * orig_perp_size - leg.perp_cost_usd);
+                        if px.is_none() {
+                            log::warn!(
+                                "[EXIT] {sym} perp closed but no trustworthy price available — PnL for this leg is unknown, not zero"
+                            );
+                        }
+                    }
                     Err(e) => {
-                        log::error!("[EXIT] {sym} perp close FAILED: {e:?}");
+                        log::error!(
+                            "[EXIT] {sym} perp close FAILED, leg remains OPEN in state: {e:?}"
+                        );
                         self.halt(format!("perp exit failed for {sym}: {e}"));
+                        any_leg_still_open = true;
                     }
                 }
             }
-            let pnl = (spot_px * leg.spot_size - leg.spot_cost_usd)
-                + (perp_px * leg.perp_size - leg.perp_cost_usd);
-            total += pnl;
+
+            let pnl_known = orig_spot_size <= 0.0 || spot_pnl.is_some();
+            let pnl_known = pnl_known && (orig_perp_size <= 0.0 || perp_pnl.is_some());
+            let leg_total = spot_pnl.unwrap_or(0.0) + perp_pnl.unwrap_or(0.0);
+            if pnl_known {
+                total += leg_total;
+            }
             let rec = serde_json::json!({
                 "ts": now_secs(), "symbol": sym, "reason": reason,
-                "spot_size": leg.spot_size, "spot_cost_usd": leg.spot_cost_usd, "spot_exit_px": spot_px,
-                "perp_size": leg.perp_size, "perp_cost_usd": leg.perp_cost_usd, "perp_exit_px": perp_px,
-                "peak_close": leg.peak_close, "exit_level": leg.exit_level, "pnl_usd_ex_funding": pnl,
+                "spot_size_closed": orig_spot_size, "spot_cost_usd": leg.spot_cost_usd,
+                "spot_pnl_usd": spot_pnl, "spot_px_source": spot_px_source,
+                "perp_size_closed": orig_perp_size, "perp_cost_usd": leg.perp_cost_usd,
+                "perp_pnl_usd": perp_pnl, "perp_px_source": perp_px_source,
+                "peak_close": leg.peak_close, "exit_level": leg.exit_level,
+                "pnl_usd_ex_funding": if pnl_known { Some(leg_total) } else { None },
+                "pnl_known": pnl_known,
                 "dry_run": self.cfg.dry_run,
             });
             if let Err(e) = append_jsonl(&self.cfg.pnl_log_path, &rec) {
                 log::warn!("[PNL_LOG] append failed: {e:?}");
             }
+            // Reset the cost basis only for what actually closed so a
+            // remaining open leg's cost_usd (used by the next exit attempt)
+            // still reflects its real, un-exited exposure.
+            if leg.spot_size <= 0.0 {
+                leg.spot_cost_usd = 0.0;
+            }
+            if leg.perp_size <= 0.0 {
+                leg.perp_cost_usd = 0.0;
+            }
+            self.state.legs.insert(sym.clone(), leg.clone());
+            self.persist();
             log::info!(
-                "[EXIT] {sym} pnl(ex-funding)=${pnl:+.2} peak={:.2} exit_level={:.2}",
+                "[EXIT] {sym} pnl(ex-funding)={} peak={:.2} exit_level={:.2}",
+                if pnl_known {
+                    format!("${leg_total:+.2}")
+                } else {
+                    "unknown".to_string()
+                },
                 leg.peak_close,
                 leg.exit_level
             );
         }
         self.state.realized_pnl_total_usd += total;
-        self.state.mode = Mode::Exited;
-        self.state.exited_at = Some(now_secs());
-        self.state.exit_reason = Some(reason.to_string());
+        if any_leg_still_open {
+            log::error!(
+                "[EXIT] one or more legs failed to close — staying in mode=On (NOT marking Exited) until the operator resolves it via RISK_ACK"
+            );
+        } else {
+            self.state.mode = Mode::Exited;
+            self.state.exited_at = Some(now_secs());
+            self.state.exit_reason = Some(reason.to_string());
+        }
         self.persist();
     }
 
@@ -835,50 +996,58 @@ impl Engine {
         if self.cfg.dry_run {
             return; // nothing real to compare against
         }
+        // Both reads are account-wide (all symbols in one call); fetch each
+        // once instead of once per symbol.
+        let positions = match self.lt.get_positions().await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::warn!("[RECONCILE] Lighter get_positions failed: {e:?}");
+                None
+            }
+        };
+        let balance = match self.hl.get_combined_balance().await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                log::warn!("[RECONCILE] HL get_combined_balance failed: {e:?}");
+                None
+            }
+        };
         for sym in self.cfg.symbols.clone() {
             let Some(leg) = self.state.legs.get(&sym).cloned() else {
                 continue;
             };
             // Perp leg: Lighter positions.
-            match self.lt.get_positions().await {
-                Ok(pos) => {
-                    let actual = pos
-                        .iter()
-                        .filter(|p| p.symbol.eq_ignore_ascii_case(&sym))
-                        .map(|p| {
-                            p.size.to_f64().unwrap_or(0.0) * if p.sign < 0 { -1.0 } else { 1.0 }
-                        })
-                        .sum::<f64>();
-                    if !within_tolerance(leg.perp_size, actual, self.cfg.reconcile_tolerance_pct) {
-                        self.halt(format!(
-                            "{sym} perp mismatch: expected {:.6} actual {actual:.6}",
-                            leg.perp_size
-                        ));
-                        return;
-                    }
+            if let Some(pos) = &positions {
+                let actual = pos
+                    .iter()
+                    .filter(|p| p.symbol.eq_ignore_ascii_case(&sym))
+                    .map(|p| p.size.to_f64().unwrap_or(0.0) * if p.sign < 0 { -1.0 } else { 1.0 })
+                    .sum::<f64>();
+                if !within_tolerance(leg.perp_size, actual, self.cfg.reconcile_tolerance_pct) {
+                    self.halt(format!(
+                        "{sym} perp mismatch: expected {:.6} actual {actual:.6}",
+                        leg.perp_size
+                    ));
+                    return;
                 }
-                Err(e) => log::warn!("[RECONCILE] Lighter get_positions failed: {e:?}"),
             }
             // Spot leg: Hyperliquid spot balances (base token of the market).
             let market = self.cfg.hl_spot_market[&sym].clone();
             let base = market.split('/').next().unwrap_or("").to_ascii_uppercase();
-            match self.hl.get_combined_balance().await {
-                Ok(b) => {
-                    let actual = b
-                        .spot_assets
-                        .iter()
-                        .filter(|a| a.symbol.eq_ignore_ascii_case(&base))
-                        .map(|a| a.balance.to_f64().unwrap_or(0.0))
-                        .sum::<f64>();
-                    if !within_tolerance(leg.spot_size, actual, self.cfg.reconcile_tolerance_pct) {
-                        self.halt(format!(
-                            "{market} spot mismatch: expected {:.6} actual {actual:.6}",
-                            leg.spot_size
-                        ));
-                        return;
-                    }
+            if let Some(b) = &balance {
+                let actual = b
+                    .spot_assets
+                    .iter()
+                    .filter(|a| a.symbol.eq_ignore_ascii_case(&base))
+                    .map(|a| a.balance.to_f64().unwrap_or(0.0))
+                    .sum::<f64>();
+                if !within_tolerance(leg.spot_size, actual, self.cfg.reconcile_tolerance_pct) {
+                    self.halt(format!(
+                        "{market} spot mismatch: expected {:.6} actual {actual:.6}",
+                        leg.spot_size
+                    ));
+                    return;
                 }
-                Err(e) => log::warn!("[RECONCILE] HL get_combined_balance failed: {e:?}"),
             }
         }
         log::debug!("[RECONCILE] ok");
@@ -1156,6 +1325,25 @@ mod tests {
         assert!(cfg.validate().is_ok());
         cfg.exit_dd_pct = 0.0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validation_rejects_daily_eval_delay_past_midnight() {
+        // Regression: num_seconds_from_midnight() only ever returns
+        // 0..86_400, so >= 86_400 here would make daily_eval_due() always
+        // false and silently disable the only exit rule forever.
+        let mut cfg = test_config();
+        cfg.daily_eval_after_utc_secs = 86_400;
+        assert!(cfg.validate().is_err());
+        cfg.daily_eval_after_utc_secs = 86_399;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn env_bool_trims_whitespace() {
+        std::env::set_var("BULL_HOLDER_TEST_ENV_BOOL", " true \n");
+        assert!(env_bool("BULL_HOLDER_TEST_ENV_BOOL", false));
+        std::env::remove_var("BULL_HOLDER_TEST_ENV_BOOL");
     }
 
     #[test]

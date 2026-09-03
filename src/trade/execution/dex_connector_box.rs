@@ -232,16 +232,28 @@ impl DexConnectorBox {
                     .ok()
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| "https://api.hyperliquid.xyz".to_string());
-                let account = get_hyperliquid_account_config_from_env(instance_id)
-                    .await
-                    .map_err(|e| DexError::Permanent(format!("hyperliquid account config: {e}")))?;
-                let connector = create_hyperliquid_account_connector(
-                    HyperliquidConnectorConfig {
-                        base_url,
-                        tracked_symbols: token_list.to_vec(),
-                    },
-                    account,
-                )?;
+                let connector_config = HyperliquidConnectorConfig {
+                    base_url,
+                    tracked_symbols: token_list.to_vec(),
+                };
+                // `dry_run` is authoritative here regardless of what signer
+                // material happens to be configured in the environment: a
+                // caller that asks for a dry-run connector must get one that
+                // is structurally unable to execute, the same guarantee the
+                // "lighter" and "arcus" branches above make. Loading and
+                // decrypting the signer key is skipped entirely rather than
+                // loaded-then-ignored, so a `false` in one call site can
+                // never leak a live-capable connector into another.
+                let connector = if dry_run {
+                    create_hyperliquid_connector(connector_config)?
+                } else {
+                    let account = get_hyperliquid_account_config_from_env(instance_id)
+                        .await
+                        .map_err(|e| {
+                            DexError::Permanent(format!("hyperliquid account config: {e}"))
+                        })?;
+                    create_hyperliquid_account_connector(connector_config, account)?
+                };
                 Ok(DexConnectorBox { inner: connector })
             }
             _ => Err(DexError::Permanent(format!("Unsupported dex: {dex_name}"))),
