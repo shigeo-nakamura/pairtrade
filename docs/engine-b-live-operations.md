@@ -90,20 +90,24 @@ make the service fail to start (fail-closed, not a silent bad default).
    does not need to be looked up by hand.
 
 2. **Determine whether the shared `ENCRYPTED_DATA_KEY` can be reused.**
-   The other bots on this host (freq/b/freq2) already have a KMS-wrapped
-   AES data key provisioned as `ENCRYPTED_DATA_KEY` in their own env files
-   under `/opt/debot`. Check only for the **existence** of that variable
-   name on the host (never its value) before deciding:
+   The other bots on this host (freq/b) already have a KMS-wrapped AES data
+   key provisioned as `ENCRYPTED_DATA_KEY` in the common secrets file their
+   launcher (`/opt/debot/scripts/debot-pair-robinhood-lighter.sh`) sources:
+   `/opt/debot/scripts/debot_secrets_common.env` (mode 0600, owner
+   `ec2-user:ec2-user` -- confirmed present 2026-09-03, alongside
+   `GMAIL_APP_PASSWORD`/`GMAIL_TO`/`GMAIL_USER`; not under `/opt/debot/*.env`
+   directly). Check only for the **existence** of that variable name on the
+   host (never its value) before deciding:
    ```bash
    aws ssm send-command --region ap-northeast-1 \
      --instance-ids i-0095af4fe0efbc5dd \
      --document-name AWS-RunShellScript \
      --parameters file:///path/to/check-encrypted-data-key.json \
      --query Command.CommandId --output text
-   # check-encrypted-data-key.json: {"commands": ["grep -l '^ENCRYPTED_DATA_KEY=' /opt/debot/*.env 2>/dev/null || echo none"]}
+   # check-encrypted-data-key.json: {"commands": ["grep -l '^ENCRYPTED_DATA_KEY=' /opt/debot/scripts/*.env 2>/dev/null || echo none"]}
    ```
    If found, reuse that same plaintext AES key (retrieve it the same way
-   it was obtained when freq2 was provisioned -- outside the scope of this
+   it was obtained when freq/b were provisioned -- outside the scope of this
    repo, ask the operator who set that up) and its `ENCRYPTED_DATA_KEY`
    ciphertext for this account too. If not found, generate a new one via
    `aws kms generate-data-key` against this project's existing KMS key (do
