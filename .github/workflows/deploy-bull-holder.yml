@@ -201,6 +201,7 @@ jobs:
       DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
     outputs:
       binary_sha256: ${{ steps.package.outputs.binary_sha256 }}
+      libsigner_sha256: ${{ steps.package.outputs.libsigner_sha256 }}
     steps:
       - name: Checkout debot
         uses: actions/checkout@v5
@@ -296,32 +297,48 @@ jobs:
         run: |
           set -euo pipefail
           BINARY=debot/target/release/bull-holder
+          LIBSIGNER=lighter-go/build/libsigner.so
           file "${BINARY}"
           file "${BINARY}" | grep -q aarch64
+          test -f "${LIBSIGNER}"
+          file "${LIBSIGNER}" | grep -q aarch64
+          # bull-holder needs libsigner.so at runtime (lighter-sdk), resolved
+          # via LD_LIBRARY_PATH like every other pairtrade launch script --
+          # mount it alongside the binary here too, or ldd reports it
+          # "not found" even for a correctly working binary.
           docker run --rm --platform linux/arm64 \
             -v "${{ github.workspace }}/${BINARY}:/artifacts/bull-holder:ro" \
+            -v "${{ github.workspace }}/${LIBSIGNER}:/artifacts/libsigner.so:ro" \
+            -e LD_LIBRARY_PATH=/artifacts \
             ${AL2023_IMAGE_RESOLVED} \
-            /bin/bash -lc "set -euo pipefail; if ldd /artifacts/bull-holder | grep -q not.found; then exit 1; fi; ldd /artifacts/bull-holder"
+            /bin/bash -lc "set -euo pipefail; if ldd /artifacts/bull-holder | grep -q not.found; then ldd /artifacts/bull-holder; exit 1; fi; ldd /artifacts/bull-holder"
 
           mkdir -p dist
           install -m 0755 "${BINARY}" dist/bull-holder
+          install -m 0644 "${LIBSIGNER}" dist/libsigner.so
           test "$(stat -c %a dist/bull-holder)" = 755
+          test "$(stat -c %a dist/libsigner.so)" = 644
           BINARY_SHA256=$(sha256sum dist/bull-holder | cut -d " " -f1)
+          LIBSIGNER_SHA256=$(sha256sum dist/libsigner.so | cut -d " " -f1)
           CARGO_LOCK_SHA256=$(sha256sum debot/Cargo.lock | cut -d " " -f1)
           DEX_CONNECTOR_SHA=$(git -C dex-connector rev-parse HEAD)
           (cd dist && sha256sum bull-holder > bull-holder.sha256)
+          (cd dist && sha256sum libsigner.so > libsigner.so.sha256)
           jq -n \
             --arg source_sha "${GITHUB_SHA}" \
             --arg dex_connector_sha "${DEX_CONNECTOR_SHA}" \
             --arg binary_sha256 "${BINARY_SHA256}" \
+            --arg libsigner_sha256 "${LIBSIGNER_SHA256}" \
             --arg cargo_lock_sha256 "${CARGO_LOCK_SHA256}" \
             --arg rust_toolchain "${RUST_TOOLCHAIN}" \
             --arg build_image "${AL2023_IMAGE_RESOLVED}" \
             --arg github_run_id "${GITHUB_RUN_ID}" \
             --arg github_run_attempt "${GITHUB_RUN_ATTEMPT}" \
-            '{schema_version: 1, artifact: "bull-holder", architecture: "aarch64", feature_set: "lighter-sdk+hyperliquid-sdk", source_sha: $source_sha, dex_connector_sha: $dex_connector_sha, cargo_lock_sha256: $cargo_lock_sha256, binary_sha256: $binary_sha256, mode: "0755", rust_toolchain: $rust_toolchain, build_image: $build_image, github_run_id: $github_run_id, github_run_attempt: $github_run_attempt}' > dist/manifest.json
+            '{schema_version: 1, artifact: "bull-holder", architecture: "aarch64", feature_set: "lighter-sdk+hyperliquid-sdk", source_sha: $source_sha, dex_connector_sha: $dex_connector_sha, cargo_lock_sha256: $cargo_lock_sha256, binary_sha256: $binary_sha256, libsigner_sha256: $libsigner_sha256, mode: "0755", libsigner_mode: "0644", rust_toolchain: $rust_toolchain, build_image: $build_image, github_run_id: $github_run_id, github_run_attempt: $github_run_attempt}' > dist/manifest.json
           echo "binary_sha256=${BINARY_SHA256}" >> "${GITHUB_OUTPUT}"
+          echo "libsigner_sha256=${LIBSIGNER_SHA256}" >> "${GITHUB_OUTPUT}"
           (cd dist && sha256sum -c bull-holder.sha256)
+          (cd dist && sha256sum -c libsigner.so.sha256)
           jq . dist/manifest.json
 
       - name: Fix cargo cache permissions
@@ -355,6 +372,8 @@ jobs:
           path: |
             dist/bull-holder
             dist/bull-holder.sha256
+            dist/libsigner.so
+            dist/libsigner.so.sha256
             dist/manifest.json
             debot/scripts/debot-bull-holder.sh
             debot/scripts/debot-bull-holder.env.example
@@ -387,6 +406,8 @@ jobs:
         run: |
           aws s3 cp dist/bull-holder "s3://${S3_BUCKET}/debot/bull-holder/bull-holder"
           aws s3 cp dist/bull-holder.sha256 "s3://${S3_BUCKET}/debot/bull-holder/bull-holder.sha256"
+          aws s3 cp dist/libsigner.so "s3://${S3_BUCKET}/debot/bull-holder/libsigner.so"
+          aws s3 cp dist/libsigner.so.sha256 "s3://${S3_BUCKET}/debot/bull-holder/libsigner.so.sha256"
           aws s3 cp dist/manifest.json "s3://${S3_BUCKET}/debot/bull-holder/manifest.json"
           # Self-contained deploy: ship the wrapper + example env + unit too
           # so a dispatch run does not depend on a prior ci.yml scripts sync.
@@ -400,21 +421,29 @@ jobs:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
           BINARY_SHA256: ${{ needs.build.outputs.binary_sha256 }}
+          LIBSIGNER_SHA256: ${{ needs.build.outputs.libsigner_sha256 }}
         run: |
           cat > /tmp/ssm-params.json <<'JSON'
           {
             "commands": [
               "set -e",
-              "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/bull_holder",
+              "sudo mkdir -p __INSTALL_DIR__/bin __INSTALL_DIR__/lib __INSTALL_DIR__/bull_holder",
               "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/bull-holder /tmp/bull-holder",
               "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/bull-holder.sha256 /tmp/bull-holder.sha256",
+              "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/libsigner.so /tmp/libsigner.so",
+              "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/libsigner.so.sha256 /tmp/libsigner.so.sha256",
               "aws s3 cp s3://__S3_BUCKET__/debot/bull-holder/manifest.json /tmp/bull-holder-manifest.json",
               "echo __BINARY_SHA256__ /tmp/bull-holder | sha256sum -c - || exit 1",
               "(cd /tmp && sha256sum -c bull-holder.sha256) || exit 1",
+              "echo __LIBSIGNER_SHA256__ /tmp/libsigner.so | sha256sum -c - || exit 1",
+              "(cd /tmp && sha256sum -c libsigner.so.sha256) || exit 1",
               "sudo install -o root -g root -m 0755 /tmp/bull-holder __INSTALL_DIR__/bin/bull-holder",
+              "sudo install -o root -g root -m 0644 /tmp/libsigner.so __INSTALL_DIR__/lib/libsigner.so",
               "sudo install -o root -g root -m 0644 /tmp/bull-holder-manifest.json __INSTALL_DIR__/manifest.json",
               "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/bin/bull-holder) = root:root:755 || exit 1",
+              "sudo test $(stat -c %U:%G:%a __INSTALL_DIR__/lib/libsigner.so) = root:root:644 || exit 1",
               "echo __BINARY_SHA256__ __INSTALL_DIR__/bin/bull-holder | sudo sha256sum -c - || exit 1",
+              "echo __LIBSIGNER_SHA256__ __INSTALL_DIR__/lib/libsigner.so | sudo sha256sum -c - || exit 1",
               "aws s3 cp s3://__S3_BUCKET__/debot/scripts/debot-bull-holder.sh /opt/debot/scripts/debot-bull-holder.sh",
               "sudo chmod 755 /opt/debot/scripts/debot-bull-holder.sh",
               "aws s3 cp s3://__S3_BUCKET__/debot/scripts/debot-bull-holder.env.example /opt/debot/scripts/debot-bull-holder.env.example",
@@ -423,7 +452,7 @@ jobs:
             ]
           }
           JSON
-          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__BINARY_SHA256__|${BINARY_SHA256}|g" /tmp/ssm-params.json
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__BINARY_SHA256__|${BINARY_SHA256}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g" /tmp/ssm-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
