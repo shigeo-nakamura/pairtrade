@@ -447,28 +447,7 @@ async fn resume_active_live_tick_attempt(
 fn archive_rejected_report(config_path: &Path) -> Result<()> {
     let config_bytes = read_private_regular_file(config_path, "config")?;
     let config = parse_config(&config_bytes, config_path)?;
-
-    // archive-rejected-apply always checks CONFIG_YAML against
-    // auto_execute_policy.json before doing anything else (same reasoning
-    // as manual-reconcile-apply, pairtrade#241: nothing else here proves
-    // CONFIG_YAML's ledger_path/runtime_state_path point at the genuine
-    // production paths rather than a caller-fabricated redirect) -- check
-    // it here too, first, so this report never claims eligibility for a
-    // CONFIG_YAML apply would actually refuse outright.
-    if let Err(error) = auto_execute_policy_from_admin_file()
-        .and_then(|policy| require_config_within_auto_execute_policy(&config, &policy))
-    {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "policy_rejected",
-                "detail": format!(
-                    "archive-rejected-apply would refuse this CONFIG_YAML before doing anything \
-                     else (auto_execute_policy.json check): {error:#}"
-                ),
-            }))
-            .context("failed to serialize Arcus archive-rejected report")?
-        );
+    if print_policy_rejected_report_if_needed(&config, "archive-rejected-apply")? {
         return Ok(());
     }
 
@@ -527,6 +506,7 @@ fn build_archive_rejected_report(config: &ArcusSpotExecuteOnceConfig) -> Result<
 /// this call is refused rather than silently archiving the wrong one.
 fn archive_rejected_apply(config_path: &Path, sequence: &str) -> Result<()> {
     let sequence: u64 = sequence
+        .trim()
         .parse()
         .context("SEQUENCE must be the ledger's active attempt sequence number")?;
 
@@ -898,34 +878,47 @@ fn require_single_manual_reconcile_candidate(
     Ok(plan)
 }
 
-fn manual_reconcile_report(
-    config_path: &Path,
-    events_jsonl_path: &Path,
-    expected_sell_amount_raw: &str,
-    expected_buy_amount_raw: &str,
-) -> Result<()> {
-    // manual-reconcile-apply always checks CONFIG_YAML against
-    // auto_execute_policy.json before doing anything else (Codex P1
-    // follow-up, pairtrade#241) -- check it here too, first, so this
-    // report never claims "ready" (or any other status implying apply
-    // would proceed) for a CONFIG_YAML apply would actually refuse
-    // outright (Codex P2 follow-up, same PR).
-    let config_bytes = read_private_regular_file(config_path, "config")?;
-    let config = parse_config(&config_bytes, config_path)?;
+/// Shared by every `*-report` command that previews a `*-apply` command
+/// gated on `auto_execute_policy.json` (`manual-reconcile-report` ->
+/// `manual-reconcile-apply`, `archive-rejected-report` ->
+/// `archive-rejected-apply`): if CONFIG_YAML would be refused, prints a
+/// `policy_rejected` report naming `apply_command_name` and returns `true`
+/// so the caller stops here, rather than letting a report ever claim
+/// "ready"/"eligible" for a CONFIG_YAML the apply command would actually
+/// refuse outright (Codex P1/P2 follow-up, pairtrade#241). Returns `false`
+/// if the config passed the check and the caller should proceed.
+fn print_policy_rejected_report_if_needed(
+    config: &ArcusSpotExecuteOnceConfig,
+    apply_command_name: &str,
+) -> Result<bool> {
     if let Err(error) = auto_execute_policy_from_admin_file()
-        .and_then(|policy| require_config_within_auto_execute_policy(&config, &policy))
+        .and_then(|policy| require_config_within_auto_execute_policy(config, &policy))
     {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "status": "policy_rejected",
                 "detail": format!(
-                    "manual-reconcile-apply would refuse this CONFIG_YAML before doing anything \
+                    "{apply_command_name} would refuse this CONFIG_YAML before doing anything \
                      else (auto_execute_policy.json check): {error:#}"
                 ),
             }))
-            .context("failed to serialize Arcus manual-reconcile report")?
+            .context("failed to serialize Arcus policy-rejected report")?
         );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn manual_reconcile_report(
+    config_path: &Path,
+    events_jsonl_path: &Path,
+    expected_sell_amount_raw: &str,
+    expected_buy_amount_raw: &str,
+) -> Result<()> {
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+    if print_policy_rejected_report_if_needed(&config, "manual-reconcile-apply")? {
         return Ok(());
     }
 
