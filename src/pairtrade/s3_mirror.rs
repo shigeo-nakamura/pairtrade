@@ -105,7 +105,7 @@ impl S3Mirror {
     /// Like `put_async`, but with an explicit `Content-Type`. Used by
     /// sibling-file mirrors (`equity_history.jsonl`, `backtest_alert.json`)
     /// — see bot-strategy#343 Phase 3.
-    pub fn put_async_with_content_type(
+    pub(crate) fn put_async_with_content_type(
         self: &Arc<Self>,
         file_name: &str,
         body: Vec<u8>,

@@ -389,6 +389,12 @@ struct RiskState {
     /// incident referenced there).
     #[serde(default)]
     pnl_today: f64,
+    /// UTC date (YYYY-MM-DD) `pnl_today` was last reset for. Persisted
+    /// (unlike the engine's in-memory-only `current_date`) so a same-day
+    /// restart can tell "still today" apart from a genuine day change --
+    /// see `roll_day_if_needed`.
+    #[serde(default)]
+    pnl_today_date: Option<String>,
     #[serde(default)]
     total_trades: u64,
     #[serde(default)]
@@ -465,6 +471,15 @@ struct DaySnapshot {
     t1_prices: Option<HashMap<String, f64>>,
     entered: bool,
     exited: bool,
+    /// True when `entered` was restored from `RiskState.last_session_date`
+    /// after a restart (roll_day_if_needed's recovery branch), rather than
+    /// decided by this process's own `maybe_enter` this run. `position` is
+    /// in-memory only and never persisted/reconciled with the real
+    /// exchange (see this file's KNOWN GAPS), so it cannot be trusted for
+    /// the rest of the day once this is true -- drives `positions_ready`
+    /// in the dashboard status payload (bot-strategy#866 PR #255 review
+    /// round 2).
+    restart_recovered: bool,
 }
 
 /// Snapshot `prices` into `day.t0_prices` the first time `now_us` reaches
@@ -543,7 +558,17 @@ impl EngineBLiveEngine {
         }
         self.current_date = Some(today);
         self.day = DaySnapshot::default();
-        self.state.pnl_today = 0.0;
+        // Keyed off the *persisted* pnl_today_date, not the in-memory
+        // current_date this function just reset -- current_date is always
+        // None right after process start (main() initializes it that way),
+        // so comparing against it would treat a same-day restart as a new
+        // day and wipe pnl_today back to 0.0 for the rest of the day
+        // (bot-strategy#866 PR #255 review round 2, bug 1).
+        let today_str = today.to_string();
+        if self.state.pnl_today_date.as_deref() != Some(today_str.as_str()) {
+            self.state.pnl_today = 0.0;
+            self.state.pnl_today_date = Some(today_str.clone());
+        }
         self.window = resolve_session_window(&self.calendar, today);
         match self.window {
             Some((t0, t1, t2)) => log::info!(
@@ -555,9 +580,10 @@ impl EngineBLiveEngine {
                 self.calendar.calendar_version
             ),
         }
-        if self.state.last_session_date.as_deref() == Some(&today.to_string()) {
+        if self.state.last_session_date.as_deref() == Some(today_str.as_str()) {
             log::info!("[DAY] {today} already acted on before a restart; not re-entering");
             self.day.entered = true;
+            self.day.restart_recovered = true;
         }
     }
 
@@ -859,7 +885,12 @@ impl EngineBLiveEngine {
             "dry_run": self.cfg.dry_run,
             "has_position": self.position.is_some(),
             "position_count": self.position.is_some() as i32,
-            "positions_ready": true,
+            // false exactly when today's `entered` flag was restored from
+            // persisted state after a restart -- our own in-memory
+            // `position` was lost in that case (never persisted, see
+            // KNOWN GAPS), so debot-dashboard's "positions_ready !==
+            // false means trustworthy" read must not be told otherwise.
+            "positions_ready": !self.day.restart_recovered,
             "positions": positions,
             "pnl_total": self.state.realized_pnl_session,
             "pnl_today": self.state.pnl_today,
@@ -881,9 +912,11 @@ impl EngineBLiveEngine {
             "window": self.window,
             "day_entered": self.day.entered,
             "day_exited": self.day.exited,
+            "restart_recovered": self.day.restart_recovered,
             "session_halted": self.state.session_halted,
             "session_halt_reason": self.state.session_halt_reason,
             "realized_pnl_session": self.state.realized_pnl_session,
+            "pnl_today_date": self.state.pnl_today_date,
             "total_trades": self.state.total_trades,
             "total_wins": self.state.total_wins,
             "max_dd_bps": self.state.max_dd_bps,
