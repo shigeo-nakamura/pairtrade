@@ -1,7 +1,7 @@
-#[cfg(feature = "lighter-sdk")]
+#[cfg(any(feature = "lighter-sdk", feature = "hyperliquid-sdk"))]
 use debot_utils::decrypt_data_with_kms;
 use rust_decimal::Error as DecimalParseError;
-#[cfg(any(feature = "lighter-sdk", feature = "extended-sdk"))]
+#[cfg(any(feature = "lighter-sdk", feature = "extended-sdk", feature = "hyperliquid-sdk"))]
 use std::env;
 use std::fmt;
 use std::num::{ParseFloatError, ParseIntError};
@@ -35,7 +35,7 @@ pub enum ConfigError {
     ParseIntError(ParseIntError),
     ParseFloatError(ParseFloatError),
     DecimalParseError(DecimalParseError),
-    #[cfg(feature = "lighter-sdk")]
+    #[cfg(any(feature = "lighter-sdk", feature = "hyperliquid-sdk"))]
     OtherError(String),
 }
 
@@ -45,7 +45,7 @@ impl fmt::Display for ConfigError {
             ConfigError::ParseIntError(e) => write!(f, "Parse int error: {}", e),
             ConfigError::ParseFloatError(e) => write!(f, "Parse float error: {}", e),
             ConfigError::DecimalParseError(e) => write!(f, "Decimal parse error: {}", e),
-            #[cfg(feature = "lighter-sdk")]
+            #[cfg(any(feature = "lighter-sdk", feature = "hyperliquid-sdk"))]
             ConfigError::OtherError(e) => write!(f, "Other error: {}", e),
         }
     }
@@ -233,5 +233,116 @@ pub async fn get_extended_config_from_env() -> Result<ExtendedConfig, ConfigErro
         vault,
         base_url,
         websocket_url,
+    })
+}
+
+/// Instance-suffixed env lookup shared by the venue loaders: `NAME_<SUFFIX>`
+/// (suffix = upper-cased instance id, '-' -> '_') wins over bare `NAME`.
+#[cfg(feature = "hyperliquid-sdk")]
+fn suffixed_env(name: &str, instance_id: Option<&str>) -> Option<String> {
+    if let Some(id) = instance_id {
+        let suffix = id.to_uppercase().replace('-', "_");
+        if let Ok(value) = env::var(format!("{name}_{suffix}")) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Hyperliquid *account* connector config (bot-strategy#894). Read-side only
+/// when no signer key is provided (balances / fills for the configured
+/// account); execution-capable when `HYPERLIQUID_SIGNER_PRIVATE_KEY` (KMS,
+/// decrypted with `ENCRYPTED_DATA_KEY` like the Lighter keys) or
+/// `HYPERLIQUID_PLAIN_SIGNER_PRIVATE_KEY` (testing only) is set.
+///
+/// Env (all accept the `_<INSTANCE>` suffix):
+/// - `HYPERLIQUID_ACCOUNT_ADDRESS` (required) — the account that owns funds
+///   (master or sub-account), NOT the API wallet address
+/// - `HYPERLIQUID_SIGNER_PRIVATE_KEY` / `HYPERLIQUID_PLAIN_SIGNER_PRIVATE_KEY`
+/// - `HYPERLIQUID_VAULT_ADDRESS` (optional)
+/// - `HYPERLIQUID_IS_MAINNET` (default true)
+/// - `HYPERLIQUID_NONCE_STATE_PATH` (required with a signer)
+/// - `HYPERLIQUID_MAX_TAKER_NOTIONAL_USD` (required with a signer; IOC cap)
+/// - `HYPERLIQUID_MAX_TAKER_SLIPPAGE_BPS` (default 50)
+/// - `HYPERLIQUID_MAX_TAKER_BOOK_AGE_MS` (default 5000)
+#[cfg(feature = "hyperliquid-sdk")]
+pub async fn get_hyperliquid_account_config_from_env(
+    instance_id: Option<&str>,
+) -> Result<dex_connector::HyperliquidAccountConfig, ConfigError> {
+    let account_address =
+        suffixed_env("HYPERLIQUID_ACCOUNT_ADDRESS", instance_id).ok_or_else(|| {
+            ConfigError::OtherError("HYPERLIQUID_ACCOUNT_ADDRESS must be set".to_owned())
+        })?;
+    let plain_key = suffixed_env("HYPERLIQUID_PLAIN_SIGNER_PRIVATE_KEY", instance_id);
+    let encrypted_key = suffixed_env("HYPERLIQUID_SIGNER_PRIVATE_KEY", instance_id);
+    let signer_private_key = match (plain_key, encrypted_key) {
+        (Some(plain), _) => {
+            log::warn!("[hyperliquid] using PLAIN signer key (testing only)");
+            Some(plain)
+        }
+        (None, Some(encrypted)) => {
+            let encrypted_data_key = env::var("ENCRYPTED_DATA_KEY")
+                .map_err(|_| {
+                    ConfigError::OtherError(
+                        "ENCRYPTED_DATA_KEY must be set to decrypt HYPERLIQUID_SIGNER_PRIVATE_KEY"
+                            .to_owned(),
+                    )
+                })?
+                .replace(' ', "");
+            let bytes = decrypt_data_with_kms(&encrypted_data_key, encrypted, true)
+                .await
+                .map_err(|_| {
+                    ConfigError::OtherError("decrypt HYPERLIQUID_SIGNER_PRIVATE_KEY".to_owned())
+                })?;
+            Some(String::from_utf8(bytes).map_err(|_| {
+                ConfigError::OtherError("HYPERLIQUID_SIGNER_PRIVATE_KEY is not utf-8".to_owned())
+            })?)
+        }
+        (None, None) => None,
+    };
+    let is_mainnet = suffixed_env("HYPERLIQUID_IS_MAINNET", instance_id)
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+        .unwrap_or(true);
+    let nonce_state_path =
+        suffixed_env("HYPERLIQUID_NONCE_STATE_PATH", instance_id).map(std::path::PathBuf::from);
+    let max_taker_notional = match suffixed_env("HYPERLIQUID_MAX_TAKER_NOTIONAL_USD", instance_id) {
+        Some(v) => Some(v.parse::<rust_decimal::Decimal>()?),
+        None => None,
+    };
+    let max_taker_slippage_bps =
+        match suffixed_env("HYPERLIQUID_MAX_TAKER_SLIPPAGE_BPS", instance_id) {
+            Some(v) => Some(v.parse::<u32>()?),
+            None => Some(50),
+        };
+    let max_taker_book_age_ms = match suffixed_env("HYPERLIQUID_MAX_TAKER_BOOK_AGE_MS", instance_id)
+    {
+        Some(v) => v.parse::<u64>()?,
+        None => 5_000,
+    };
+    if signer_private_key.is_some() {
+        if nonce_state_path.is_none() {
+            return Err(ConfigError::OtherError(
+                "HYPERLIQUID_NONCE_STATE_PATH must be set when a signer key is configured"
+                    .to_owned(),
+            ));
+        }
+        if max_taker_notional.is_none() {
+            return Err(ConfigError::OtherError(
+                "HYPERLIQUID_MAX_TAKER_NOTIONAL_USD must be set when a signer key is configured"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(dex_connector::HyperliquidAccountConfig {
+        account_address,
+        signer_private_key,
+        vault_address: suffixed_env("HYPERLIQUID_VAULT_ADDRESS", instance_id),
+        is_mainnet,
+        nonce_state_path,
+        max_taker_notional,
+        max_taker_slippage_bps,
+        max_taker_book_age_ms,
     })
 }

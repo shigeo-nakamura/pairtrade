@@ -1,0 +1,24 @@
+[Unit]
+Description="debot-bull-holder (bot-strategy#893 bull-mode holder: HL spot 1x + Lighter perp 0.5x, operator-armed)"
+After=network-online.target debot-pair-btceth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=-/opt/debot/bull_holder
+# Lighter WS/REST boot destagger (bot-strategy#163 ladder): after A/B/C (30s)
+# and canary (45s).
+ExecStartPre=/bin/sleep 75
+ExecStart=/bin/bash /opt/debot/scripts/debot-bull-holder.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+TimeoutStartSec=300
+# Holder does NOT force-close on stop: positions are meant to persist across
+# restarts; the exchange-side Lighter stop covers the perp leg meanwhile.
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
