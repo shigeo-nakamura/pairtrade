@@ -960,6 +960,13 @@ impl EngineBLiveEngine {
         // review round 2, nit 5).
         let has_position = !positions.is_empty();
         let position_count = positions.len() as i32;
+        // Same one-source-of-truth treatment as `positions` above: a
+        // fresh Path::exists() check, read once instead of independently
+        // for kill_switch_active and kill_switch, so the two can't
+        // disagree within a single status.json snapshot if the sentinel
+        // file is created/removed between the two reads (review round 3
+        // on this same PR, self-review finding).
+        let kill_switch = self.kill_switch_engaged();
         let status = FullStatus {
             dashboard: DashboardStatus {
                 ts: now_us / 1_000_000,
@@ -980,7 +987,7 @@ impl EngineBLiveEngine {
                 pnl_total: self.state.realized_pnl_session,
                 pnl_today: self.state.pnl_today,
                 pnl_source: "engine_b_live_risk_state",
-                kill_switch_active: self.kill_switch_engaged(),
+                kill_switch_active: kill_switch,
                 trade_stats: DashboardTradeStats {
                     trades: self.state.total_trades,
                     wins: self.state.total_wins,
@@ -1005,14 +1012,23 @@ impl EngineBLiveEngine {
                 total_wins: self.state.total_wins,
                 max_dd_bps: self.state.max_dd_bps,
                 max_dd_usd: self.state.max_dd_usd,
-                kill_switch: self.kill_switch_engaged(),
+                kill_switch,
                 calendar_version: self.calendar.calendar_version.clone(),
             },
         };
         // Serialized once and reused for both destinations (previously
         // two separate serde_json calls per tick -- bot-strategy#866 PR
-        // #255 review round 2, nit 4).
-        let Ok(body) = serde_json::to_vec_pretty(&status) else {
+        // #255 review round 2, nit 4). Compact, not to_vec_pretty: the
+        // shared bytes go to the S3 mirror on every 30s tick for the life
+        // of the process, and nobody reads that copy by eye (the Go
+        // consumer's json.Unmarshal is whitespace-agnostic) -- pretty-
+        // printing it would have been a silent ~25%+ size regression on
+        // every PutObject with no benefit (self-review round on this PR
+        // caught this; matches src/pairtrade/status.rs's own convention
+        // of reusing compact serde_json::to_string for both destinations).
+        // The local status.json file trades away pretty-printing for
+        // this; inspect it with `python3 -m json.tool` or `jq` if needed.
+        let Ok(body) = serde_json::to_vec(&status) else {
             log::warn!("[STATUS] serialize failed for {}", self.cfg.status_path.display());
             return;
         };
