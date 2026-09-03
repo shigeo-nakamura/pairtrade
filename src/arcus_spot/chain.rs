@@ -6,7 +6,7 @@ use ethers::{
     abi::RawLog,
     contract::{abigen, EthLogDecode},
     providers::{Http, Middleware, Provider},
-    types::{Address, Bytes, TransactionReceipt, H256, U256},
+    types::{Address, TransactionReceipt, H256, U256},
 };
 use serde::{Deserialize, Serialize};
 use std::{str::FromStr, sync::Arc, time::Duration};
@@ -849,11 +849,21 @@ impl ArcusSpotChainClient {
                 let receipt_block_number = receipt
                     .block_number
                     .context("Arcus confirmed-transaction receipt is missing its block number")?;
-                let current_block_number = provider.get_block_number().await.map_err(|error| {
-                    ProviderAttemptError::Transient(anyhow::anyhow!(
-                        "Arcus current block number read failed: {error}"
-                    ))
-                })?;
+                // `.context(...)` rather than interpolating `{error}`
+                // directly: `ProviderError::HTTPError` wraps a
+                // `reqwest::Error` whose Display commonly includes the
+                // failing request URL, and RPC URLs configured here can
+                // carry an API key in the path/query (Codex P1 follow-up,
+                // pairtrade#182, round 6 -- see `redact_rpc_url`). anyhow's
+                // plain `{}`/`{error}` Display only renders the top-level
+                // context, not the chained source, so this stays safe to
+                // log/propagate unredacted the same way every other error
+                // in this function already is.
+                let current_block_number = provider
+                    .get_block_number()
+                    .await
+                    .context("Arcus current block number read failed")
+                    .map_err(ProviderAttemptError::Transient)?;
                 if current_block_number < receipt_block_number {
                     return Err(ProviderAttemptError::Transient(anyhow::anyhow!(
                         "Arcus provider's latest block {current_block_number} has not caught up \
@@ -1028,7 +1038,7 @@ mod tests {
     use super::*;
     use ethers::{
         abi::{encode, Token},
-        types::{Log, U64},
+        types::{Bytes, Log, U64},
         utils::keccak256,
     };
     use serde_json::{json, Value};

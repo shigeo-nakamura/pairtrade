@@ -540,9 +540,11 @@ where
     /// against the chain (e.g. `eth_getTransactionReceipt` logs plus
     /// `balanceOf` deltas, not derived from this process or this ledger).
     /// Both must equal the deltas this attempt's own `reconcile_confirmed`
-    /// already computed from EIP-1898-pinned canonical post-swap balances --
-    /// if either disagrees, this is not the incident the caller thinks it
-    /// is, and this method refuses rather than guess.
+    /// already computed (bot-strategy#880: `latest` balances, read only
+    /// once the answering provider has proven itself caught up to the
+    /// confirmed transaction's block) -- if either disagrees, this is not
+    /// the incident the caller thinks it is, and this method refuses
+    /// rather than guess.
     ///
     /// `plan.direction`/`plan.trigger`/`plan.sell_quantity` still drive the
     /// runtime commit (`apply_confirmed_live_fill_once`), and
@@ -742,8 +744,9 @@ where
     }
 }
 
-/// Keep canonical-read failure handling visibly ahead of every ledger or
-/// filesystem mutation. A rejected EIP-1898 selector must leave a Confirmed
+/// Keep reconciliation-read failure handling visibly ahead of every ledger
+/// or filesystem mutation. A provider that hasn't caught up to the
+/// confirmed block (or any other read failure) must leave a Confirmed
 /// attempt retryable, not convert it into sticky Unknown with a fake delta.
 fn persist_reconciliation_read(
     ledger: &mut ArcusSpotExecutionLedger,
@@ -889,9 +892,26 @@ fn require_intent_matches_plan_shape(
 }
 
 /// The real settled sell/buy deltas for a `Reconciled` attempt, from its own
-/// pre/post balance snapshots (`reconcile_confirmed` populates `post_balances`
-/// from an EIP-1898-pinned canonical read at the confirmed tx's block --
-/// this never depends on any caller-supplied plan).
+/// pre/post balance snapshots -- this never depends on any caller-supplied
+/// plan. `reconcile_confirmed` populates `post_balances` by reading
+/// `latest` balances once the answering provider has proven itself caught
+/// up to the confirmed transaction's block (bot-strategy#880; previously an
+/// EIP-1898-pinned read at that exact block, retired because the
+/// configured RPC providers turned out not to retain that pinnable
+/// historical state long enough in practice).
+///
+/// The caller-side check in `reconciled_runtime_fill` below closes the gap
+/// this leaves on the *sell* side (requiring the sell delta to equal the
+/// dispatched plan's own `sell_amount_raw` exactly). There is deliberately
+/// no equivalent exact/floor check of the *buy* delta here against the
+/// on-chain `SwapExecuted` event's own `amount_out` yet -- unlike the
+/// retired pinned-block read, which was structurally isolated to the one
+/// block the swap confirmed in, `post_balances` can now be read an
+/// unbounded amount of time after that (a provider taking several ticks to
+/// catch up, say), widening the window in which unrelated buy-token wallet
+/// activity (a manual operator trade, as has happened historically) could
+/// contaminate `actual_buy_quantity` without being caught. Tracked as a
+/// follow-up in bot-strategy#880 rather than rushed into this pass.
 fn reconciled_balance_deltas(active: &ArcusSpotExecutionAttempt) -> Result<(U256, U256)> {
     let post = active
         .post_balances
@@ -1455,7 +1475,7 @@ mod tests {
         // real fix is that actual_sell_quantity/actual_buy_quantity never
         // come from the candidate plan's own sell_quantity/buy_quantity/
         // buy_amount_raw fields -- only from the operator-attested raw
-        // amounts (already proven equal to the ledger's own EIP-1898-pinned
+        // amounts (already proven equal to the ledger's own reconciled
         // balance deltas) and the config-pinned decimals. A candidate
         // claiming wildly different quantities/ratios must produce the
         // exact same fill as one with sane ones, for the same raw amounts
