@@ -87,7 +87,15 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::Region;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client as S3Client;
+use once_cell::sync::OnceCell;
+use tokio::sync::OnceCell as AsyncOnceCell;
 
 fn init_logger() {
     let offset_seconds = std::env::var("TIMEZONE_OFFSET")
@@ -418,6 +426,94 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) {
     }
 }
 
+/// Optional status.json mirror to the `debot-dashboard` S3 bucket
+/// (bot-strategy#866 dashboard panel request, 2026-09-03). Reimplemented
+/// locally rather than reusing `pairtrade::pairtrade::s3_mirror::S3Mirror`
+/// for the same reason as the KILL_SWITCH/RISK_ACK conventions above:
+/// that module is `pub(crate)` inside the `pairtrade` lib target, and a
+/// `src/bin/` file compiles as its own crate that only sees the lib's
+/// `pub` surface. No-op (never constructs an S3 client) when
+/// `STATUS_S3_BUCKET`/`STATUS_S3_KEY_PREFIX` are unset, so hosts that
+/// don't opt in pay no cost.
+struct StatusS3Mirror {
+    bucket: String,
+    key_prefix: String,
+    client: AsyncOnceCell<S3Client>,
+}
+
+/// Hard-coded like `pairtrade`'s own mirror: the `debot-dashboard` bucket
+/// is single-region in `eu-central-1`; Tokyo hosts cross-region write the
+/// same way the rest of this project's S3 status mirroring does.
+const STATUS_S3_BUCKET_REGION: &str = "eu-central-1";
+
+static STATUS_S3_MIRROR: OnceCell<Option<Arc<StatusS3Mirror>>> = OnceCell::new();
+
+impl StatusS3Mirror {
+    fn from_env() -> Option<Arc<Self>> {
+        STATUS_S3_MIRROR
+            .get_or_init(|| {
+                let bucket = std::env::var("STATUS_S3_BUCKET")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())?;
+                let key_prefix = std::env::var("STATUS_S3_KEY_PREFIX")
+                    .ok()
+                    .map(|v| v.trim().trim_end_matches('/').to_string())
+                    .filter(|v| !v.is_empty())?;
+                log::info!(
+                    "[STATUS_S3] mirror enabled bucket={bucket} prefix={key_prefix} region={STATUS_S3_BUCKET_REGION}"
+                );
+                Some(Arc::new(StatusS3Mirror {
+                    bucket,
+                    key_prefix,
+                    client: AsyncOnceCell::new(),
+                }))
+            })
+            .clone()
+    }
+
+    async fn client(&self) -> &S3Client {
+        self.client
+            .get_or_init(|| async {
+                let cfg = aws_config::defaults(BehaviorVersion::latest())
+                    .region(Region::new(STATUS_S3_BUCKET_REGION))
+                    .load()
+                    .await;
+                S3Client::new(&cfg)
+            })
+            .await
+    }
+
+    /// Fire-and-forget `PutObject` of `status.json`. Spawns on the
+    /// current tokio runtime and returns immediately; failures are
+    /// logged at WARN and never block the local atomic write this always
+    /// follows.
+    fn put_status_async(self: &Arc<Self>, body: Vec<u8>) {
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let me = Arc::clone(self);
+        handle.spawn(async move {
+            let key = format!("{}/status.json", me.key_prefix);
+            let client = me.client().await;
+            let resp = client
+                .put_object()
+                .bucket(&me.bucket)
+                .key(&key)
+                .cache_control("max-age=2")
+                .content_type("application/json")
+                .body(ByteStream::from(body))
+                .send()
+                .await;
+            match resp {
+                Ok(_) => log::debug!("[STATUS_S3] put ok key={key}"),
+                Err(err) => log::warn!("[STATUS_S3] put failed key={key} err={err:?}"),
+            }
+        });
+    }
+}
+
 fn append_pnl_log(path: &Path, record: &serde_json::Value) {
     let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
         log::warn!("[PNL_LOG] open failed: {}", path.display());
@@ -476,6 +572,7 @@ struct EngineBLiveEngine {
     position: Option<OpenPosition>,
     state: RiskState,
     last_status_write_us: i64,
+    status_s3_mirror: Option<Arc<StatusS3Mirror>>,
 }
 
 impl EngineBLiveEngine {
@@ -798,13 +895,56 @@ impl EngineBLiveEngine {
             return;
         }
         self.last_status_write_us = now_us;
+        let win_rate = if self.state.total_trades > 0 {
+            self.state.total_wins as f64 / self.state.total_trades as f64
+        } else {
+            0.0
+        };
+        let positions = match &self.position {
+            Some(pos) => vec![serde_json::json!({
+                "symbol": self.cfg.us_primary_symbol,
+                "side": match pos.side {
+                    dex_connector::OrderSide::Long => "long",
+                    dex_connector::OrderSide::Short => "short",
+                },
+                "size": pos.size.to_string(),
+                "entry_price": pos.entry_price.to_string(),
+            })],
+            None => vec![],
+        };
         let status = serde_json::json!({
+            // debot-dashboard's StatusData (main.go) fields -- kept in
+            // sync manually since that struct lives in a different repo;
+            // unknown extra fields below are ignored by Go's
+            // json.Unmarshal, so the engine_b_live-specific fields and
+            // the dashboard-shaped fields coexist in one document.
+            "ts": now_us / 1_000_000,
+            "updated_at": Utc::now().to_rfc3339(),
+            "id": self.cfg.instance_id,
+            "dex": "lighter",
+            "dry_run": self.cfg.dry_run,
+            "has_position": self.position.is_some(),
+            "position_count": self.position.is_some() as i32,
+            "positions_ready": true,
+            "positions": positions,
+            "pnl_total": self.state.realized_pnl_session,
+            "pnl_today": self.state.realized_pnl_session,
+            "pnl_source": "engine_b_live_risk_state",
+            "kill_switch_active": self.kill_switch_engaged(),
+            "trade_stats": {
+                "trades": self.state.total_trades,
+                "wins": self.state.total_wins,
+                "win_rate": win_rate,
+                "max_dd": self.state.max_dd_bps,
+                "pnl": self.state.realized_pnl_session,
+            },
+            // engine_b_live-specific fields, not part of debot-dashboard's
+            // schema -- ignored by the Go backend, useful for
+            // journalctl/manual inspection and any future dedicated panel.
             "ts_us": now_us,
             "instance_id": self.cfg.instance_id,
-            "dry_run": self.cfg.dry_run,
             "current_date": self.current_date.map(|d| d.to_string()),
             "window": self.window,
-            "has_position": self.position.is_some(),
             "day_entered": self.day.entered,
             "day_exited": self.day.exited,
             "session_halted": self.state.session_halted,
@@ -817,6 +957,11 @@ impl EngineBLiveEngine {
             "calendar_version": self.calendar.calendar_version,
         });
         atomic_write_json(&self.cfg.status_path, &status);
+        if let Some(mirror) = &self.status_s3_mirror {
+            if let Ok(body) = serde_json::to_vec(&status) {
+                mirror.put_status_async(body);
+            }
+        }
     }
 }
 
@@ -925,6 +1070,7 @@ async fn main() -> Result<()> {
         position: None,
         state,
         last_status_write_us: 0,
+        status_s3_mirror: StatusS3Mirror::from_env(),
     };
 
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(5));
