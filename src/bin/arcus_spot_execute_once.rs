@@ -422,6 +422,138 @@ async fn resume_active_live_tick_attempt(
     ))
 }
 
+/// Read-only preview for `archive-rejected-apply` (bot-strategy#898):
+/// reports the ledger's active attempt and whether it is eligible to be
+/// archived, without mutating anything. Run this first, then pass the
+/// sequence it reports to `archive-rejected-apply` to confirm you are
+/// archiving the attempt you just reviewed and not a different one that
+/// appeared in the meantime.
+fn archive_rejected_report(config_path: &Path) -> Result<()> {
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+    if print_policy_rejected_report_if_needed(&config, "archive-rejected-apply")? {
+        return Ok(());
+    }
+
+    // Pass the already-parsed, already-approved config object -- not
+    // config_path -- so build_archive_rejected_report cannot re-read
+    // CONFIG_YAML from disk a second time (same TOCTOU reasoning as
+    // manual-reconcile-report, pairtrade#241).
+    let report = build_archive_rejected_report(&config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .context("failed to serialize Arcus archive-rejected report")?
+    );
+    Ok(())
+}
+
+fn build_archive_rejected_report(config: &ArcusSpotExecuteOnceConfig) -> Result<serde_json::Value> {
+    // Same exclusive lock a dispatching tick takes, so this read cannot
+    // interleave with one committing a fill (mirrors build_repair_report).
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+    let ledger = ledger_store.load_existing()?;
+
+    let Some(active) = ledger.active.clone() else {
+        return Ok(serde_json::json!({
+            "status": "no_active_attempt",
+            "detail": "the ledger has no active attempt; there is nothing to archive",
+        }));
+    };
+
+    // Dry-run the real guard on a throwaway clone rather than hand-duplicating
+    // archive_rejected()'s phase/tx_hash conditions here: if that method's
+    // eligibility rule ever changes, this report (both the status and the
+    // reason) follows automatically instead of silently drifting into
+    // telling an operator something is "eligible_to_archive" that apply
+    // would then refuse (matching how manual_reconcile_report runs the real
+    // commit logic against a clone to derive "ready", not a hand-written
+    // approximation of it).
+    let ineligible_reason = ledger.clone().archive_rejected().err();
+    let eligible = ineligible_reason.is_none();
+    Ok(serde_json::json!({
+        "status": if eligible { "eligible_to_archive" } else { "not_eligible" },
+        "sequence": active.sequence,
+        "phase": active.phase,
+        "tx_hash": active.tx_hash,
+        "detail": active.detail,
+        "intent": active.intent,
+        "reason_if_ineligible": ineligible_reason.map(|error| format!("{error:#}")),
+    }))
+}
+
+/// Archives the ledger's active attempt once an operator has reviewed it
+/// with `archive-rejected-report` and confirmed it is safe to clear
+/// (bot-strategy#898). SEQUENCE must match the report's `sequence` exactly,
+/// so a concurrent tick that started a new attempt between the report and
+/// this call is refused rather than silently archiving the wrong one.
+fn archive_rejected_apply(config_path: &Path, sequence: &str) -> Result<()> {
+    let sequence: u64 = sequence
+        .trim()
+        .parse()
+        .context("SEQUENCE must be the ledger's active attempt sequence number")?;
+
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+    // Same administrator-approval gate as auto-execute/auto-resume/
+    // clear-risk-halt/manual-reconcile-apply: this path skips the offline
+    // Ed25519 signature entirely, so nothing else here proves CONFIG_YAML's
+    // ledger_path/runtime_state_path are the genuine production paths
+    // rather than a caller-fabricated redirect.
+    let policy = auto_execute_policy_from_admin_file()?;
+    require_config_within_auto_execute_policy(&config, &policy)?;
+
+    let result = commit_archive_rejected(&config, sequence)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result)
+            .context("failed to serialize Arcus archive-rejected result")?
+    );
+    Ok(())
+}
+
+fn commit_archive_rejected(
+    config: &ArcusSpotExecuteOnceConfig,
+    sequence: u64,
+) -> Result<serde_json::Value> {
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+    let mut ledger = ledger_store.load_existing()?;
+
+    let active = ledger
+        .active
+        .clone()
+        .context("Arcus execution ledger has no active attempt")?;
+    if active.sequence != sequence {
+        bail!(
+            "refusing to archive: caller expected sequence {sequence} but the ledger's active \
+             attempt is sequence {} -- re-run archive-rejected-report and confirm before retrying",
+            active.sequence
+        );
+    }
+
+    ledger.archive_rejected()?;
+    ledger_store.persist(&ledger)?;
+
+    // Printed rather than merely done: this is the audit record of a
+    // stuck, operator-reviewed attempt being cleared, and it lands in the
+    // journal (mirrors clear-risk-halt's audit print).
+    Ok(serde_json::json!({
+        "archived": {
+            "sequence": active.sequence,
+            "idempotency_key": active.idempotency_key,
+            "phase": active.phase,
+            "prepared_at": active.prepared_at,
+            "dispatched_at": active.dispatched_at,
+            "updated_at": active.updated_at,
+            "detail": active.detail,
+            "intent": active.intent,
+        },
+        "ledger_path": config.ledger_path,
+    }))
+}
+
 /// Read-only diagnostic for an active execution attempt whose live-tick
 /// pending-plan evidence was lost or overwritten (bot-strategy#869): scans an
 /// operator-supplied, already fetch-and-verified durable event export
@@ -750,34 +882,47 @@ fn require_single_manual_reconcile_candidate(
     Ok(plan)
 }
 
-fn manual_reconcile_report(
-    config_path: &Path,
-    events_jsonl_path: &Path,
-    expected_sell_amount_raw: &str,
-    expected_buy_amount_raw: &str,
-) -> Result<()> {
-    // manual-reconcile-apply always checks CONFIG_YAML against
-    // auto_execute_policy.json before doing anything else (Codex P1
-    // follow-up, pairtrade#241) -- check it here too, first, so this
-    // report never claims "ready" (or any other status implying apply
-    // would proceed) for a CONFIG_YAML apply would actually refuse
-    // outright (Codex P2 follow-up, same PR).
-    let config_bytes = read_private_regular_file(config_path, "config")?;
-    let config = parse_config(&config_bytes, config_path)?;
+/// Shared by every `*-report` command that previews a `*-apply` command
+/// gated on `auto_execute_policy.json` (`manual-reconcile-report` ->
+/// `manual-reconcile-apply`, `archive-rejected-report` ->
+/// `archive-rejected-apply`): if CONFIG_YAML would be refused, prints a
+/// `policy_rejected` report naming `apply_command_name` and returns `true`
+/// so the caller stops here, rather than letting a report ever claim
+/// "ready"/"eligible" for a CONFIG_YAML the apply command would actually
+/// refuse outright (Codex P1/P2 follow-up, pairtrade#241). Returns `false`
+/// if the config passed the check and the caller should proceed.
+fn print_policy_rejected_report_if_needed(
+    config: &ArcusSpotExecuteOnceConfig,
+    apply_command_name: &str,
+) -> Result<bool> {
     if let Err(error) = auto_execute_policy_from_admin_file()
-        .and_then(|policy| require_config_within_auto_execute_policy(&config, &policy))
+        .and_then(|policy| require_config_within_auto_execute_policy(config, &policy))
     {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "status": "policy_rejected",
                 "detail": format!(
-                    "manual-reconcile-apply would refuse this CONFIG_YAML before doing anything \
+                    "{apply_command_name} would refuse this CONFIG_YAML before doing anything \
                      else (auto_execute_policy.json check): {error:#}"
                 ),
             }))
-            .context("failed to serialize Arcus manual-reconcile report")?
+            .context("failed to serialize Arcus policy-rejected report")?
         );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn manual_reconcile_report(
+    config_path: &Path,
+    events_jsonl_path: &Path,
+    expected_sell_amount_raw: &str,
+    expected_buy_amount_raw: &str,
+) -> Result<()> {
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+    if print_policy_rejected_report_if_needed(&config, "manual-reconcile-apply")? {
         return Ok(());
     }
 
@@ -3104,6 +3249,27 @@ fn usage() -> &'static str {
       EXPECTED_SELL_AMOUNT_RAW EXPECTED_BUY_AMOUNT_RAW
   arcus-spot-execute-once manual-reconcile-apply CONFIG_YAML EVENTS_JSONL \
       EXPECTED_SELL_AMOUNT_RAW EXPECTED_BUY_AMOUNT_RAW SEQUENCE IDEMPOTENCY_KEY TX_HASH
+  arcus-spot-execute-once archive-rejected-report CONFIG_YAML
+  arcus-spot-execute-once archive-rejected-apply CONFIG_YAML SEQUENCE
+
+archive-rejected-report/archive-rejected-apply are the recovery path for an
+active attempt stuck in phase Rejected (bot-strategy#898): the router
+refused a submission (or a prepared plan aged out before dispatch) before
+any transaction was ever sent, so there is nothing to reconcile financially,
+but nothing previously moved it out of the ledger's single `active` slot
+either -- every later tick's resume/require_non_terminal_failure check
+correctly (and permanently) refuses to proceed past it, by design, since a
+rejected outcome must never be silently retried. -report only ever loads
+the ledger and never mutates anything; it also refuses (as `not_eligible`)
+a Rejected attempt that somehow carries a tx_hash, since that would mean a
+transaction may actually have reached the chain and needs
+repair-report/manual-reconcile's heavier on-chain verification instead of a
+plain archive. Run -report first, then -apply with the exact sequence it
+reported, so a new attempt that started between the two calls is refused
+rather than silently archived. Both require CONFIG_YAML to match
+auto_execute_policy.json's administrator-approved digest (same gate as
+auto-execute/auto-resume/clear-risk-halt/manual-reconcile-report/apply)
+before doing anything else.
 
 manual-reconcile-report/manual-reconcile-apply are the last-resort recovery
 path for exactly the incident class repair-report's own report describes as
@@ -3824,6 +3990,12 @@ async fn main() -> Result<()> {
         }
         [command, config_path, events_jsonl_path] if command == "repair-report" => {
             repair_report(Path::new(config_path), Path::new(events_jsonl_path))
+        }
+        [command, config_path] if command == "archive-rejected-report" => {
+            archive_rejected_report(Path::new(config_path))
+        }
+        [command, config_path, sequence] if command == "archive-rejected-apply" => {
+            archive_rejected_apply(Path::new(config_path), sequence)
         }
         [command, config_path, events_jsonl_path, expected_sell_amount_raw, expected_buy_amount_raw]
             if command == "manual-reconcile-report" =>
@@ -7676,6 +7848,160 @@ runtime:
 
         let report = build_repair_report(&config_path, &events_path).unwrap();
         assert_eq!(report["status"], "no_active_attempt");
+    }
+
+    fn rejected_attempt_no_tx(
+        config: &ArcusSpotExecuteOnceConfig,
+        plan: &ArcusSpotRotationPlan,
+        at: DateTime<Utc>,
+    ) -> ArcusSpotExecutionAttempt {
+        let mut attempt = repair_report_active_submitted_attempt(config, plan, at);
+        attempt.phase = ArcusSpotExecutionPhase::Rejected;
+        attempt.tx_hash = None;
+        attempt.router_status = None;
+        attempt.detail = Some("HTTP 422 SHELL_SUBMIT_FAILED".to_string());
+        attempt
+    }
+
+    #[test]
+    fn archive_rejected_report_reports_no_active_attempt_when_the_ledger_is_flat() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_repair_report_ledger_state(&config, None);
+
+        let report = build_archive_rejected_report(&config).unwrap();
+        assert_eq!(report["status"], "no_active_attempt");
+    }
+
+    #[test]
+    fn archive_rejected_report_flags_eligible_for_a_rejected_attempt_with_no_tx_hash() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let at = fixture_now();
+        let plan = rotation_plan("entry_signal");
+        persist_repair_report_ledger_state(
+            &config,
+            Some(rejected_attempt_no_tx(&config, &plan, at)),
+        );
+
+        let report = build_archive_rejected_report(&config).unwrap();
+        assert_eq!(report["status"], "eligible_to_archive");
+        assert_eq!(report["reason_if_ineligible"], serde_json::Value::Null);
+        // Must serialize via ArcusSpotExecutionPhase's own snake_case
+        // Serialize impl, not Debug's PascalCase spelling, to match every
+        // other report's "phase" convention (build_repair_report et al.).
+        assert_eq!(report["phase"], "rejected");
+    }
+
+    #[test]
+    fn archive_rejected_report_flags_not_eligible_for_a_submitted_attempt() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let at = fixture_now();
+        let plan = rotation_plan("entry_signal");
+        persist_repair_report_ledger_state(
+            &config,
+            Some(repair_report_active_submitted_attempt(&config, &plan, at)),
+        );
+
+        let report = build_archive_rejected_report(&config).unwrap();
+        assert_eq!(report["status"], "not_eligible");
+        assert!(report["reason_if_ineligible"].is_string());
+    }
+
+    #[test]
+    fn archive_rejected_report_flags_not_eligible_for_a_rejected_attempt_with_a_tx_hash() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let at = fixture_now();
+        let plan = rotation_plan("entry_signal");
+        let mut attempt = rejected_attempt_no_tx(&config, &plan, at);
+        attempt.tx_hash = Some(format!("0x{:064x}", 7));
+        persist_repair_report_ledger_state(&config, Some(attempt));
+
+        let report = build_archive_rejected_report(&config).unwrap();
+        assert_eq!(report["status"], "not_eligible");
+    }
+
+    #[test]
+    fn commit_archive_rejected_archives_a_matching_sequence() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let at = fixture_now();
+        let plan = rotation_plan("entry_signal");
+        let attempt = rejected_attempt_no_tx(&config, &plan, at);
+        let sequence = attempt.sequence;
+        persist_repair_report_ledger_state(&config, Some(attempt));
+
+        let result = commit_archive_rejected(&config, sequence).unwrap();
+        assert_eq!(result["archived"]["sequence"], sequence);
+
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert!(ledger.active.is_none());
+        assert_eq!(ledger.history.len(), 1);
+    }
+
+    #[test]
+    fn commit_archive_rejected_refuses_a_sequence_mismatch() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let at = fixture_now();
+        let plan = rotation_plan("entry_signal");
+        let attempt = rejected_attempt_no_tx(&config, &plan, at);
+        let real_sequence = attempt.sequence;
+        persist_repair_report_ledger_state(&config, Some(attempt));
+
+        let error = commit_archive_rejected(&config, real_sequence + 1).unwrap_err();
+        assert!(error.to_string().contains("refusing to archive"));
+
+        // Refusing must leave the ledger untouched.
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert!(ledger.active.is_some());
+    }
+
+    #[test]
+    fn commit_archive_rejected_refuses_a_non_rejected_active_attempt() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let at = fixture_now();
+        let plan = rotation_plan("entry_signal");
+        let attempt = repair_report_active_submitted_attempt(&config, &plan, at);
+        let sequence = attempt.sequence;
+        persist_repair_report_ledger_state(&config, Some(attempt));
+
+        assert!(commit_archive_rejected(&config, sequence).is_err());
     }
 
     /// `repair_report_active_submitted_attempt` plus a `Reconciled` phase
