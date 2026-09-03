@@ -434,6 +434,42 @@ impl ArcusSpotExecutionLedger {
         Ok(())
     }
 
+    /// Explicitly archive a Rejected attempt, once an operator has reviewed
+    /// it (bot-strategy#898). Before this, nothing ever moved a Rejected
+    /// attempt out of `active` -- `require_non_terminal_failure`/
+    /// `resume_status_and_reconcile` correctly refuse to proceed past one
+    /// (by design, so an ambiguous or rejected outcome is never silently
+    /// retried), but no code path ever cleared it either, so every
+    /// subsequent tick failed the same way indefinitely with no operator
+    /// recourse short of hand-editing the ledger file. Restricted to
+    /// Rejected specifically (not Unknown/Failed, which can involve a
+    /// dispatched-but-unconfirmed transaction and need the heavier
+    /// repair-report/manual-reconcile review) and additionally requires
+    /// `tx_hash` to be absent: `record_submit_rejected`/`cancel_prepared`
+    /// only ever set this phase when the router refused the request before
+    /// any transaction went out, so this is a belt-and-suspenders check
+    /// that there is nothing to reconcile financially, not just a phase
+    /// check.
+    pub fn archive_rejected(&mut self) -> Result<()> {
+        let active = self
+            .active
+            .take()
+            .context("no active Arcus execution attempt")?;
+        if active.phase != ArcusSpotExecutionPhase::Rejected {
+            self.active = Some(active);
+            bail!("only a rejected Arcus attempt can be archived by this path");
+        }
+        if active.tx_hash.is_some() {
+            self.active = Some(active);
+            bail!(
+                "refusing to archive: a Rejected attempt with a tx_hash may have reached the \
+                 chain -- use repair-report/manual-reconcile instead"
+            );
+        }
+        self.history.push(active);
+        Ok(())
+    }
+
     /// Startup is non-mutating: a prepared signed payload is held for an
     /// operator, while an in-flight POST becomes sticky UNKNOWN.
     pub fn recover_after_restart(&mut self, now: DateTime<Utc>) -> bool {
@@ -809,6 +845,109 @@ mod tests {
             .unwrap();
         ledger.mark_dispatching(now).unwrap();
         assert!(ledger.cancel_prepared("too late", now).is_err());
+    }
+
+    #[test]
+    fn archive_rejected_moves_a_rejected_attempt_to_history() {
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.cancel_prepared("plan expired", now).unwrap();
+
+        ledger.archive_rejected().unwrap();
+
+        assert!(ledger.active.is_none());
+        assert_eq!(ledger.history.len(), 1);
+        assert_eq!(ledger.history[0].phase, ArcusSpotExecutionPhase::Rejected);
+    }
+
+    #[test]
+    fn archive_rejected_moves_a_router_rejected_dispatch_to_history() {
+        // Mirrors the actual production incident (bot-strategy#898): a
+        // submission reaches Dispatching, the router refuses it (HTTP 422
+        // SHELL_SUBMIT_FAILED) before any transaction exists, and
+        // record_submit_rejected -- not cancel_prepared -- is what sets
+        // Rejected in that path.
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.mark_dispatching(now).unwrap();
+        ledger
+            .record_submit_rejected("HTTP 422 SHELL_SUBMIT_FAILED", now)
+            .unwrap();
+
+        ledger.archive_rejected().unwrap();
+
+        assert!(ledger.active.is_none());
+        assert_eq!(ledger.history.len(), 1);
+        assert_eq!(
+            ledger.history[0].detail.as_deref(),
+            Some("HTTP 422 SHELL_SUBMIT_FAILED")
+        );
+        assert!(ledger.history[0].tx_hash.is_none());
+    }
+
+    #[test]
+    fn archive_rejected_refuses_a_non_rejected_active_attempt() {
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+
+        assert!(ledger.archive_rejected().is_err());
+        // Refusing must not have taken the active attempt out from under it.
+        assert!(ledger.active.is_some());
+    }
+
+    #[test]
+    fn archive_rejected_refuses_a_rejected_attempt_with_a_tx_hash() {
+        // A Rejected phase can in principle carry a tx_hash if some future
+        // code path sets both (belt-and-suspenders: today's two setters,
+        // cancel_prepared/record_submit_rejected, never do). This proves
+        // the check is on the field, not just trusting the phase.
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.cancel_prepared("plan expired", now).unwrap();
+        ledger.active.as_mut().unwrap().tx_hash = Some(format!("{:#x}", H256::from_low_u64_be(1)));
+
+        assert!(ledger.archive_rejected().is_err());
+        assert!(ledger.active.is_some());
     }
 
     #[test]
