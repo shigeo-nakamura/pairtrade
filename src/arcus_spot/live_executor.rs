@@ -655,13 +655,28 @@ where
             .context("Arcus confirmed attempt is missing its transaction hash")?
             .parse::<H256>()
             .context("Arcus confirmed attempt has an invalid transaction hash")?;
-        // Deliberately not the current-state `balances()`: reconciliation
+        // Deliberately not the plain `balances()`: reconciliation still
         // requires the confirmed transaction's receipt on each attempted
-        // provider and pins all three reads to that receipt block with
-        // EIP-1898 requireCanonical=true. A lagging or reorged provider
-        // therefore errors and falls back instead of returning a stale
+        // provider before trusting any balance it reports, and still
+        // requires that provider's own current block number to be at or
+        // beyond the receipt's block -- a lagging or not-yet-indexed
+        // provider errors and falls back instead of returning a stale
         // pre-swap snapshot that reconcile_balances would turn into sticky
-        // Unknown (pairtrade#182, bot-strategy#779).
+        // Unknown (pairtrade#182, bot-strategy#779). What changed under
+        // bot-strategy#880: the balance reads themselves are no longer
+        // pinned to the receipt's exact block hash via EIP-1898
+        // requireCanonical=true -- in production, the two configured RPC
+        // providers turned out to retain that pinnable historical state
+        // for only ~15-20 minutes, far short of this bot's own 15-minute
+        // live-tick cadence, so the pinned read failed on essentially
+        // every reconciliation attempt. Once a provider has proven (via
+        // the receipt + block-number checks above) that it is caught up
+        // to the confirmed block, its own `latest` is read instead. This
+        // can no longer prove the returned balances reflect *only* this
+        // swap -- `reconciled_runtime_fill` below closes that gap by
+        // requiring the computed sell delta to equal the dispatched
+        // plan's own sell_amount_raw exactly, and refusing (fail-closed)
+        // otherwise.
         let post = self
             .chain
             .balances_requiring_settlement_receipt(
