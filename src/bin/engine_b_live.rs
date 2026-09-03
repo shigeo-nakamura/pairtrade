@@ -90,12 +90,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::Region;
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client as S3Client;
-use once_cell::sync::OnceCell;
-use tokio::sync::OnceCell as AsyncOnceCell;
+use debot::pairtrade::s3_mirror::S3Mirror;
 
 fn init_logger() {
     let offset_seconds = std::env::var("TIMEZONE_OFFSET")
@@ -384,12 +379,30 @@ struct RiskState {
     peak_equity: f64,
     #[serde(default)]
     realized_pnl_session: f64,
+    /// Realized PnL since the last `roll_day_if_needed` date change, reset
+    /// to 0.0 there -- unlike `realized_pnl_session` (lifetime-since-halt-
+    /// clear, never reset by a day roll), this is what the dashboard's
+    /// `pnl_today` field means. Fixed after review caught it defaulting to
+    /// a copy of the lifetime total (bot-strategy#866 PR #255 review) --
+    /// same bug class `pairtrade::status.rs`'s `pnl_today`/`pnl_today_date`
+    /// split was introduced to fix (single-instance -> A/B/C cutover
+    /// incident referenced there).
+    #[serde(default)]
+    pnl_today: f64,
     #[serde(default)]
     total_trades: u64,
     #[serde(default)]
     total_wins: u64,
     #[serde(default)]
     max_dd_bps: f64,
+    /// Same running-max-drawdown as `max_dd_bps`, in USD instead of bps
+    /// (peak_equity - current_equity at each new max) -- the dashboard's
+    /// `trade_stats.max_dd` expects a dollar amount, matching
+    /// `pairtrade::mod.rs`'s `peak_pnl - total_pnl` convention.
+    /// `max_dd_bps` stays authoritative for the `max_session_loss_bps`
+    /// halt gate below; this field exists purely for dashboard display.
+    #[serde(default)]
+    max_dd_usd: f64,
     #[serde(default)]
     session_halted: bool,
     #[serde(default)]
@@ -423,94 +436,6 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) {
         let _ = std::fs::rename(&tmp, path);
     } else {
         log::warn!("[STATE] write failed for {}", path.display());
-    }
-}
-
-/// Optional status.json mirror to the `debot-dashboard` S3 bucket
-/// (bot-strategy#866 dashboard panel request, 2026-09-03). Reimplemented
-/// locally rather than reusing `pairtrade::pairtrade::s3_mirror::S3Mirror`
-/// for the same reason as the KILL_SWITCH/RISK_ACK conventions above:
-/// that module is `pub(crate)` inside the `pairtrade` lib target, and a
-/// `src/bin/` file compiles as its own crate that only sees the lib's
-/// `pub` surface. No-op (never constructs an S3 client) when
-/// `STATUS_S3_BUCKET`/`STATUS_S3_KEY_PREFIX` are unset, so hosts that
-/// don't opt in pay no cost.
-struct StatusS3Mirror {
-    bucket: String,
-    key_prefix: String,
-    client: AsyncOnceCell<S3Client>,
-}
-
-/// Hard-coded like `pairtrade`'s own mirror: the `debot-dashboard` bucket
-/// is single-region in `eu-central-1`; Tokyo hosts cross-region write the
-/// same way the rest of this project's S3 status mirroring does.
-const STATUS_S3_BUCKET_REGION: &str = "eu-central-1";
-
-static STATUS_S3_MIRROR: OnceCell<Option<Arc<StatusS3Mirror>>> = OnceCell::new();
-
-impl StatusS3Mirror {
-    fn from_env() -> Option<Arc<Self>> {
-        STATUS_S3_MIRROR
-            .get_or_init(|| {
-                let bucket = std::env::var("STATUS_S3_BUCKET")
-                    .ok()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())?;
-                let key_prefix = std::env::var("STATUS_S3_KEY_PREFIX")
-                    .ok()
-                    .map(|v| v.trim().trim_end_matches('/').to_string())
-                    .filter(|v| !v.is_empty())?;
-                log::info!(
-                    "[STATUS_S3] mirror enabled bucket={bucket} prefix={key_prefix} region={STATUS_S3_BUCKET_REGION}"
-                );
-                Some(Arc::new(StatusS3Mirror {
-                    bucket,
-                    key_prefix,
-                    client: AsyncOnceCell::new(),
-                }))
-            })
-            .clone()
-    }
-
-    async fn client(&self) -> &S3Client {
-        self.client
-            .get_or_init(|| async {
-                let cfg = aws_config::defaults(BehaviorVersion::latest())
-                    .region(Region::new(STATUS_S3_BUCKET_REGION))
-                    .load()
-                    .await;
-                S3Client::new(&cfg)
-            })
-            .await
-    }
-
-    /// Fire-and-forget `PutObject` of `status.json`. Spawns on the
-    /// current tokio runtime and returns immediately; failures are
-    /// logged at WARN and never block the local atomic write this always
-    /// follows.
-    fn put_status_async(self: &Arc<Self>, body: Vec<u8>) {
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-        let me = Arc::clone(self);
-        handle.spawn(async move {
-            let key = format!("{}/status.json", me.key_prefix);
-            let client = me.client().await;
-            let resp = client
-                .put_object()
-                .bucket(&me.bucket)
-                .key(&key)
-                .cache_control("max-age=2")
-                .content_type("application/json")
-                .body(ByteStream::from(body))
-                .send()
-                .await;
-            match resp {
-                Ok(_) => log::debug!("[STATUS_S3] put ok key={key}"),
-                Err(err) => log::warn!("[STATUS_S3] put failed key={key} err={err:?}"),
-            }
-        });
     }
 }
 
@@ -572,7 +497,7 @@ struct EngineBLiveEngine {
     position: Option<OpenPosition>,
     state: RiskState,
     last_status_write_us: i64,
-    status_s3_mirror: Option<Arc<StatusS3Mirror>>,
+    status_s3_mirror: Option<Arc<S3Mirror>>,
 }
 
 impl EngineBLiveEngine {
@@ -618,6 +543,7 @@ impl EngineBLiveEngine {
         }
         self.current_date = Some(today);
         self.day = DaySnapshot::default();
+        self.state.pnl_today = 0.0;
         self.window = resolve_session_window(&self.calendar, today);
         match self.window {
             Some((t0, t1, t2)) => log::info!(
@@ -829,6 +755,7 @@ impl EngineBLiveEngine {
         );
 
         self.state.realized_pnl_session += pnl;
+        self.state.pnl_today += pnl;
         self.state.total_trades += 1;
         if pnl > 0.0 {
             self.state.total_wins += 1;
@@ -837,8 +764,12 @@ impl EngineBLiveEngine {
         if current_equity > self.state.peak_equity {
             self.state.peak_equity = current_equity;
         }
+        let dd_usd = self.state.peak_equity - current_equity;
+        if dd_usd > self.state.max_dd_usd {
+            self.state.max_dd_usd = dd_usd;
+        }
         let dd_bps = if self.state.peak_equity > 0.0 {
-            (self.state.peak_equity - current_equity) / self.state.peak_equity * 10_000.0
+            dd_usd / self.state.peak_equity * 10_000.0
         } else {
             0.0
         };
@@ -895,8 +826,11 @@ impl EngineBLiveEngine {
             return;
         }
         self.last_status_write_us = now_us;
+        // 0-100 scale, not 0.0-1.0 -- debot-dashboard's web/app.js renders
+        // this as `${win_rate.toFixed(0)}%` with no *100 on the frontend,
+        // matching pairtrade::status.rs::set_trade_stats_totals.
         let win_rate = if self.state.total_trades > 0 {
-            self.state.total_wins as f64 / self.state.total_trades as f64
+            self.state.total_wins as f64 / self.state.total_trades as f64 * 100.0
         } else {
             0.0
         };
@@ -928,14 +862,14 @@ impl EngineBLiveEngine {
             "positions_ready": true,
             "positions": positions,
             "pnl_total": self.state.realized_pnl_session,
-            "pnl_today": self.state.realized_pnl_session,
+            "pnl_today": self.state.pnl_today,
             "pnl_source": "engine_b_live_risk_state",
             "kill_switch_active": self.kill_switch_engaged(),
             "trade_stats": {
                 "trades": self.state.total_trades,
                 "wins": self.state.total_wins,
                 "win_rate": win_rate,
-                "max_dd": self.state.max_dd_bps,
+                "max_dd": self.state.max_dd_usd,
                 "pnl": self.state.realized_pnl_session,
             },
             // engine_b_live-specific fields, not part of debot-dashboard's
@@ -953,13 +887,14 @@ impl EngineBLiveEngine {
             "total_trades": self.state.total_trades,
             "total_wins": self.state.total_wins,
             "max_dd_bps": self.state.max_dd_bps,
+            "max_dd_usd": self.state.max_dd_usd,
             "kill_switch": self.kill_switch_engaged(),
             "calendar_version": self.calendar.calendar_version,
         });
         atomic_write_json(&self.cfg.status_path, &status);
         if let Some(mirror) = &self.status_s3_mirror {
             if let Ok(body) = serde_json::to_vec(&status) {
-                mirror.put_status_async(body);
+                mirror.put_async("status.json", body);
             }
         }
     }
@@ -1070,7 +1005,7 @@ async fn main() -> Result<()> {
         position: None,
         state,
         last_status_write_us: 0,
-        status_s3_mirror: StatusS3Mirror::from_env(),
+        status_s3_mirror: S3Mirror::from_env(),
     };
 
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(5));

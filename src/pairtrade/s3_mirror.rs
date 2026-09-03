@@ -33,7 +33,7 @@ const BUCKET_REGION: &str = "eu-central-1";
 /// without the mirror feature pay no cost.
 static GLOBAL: OnceCell<Option<Arc<S3Mirror>>> = OnceCell::new();
 
-pub(crate) struct S3Mirror {
+pub struct S3Mirror {
     bucket: String,
     /// Trailing-slash-free prefix, e.g. `debot/status/frankfurt`.
     key_prefix: String,
@@ -56,7 +56,7 @@ impl S3Mirror {
     /// Read `STATUS_S3_BUCKET` / `STATUS_S3_KEY_PREFIX`. When either is
     /// unset / empty, returns `None` and subsequent `put_async` calls
     /// are no-ops.
-    pub(crate) fn from_env() -> Option<Arc<Self>> {
+    pub fn from_env() -> Option<Arc<Self>> {
         GLOBAL
             .get_or_init(|| {
                 let mirror = Self::build_from_env_unlocked()?;
@@ -98,14 +98,14 @@ impl S3Mirror {
     ///
     /// `file_name` is appended to `key_prefix` with a `/` separator —
     /// it must NOT include a leading slash.
-    pub(crate) fn put_async(self: &Arc<Self>, file_name: &str, body: Vec<u8>) {
+    pub fn put_async(self: &Arc<Self>, file_name: &str, body: Vec<u8>) {
         self.put_async_with_content_type(file_name, body, "application/json");
     }
 
     /// Like `put_async`, but with an explicit `Content-Type`. Used by
     /// sibling-file mirrors (`equity_history.jsonl`, `backtest_alert.json`)
     /// — see bot-strategy#343 Phase 3.
-    pub(crate) fn put_async_with_content_type(
+    pub fn put_async_with_content_type(
         self: &Arc<Self>,
         file_name: &str,
         body: Vec<u8>,
