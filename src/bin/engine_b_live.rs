@@ -512,17 +512,24 @@ struct DaySnapshot {
     /// in the dashboard status payload (bot-strategy#866 PR #255 review
     /// round 2).
     restart_recovered: bool,
-    /// Set once `maybe_enter` has attempted the Lighter `orderBookDetails`
-    /// eligibility check for today, so a failed/successful check is never
-    /// re-fetched every 5s tick for the rest of the entry window.
-    eligibility_checked: bool,
-    /// `Some(reason)` when the eligibility check found `kr_primary` or
-    /// `us_primary` ineligible (force_reduce_only / below
-    /// `min_daily_volume_usd` / not found) -- `maybe_enter` skips today's
-    /// entry when this is set. Stays `None` on a fetch/parse failure
-    /// (fail-open: a network blip must not silently kill the one entry
-    /// opportunity for the day) -- see bot-strategy#872.
-    ineligible_reason: Option<String>,
+    /// Set only once the Lighter `orderBookDetails` eligibility check has
+    /// produced a *definitive* answer for today (a response that parsed,
+    /// whether it found both symbols eligible or not) -- deliberately
+    /// **not** set on a fetch/parse error, so a transient network blip
+    /// gets retried on the next 5s tick instead of permanently skipping
+    /// the one entry opportunity for the day on a single hiccup
+    /// (bot-strategy#872 PR #266 self-review, non-blocking finding).
+    eligibility_confirmed: bool,
+    /// One entry per ineligible symbol found (`kr_primary`/`us_primary`,
+    /// either or both) -- kept as a `Vec` rather than the first-match-wins
+    /// `Option<String>` this started as, so a same-day gate on an
+    /// exchange-wide event (e.g. both symbols going `force_reduce_only`
+    /// at once) still surfaces both reasons in the log/status instead of
+    /// silently dropping the second (bot-strategy#872 PR #266
+    /// self-review). Non-empty means `maybe_enter` skips today's entry.
+    /// Stays empty on a fetch/parse failure (fail-open: see
+    /// `eligibility_confirmed`'s doc comment) -- see bot-strategy#872.
+    ineligible_reasons: Vec<String>,
 }
 
 /// Snapshot `prices` into `day.t0_prices` the first time `now_us` reaches
@@ -568,8 +575,20 @@ struct OrderBookDetail {
     status: Option<String>,
     #[serde(default)]
     market_config: Option<MarketConfig>,
+    /// A bare JSON number on the real endpoint (verified 2026-09-04 both
+    /// against `~/bot/lighter-python/docs/PerpsOrderBookDetail.md`'s
+    /// `float` type and a live curl of
+    /// `mainnet.zklighter.elliot.ai/api/v1/orderBookDetails`), NOT a
+    /// quoted string like most other decimal fields in this codebase --
+    /// `Option<String>` here would make `serde_json`'s `.json()` call
+    /// fail on every real response, silently fail-opening the gate on
+    /// every single call (bot-strategy#872 PR #266 self-review, blocking
+    /// finding). `engine_b_phase0.py`'s `poll_venue()` gets away with
+    /// `canonical_decimal(detail.get(...))` because Python's `json`
+    /// module hands it a `float` either way; Rust's static typing does
+    /// not forgive the same assumption.
     #[serde(default)]
-    daily_quote_token_volume: Option<String>,
+    daily_quote_token_volume: Option<f64>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -614,12 +633,7 @@ fn evaluate_eligibility(detail: &OrderBookDetail, min_daily_volume_usd: f64) -> 
         .as_ref()
         .map(|c| c.force_reduce_only)
         .unwrap_or(false);
-    let volume: f64 = detail
-        .daily_quote_token_volume
-        .as_deref()
-        .unwrap_or("0")
-        .parse()
-        .unwrap_or(0.0);
+    let volume = detail.daily_quote_token_volume.unwrap_or(0.0);
     let mut reasons = Vec::new();
     if status != "active" {
         reasons.push(format!("status={status}"));
@@ -687,6 +701,15 @@ struct EngineStatusExtra {
     day_entered: bool,
     day_exited: bool,
     restart_recovered: bool,
+    /// Mirrors `DaySnapshot.ineligible_reasons` (bot-strategy#872) --
+    /// empty until proven otherwise (no eligibility check has run yet, or
+    /// every check so far errored and is being retried) or once a
+    /// definitive ineligible finding has been logged; non-empty means
+    /// today's entry, if any, was skipped for this reason rather than an
+    /// epsilon-below-threshold no-signal day. Lets an operator read
+    /// `status.json` instead of grepping journalctl for `[ELIGIBILITY]`
+    /// (bot-strategy#872 PR #266 self-review nit).
+    eligibility_ineligible_reasons: Vec<String>,
     session_halted: bool,
     session_halt_reason: Option<String>,
     realized_pnl_session: f64,
@@ -886,10 +909,28 @@ impl EngineBLiveEngine {
             atomic_write_json(&self.cfg.state_path, &self.state);
             return;
         }
-        if !self.day.eligibility_checked {
-            self.day.eligibility_checked = true;
+        if !self.day.eligibility_confirmed {
             match fetch_order_book_details(&self.http_client, &self.cfg.lighter_rest_url).await {
                 Ok(details) => {
+                    // Only a successful (parsed) response counts as
+                    // "confirmed" -- see the field's doc comment on why an
+                    // Err below must NOT set this, so the next tick (5s
+                    // later, still inside entry_deadline_secs) retries
+                    // instead of giving up on today's only entry window
+                    // over one transient failure.
+                    self.day.eligibility_confirmed = true;
+                    // Both symbols gate entry, not just us_primary (the
+                    // only one actually traded -- see this file's module
+                    // doc, "The *traded* instrument is the US primary
+                    // symbol only"). Deliberate: kr_primary only feeds
+                    // `compute_epsilon`'s signal, never an order, but a
+                    // KR market Lighter itself has restricted
+                    // (force_reduce_only) or that has gone extremely thin
+                    // (below min_daily_volume_usd) casts doubt on that
+                    // day's KR price observations feeding the signal, not
+                    // just on KR's own tradeability -- distrust the
+                    // signal input, not only the order leg (bot-
+                    // strategy#872 PR #266 self-review, design question).
                     for (label, symbol) in [
                         ("kr_primary", &self.cfg.kr_primary_symbol),
                         ("us_primary", &self.cfg.us_primary_symbol),
@@ -902,9 +943,9 @@ impl EngineBLiveEngine {
                                     log::warn!(
                                         "[ELIGIBILITY] {label}={symbol} ineligible ({reason})"
                                     );
-                                    self.day.ineligible_reason.get_or_insert_with(|| {
-                                        format!("{label}={symbol}:{reason}")
-                                    });
+                                    self.day
+                                        .ineligible_reasons
+                                        .push(format!("{label}={symbol}:{reason}"));
                                 }
                             }
                             None => {
@@ -912,22 +953,26 @@ impl EngineBLiveEngine {
                                     "[ELIGIBILITY] {label}={symbol} not found in orderBookDetails response"
                                 );
                                 self.day
-                                    .ineligible_reason
-                                    .get_or_insert_with(|| format!("{label}={symbol}:not_found"));
+                                    .ineligible_reasons
+                                    .push(format!("{label}={symbol}:not_found"));
                             }
                         }
                     }
                 }
                 Err(e) => {
                     log::warn!(
-                        "[ELIGIBILITY] orderBookDetails fetch failed: {e:?}; proceeding without \
-                         the eligibility gate today (fail-open)"
+                        "[ELIGIBILITY] orderBookDetails fetch failed: {e:?}; will retry next tick \
+                         if still within the entry window, otherwise proceeding without the \
+                         eligibility gate today (fail-open)"
                     );
                 }
             }
         }
-        if let Some(reason) = self.day.ineligible_reason.clone() {
-            log::warn!("[ENTRY] skipped: {reason}");
+        if !self.day.ineligible_reasons.is_empty() {
+            log::warn!(
+                "[ENTRY] skipped: {}",
+                self.day.ineligible_reasons.join("; ")
+            );
             self.day.entered = true;
             self.state.last_session_date = self.current_date.map(|d| d.to_string());
             atomic_write_json(&self.cfg.state_path, &self.state);
@@ -1202,6 +1247,7 @@ impl EngineBLiveEngine {
                 day_entered: self.day.entered,
                 day_exited: self.day.exited,
                 restart_recovered: self.day.restart_recovered,
+                eligibility_ineligible_reasons: self.day.ineligible_reasons.clone(),
                 session_halted: self.state.session_halted,
                 session_halt_reason: self.state.session_halt_reason.clone(),
                 realized_pnl_session: self.state.realized_pnl_session,
@@ -1468,18 +1514,18 @@ mod tests {
     // evaluate_eligibility
     // -------------------------------------------------------------
 
-    fn fixture_detail(status: &str, force_reduce_only: bool, volume: &str) -> OrderBookDetail {
+    fn fixture_detail(status: &str, force_reduce_only: bool, volume: f64) -> OrderBookDetail {
         OrderBookDetail {
             symbol: "SNDK".to_string(),
             status: Some(status.to_string()),
             market_config: Some(MarketConfig { force_reduce_only }),
-            daily_quote_token_volume: Some(volume.to_string()),
+            daily_quote_token_volume: Some(volume),
         }
     }
 
     #[test]
     fn eligibility_ok_when_active_and_liquid() {
-        let detail = fixture_detail("active", false, "500000");
+        let detail = fixture_detail("active", false, 500_000.0);
         let (eligible, reason) = evaluate_eligibility(&detail, 100_000.0);
         assert!(eligible, "reason={reason}");
         assert_eq!(reason, "");
@@ -1487,7 +1533,7 @@ mod tests {
 
     #[test]
     fn eligibility_fails_on_force_reduce_only() {
-        let detail = fixture_detail("active", true, "500000");
+        let detail = fixture_detail("active", true, 500_000.0);
         let (eligible, reason) = evaluate_eligibility(&detail, 100_000.0);
         assert!(!eligible);
         assert!(reason.contains("force_reduce_only"), "reason={reason}");
@@ -1495,7 +1541,7 @@ mod tests {
 
     #[test]
     fn eligibility_fails_below_min_volume() {
-        let detail = fixture_detail("active", false, "1000");
+        let detail = fixture_detail("active", false, 1_000.0);
         let (eligible, reason) = evaluate_eligibility(&detail, 100_000.0);
         assert!(!eligible);
         assert!(reason.contains("daily_volume_below_min"), "reason={reason}");
@@ -1503,10 +1549,55 @@ mod tests {
 
     #[test]
     fn eligibility_fails_when_status_not_active() {
-        let detail = fixture_detail("inactive", false, "500000");
+        let detail = fixture_detail("inactive", false, 500_000.0);
         let (eligible, reason) = evaluate_eligibility(&detail, 100_000.0);
         assert!(!eligible);
         assert!(reason.contains("status=inactive"), "reason={reason}");
+    }
+
+    /// Regression test for bot-strategy#872 PR #266's self-review blocking
+    /// finding: `daily_quote_token_volume` must deserialize as a bare
+    /// JSON number (the real endpoint's shape), not a quoted string --
+    /// the fixture-only tests above construct `OrderBookDetail` directly
+    /// and would not have caught a field-type mismatch that only breaks
+    /// `serde_json::from_str`/`Response::json()`. This string is a
+    /// trimmed real response captured 2026-09-04 from
+    /// `mainnet.zklighter.elliot.ai/api/v1/orderBookDetails`.
+    #[test]
+    fn order_book_details_response_deserializes_from_real_shaped_json() {
+        let raw = r#"{
+            "order_book_details": [
+                {
+                    "symbol": "SNDK",
+                    "status": "active",
+                    "daily_quote_token_volume": 15381082.456101,
+                    "open_interest": 1288.0688,
+                    "market_config": {
+                        "market_margin_mode": 0,
+                        "force_reduce_only": false,
+                        "hidden": false
+                    }
+                },
+                {
+                    "symbol": "WDC",
+                    "status": "active",
+                    "daily_quote_token_volume": 0.0,
+                    "market_config": {
+                        "force_reduce_only": true
+                    }
+                }
+            ]
+        }"#;
+        let resp: OrderBookDetailsResponse =
+            serde_json::from_str(raw).expect("real-shaped orderBookDetails response must parse");
+        assert_eq!(resp.order_book_details.len(), 2);
+        let sndk = &resp.order_book_details[0];
+        assert_eq!(sndk.daily_quote_token_volume, Some(15381082.456101));
+        let (eligible, _) = evaluate_eligibility(sndk, 100_000.0);
+        assert!(eligible);
+        let wdc = &resp.order_book_details[1];
+        let (eligible, reason) = evaluate_eligibility(wdc, 100_000.0);
+        assert!(!eligible, "reason={reason}");
     }
 
     #[test]
@@ -1722,6 +1813,7 @@ mod tests {
                 day_entered: false,
                 day_exited: false,
                 restart_recovered: false,
+                eligibility_ineligible_reasons: Vec::new(),
                 session_halted: false,
                 session_halt_reason: None,
                 realized_pnl_session: 0.0,
