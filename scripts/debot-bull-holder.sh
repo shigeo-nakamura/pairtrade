@@ -12,7 +12,9 @@
 # state.json, status.json, pnl_log.jsonl under bull_holder/.
 #
 # Operator quick reference (all under $STATE_DIR/bull_holder/):
-#   touch ARM          open the book (one-shot, full size)
+#   touch ARM          open the book (BULL_HOLDER_ENTRY_TRANCHES daily
+#                      tranches; first fills now, rest one per UTC day)
+#   echo 2 > ADD       schedule 2 more tranches of the ARM size (empty = 1)
 #   touch DISARM       close every leg now (manual exit; the only other exit
 #                      is the automatic 30% daily-close rule)
 #   touch KILL_SWITCH  block new ARMs / stop re-placement (exits still run)

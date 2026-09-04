@@ -21,15 +21,28 @@
 //!
 //! Operator surface (files under `BULL_HOLDER_BASE_DIR`, default
 //! /opt/debot-bull-holder — isolated from the pairtrade A/B/C tree):
-//! - `bull_holder/ARM`        touch → arm (consumed)
+//! - `bull_holder/ARM`        touch → arm (consumed). The book is built in
+//!   `BULL_HOLDER_ENTRY_TRANCHES` equal daily tranches (default 1 = all at
+//!   once): the first fills immediately, the rest one per UTC day at the
+//!   daily-eval slot. Pinpointing the entry day is not possible, so a short
+//!   ladder (recommended 5, see bot-strategy#893 addendum: P1 still passes
+//!   up to N=7) trades a few points of upside for insurance against ARMing
+//!   into a local spike. The exit rule is live from the first tranche; an
+//!   exit (rule or DISARM) cancels the remaining tranches — a 30% drop mid-
+//!   ladder means the regime call was wrong, it is not a dip to buy. Days
+//!   the bot is down push the ladder out; tranches never clump.
+//! - `bull_holder/ADD`        touch (optionally containing an integer K) →
+//!   schedule K more tranches (default 1) of the size fixed at ARM, while
+//!   On. Adds run one per UTC day like the ladder. Ignored (consumed) when
+//!   nothing is held or KILL_SWITCH is engaged; deferred while halted.
 //! - `bull_holder/DISARM`     touch → close BOTH legs of every symbol now and
 //!   go to `Exited` (consumed). The operator's manual exit; the only other
 //!   exit is the automatic 30% daily-close rule. While halted the file is
 //!   left in place and acted on once RISK_ACK clears the halt (state may be
 //!   inconsistent during a halt, so no order is sent from it blindly). If
 //!   ARM and DISARM are both present, DISARM wins and the ARM is discarded.
-//! - `bull_holder/KILL_SWITCH` exists → no arming / no stop re-placement
-//!   (protective exits, including DISARM, still run)
+//! - `bull_holder/KILL_SWITCH` exists → no arming / no further tranches or
+//!   ADDs / no stop re-placement (protective exits, including DISARM, still run)
 //! - `bull_holder/RISK_ACK`   touch → clear a reconcile/data halt (consumed)
 //!
 //! KNOWN GAPS before any live use (bot-strategy#895 rollout gates):
@@ -130,6 +143,9 @@ struct Config {
     spot_fraction: f64,
     /// Fraction of `equity_usd` deployed as perp notional (all symbols together).
     perp_fraction: f64,
+    /// Number of equal daily tranches the book is built in after ARM (1 = all
+    /// at once). Per-symbol tranche notionals are fixed at ARM time.
+    entry_tranches: u32,
     /// Daily-close exit: close < peak × (1 − exit_dd_pct/100).
     exit_dd_pct: f64,
     /// Lighter exchange stop (insurance) level: peak × (1 − stop_dd_pct/100).
@@ -148,6 +164,7 @@ struct Config {
     reconcile_every_secs: u64,
     hl_info_url: String,
     arm_path: PathBuf,
+    add_path: PathBuf,
     disarm_path: PathBuf,
     kill_switch_path: PathBuf,
     risk_ack_path: PathBuf,
@@ -192,6 +209,7 @@ impl Config {
             equity_usd: env_f64("BULL_HOLDER_EQUITY_USD", 1_000.0),
             spot_fraction: env_f64("BULL_HOLDER_SPOT_FRACTION", 0.90),
             perp_fraction: env_f64("BULL_HOLDER_PERP_FRACTION", 0.45),
+            entry_tranches: env_u32("BULL_HOLDER_ENTRY_TRANCHES", 1),
             exit_dd_pct: env_f64("BULL_HOLDER_EXIT_DD_PCT", 30.0),
             stop_dd_pct: env_f64("BULL_HOLDER_STOP_DD_PCT", 35.0),
             tick_secs: env_u64("BULL_HOLDER_TICK_SECS", 60),
@@ -207,6 +225,10 @@ impl Config {
             arm_path: PathBuf::from(env_string(
                 "BULL_HOLDER_ARM_PATH",
                 &dir.join("ARM").to_string_lossy(),
+            )),
+            add_path: PathBuf::from(env_string(
+                "BULL_HOLDER_ADD_PATH",
+                &dir.join("ADD").to_string_lossy(),
             )),
             disarm_path: PathBuf::from(env_string(
                 "BULL_HOLDER_DISARM_PATH",
@@ -259,6 +281,9 @@ impl Config {
         // `daily_eval_due` compares against `num_seconds_from_midnight()`,
         // which only ever returns 0..86_400; a value at or above that would
         // make the daily-close exit rule silently never fire again.
+        if self.entry_tranches == 0 || self.entry_tranches > 30 {
+            bail!("BULL_HOLDER_ENTRY_TRANCHES must be in 1..=30 (a ladder longer than a month is DCA, not an entry)");
+        }
         if self.daily_eval_after_utc_secs >= 86_400 {
             bail!("BULL_HOLDER_DAILY_EVAL_AFTER_UTC_SECS must be < 86400 (seconds after UTC midnight)");
         }
@@ -271,6 +296,7 @@ impl Config {
             ("equity_usd", format!("{:.2}", self.equity_usd)),
             ("spot_fraction", format!("{:.4}", self.spot_fraction)),
             ("perp_fraction", format!("{:.4}", self.perp_fraction)),
+            ("entry_tranches", self.entry_tranches.to_string()),
             ("exit_dd_pct", format!("{:.2}", self.exit_dd_pct)),
             ("stop_dd_pct", format!("{:.2}", self.stop_dd_pct)),
             (
@@ -402,6 +428,40 @@ fn resolve_operator_intent(
     }
 }
 
+/// Whether the next entry tranche is due: something remains, the UTC day is
+/// old enough for the daily slot, and no tranche has run yet today. Keyed on
+/// today's date (unlike `daily_eval_due`, which is keyed on yesterday's
+/// completed close), so days the bot is down simply push the ladder out.
+fn tranche_due(
+    now: u64,
+    remaining: u32,
+    last_tranche_date: Option<&str>,
+    after_utc_secs: u32,
+) -> bool {
+    if remaining == 0 {
+        return false;
+    }
+    let dt: DateTime<Utc> = match Utc.timestamp_opt(now as i64, 0).single() {
+        Some(d) => d,
+        None => return false,
+    };
+    if dt.num_seconds_from_midnight() < after_utc_secs {
+        return false;
+    }
+    last_tranche_date != Some(utc_date(now).as_str())
+}
+
+/// Parse the optional tranche count in an ADD file: empty/whitespace → 1,
+/// a positive integer → that, anything else → None (caller warns and
+/// ignores the request rather than guessing).
+fn parse_add_count(contents: &str) -> Option<u32> {
+    let t = contents.trim();
+    if t.is_empty() {
+        return Some(1);
+    }
+    t.parse::<u32>().ok().filter(|k| *k >= 1 && *k <= 30)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct DailyCandle {
     /// Candle open time (ms).
@@ -503,6 +563,18 @@ struct State {
     realized_pnl_total_usd: f64,
     #[serde(default)]
     cycles: u64,
+    /// Per-symbol notionals of ONE tranche (USD), fixed at ARM.
+    #[serde(default)]
+    tranche_spot_usd: f64,
+    #[serde(default)]
+    tranche_perp_usd: f64,
+    #[serde(default)]
+    tranches_remaining: u32,
+    #[serde(default)]
+    tranches_done: u32,
+    /// UTC date of the last tranche that ran (one per day).
+    #[serde(default)]
+    last_tranche_date: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -716,8 +788,10 @@ impl Engine {
             self.cfg.perp_fraction,
             n,
         );
+        let k = self.cfg.entry_tranches.max(1);
+        let (spot_tr, perp_tr) = (spot_notional / k as f64, perp_notional / k as f64);
         log::info!(
-            "[ARM] arming {} symbols: spot ${spot_notional:.0} + perp ${perp_notional:.0} each",
+            "[ARM] arming {} symbols: spot ${spot_notional:.0} + perp ${perp_notional:.0} each, in {k} tranche(s) of spot ${spot_tr:.0} + perp ${perp_tr:.0}",
             n
         );
         // Fresh arm: any legs from a previous, unrelated cycle must already be
@@ -728,7 +802,23 @@ impl Engine {
         // the bot in On with zero legs and no way to re-ARM if a read-only
         // quote fails before any order is sent.
         self.state.legs.clear();
+        self.state.tranche_spot_usd = spot_tr;
+        self.state.tranche_perp_usd = perp_tr;
+        self.state.tranches_remaining = k;
+        self.state.tranches_done = 0;
+        self.state.last_tranche_date = None;
         self.persist();
+        self.buy_tranche("ARM").await
+    }
+
+    /// Buy one tranche (`state.tranche_*_usd` per symbol) of both legs for
+    /// every symbol. The first call of a cycle creates the legs and flips the
+    /// book to On; later calls add to them. Each fill is persisted as it
+    /// happens so a failure partway never leaves exposure unrecorded.
+    async fn buy_tranche(&mut self, why: &str) -> Result<()> {
+        let spot_notional = self.state.tranche_spot_usd;
+        let perp_notional = self.state.tranche_perp_usd;
+        let n_th = self.state.tranches_done + 1;
         for sym in self.cfg.symbols.clone() {
             let market = self.cfg.hl_spot_market[&sym].clone();
             // Read-only: safe to bail before any order for this symbol is sent.
@@ -738,42 +828,52 @@ impl Engine {
             let perp_size = size_from_notional(perp_notional, lq.price, lq.size_decimals);
             if spot_size.to_f64().unwrap_or(0.0) < hq.min_order {
                 bail!(
-                    "{market}: spot size {spot_size} below min_order {}",
+                    "{market}: tranche spot size {spot_size} below min_order {} (raise EQUITY_USD or lower ENTRY_TRANCHES)",
                     hq.min_order
                 );
             }
             if perp_notional > 0.0 && perp_size.to_f64().unwrap_or(0.0) < lq.min_order {
                 bail!(
-                    "{sym}: perp size {perp_size} below min_order {}",
+                    "{sym}: tranche perp size {perp_size} below min_order {} (raise EQUITY_USD or lower ENTRY_TRANCHES)",
                     lq.min_order
                 );
             }
-            let peak = hq.price.max(lq.price);
             // Record the leg BEFORE/AS EACH order fills so a failure partway
             // through this symbol (or the next one) never leaves a filled
             // position invisible to state, the daily exit rule, or the stop.
             // A stray re-ARM after such a failure must never double the
             // position it already holds.
-            let mut leg = LegState {
-                spot_size: 0.0,
-                spot_cost_usd: 0.0,
-                perp_size: 0.0,
-                perp_cost_usd: 0.0,
-                peak_close: peak,
-                exit_level: level_below_peak(peak, self.cfg.exit_dd_pct),
-                lighter_peak: lq.price,
-                stop_level: None,
-                stop_order_id: None,
-                last_close_date: None,
-                last_close: None,
-                close_fetch_failures: 0,
+            let mut leg = match self.state.legs.get(&sym) {
+                Some(l) => l.clone(),
+                None => {
+                    let peak = hq.price.max(lq.price);
+                    LegState {
+                        spot_size: 0.0,
+                        spot_cost_usd: 0.0,
+                        perp_size: 0.0,
+                        perp_cost_usd: 0.0,
+                        peak_close: peak,
+                        exit_level: level_below_peak(peak, self.cfg.exit_dd_pct),
+                        lighter_peak: lq.price,
+                        stop_level: None,
+                        stop_order_id: None,
+                        last_close_date: None,
+                        last_close: None,
+                        close_fetch_failures: 0,
+                    }
+                }
             };
             let filled_spot = self
                 .hl_spot_ioc(&market, spot_size, OrderSide::Long)
                 .await
-                .with_context(|| format!("{sym}: spot entry failed (no exposure taken yet)"))?;
-            leg.spot_size = filled_spot.to_f64().unwrap_or(0.0);
-            leg.spot_cost_usd = leg.spot_size * hq.price;
+                .with_context(|| {
+                    format!(
+                        "{sym}: spot {why} tranche {n_th} failed (this tranche took no exposure)"
+                    )
+                })?;
+            let fs = filled_spot.to_f64().unwrap_or(0.0);
+            leg.spot_size += fs;
+            leg.spot_cost_usd += fs * hq.price;
             self.state.legs.insert(sym.clone(), leg.clone());
             // Real exposure now exists: flip to On (only once) so a crash or
             // a later error in this loop never leaves a filled position
@@ -786,28 +886,42 @@ impl Engine {
                 self.state.cycles += 1;
             }
             self.persist();
+            let mut fp = 0.0;
             if perp_notional > 0.0 {
                 let filled_perp = self
                     .lt_perp_taker(&sym, perp_size, OrderSide::Long, false)
                     .await
                     .with_context(|| {
                         format!(
-                            "{sym}: perp entry failed AFTER spot filled ({} @ {:.2}) — spot-only leg is recorded in state, do not re-ARM without checking it",
-                            leg.spot_size, hq.price
+                            "{sym}: perp {why} tranche {n_th} failed AFTER spot filled ({fs} @ {:.2}) — the spot part is recorded in state, do not re-ARM without checking it",
+                            hq.price
                         )
                     })?;
-                leg.perp_size = filled_perp.to_f64().unwrap_or(0.0);
-                leg.perp_cost_usd = leg.perp_size * lq.price;
+                fp = filled_perp.to_f64().unwrap_or(0.0);
+                leg.perp_size += fp;
+                leg.perp_cost_usd += fp * lq.price;
                 self.state.legs.insert(sym.clone(), leg.clone());
                 self.persist();
             }
             log::info!(
-                "[ENTRY] {sym}: spot {} @ {:.2} (${:.0}) + perp {} @ {:.2} (${:.0}); peak={:.2} exit_level={:.2}",
-                leg.spot_size, hq.price, leg.spot_cost_usd, leg.perp_size, lq.price, leg.perp_cost_usd, leg.peak_close, leg.exit_level
+                "[ENTRY] {sym} {why} tranche {n_th}/{}: +spot {} @ {:.2} +perp {} @ {:.2}; book spot {} (${:.0}) perp {} (${:.0}); peak={:.2} exit_level={:.2}",
+                self.state.tranches_done + self.state.tranches_remaining,
+                fs, hq.price, fp, lq.price,
+                leg.spot_size, leg.spot_cost_usd, leg.perp_size, leg.perp_cost_usd, leg.peak_close, leg.exit_level
             );
             if let Err(e) = self.place_stop(&sym).await {
-                log::error!("[STOP] initial stop for {sym} failed: {e:?}");
+                log::error!("[STOP] stop (re)placement for {sym} failed: {e:?}");
             }
+        }
+        self.state.tranches_done += 1;
+        self.state.tranches_remaining = self.state.tranches_remaining.saturating_sub(1);
+        self.state.last_tranche_date = Some(utc_date(now_secs()));
+        self.persist();
+        if self.state.tranches_remaining > 0 {
+            log::info!(
+                "[ENTRY] {} tranche(s) remaining, next on the following UTC day",
+                self.state.tranches_remaining
+            );
         }
         Ok(())
     }
@@ -949,6 +1063,13 @@ impl Engine {
             );
         }
         self.state.realized_pnl_total_usd += total;
+        if self.state.tranches_remaining > 0 {
+            log::warn!(
+                "[EXIT] cancelling {} remaining entry tranche(s)",
+                self.state.tranches_remaining
+            );
+            self.state.tranches_remaining = 0;
+        }
         if any_leg_still_open {
             log::error!(
                 "[EXIT] one or more legs failed to close — staying in mode=On (NOT marking Exited) until the operator resolves it via RISK_ACK"
@@ -1191,10 +1312,60 @@ impl Engine {
             OperatorIntent::Idle => {}
         }
 
+        // ADD: schedule more tranches of the size fixed at ARM.
+        if self.cfg.add_path.exists() {
+            if self.state.halted {
+                log::error!(
+                    "[ADD] requested but the bot is HALTED; file left in place until RISK_ACK"
+                );
+            } else if self.state.mode != Mode::On {
+                let _ = std::fs::remove_file(&self.cfg.add_path);
+                log::warn!(
+                    "[ADD] ignored: nothing held (mode={:?}); use ARM to open a book",
+                    self.state.mode
+                );
+            } else if kill {
+                let _ = std::fs::remove_file(&self.cfg.add_path);
+                log::warn!("[ADD] ignored: KILL_SWITCH engaged");
+            } else {
+                let contents = std::fs::read_to_string(&self.cfg.add_path).unwrap_or_default();
+                let _ = std::fs::remove_file(&self.cfg.add_path);
+                match parse_add_count(&contents) {
+                    Some(k) => {
+                        self.state.tranches_remaining += k;
+                        self.persist();
+                        log::warn!(
+                            "[ADD] +{k} tranche(s) scheduled (spot ${:.0} + perp ${:.0} per symbol each); {} remaining",
+                            self.state.tranche_spot_usd, self.state.tranche_perp_usd, self.state.tranches_remaining
+                        );
+                    }
+                    None => log::error!(
+                        "[ADD] ignored: file content {contents:?} is not a count in 1..=30"
+                    ),
+                }
+            }
+        }
+
         if self.state.halted {
             log::error!("[HALT] active: {:?}", self.state.halt_reason);
         } else if self.state.mode == Mode::On && intent != OperatorIntent::DisarmNow {
             self.daily_eval().await;
+            // Next entry tranche, only if still On after the daily exit check
+            // and the operator has not blocked entries.
+            if self.state.mode == Mode::On
+                && !kill
+                && tranche_due(
+                    now,
+                    self.state.tranches_remaining,
+                    self.state.last_tranche_date.as_deref(),
+                    self.cfg.daily_eval_after_utc_secs,
+                )
+            {
+                if let Err(e) = self.buy_tranche("scheduled").await {
+                    log::error!("[ENTRY] tranche failed: {e:?}");
+                    self.halt(format!("tranche failed: {e}"));
+                }
+            }
             if self.state.mode == Mode::On
                 && now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs
             {
@@ -1230,6 +1401,11 @@ impl Engine {
             "kill_switch": kill,
             "realized_pnl_total_usd": self.state.realized_pnl_total_usd,
             "cycles": self.state.cycles,
+            "tranches_done": self.state.tranches_done,
+            "tranches_remaining": self.state.tranches_remaining,
+            "tranche_spot_usd": self.state.tranche_spot_usd,
+            "tranche_perp_usd": self.state.tranche_perp_usd,
+            "last_tranche_date": self.state.last_tranche_date,
             "config_fp": self.cfg.fingerprint(),
             "legs": legs,
         });
@@ -1423,6 +1599,51 @@ mod tests {
     }
 
     #[test]
+    fn tranche_due_one_per_utc_day_after_slot() {
+        let t = Utc
+            .with_ymd_and_hms(2026, 9, 5, 0, 2, 0)
+            .unwrap()
+            .timestamp() as u64;
+        assert!(!tranche_due(t, 3, None, 300)); // too early in the day
+        let t = Utc
+            .with_ymd_and_hms(2026, 9, 5, 0, 6, 0)
+            .unwrap()
+            .timestamp() as u64;
+        assert!(tranche_due(t, 3, None, 300));
+        assert!(tranche_due(t, 3, Some("2026-09-04"), 300)); // yesterday's ran
+        assert!(!tranche_due(t, 3, Some("2026-09-05"), 300)); // already ran today
+        assert!(!tranche_due(t, 0, Some("2026-09-04"), 300)); // nothing left
+                                                              // A gap of several days just runs the next one (no clumping is by
+                                                              // construction: one call per day).
+        assert!(tranche_due(t, 2, Some("2026-08-30"), 300));
+    }
+
+    #[test]
+    fn add_count_parsing() {
+        assert_eq!(parse_add_count(""), Some(1));
+        assert_eq!(parse_add_count("  \n"), Some(1));
+        assert_eq!(parse_add_count("3"), Some(3));
+        assert_eq!(parse_add_count(" 7 \n"), Some(7));
+        assert_eq!(parse_add_count("0"), None);
+        assert_eq!(parse_add_count("31"), None);
+        assert_eq!(parse_add_count("lots"), None);
+        assert_eq!(parse_add_count("-2"), None);
+    }
+
+    #[test]
+    fn config_validation_bounds_entry_tranches() {
+        let mut cfg = test_config();
+        cfg.entry_tranches = 0;
+        assert!(cfg.validate().is_err());
+        cfg.entry_tranches = 31;
+        assert!(cfg.validate().is_err());
+        cfg.entry_tranches = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.entry_tranches = 30;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn operator_intent_precedence() {
         use OperatorIntent::*;
         // DISARM while holding: exit, regardless of kill switch.
@@ -1538,6 +1759,7 @@ mod tests {
             equity_usd: 10_000.0,
             spot_fraction: 0.9,
             perp_fraction: 0.45,
+            entry_tranches: 5,
             exit_dd_pct: 30.0,
             stop_dd_pct: 35.0,
             tick_secs: 60,
@@ -1548,6 +1770,7 @@ mod tests {
             reconcile_every_secs: 600,
             hl_info_url: "http://127.0.0.1:1/info".into(),
             arm_path: dir.join("ARM"),
+            add_path: dir.join("ADD"),
             disarm_path: dir.join("DISARM"),
             kill_switch_path: dir.join("KILL"),
             risk_ack_path: dir.join("ACK"),
