@@ -8,8 +8,15 @@
 # Binary + state live entirely under /opt/debot-bull-holder/ — separate from
 # the pairtrade A/B/C tree at /opt/debot/ (same isolation pattern as
 # debot-pair-canary -> /opt/debot-canary and the Hyperliquid observer ->
-# /opt/debot-hl). State: ARM / KILL_SWITCH / RISK_ACK sentinels, state.json,
-# status.json, pnl_log.jsonl under bull_holder/.
+# /opt/debot-hl). State: ARM / DISARM / KILL_SWITCH / RISK_ACK sentinels,
+# state.json, status.json, pnl_log.jsonl under bull_holder/.
+#
+# Operator quick reference (all under $STATE_DIR/bull_holder/):
+#   touch ARM          open the book (one-shot, full size)
+#   touch DISARM       close every leg now (manual exit; the only other exit
+#                      is the automatic 30% daily-close rule)
+#   touch KILL_SWITCH  block new ARMs / stop re-placement (exits still run)
+#   touch RISK_ACK     clear a reconcile/data halt
 
 set -eu
 
