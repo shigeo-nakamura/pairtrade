@@ -22,8 +22,14 @@
 //! Operator surface (files under `BULL_HOLDER_BASE_DIR`, default
 //! /opt/debot-bull-holder — isolated from the pairtrade A/B/C tree):
 //! - `bull_holder/ARM`        touch → arm (consumed)
+//! - `bull_holder/DISARM`     touch → close BOTH legs of every symbol now and
+//!   go to `Exited` (consumed). The operator's manual exit; the only other
+//!   exit is the automatic 30% daily-close rule. While halted the file is
+//!   left in place and acted on once RISK_ACK clears the halt (state may be
+//!   inconsistent during a halt, so no order is sent from it blindly). If
+//!   ARM and DISARM are both present, DISARM wins and the ARM is discarded.
 //! - `bull_holder/KILL_SWITCH` exists → no arming / no stop re-placement
-//!   (protective exits still run)
+//!   (protective exits, including DISARM, still run)
 //! - `bull_holder/RISK_ACK`   touch → clear a reconcile/data halt (consumed)
 //!
 //! KNOWN GAPS before any live use (bot-strategy#895 rollout gates):
@@ -142,6 +148,7 @@ struct Config {
     reconcile_every_secs: u64,
     hl_info_url: String,
     arm_path: PathBuf,
+    disarm_path: PathBuf,
     kill_switch_path: PathBuf,
     risk_ack_path: PathBuf,
     state_path: PathBuf,
@@ -200,6 +207,10 @@ impl Config {
             arm_path: PathBuf::from(env_string(
                 "BULL_HOLDER_ARM_PATH",
                 &dir.join("ARM").to_string_lossy(),
+            )),
+            disarm_path: PathBuf::from(env_string(
+                "BULL_HOLDER_DISARM_PATH",
+                &dir.join("DISARM").to_string_lossy(),
             )),
             kill_switch_path: PathBuf::from(env_string(
                 "BULL_HOLDER_KILL_SWITCH_PATH",
@@ -335,6 +346,60 @@ fn daily_eval_due(now: u64, last_evaluated_close_date: Option<&str>, after_utc_s
     }
     let yesterday = utc_date(now.saturating_sub(86_400));
     last_evaluated_close_date != Some(yesterday.as_str())
+}
+
+/// What the operator's sentinel files ask the bot to do on this tick. Pure so
+/// the precedence rules are unit-testable without connectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorIntent {
+    /// Nothing requested.
+    Idle,
+    /// DISARM present while a book is held: close every leg now.
+    DisarmNow,
+    /// DISARM present but the bot is halted: leave the file, act after RISK_ACK.
+    DisarmDeferredByHalt,
+    /// DISARM present with nothing held (Off/Exited): consume it (and any ARM
+    /// alongside it — DISARM always wins over ARM).
+    DisarmNothingToDo { cancels_arm: bool },
+    /// ARM present with nothing held and no kill switch: open the book.
+    ArmNow,
+    /// ARM present but KILL_SWITCH engaged: leave the file, do not arm.
+    ArmBlockedByKill,
+    /// ARM present while already On: consume it, nothing else (never double).
+    ArmIgnoredAlreadyOn,
+}
+
+fn resolve_operator_intent(
+    mode: Mode,
+    halted: bool,
+    kill: bool,
+    arm_present: bool,
+    disarm_present: bool,
+) -> OperatorIntent {
+    if disarm_present {
+        if halted {
+            return OperatorIntent::DisarmDeferredByHalt;
+        }
+        return match mode {
+            Mode::On => OperatorIntent::DisarmNow,
+            Mode::Off | Mode::Exited => OperatorIntent::DisarmNothingToDo {
+                cancels_arm: arm_present,
+            },
+        };
+    }
+    if halted || !arm_present {
+        return OperatorIntent::Idle;
+    }
+    match mode {
+        Mode::On => OperatorIntent::ArmIgnoredAlreadyOn,
+        Mode::Off | Mode::Exited => {
+            if kill {
+                OperatorIntent::ArmBlockedByKill
+            } else {
+                OperatorIntent::ArmNow
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1068,33 +1133,73 @@ impl Engine {
             self.persist();
         }
         let kill = self.sentinels.kill_switch_engaged();
+        let intent = resolve_operator_intent(
+            self.state.mode,
+            self.state.halted,
+            kill,
+            self.cfg.arm_path.exists(),
+            self.cfg.disarm_path.exists(),
+        );
+
+        match intent {
+            OperatorIntent::DisarmNow => {
+                let _ = std::fs::remove_file(&self.cfg.disarm_path);
+                if self.cfg.arm_path.exists() {
+                    let _ = std::fs::remove_file(&self.cfg.arm_path);
+                    log::warn!("[DISARM] a pending ARM was also present; discarded");
+                }
+                log::warn!("[DISARM] operator requested exit — closing all legs");
+                self.exit_all("operator DISARM").await;
+            }
+            OperatorIntent::DisarmDeferredByHalt => {
+                log::error!(
+                    "[DISARM] requested but the bot is HALTED ({:?}) — state may be inconsistent, \
+                     so no exit order is sent from here. Clear the halt with RISK_ACK (or close the \
+                     positions manually); the DISARM file is left in place and will run right after.",
+                    self.state.halt_reason
+                );
+            }
+            OperatorIntent::DisarmNothingToDo { cancels_arm } => {
+                let _ = std::fs::remove_file(&self.cfg.disarm_path);
+                if cancels_arm {
+                    let _ = std::fs::remove_file(&self.cfg.arm_path);
+                    log::warn!(
+                        "[DISARM] nothing held (mode={:?}); pending ARM cancelled",
+                        self.state.mode
+                    );
+                } else {
+                    log::info!(
+                        "[DISARM] nothing held (mode={:?}); ignored",
+                        self.state.mode
+                    );
+                }
+            }
+            OperatorIntent::ArmNow => {
+                let _ = std::fs::remove_file(&self.cfg.arm_path);
+                if let Err(e) = self.arm().await {
+                    log::error!("[ARM] failed: {e:?}");
+                    self.halt(format!("arm failed: {e}"));
+                }
+            }
+            OperatorIntent::ArmBlockedByKill => {
+                log::warn!("[ARM] ignored: KILL_SWITCH engaged (file left in place)");
+            }
+            OperatorIntent::ArmIgnoredAlreadyOn => {
+                let _ = std::fs::remove_file(&self.cfg.arm_path);
+                log::warn!("[ARM] ignored: already On with a live book (never double-arm)");
+            }
+            OperatorIntent::Idle => {}
+        }
 
         if self.state.halted {
             log::error!("[HALT] active: {:?}", self.state.halt_reason);
-        } else {
-            match self.state.mode {
-                Mode::Off | Mode::Exited => {
-                    if self.cfg.arm_path.exists() {
-                        if kill {
-                            log::warn!("[ARM] ignored: KILL_SWITCH engaged");
-                        } else {
-                            let _ = std::fs::remove_file(&self.cfg.arm_path);
-                            if let Err(e) = self.arm().await {
-                                log::error!("[ARM] failed: {e:?}");
-                                self.halt(format!("arm failed: {e}"));
-                            }
-                        }
-                    }
-                }
-                Mode::On => {
-                    self.daily_eval().await;
-                    if self.state.mode == Mode::On
-                        && now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs
-                    {
-                        self.last_reconcile = now;
-                        self.reconcile().await;
-                    }
-                }
+        } else if self.state.mode == Mode::On && intent != OperatorIntent::DisarmNow {
+            self.daily_eval().await;
+            if self.state.mode == Mode::On
+                && now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs
+            {
+                self.last_reconcile = now;
+                self.reconcile().await;
             }
         }
         self.write_status_if_due(now, kill);
@@ -1318,6 +1423,68 @@ mod tests {
     }
 
     #[test]
+    fn operator_intent_precedence() {
+        use OperatorIntent::*;
+        // DISARM while holding: exit, regardless of kill switch.
+        assert_eq!(
+            resolve_operator_intent(Mode::On, false, false, false, true),
+            DisarmNow
+        );
+        assert_eq!(
+            resolve_operator_intent(Mode::On, false, true, false, true),
+            DisarmNow
+        );
+        // DISARM beats a simultaneous ARM.
+        assert_eq!(
+            resolve_operator_intent(Mode::On, false, false, true, true),
+            DisarmNow
+        );
+        assert_eq!(
+            resolve_operator_intent(Mode::Off, false, false, true, true),
+            DisarmNothingToDo { cancels_arm: true }
+        );
+        assert_eq!(
+            resolve_operator_intent(Mode::Exited, false, false, false, true),
+            DisarmNothingToDo { cancels_arm: false }
+        );
+        // Halt defers DISARM (file kept) and suppresses ARM entirely.
+        assert_eq!(
+            resolve_operator_intent(Mode::On, true, false, false, true),
+            DisarmDeferredByHalt
+        );
+        assert_eq!(
+            resolve_operator_intent(Mode::Off, true, false, true, false),
+            Idle
+        );
+        // ARM paths.
+        assert_eq!(
+            resolve_operator_intent(Mode::Off, false, false, true, false),
+            ArmNow
+        );
+        assert_eq!(
+            resolve_operator_intent(Mode::Exited, false, false, true, false),
+            ArmNow
+        );
+        assert_eq!(
+            resolve_operator_intent(Mode::Off, false, true, true, false),
+            ArmBlockedByKill
+        );
+        assert_eq!(
+            resolve_operator_intent(Mode::On, false, false, true, false),
+            ArmIgnoredAlreadyOn
+        );
+        // Nothing requested.
+        assert_eq!(
+            resolve_operator_intent(Mode::On, false, false, false, false),
+            Idle
+        );
+        assert_eq!(
+            resolve_operator_intent(Mode::Off, false, true, false, false),
+            Idle
+        );
+    }
+
+    #[test]
     fn config_validation_rejects_stop_inside_exit() {
         let mut cfg = test_config();
         cfg.stop_dd_pct = 25.0;
@@ -1381,6 +1548,7 @@ mod tests {
             reconcile_every_secs: 600,
             hl_info_url: "http://127.0.0.1:1/info".into(),
             arm_path: dir.join("ARM"),
+            disarm_path: dir.join("DISARM"),
             kill_switch_path: dir.join("KILL"),
             risk_ack_path: dir.join("ACK"),
             state_path: dir.join("state.json"),
