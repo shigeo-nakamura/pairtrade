@@ -45,6 +45,15 @@ GAPS section -- do not duplicate that list here; read it there.
   `robinhood_dipgrid.rs` / pairtrade's own RISK_ACK/KILL_SWITCH pattern
   (see `runbook_risk_ack.md`), reimplemented locally in this binary since
   pairtrade's `risk_io` module is private to the `pairtrade` module tree.
+- **Same-day eligibility gate** (bot-strategy#872): right before submitting
+  an order, the engine fetches Lighter's public `orderBookDetails` REST
+  endpoint (`ENGINE_B_LIVE_LIGHTER_REST_URL`, default
+  `https://mainnet.zklighter.elliot.ai`) and skips today's entry if
+  `kr_primary`/`us_primary` is `force_reduce_only`, not `status=active`, or
+  below `ENGINE_B_LIVE_MIN_DAILY_VOLUME_USD` (default `100000`, same
+  placeholder value as `engine_b_phase0.py`'s `MIN_DAILY_VOLUME_USD` --
+  keep both in sync until #872 freezes a data-driven value). Fails open
+  (proceeds without the gate, logged as a warning) on a fetch/parse error.
 - **No SIGTERM-graceful-close handling exists in this prototype.** An open
   position is not reduce-only-closed on service stop/restart. Before any
   planned restart, check `status.json`'s `has_position` field and either

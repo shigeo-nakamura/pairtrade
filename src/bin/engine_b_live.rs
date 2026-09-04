@@ -578,11 +578,19 @@ struct MarketConfig {
     force_reduce_only: bool,
 }
 
-async fn fetch_order_book_details(rest_url: &str) -> Result<Vec<OrderBookDetail>> {
+/// `client` is reused across calls (built once in `main()`, same pattern
+/// as `bull_holder.rs`'s `Engine.http`) rather than a fresh `Client::new()`
+/// per call. This call is `.await`ed inline inside `tick()`'s single
+/// `tokio::select!` loop (same as `create_order`/`set_leverage` already
+/// are for the actual order submission a few lines below it in
+/// `maybe_enter`) -- a slow response stalls price-feed draining and
+/// KILL_SWITCH polling for up to `timeout`, so it is kept short (5s,
+/// tighter than bull_holder.rs's 15s) rather than the crate default.
+async fn fetch_order_book_details(client: &Client, rest_url: &str) -> Result<Vec<OrderBookDetail>> {
     let url = format!("{}/api/v1/orderBookDetails", rest_url.trim_end_matches('/'));
-    let resp: OrderBookDetailsResponse = Client::new()
+    let resp: OrderBookDetailsResponse = client
         .get(&url)
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
         .context("orderBookDetails request failed")?
@@ -703,6 +711,10 @@ struct EngineBLiveEngine {
     cfg: EngineBLiveConfig,
     connector: std::sync::Arc<dyn DexConnector + Send + Sync>,
     calendar: TradingCalendar,
+    /// Reused across `fetch_order_book_details` calls (same pattern as
+    /// `bull_holder.rs`'s `Engine.http`) instead of a fresh `Client::new()`
+    /// per call.
+    http_client: Client,
     latest_price: HashMap<String, f64>,
     current_date: Option<NaiveDate>,
     window: Option<(i64, i64, i64)>, // (t0, t1, t2) us epoch for current_date
@@ -876,7 +888,7 @@ impl EngineBLiveEngine {
         }
         if !self.day.eligibility_checked {
             self.day.eligibility_checked = true;
-            match fetch_order_book_details(&self.cfg.lighter_rest_url).await {
+            match fetch_order_book_details(&self.http_client, &self.cfg.lighter_rest_url).await {
                 Ok(details) => {
                     for (label, symbol) in [
                         ("kr_primary", &self.cfg.kr_primary_symbol),
@@ -1337,6 +1349,7 @@ async fn main() -> Result<()> {
         cfg,
         connector,
         calendar,
+        http_client: Client::new(),
         latest_price: HashMap::new(),
         current_date: None,
         window: None,
