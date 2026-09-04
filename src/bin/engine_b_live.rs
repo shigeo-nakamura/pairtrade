@@ -802,12 +802,33 @@ struct EngineStatusExtra {
     calendar_version: String,
 }
 
+/// Engine-B-specific dashboard block, nested under a named `han_bridge`
+/// key (same pattern as `hype-accumulator`'s `accumulator` block in
+/// debot-dashboard's `StatusData`) rather than flattened alongside
+/// `DashboardStatus`/`EngineStatusExtra` -- lets debot-dashboard's web UI
+/// render an extra section only for this target (gated on the field's
+/// presence, `omitempty` on the Go side) without touching how any other
+/// bot's card renders. Answers "why didn't it trade today" without
+/// grepping journalctl: which symbols this instance trades, whether
+/// today's entry/exit decision has already been made, and why an entry
+/// was skipped if it was (bot-strategy#872 dashboard follow-up).
+#[derive(Serialize)]
+struct HanBridgeStatus {
+    kr_primary_symbol: String,
+    us_primary_symbol: String,
+    day_entered: bool,
+    day_exited: bool,
+    ineligible_reasons: Vec<String>,
+    session_halt_reason: Option<String>,
+}
+
 #[derive(Serialize)]
 struct FullStatus {
     #[serde(flatten)]
     dashboard: DashboardStatus,
     #[serde(flatten)]
     extra: EngineStatusExtra,
+    han_bridge: HanBridgeStatus,
 }
 
 struct EngineBLiveEngine {
@@ -1415,6 +1436,14 @@ impl EngineBLiveEngine {
                 max_dd_usd: self.state.max_dd_usd,
                 kill_switch,
                 calendar_version: self.calendar.calendar_version.clone(),
+            },
+            han_bridge: HanBridgeStatus {
+                kr_primary_symbol: self.cfg.kr_primary_symbol.clone(),
+                us_primary_symbol: self.cfg.us_primary_symbol.clone(),
+                day_entered: self.day.entered,
+                day_exited: self.day.exited,
+                ineligible_reasons: self.day.ineligible_reasons.clone(),
+                session_halt_reason: self.state.session_halt_reason.clone(),
             },
         };
         // Serialized once and reused for both destinations (previously
@@ -2060,6 +2089,14 @@ mod tests {
                 kill_switch: false,
                 calendar_version: "test".to_string(),
             },
+            han_bridge: HanBridgeStatus {
+                kr_primary_symbol: "SKHY".to_string(),
+                us_primary_symbol: "SNDK".to_string(),
+                day_entered: false,
+                day_exited: false,
+                ineligible_reasons: Vec::new(),
+                session_halt_reason: None,
+            },
         }
     }
 
@@ -2094,5 +2131,28 @@ mod tests {
         }
         assert!(!obj.contains_key("dashboard"), "flatten must not leave a nested \"dashboard\" key");
         assert!(!obj.contains_key("extra"), "flatten must not leave a nested \"extra\" key");
+
+        // han_bridge is deliberately NOT flattened -- debot-dashboard
+        // gates an extra UI section on this key's presence (same pattern
+        // as hype-accumulator's "accumulator" block), so it must stay a
+        // nested object, not spread across the top level like the other
+        // two.
+        let han_bridge = obj
+            .get("han_bridge")
+            .and_then(|v| v.as_object())
+            .expect("han_bridge must be present as a nested object");
+        for key in [
+            "kr_primary_symbol",
+            "us_primary_symbol",
+            "day_entered",
+            "day_exited",
+            "ineligible_reasons",
+            "session_halt_reason",
+        ] {
+            assert!(
+                han_bridge.contains_key(key),
+                "missing han_bridge field: {key}"
+            );
+        }
     }
 }
