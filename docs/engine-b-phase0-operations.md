@@ -236,7 +236,7 @@ since (deploy ≠ restart -- the same trap as pairtrade configs).
 
 Follow-ups for these three (venue-wide teardown on one zero stat,
 missing post-reconnect snapshot recovery, `task_cancelled` attribution)
-are tracked in bot-strategy under Project 8, not in this document.
+are tracked in bot-strategy#908 (Project 8), not in this document.
 
 ### Resolution
 
