@@ -62,6 +62,11 @@
 //!   (Phase 1) of this code before it places real orders.
 //! - KR/US primary symbols and `epsilon_threshold` are operator config,
 //!   not the data-driven freeze bot-strategy#872 will eventually produce.
+//!   A same-day eligibility check (`fetch_order_book_details`,
+//!   bot-strategy#872 comment 2026-09-04) guards against entering on a
+//!   symbol Lighter itself has gone `force_reduce_only` on or that has
+//!   fallen below `min_daily_volume_usd`, but it does not pick the
+//!   *better* of two candidates -- that freeze is still #872's job.
 //! - `OpenPosition` (the in-flight entry/exit state) is in-memory only,
 //!   not persisted to `state_path` -- a crash or restart between entry and
 //!   exit loses track of the open position in this process's own state.
@@ -80,6 +85,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
 use dex_connector::{DexConnector, OrderSide, PriceUpdate};
+use reqwest::Client;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -238,6 +244,8 @@ struct EngineBLiveConfig {
     signal_model: String,
     entry_deadline_secs: i64,
     exit_deadline_secs: i64,
+    lighter_rest_url: String,
+    min_daily_volume_usd: f64,
     equity_usd_reference: f64,
     max_session_loss_bps: f64,
     trading_calendar_path: PathBuf,
@@ -318,6 +326,15 @@ impl EngineBLiveConfig {
             signal_model: env_string("ENGINE_B_LIVE_SIGNAL_MODEL", "diff"),
             entry_deadline_secs: env_i64("ENGINE_B_LIVE_ENTRY_DEADLINE_SECS", 180),
             exit_deadline_secs: env_i64("ENGINE_B_LIVE_EXIT_DEADLINE_SECS", 900),
+            lighter_rest_url: env_string(
+                "ENGINE_B_LIVE_LIGHTER_REST_URL",
+                "https://mainnet.zklighter.elliot.ai",
+            ),
+            // Same placeholder value as engine_b_phase0.py's
+            // MIN_DAILY_VOLUME_USD (TBD-9, bot-strategy#872) -- not yet
+            // data-driven-frozen, just the same operator guess reused here
+            // so the two eligibility checks agree until #872 freezes it.
+            min_daily_volume_usd: env_f64("ENGINE_B_LIVE_MIN_DAILY_VOLUME_USD", 100_000.0),
             equity_usd_reference: env_f64("ENGINE_B_LIVE_EQUITY_USD_REFERENCE", 1000.0),
             max_session_loss_bps: env_f64("ENGINE_B_LIVE_MAX_SESSION_LOSS_BPS", 500.0),
             trading_calendar_path: PathBuf::from(env_string(
@@ -495,6 +512,17 @@ struct DaySnapshot {
     /// in the dashboard status payload (bot-strategy#866 PR #255 review
     /// round 2).
     restart_recovered: bool,
+    /// Set once `maybe_enter` has attempted the Lighter `orderBookDetails`
+    /// eligibility check for today, so a failed/successful check is never
+    /// re-fetched every 5s tick for the rest of the entry window.
+    eligibility_checked: bool,
+    /// `Some(reason)` when the eligibility check found `kr_primary` or
+    /// `us_primary` ineligible (force_reduce_only / below
+    /// `min_daily_volume_usd` / not found) -- `maybe_enter` skips today's
+    /// entry when this is set. Stays `None` on a fetch/parse failure
+    /// (fail-open: a network blip must not silently kill the one entry
+    /// opportunity for the day) -- see bot-strategy#872.
+    ineligible_reason: Option<String>,
 }
 
 /// Snapshot `prices` into `day.t0_prices` the first time `now_us` reaches
@@ -514,6 +542,87 @@ fn capture_t0_if_due(
     if day.t0_prices.is_none() && now_us >= t0 {
         day.t0_prices = Some(prices.clone());
     }
+}
+
+// ---------------------------------------------------------------------
+// Same-day market eligibility gate (bot-strategy#872). Queries Lighter's
+// public, unauthenticated `orderBookDetails` REST endpoint directly --
+// the same endpoint and field names `engine_b_phase0.py`'s
+// `poll_venue()` already uses to compute its own `is_eligible` column --
+// rather than extending `DexConnector` for a read-only public-data need
+// (would need a `DexConnectorBox` forwarding override for every other
+// connector, see CLAUDE.md's dex-connector pitfall list, for a method
+// only this prototype calls).
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize, Debug)]
+struct OrderBookDetailsResponse {
+    #[serde(default)]
+    order_book_details: Vec<OrderBookDetail>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OrderBookDetail {
+    symbol: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    market_config: Option<MarketConfig>,
+    #[serde(default)]
+    daily_quote_token_volume: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct MarketConfig {
+    #[serde(default)]
+    force_reduce_only: bool,
+}
+
+async fn fetch_order_book_details(rest_url: &str) -> Result<Vec<OrderBookDetail>> {
+    let url = format!("{}/api/v1/orderBookDetails", rest_url.trim_end_matches('/'));
+    let resp: OrderBookDetailsResponse = Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .context("orderBookDetails request failed")?
+        .error_for_status()
+        .context("orderBookDetails non-2xx response")?
+        .json()
+        .await
+        .context("orderBookDetails parse failed")?;
+    Ok(resp.order_book_details)
+}
+
+/// Same three eligibility checks and reason strings as
+/// `engine_b_phase0.py`'s `poll_venue()` (`status != "active"` /
+/// `force_reduce_only` / `daily_volume_below_min`), so a symbol's
+/// eligibility reads identically in both this binary's log and the
+/// Phase 0A observer's `market_status` table.
+fn evaluate_eligibility(detail: &OrderBookDetail, min_daily_volume_usd: f64) -> (bool, String) {
+    let status = detail.status.as_deref().unwrap_or("unknown");
+    let force_reduce_only = detail
+        .market_config
+        .as_ref()
+        .map(|c| c.force_reduce_only)
+        .unwrap_or(false);
+    let volume: f64 = detail
+        .daily_quote_token_volume
+        .as_deref()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0.0);
+    let mut reasons = Vec::new();
+    if status != "active" {
+        reasons.push(format!("status={status}"));
+    }
+    if force_reduce_only {
+        reasons.push("force_reduce_only".to_string());
+    }
+    if volume < min_daily_volume_usd {
+        reasons.push("daily_volume_below_min".to_string());
+    }
+    (reasons.is_empty(), reasons.join(","))
 }
 
 #[derive(Serialize)]
@@ -760,6 +869,53 @@ impl EngineBLiveEngine {
                 epsilon.abs(),
                 self.cfg.epsilon_threshold
             );
+            self.day.entered = true;
+            self.state.last_session_date = self.current_date.map(|d| d.to_string());
+            atomic_write_json(&self.cfg.state_path, &self.state);
+            return;
+        }
+        if !self.day.eligibility_checked {
+            self.day.eligibility_checked = true;
+            match fetch_order_book_details(&self.cfg.lighter_rest_url).await {
+                Ok(details) => {
+                    for (label, symbol) in [
+                        ("kr_primary", &self.cfg.kr_primary_symbol),
+                        ("us_primary", &self.cfg.us_primary_symbol),
+                    ] {
+                        match details.iter().find(|d| &d.symbol == symbol) {
+                            Some(detail) => {
+                                let (eligible, reason) =
+                                    evaluate_eligibility(detail, self.cfg.min_daily_volume_usd);
+                                if !eligible {
+                                    log::warn!(
+                                        "[ELIGIBILITY] {label}={symbol} ineligible ({reason})"
+                                    );
+                                    self.day.ineligible_reason.get_or_insert_with(|| {
+                                        format!("{label}={symbol}:{reason}")
+                                    });
+                                }
+                            }
+                            None => {
+                                log::warn!(
+                                    "[ELIGIBILITY] {label}={symbol} not found in orderBookDetails response"
+                                );
+                                self.day
+                                    .ineligible_reason
+                                    .get_or_insert_with(|| format!("{label}={symbol}:not_found"));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[ELIGIBILITY] orderBookDetails fetch failed: {e:?}; proceeding without \
+                         the eligibility gate today (fail-open)"
+                    );
+                }
+            }
+        }
+        if let Some(reason) = self.day.ineligible_reason.clone() {
+            log::warn!("[ENTRY] skipped: {reason}");
             self.day.entered = true;
             self.state.last_session_date = self.current_date.map(|d| d.to_string());
             atomic_write_json(&self.cfg.state_path, &self.state);
@@ -1094,7 +1250,8 @@ async fn main() -> Result<()> {
     let cfg = EngineBLiveConfig::from_env();
     log::info!(
         "[CONFIG] instance={} dry_run={} kr_primary={} us_primary={} lot_usd=${:.0} leverage={} \
-         epsilon_threshold={:.5} direction_multiplier={} signal_model={} entry_deadline={}s exit_deadline={}s",
+         epsilon_threshold={:.5} direction_multiplier={} signal_model={} entry_deadline={}s exit_deadline={}s \
+         min_daily_volume_usd=${:.0}",
         cfg.instance_id,
         cfg.dry_run,
         cfg.kr_primary_symbol,
@@ -1106,6 +1263,7 @@ async fn main() -> Result<()> {
         cfg.signal_model,
         cfg.entry_deadline_secs,
         cfg.exit_deadline_secs,
+        cfg.min_daily_volume_usd,
     );
 
     // Mirrors robinhood_dipgrid.rs's explicit live-refusal gate: flipping
@@ -1237,6 +1395,8 @@ mod tests {
             signal_model: "diff".to_string(),
             entry_deadline_secs: 180,
             exit_deadline_secs: 900,
+            lighter_rest_url: "https://mainnet.zklighter.elliot.ai".to_string(),
+            min_daily_volume_usd: 100_000.0,
             equity_usd_reference: 1000.0,
             max_session_loss_bps: 500.0,
             trading_calendar_path: PathBuf::from("/nonexistent"),
@@ -1289,6 +1449,68 @@ mod tests {
         let t0 = HashMap::from([("SKHY".to_string(), 0.0), ("SNDK".to_string(), 50.0)]);
         let t1 = HashMap::from([("SKHY".to_string(), 102.0), ("SNDK".to_string(), 50.0)]);
         assert!(compute_epsilon("diff", "SKHY", "SNDK", &t0, &t1).is_none());
+    }
+
+    // -------------------------------------------------------------
+    // evaluate_eligibility
+    // -------------------------------------------------------------
+
+    fn fixture_detail(status: &str, force_reduce_only: bool, volume: &str) -> OrderBookDetail {
+        OrderBookDetail {
+            symbol: "SNDK".to_string(),
+            status: Some(status.to_string()),
+            market_config: Some(MarketConfig { force_reduce_only }),
+            daily_quote_token_volume: Some(volume.to_string()),
+        }
+    }
+
+    #[test]
+    fn eligibility_ok_when_active_and_liquid() {
+        let detail = fixture_detail("active", false, "500000");
+        let (eligible, reason) = evaluate_eligibility(&detail, 100_000.0);
+        assert!(eligible, "reason={reason}");
+        assert_eq!(reason, "");
+    }
+
+    #[test]
+    fn eligibility_fails_on_force_reduce_only() {
+        let detail = fixture_detail("active", true, "500000");
+        let (eligible, reason) = evaluate_eligibility(&detail, 100_000.0);
+        assert!(!eligible);
+        assert!(reason.contains("force_reduce_only"), "reason={reason}");
+    }
+
+    #[test]
+    fn eligibility_fails_below_min_volume() {
+        let detail = fixture_detail("active", false, "1000");
+        let (eligible, reason) = evaluate_eligibility(&detail, 100_000.0);
+        assert!(!eligible);
+        assert!(reason.contains("daily_volume_below_min"), "reason={reason}");
+    }
+
+    #[test]
+    fn eligibility_fails_when_status_not_active() {
+        let detail = fixture_detail("inactive", false, "500000");
+        let (eligible, reason) = evaluate_eligibility(&detail, 100_000.0);
+        assert!(!eligible);
+        assert!(reason.contains("status=inactive"), "reason={reason}");
+    }
+
+    #[test]
+    fn eligibility_defaults_missing_fields_to_ineligible() {
+        let detail = OrderBookDetail {
+            symbol: "SNDK".to_string(),
+            status: None,
+            market_config: None,
+            daily_quote_token_volume: None,
+        };
+        let (eligible, reason) = evaluate_eligibility(&detail, 100_000.0);
+        assert!(!eligible, "reason={reason}");
+        // status defaults to "unknown" (!= "active") and volume defaults
+        // to 0.0 (< any positive min_daily_volume_usd) -- a response
+        // missing these fields must fail closed, not read as eligible.
+        assert!(reason.contains("status=unknown"));
+        assert!(reason.contains("daily_volume_below_min"));
     }
 
     // -------------------------------------------------------------
