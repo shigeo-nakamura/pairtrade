@@ -438,6 +438,25 @@ struct RiskState {
     /// never re-evaluates a boundary it already passed.
     #[serde(default)]
     last_session_date: Option<String>,
+    /// Persisted copy of `DaySnapshot.t0_prices` (KRX-open mid prices),
+    /// keyed by `t0_snapshot_date` -- restores the *true* t0 snapshot
+    /// across a restart that happens between `t0` and `t1`, instead of
+    /// `capture_t0_if_due` silently re-capturing a wrong one from
+    /// whatever `latest_price` happens to hold on the new process's
+    /// first tick (which may be near-empty right after a WS reconnect).
+    /// Discovered live 2026-09-04: a restart at 06:03 UTC (t0=00:00,
+    /// t1=06:30) wiped the in-memory-only t0 snapshot, the fresh
+    /// recapture silently missed kr_primary/us_primary (WS had not yet
+    /// delivered a tick for them), and `compute_epsilon`'s `?`-early-
+    /// returns on a missing key produce no log line at all -- the day's
+    /// entry decision failed completely silently, surfacing only as
+    /// "entry_deadline passed without a valid signal" at the deadline,
+    /// indistinguishable in the log from a genuine no-signal day
+    /// (bot-strategy#872 PR #266 follow-up).
+    #[serde(default)]
+    t0_snapshot_date: Option<String>,
+    #[serde(default)]
+    t0_prices: HashMap<String, f64>,
 }
 
 fn load_state(path: &Path) -> RiskState {
@@ -548,6 +567,25 @@ fn capture_t0_if_due(
     let Some((t0, _t1, _t2)) = window else { return };
     if day.t0_prices.is_none() && now_us >= t0 {
         day.t0_prices = Some(prices.clone());
+    }
+}
+
+/// `Some(prices)` when `RiskState`'s persisted t0 snapshot is usable for
+/// `today_str` (same date, non-empty) -- `None` otherwise (no snapshot
+/// yet, a stale one from a previous day, or an empty one). Free/pure so
+/// `EngineBLiveEngine::roll_day_if_needed`'s recovery decision is
+/// unit-testable without a live `DexConnector` (bot-strategy#872 PR #266
+/// follow-up fix for the 2026-09-04 silent-signal-loss incident -- see
+/// `RiskState.t0_snapshot_date`'s doc comment).
+fn recoverable_t0_prices(
+    today_str: &str,
+    snapshot_date: Option<&str>,
+    snapshot_prices: &HashMap<String, f64>,
+) -> Option<HashMap<String, f64>> {
+    if snapshot_date == Some(today_str) && !snapshot_prices.is_empty() {
+        Some(snapshot_prices.clone())
+    } else {
+        None
     }
 }
 
@@ -819,6 +857,24 @@ impl EngineBLiveEngine {
             self.day.entered = true;
             self.day.restart_recovered = true;
         }
+        // Recover a t0 snapshot a prior run of this process already
+        // captured and persisted today, rather than letting
+        // `maybe_capture_t0` silently re-capture a wrong one from
+        // whatever `latest_price` holds on this process's first tick
+        // (see `RiskState.t0_snapshot_date`'s doc comment for the
+        // 2026-09-04 incident this fixes).
+        if let Some(prices) = recoverable_t0_prices(
+            &today_str,
+            self.state.t0_snapshot_date.as_deref(),
+            &self.state.t0_prices,
+        ) {
+            log::info!(
+                "[DAY] {today} recovered t0 snapshot from persisted state ({} symbols) -- \
+                 restart happened after t0, before a fresh capture would have run",
+                prices.len()
+            );
+            self.day.t0_prices = Some(prices);
+        }
     }
 
     fn snapshot_prices(&self) -> HashMap<String, f64> {
@@ -863,7 +919,39 @@ impl EngineBLiveEngine {
     /// `compute_epsilon` return ~0.0 every day. Must run every tick
     /// regardless of `self.day.entered`/entry-window state.
     fn maybe_capture_t0(&mut self, now_us: i64) {
+        let was_none = self.day.t0_prices.is_none();
         capture_t0_if_due(self.window, &mut self.day, now_us, &self.latest_price);
+        if !was_none {
+            return;
+        }
+        let Some(prices) = self.day.t0_prices.clone() else {
+            return;
+        };
+        let Some((t0, _, _)) = self.window else {
+            return;
+        };
+        let delay_secs = (now_us - t0) as f64 / 1_000_000.0;
+        if delay_secs > 300.0 {
+            // Most likely a restart between t0 and t1 with nothing to
+            // recover from RiskState.t0_prices (e.g. the first-ever start
+            // of the day, or a prior run that crashed before persisting)
+            // -- `latest_price` this late after t0 no longer reflects the
+            // true KRX-open price, so today's epsilon is suspect even
+            // though nothing here blocks it (bot-strategy#872 PR #266
+            // follow-up, see RiskState.t0_snapshot_date's doc comment).
+            log::warn!(
+                "[DAY] t0 snapshot captured {delay_secs:.0}s after t0 with nothing to recover \
+                 from persisted state -- likely does not reflect the true KRX-open price; \
+                 today's epsilon signal is suspect"
+            );
+        } else {
+            log::info!("[DAY] t0 snapshot captured ({delay_secs:.0}s after t0)");
+        }
+        if let Some(today) = self.current_date {
+            self.state.t0_snapshot_date = Some(today.to_string());
+            self.state.t0_prices = prices;
+            atomic_write_json(&self.cfg.state_path, &self.state);
+        }
     }
 
     async fn maybe_enter(&mut self, now_us: i64) {
@@ -1712,6 +1800,42 @@ mod tests {
             day.t0_prices,
             Some(early_prices),
             "a second call (e.g. at/after t1) must not clobber the real t0 snapshot with a later price"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // recoverable_t0_prices (bot-strategy#872 PR #266 follow-up:
+    // 2026-09-04 silent-signal-loss incident)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn t0_recovery_uses_persisted_snapshot_for_same_day() {
+        let prices = HashMap::from([("SKHY".to_string(), 100.0), ("SNDK".to_string(), 50.0)]);
+        let recovered = recoverable_t0_prices("2026-09-04", Some("2026-09-04"), &prices);
+        assert_eq!(recovered, Some(prices));
+    }
+
+    #[test]
+    fn t0_recovery_ignores_a_stale_prior_day_snapshot() {
+        let prices = HashMap::from([("SKHY".to_string(), 100.0)]);
+        // Restart lands on a new calendar day -- yesterday's t0 price is
+        // not today's KRX-open price and must not be reused.
+        let recovered = recoverable_t0_prices("2026-09-04", Some("2026-09-03"), &prices);
+        assert_eq!(recovered, None);
+    }
+
+    #[test]
+    fn t0_recovery_ignores_no_snapshot_and_empty_snapshot() {
+        assert_eq!(
+            recoverable_t0_prices("2026-09-04", None, &HashMap::new()),
+            None
+        );
+        // Same-day date match but an empty map (e.g. a still-default
+        // RiskState that was never actually populated) must not be
+        // treated as a usable recovery either.
+        assert_eq!(
+            recoverable_t0_prices("2026-09-04", Some("2026-09-04"), &HashMap::new()),
+            None
         );
     }
 
