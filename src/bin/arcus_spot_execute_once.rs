@@ -1431,6 +1431,35 @@ fn append_declined_route(
         .with_context(|| format!("failed to flush {}", path.display()))
 }
 
+/// The extra recorder row live-tick requests while the checkpointed
+/// position is rotated: the exit direction at exactly the open rotation
+/// quantity, in raw units of the token that exit sells, using the
+/// administrator-pinned `router.trusted_token_decimals` (a missing pin is
+/// a configuration error -- the live path could not execute that exit
+/// anyway). `None` when there is no checkpoint yet or it is neutral.
+fn live_tick_open_quantity_exit_row(
+    config: &ArcusSpotExecuteOnceConfig,
+) -> Result<Option<dex_connector::ArcusSpotFixedSellAmountRow>> {
+    let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+    let runtime = store.load_or_create(&config.runtime)?;
+    let Some((direction, _)) = runtime.open_exit_leg() else {
+        return Ok(None);
+    };
+    let (sell_symbol, _) = runtime.direction_symbols(direction);
+    let decimals = config
+        .router
+        .trusted_token_decimals
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(sell_symbol))
+        .map(|(_, decimals)| *decimals)
+        .with_context(|| {
+            format!("Arcus live-tick has no decimals pin for the exit sell token {sell_symbol}")
+        })?;
+    runtime
+        .open_exit_fixed_sell_amount_row(decimals)
+        .map_err(anyhow::Error::msg)
+}
+
 fn live_tick_observation_evidence_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
     let parent = config
         .runtime_state_path
@@ -4178,13 +4207,23 @@ async fn main() -> Result<()> {
             // than merely asserted.
             let client = ArcusSpotClient::new(config.router.clone())
                 .context("invalid Arcus router configuration")?;
-            let recorder_config = ArcusSpotRecorderConfig::from_csv(
+            let mut recorder_config = ArcusSpotRecorderConfig::from_csv(
                 &config.runtime.bidirectional_recorder_pairs_csv(),
                 &config.runtime.notional_usd.normalize().to_string(),
             )
             .context(
                 "failed to build a bidirectional recorder config from the runtime pair/notional",
             )?;
+            // A rotated position exits by selling exactly the quantity it
+            // acquired, so the snapshot must carry a quote at that exact
+            // size (bot-strategy#906). This unlocked peek at the checkpoint
+            // only decides which rows to *request*; the locked load below
+            // is what the decision is made against, and step_at matches
+            // the row by exact raw amount, so a checkpoint that moves in
+            // between (a concurrent fill) simply leaves this row unused.
+            if let Some(row) = live_tick_open_quantity_exit_row(&config)? {
+                recorder_config = recorder_config.with_fixed_sell_amount_row(row);
+            }
             let recorder = ArcusSpotRecorder::new(client, recorder_config)
                 .context("invalid Arcus recorder configuration")?;
             let snapshot: ArcusSpotRecorderSnapshot = recorder.collect_once().await;

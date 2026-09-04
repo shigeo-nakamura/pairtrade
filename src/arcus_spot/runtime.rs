@@ -4,6 +4,7 @@ use dex_connector::{
     ArcusSpotCapture, ArcusSpotOverviewEntry, ArcusSpotRecorderSnapshot, ArcusSpotRoundTripRecord,
     ArcusSpotRouteObservation, ArcusSpotToken,
 };
+use dex_connector::{ArcusSpotFixedSellAmountRow, ArcusSpotPair};
 use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -289,12 +290,29 @@ struct PriceContext {
     token_b_price_usd: Decimal,
 }
 
+/// Which leg of `SnapshotContext::row` an exit executes, and therefore how
+/// its sell quantity was chosen (see `snapshot_context`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitLegSizing {
+    /// The row was requested at exactly the tracked open rotation quantity
+    /// (`ArcusSpotRoundTripRecord::fixed_sell_amount`, bot-strategy#906);
+    /// the exit executes its *forward* leg, which sells that quantity.
+    OpenQuantityRow,
+    /// The row is the entry-direction, notional-sized cycle; the exit
+    /// executes its *reverse* leg, whose size is whatever the fresh
+    /// forward quote happened to produce. Only used when the snapshot
+    /// carries no open-quantity row (archival recorder replays, snapshots
+    /// collected before #906).
+    EntryCycleReverseLeg,
+}
+
 struct SnapshotContext {
     token_a: ArcusSpotToken,
     token_b: ArcusSpotToken,
     token_a_price_usd: Decimal,
     token_b_price_usd: Decimal,
     row: ArcusSpotRoundTripRecord,
+    exit_leg_sizing: ExitLegSizing,
     /// Round-trip cost in bps. For an entry (or any tick with no exit
     /// executing), independently recomputed from the forward and reverse
     /// recommended quote amounts and cross-checked against the recorded
@@ -389,6 +407,59 @@ impl ArcusSpotRuntime {
 
     pub fn state(&self) -> &ArcusSpotRuntimeState {
         &self.state
+    }
+
+    /// The direction a currently rotated position sells to exit, with the
+    /// exact quantity still open, or `None` when neutral. A caller that
+    /// collects the snapshot itself should request an extra recorder row at
+    /// exactly this quantity (`ArcusSpotRecorderConfig::fixed_sell_amount_rows`)
+    /// so `step_at` can size the exit to it (bot-strategy#906).
+    pub fn open_exit_leg(&self) -> Option<(ArcusSpotDirection, Decimal)> {
+        let open = self.state.rotated_quantity?;
+        match self.state.regime {
+            ArcusSpotRegime::Neutral => None,
+            ArcusSpotRegime::RotatedAToB => Some((ArcusSpotDirection::TokenBToTokenA, open)),
+            ArcusSpotRegime::RotatedBToA => Some((ArcusSpotDirection::TokenAToTokenB, open)),
+        }
+    }
+
+    /// The extra recorder row a snapshot collector should request so the
+    /// next `step_at` can exit the current rotated position at exactly its
+    /// open quantity: `None` while neutral. `sell_token_decimals` is the
+    /// pinned decimals of the token that exit sells (the first symbol of
+    /// `direction_symbols(open_exit_leg().0)`); a quantity that is not an
+    /// exact raw amount at those decimals is an error, never rounded.
+    pub fn open_exit_fixed_sell_amount_row(
+        &self,
+        sell_token_decimals: u32,
+    ) -> Result<Option<ArcusSpotFixedSellAmountRow>, String> {
+        let Some((direction, open_quantity)) = self.open_exit_leg() else {
+            return Ok(None);
+        };
+        let (sell_symbol, buy_symbol) = self.direction_symbols(direction);
+        let sell_amount_raw =
+            quantity_to_raw_amount(open_quantity, sell_token_decimals).map_err(|detail| {
+                format!("open rotation quantity {open_quantity} {sell_symbol}: {detail}")
+            })?;
+        Ok(Some(ArcusSpotFixedSellAmountRow {
+            pair: ArcusSpotPair {
+                sell_symbol: sell_symbol.to_string(),
+                buy_symbol: buy_symbol.to_string(),
+            },
+            sell_amount_raw,
+        }))
+    }
+
+    /// `(sell_symbol, buy_symbol)` for `direction` under the configured pair.
+    pub fn direction_symbols(&self, direction: ArcusSpotDirection) -> (&str, &str) {
+        match direction {
+            ArcusSpotDirection::TokenAToTokenB => {
+                (&self.config.pair.sell_symbol, &self.config.pair.buy_symbol)
+            }
+            ArcusSpotDirection::TokenBToTokenA => {
+                (&self.config.pair.buy_symbol, &self.config.pair.sell_symbol)
+            }
+        }
     }
 
     /// The risk mark implied by the state as it stands, valued at the marks
@@ -1154,6 +1225,30 @@ impl ArcusSpotRuntime {
         let token_a_price_usd = price.token_a_price_usd;
         let token_b_price_usd = price.token_b_price_usd;
 
+        // A rotated position exits by selling exactly what it acquired.
+        // Prefer a row quoted at that exact quantity when the snapshot
+        // carries one; the notional-sized cycle below is only a fallback
+        // (see `ExitLegSizing`).
+        let exit_direction = match signal {
+            Some((direction, ArcusSpotRotationTrigger::MeanReversionExit))
+            | Some((direction, ArcusSpotRotationTrigger::MaxHoldExit)) => Some(direction),
+            Some((_, ArcusSpotRotationTrigger::EntrySignal)) => None,
+            None => self.open_exit_leg().map(|(direction, _)| direction),
+        };
+        if let (Some(direction), Some(open_quantity)) =
+            (exit_direction, self.state.rotated_quantity)
+        {
+            if let Some(context) = self.open_quantity_exit_context(
+                snapshot,
+                evaluation_time,
+                price,
+                direction,
+                open_quantity,
+            )? {
+                return Ok(context);
+            }
+        }
+
         let cycle_forward_direction = match signal {
             Some((direction, ArcusSpotRotationTrigger::EntrySignal)) => direction,
             Some((ArcusSpotDirection::TokenAToTokenB, _)) => ArcusSpotDirection::TokenBToTokenA,
@@ -1310,8 +1405,144 @@ impl ArcusSpotRuntime {
             token_a_price_usd,
             token_b_price_usd,
             row: row.clone(),
+            exit_leg_sizing: ExitLegSizing::EntryCycleReverseLeg,
             verified_round_trip_loss_bps,
         })
+    }
+
+    /// Selects the row quoted at exactly `open_quantity` in `direction`
+    /// (`fixed_sell_amount` == the open quantity in raw units), validating
+    /// only the forward leg an exit would execute. `Ok(None)` when the
+    /// snapshot carries no such row at all, so the caller can fall back to
+    /// the notional-sized cycle; any row that exists but is unusable is a
+    /// hold, never a silent fallback -- a live tick always requests this
+    /// row when rotated, so its absence there would itself be the problem.
+    ///
+    /// Why this exists (bot-strategy#906): the notional-sized cycle's
+    /// reverse leg sells `notional_usd` worth of the held token at *today's*
+    /// price, while the entry acquired `notional_usd` worth minus costs at
+    /// the *entry* price. Bounding that leg to the open quantity therefore
+    /// admits an exit only once the held token's USD price has risen past
+    /// the entry's cost basis -- a hidden "exit only at a gain on the held
+    /// leg" gate that blocked both mean-reversion and max-hold exits.
+    fn open_quantity_exit_context(
+        &self,
+        snapshot: &ArcusSpotRecorderSnapshot,
+        evaluation_time: DateTime<Utc>,
+        price: &PriceContext,
+        direction: ArcusSpotDirection,
+        open_quantity: Decimal,
+    ) -> Result<Option<SnapshotContext>, ArcusSpotHold> {
+        let (sell_symbol, buy_symbol) = self.direction_symbols(direction);
+        let (sell_token, buy_token, sell_price_usd, buy_price_usd) = match direction {
+            ArcusSpotDirection::TokenAToTokenB => (
+                &price.token_a,
+                &price.token_b,
+                price.token_a_price_usd,
+                price.token_b_price_usd,
+            ),
+            ArcusSpotDirection::TokenBToTokenA => (
+                &price.token_b,
+                &price.token_a,
+                price.token_b_price_usd,
+                price.token_a_price_usd,
+            ),
+        };
+        let open_raw =
+            quantity_to_raw_amount(open_quantity, sell_token.decimals).map_err(|detail| {
+                ArcusSpotHold::new(
+                    ArcusSpotHoldCode::RotationLimit,
+                    format!(
+                        "open rotation quantity {open_quantity} {}: {detail}",
+                        sell_token.symbol
+                    ),
+                )
+            })?;
+        let matching_rows = snapshot
+            .round_trips
+            .iter()
+            .filter(|row| {
+                row.pair.sell_symbol.eq_ignore_ascii_case(sell_symbol)
+                    && row.pair.buy_symbol.eq_ignore_ascii_case(buy_symbol)
+                    && row.fixed_sell_amount.as_deref() == Some(open_raw.as_str())
+            })
+            .collect::<Vec<_>>();
+        if matching_rows.is_empty() {
+            return Ok(None);
+        }
+        if matching_rows.len() != 1 {
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::RouteUnavailable,
+                format!(
+                    "expected one {sell_symbol}/{buy_symbol} row at the open quantity {open_raw}; \
+                     found {}",
+                    matching_rows.len()
+                ),
+            ));
+        }
+        let row = matching_rows[0];
+        if !row.errors.is_empty() {
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::RouteUnavailable,
+                format!(
+                    "open-quantity exit row contains {} error(s): {}",
+                    row.errors.len(),
+                    row.errors[0].message
+                ),
+            ));
+        }
+        validate_recorded_reference(
+            "exit sell token",
+            row.sell_reference_price_usd.as_deref(),
+            sell_price_usd,
+        )?;
+        validate_recorded_reference(
+            "exit buy token",
+            row.buy_reference_price_usd.as_deref(),
+            buy_price_usd,
+        )?;
+        let Some(forward_route) = row.forward.as_ref() else {
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::RouteUnavailable,
+                "open-quantity exit row has no forward route",
+            ));
+        };
+        // Only the leg the exit executes is validated for freshness; the
+        // chained reverse leg exists so the row carries a round-trip cost
+        // figure, but a stale unused leg must not block a position close
+        // (same reasoning as the entry-cycle exit path).
+        validate_route_leg(
+            forward_route,
+            sell_token,
+            buy_token,
+            evaluation_time,
+            self.config.max_quote_age_secs,
+        )?;
+        if row.requested_sell_amount.as_deref() != Some(open_raw.as_str())
+            || forward_route.sell_amount != open_raw
+        {
+            return Err(ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                format!(
+                    "open-quantity exit row was not quoted at {open_raw}: requested {:?}, route \
+                     sellAmount {}",
+                    row.requested_sell_amount, forward_route.sell_amount
+                ),
+            ));
+        }
+        let verified_round_trip_loss_bps = parse_positive_or_zero(
+            "optimistic_round_trip_loss_bps",
+            row.optimistic_round_trip_loss_bps.as_deref(),
+        )?;
+        Ok(Some(SnapshotContext {
+            token_a: price.token_a.clone(),
+            token_b: price.token_b.clone(),
+            token_a_price_usd: price.token_a_price_usd,
+            token_b_price_usd: price.token_b_price_usd,
+            row: row.clone(),
+            exit_leg_sizing: ExitLegSizing::OpenQuantityRow,
+            verified_round_trip_loss_bps,
+        }))
     }
 
     /// `z_score` is `None` once the signal window is flat enough that its
@@ -1424,13 +1655,16 @@ impl ArcusSpotRuntime {
             ));
         }
 
-        let route = match trigger {
-            ArcusSpotRotationTrigger::EntrySignal => {
-                context.row.forward.as_ref().expect("validated forward")
-            }
-            ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit => {
-                context.row.reverse.as_ref().expect("validated reverse")
-            }
+        let route = match (trigger, context.exit_leg_sizing) {
+            (ArcusSpotRotationTrigger::EntrySignal, _)
+            | (
+                ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit,
+                ExitLegSizing::OpenQuantityRow,
+            ) => context.row.forward.as_ref().expect("validated forward"),
+            (
+                ArcusSpotRotationTrigger::MeanReversionExit | ArcusSpotRotationTrigger::MaxHoldExit,
+                ExitLegSizing::EntryCycleReverseLeg,
+            ) => context.row.reverse.as_ref().expect("validated reverse"),
         };
         let (sell_token, buy_token, sell_balance, sell_floor) = match direction {
             ArcusSpotDirection::TokenAToTokenB => (
@@ -1532,7 +1766,23 @@ impl ArcusSpotRuntime {
         // floor-crossing case above is prorated.
         if trigger != ArcusSpotRotationTrigger::EntrySignal {
             if let Some(open_quantity) = self.state.rotated_quantity {
-                if sell_quantity > open_quantity {
+                // An open-quantity row was requested at exactly this
+                // quantity, so anything else means the row does not
+                // describe the exit it was selected for.
+                if context.exit_leg_sizing == ExitLegSizing::OpenQuantityRow
+                    && sell_quantity != open_quantity
+                {
+                    return Err(ArcusSpotHold::new(
+                        ArcusSpotHoldCode::RotationLimit,
+                        format!(
+                            "open-quantity exit row sells {} {} but {} is open",
+                            sell_quantity, sell_token.symbol, open_quantity
+                        ),
+                    ));
+                }
+                if context.exit_leg_sizing == ExitLegSizing::EntryCycleReverseLeg
+                    && sell_quantity > open_quantity
+                {
                     // Scaling buy_quantity linearly down to open_quantity
                     // was tried here, but that synthesizes a fill price the
                     // venue never actually quoted for that smaller size --
@@ -2586,6 +2836,7 @@ mod tests {
             token_a_price_usd: Decimal::from(200),
             token_b_price_usd: Decimal::from(100),
             row,
+            exit_leg_sizing: ExitLegSizing::EntryCycleReverseLeg,
             verified_round_trip_loss_bps: loss_bps,
         }
     }
@@ -4449,6 +4700,336 @@ mod tests {
         }
         assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
         assert_eq!(runtime.state().rotated_quantity, Some(Decimal::new(40, 3)));
+    }
+
+    /// A recorder row requested at an exact raw sell amount (see
+    /// `ArcusSpotRecorderConfig::fixed_sell_amount_rows`): `sell_symbol`
+    /// -> `buy_symbol` at `sell_amount` raw, reverse leg chained off the
+    /// forward output as the recorder does.
+    fn fixed_exit_row(
+        sell_symbol: &str,
+        buy_symbol: &str,
+        sell_amount: &str,
+        forward_buy_amount: &str,
+        reverse_buy_amount: &str,
+        received_at: DateTime<Utc>,
+    ) -> ArcusSpotRoundTripRecord {
+        let address = |symbol: &str| match symbol {
+            "NVDA" => "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+            "AMD" => "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+            other => panic!("unknown fixture symbol {other}"),
+        };
+        let price = |symbol: &str| match symbol {
+            "NVDA" => "200",
+            "AMD" => "100",
+            other => panic!("unknown fixture symbol {other}"),
+        };
+        serde_json::from_value(json!({
+            "pair": {"sell_symbol": sell_symbol, "buy_symbol": buy_symbol},
+            "notional_usd": "4.0",
+            "fixed_sell_amount": sell_amount,
+            "sell_reference_price_usd": price(sell_symbol),
+            "buy_reference_price_usd": price(buy_symbol),
+            "requested_sell_amount": sell_amount,
+            "forward": {
+                "chain_id": 4663,
+                "sell_symbol": sell_symbol,
+                "buy_symbol": buy_symbol,
+                "sell_token": address(sell_symbol),
+                "buy_token": address(buy_symbol),
+                "sell_amount": sell_amount,
+                "response": {
+                    "payload": {
+                        "recommended": "arcus",
+                        "all": [{
+                            "venue": "arcus",
+                            "buyAmount": forward_buy_amount,
+                            "sellAmount": sell_amount,
+                            "fees": []
+                        }],
+                        "errors": []
+                    },
+                    "requested_at": received_at,
+                    "received_at": received_at,
+                    "latency_ms": 1000,
+                    "attempts": 1
+                }
+            },
+            "reverse": {
+                "chain_id": 4663,
+                "sell_symbol": buy_symbol,
+                "buy_symbol": sell_symbol,
+                "sell_token": address(buy_symbol),
+                "buy_token": address(sell_symbol),
+                "sell_amount": forward_buy_amount,
+                "response": {
+                    "payload": {
+                        "recommended": "arcus",
+                        "all": [{
+                            "venue": "arcus",
+                            "buyAmount": reverse_buy_amount,
+                            "sellAmount": forward_buy_amount,
+                            "fees": []
+                        }],
+                        "errors": []
+                    },
+                    "requested_at": received_at,
+                    "received_at": received_at,
+                    "latency_ms": 1000,
+                    "attempts": 1
+                }
+            },
+            "optimistic_return_amount": reverse_buy_amount,
+            "optimistic_round_trip_loss_bps": "50",
+            "errors": []
+        }))
+        .unwrap()
+    }
+
+    /// The live scenario behind bot-strategy#906: 0.04 AMD is open, the
+    /// notional cycle's reverse leg would sell 0.049 AMD (oversized, so the
+    /// legacy path holds on `rotation_limit` forever), but the snapshot
+    /// also carries a row quoted at exactly 0.04 AMD.
+    fn rotated_runtime_with_open_amd(open_raw_units: i64) -> ArcusSpotRuntime {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(open_raw_units, 3));
+        runtime.state.last_rotation_at =
+            Some(event_time() - Duration::seconds(runtime.config.max_hold_secs));
+        runtime
+    }
+
+    #[test]
+    fn open_exit_leg_reports_the_exit_direction_and_open_quantity() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        assert_eq!(runtime.open_exit_leg(), None);
+        runtime.state.regime = ArcusSpotRegime::RotatedAToB;
+        runtime.state.rotated_quantity = Some(Decimal::new(40, 3));
+        assert_eq!(
+            runtime.open_exit_leg(),
+            Some((ArcusSpotDirection::TokenBToTokenA, Decimal::new(40, 3)))
+        );
+        assert_eq!(
+            runtime.direction_symbols(ArcusSpotDirection::TokenBToTokenA),
+            ("AMD", "NVDA")
+        );
+        runtime.state.regime = ArcusSpotRegime::RotatedBToA;
+        assert_eq!(
+            runtime.open_exit_leg(),
+            Some((ArcusSpotDirection::TokenAToTokenB, Decimal::new(40, 3)))
+        );
+        assert_eq!(
+            runtime.direction_symbols(ArcusSpotDirection::TokenAToTokenB),
+            ("NVDA", "AMD")
+        );
+        runtime.state.rotated_quantity = None;
+        assert_eq!(runtime.open_exit_leg(), None);
+    }
+
+    #[test]
+    fn open_exit_fixed_sell_amount_row_requests_the_exact_open_quantity() {
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        assert_eq!(runtime.open_exit_fixed_sell_amount_row(18).unwrap(), None);
+        runtime.state.regime = ArcusSpotRegime::RotatedBToA;
+        runtime.state.rotated_quantity =
+            Some(Decimal::from_str("0.323268605206725905000").unwrap());
+        assert_eq!(
+            runtime.open_exit_fixed_sell_amount_row(18).unwrap(),
+            Some(ArcusSpotFixedSellAmountRow {
+                pair: ArcusSpotPair {
+                    sell_symbol: "NVDA".to_string(),
+                    buy_symbol: "AMD".to_string(),
+                },
+                sell_amount_raw: "323268605206725905".to_string(),
+            })
+        );
+        // Not representable at 6 decimals: refuse rather than round.
+        let error = runtime.open_exit_fixed_sell_amount_row(6).unwrap_err();
+        assert!(
+            error.contains("not exactly representable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn open_quantity_exit_row_sizes_the_exit_to_exactly_the_open_quantity() {
+        let mut runtime = rotated_runtime_with_open_amd(40);
+        let mut snapshot = snapshot_with_valid_row(event_time());
+        snapshot.round_trips.push(fixed_exit_row(
+            "AMD",
+            "NVDA",
+            "40000000000000000",
+            "19900000000000000",
+            "39800000000000000",
+            event_time(),
+        ));
+        let inventory_before = runtime.state.inventory;
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::MaxHoldExit);
+                assert_eq!(plan.direction, ArcusSpotDirection::TokenBToTokenA);
+                assert_eq!(plan.sell_symbol, "AMD");
+                assert_eq!(plan.buy_symbol, "NVDA");
+                assert_eq!(plan.sell_quantity, Decimal::new(40, 3));
+                assert_eq!(plan.sell_amount_raw, "40000000000000000");
+                assert_eq!(plan.buy_amount_raw, "19900000000000000");
+                assert_eq!(plan.buy_quantity, Decimal::new(199, 4));
+                assert_eq!(plan.optimistic_round_trip_loss_bps, Decimal::from(50));
+            }
+            other => panic!("expected an exit sized to the open quantity, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+        assert_eq!(runtime.state().rotated_quantity, None);
+        assert_eq!(
+            runtime.state().inventory.token_b,
+            inventory_before.token_b - Decimal::new(40, 3)
+        );
+        assert_eq!(
+            runtime.state().inventory.token_a,
+            inventory_before.token_a + Decimal::new(199, 4)
+        );
+    }
+
+    #[test]
+    fn open_quantity_exit_row_is_matched_by_exact_raw_amount_only() {
+        // A fixed row at a *different* amount is not "close enough": it is
+        // not the row for this position, so the legacy cycle is consulted
+        // and (being oversized) still holds.
+        let mut runtime = rotated_runtime_with_open_amd(40);
+        let mut snapshot = snapshot_with_valid_row(event_time());
+        snapshot.round_trips.push(fixed_exit_row(
+            "AMD",
+            "NVDA",
+            "41000000000000000",
+            "20400000000000000",
+            "40800000000000000",
+            event_time(),
+        ));
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::RotationLimit);
+                assert!(
+                    hold.detail.contains("exceeds the open rotation quantity"),
+                    "unexpected hold detail: {}",
+                    hold.detail
+                );
+            }
+            other => panic!("expected the legacy oversized-exit hold, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
+    }
+
+    #[test]
+    fn open_quantity_exit_row_with_errors_holds_instead_of_falling_back() {
+        let mut runtime = rotated_runtime_with_open_amd(40);
+        let mut snapshot = snapshot_with_valid_row(event_time());
+        let mut row = fixed_exit_row(
+            "AMD",
+            "NVDA",
+            "40000000000000000",
+            "19900000000000000",
+            "39800000000000000",
+            event_time(),
+        );
+        row.forward = None;
+        row.reverse = None;
+        row.optimistic_return_amount = None;
+        row.optimistic_round_trip_loss_bps = None;
+        row.errors = serde_json::from_value(json!([{
+            "stage": "forward_price",
+            "classification": "http",
+            "retryable": true,
+            "message": "router timeout"
+        }]))
+        .unwrap();
+        snapshot.round_trips.push(row);
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::RouteUnavailable);
+                assert!(
+                    hold.detail.contains("router timeout"),
+                    "unexpected hold detail: {}",
+                    hold.detail
+                );
+            }
+            other => panic!("expected a route-unavailable hold, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
+        assert_eq!(runtime.state().rotated_quantity, Some(Decimal::new(40, 3)));
+    }
+
+    #[test]
+    fn open_quantity_exit_row_must_be_quoted_at_the_requested_amount() {
+        // fixed_sell_amount says 0.04 AMD but the route was actually
+        // requested at 0.039: the row is internally inconsistent.
+        let mut runtime = rotated_runtime_with_open_amd(40);
+        let mut snapshot = snapshot_with_valid_row(event_time());
+        let mut row = fixed_exit_row(
+            "AMD",
+            "NVDA",
+            "39000000000000000",
+            "19400000000000000",
+            "38800000000000000",
+            event_time(),
+        );
+        row.fixed_sell_amount = Some("40000000000000000".to_string());
+        snapshot.round_trips.push(row);
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::InvalidSnapshot);
+            }
+            other => panic!("expected an invalid-snapshot hold, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
+    }
+
+    #[test]
+    fn stale_open_quantity_exit_row_holds_on_quote_age() {
+        let mut runtime = rotated_runtime_with_open_amd(40);
+        let mut snapshot = snapshot_with_valid_row(event_time());
+        snapshot.round_trips.push(fixed_exit_row(
+            "AMD",
+            "NVDA",
+            "40000000000000000",
+            "19900000000000000",
+            "39800000000000000",
+            event_time() - Duration::seconds(runtime.config.max_quote_age_secs + 1),
+        ));
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::StaleQuote);
+            }
+            other => panic!("expected a stale-quote hold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_quantity_exit_row_is_ignored_while_neutral() {
+        // A leftover fixed row (e.g. collected for a position that has
+        // since closed) must not influence an entry decision.
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let mut snapshot = snapshot_with_valid_row(event_time());
+        snapshot.round_trips.push(fixed_exit_row(
+            "AMD",
+            "NVDA",
+            "40000000000000000",
+            "19900000000000000",
+            "39800000000000000",
+            event_time(),
+        ));
+        let event = runtime.step_at(&snapshot, event_time());
+        match event.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::Warmup);
+            }
+            other => panic!("expected a warmup hold, got {other:?}"),
+        }
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
     }
 
     #[test]

@@ -1332,7 +1332,10 @@ impl EngineBLiveEngine {
             }),
         );
         send_notification(
-            format!("Han Bridge EXIT {} pnl=${pnl:.2}", self.cfg.us_primary_symbol),
+            format!(
+                "Han Bridge EXIT {} pnl=${pnl:.2}",
+                self.cfg.us_primary_symbol
+            ),
             format!(
                 "entry={:.4} exit={exit_price:.4} size={:.6} dry_run={}",
                 pos.entry_price, pos.size, self.cfg.dry_run
@@ -1469,7 +1472,10 @@ impl EngineBLiveEngine {
         // The local status.json file trades away pretty-printing for
         // this; inspect it with `python3 -m json.tool` or `jq` if needed.
         let Ok(body) = serde_json::to_vec(&status) else {
-            log::warn!("[STATUS] serialize failed for {}", self.cfg.status_path.display());
+            log::warn!(
+                "[STATUS] serialize failed for {}",
+                self.cfg.status_path.display()
+            );
             return;
         };
         atomic_write_bytes(&self.cfg.status_path, &body);
@@ -2113,34 +2119,68 @@ mod tests {
     #[test]
     fn full_status_flattens_both_structs_into_one_flat_object() {
         let value = serde_json::to_value(fixture_status()).unwrap();
-        let obj = value.as_object().expect("status must serialize to a JSON object");
+        let obj = value
+            .as_object()
+            .expect("status must serialize to a JSON object");
 
         // debot-dashboard's StatusData (main.go) field names.
         for key in [
-            "ts", "updated_at", "id", "dex", "dry_run", "has_position",
-            "position_count", "positions_ready", "positions", "pnl_total",
-            "pnl_today", "pnl_source", "kill_switch_active", "trade_stats",
+            "ts",
+            "updated_at",
+            "id",
+            "dex",
+            "dry_run",
+            "has_position",
+            "position_count",
+            "positions_ready",
+            "positions",
+            "pnl_total",
+            "pnl_today",
+            "pnl_source",
+            "kill_switch_active",
+            "trade_stats",
         ] {
             assert!(obj.contains_key(key), "missing dashboard field: {key}");
         }
         let trade_stats = obj["trade_stats"].as_object().unwrap();
         for key in ["trades", "wins", "win_rate", "max_dd", "pnl"] {
-            assert!(trade_stats.contains_key(key), "missing trade_stats field: {key}");
+            assert!(
+                trade_stats.contains_key(key),
+                "missing trade_stats field: {key}"
+            );
         }
 
         // engine_b_live-specific fields, flattened alongside the above,
         // not nested under a separate "extra" key.
         for key in [
-            "ts_us", "instance_id", "current_date", "window", "day_entered",
-            "day_exited", "restart_recovered", "session_halted",
-            "session_halt_reason", "realized_pnl_session", "pnl_today_date",
-            "total_trades", "total_wins", "max_dd_bps", "max_dd_usd",
-            "kill_switch", "calendar_version",
+            "ts_us",
+            "instance_id",
+            "current_date",
+            "window",
+            "day_entered",
+            "day_exited",
+            "restart_recovered",
+            "session_halted",
+            "session_halt_reason",
+            "realized_pnl_session",
+            "pnl_today_date",
+            "total_trades",
+            "total_wins",
+            "max_dd_bps",
+            "max_dd_usd",
+            "kill_switch",
+            "calendar_version",
         ] {
             assert!(obj.contains_key(key), "missing engine_b_live field: {key}");
         }
-        assert!(!obj.contains_key("dashboard"), "flatten must not leave a nested \"dashboard\" key");
-        assert!(!obj.contains_key("extra"), "flatten must not leave a nested \"extra\" key");
+        assert!(
+            !obj.contains_key("dashboard"),
+            "flatten must not leave a nested \"dashboard\" key"
+        );
+        assert!(
+            !obj.contains_key("extra"),
+            "flatten must not leave a nested \"extra\" key"
+        );
 
         // han_bridge is deliberately NOT flattened -- debot-dashboard
         // gates an extra UI section on this key's presence (same pattern

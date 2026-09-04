@@ -371,6 +371,43 @@ just-reconciled fill with stale state); only when the tick genuinely decides
 policy-gated path as `auto-execute`. Most ticks decide `Observe` and never
 touch the KMS signer or the submission network.
 
+### Exit sizing: the open-quantity row (bot-strategy#906)
+
+While the checkpoint is rotated, `live-tick` requests one extra recorder
+row in addition to the bidirectional notional-sized cycles: the exit
+direction (held token -> other token) quoted at **exactly the tracked open
+rotation quantity** in raw units (`ArcusSpotRecorderConfig::
+fixed_sell_amount_rows`, `ArcusSpotRoundTripRecord::fixed_sell_amount`).
+`step_at` selects that row by exact raw amount and executes its forward
+leg, so a `mean_reversion_exit`/`max_hold_exit` plan always sells the
+whole open quantity and the regime returns to `neutral` on fill. The
+row's chained reverse leg only supplies the informational round-trip cost
+figure; as with every exit, only the leg actually executed is checked for
+freshness, and the cost cap is not applied.
+
+Before this, exits were taken from the reverse leg of the entry-direction
+notional cycle -- i.e. "sell `notional_usd` worth of the held token at
+today's price" -- bounded to the open quantity. The entry had acquired
+`notional_usd` worth *minus costs* at the *entry* price, so that leg only
+fitted once the held token's USD price had risen above the entry's cost
+basis: a hidden "exit only at a gain on the held leg" gate that stalled
+both exit triggers indefinitely (the first SPY/QQQ rotation of #902 sat on
+`rotation_limit` with z back at 0 and `max_hold_secs` unable to unwind
+it). Requesting the exit-sized quote is what removes the gate; prorating
+the notional leg down would instead synthesize a fill price the venue
+never quoted (the reason that earlier check was written as a hard hold).
+
+The unlocked read of the checkpoint that decides whether to request the
+row happens before the snapshot fetch; the decision itself is still made
+against the locked load, and a checkpoint that moves in between (a
+concurrent fill) simply leaves the row unmatched. A snapshot that carries
+no such row at all -- an archival recorder replay, or one collected before
+this change -- falls back to the entry-cycle reverse leg with the previous
+bound, so replays of old archives are unchanged; a row that is present but
+unusable (errored, stale, quoted at a different amount) is a hold, never a
+silent fallback. The pinned `router.trusted_token_decimals` entry for the
+held token is required to size the request; a missing pin fails the tick.
+
 An earlier version took `RECORDER_SNAPSHOT_JSON` as a second argument.
 `read_private_regular_file` only checks a file's mode and type, not its
 origin, so the executor identity could fabricate an internally-consistent
