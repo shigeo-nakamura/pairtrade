@@ -802,12 +802,33 @@ struct EngineStatusExtra {
     calendar_version: String,
 }
 
+/// Engine-B-specific dashboard block, nested under a named `han_bridge`
+/// key (same pattern as `hype-accumulator`'s `accumulator` block in
+/// debot-dashboard's `StatusData`) rather than flattened alongside
+/// `DashboardStatus`/`EngineStatusExtra` -- lets debot-dashboard's web UI
+/// render an extra section only for this target (gated on the field's
+/// presence, `omitempty` on the Go side) without touching how any other
+/// bot's card renders. Answers "why didn't it trade today" without
+/// grepping journalctl: which symbols this instance trades, whether
+/// today's entry/exit decision has already been made, and why an entry
+/// was skipped if it was (bot-strategy#872 dashboard follow-up).
+#[derive(Serialize)]
+struct HanBridgeStatus {
+    kr_primary_symbol: String,
+    us_primary_symbol: String,
+    day_entered: bool,
+    day_exited: bool,
+    ineligible_reasons: Vec<String>,
+    session_halt_reason: Option<String>,
+}
+
 #[derive(Serialize)]
 struct FullStatus {
     #[serde(flatten)]
     dashboard: DashboardStatus,
     #[serde(flatten)]
     extra: EngineStatusExtra,
+    han_bridge: HanBridgeStatus,
 }
 
 struct EngineBLiveEngine {
@@ -1367,6 +1388,42 @@ impl EngineBLiveEngine {
         // file is created/removed between the two reads (review round 3
         // on this same PR, self-review finding).
         let kill_switch = self.kill_switch_engaged();
+        // Built as a standalone binding, not inline in the `FullStatus`
+        // literal below, so `han_bridge` can derive its four overlapping
+        // fields (day_entered/day_exited/ineligible_reasons/
+        // session_halt_reason) FROM this value instead of re-reading
+        // self.day/self.state a second time -- one source of truth per
+        // tick instead of two independent reads that could silently
+        // drift apart on a future edit to only one of the two struct
+        // literals (code-review finding on PR #271).
+        let extra = EngineStatusExtra {
+            ts_us: now_us,
+            instance_id: self.cfg.instance_id.clone(),
+            current_date: self.current_date.map(|d| d.to_string()),
+            window: self.window,
+            day_entered: self.day.entered,
+            day_exited: self.day.exited,
+            restart_recovered: self.day.restart_recovered,
+            eligibility_ineligible_reasons: self.day.ineligible_reasons.clone(),
+            session_halted: self.state.session_halted,
+            session_halt_reason: self.state.session_halt_reason.clone(),
+            realized_pnl_session: self.state.realized_pnl_session,
+            pnl_today_date: self.state.pnl_today_date.clone(),
+            total_trades: self.state.total_trades,
+            total_wins: self.state.total_wins,
+            max_dd_bps: self.state.max_dd_bps,
+            max_dd_usd: self.state.max_dd_usd,
+            kill_switch,
+            calendar_version: self.calendar.calendar_version.clone(),
+        };
+        let han_bridge = HanBridgeStatus {
+            kr_primary_symbol: self.cfg.kr_primary_symbol.clone(),
+            us_primary_symbol: self.cfg.us_primary_symbol.clone(),
+            day_entered: extra.day_entered,
+            day_exited: extra.day_exited,
+            ineligible_reasons: extra.eligibility_ineligible_reasons.clone(),
+            session_halt_reason: extra.session_halt_reason.clone(),
+        };
         let status = FullStatus {
             dashboard: DashboardStatus {
                 ts: now_us / 1_000_000,
@@ -1396,26 +1453,8 @@ impl EngineBLiveEngine {
                     pnl: self.state.realized_pnl_session,
                 },
             },
-            extra: EngineStatusExtra {
-                ts_us: now_us,
-                instance_id: self.cfg.instance_id.clone(),
-                current_date: self.current_date.map(|d| d.to_string()),
-                window: self.window,
-                day_entered: self.day.entered,
-                day_exited: self.day.exited,
-                restart_recovered: self.day.restart_recovered,
-                eligibility_ineligible_reasons: self.day.ineligible_reasons.clone(),
-                session_halted: self.state.session_halted,
-                session_halt_reason: self.state.session_halt_reason.clone(),
-                realized_pnl_session: self.state.realized_pnl_session,
-                pnl_today_date: self.state.pnl_today_date.clone(),
-                total_trades: self.state.total_trades,
-                total_wins: self.state.total_wins,
-                max_dd_bps: self.state.max_dd_bps,
-                max_dd_usd: self.state.max_dd_usd,
-                kill_switch,
-                calendar_version: self.calendar.calendar_version.clone(),
-            },
+            extra,
+            han_bridge,
         };
         // Serialized once and reused for both destinations (previously
         // two separate serde_json calls per tick -- bot-strategy#866 PR
@@ -2060,6 +2099,14 @@ mod tests {
                 kill_switch: false,
                 calendar_version: "test".to_string(),
             },
+            han_bridge: HanBridgeStatus {
+                kr_primary_symbol: "SKHY".to_string(),
+                us_primary_symbol: "SNDK".to_string(),
+                day_entered: false,
+                day_exited: false,
+                ineligible_reasons: Vec::new(),
+                session_halt_reason: None,
+            },
         }
     }
 
@@ -2094,5 +2141,28 @@ mod tests {
         }
         assert!(!obj.contains_key("dashboard"), "flatten must not leave a nested \"dashboard\" key");
         assert!(!obj.contains_key("extra"), "flatten must not leave a nested \"extra\" key");
+
+        // han_bridge is deliberately NOT flattened -- debot-dashboard
+        // gates an extra UI section on this key's presence (same pattern
+        // as hype-accumulator's "accumulator" block), so it must stay a
+        // nested object, not spread across the top level like the other
+        // two.
+        let han_bridge = obj
+            .get("han_bridge")
+            .and_then(|v| v.as_object())
+            .expect("han_bridge must be present as a nested object");
+        for key in [
+            "kr_primary_symbol",
+            "us_primary_symbol",
+            "day_entered",
+            "day_exited",
+            "ineligible_reasons",
+            "session_halt_reason",
+        ] {
+            assert!(
+                han_bridge.contains_key(key),
+                "missing han_bridge field: {key}"
+            );
+        }
     }
 }
