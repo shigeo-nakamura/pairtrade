@@ -18,6 +18,12 @@ See `src/bin/engine_b_live.rs`'s module doc for the exact strategy shape
 `epsilon = ln(kr_t1/kr_t0) - ln(us_t1/us_t0)` diff signal) and its KNOWN
 GAPS section -- do not duplicate that list here; read it there.
 
+The order path itself (Lighter decimals / minimum sizes, rate limits, IOC
+/ reduce-only / cancel / client-order-ID semantics, and the gaps between
+what this binary does and what the requirements doc specifies) is
+documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
+/ A-9). Read its §4 gap table before any `CONFIRM_LIVE` flip.
+
 ## Safety boundary
 
 - `order_capability` is real for this binary (unlike `engine-b-phase0`,
