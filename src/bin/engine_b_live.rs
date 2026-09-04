@@ -76,6 +76,22 @@
 //!   position directly rather than trusting this process's state file.
 //! - No SIGTERM-graceful-close handling: `systemctl stop` does not
 //!   reduce-only-close an open position.
+//! - `capture_t0_if_due` locks in `day.t0_prices` on the *first* tick at
+//!   or after `t0`, complete or not, and (deliberately, see
+//!   `capture_t0_if_due_never_overwrites_an_existing_snapshot`) never
+//!   recaptures within the same process run. `RiskState.t0_prices`
+//!   recovery (bot-strategy#872 PR #266/#270, the 2026-09-04
+//!   silent-signal-loss fix) only helps a *second* same-day restart --
+//!   the very first restart between `t0` and `t1` of the day can still
+//!   land its first tick on an incomplete `latest_price` (missing
+//!   `kr_primary`/`us_primary`, e.g. right after a WS reconnect) with
+//!   nothing yet persisted to recover. That case now logs a clear
+//!   `[DAY] ... but is missing kr_primary=.../us_primary=... prices`
+//!   `WARN` instead of failing silently, but does not by itself recover
+//!   the day -- an operator who sees that WARN should manually restart
+//!   again (now that an incomplete snapshot is never persisted, a second
+//!   attempt gets a fresh, hopefully-complete capture instead of
+//!   re-trusting the bad one) rather than assume the gap fixes itself.
 //!
 //! DRY_RUN must stay on until a human explicitly flips the `refuse_live`
 //! gate below (mirrors `robinhood_dipgrid.rs`'s pattern: flipping
@@ -438,6 +454,25 @@ struct RiskState {
     /// never re-evaluates a boundary it already passed.
     #[serde(default)]
     last_session_date: Option<String>,
+    /// Persisted copy of `DaySnapshot.t0_prices` (KRX-open mid prices),
+    /// keyed by `t0_snapshot_date` -- restores the *true* t0 snapshot
+    /// across a restart that happens between `t0` and `t1`, instead of
+    /// `capture_t0_if_due` silently re-capturing a wrong one from
+    /// whatever `latest_price` happens to hold on the new process's
+    /// first tick (which may be near-empty right after a WS reconnect).
+    /// Discovered live 2026-09-04: a restart at 06:03 UTC (t0=00:00,
+    /// t1=06:30) wiped the in-memory-only t0 snapshot, the fresh
+    /// recapture silently missed kr_primary/us_primary (WS had not yet
+    /// delivered a tick for them), and `compute_epsilon`'s `?`-early-
+    /// returns on a missing key produce no log line at all -- the day's
+    /// entry decision failed completely silently, surfacing only as
+    /// "entry_deadline passed without a valid signal" at the deadline,
+    /// indistinguishable in the log from a genuine no-signal day
+    /// (bot-strategy#872 PR #266 follow-up).
+    #[serde(default)]
+    t0_snapshot_date: Option<String>,
+    #[serde(default)]
+    t0_prices: HashMap<String, f64>,
 }
 
 fn load_state(path: &Path) -> RiskState {
@@ -548,6 +583,51 @@ fn capture_t0_if_due(
     let Some((t0, _t1, _t2)) = window else { return };
     if day.t0_prices.is_none() && now_us >= t0 {
         day.t0_prices = Some(prices.clone());
+    }
+}
+
+/// Whether `prices` actually has what `compute_epsilon` needs --
+/// `kr_symbol` and `us_symbol` both present. A map that is merely
+/// non-empty is not good enough: `all_symbols()` subscribes
+/// `control_symbols` (SOXL/NVDA/EWY/USDKRW) alongside the two primaries,
+/// and WS delivery order across symbols is not guaranteed, so a snapshot
+/// taken moments after a (re)connect can easily hold only control-symbol
+/// prices. Shared by the capture path (decides whether to persist/WARN)
+/// and the recovery path (decides whether a persisted snapshot is safe
+/// to trust) so both apply the exact same bar (PR #270 review finding:
+/// the first cut of this fix checked only "non-empty", which would have
+/// silently trusted/re-persisted exactly this kind of partial snapshot
+/// on a second same-day restart).
+fn t0_snapshot_has_required_symbols(
+    prices: &HashMap<String, f64>,
+    kr_symbol: &str,
+    us_symbol: &str,
+) -> bool {
+    prices.contains_key(kr_symbol) && prices.contains_key(us_symbol)
+}
+
+/// `Some(prices)` when `RiskState`'s persisted t0 snapshot is usable for
+/// `today_str` -- same date, and containing both `kr_symbol` and
+/// `us_symbol` (see `t0_snapshot_has_required_symbols`). `None` otherwise
+/// (no snapshot yet, a stale one from a previous day, or an incomplete
+/// one). Free/pure so `EngineBLiveEngine::roll_day_if_needed`'s recovery
+/// decision is unit-testable without a live `DexConnector`
+/// (bot-strategy#872 PR #266 follow-up fix for the 2026-09-04
+/// silent-signal-loss incident -- see `RiskState.t0_snapshot_date`'s doc
+/// comment).
+fn recoverable_t0_prices(
+    today_str: &str,
+    snapshot_date: Option<&str>,
+    snapshot_prices: &HashMap<String, f64>,
+    kr_symbol: &str,
+    us_symbol: &str,
+) -> Option<HashMap<String, f64>> {
+    if snapshot_date == Some(today_str)
+        && t0_snapshot_has_required_symbols(snapshot_prices, kr_symbol, us_symbol)
+    {
+        Some(snapshot_prices.clone())
+    } else {
+        None
     }
 }
 
@@ -819,6 +899,26 @@ impl EngineBLiveEngine {
             self.day.entered = true;
             self.day.restart_recovered = true;
         }
+        // Recover a t0 snapshot a prior run of this process already
+        // captured and persisted today, rather than letting
+        // `maybe_capture_t0` silently re-capture a wrong one from
+        // whatever `latest_price` holds on this process's first tick
+        // (see `RiskState.t0_snapshot_date`'s doc comment for the
+        // 2026-09-04 incident this fixes).
+        if let Some(prices) = recoverable_t0_prices(
+            &today_str,
+            self.state.t0_snapshot_date.as_deref(),
+            &self.state.t0_prices,
+            &self.cfg.kr_primary_symbol,
+            &self.cfg.us_primary_symbol,
+        ) {
+            log::info!(
+                "[DAY] {today} recovered t0 snapshot from persisted state ({} symbols) -- \
+                 restart happened after t0, before a fresh capture would have run",
+                prices.len()
+            );
+            self.day.t0_prices = Some(prices);
+        }
     }
 
     fn snapshot_prices(&self) -> HashMap<String, f64> {
@@ -863,7 +963,64 @@ impl EngineBLiveEngine {
     /// `compute_epsilon` return ~0.0 every day. Must run every tick
     /// regardless of `self.day.entered`/entry-window state.
     fn maybe_capture_t0(&mut self, now_us: i64) {
+        let was_none = self.day.t0_prices.is_none();
         capture_t0_if_due(self.window, &mut self.day, now_us, &self.latest_price);
+        if !was_none {
+            return;
+        }
+        let Some(prices) = self.day.t0_prices.clone() else {
+            return;
+        };
+        let Some((t0, _, _)) = self.window else {
+            return;
+        };
+        let delay_secs = (now_us - t0) as f64 / 1_000_000.0;
+        let complete = t0_snapshot_has_required_symbols(
+            &prices,
+            &self.cfg.kr_primary_symbol,
+            &self.cfg.us_primary_symbol,
+        );
+        if !complete {
+            // Gated on completeness, not `delay_secs`: a snapshot missing
+            // kr_primary/us_primary is unusable to compute_epsilon
+            // regardless of how soon after t0 it was taken (WS delivery
+            // order across symbols is not guaranteed -- control_symbols
+            // can easily arrive before the two primaries right after a
+            // (re)connect). Deliberately does NOT persist to RiskState:
+            // a future same-day restart must get another fresh-capture
+            // attempt, not silently recover this same incomplete map
+            // (PR #270 review finding).
+            log::warn!(
+                "[DAY] t0 snapshot captured {delay_secs:.0}s after t0 but is missing \
+                 kr_primary={}/us_primary={} prices -- not persisted, today's epsilon signal \
+                 will fail silently unless a later restart captures a complete one",
+                self.cfg.kr_primary_symbol,
+                self.cfg.us_primary_symbol
+            );
+            return;
+        }
+        if delay_secs > 300.0 {
+            // Complete, but captured well after t0 -- most likely a
+            // restart between t0 and t1 with nothing to recover from
+            // RiskState.t0_prices (e.g. the first-ever start of the day
+            // after t0, or a prior run that crashed before persisting).
+            // `latest_price` this late may already have drifted from the
+            // true KRX-open price even though every required key is
+            // present (bot-strategy#872 PR #266 follow-up, see
+            // RiskState.t0_snapshot_date's doc comment).
+            log::warn!(
+                "[DAY] t0 snapshot captured {delay_secs:.0}s after t0 with nothing to recover \
+                 from persisted state -- may not reflect the true KRX-open price; today's \
+                 epsilon signal is suspect"
+            );
+        } else {
+            log::info!("[DAY] t0 snapshot captured ({delay_secs:.0}s after t0)");
+        }
+        if let Some(today) = self.current_date {
+            self.state.t0_snapshot_date = Some(today.to_string());
+            self.state.t0_prices = prices;
+            atomic_write_json(&self.cfg.state_path, &self.state);
+        }
     }
 
     async fn maybe_enter(&mut self, now_us: i64) {
@@ -1713,6 +1870,84 @@ mod tests {
             Some(early_prices),
             "a second call (e.g. at/after t1) must not clobber the real t0 snapshot with a later price"
         );
+    }
+
+    // -------------------------------------------------------------
+    // t0_snapshot_has_required_symbols / recoverable_t0_prices
+    // (bot-strategy#872 PR #266 follow-up: 2026-09-04 silent-signal-loss
+    // incident, PR #270 review: the first cut only checked "non-empty")
+    // -------------------------------------------------------------
+
+    #[test]
+    fn snapshot_complete_when_both_primaries_present() {
+        let prices = HashMap::from([
+            ("SKHY".to_string(), 100.0),
+            ("SNDK".to_string(), 50.0),
+            ("SOXL".to_string(), 20.0),
+        ]);
+        assert!(t0_snapshot_has_required_symbols(&prices, "SKHY", "SNDK"));
+    }
+
+    #[test]
+    fn snapshot_incomplete_when_missing_a_primary() {
+        // Only a control symbol arrived -- e.g. right after a WS
+        // reconnect, before kr_primary/us_primary's own first tick.
+        let prices = HashMap::from([("SOXL".to_string(), 20.0)]);
+        assert!(!t0_snapshot_has_required_symbols(&prices, "SKHY", "SNDK"));
+
+        let kr_only = HashMap::from([("SKHY".to_string(), 100.0)]);
+        assert!(!t0_snapshot_has_required_symbols(&kr_only, "SKHY", "SNDK"));
+    }
+
+    #[test]
+    fn t0_recovery_uses_persisted_snapshot_for_same_day() {
+        let prices = HashMap::from([("SKHY".to_string(), 100.0), ("SNDK".to_string(), 50.0)]);
+        let recovered =
+            recoverable_t0_prices("2026-09-04", Some("2026-09-04"), &prices, "SKHY", "SNDK");
+        assert_eq!(recovered, Some(prices));
+    }
+
+    #[test]
+    fn t0_recovery_ignores_a_stale_prior_day_snapshot() {
+        let prices = HashMap::from([("SKHY".to_string(), 100.0), ("SNDK".to_string(), 50.0)]);
+        // Restart lands on a new calendar day -- yesterday's t0 price is
+        // not today's KRX-open price and must not be reused.
+        let recovered =
+            recoverable_t0_prices("2026-09-04", Some("2026-09-03"), &prices, "SKHY", "SNDK");
+        assert_eq!(recovered, None);
+    }
+
+    #[test]
+    fn t0_recovery_ignores_no_snapshot_and_empty_snapshot() {
+        assert_eq!(
+            recoverable_t0_prices("2026-09-04", None, &HashMap::new(), "SKHY", "SNDK"),
+            None
+        );
+        // Same-day date match but an empty map (e.g. a still-default
+        // RiskState that was never actually populated) must not be
+        // treated as a usable recovery either.
+        assert_eq!(
+            recoverable_t0_prices(
+                "2026-09-04",
+                Some("2026-09-04"),
+                &HashMap::new(),
+                "SKHY",
+                "SNDK"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn t0_recovery_ignores_a_same_day_but_incomplete_snapshot() {
+        // Same-day date match, non-empty, but missing us_primary -- must
+        // not be trusted (PR #270 review finding: a partial snapshot from
+        // control_symbols winning the WS delivery race must not be
+        // silently re-recovered on a second same-day restart).
+        let partial = HashMap::from([("SKHY".to_string(), 100.0), ("SOXL".to_string(), 20.0)]);
+        let recovered =
+            recoverable_t0_prices("2026-09-04", Some("2026-09-04"), &partial, "SKHY", "SNDK");
+        assert_eq!(recovered, None);
     }
 
     #[test]
