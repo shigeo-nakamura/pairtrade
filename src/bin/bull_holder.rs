@@ -1501,9 +1501,9 @@ async fn main() -> Result<()> {
     init_logger();
     let cfg = Config::from_env()?;
     log::info!(
-        "[CONFIG] bot={BOT} instance={} dry_run={} symbols={} equity=${:.0} spot_frac={} perp_frac={} exit_dd={}% stop_dd={}% hl_slip={}bps fp={}",
+        "[CONFIG] bot={BOT} instance={} dry_run={} symbols={} equity=${:.0} spot_frac={} perp_frac={} tranches={} exit_dd={}% stop_dd={}% hl_slip={}bps fp={}",
         cfg.instance_id, cfg.dry_run, cfg.symbols.join(","), cfg.equity_usd, cfg.spot_fraction, cfg.perp_fraction,
-        cfg.exit_dd_pct, cfg.stop_dd_pct, cfg.hl_taker_slippage_bps, cfg.fingerprint()
+        cfg.entry_tranches, cfg.exit_dd_pct, cfg.stop_dd_pct, cfg.hl_taker_slippage_bps, cfg.fingerprint()
     );
     refuse_live(
         cfg.dry_run,
