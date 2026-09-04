@@ -51,7 +51,7 @@
 //! - Prometheus export is not wired (status JSON only); follow-up.
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, FixedOffset, TimeZone, Timelike, Utc};
+use chrono::{FixedOffset, TimeZone, Timelike, Utc};
 use debot::directional::{
     append_jsonl, config_fingerprint, load_json, persist_json, refuse_live, Sentinels,
 };
@@ -363,11 +363,7 @@ fn utc_date(ts: u64) -> String {
 /// Whether the daily evaluation is due: we have not yet evaluated yesterday's
 /// completed close and the UTC day is old enough for the candle to be closed.
 fn daily_eval_due(now: u64, last_evaluated_close_date: Option<&str>, after_utc_secs: u32) -> bool {
-    let dt: DateTime<Utc> = match Utc.timestamp_opt(now as i64, 0).single() {
-        Some(d) => d,
-        None => return false,
-    };
-    if dt.num_seconds_from_midnight() < after_utc_secs {
+    if !past_daily_slot(now, after_utc_secs) {
         return false;
     }
     let yesterday = utc_date(now.saturating_sub(86_400));
@@ -441,14 +437,41 @@ fn tranche_due(
     if remaining == 0 {
         return false;
     }
-    let dt: DateTime<Utc> = match Utc.timestamp_opt(now as i64, 0).single() {
-        Some(d) => d,
-        None => return false,
-    };
-    if dt.num_seconds_from_midnight() < after_utc_secs {
+    if !past_daily_slot(now, after_utc_secs) {
         return false;
     }
     last_tranche_date != Some(utc_date(now).as_str())
+}
+
+/// The one time gate both daily schedules share: is the UTC day at least
+/// `after_utc_secs` old (so a completed daily candle is published)?
+fn past_daily_slot(now: u64, after_utc_secs: u32) -> bool {
+    match Utc.timestamp_opt(now as i64, 0).single() {
+        Some(dt) => dt.num_seconds_from_midnight() >= after_utc_secs,
+        None => false,
+    }
+}
+
+/// Which legs of a symbol still need an order in the current tranche attempt.
+/// `(need_spot, need_perp)`; a zero perp allocation never needs a perp order.
+fn legs_pending(progress: &LegProgress, perp_allocated: bool) -> (bool, bool) {
+    (!progress.spot_done, perp_allocated && !progress.perp_done)
+}
+
+/// Whether the resting Lighter stop already covers the current book: same
+/// trigger level AND same size. A tranche that grows `perp_size` on a day the
+/// Lighter peak did not move must still re-place the stop, or the new
+/// exposure is unprotected (pairtrade#268 review).
+fn stop_is_current(
+    prev_level: Option<f64>,
+    prev_size: Option<f64>,
+    has_order: bool,
+    level: f64,
+    size: f64,
+) -> bool {
+    has_order
+        && prev_level.is_some_and(|l| (l - level).abs() < 1e-9)
+        && prev_size.is_some_and(|z| (z - size).abs() < 1e-12)
 }
 
 /// Parse the optional tranche count in an ADD file: empty/whitespace → 1,
@@ -537,6 +560,9 @@ struct LegState {
     lighter_peak: f64,
     stop_level: Option<f64>,
     stop_order_id: Option<String>,
+    /// perp_size the resting stop was placed for; re-place when it changes.
+    #[serde(default)]
+    stop_size: Option<f64>,
     /// Date (UTC) of the last completed daily close that was evaluated.
     last_close_date: Option<String>,
     last_close: Option<f64>,
@@ -575,6 +601,18 @@ struct State {
     /// UTC date of the last tranche that ran (one per day).
     #[serde(default)]
     last_tranche_date: Option<String>,
+    /// Per-symbol progress of the tranche attempt currently in flight. A
+    /// failed attempt (halt) resumes from here after RISK_ACK instead of
+    /// re-sending orders for legs that already filled (pairtrade#268 review).
+    /// Empty when no attempt is in flight.
+    #[serde(default)]
+    tranche_progress: BTreeMap<String, LegProgress>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LegProgress {
+    spot_done: bool,
+    perp_done: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -685,7 +723,13 @@ impl Engine {
         let lighter_price = self.quote(&self.lt, symbol).await?.price;
         leg.lighter_peak = leg.lighter_peak.max(lighter_price);
         let level = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
-        if leg.stop_level.is_some_and(|l| (l - level).abs() < 1e-9) && leg.stop_order_id.is_some() {
+        if stop_is_current(
+            leg.stop_level,
+            leg.stop_size,
+            leg.stop_order_id.is_some(),
+            level,
+            leg.perp_size,
+        ) {
             if let Some(l) = self.state.legs.get_mut(symbol) {
                 l.lighter_peak = leg.lighter_peak;
             }
@@ -744,13 +788,15 @@ impl Engine {
             resp.order_id
         };
         log::info!(
-            "[STOP] {symbol} stop-loss resting at {level:.2} (lighter_peak {:.2}, {}%) id={order_id}",
+            "[STOP] {symbol} stop-loss resting at {level:.2} for size {} (lighter_peak {:.2}, {}%) id={order_id}",
+            leg.perp_size,
             leg.lighter_peak,
             self.cfg.stop_dd_pct
         );
         if let Some(l) = self.state.legs.get_mut(symbol) {
             l.lighter_peak = leg.lighter_peak;
             l.stop_level = Some(level);
+            l.stop_size = Some(leg.perp_size);
             l.stop_order_id = Some(order_id);
         }
         self.persist();
@@ -775,6 +821,7 @@ impl Engine {
         if let Some(l) = self.state.legs.get_mut(symbol) {
             l.stop_order_id = None;
             l.stop_level = None;
+            l.stop_size = None;
         }
     }
 
@@ -807,6 +854,7 @@ impl Engine {
         self.state.tranches_remaining = k;
         self.state.tranches_done = 0;
         self.state.last_tranche_date = None;
+        self.state.tranche_progress.clear();
         self.persist();
         self.buy_tranche("ARM").await
     }
@@ -819,20 +867,37 @@ impl Engine {
         let spot_notional = self.state.tranche_spot_usd;
         let perp_notional = self.state.tranche_perp_usd;
         let n_th = self.state.tranches_done + 1;
+        if !self.state.tranche_progress.is_empty() {
+            log::warn!(
+                "[ENTRY] resuming tranche {n_th} after a partial failure; already filled: {:?}",
+                self.state.tranche_progress
+            );
+        }
         for sym in self.cfg.symbols.clone() {
+            let progress = self
+                .state
+                .tranche_progress
+                .get(&sym)
+                .copied()
+                .unwrap_or_default();
+            let (need_spot, need_perp) = legs_pending(&progress, perp_notional > 0.0);
+            if !need_spot && !need_perp {
+                log::info!("[ENTRY] {sym}: tranche {n_th} already filled, skipping");
+                continue;
+            }
             let market = self.cfg.hl_spot_market[&sym].clone();
             // Read-only: safe to bail before any order for this symbol is sent.
             let hq = self.quote(&self.hl, &market).await?;
             let lq = self.quote(&self.lt, &sym).await?;
             let spot_size = size_from_notional(spot_notional, hq.price, hq.size_decimals);
             let perp_size = size_from_notional(perp_notional, lq.price, lq.size_decimals);
-            if spot_size.to_f64().unwrap_or(0.0) < hq.min_order {
+            if need_spot && spot_size.to_f64().unwrap_or(0.0) < hq.min_order {
                 bail!(
                     "{market}: tranche spot size {spot_size} below min_order {} (raise EQUITY_USD or lower ENTRY_TRANCHES)",
                     hq.min_order
                 );
             }
-            if perp_notional > 0.0 && perp_size.to_f64().unwrap_or(0.0) < lq.min_order {
+            if need_perp && perp_size.to_f64().unwrap_or(0.0) < lq.min_order {
                 bail!(
                     "{sym}: tranche perp size {perp_size} below min_order {} (raise EQUITY_USD or lower ENTRY_TRANCHES)",
                     lq.min_order
@@ -857,24 +922,33 @@ impl Engine {
                         lighter_peak: lq.price,
                         stop_level: None,
                         stop_order_id: None,
+                        stop_size: None,
                         last_close_date: None,
                         last_close: None,
                         close_fetch_failures: 0,
                     }
                 }
             };
-            let filled_spot = self
-                .hl_spot_ioc(&market, spot_size, OrderSide::Long)
-                .await
-                .with_context(|| {
-                    format!(
-                        "{sym}: spot {why} tranche {n_th} failed (this tranche took no exposure)"
-                    )
-                })?;
-            let fs = filled_spot.to_f64().unwrap_or(0.0);
-            leg.spot_size += fs;
-            leg.spot_cost_usd += fs * hq.price;
+            let mut fs = 0.0;
+            if need_spot {
+                let filled_spot = self
+                    .hl_spot_ioc(&market, spot_size, OrderSide::Long)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "{sym}: spot {why} tranche {n_th} failed (this leg took no exposure; legs already filled in this attempt are recorded and will be skipped on retry)"
+                        )
+                    })?;
+                fs = filled_spot.to_f64().unwrap_or(0.0);
+                leg.spot_size += fs;
+                leg.spot_cost_usd += fs * hq.price;
+            }
             self.state.legs.insert(sym.clone(), leg.clone());
+            self.state
+                .tranche_progress
+                .entry(sym.clone())
+                .or_default()
+                .spot_done = true;
             // Real exposure now exists: flip to On (only once) so a crash or
             // a later error in this loop never leaves a filled position
             // recorded under Off/Exited, where a stray re-ARM would double it.
@@ -887,13 +961,13 @@ impl Engine {
             }
             self.persist();
             let mut fp = 0.0;
-            if perp_notional > 0.0 {
+            if need_perp {
                 let filled_perp = self
                     .lt_perp_taker(&sym, perp_size, OrderSide::Long, false)
                     .await
                     .with_context(|| {
                         format!(
-                            "{sym}: perp {why} tranche {n_th} failed AFTER spot filled ({fs} @ {:.2}) — the spot part is recorded in state, do not re-ARM without checking it",
+                            "{sym}: perp {why} tranche {n_th} failed AFTER spot filled ({fs} @ {:.2}) — the spot part is recorded and will be skipped on retry; only this perp leg is re-sent",
                             hq.price
                         )
                     })?;
@@ -901,8 +975,13 @@ impl Engine {
                 leg.perp_size += fp;
                 leg.perp_cost_usd += fp * lq.price;
                 self.state.legs.insert(sym.clone(), leg.clone());
-                self.persist();
             }
+            self.state
+                .tranche_progress
+                .entry(sym.clone())
+                .or_default()
+                .perp_done = true;
+            self.persist();
             log::info!(
                 "[ENTRY] {sym} {why} tranche {n_th}/{}: +spot {} @ {:.2} +perp {} @ {:.2}; book spot {} (${:.0}) perp {} (${:.0}); peak={:.2} exit_level={:.2}",
                 self.state.tranches_done + self.state.tranches_remaining,
@@ -913,6 +992,7 @@ impl Engine {
                 log::error!("[STOP] stop (re)placement for {sym} failed: {e:?}");
             }
         }
+        self.state.tranche_progress.clear();
         self.state.tranches_done += 1;
         self.state.tranches_remaining = self.state.tranches_remaining.saturating_sub(1);
         self.state.last_tranche_date = Some(utc_date(now_secs()));
@@ -1070,6 +1150,7 @@ impl Engine {
             );
             self.state.tranches_remaining = 0;
         }
+        self.state.tranche_progress.clear();
         if any_leg_still_open {
             log::error!(
                 "[EXIT] one or more legs failed to close — staying in mode=On (NOT marking Exited) until the operator resolves it via RISK_ACK"
@@ -1616,6 +1697,44 @@ mod tests {
                                                               // A gap of several days just runs the next one (no clumping is by
                                                               // construction: one call per day).
         assert!(tranche_due(t, 2, Some("2026-08-30"), 300));
+    }
+
+    #[test]
+    fn stop_replaced_when_size_grows_even_if_level_unchanged() {
+        // Same level, same size, order resting -> current.
+        assert!(stop_is_current(Some(70.0), Some(1.0), true, 70.0, 1.0));
+        // Same level but perp_size grew by a tranche -> must re-place.
+        assert!(!stop_is_current(Some(70.0), Some(1.0), true, 70.0, 1.5));
+        // Level moved -> re-place.
+        assert!(!stop_is_current(Some(70.0), Some(1.0), true, 75.0, 1.0));
+        // No resting order -> place.
+        assert!(!stop_is_current(Some(70.0), Some(1.0), false, 70.0, 1.0));
+        // Legacy state without stop_size -> re-place once.
+        assert!(!stop_is_current(Some(70.0), None, true, 70.0, 1.0));
+    }
+
+    #[test]
+    fn tranche_retry_skips_filled_legs() {
+        let fresh = LegProgress::default();
+        assert_eq!(legs_pending(&fresh, true), (true, true));
+        assert_eq!(legs_pending(&fresh, false), (true, false));
+        let spot_only = LegProgress {
+            spot_done: true,
+            perp_done: false,
+        };
+        assert_eq!(legs_pending(&spot_only, true), (false, true));
+        let both = LegProgress {
+            spot_done: true,
+            perp_done: true,
+        };
+        assert_eq!(legs_pending(&both, true), (false, false));
+        // A resumed tranche keeps the counters untouched until it completes:
+        // tranche_due must still fire the same day for the retry.
+        let t = Utc
+            .with_ymd_and_hms(2026, 9, 5, 0, 6, 0)
+            .unwrap()
+            .timestamp() as u64;
+        assert!(tranche_due(t, 3, Some("2026-09-04"), 300));
     }
 
     #[test]
