@@ -76,6 +76,22 @@
 //!   position directly rather than trusting this process's state file.
 //! - No SIGTERM-graceful-close handling: `systemctl stop` does not
 //!   reduce-only-close an open position.
+//! - `capture_t0_if_due` locks in `day.t0_prices` on the *first* tick at
+//!   or after `t0`, complete or not, and (deliberately, see
+//!   `capture_t0_if_due_never_overwrites_an_existing_snapshot`) never
+//!   recaptures within the same process run. `RiskState.t0_prices`
+//!   recovery (bot-strategy#872 PR #266/#270, the 2026-09-04
+//!   silent-signal-loss fix) only helps a *second* same-day restart --
+//!   the very first restart between `t0` and `t1` of the day can still
+//!   land its first tick on an incomplete `latest_price` (missing
+//!   `kr_primary`/`us_primary`, e.g. right after a WS reconnect) with
+//!   nothing yet persisted to recover. That case now logs a clear
+//!   `[DAY] ... but is missing kr_primary=.../us_primary=... prices`
+//!   `WARN` instead of failing silently, but does not by itself recover
+//!   the day -- an operator who sees that WARN should manually restart
+//!   again (now that an incomplete snapshot is never persisted, a second
+//!   attempt gets a fresh, hopefully-complete capture instead of
+//!   re-trusting the bad one) rather than assume the gap fixes itself.
 //!
 //! DRY_RUN must stay on until a human explicitly flips the `refuse_live`
 //! gate below (mirrors `robinhood_dipgrid.rs`'s pattern: flipping
