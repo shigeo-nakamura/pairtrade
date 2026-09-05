@@ -884,6 +884,15 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         )
     if int(raw["top_levels"]) < 5:
         raise ValueError("top_levels must be at least 5")
+    for key, default in (
+        ("book_resubscribe_after_ms", 10_000),
+        ("book_stall_after_ms", 60_000),
+        ("book_watchdog_batch", 5),
+    ):
+        # Optional keys, but a typo must not silently disable the watchdog
+        # (batch <= 0) or turn it into a subscribe storm (after_ms <= 0).
+        if int(raw.get(key, default)) <= 0:
+            raise ValueError(f"{key} must be positive")
     host, port_text = raw["metrics_listen"].rsplit(":", 1)
     return AppConfig(
         raw=raw,

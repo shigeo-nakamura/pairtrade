@@ -1157,6 +1157,26 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_non_positive_watchdog_settings_are_rejected(self) -> None:
+        # bot-strategy#908 / Codex: a zero or negative watchdog setting must
+        # fail config loading, not silently disable recovery or storm subscribes.
+        base = json.loads(CONFIG_PATH.read_text())
+        for key in ("book_resubscribe_after_ms", "book_stall_after_ms", "book_watchdog_batch"):
+            for bad in (0, -1):
+                raw = dict(base)
+                raw[key] = bad
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "phase0.json"
+                    path.write_text(json.dumps(raw))
+                    with self.assertRaisesRegex(ValueError, f"{key} must be positive"):
+                        engine_b.load_config(path, LOCK_PATH)
+
+    def test_watchdog_settings_default_when_absent(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        self.assertEqual(config.book_resubscribe_after_ms, 10_000)
+        self.assertEqual(config.book_stall_after_ms, 60_000)
+        self.assertEqual(config.book_watchdog_batch, 5)
+
     def test_config_lighter_venue_has_no_missing_symbols(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         lighter = next(venue for venue in config.venues if venue.name == "lighter")
