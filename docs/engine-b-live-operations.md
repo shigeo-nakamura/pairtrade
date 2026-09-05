@@ -69,9 +69,13 @@ GAPS section -- do not duplicate that list here; read it there.
   account unreadable at the end of the window (even if an earlier read was
   flat -- a fill update can land after a flat reading) → `Han Bridge ENTRY
   UNCONFIRMED`, day marked acted, no position tracked: check the exchange
-  manually before the exit window. Partial exits shrink only the tracked
-  *open* size; PnL and the drawdown halt are booked on the size confirmed
-  at entry. **At most one entry `sendTx` per session day** --
+  manually before the exit window. Partial exits: each observed reduction is booked as realized at the WS
+  mid of the attempt that closed it, and the final flat books only the
+  last remainder, so the drawdown halt sees the aggregate. While an entry
+  is `UNCONFIRMED`, `status.json` publishes `positions_ready=false` and
+  `han_bridge.position_unconfirmed=true` until the day rolls. The pre-send
+  marker write is checked: if `risk_state.json` cannot be written the
+  order is not sent that tick. **At most one entry `sendTx` per session day** --
   `risk_state.json`'s `last_session_date` is written *before* the send
   (so a crash/restart mid-confirmation cannot re-submit; after such a
   restart, check the exchange for a position this process no longer

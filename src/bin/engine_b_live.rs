@@ -520,17 +520,30 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) {
 /// write and the S3 mirror `put_async` call, instead of serializing twice
 /// per tick (bot-strategy#866 PR #255 review round 2, nit 4).
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) {
-    let Some(dir) = path.parent() else { return };
+    if let Err(e) = atomic_write_bytes_checked(path, bytes) {
+        log::warn!("[STATE] write failed for {}: {e}", path.display());
+    }
+}
+
+/// Same tmp+rename write, but reports failure to the caller. Used where a
+/// durable write is a precondition for acting (the pre-send entry marker,
+/// pairtrade#275 Codex review) rather than best-effort bookkeeping.
+fn atomic_write_bytes_checked(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent dir"))?;
     let tmp = dir.join(format!(
         ".{}.tmp.{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id()
     ));
-    if std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    } else {
-        log::warn!("[STATE] write failed for {}", path.display());
-    }
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn atomic_write_json_checked(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
+    atomic_write_bytes_checked(path, json.as_bytes())
 }
 
 fn append_pnl_log(path: &Path, record: &serde_json::Value) {
@@ -563,6 +576,11 @@ struct OpenPosition {
     /// Quantity the exchange still reports open; shrinks across partial
     /// exit retries and is what the next reduce-only is sized from.
     open_size: f64,
+    /// PnL already realized by partial reductions observed before the
+    /// final flat, each booked at the WS mid of the attempt that closed
+    /// it (pairtrade#275 Codex review): `on_exit` adds only the last
+    /// open remainder at the final price.
+    realized_partial_pnl: f64,
     entered_at_us: i64,
 }
 
@@ -676,6 +694,12 @@ struct DaySnapshot {
     /// the one entry opportunity for the day on a single hiccup
     /// (bot-strategy#872 PR #266 self-review, non-blocking finding).
     eligibility_confirmed: bool,
+    /// Set when a sendTx went out (or errored ambiguously) and the exchange
+    /// position could not be read for the whole confirm window: a live
+    /// position may exist that this process does not track. Drives
+    /// `positions_ready = false` in the dashboard status until the day
+    /// rolls (pairtrade#275 Codex review).
+    position_unconfirmed: bool,
     /// One entry per ineligible symbol found (`kr_primary`/`us_primary`,
     /// either or both) -- kept as a `Vec` rather than the first-match-wins
     /// `Option<String>` this started as, so a same-day gate on an
@@ -939,6 +963,9 @@ struct HanBridgeStatus {
     us_primary_symbol: String,
     day_entered: bool,
     day_exited: bool,
+    /// True while today's entry sendTx has an unknown outcome (see
+    /// `DaySnapshot.position_unconfirmed`); `positions_ready` is false too.
+    position_unconfirmed: bool,
     ineligible_reasons: Vec<String>,
     session_halt_reason: Option<String>,
 }
@@ -1269,6 +1296,7 @@ impl EngineBLiveEngine {
                                 self.cfg.fill_confirm_timeout_secs, after_send_error
                             ),
                         );
+                        self.day.position_unconfirmed = true;
                         self.record_no_position_today();
                     }
                     Err(_) => {
@@ -1309,12 +1337,14 @@ impl EngineBLiveEngine {
                                         remaining.size,
                                         self.cfg.fill_confirm_timeout_secs
                                     );
-                                    if let Some(p) = self.position.as_mut() {
-                                        // Only the open remainder shrinks; `size`
-                                        // (what we entered with) is what on_exit
-                                        // books PnL and drawdown on.
-                                        p.open_size = remaining.size;
-                                    }
+                                    // Book whatever this attempt closed at
+                                    // this attempt's price; only the open
+                                    // remainder carries to the next tick.
+                                    self.book_partial_close(
+                                        remaining.size,
+                                        exit_price,
+                                        "reduce-only partially filled",
+                                    );
                                 } else {
                                     self.pending = Some(PendingConfirm::Exit {
                                         exit_price,
@@ -1393,12 +1423,44 @@ impl EngineBLiveEngine {
                 entry_price_estimated,
                 size: filled.size,
                 open_size: filled.size,
+                realized_partial_pnl: 0.0,
                 entered_at_us: now_us,
             },
             epsilon,
             notional_usd,
             &format!("{note} confirmed_by=exchange_position"),
         );
+    }
+
+    /// The exchange reports a smaller open quantity than we track: book the
+    /// difference as realized at `price` (the WS mid of the attempt that
+    /// closed it) and shrink `open_size`. A *larger* quantity is not a
+    /// close; it is only recorded (an external add or an over-report the
+    /// cap handles at the next send).
+    fn book_partial_close(&mut self, new_open_size: f64, price: f64, context: &str) {
+        let Some(p) = self.position.as_mut() else {
+            return;
+        };
+        let closed = p.open_size - new_open_size;
+        if closed > 1e-12 {
+            let sign = match p.side {
+                OrderSide::Long => 1.0,
+                OrderSide::Short => -1.0,
+            };
+            let pnl = sign * (price - p.entry_price) * closed;
+            p.realized_partial_pnl += pnl;
+            log::warn!(
+                "[EXIT] partial close ({context}): closed={closed:.6} at {price:.4} pnl=${pnl:.2} \
+                 remaining_open={new_open_size:.6} realized_so_far=${:.2}",
+                p.realized_partial_pnl
+            );
+        } else if new_open_size > p.open_size + 1e-12 {
+            log::warn!(
+                "[EXIT] exchange open size grew ({context}): tracked {:.6} -> exchange {new_open_size:.6}",
+                p.open_size
+            );
+        }
+        p.open_size = new_open_size;
     }
 
     /// If the exchange holds the opposite side of what we track, record the
@@ -1685,6 +1747,7 @@ impl EngineBLiveEngine {
                                 entry_price_estimated,
                                 size: existing.size,
                                 open_size: existing.size,
+                                realized_partial_pnl: 0.0,
                                 entered_at_us: now_us,
                             },
                             epsilon,
@@ -1732,7 +1795,16 @@ impl EngineBLiveEngine {
         // not persisted (KNOWN GAPS): after such a restart the operator
         // checks the exchange, which is the documented recovery.
         self.state.last_session_date = self.current_date.map(|d| d.to_string());
-        atomic_write_json(&self.cfg.state_path, &self.state);
+        if let Err(e) = atomic_write_json_checked(&self.cfg.state_path, &self.state) {
+            // No durable marker, no order: sending now would make the
+            // at-most-one guarantee depend on this process surviving.
+            // Nothing was sent, so the next tick may simply try again.
+            log::error!(
+                "[ENTRY] cannot persist the entry-attempt marker to {} ({e}); NOT sending this tick",
+                self.cfg.state_path.display()
+            );
+            return;
+        }
         let submit = self.submit_order(side, size, false).await;
         // Fresh clock: `now_us` is the tick's start time and the
         // eligibility fetch / position read / sendTx above can take
@@ -1748,6 +1820,7 @@ impl EngineBLiveEngine {
                         entry_price_estimated: false,
                         size: requested.to_f64().unwrap_or(size),
                         open_size: requested.to_f64().unwrap_or(size),
+                        realized_partial_pnl: 0.0,
                         entered_at_us: sent_at_us,
                     },
                     epsilon,
@@ -1838,16 +1911,13 @@ impl EngineBLiveEngine {
                                 pos.open_size
                             );
                         } else if (live.size - pos.open_size).abs() > 1e-9 {
-                            log::warn!(
-                                "[EXIT] exchange open size={:.6} differs from tracked {:.6}; sizing the \
-                                 reduce-only to the exchange (PnL stays on the entry size {:.6})",
+                            // Reduced (or grown) outside our own attempts:
+                            // book the reduction at the current mid.
+                            self.book_partial_close(
                                 live.size,
-                                pos.open_size,
-                                pos.size
+                                price,
+                                "exchange open size differs from tracked before exit",
                             );
-                            if let Some(p) = self.position.as_mut() {
-                                p.open_size = live.size;
-                            }
                         }
                         (opposite(live.side), size)
                     }
@@ -1903,15 +1973,19 @@ impl EngineBLiveEngine {
             OrderSide::Long => 1.0,
             OrderSide::Short => -1.0,
         };
-        let pnl = sign * (exit_price - pos.entry_price) * pos.size;
+        // Final remainder at the final price, plus what earlier partial
+        // reductions already realized at their own prices.
+        let pnl = pos.realized_partial_pnl + sign * (exit_price - pos.entry_price) * pos.open_size;
         log::info!(
-            "[EXIT] side={} entry={:.4} exit={:.4} size={:.6} pnl=${:.2} held={}s entry_price_estimated={} \
-             (exit price is the WS mid, not the fill)",
+            "[EXIT] side={} entry={:.4} exit={:.4} size={:.6} final_open={:.6} pnl=${:.2} \
+             (partials=${:.2}) held={}s entry_price_estimated={} (exit price is the WS mid, not the fill)",
             pos.side,
             pos.entry_price,
             exit_price,
             pos.size,
+            pos.open_size,
             pnl,
+            pos.realized_partial_pnl,
             (now_us - pos.entered_at_us) / 1_000_000,
             pos.entry_price_estimated
         );
@@ -2063,6 +2137,7 @@ impl EngineBLiveEngine {
             us_primary_symbol: self.cfg.us_primary_symbol.clone(),
             day_entered: extra.day_entered,
             day_exited: extra.day_exited,
+            position_unconfirmed: self.day.position_unconfirmed,
             ineligible_reasons: extra.eligibility_ineligible_reasons.clone(),
             session_halt_reason: extra.session_halt_reason.clone(),
         };
@@ -2081,7 +2156,7 @@ impl EngineBLiveEngine {
                 // persisted, see KNOWN GAPS), so debot-dashboard's
                 // "positions_ready !== false means trustworthy" read must
                 // not be told otherwise.
-                positions_ready: !self.day.restart_recovered,
+                positions_ready: !(self.day.restart_recovered || self.day.position_unconfirmed),
                 positions,
                 pnl_total: self.state.realized_pnl_session,
                 pnl_today: self.state.pnl_today,
@@ -2748,6 +2823,7 @@ mod tests {
                 us_primary_symbol: "SNDK".to_string(),
                 day_entered: false,
                 day_exited: false,
+                position_unconfirmed: false,
                 ineligible_reasons: Vec::new(),
                 session_halt_reason: None,
             },
