@@ -1172,18 +1172,21 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             "started_us": 1_774_884_000_000_000,
             "api_schema_version": config.api_schema_version,
         }
-        with self.assertRaisesRegex(RuntimeError, "without exchange timestamp"):
-            await collector.handle_trades(
-                venue,
-                connection,
-                {
-                    "type": "subscribed/trade",
-                    "channel": "trade/216",
-                    "trades": [{"price": "101", "size": "2"}],
-                },
-                1_774_884_082_400_000,
-            )
-        self.assertEqual(sink.commands, [])
+        await collector.handle_trades(
+            venue,
+            connection,
+            {
+                "type": "subscribed/trade",
+                "channel": "trade/216",
+                "trades": [{"price": "101", "size": "2"}],
+            },
+            1_774_884_082_400_000,
+        )
+        self.assertEqual([kind for kind, _ in sink.commands], ["gap"])
+        gap = sink.commands[0][1]
+        self.assertEqual(gap["channel"], "trade")
+        self.assertEqual(gap["reason"], "missing_timestamp")
+        self.assertEqual(gap["market_id"], 216)
 
     async def test_incremental_trade_without_exchange_timestamp_fails_closed(
         self,
@@ -1198,69 +1201,134 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
             "started_us": 1_774_884_000_000_000,
             "api_schema_version": config.api_schema_version,
         }
-        with self.assertRaisesRegex(RuntimeError, "without exchange timestamp"):
-            await collector.handle_trades(
-                venue,
-                connection,
-                {
-                    "type": "update/trade",
-                    "channel": "trade/216",
-                    "nonce": 9001,
-                    "trades": [
-                        {
-                            "trade_id": "explicit-id-without-time",
-                            "price": "101",
-                            "size": "2",
-                        }
-                    ],
-                },
-                1_774_884_082_400_000,
-            )
-        self.assertEqual(sink.commands, [])
+        await collector.handle_trades(
+            venue,
+            connection,
+            {
+                "type": "update/trade",
+                "channel": "trade/216",
+                "nonce": 9001,
+                "trades": [
+                    {
+                        "trade_id": "explicit-id-without-time",
+                        "price": "101",
+                        "size": "2",
+                    }
+                ],
+            },
+            1_774_884_082_400_000,
+        )
+        self.assertEqual([kind for kind, _ in sink.commands], ["gap"])
+        self.assertEqual(sink.commands[0][1]["reason"], "missing_timestamp")
 
-    async def test_out_of_range_exchange_timestamp_fails_closed(self) -> None:
+    async def test_out_of_range_exchange_timestamp_rejects_trade_not_connection(
+        self,
+    ) -> None:
+        # bot-strategy#908: a thin market's subscribed/trade snapshot carries
+        # its last fills, which on a weekend restart were 8 and 19 days old.
+        # Raising here tore the venue feed down on every reconnect; the stale
+        # row alone must be dropped (point gap + counter) and the fresh
+        # sibling in the same message kept.
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         venue = next(item for item in config.venues if item.name == "lighter")
         recv_us = 1_774_884_082_400_000
-        for timestamp in (1_774_884_082, 10**30):
+        stale_us = recv_us - engine_b.MAX_TRADE_EVENT_AGE_US - 1
+        future_us = recv_us + engine_b.MAX_TRADE_EVENT_FUTURE_US + 1
+        for timestamp in (1_774_884_082, 10**30, stale_us, future_us):
             with self.subTest(timestamp=timestamp):
                 sink = RecordingSink()
-                collector = engine_b.Collector(config, sink, engine_b.Metrics())
+                metrics = engine_b.Metrics()
+                collector = engine_b.Collector(config, sink, metrics)
                 connection = {
                     "id": f"out-of-range-{timestamp}",
                     "venue": venue.name,
                     "started_us": recv_us,
                     "api_schema_version": config.api_schema_version,
                 }
-                with self.assertRaisesRegex(
-                    RuntimeError, "out-of-range exchange timestamp"
-                ):
-                    await collector.handle_trades(
-                        venue,
-                        connection,
-                        {
-                            "type": "subscribed/trade",
-                            "channel": "trade/216",
-                            "trades": [
-                                {
-                                    "trade_id": "invalid-time",
-                                    "timestamp": timestamp,
-                                    "price": "101",
-                                    "size": "2",
-                                }
-                            ],
-                        },
-                        recv_us,
-                    )
-                self.assertEqual(sink.commands, [])
+                await collector.handle_trades(
+                    venue,
+                    connection,
+                    {
+                        "type": "subscribed/trade",
+                        "channel": "trade/216",
+                        "trades": [
+                            {
+                                "trade_id": "invalid-time",
+                                "timestamp": timestamp,
+                                "price": "101",
+                                "size": "2",
+                            },
+                            {
+                                "trade_id": "fresh-sibling",
+                                "timestamp": recv_us - 1_000_000,
+                                "price": "102",
+                                "size": "3",
+                            },
+                        ],
+                    },
+                    recv_us,
+                )
+                kinds = [kind for kind, _ in sink.commands]
+                self.assertEqual(kinds, ["gap", "trade"])
+                gap = sink.commands[0][1]
+                self.assertEqual(gap["channel"], "trade")
+                self.assertEqual(gap["reason"], "out_of_range_timestamp")
+                self.assertEqual(gap["start_us"], gap["end_us"])
+                self.assertEqual(gap["partition_us"], recv_us)
+                self.assertEqual(gap["market_id"], 216)
+                kept = sink.commands[1][1]
+                self.assertEqual(kept["trade_id"], "fresh-sibling")
+                self.assertEqual(kept["price"], "102")
+                self.assertIn(
+                    'engine_b_phase0_trade_rejected_total{reason="out_of_range_timestamp",symbol="SKHY",venue="lighter"} 1',
+                    metrics.render(queue_size=0),
+                )
 
-    async def test_non_positive_trade_values_fail_closed_before_enqueue(self) -> None:
+    async def test_boundary_exchange_timestamps_are_accepted(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         venue = next(item for item in config.venues if item.name == "lighter")
         recv_us = 1_774_884_082_400_000
-        for invalid_trade in (
-            {"trade_id": "zero-price", "price": "0", "size": "2"},
-            {"trade_id": "negative-size", "price": "101", "size": "-1"},
+        for timestamp in (
+            recv_us - engine_b.MAX_TRADE_EVENT_AGE_US,
+            recv_us + engine_b.MAX_TRADE_EVENT_FUTURE_US,
+        ):
+            with self.subTest(timestamp=timestamp):
+                sink = RecordingSink()
+                collector = engine_b.Collector(config, sink, engine_b.Metrics())
+                connection = {
+                    "id": f"boundary-{timestamp}",
+                    "venue": venue.name,
+                    "started_us": recv_us,
+                    "api_schema_version": config.api_schema_version,
+                }
+                await collector.handle_trades(
+                    venue,
+                    connection,
+                    {
+                        "type": "subscribed/trade",
+                        "channel": "trade/216",
+                        "trades": [
+                            {
+                                "trade_id": "boundary",
+                                "timestamp": timestamp,
+                                "price": "101",
+                                "size": "2",
+                            }
+                        ],
+                    },
+                    recv_us,
+                )
+                self.assertEqual([kind for kind, _ in sink.commands], ["trade"])
+
+    async def test_non_positive_trade_values_reject_trade_not_connection(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "lighter")
+        recv_us = 1_774_884_082_400_000
+        for invalid_trade, reason in (
+            ({"trade_id": "zero-price", "price": "0", "size": "2"}, "non_positive_price"),
+            ({"trade_id": "negative-size", "price": "101", "size": "-1"}, "non_positive_size"),
+            ({"trade_id": "no-price", "size": "2"}, "malformed_price_or_size"),
+            ({"trade_id": "nan-size", "price": "101", "size": "abc"}, "malformed_price_or_size"),
         ):
             with self.subTest(trade_id=invalid_trade["trade_id"]):
                 sink = RecordingSink()
@@ -1277,21 +1345,24 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                     "price": "101",
                     "size": "2",
                 }
-                with self.assertRaisesRegex(RuntimeError, "non-positive"):
-                    await collector.handle_trades(
-                        venue,
-                        connection,
-                        {
-                            "type": "subscribed/trade",
-                            "channel": "trade/216",
-                            "trades": [
-                                valid_trade,
-                                {**invalid_trade, "timestamp": recv_us},
-                            ],
-                        },
-                        recv_us,
-                    )
-                self.assertEqual(sink.commands, [])
+                await collector.handle_trades(
+                    venue,
+                    connection,
+                    {
+                        "type": "subscribed/trade",
+                        "channel": "trade/216",
+                        "trades": [
+                            valid_trade,
+                            {**invalid_trade, "timestamp": recv_us},
+                        ],
+                    },
+                    recv_us,
+                )
+                kinds = [kind for kind, _ in sink.commands]
+                self.assertEqual(kinds, ["gap", "trade"])
+                self.assertEqual(sink.commands[0][1]["reason"], reason)
+                self.assertEqual(sink.commands[0][1]["channel"], "trade")
+                self.assertEqual(sink.commands[1][1]["trade_id"], "valid-before-invalid")
 
     async def test_sealed_same_batch_update_snapshot_uses_pending_alias(
         self,

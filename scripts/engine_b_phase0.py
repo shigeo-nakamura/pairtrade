@@ -389,18 +389,12 @@ def normalize_exchange_timestamp_us(value: Any) -> int | None:
     return raw
 
 
-def validate_trade_timestamp_us(timestamp_us: int | None, recv_us: int) -> None:
-    if timestamp_us is None:
-        return
-    if not (
+def trade_timestamp_in_range(timestamp_us: int, recv_us: int) -> bool:
+    return (
         recv_us - MAX_TRADE_EVENT_AGE_US
         <= timestamp_us
         <= recv_us + MAX_TRADE_EVENT_FUTURE_US
-    ):
-        raise RuntimeError(
-            "refusing trade with out-of-range exchange timestamp "
-            f"timestamp_us={timestamp_us} recv_us={recv_us}"
-        )
+    )
 
 
 def canonical_decimal(value: Any) -> str:
@@ -3283,6 +3277,7 @@ class Collector:
         # back to the message clock they drive.
         self._clock = now_us
         self.market_stats_rejections: defaultdict[tuple[str, int], int] = defaultdict(int)
+        self.trade_rejections: defaultdict[tuple[str, int], int] = defaultdict(int)
         self.local_sequences: defaultdict[tuple[str, str, int], int] = defaultdict(int)
         self.last_health_error: str | None = None
         self.trading_calendar = (
@@ -3952,6 +3947,48 @@ class Collector:
             )
         self.metrics.inc("engine_b_phase0_book_message_total", {"venue": venue.name, "symbol": market.symbol})
 
+    async def reject_trade(
+        self,
+        venue: VenueConfig,
+        market: MarketConfig,
+        recv_us: int,
+        reason: str,
+        detail: str = "",
+    ) -> None:
+        key = (venue.name, market.market_id)
+        self.trade_rejections[key] += 1
+        count = self.trade_rejections[key]
+        if count == 1 or count % 100 == 0:
+            LOG.warning(
+                "rejecting trade venue=%s symbol=%s reason=%s %s (rejections so far: %d)",
+                venue.name,
+                market.symbol,
+                reason,
+                detail,
+                count,
+            )
+        self.metrics.inc(
+            "engine_b_phase0_trade_rejected_total",
+            {"venue": venue.name, "symbol": market.symbol, "reason": reason},
+        )
+        await self.sink.put(
+            "gap",
+            {
+                "recv_us": recv_us,
+                "start_us": recv_us,
+                "end_us": recv_us,
+                "partition_us": recv_us,
+                "connection_id": None,
+                "venue": venue.name,
+                "market_id": market.market_id,
+                "symbol": market.symbol,
+                "channel": "trade",
+                "expected_sequence": None,
+                "observed_sequence": None,
+                "reason": reason,
+            },
+        )
+
     async def handle_trades(
         self,
         venue: VenueConfig,
@@ -3974,30 +4011,58 @@ class Collector:
             raise RuntimeError(
                 "refusing ID-less incremental trade message without exchange nonce"
             )
-        normalized_trades = [
-            (
-                trade,
-                normalize_exchange_timestamp_us(
-                    (
-                        trade.get("timestamp")
-                        if trade.get("timestamp") is not None
-                        else message.get("timestamp")
-                    )
-                ),
+        # Fail closed on the *trade*, not on the connection (same rule as
+        # market_stats, bot-strategy#908 item 1): raising here tore the whole
+        # venue feed down and looped through reconnects, each one re-sending
+        # the offending row. The subscribed/trade snapshot of a thin market
+        # legitimately carries its last fills, which can be older than
+        # MAX_TRADE_EVENT_AGE_US (2026-09-05 weekend restart: 8- and 19-day-old
+        # fills), and such rows would land in a sealed partition -- so each
+        # implausible trade is dropped on its own, counted in
+        # engine_b_phase0_trade_rejected_total and recorded as a point gap on
+        # the trade channel, while the plausible rows of the same message are
+        # kept. A missing exchange timestamp or a non-positive / malformed
+        # price or size is handled the same way.
+        parsed_trades: list[tuple[dict[str, Any], int, str, str]] = []
+        for trade in trades:
+            srv_us = normalize_exchange_timestamp_us(
+                trade.get("timestamp")
+                if trade.get("timestamp") is not None
+                else message.get("timestamp")
             )
-            for trade in trades
-        ]
-        for _, srv_us in normalized_trades:
-            validate_trade_timestamp_us(srv_us, recv_us)
-        if any(srv_us is None for _, srv_us in normalized_trades):
-            raise RuntimeError("refusing trade message without exchange timestamp")
-        parsed_trades: list[tuple[dict[str, Any], int | None, str, str]] = []
-        for trade, srv_us in normalized_trades:
-            price_text = canonical_decimal(trade["price"])
-            size_text = canonical_decimal(trade["size"])
-            if Decimal(price_text) <= 0 or Decimal(size_text) <= 0:
-                raise RuntimeError("refusing trade with non-positive price or size")
+            if srv_us is None:
+                await self.reject_trade(venue, market, recv_us, "missing_timestamp")
+                continue
+            if not trade_timestamp_in_range(srv_us, recv_us):
+                await self.reject_trade(
+                    venue,
+                    market,
+                    recv_us,
+                    "out_of_range_timestamp",
+                    f"timestamp_us={srv_us} recv_us={recv_us}",
+                )
+                continue
+            try:
+                price_text = canonical_decimal(trade.get("price"))
+                size_text = canonical_decimal(trade.get("size"))
+            except ValueError as exc:
+                await self.reject_trade(
+                    venue, market, recv_us, "malformed_price_or_size", str(exc)
+                )
+                continue
+            if Decimal(price_text) <= 0:
+                await self.reject_trade(
+                    venue, market, recv_us, "non_positive_price", f"price={price_text}"
+                )
+                continue
+            if Decimal(size_text) <= 0:
+                await self.reject_trade(
+                    venue, market, recv_us, "non_positive_size", f"size={size_text}"
+                )
+                continue
             parsed_trades.append((trade, srv_us, price_text, size_text))
+        if not parsed_trades:
+            return
         message_scope = trade_message_scope(
             message_type, exchange_sequence, recv_us
         )

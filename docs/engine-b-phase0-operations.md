@@ -306,7 +306,17 @@ Per-market book watchdog (bot-strategy#908): the collector no longer tears
 the venue connection down when one market's `market_stats` carries a
 non-positive price -- that message is skipped, counted in
 `engine_b_phase0_market_stats_rejected_total{field=...}` and recorded as a
-point `data_gap` on the `market_stats` channel. A market still unsynced
+point `data_gap` on the `market_stats` channel. The same rule applies to
+an individual trade whose exchange timestamp is missing or implausible
+(older than 7 days or more than 5 minutes ahead of receipt -- a thin
+market's `subscribed/trade` snapshot carries its last fills, which on a
+weekend restart were 8 and 19 days old) or whose price / size is
+non-positive or malformed: that row alone is dropped, counted in
+`engine_b_phase0_trade_rejected_total{reason=...}` (`missing_timestamp`,
+`out_of_range_timestamp`, `non_positive_price`, `non_positive_size`,
+`malformed_price_or_size`) and recorded as a point `data_gap` on the
+`trade` channel, while the other trades of the same message are kept.
+A market still unsynced
 `book_resubscribe_after_ms` (default 10 s) after its last subscribe gets
 its `order_book` channel re-subscribed
 (`engine_b_phase0_book_resubscribe_total{reason="unsynced"}`), and a
