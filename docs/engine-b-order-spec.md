@@ -1,7 +1,8 @@
 # Engine B order-path specification (A-3 / A-8 / A-9)
 
 Resolution record for bot-strategy#875 (requirements doc
-`engine_b_requirements_0.3.md` §3 items A-3, A-8, A-9 and §10 TBD-6/7).
+`engine_b_requirements_0.3.md` -- an attachment on bot-strategy#866, not a
+file in any repo -- §3 items A-3, A-8, A-9 and §10 TBD-6/7).
 All three are pure technical-correctness items the 2026-09-02 pivot
 (bot-strategy#866, "方針転換の記録") explicitly kept in scope for the
 live-smoke track, so this document is written against **what
@@ -168,7 +169,9 @@ tier). Design against 60 req/min.
   on disk so every Lighter process on the host fails fast with
   `DexError::RateLimited` instead of refreshing the WAF window). This is
   the mechanism that actually protects a Standard account once a burst
-  has happened.
+  has happened. Tunables and file locations are documented once, in
+  dex-connector's `README_LIGHTER.md` ("Rate Limit / WAF 対策の環境変数");
+  this document deliberately does not repeat them.
 - **Observability**: `[API_TRACKER] #N <METHOD> <endpoint> | Recent calls
   (60s): k | Rate: k/min` on every REST call, with an extra warning line
   above 45 calls / 60 s.
@@ -201,7 +204,7 @@ Per-boundary REST cost of the order path, worst case:
 | step | REST calls | weight | note |
 |---|---|---|---|
 | eligibility gate (`fetch_order_book_details`) | 1 | 300 | raw `reqwest`, **bypasses the sidecar budget**; once per entry window |
-| `get_ticker` inside `create_order(price=None)` | 0–1 | 300 | served from the WS price cache when < 30 s old; REST `orderBook` fallback only if stale |
+| `get_ticker` inside `create_order(price=None)` | 0–1 | **600** | served from the WS price cache when < 30 s old; REST fallback is `recentTrades` (weight 600, the heaviest endpoint on this path) and only fires if the WS price is stale -- i.e. exactly when the WS is already unhealthy, so a retry loop here is the one place this binary could burn budget |
 | `nextNonce` | 0–1 | 6 | cached with TTL; refetched after any `sendTx` failure |
 | `sendTx` (entry) | 1 | 6 | |
 | exit: same as entry minus the eligibility gate | 1–3 | | |
@@ -334,17 +337,18 @@ below.
 | id | gap | where | impact at `$100` / SNDK | recommendation |
 |---|---|---|---|---|
 | G-1 | `set_leverage` is a **no-op** on the Lighter connector (`dex_impl.rs`: logs at debug, returns `Ok`). `ENGINE_B_LIVE_LEVERAGE=2` only feeds the notional cap (`equity × leverage × 0.9`); the exchange applies its per-market default margin (SNDK `default_initial_margin_fraction=666`, `maintenance=300`, raw units — interpret under A-5 / #877). | entry | none: $100 notional on ~$1,000 equity is far below any margin bound | document; do not read `leverage=2` as an exchange setting |
-| G-2 | **Fill is assumed on HTTP 200.** `OpenPosition.size` = requested size, `entry_price` = last WS mid. If the IOC fills partially or not at all, the engine holds a phantom position, logs a fictitious PnL, and sends a reduce-only exit sized to a position that may not exist. | entry → exit | real for the smoke test — it is exactly the class of bug the test is meant to surface | before `CONFIRM_LIVE`: after `submit_order` succeeds, wait for `[FILL_DETECTION]` / `get_positions()` and set `OpenPosition.size` from the exchange position; before exit, re-read the position and size the reduce-only to it (§5.4 "再指値前に最新建玉を再照会"). One small PR. |
+| G-2 | **Fill was assumed on HTTP 200.** `OpenPosition.size` = requested size, `entry_price` = last WS mid. If the IOC filled partially or not at all, the engine held a phantom position, logged a fictitious PnL, and sent a reduce-only exit sized to a position that might not exist. | entry → exit | real for the smoke test — exactly the class of bug the test is meant to surface | **Fixed in pairtrade#275**: after an accepted IOC the engine polls the WS-fed `get_positions()` for up to `ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS` (15 s) and records the exchange's side / size / entry price; no position → treated as unfilled, no retry that day; exits are sized to the exchange's current position and only complete once it reports flat. Verify on the first live cycle. |
 | G-3 | Entry/exit is MARKET+IOC with a **±20 % protection price**, not the doc's "marketable limit ≤ 50 bps from mid" (§6.3). No limit-IOC path exists in the connector for Lighter. | entry, exit | low: SNDK does ~$15 M/day with ~1.3 bps spread; observed top-5 depth ≈ $83 k vs a $100 order | accept for the smoke test; open a dex-connector item (LIMIT + TIF_IOC) before any Phase 2 sizing |
-| G-4 | **No idempotency journal.** A `sendTx` that times out after Lighter accepted it returns `Transient`; `day.entered` stays `false`, and the next 5 s tick re-submits → possible double entry (2 × notional). §6.5 (persist intent, then send; on timeout query by client ID) is unimplemented. | entry | bounded (2 × $100), but it is a correctness hole | same fix as G-2 covers the practical case: check the exchange position before any re-submit; a full `order_intent` journal is Phase 2 work |
+| G-4 | **No idempotency journal.** A `sendTx` that timed out after Lighter accepted it returned `Transient`; `day.entered` stayed `false`, and the next 5 s tick re-submitted → possible double entry (2 × notional). §6.5 (persist intent, then send; on timeout query by client ID) is unimplemented. A position check alone does not close this: REST and WS rate limits are coupled (§2.1), so the same stress that timed out the `sendTx` can delay the WS `account_all` update, and a single `get_positions()` read right after the timeout can be a false negative. | entry | bounded (2 × $100), but a correctness hole | **Fixed in pairtrade#275 by construction: at most one entry `sendTx` per session day.** Any `submit_order` outcome (Ok, `Transient`, `RateLimited`, `ServerResponse`) ends the day's submitting; after an error the engine still polls the exchange position for the full confirm window and adopts a position if one appears. The exchange position is also read before the single submit (catches a position left by a crashed prior process). A persisted `order_intent` journal remains Phase 2 work. |
 | G-5 | Rate limiter sidecar models a 60,000-weight/min bucket; Standard tier is 60 req/min unweighted. The connector's real Standard-tier protection is reactive (429 → 90–120 s cooldown) plus the `[API_TRACKER]` warning at 45/60 s. | REST | none at ≤ 8 req/day | do not add REST polling loops to this binary without revisiting; if `reconcile` polling is added for G-2, poll ≤ 1/s and prefer the WS-fed `get_positions()` |
 | G-6 | Startup / reconnect reconcile (§6.4) is not implemented: the engine does not compare its state file with exchange positions at boot and does not cancel unknown open orders. `OpenPosition` is in-memory only (already in the binary's KNOWN GAPS). | boot | matters only if the service restarts between entry and exit | keep the documented manual rule (check the exchange before trusting `status.json`); Phase 2 item |
-| G-7 | No `min_base_amount` / `min_quote_amount` / decimals guard in the engine; sizing relies on connector truncation. | entry | none at $100 / SNDK (11× the minimum) | add an explicit floor check when `lot_usd` becomes `Q_gate`-driven |
+| G-7 | No `min_base_amount` / `min_quote_amount` / decimals guard in the engine; sizing relies on connector truncation, and the connector silently substitutes `base_amount = 1` (one size tick) when truncation yields zero rather than refusing — on a thin symbol that is a different order than the one intended, not a rejection. | entry | none at $100 / SNDK (11× the minimum) | add an explicit floor check (and reject a zero-after-truncation size) when `lot_usd` becomes `Q_gate`-driven |
+| G-8 | Lighter's reduce-only semantics for an order larger than the position (reject the whole order vs clip to the position) are **not documented on the pages read and not yet observed live**. Before #275 this was the only guard against an over-sized exit flipping the position. | exit | after #275 reduce-only is no longer load-bearing (exits are sized to the exchange position), but the exchange behaviour is still unverified | observe on the first live exit; if a partial exit ever leaves a remainder, the next tick's re-read + re-send covers it either way |
 
-Only **G-2 (with G-4 as its free by-product)** is worth a code change
-before the first `CONFIRM_LIVE` flip; the rest are recorded here so the
-requirements doc v0.4 (bot-strategy#879) can mark A-3/A-8/A-9 ✅ with
-these caveats instead of ❌.
+G-2 and G-4 were the two worth a code change before the first
+`CONFIRM_LIVE` flip and are closed by pairtrade#275; the rest are recorded
+here so the requirements doc v0.4 (bot-strategy#879) can mark A-3/A-8/A-9
+✅ with these caveats instead of ❌.
 
 ## 5. Quick reference for the operator
 
