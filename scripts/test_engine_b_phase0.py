@@ -428,9 +428,37 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gaps[0]["channel"], "order_book")
         self.assertEqual(gaps[0]["reason"], "book_channel_stalled")
         self.assertEqual(gaps[0]["start_us"], t0)
-        self.assertEqual(gaps[0]["partition_us"], t0)
+        self.assertEqual(gaps[0]["partition_us"], t0 + 61_000_000)
         self.assertEqual(gaps[0]["market_id"], 216)
         self.assertEqual(gaps[0]["expected_sequence"], "10")
+
+    async def test_stall_gap_start_is_clamped_to_the_detecting_partition(self) -> None:
+        # Codex on pairtrade#277: a stall whose last book message lies in an
+        # earlier (possibly sealed) hour must not target that partition.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        hour = 3_600_000_000
+        boundary = (1_774_884_000_000_000 // hour + 1) * hour
+        last_book = boundary - 30_000_000
+        now = boundary + 40_000_000
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = last_book
+            collector.book_last_recv_us[other] = now - 1_000_000
+        collector.book_last_recv_us[key] = last_book
+        collector.market_last_activity_us[key] = now - 1_000_000
+        await collector.watchdog_books(ws, venue, connection, now)
+        gaps = [payload for kind, payload in sink.commands if kind == "gap"]
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["start_us"], boundary)
+        self.assertEqual(gaps[0]["partition_us"], now)
+        self.assertEqual(
+            engine_b.partition_for_us(gaps[0]["partition_us"]),
+            engine_b.partition_for_us(gaps[0]["start_us"]),
+        )
 
     async def test_stale_activity_does_not_declare_a_stall(self) -> None:
         # One stats message shortly after the last book message, then a

@@ -3490,12 +3490,23 @@ class Collector:
                 or recv_us - last_book_us < stall_after_us
             ):
                 continue
+            # The gap is written to the partition that detects it. Its start
+            # is clamped to that partition's beginning: an hour that has
+            # already been sealed must never receive a new non-trade row
+            # (`_write_batch` raises), and the earlier part of a stall that
+            # straddles the boundary is recoverable offline from the market's
+            # last `book_event` (logged here) -- see the A-10 notes.
+            partition_floor_us = partition_start_us(partition_for_us(recv_us))
+            gap_start_us = max(last_book_us, partition_floor_us)
             LOG.warning(
-                "order_book channel stalled venue=%s symbol=%s: no book message for %.0fs while "
-                "trade/market_stats kept arriving; marking unsynced and re-subscribing",
+                "order_book channel stalled venue=%s symbol=%s: no book message since %d "
+                "(%.0fs) while trade/market_stats kept arriving; marking unsynced and re-subscribing"
+                "%s",
                 venue.name,
                 market.symbol,
+                last_book_us,
                 (recv_us - last_book_us) / 1_000_000,
+                "" if gap_start_us == last_book_us else f" (gap start clamped to partition {gap_start_us})",
             )
             last_accepted_nonce = state.last_nonce
             state.synced = False
@@ -3515,11 +3526,8 @@ class Collector:
                 "gap",
                 {
                     "recv_us": recv_us,
-                    "start_us": last_book_us,
-                    # Route the gap to the partition its start belongs to, so
-                    # the existing cross-hour continuation machinery applies
-                    # when the stall straddles an hour boundary.
-                    "partition_us": last_book_us,
+                    "start_us": gap_start_us,
+                    "partition_us": recv_us,
                     "connection_id": connection["id"],
                     "venue": venue.name,
                     "market_id": market.market_id,

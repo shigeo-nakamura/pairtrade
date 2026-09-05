@@ -134,8 +134,10 @@ its `order_book` channel re-subscribed
 synced market whose book has been silent for `book_stall_after_ms`
 (default 60 s) while its own trade / market_stats kept arriving (at least
 one within the last half of that window) is declared stale: unsynced, `data_gap(channel=order_book,
-reason=book_channel_stalled)`, re-subscribed
-(`engine_b_phase0_book_stall_total`). At most `book_watchdog_batch`
+reason=book_channel_stalled)` written to the detecting partition with its
+start clamped to that partition's beginning (a sealed hour never receives
+new rows; the true last book time is in the WARN line and in
+`book_event`), re-subscribed (`engine_b_phase0_book_stall_total`). At most `book_watchdog_batch`
 (default 5) subscribe frames per venue per second. All three keys are
 optional in `phase0.json`. A feed task cancelled without `stop_event`
 set is now recorded as `task_cancelled_unexpected` with a logged stack.
