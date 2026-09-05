@@ -132,8 +132,8 @@ point `data_gap` on the `market_stats` channel. A market still unsynced
 its `order_book` channel re-subscribed
 (`engine_b_phase0_book_resubscribe_total{reason="unsynced"}`), and a
 synced market whose book has been silent for `book_stall_after_ms`
-(default 60 s) while its own trade / market_stats kept arriving is
-declared stale: unsynced, `data_gap(channel=order_book,
+(default 60 s) while its own trade / market_stats kept arriving (at least
+one within the last half of that window) is declared stale: unsynced, `data_gap(channel=order_book,
 reason=book_channel_stalled)`, re-subscribed
 (`engine_b_phase0_book_stall_total`). At most `book_watchdog_batch`
 (default 5) subscribe frames per venue per second. All three keys are

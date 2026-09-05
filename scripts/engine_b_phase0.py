@@ -3470,10 +3470,14 @@ class Collector:
                 continue
             last_book_us = self.book_last_recv_us.get(key)
             last_activity_us = self.market_last_activity_us.get(key)
+            # "Stalled" needs the market's *own* other channels to be alive
+            # right now, not merely once since the last book message: a
+            # market that went quiet on every channel is quiet, not stalled.
             if (
                 last_book_us is None
                 or last_activity_us is None
                 or last_activity_us <= last_book_us
+                or recv_us - last_activity_us > stall_after_us // 2
                 or recv_us - last_book_us < stall_after_us
             ):
                 continue
@@ -3502,7 +3506,10 @@ class Collector:
                 {
                     "recv_us": recv_us,
                     "start_us": last_book_us,
-                    "partition_us": recv_us,
+                    # Route the gap to the partition its start belongs to, so
+                    # the existing cross-hour continuation machinery applies
+                    # when the stall straddles an hour boundary.
+                    "partition_us": last_book_us,
                     "connection_id": connection["id"],
                     "venue": venue.name,
                     "market_id": market.market_id,
@@ -3597,6 +3604,9 @@ class Collector:
             )
             await send_public_control(ws, {"type": "unsubscribe", "channel": f"order_book/{market_id}"})
             await send_public_control(ws, {"type": "subscribe", "channel": f"order_book/{market_id}"})
+            # Restart the watchdog's retry spacing from this re-subscribe, so
+            # it does not fire again in the same iteration (bot-strategy#908).
+            self.book_subscribe_us[(venue.name, market_id)] = recv_us
             self.metrics.book_synced[(venue.name, market_id)] = False
             return
         self.metrics.book_synced[(venue.name, market_id)] = state.synced

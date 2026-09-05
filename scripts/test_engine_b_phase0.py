@@ -421,7 +421,56 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gaps[0]["channel"], "order_book")
         self.assertEqual(gaps[0]["reason"], "book_channel_stalled")
         self.assertEqual(gaps[0]["start_us"], t0)
+        self.assertEqual(gaps[0]["partition_us"], t0)
         self.assertEqual(gaps[0]["market_id"], 216)
+
+    async def test_stale_activity_does_not_declare_a_stall(self) -> None:
+        # One stats message shortly after the last book message, then a
+        # fully quiet market: quiet, not stalled.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = t0
+            collector.book_last_recv_us[other] = t0
+        collector.market_last_activity_us[key] = t0 + 1_000_000
+        await collector.watchdog_books(ws, venue, connection, t0 + 61_000_000)
+        self.assertTrue(collector.books[key].synced)
+        self.assertEqual(ws.messages, [])
+        self.assertEqual(sink.commands, [])
+
+    async def test_handle_book_resubscribe_refreshes_watchdog_deadline(self) -> None:
+        # bot-strategy#908 / Codex: handle_book's own unsubscribe+subscribe on
+        # a sequence break must restart the watchdog spacing, or the watchdog
+        # fires a second subscribe in the same iteration.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        collector.book_subscribe_us[key] = t0 - 60_000_000
+        state = collector.books.setdefault(key, engine_b.BookState())
+        state.synced = True
+        state.last_nonce = "10"
+        await collector.handle_book(
+            ws,
+            venue,
+            connection,
+            {
+                "type": "update/order_book",
+                "channel": "order_book/216",
+                "order_book": {"begin_nonce": 99, "nonce": 100, "bids": [], "asks": []},
+            },
+            t0,
+        )
+        self.assertEqual(collector.book_subscribe_us[key], t0)
+        self.assertEqual(len(ws.messages), 2)  # unsubscribe + subscribe from handle_book
+        await collector.watchdog_books(ws, venue, connection, t0 + 1_500_000)
+        self.assertEqual(len(ws.messages), 2)  # watchdog stays quiet inside the spacing
 
     async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
         # A quiet market (no trades, no stats either) is just quiet, not stalled.
