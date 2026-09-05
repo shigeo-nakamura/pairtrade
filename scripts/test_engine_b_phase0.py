@@ -1243,6 +1243,17 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "WS frames/min"):
                 engine_b.load_config(path, LOCK_PATH)
 
+    def test_stall_shorter_than_resubscribe_spacing_is_rejected(self) -> None:
+        base = json.loads(CONFIG_PATH.read_text())
+        raw = dict(base)
+        raw["book_resubscribe_after_ms"] = 30_000
+        raw["book_stall_after_ms"] = 20_000
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "phase0.json"
+            path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "book_stall_after_ms must be >="):
+                engine_b.load_config(path, LOCK_PATH)
+
     def test_watchdog_settings_default_when_absent(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         self.assertEqual(config.book_resubscribe_after_ms, 10_000)

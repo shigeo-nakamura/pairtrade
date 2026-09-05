@@ -902,10 +902,14 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
     # the two intervals. Keep that under half of Lighter's documented
     # 200 client messages / minute per IP so the trading bots sharing the IP
     # keep the other half (bot-strategy#908, Codex review on pairtrade#277).
-    shortest_ms = min(
-        int(raw.get("book_resubscribe_after_ms", 10_000)),
-        int(raw.get("book_stall_after_ms", 60_000)),
-    )
+    resubscribe_after_ms = int(raw.get("book_resubscribe_after_ms", 10_000))
+    stall_after_ms = int(raw.get("book_stall_after_ms", 60_000))
+    if stall_after_ms < resubscribe_after_ms:
+        # A stall declared before the per-market re-subscribe spacing allows
+        # a frame would sit unsynced with no recovery until that spacing
+        # elapses; require the stall threshold to be the longer of the two.
+        raise ValueError("book_stall_after_ms must be >= book_resubscribe_after_ms")
+    shortest_ms = min(resubscribe_after_ms, stall_after_ms)
     worst_frames_per_min = 2 * int(raw.get("book_watchdog_batch", 5)) * 60_000 / shortest_ms
     if worst_frames_per_min > WATCHDOG_MAX_FRAMES_PER_MIN:
         raise ValueError(
@@ -3567,6 +3571,9 @@ class Collector:
                 or last_activity_us <= last_book_us
                 or recv_us - last_activity_us > stall_after_us // 2
                 or recv_us - last_book_us < stall_after_us
+                # Never invalidate a book we could not re-subscribe right now
+                # (per-market spacing); wait for the next pass instead.
+                or recv_us - subscribed_us < resubscribe_after_us
             ):
                 continue
             # The gap row is written to the partition that detects it, so an
