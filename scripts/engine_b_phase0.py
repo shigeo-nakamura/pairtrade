@@ -3386,6 +3386,13 @@ class Collector:
                             await self.handle_market_stats(venue, message, recv_us)
                         elif message_type == "ping":
                             await send_public_control(ws, {"type": "pong"})
+                            # Every outbound client message counts against the
+                            # per-IP budget, pongs included; the limiter's
+                            # window must see them so subscribe traffic backs
+                            # off accordingly (bot-strategy#908).
+                            self.watchdog_frames_us[venue.name].append(
+                                self._clock_at_least(recv_us)
+                            )
                         elif message_type == "pong":
                             pass
                         else:
