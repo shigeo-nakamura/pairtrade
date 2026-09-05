@@ -570,6 +570,29 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ws.messages), 2)  # one unsubscribe + one subscribe
         self.assertEqual(collector.book_subscribe_us[key], t0)
 
+    async def test_initial_subscriptions_consume_the_frame_budget(self) -> None:
+        # Codex on pairtrade#277: the 42 subscribe frames of a (re)connect
+        # count against the same 100/min budget as watchdog re-subscribes.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        await collector.subscribe_public_channels(ws, venue)
+        initial = len(ws.messages)
+        self.assertEqual(initial, 3 * len(venue.markets))
+        self.assertEqual(len(collector.watchdog_frames_us[venue.name]), initial)
+        # Re-anchor the real-clock timestamps onto the test clock.
+        frames = collector.watchdog_frames_us[venue.name]
+        frames.clear()
+        frames.extend([t0] * initial)
+        for key in list(collector.book_subscribe_us):
+            collector.book_subscribe_us[key] = t0
+        for second in range(11, 71, 1):
+            await collector.watchdog_books(ws, venue, connection, t0 + second * 1_000_000)
+        # Within the first rolling minute the total (initial + watchdog) stays capped.
+        self.assertLessEqual(len(ws.messages), engine_b.WATCHDOG_MAX_FRAMES_PER_MIN)
+        self.assertGreater(len(ws.messages), initial)
+
     async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
         # A quiet market (no trades, no stats either) is just quiet, not stalled.
         config, venue, sink, collector = self._collector()

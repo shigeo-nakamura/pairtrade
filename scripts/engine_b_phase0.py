@@ -3435,11 +3435,19 @@ class Collector:
 
     async def subscribe_public_channels(self, ws: Any, venue: VenueConfig) -> None:
         subscribed_us = now_us()
+        sent = self.watchdog_frames_us[venue.name]
+        while sent and subscribed_us - sent[0] > 60_000_000:
+            sent.popleft()
         for market in venue.markets:
             for channel in ("order_book", "trade", "market_stats"):
                 await send_public_control(
                     ws, {"type": "subscribe", "channel": f"{channel}/{market.market_id}"}
                 )
+                # The initial subscriptions draw from the same rolling frame
+                # budget the watchdog uses, so a reconnect burst plus recovery
+                # frames together stay within the observer's share of
+                # Lighter's per-IP client-message limit (bot-strategy#908).
+                sent.append(subscribed_us)
             self.book_subscribe_us[(venue.name, market.market_id)] = subscribed_us
         LOG.info("Subscribed to public channels venue=%s markets=%d", venue.name, len(venue.markets))
 
