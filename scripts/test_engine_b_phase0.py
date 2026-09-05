@@ -431,6 +431,13 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gaps[0]["partition_us"], t0 + 61_000_000)
         self.assertEqual(gaps[0]["market_id"], 216)
         self.assertEqual(gaps[0]["expected_sequence"], "10")
+        self.assertEqual(gaps[0]["sealed_intervals"], [])
+        rendered = collector.metrics.render(queue_size=0)
+        self.assertIn('engine_b_phase0_book_stall_total{symbol="SKHY",venue="lighter"} 1', rendered)
+        self.assertIn(
+            'engine_b_phase0_book_resubscribe_total{reason="stalled",symbol="SKHY",venue="lighter"} 1',
+            rendered,
+        )
 
     async def test_stall_gap_start_is_clamped_to_the_detecting_partition(self) -> None:
         # Codex on pairtrade#277: a stall whose last book message lies in an
@@ -459,6 +466,13 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
             engine_b.partition_for_us(gaps[0]["partition_us"]),
             engine_b.partition_for_us(gaps[0]["start_us"]),
         )
+        # The 30 s before the boundary are not dropped: they travel as a
+        # sealed interval for the previous hour inside the same gap command.
+        self.assertEqual(
+            [(i["start_us"], i["end_us"], i["sealed_partition"]) for i in gaps[0]["sealed_intervals"]],
+            [(last_book, boundary, engine_b.partition_for_us(last_book))],
+        )
+        self.assertTrue(gaps[0]["sealed_intervals"][0]["interval_id"].startswith("stalled-book:"))
 
     async def test_stale_activity_does_not_declare_a_stall(self) -> None:
         # One stats message shortly after the last book message, then a

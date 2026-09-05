@@ -3569,14 +3569,33 @@ class Collector:
                 or recv_us - last_book_us < stall_after_us
             ):
                 continue
-            # The gap is written to the partition that detects it. Its start
-            # is clamped to that partition's beginning: an hour that has
-            # already been sealed must never receive a new non-trade row
-            # (`_write_batch` raises), and the earlier part of a stall that
-            # straddles the boundary is recoverable offline from the market's
-            # last `book_event` (logged here) -- see the A-10 notes.
+            # The gap row is written to the partition that detects it, so an
+            # hour that may already be sealed never receives a new non-trade
+            # row (`_write_batch` raises on that). The part of the stall that
+            # lies in earlier hours is not dropped: it is recorded, hour by
+            # hour, as `sealed_gap_interval` rows in the detecting partition
+            # -- the same representation the gap-continuation machinery uses
+            # for intervals whose home partition is unavailable.
             partition_floor_us = partition_start_us(partition_for_us(recv_us))
             gap_start_us = max(last_book_us, partition_floor_us)
+            sealed_intervals: list[dict[str, Any]] = []
+            cursor_us = last_book_us
+            while cursor_us < partition_floor_us:
+                hour_partition = partition_for_us(cursor_us)
+                hour_end_us = partition_start_us(hour_partition) + 3_600_000_000
+                interval_end_us = min(hour_end_us, partition_floor_us)
+                interval_id = "stalled-book:" + hashlib.sha256(
+                    f"{venue.name}:{market.market_id}:{cursor_us}:{interval_end_us}".encode("utf-8")
+                ).hexdigest()
+                sealed_intervals.append(
+                    {
+                        "interval_id": interval_id,
+                        "sealed_partition": hour_partition,
+                        "start_us": cursor_us,
+                        "end_us": interval_end_us,
+                    }
+                )
+                cursor_us = interval_end_us
             LOG.warning(
                 "order_book channel stalled venue=%s symbol=%s: no book message since %d "
                 "(%.0fs) while trade/market_stats kept arriving; marking unsynced and re-subscribing"
@@ -3585,7 +3604,9 @@ class Collector:
                 market.symbol,
                 last_book_us,
                 (recv_us - last_book_us) / 1_000_000,
-                "" if gap_start_us == last_book_us else f" (gap start clamped to partition {gap_start_us})",
+                ""
+                if gap_start_us == last_book_us
+                else f" (gap row starts at partition {gap_start_us}; earlier portion recorded as {len(sealed_intervals)} sealed interval(s))",
             )
             last_accepted_nonce = state.last_nonce
             state.synced = False
@@ -3593,13 +3614,11 @@ class Collector:
             state.bids.clear()
             state.asks.clear()
             self.metrics.book_synced[key] = False
+            # Counts detections; the re-subscribe counter below counts only
+            # frames actually sent.
             self.metrics.inc(
                 "engine_b_phase0_book_stall_total",
                 {"venue": venue.name, "symbol": market.symbol},
-            )
-            self.metrics.inc(
-                "engine_b_phase0_book_resubscribe_total",
-                {"venue": venue.name, "symbol": market.symbol, "reason": "stalled"},
             )
             await self.sink.put(
                 "gap",
@@ -3615,6 +3634,7 @@ class Collector:
                     "expected_sequence": last_accepted_nonce,
                     "observed_sequence": None,
                     "reason": "book_channel_stalled",
+                    "sealed_intervals": sealed_intervals,
                 },
             )
             # The market was synced, so its last subscribe is old: the
@@ -3623,6 +3643,10 @@ class Collector:
                 ws, venue, market.market_id, recv_us, unsubscribe_first=True, reason="stalled"
             ):
                 return
+            self.metrics.inc(
+                "engine_b_phase0_book_resubscribe_total",
+                {"venue": venue.name, "symbol": market.symbol, "reason": "stalled"},
+            )
             budget -= 1
 
     async def handle_book(
