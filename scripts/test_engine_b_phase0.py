@@ -551,7 +551,10 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
         key = (venue.name, 216)
         t0 = 1_774_884_000_000_000
-        collector.book_subscribe_us[key] = t0 - 60_000_000
+        # Subscribed 2 s ago: still inside the spacing, yet the FIRST break on
+        # a synced book must recover immediately; only the follow-ups are
+        # suppressed.
+        collector.book_subscribe_us[key] = t0 - 2_000_000
         state = collector.books.setdefault(key, engine_b.BookState())
         state.synced = True
         state.last_nonce = "10"
@@ -596,6 +599,29 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         before = len(ws.messages)
         await collector.watchdog_books(ws, venue, connection, t0 + 75 * 1_000_000)
         self.assertGreater(len(ws.messages), before)
+
+    async def test_stall_is_not_declared_when_the_frame_cap_is_exhausted(self) -> None:
+        # Codex on pairtrade#277: a stall is inferred from silence; do not
+        # invalidate the book if the recovery frames cannot be sent right now.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = t0 - 120_000_000
+            collector.book_last_recv_us[other] = t0 + 59_000_000
+        collector.book_last_recv_us[key] = t0
+        collector.market_last_activity_us[key] = t0 + 60_000_000
+        collector.watchdog_frames_us[venue.name].extend(
+            [t0 + 30_000_000] * engine_b.WATCHDOG_MAX_FRAMES_PER_MIN
+        )
+        await collector.watchdog_books(ws, venue, connection, t0 + 61_000_000)
+        self.assertTrue(collector.books[key].synced)
+        self.assertEqual(ws.messages, [])
+        self.assertEqual(sink.commands, [])
 
     async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
         # A quiet market (no trades, no stats either) is just quiet, not stalled.

@@ -3460,6 +3460,7 @@ class Collector:
         *,
         unsubscribe_first: bool,
         reason: str,
+        bypass_spacing: bool = False,
     ) -> bool:
         """Single choke point for every order_book (re)subscribe frame this
         process sends after the initial subscription (bot-strategy#908):
@@ -3468,11 +3469,15 @@ class Collector:
         minute, whichever path asks -- the watchdog or ``handle_book``'s
         sequence-break handler (a burst of already-queued deltas against an
         unsynced book must not turn into a burst of subscribe frames).
+        ``bypass_spacing`` is for the *first* recovery after a proven
+        sequence break on a synced book, which must go out immediately (as
+        the pre-watchdog code did); follow-up attempts keep the spacing.
         Returns True when frames were sent."""
         key = (venue.name, market_id)
         last_subscribe_us = self.book_subscribe_us.get(key)
         if (
-            last_subscribe_us is not None
+            not bypass_spacing
+            and last_subscribe_us is not None
             and recv_us - last_subscribe_us < self.config.book_resubscribe_after_ms * 1_000
         ):
             LOG.debug(
@@ -3496,6 +3501,14 @@ class Collector:
         sent.extend([recv_us] * frames)
         self.book_subscribe_us[key] = recv_us
         return True
+
+    def can_send_frames(self, venue_name: str, recv_us: int, frames: int) -> bool:
+        """True if ``frames`` more WS frames fit under the rolling per-minute
+        cap right now (no side effects)."""
+        sent = self.watchdog_frames_us[venue_name]
+        while sent and recv_us - sent[0] > 60_000_000:
+            sent.popleft()
+        return len(sent) + frames <= WATCHDOG_MAX_FRAMES_PER_MIN
 
     async def watchdog_books(
         self,
@@ -3580,8 +3593,11 @@ class Collector:
                 or recv_us - last_activity_us > stall_after_us // 2
                 or recv_us - last_book_us < stall_after_us
                 # Never invalidate a book we could not re-subscribe right now
-                # (per-market spacing); wait for the next pass instead.
+                # (per-market spacing, or the per-minute frame cap); a stall is
+                # inferred from silence, so collector-imposed downtime without
+                # a recovery frame is worse than waiting one more pass.
                 or recv_us - subscribed_us < resubscribe_after_us
+                or not self.can_send_frames(venue.name, recv_us, 2)
             ):
                 continue
             # The gap row is written to the partition that detects it, so an
@@ -3705,6 +3721,7 @@ class Collector:
                 "levels": levels,
             },
         )
+        was_synced = state.synced
         if event_kind == "snapshot":
             applied = state.apply_snapshot(payload)
             expected = None
@@ -3742,7 +3759,17 @@ class Collector:
             # (bot-strategy#908); the watchdog retries if this one is
             # suppressed.
             await self.resubscribe_book(
-                ws, venue, market_id, recv_us, unsubscribe_first=True, reason=reason
+                ws,
+                venue,
+                market_id,
+                recv_us,
+                unsubscribe_first=True,
+                reason=reason,
+                # A break on a book that was synced a moment ago is a proven
+                # sequence error: recover immediately. Deltas that keep
+                # failing against an already-unsynced book are the burst the
+                # spacing exists for.
+                bypass_spacing=was_synced,
             )
             self.metrics.book_synced[(venue.name, market_id)] = False
             return
