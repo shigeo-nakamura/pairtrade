@@ -4127,12 +4127,14 @@ class Collector:
                     "raw_public_json": raw_public_json,
                 },
             )
-        if trades:
-            self.metrics.inc(
-                "engine_b_phase0_trade_total",
-                {"venue": venue.name, "symbol": market.symbol},
-                len(trades),
-            )
+        # Accepted rows only: rejected rows are counted in
+        # engine_b_phase0_trade_rejected_total, so the two series partition
+        # the received rows regardless of how they were batched.
+        self.metrics.inc(
+            "engine_b_phase0_trade_total",
+            {"venue": venue.name, "symbol": market.symbol},
+            len(parsed_trades),
+        )
 
     async def handle_market_stats(
         self, venue: VenueConfig, message: dict[str, Any], recv_us: int

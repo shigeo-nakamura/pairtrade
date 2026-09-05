@@ -1220,6 +1220,10 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([kind for kind, _ in sink.commands], ["gap"])
         self.assertEqual(sink.commands[0][1]["reason"], "missing_timestamp")
+        # A fully rejected message contributes nothing to trade_total.
+        self.assertNotIn(
+            "engine_b_phase0_trade_total", collector.metrics.render(queue_size=0)
+        )
 
     async def test_out_of_range_exchange_timestamp_rejects_trade_not_connection(
         self,
@@ -1279,9 +1283,16 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                 kept = sink.commands[1][1]
                 self.assertEqual(kept["trade_id"], "fresh-sibling")
                 self.assertEqual(kept["price"], "102")
+                rendered = metrics.render(queue_size=0)
                 self.assertIn(
                     'engine_b_phase0_trade_rejected_total{reason="out_of_range_timestamp",symbol="SKHY",venue="lighter"} 1',
-                    metrics.render(queue_size=0),
+                    rendered,
+                )
+                # trade_total counts accepted rows only, so the two series
+                # partition the received rows whatever the batching.
+                self.assertIn(
+                    'engine_b_phase0_trade_total{symbol="SKHY",venue="lighter"} 1',
+                    rendered,
                 )
 
     async def test_boundary_exchange_timestamps_are_accepted(self) -> None:
