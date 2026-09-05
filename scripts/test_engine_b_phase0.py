@@ -345,7 +345,44 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         sink = RecordingSink()
         metrics = engine_b.Metrics()
         collector = engine_b.Collector(config, sink, metrics)
+        collector._clock = lambda: 0  # send-time stamps fall back to the test clock
         return config, venue, sink, collector
+
+    async def test_sequence_break_reserve_is_per_market(self) -> None:
+        # Codex on pairtrade#277: one noisy market cannot spend the reserve
+        # meant for the others -- each market gets one reserved recovery per
+        # rolling minute once the shared share is exhausted.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        collector.watchdog_frames_us[venue.name].extend(
+            [t0 - 1_000_000] * collector.watchdog_share(venue)
+        )
+
+        async def proven_break(market_id: int, at_us: int) -> int:
+            key = (venue.name, market_id)
+            state = collector.books.setdefault(key, engine_b.BookState())
+            state.synced = True
+            state.last_nonce = "10"
+            before = len(ws.messages)
+            await collector.handle_book(
+                ws,
+                venue,
+                connection,
+                {
+                    "type": "update/order_book",
+                    "channel": f"order_book/{market_id}",
+                    "order_book": {"begin_nonce": 99, "nonce": 100, "bids": [], "asks": []},
+                },
+                at_us,
+            )
+            return len(ws.messages) - before
+
+        self.assertEqual(await proven_break(216, t0), 2)  # SKHY: reserve used
+        self.assertEqual(await proven_break(216, t0 + 20_000_000), 0)  # SKHY again: refused
+        self.assertEqual(await proven_break(139, t0 + 21_000_000), 2)  # SNDK: its own reserve
+        self.assertEqual(await proven_break(216, t0 + 61_000_000), 2)  # SKHY: reserve back after 60 s
 
     async def test_unsynced_market_is_resubscribed_after_threshold(self) -> None:
         # bot-strategy#908 item 2: a market whose post-(re)connect snapshot

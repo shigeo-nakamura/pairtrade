@@ -3262,6 +3262,12 @@ class Collector:
         # Runtime enforcement of WATCHDOG_MAX_FRAMES_PER_MIN, independent of
         # config: timestamps (us) of watchdog-sent frames per venue.
         self.watchdog_frames_us: defaultdict[str, deque[int]] = defaultdict(deque)
+        # When each market last spent its reserved sequence-break recovery
+        # (one unsubscribe+subscribe per market per rolling minute).
+        self.break_reserve_used_us: dict[tuple[str, int], int] = {}
+        # Wall clock for send-time stamps; tests pin it to 0 so stamps fall
+        # back to the message clock they drive.
+        self._clock = now_us
         self.market_stats_rejections: defaultdict[tuple[str, int], int] = defaultdict(int)
         self.local_sequences: defaultdict[tuple[str, str, int], int] = defaultdict(int)
         self.last_health_error: str | None = None
@@ -3545,21 +3551,38 @@ class Collector:
                 (recv_us - last_subscribe_us) / 1_000_000,
             )
             return False
+        # Stamp at send time, not with the message's receive time: awaited
+        # sink/WS calls before this point can be delayed under backpressure,
+        # and a stale stamp would age out of the window (and re-arm the retry
+        # spacing) too early.
+        stamp_us = max(recv_us, self._clock())
         sent = self.watchdog_frames_us[venue.name]
-        while sent and recv_us - sent[0] > 60_000_000:
+        while sent and stamp_us - sent[0] > 60_000_000:
             sent.popleft()
         frames = 2 if unsubscribe_first else 1
-        # A proven sequence break may dip into the reserve; silence-inferred
-        # retries (and the reconnect burst) stop short of it.
-        limit = WATCHDOG_MAX_FRAMES_PER_MIN if bypass_spacing else self.watchdog_share(venue)
-        if len(sent) + frames > limit:
-            self.metrics.inc("engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name})
-            return False
+        fits_shared = len(sent) + frames <= self.watchdog_share(venue)
+        if not fits_shared:
+            # The shared share is spent. A proven sequence break may use this
+            # market's *own* reserved recovery (2 frames, once per rolling
+            # minute), so one noisy market cannot consume the slots meant for
+            # the others; silence-inferred retries never touch the reserve.
+            reserve_used_us = self.break_reserve_used_us.get(key)
+            reserve_free = reserve_used_us is None or stamp_us - reserve_used_us > 60_000_000
+            if not (
+                bypass_spacing
+                and reserve_free
+                and len(sent) + frames <= WATCHDOG_MAX_FRAMES_PER_MIN
+            ):
+                self.metrics.inc(
+                    "engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name}
+                )
+                return False
+            self.break_reserve_used_us[key] = stamp_us
         if unsubscribe_first:
             await send_public_control(ws, {"type": "unsubscribe", "channel": f"order_book/{market_id}"})
         await send_public_control(ws, {"type": "subscribe", "channel": f"order_book/{market_id}"})
-        sent.extend([recv_us] * frames)
-        self.book_subscribe_us[key] = recv_us
+        sent.extend([stamp_us] * frames)
+        self.book_subscribe_us[key] = stamp_us
         return True
 
     def can_send_frames(self, venue: VenueConfig, recv_us: int, frames: int) -> bool:
