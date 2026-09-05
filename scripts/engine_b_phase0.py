@@ -3268,6 +3268,10 @@ class Collector:
         self.book_subscribe_us: dict[tuple[str, int], int] = {}
         self.book_last_recv_us: dict[tuple[str, int], int] = {}
         self.market_last_activity_us: dict[tuple[str, int], int] = {}
+        # First trade/market_stats message seen *after* the market's last
+        # book message: the point from which "auxiliary channels alive, book
+        # silent" is observable. Reset by every book message.
+        self.aux_since_book_us: dict[tuple[str, int], int] = {}
         self.last_book_watchdog_us: dict[str, int] = {}
         # Runtime enforcement of WATCHDOG_MAX_FRAMES_PER_MIN, independent of
         # config: timestamps (us) of watchdog-sent frames per venue.
@@ -3629,6 +3633,11 @@ class Collector:
         that drove this call (tests pin the clock to 0)."""
         return max(floor_us, self._clock())
 
+    def note_aux_activity(self, venue_name: str, market_id: int, recv_us: int) -> None:
+        key = (venue_name, market_id)
+        self.market_last_activity_us[key] = recv_us
+        self.aux_since_book_us.setdefault(key, recv_us)
+
     def can_send_frames(self, venue: VenueConfig, recv_us: int, frames: int) -> bool:
         """True if ``frames`` more WS frames fit under the watchdog share of
         the rolling per-minute cap right now (no side effects)."""
@@ -3710,15 +3719,20 @@ class Collector:
                 continue
             last_book_us = self.book_last_recv_us.get(key)
             last_activity_us = self.market_last_activity_us.get(key)
-            # "Stalled" needs the market's *own* other channels to be alive
-            # right now, not merely once since the last book message: a
-            # market that went quiet on every channel is quiet, not stalled.
+            aux_since_us = self.aux_since_book_us.get(key)
+            # "Stalled" needs the market's *own* other channels to have been
+            # alive for the whole stall window -- from the first auxiliary
+            # message after the last book message (`aux_since_us`) until now
+            # -- not merely once: a market that was quiet on every channel and
+            # just woke up is quiet, not stalled, and its silence is not a
+            # book outage.
             if (
                 last_book_us is None
                 or last_activity_us is None
+                or aux_since_us is None
                 or last_activity_us <= last_book_us
                 or recv_us - last_activity_us > stall_after_us // 2
-                or recv_us - last_book_us < stall_after_us
+                or recv_us - aux_since_us < stall_after_us
                 # Never invalidate a book we could not re-subscribe right now
                 # (per-market spacing, or the per-minute frame cap); a stall is
                 # inferred from silence, so collector-imposed downtime without
@@ -3734,10 +3748,14 @@ class Collector:
             # hour, as `sealed_gap_interval` rows in the detecting partition
             # -- the same representation the gap-continuation machinery uses
             # for intervals whose home partition is unavailable.
+            # The evidence-backed outage starts where auxiliary traffic was
+            # observably flowing while the book was not, i.e. at
+            # `aux_since_us`, not at the last book message (the interval
+            # between the two could be an all-quiet market).
             partition_floor_us = partition_start_us(partition_for_us(recv_us))
-            gap_start_us = max(last_book_us, partition_floor_us)
+            gap_start_us = max(aux_since_us, partition_floor_us)
             sealed_intervals: list[dict[str, Any]] = []
-            cursor_us = last_book_us
+            cursor_us = aux_since_us
             while cursor_us < partition_floor_us:
                 hour_partition = partition_for_us(cursor_us)
                 hour_end_us = partition_start_us(hour_partition) + 3_600_000_000
@@ -3756,14 +3774,15 @@ class Collector:
                 cursor_us = interval_end_us
             LOG.warning(
                 "order_book channel stalled venue=%s symbol=%s: no book message since %d "
-                "(%.0fs) while trade/market_stats kept arriving; marking unsynced and re-subscribing"
-                "%s",
+                "while trade/market_stats kept arriving for %.0fs (since %d); marking unsynced and "
+                "re-subscribing%s",
                 venue.name,
                 market.symbol,
                 last_book_us,
-                (recv_us - last_book_us) / 1_000_000,
+                (recv_us - aux_since_us) / 1_000_000,
+                aux_since_us,
                 ""
-                if gap_start_us == last_book_us
+                if gap_start_us == aux_since_us
                 else f" (gap row starts at partition {gap_start_us}; earlier portion recorded as {len(sealed_intervals)} sealed interval(s))",
             )
             last_accepted_nonce = state.last_nonce
@@ -3823,6 +3842,7 @@ class Collector:
         levels = BookState.raw_levels(payload)
         state = self.books.setdefault((venue.name, market_id), BookState())
         self.book_last_recv_us[(venue.name, market_id)] = recv_us
+        self.aux_since_book_us.pop((venue.name, market_id), None)
         message_type = message["type"]
         local_sequence = self.next_sequence(venue.name, "order_book", market_id)
         srv_us = normalize_exchange_timestamp_us(
@@ -3943,7 +3963,7 @@ class Collector:
         market = venue.market_by_id.get(market_id)
         if market is None:
             return
-        self.market_last_activity_us[(venue.name, market_id)] = recv_us
+        self.note_aux_activity(venue.name, market_id, recv_us)
         exchange_sequence = str(message["nonce"]) if message.get("nonce") is not None else None
         message_type = str(message.get("type", "update/trade"))
         trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
@@ -4056,7 +4076,7 @@ class Collector:
         market = venue.market_by_id.get(market_id)
         if market is None:
             return
-        self.market_last_activity_us[(venue.name, market_id)] = recv_us
+        self.note_aux_activity(venue.name, market_id, recv_us)
         stats = message.get("market_stats", {})
         srv_us = normalize_exchange_timestamp_us(message.get("timestamp"))
         prices: list[tuple[str, str]] = []

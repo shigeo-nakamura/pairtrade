@@ -131,9 +131,11 @@ point `data_gap` on the `market_stats` channel. A market still unsynced
 `book_resubscribe_after_ms` (default 10 s) after its last subscribe gets
 its `order_book` channel re-subscribed
 (`engine_b_phase0_book_resubscribe_total{reason="unsynced"}`), and a
-synced market whose book has been silent for `book_stall_after_ms`
-(default 60 s) while its own trade / market_stats kept arriving (at least
-one within the last half of that window) is declared stale: unsynced, `data_gap(channel=order_book,
+synced market whose book has been silent while its own trade /
+market_stats have been arriving for `book_stall_after_ms` (default 60 s,
+measured from the first auxiliary message after the last book message,
+with at least one within the last half of that window) is declared stale
+-- the gap starts where the auxiliary traffic was observably flowing: unsynced, `data_gap(channel=order_book,
 reason=book_channel_stalled)` written to the detecting partition with its
 start clamped to that partition's beginning (a sealed hour never receives
 new rows); the portion of the stall in earlier hours is preserved as

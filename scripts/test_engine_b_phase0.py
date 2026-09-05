@@ -436,6 +436,7 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         state.last_nonce = "10"
         collector.book_subscribe_us[key] = t0
         collector.book_last_recv_us[key] = t0
+        collector.aux_since_book_us[key] = t0 + 1_000_000
         collector.market_last_activity_us[key] = t0 + 50_000_000
         # Other markets: keep them out of the way (synced, fresh).
         for market in venue.markets:
@@ -464,7 +465,7 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["channel"], "order_book")
         self.assertEqual(gaps[0]["reason"], "book_channel_stalled")
-        self.assertEqual(gaps[0]["start_us"], t0)
+        self.assertEqual(gaps[0]["start_us"], t0 + 1_000_000)  # where aux traffic resumed
         self.assertEqual(gaps[0]["partition_us"], t0 + 61_000_000)
         self.assertEqual(gaps[0]["market_id"], 216)
         self.assertEqual(gaps[0]["expected_sequence"], "10")
@@ -493,6 +494,8 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
             collector.book_subscribe_us[other] = last_book
             collector.book_last_recv_us[other] = now - 1_000_000
         collector.book_last_recv_us[key] = last_book
+        aux_since = last_book + 1_000_000
+        collector.aux_since_book_us[key] = aux_since
         collector.market_last_activity_us[key] = now - 1_000_000
         await collector.watchdog_books(ws, venue, connection, now)
         gaps = [payload for kind, payload in sink.commands if kind == "gap"]
@@ -507,7 +510,7 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         # sealed interval for the previous hour inside the same gap command.
         self.assertEqual(
             [(i["start_us"], i["end_us"], i["sealed_partition"]) for i in gaps[0]["sealed_intervals"]],
-            [(last_book, boundary, engine_b.partition_for_us(last_book))],
+            [(aux_since, boundary, engine_b.partition_for_us(aux_since))],
         )
         self.assertTrue(gaps[0]["sealed_intervals"][0]["interval_id"].startswith("stalled-book:"))
 
@@ -524,6 +527,7 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
             collector.books.setdefault(other, engine_b.BookState()).synced = True
             collector.book_subscribe_us[other] = t0
             collector.book_last_recv_us[other] = t0
+        collector.aux_since_book_us[key] = t0 + 1_000_000
         collector.market_last_activity_us[key] = t0 + 1_000_000
         await collector.watchdog_books(ws, venue, connection, t0 + 61_000_000)
         self.assertTrue(collector.books[key].synced)
@@ -651,6 +655,7 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
             collector.book_subscribe_us[other] = t0 - 120_000_000
             collector.book_last_recv_us[other] = t0 + 59_000_000
         collector.book_last_recv_us[key] = t0
+        collector.aux_since_book_us[key] = t0 + 1_000_000
         collector.market_last_activity_us[key] = t0 + 60_000_000
         collector.watchdog_frames_us[venue.name].extend(
             [t0 + 30_000_000] * engine_b.WATCHDOG_MAX_FRAMES_PER_MIN
@@ -730,6 +735,35 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(engine_b.asyncio, "sleep", fake_sleep):
             await collector.subscribe_public_channels(ws, venue)
         self.assertEqual(ws.messages, [])
+
+    async def test_quiet_market_waking_up_is_not_backfilled_as_a_stall(self) -> None:
+        # Codex on pairtrade#277: book at T, everything quiet for 10 min, then
+        # one stats message -> not a 10-minute book outage; the stall clock
+        # only starts when auxiliary traffic resumes.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = t0 - 120_000_000
+            collector.book_last_recv_us[other] = t0 + 600_000_000
+        collector.book_last_recv_us[key] = t0
+        collector.note_aux_activity(venue.name, 216, t0 + 600_000_000)
+        await collector.watchdog_books(ws, venue, connection, t0 + 601_000_000)
+        self.assertTrue(collector.books[key].synced)
+        self.assertEqual(sink.commands, [])
+        # A book message resets the observation window.
+        collector.aux_since_book_us[key] = t0
+        await collector.handle_book(
+            ws, venue, connection,
+            {"type": "subscribed/order_book", "channel": "order_book/216",
+             "order_book": {"nonce": 1, "bids": [], "asks": []}},
+            t0 + 602_000_000,
+        )
+        self.assertNotIn(key, collector.aux_since_book_us)
 
     async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
         # A quiet market (no trades, no stats either) is just quiet, not stalled.
