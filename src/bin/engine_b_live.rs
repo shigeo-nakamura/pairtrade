@@ -1574,11 +1574,22 @@ impl EngineBLiveEngine {
             // review).
             let grown = new_open_size - p.open_size;
             let old_basis = p.entry_price;
-            if let Some(e) = live.entry_price {
-                p.entry_price = e;
-                p.entry_price_estimated = false;
-            } else {
-                p.entry_price_estimated = true;
+            match live.entry_price {
+                Some(e) => {
+                    p.entry_price = e;
+                    p.entry_price_estimated = false;
+                }
+                None => {
+                    // No exchange basis: assume the added quantity was
+                    // bought near the current mid and blend, rather than
+                    // valuing it at the old basis (pairtrade#275 Codex
+                    // review).
+                    if new_open_size > 0.0 && price > 0.0 {
+                        p.entry_price =
+                            (p.entry_price * p.open_size + price * grown) / new_open_size;
+                    }
+                    p.entry_price_estimated = true;
+                }
             }
             p.size += grown;
             let reason = format!(
@@ -2335,7 +2346,12 @@ impl EngineBLiveEngine {
                 // persisted, see KNOWN GAPS), so debot-dashboard's
                 // "positions_ready !== false means trustworthy" read must
                 // not be told otherwise.
-                positions_ready: !(self.day.restart_recovered || self.state.position_unconfirmed),
+                // Not trustworthy while a sendTx is awaiting exchange
+                // confirmation either: the exchange may already differ from
+                // the in-memory list (pairtrade#275 Codex review).
+                positions_ready: !(self.day.restart_recovered
+                    || self.state.position_unconfirmed
+                    || self.pending.is_some()),
                 positions,
                 pnl_total: self.state.realized_pnl_session,
                 pnl_today: self.state.pnl_today,
