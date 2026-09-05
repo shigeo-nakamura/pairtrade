@@ -62,10 +62,14 @@
 //!   §4): live entries and exits are confirmed against the exchange's own
 //!   position (`get_positions()`, WS-fed `account_all`) within
 //!   `fill_confirm_timeout_secs`, an IOC that leaves no position is
-//!   treated as unfilled (no retry that day), a position the exchange
-//!   already reports before we submit is adopted instead of re-submitted,
-//!   and every exit is sized to the exchange's current position, not to
-//!   this process's memory of the entry. PnL still uses the WS mid as the
+//!   treated as unfilled (no retry that day), at most one entry `sendTx`
+//!   is ever sent per session day (a send error is followed by the same
+//!   position watch, never by a re-submit -- REST and WS limits are
+//!   coupled, so a position read right after a timeout can be a false
+//!   negative), a position the exchange already reports before we submit
+//!   is adopted instead of re-submitted, and every exit is sized to the
+//!   exchange's current position, not to this process's memory of the
+//!   entry. PnL still uses the WS mid as the
 //!   exit price (the fill price itself is not read back).
 //! - No out-of-sample validation (Phase 0B) or paper-trade rehearsal
 //!   (Phase 1) of this code before it places real orders.
@@ -1319,12 +1323,12 @@ impl EngineBLiveEngine {
 
         if !self.cfg.dry_run {
             // Exchange truth before we send anything (bot-strategy#875
-            // G-4): a previous tick's `sendTx` may have timed out on our
-            // side after Lighter accepted it. If the account already
-            // holds `us_primary`, adopt that position instead of
-            // submitting a second order. Fail closed on an unreadable
-            // account -- the next 5 s tick retries while still inside
-            // `entry_deadline_secs`.
+            // G-4): a prior process (crash / restart between sendTx and
+            // persisting `last_session_date`) may have left a position.
+            // If the account already holds `us_primary`, adopt that
+            // position instead of submitting a second order. Fail closed
+            // on an unreadable account -- the next 5 s tick retries while
+            // still inside `entry_deadline_secs`.
             match self.connector.get_positions().await {
                 Ok(positions) => {
                     if let Some(existing) =
@@ -1332,8 +1336,7 @@ impl EngineBLiveEngine {
                     {
                         log::warn!(
                             "[ENTRY] exchange already holds {} {} size={:.6} before submit -- adopting it \
-                             instead of sending a second order (prior sendTx likely accepted after a \
-                             local timeout)",
+                             instead of sending a second order",
                             existing.side,
                             self.cfg.us_primary_symbol,
                             existing.size
@@ -1374,10 +1377,64 @@ impl EngineBLiveEngine {
         }
         let requested = match self.submit_order(side, size, false).await {
             Ok(requested) => requested.to_f64().unwrap_or(size),
-            Err(e) => {
-                // Not marking the day as acted: the next tick re-checks the
-                // exchange position first (above) and only then re-submits.
+            Err(e) if self.cfg.dry_run => {
                 log::error!("[ENTRY] order failed: {e:?}");
+                return;
+            }
+            Err(e) => {
+                // At most ONE entry sendTx per session day (bot-strategy#875
+                // G-4). A local timeout / 5xx / rate-limit does not prove
+                // Lighter rejected the order, and a single position read
+                // right after it can be a false negative because REST and
+                // WS limits are coupled (the same stress delays the
+                // account_all fill update). So: never re-submit today;
+                // instead watch the exchange position for the full confirm
+                // window and adopt whatever appears.
+                log::error!(
+                    "[ENTRY] order failed ({e:?}); no re-submit today -- watching the exchange \
+                     position for {}s in case Lighter accepted it anyway",
+                    self.cfg.fill_confirm_timeout_secs
+                );
+                match self.await_exchange_position(true).await {
+                    Ok(Some(filled)) => {
+                        let entry_price = filled.entry_price.unwrap_or(price);
+                        self.record_entry(
+                            OpenPosition {
+                                side: filled.side,
+                                entry_price,
+                                size: filled.size,
+                                entered_at_us: now_us,
+                            },
+                            epsilon,
+                            notional_usd,
+                            " adopted_after_send_error=true",
+                        );
+                    }
+                    Ok(None) => {
+                        send_notification(
+                            format!("Han Bridge ENTRY FAILED {}", self.cfg.us_primary_symbol),
+                            format!(
+                                "sendTx error and no position within {}s: {e:?}. Skipped today.",
+                                self.cfg.fill_confirm_timeout_secs
+                            ),
+                        );
+                        self.record_no_position_today();
+                    }
+                    Err(pe) => {
+                        log::error!(
+                            "[ENTRY] order failed AND exchange positions unreadable ({pe:?}) -- position \
+                             UNKNOWN; marking today as acted. Check the exchange account manually."
+                        );
+                        send_notification(
+                            format!("Han Bridge ENTRY UNCONFIRMED {}", self.cfg.us_primary_symbol),
+                            format!(
+                                "sendTx error ({e:?}) and get_positions failed for {}s ({pe:?}). Manual check required.",
+                                self.cfg.fill_confirm_timeout_secs
+                            ),
+                        );
+                        self.record_no_position_today();
+                    }
+                }
                 return;
             }
         };

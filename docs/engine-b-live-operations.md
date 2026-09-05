@@ -61,9 +61,13 @@ GAPS section -- do not duplicate that list here; read it there.
   IOC's HTTP 200 -- Lighter's 200 means "accepted", not "executed". No
   position within the window → `[ENTRY] IOC accepted ... treating as
   unfilled`, a `Han Bridge ENTRY UNFILLED` notification, and no retry that
-  day. Before submitting, the engine also reads the exchange position and
-  *adopts* an existing one instead of sending a second order (a prior
-  `sendTx` that timed out locally after Lighter accepted it). Every exit
+  day. **At most one entry `sendTx` is sent per session day**: a send error
+  (timeout, 5xx, rate limit, rejection) is never followed by a re-submit;
+  the engine watches the exchange position for the same window and adopts
+  a position if one appears (`Han Bridge ENTRY FAILED` if none does).
+  Before submitting, the engine also reads the exchange position and
+  *adopts* an existing one instead of sending a second order (a position
+  left by a prior process). Every exit
   is sized to the exchange's current position and only counts as done
   when the exchange reports flat; if the account channel is unreadable the
   exit waits, except past `exit_deadline` where a reduce-only for the
