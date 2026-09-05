@@ -204,7 +204,7 @@ Measured on the host, current binary (pairtrade `7ba80fb`):
 
 | window | REST calls | detail |
 |---|---|---|
-| 2026-09-04 11:27 → 14:59 UTC (3.5 h, one process lifetime) | **3** | `orderBooks`, `orderBookDetails`, `funding-rates`, all at startup |
+| 2026-09-04 11:27 → 14:59 UTC (3.5 h, one process lifetime) | **3** | `orderBooks`, `orderBookDetails`, `funding-rates`, all at startup. Plus one conditional call this measurement did not catch in `[API_TRACKER]`: with the provisioned `LIGHTER_ACCOUNT_INDEX=0`, `DexConnectorBox::create` first awaits `discover_account_index(wallet_address)` (REST, weight 300) before `start()` -- budget **4** startup requests per process start |
 | steady state | 0 / min | prices, positions, fills all arrive over WS |
 
 Per-boundary REST cost of the order path, worst case:
@@ -217,7 +217,8 @@ Per-boundary REST cost of the order path, worst case:
 | `sendTx` (entry) | 1 | 6 | |
 | exit: same as entry minus the eligibility gate | 1–3 | | |
 
-Happy path: ≤ ~8 requests per trading day against a 60 / min budget.
+Happy path: ≤ ~9 requests per trading day (4 at startup incl. account
+discovery, ≤ 5 across the two boundaries) against a 60 / min budget.
 
 Failure-path ceiling (this is what A-8 has to be judged on, not the happy
 path). With the binary running today (before pairtrade#275): a `sendTx`
