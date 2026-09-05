@@ -592,6 +592,13 @@ struct OpenPosition {
     /// open remainder at the final price.
     realized_partial_pnl: f64,
     entered_at_us: i64,
+    /// This position does not belong to today's signal (adopted from the
+    /// exchange with unknown origin, recovered after an UNCONFIRMED send,
+    /// or carried over midnight because its exit kept failing): its
+    /// intended exit window is unknown or already past, so `maybe_exit`
+    /// flattens it on the next tick instead of waiting for today's `t2`
+    /// (pairtrade#275 Codex review).
+    flatten_asap: bool,
 }
 
 /// Fill / flat confirmation in flight, advanced by `poll_pending_confirm`
@@ -1061,8 +1068,12 @@ impl EngineBLiveEngine {
             // before t1 the position is gone and a t1-time check would
             // let a new entry through (pairtrade#275 Codex review).
             log::warn!(
-                "[DAY] {today} starts with a carried-over position/exit in flight; no new entry today"
+                "[DAY] {today} starts with a carried-over position/exit in flight; no new entry today, \
+                 and the position is flattened on the next tick rather than at today's t2"
             );
+            if let Some(p) = self.position.as_mut() {
+                p.flatten_asap = true;
+            }
             self.day.entered = true;
             self.state.last_session_date = Some(today.to_string());
             atomic_write_json(&self.cfg.state_path, &self.state);
@@ -1273,6 +1284,7 @@ impl EngineBLiveEngine {
             open_size: live.size,
             realized_partial_pnl: 0.0,
             entered_at_us: now_us,
+            flatten_asap: true,
         });
         send_notification(
             format!("Han Bridge ENTRY ADOPTED {} {}", self.cfg.us_primary_symbol, live.side),
@@ -1520,6 +1532,7 @@ impl EngineBLiveEngine {
                 open_size: filled.size,
                 realized_partial_pnl: 0.0,
                 entered_at_us: now_us,
+                flatten_asap: false,
             },
             epsilon,
             notional_usd,
@@ -1885,6 +1898,7 @@ impl EngineBLiveEngine {
                                 open_size: existing.size,
                                 realized_partial_pnl: 0.0,
                                 entered_at_us: now_us,
+                                flatten_asap: true,
                             },
                             epsilon,
                             notional_usd,
@@ -1958,6 +1972,7 @@ impl EngineBLiveEngine {
                         open_size: requested.to_f64().unwrap_or(size),
                         realized_partial_pnl: 0.0,
                         entered_at_us: sent_at_us,
+                        flatten_asap: false,
                     },
                     epsilon,
                     notional_usd,
@@ -1997,19 +2012,33 @@ impl EngineBLiveEngine {
     }
 
     async fn maybe_exit(&mut self, now_us: i64) {
-        let Some((_t0, _t1, t2)) = self.window else {
-            return;
-        };
         let Some(pos) = self.position.clone() else {
             return;
         };
-        if self.day.exited || now_us < t2 {
-            return;
-        }
-        let emergency = now_us > t2 + self.cfg.exit_deadline_secs * 1_000_000;
-        if emergency {
-            log::warn!("[EXIT] exit_deadline passed; forcing emergency close");
-        }
+        // A position that is not today's own entry (adopted / recovered /
+        // carried over) has no valid window to wait for: flatten now, with
+        // emergency semantics, even on a closed day.
+        let emergency = if pos.flatten_asap {
+            log::warn!(
+                "[EXIT] flattening a position whose original exit window is unknown or past \
+                 ({} size={:.6}); not waiting for today's t2",
+                pos.side,
+                pos.open_size
+            );
+            true
+        } else {
+            let Some((_t0, _t1, t2)) = self.window else {
+                return;
+            };
+            if self.day.exited || now_us < t2 {
+                return;
+            }
+            let emergency = now_us > t2 + self.cfg.exit_deadline_secs * 1_000_000;
+            if emergency {
+                log::warn!("[EXIT] exit_deadline passed; forcing emergency close");
+            }
+            emergency
+        };
         let Some(price) = self.latest_price.get(&self.cfg.us_primary_symbol).copied() else {
             return;
         };

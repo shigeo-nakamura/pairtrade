@@ -82,7 +82,11 @@ GAPS section -- do not duplicate that list here; read it there.
   adoption), and only RISK_ACK -- after the operator has reconciled
   against the exchange -- clears the flag and the halt. A same-side
   position that grows outside the engine's own orders re-bases the cost
-  on the exchange's average entry price and halts new entries. `status.json`'s position `size` is the live open quantity, not the
+  on the exchange's average entry price and halts new entries. Any
+  position that is not today's own confirmed entry (adopted with unknown
+  origin, recovered after `UNCONFIRMED`, or carried over midnight) is
+  flattened on the next tick with emergency semantics instead of waiting
+  for today's `t2` -- its intended exit window is unknown or already past. `status.json`'s position `size` is the live open quantity, not the
   entry quantity. The pre-send
   marker write is checked: if `risk_state.json` cannot be written the
   order is not sent that tick. **At most one entry `sendTx` per session day** --
