@@ -192,7 +192,10 @@ states plainly which parts are **not** done online.
    `event_count`, `missing_duration_us`, `out_of_order_count`,
    `duplicate_count`, `sequence_gap_count`, `stale_quote_duration_us`,
    `crossed_book_duration_us` (F0-10) must be derived at analysis time
-   from `book_event` / `trade` / `data_gap` / `ws_connection`.
+   from `book_event` / `trade` / `data_gap` / **`sealed_gap_interval`** /
+   `ws_connection` -- `missing_duration_us` in particular must union
+   `data_gap` with `sealed_gap_interval`, since a gap whose continuation
+   landed in an already-sealed hour exists only in the latter.
    `reconnect_count` and `duplicate_count` are the exceptions.
    `duplicate_count`: replayed / duplicate trades are discarded by the
    replay-alias check, the sealed-index check or `INSERT OR IGNORE`
@@ -221,9 +224,11 @@ states plainly which parts are **not** done online.
 - Host clock: `chronyc tracking` (the host is NTP-disciplined; §7's 250 ms /
   1 s thresholds are a host property, not something the collector measures).
 - Gap inventory for a partition:
-  `SELECT channel, reason, COUNT(*) FROM data_gap GROUP BY 1, 2` and
+  `SELECT channel, reason, COUNT(*) FROM data_gap GROUP BY 1, 2`,
   `SELECT venue, symbol, channel, reason FROM data_gap WHERE ts_end_us IS NULL`
-  (open gaps). `channel = order_book` rows are sequence breaks; `channel =
+  (open gaps), and `SELECT venue, symbol, channel, sealed_partition FROM
+  sealed_gap_interval` (intervals known unusable whose original gap row
+  lives in an already-sealed hour -- always union these with `data_gap`). `channel = order_book` rows are sequence breaks; `channel =
   connection` rows are disconnects.
 - Live sync state: `engine_b_phase0_book_synced{market_id=...}` on
   `127.0.0.1:9472/metrics` -- a market stuck at `0` while
