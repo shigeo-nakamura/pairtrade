@@ -196,7 +196,10 @@ states plainly which parts are **not** done online.
    `ws_connection` -- `missing_duration_us` in particular must union
    `data_gap` with `sealed_gap_interval`, since a gap whose continuation
    landed in an already-sealed hour exists only in the latter.
-   `reconnect_count` and `duplicate_count` are the exceptions.
+   `reconnect_count`, `duplicate_count` and `sequence_gap_count` are the
+   exceptions (`sequence_gap_count`: repeated invalid deltas before the
+   replacement snapshot are coalesced into the one open `order_book` gap
+   row, so only the Prometheus counter has the per-break count).
    `duplicate_count`: replayed / duplicate trades are discarded by the
    replay-alias check, the sealed-index check or `INSERT OR IGNORE`
    without a rejection row or a durable counter, and `local_sequence`
@@ -265,9 +268,18 @@ snapshot can be proven synced or not, every interval in which a market's
 book was unusable is covered by a bounded `data_gap` (or
 `sealed_gap_interval`) row -- coalesced, not one row per disconnect: a
 disconnect while a market is already unsynced extends the open gap, and
-the per-disconnect record is `ws_connection` -- every `order_book`
-sequence break is its own `data_gap` row, and server versus receive time
-are both kept in a known unit. Items 1–3 above are
+the per-disconnect record is `ws_connection` -- `order_book` sequence
+breaks are likewise coalesced into one open `order_book` gap per market
+until the replacement snapshot arrives (`idx_data_gap_open_order_book`;
+the per-break count lives only in `engine_b_phase0_sequence_gap_total`),
+and server versus receive time are both kept in a known unit. One
+interval is **not** recorded anywhere: from a connection's start until
+its first complete snapshot for a market (`BookState` starts unsynced,
+but a `connection` gap is opened only on disconnect), so a delayed or
+missing initial snapshot is unusable time that `missing_duration_us`
+derived from the tables will omit -- bound it offline as `ws_connection.
+started_ts_recv_us` → first `is_complete_snapshot = 1` row of that
+session and market. Items 1–3 above are
 analysis-time obligations (1, 2) and a host-level check (3). "Resolved"
 here means *detected and recorded*, not *self-healing*: the collector has
 no automatic resubscribe when a post-reconnect snapshot never arrives, so
