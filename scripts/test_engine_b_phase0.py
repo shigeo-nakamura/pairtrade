@@ -528,6 +528,34 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(ws.messages), engine_b.WATCHDOG_MAX_FRAMES_PER_MIN)
         self.assertGreater(len(ws.messages), 0)
 
+    async def test_burst_of_stale_deltas_resubscribes_once(self) -> None:
+        # Codex on pairtrade#277: queued deltas against an unsynced book must
+        # not each send unsubscribe/subscribe; only the first within
+        # book_resubscribe_after_ms does, the rest are suppressed.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        collector.book_subscribe_us[key] = t0 - 60_000_000
+        state = collector.books.setdefault(key, engine_b.BookState())
+        state.synced = True
+        state.last_nonce = "10"
+        for i in range(5):
+            await collector.handle_book(
+                ws,
+                venue,
+                connection,
+                {
+                    "type": "update/order_book",
+                    "channel": "order_book/216",
+                    "order_book": {"begin_nonce": 50 + i, "nonce": 51 + i, "bids": [], "asks": []},
+                },
+                t0 + i * 200_000,
+            )
+        self.assertEqual(len(ws.messages), 2)  # one unsubscribe + one subscribe
+        self.assertEqual(collector.book_subscribe_us[key], t0)
+
     async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
         # A quiet market (no trades, no stats either) is just quiet, not stalled.
         config, venue, sink, collector = self._collector()

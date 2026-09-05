@@ -3439,6 +3439,52 @@ class Collector:
             self.book_subscribe_us[(venue.name, market.market_id)] = subscribed_us
         LOG.info("Subscribed to public channels venue=%s markets=%d", venue.name, len(venue.markets))
 
+    async def resubscribe_book(
+        self,
+        ws: Any,
+        venue: VenueConfig,
+        market_id: int,
+        recv_us: int,
+        *,
+        unsubscribe_first: bool,
+        reason: str,
+    ) -> bool:
+        """Single choke point for every order_book (re)subscribe frame this
+        process sends after the initial subscription (bot-strategy#908):
+        spaced at least ``book_resubscribe_after_ms`` per market and capped
+        at ``WATCHDOG_MAX_FRAMES_PER_MIN`` frames per venue per rolling
+        minute, whichever path asks -- the watchdog or ``handle_book``'s
+        sequence-break handler (a burst of already-queued deltas against an
+        unsynced book must not turn into a burst of subscribe frames).
+        Returns True when frames were sent."""
+        key = (venue.name, market_id)
+        last_subscribe_us = self.book_subscribe_us.get(key)
+        if (
+            last_subscribe_us is not None
+            and recv_us - last_subscribe_us < self.config.book_resubscribe_after_ms * 1_000
+        ):
+            LOG.debug(
+                "suppressing order_book re-subscribe venue=%s market_id=%s (%s): last subscribe %.1fs ago",
+                venue.name,
+                market_id,
+                reason,
+                (recv_us - last_subscribe_us) / 1_000_000,
+            )
+            return False
+        sent = self.watchdog_frames_us[venue.name]
+        while sent and recv_us - sent[0] > 60_000_000:
+            sent.popleft()
+        frames = 2 if unsubscribe_first else 1
+        if len(sent) + frames > WATCHDOG_MAX_FRAMES_PER_MIN:
+            self.metrics.inc("engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name})
+            return False
+        if unsubscribe_first:
+            await send_public_control(ws, {"type": "unsubscribe", "channel": f"order_book/{market_id}"})
+        await send_public_control(ws, {"type": "subscribe", "channel": f"order_book/{market_id}"})
+        sent.extend([recv_us] * frames)
+        self.book_subscribe_us[key] = recv_us
+        return True
+
     async def watchdog_books(
         self,
         ws: Any,
@@ -3470,15 +3516,7 @@ class Collector:
         if recv_us - last < 1_000_000:
             return
         self.last_book_watchdog_us[venue.name] = recv_us
-        sent = self.watchdog_frames_us[venue.name]
-        while sent and recv_us - sent[0] > 60_000_000:
-            sent.popleft()
-        frames_left = WATCHDOG_MAX_FRAMES_PER_MIN - len(sent)
-        if frames_left < 2:
-            self.metrics.inc("engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name})
-            return
-        # Each stall recovery costs two frames; never start one we cannot pay.
-        budget = min(self.config.book_watchdog_batch, frames_left // 2)
+        budget = self.config.book_watchdog_batch
         resubscribe_after_us = self.config.book_resubscribe_after_ms * 1_000
         stall_after_us = self.config.book_stall_after_ms * 1_000
         # Oldest subscribe deadline first, so a batch smaller than the number
@@ -3507,16 +3545,16 @@ class Collector:
                     venue.name,
                     market.symbol,
                 )
-                self.metrics.inc(
-                    "engine_b_phase0_book_resubscribe_total",
-                    {"venue": venue.name, "symbol": market.symbol, "reason": "unsynced"},
-                )
-                await send_public_control(
-                    ws, {"type": "subscribe", "channel": f"order_book/{market.market_id}"}
-                )
-                sent.append(recv_us)
-                self.book_subscribe_us[key] = recv_us
-                budget -= 1
+                if await self.resubscribe_book(
+                    ws, venue, market.market_id, recv_us, unsubscribe_first=False, reason="unsynced"
+                ):
+                    self.metrics.inc(
+                        "engine_b_phase0_book_resubscribe_total",
+                        {"venue": venue.name, "symbol": market.symbol, "reason": "unsynced"},
+                    )
+                    budget -= 1
+                else:
+                    return  # per-minute cap reached; nothing more this pass
                 continue
             last_book_us = self.book_last_recv_us.get(key)
             last_activity_us = self.market_last_activity_us.get(key)
@@ -3579,14 +3617,12 @@ class Collector:
                     "reason": "book_channel_stalled",
                 },
             )
-            await send_public_control(
-                ws, {"type": "unsubscribe", "channel": f"order_book/{market.market_id}"}
-            )
-            await send_public_control(
-                ws, {"type": "subscribe", "channel": f"order_book/{market.market_id}"}
-            )
-            sent.extend((recv_us, recv_us))
-            self.book_subscribe_us[key] = recv_us
+            # The market was synced, so its last subscribe is old: the
+            # spacing check passes; only the per-minute cap can refuse.
+            if not await self.resubscribe_book(
+                ws, venue, market.market_id, recv_us, unsubscribe_first=True, reason="stalled"
+            ):
+                return
             budget -= 1
 
     async def handle_book(
@@ -3662,11 +3698,13 @@ class Collector:
                     "reason": reason,
                 },
             )
-            await send_public_control(ws, {"type": "unsubscribe", "channel": f"order_book/{market_id}"})
-            await send_public_control(ws, {"type": "subscribe", "channel": f"order_book/{market_id}"})
-            # Restart the watchdog's retry spacing from this re-subscribe, so
-            # it does not fire again in the same iteration (bot-strategy#908).
-            self.book_subscribe_us[(venue.name, market_id)] = recv_us
+            # Through the shared limiter: a queue of stale deltas against an
+            # unsynced book must not become a burst of subscribe frames
+            # (bot-strategy#908); the watchdog retries if this one is
+            # suppressed.
+            await self.resubscribe_book(
+                ws, venue, market_id, recv_us, unsubscribe_first=True, reason=reason
+            )
             self.metrics.book_synced[(venue.name, market_id)] = False
             return
         self.metrics.book_synced[(venue.name, market_id)] = state.synced
