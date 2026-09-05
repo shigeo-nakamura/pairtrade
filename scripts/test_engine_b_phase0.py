@@ -9,6 +9,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+import subprocess
 import tempfile
 import types
 import unittest
@@ -2108,6 +2109,61 @@ class RestPollingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_installer_tolerates_state_files_that_vanish_mid_walk(self) -> None:
+        # bot-strategy#908 item 8: the observer keeps writing while the
+        # installer re-owns /var/lib/engine-b-phase0, so SQLite -shm/-wal
+        # side files can vanish between find and chgrp. `chgrp -R` made that
+        # fail the whole deploy; the walk must skip vanished paths and still
+        # fail on a real permission problem.
+        installer = INSTALLER_PATH.read_text()
+        self.assertNotIn('chgrp -R "$SERVICE_GROUP" "$STATE_DIR"', installer)
+        self.assertIn("reown_state_tree", installer)
+        syntax = subprocess.run(
+            ["bash", "-n", str(INSTALLER_PATH)], capture_output=True, text=True
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        start = installer.index("reown_state_tree() {")
+        end = installer.index("\n}\n", start) + 3
+        function_source = installer[start:end]
+        group = subprocess.run(
+            ["id", "-gn"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            (state_dir / "data").mkdir(parents=True)
+            (state_dir / "data" / "engine_b_phase0_20260823_00.sqlite3").write_text("x")
+            # A dangling symlink behaves like a file that vanished after the
+            # walk enumerated it: chgrp fails and `-e` is false.
+            (state_dir / "data" / "engine_b_phase0_20260823_00.sqlite3-shm").symlink_to(
+                state_dir / "data" / "gone-shm"
+            )
+            script = (
+                "set -euo pipefail\n"
+                f"SERVICE_GROUP={group}\n"
+                f"STATE_DIR={state_dir}\n"
+                f"{function_source}\n"
+                "reown_state_tree\n"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("vanished during re-own", result.stderr)
+            # A path that exists but cannot be re-owned is still fatal.
+            script_fail = (
+                "set -euo pipefail\n"
+                "SERVICE_GROUP=no-such-group-engine-b\n"
+                f"STATE_DIR={state_dir}\n"
+                f"{function_source}\n"
+                "reown_state_tree\n"
+            )
+            failure = subprocess.run(
+                ["bash", "-c", script_fail], capture_output=True, text=True
+            )
+            self.assertNotEqual(failure.returncode, 0)
+            self.assertIn("failed to re-own", failure.stderr)
+
     def test_installer_records_commit_and_installs_all_units(self) -> None:
         installer = INSTALLER_PATH.read_text()
         workflow = DEPLOY_WORKFLOW_PATH.read_text()

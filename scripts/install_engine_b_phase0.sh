@@ -76,10 +76,33 @@ install -o root -g "$SERVICE_GROUP" -m 0440 "$REQUIREMENTS" \
 # Preserve uninterrupted writes for an already-running legacy ec2-user
 # process while making all existing state group-writable for the dedicated
 # identity that takes over on the next operator-controlled restart.
+#
+# The observer keeps writing while this runs (deploy != restart), so SQLite
+# -wal/-shm side files and partitions being sealed can vanish between the
+# directory walk and the chgrp/chmod call. `chgrp -R` treated that as a hard
+# failure and turned the whole Deploy Configs job red (bot-strategy#908
+# item 8: engine_b_phase0_20260823_00.sqlite3-shm). A path that no longer
+# exists is not an error; any other failure still aborts the install.
+reown_state_tree() {
+  local path mode
+  while IFS= read -r -d '' path; do
+    if [ -d "$path" ]; then
+      mode=g+rwx,o-rwx
+    else
+      mode=g+rw,o-rwx
+    fi
+    if ! { chgrp "$SERVICE_GROUP" "$path" && chmod "$mode" "$path"; } 2>/dev/null; then
+      if [ -e "$path" ]; then
+        echo "failed to re-own $path for $SERVICE_GROUP" >&2
+        return 1
+      fi
+      echo "skipping $path: vanished during re-own" >&2
+    fi
+  done < <(find "$STATE_DIR" -print0)
+}
+
 if [ -d "$STATE_DIR" ]; then
-  chgrp -R "$SERVICE_GROUP" "$STATE_DIR"
-  find "$STATE_DIR" -type d -exec chmod g+rwx,o-rwx {} +
-  find "$STATE_DIR" -type f -exec chmod g+rw,o-rwx {} +
+  reown_state_tree
 else
   install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 \
     "$STATE_DIR" "$STATE_DIR/data" "$STATE_DIR/locks" "$STATE_DIR/sealed" \
