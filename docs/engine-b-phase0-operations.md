@@ -261,9 +261,13 @@ attributed.
 ### Resolution
 
 For the Phase 0 logger's purpose A-10 is resolved: every stored book
-snapshot can be proven synced or not, every disconnect and every
-`order_book` sequence break is a bounded `data_gap` row, and server versus
-receive time are both kept in a known unit. Items 1–3 above are
+snapshot can be proven synced or not, every interval in which a market's
+book was unusable is covered by a bounded `data_gap` (or
+`sealed_gap_interval`) row -- coalesced, not one row per disconnect: a
+disconnect while a market is already unsynced extends the open gap, and
+the per-disconnect record is `ws_connection` -- every `order_book`
+sequence break is its own `data_gap` row, and server versus receive time
+are both kept in a known unit. Items 1–3 above are
 analysis-time obligations (1, 2) and a host-level check (3). "Resolved"
 here means *detected and recorded*, not *self-healing*: the collector has
 no automatic resubscribe when a post-reconnect snapshot never arrives, so
