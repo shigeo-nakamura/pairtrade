@@ -3582,12 +3582,23 @@ class Collector:
                 )
                 return False
             self.break_reserve_used_us[key] = stamp_us
+        # Account each frame right after its own send: if the socket dies
+        # between the two awaited sends, the unsubscribe that did go out is
+        # still counted (and the retry deadline only moves once the subscribe
+        # actually went out).
         if unsubscribe_first:
             await send_public_control(ws, {"type": "unsubscribe", "channel": f"order_book/{market_id}"})
+            sent.append(self._clock_at_least(stamp_us))
         await send_public_control(ws, {"type": "subscribe", "channel": f"order_book/{market_id}"})
-        sent.extend([stamp_us] * frames)
-        self.book_subscribe_us[key] = stamp_us
+        subscribed_us = self._clock_at_least(stamp_us)
+        sent.append(subscribed_us)
+        self.book_subscribe_us[key] = subscribed_us
         return True
+
+    def _clock_at_least(self, floor_us: int) -> int:
+        """Send-time stamp: wall clock, never earlier than the message time
+        that drove this call (tests pin the clock to 0)."""
+        return max(floor_us, self._clock())
 
     def can_send_frames(self, venue: VenueConfig, recv_us: int, frames: int) -> bool:
         """True if ``frames`` more WS frames fit under the watchdog share of
