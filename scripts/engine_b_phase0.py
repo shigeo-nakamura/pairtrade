@@ -63,10 +63,16 @@ WATCHDOG_MAX_FRAMES_PER_MIN = 100
 # `load_config` rejects venues where that reserve would leave the watchdog
 # fewer than WATCHDOG_MIN_SHARE_FRAMES.
 WATCHDOG_MIN_SHARE_FRAMES = 20
-# Frames per minute set aside for the WebSocket library's automatic keepalive
-# (`ping_interval=20` -> 3 protocol pings/min, plus protocol pong replies to
-# server pings), which never pass through the application-level accounting.
-KEEPALIVE_RESERVE_FRAMES = 6
+# Frames per minute set aside for keepalive traffic that is never gated:
+# the WebSocket library's automatic protocol pings (`ping_interval=20` -> 3/min)
+# and pong replies to server protocol pings (~3/min), plus application-level
+# pong replies to server `{"type":"ping"}` frames (Lighter currently sends
+# none; 4/min budgeted). Keepalive replies are deliberately never withheld --
+# a dropped pong can cost the whole connection, i.e. a 42-frame resubscribe
+# burst -- so they draw from this reserve and, only if a server ever pinged
+# faster than budgeted, from the subscription share (which then backs off
+# because the pongs are counted in the same window).
+KEEPALIVE_RESERVE_FRAMES = 10
 MAX_TRADE_EVENT_AGE_US = 7 * 24 * 60 * 60 * 1_000_000
 MAX_TRADE_EVENT_FUTURE_US = 5 * 60 * 1_000_000
 OHLCV_FINALIZE_GRACE_US = 120_000_000
@@ -3391,9 +3397,11 @@ class Collector:
                         elif message_type == "ping":
                             await send_public_control(ws, {"type": "pong"})
                             # Every outbound client message counts against the
-                            # per-IP budget, pongs included; the limiter's
-                            # window must see them so subscribe traffic backs
-                            # off accordingly (bot-strategy#908).
+                            # per-IP budget, pongs included; they are budgeted
+                            # in KEEPALIVE_RESERVE_FRAMES and never withheld,
+                            # and the limiter's window sees them so subscribe
+                            # traffic backs off if a server ever pinged faster
+                            # than budgeted (bot-strategy#908).
                             self.watchdog_frames_us[venue.name].append(
                                 self._clock_at_least(recv_us)
                             )

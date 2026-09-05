@@ -146,8 +146,9 @@ actually sent). At most `book_watchdog_batch`
 (re)subscribe frames per venue per rolling minute across the reconnect
 burst, the watchdog and sequence-break recovery (half of Lighter's 200
 client messages / minute per IP); a reconnect burst subscribes market by market, waiting for budget;
-6 frames/min are set aside for the WebSocket library's own keepalive
-pings/pongs and 2 frames per configured market for proven sequence breaks
+10 frames/min are set aside for keepalive traffic (library protocol
+pings/pongs and application-level pong replies, which are never withheld)
+and 2 frames per configured market for proven sequence breaks
 (`load_config` rejects a venue whose reserve would leave the watchdog
 fewer than 20 frames/min). All three keys are
 optional in `phase0.json`. A feed task cancelled without `stop_event`
