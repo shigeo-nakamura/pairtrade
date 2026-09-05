@@ -504,7 +504,7 @@ Archive controls (environment variables):
 | `ENGINE_B_PHASE0_RETENTION_HOURS` | `0` | Skip partitions whose **end** is newer than now minus this many hours; also protects interrupted-seal recovery. Set `24` for the proposed hot window. |
 | `ENGINE_B_PHASE0_MAX_PARTITIONS` | `0` | Maximum eligible partitions attempted per invocation, oldest first; `0` is unlimited. Busy/skipped attempts count. |
 | `ENGINE_B_PHASE0_ARCHIVE_PARTITION` | empty | Restrict a verification/recovery run to one `YYYYMMDD_HH`; never bypasses hot/current-hour protection. Missing or invalid targets fail. |
-| `ENGINE_B_PHASE0_MIN_FREE_BYTES` | `536870912` | Reserve left after the estimated scratch budget of four times DB plus WAL size. An insufficient preflight fails before checkpoint/upload. |
+| `ENGINE_B_PHASE0_MIN_FREE_BYTES` | `536870912` | Reserve left after the estimated scratch budget of four times DB plus WAL size. An insufficient full-DB preflight fails before checkpoint/upload. Every sidecar publication (including interrupted-seal recovery and reconciled-index republication) also checks the actual index plus seal download sizes against the remaining free space and this reserve. |
 
 All values are validated before modifying a partition. The space estimate is
 conservative planning, not a reservation: concurrent collection, sidecar sizes,

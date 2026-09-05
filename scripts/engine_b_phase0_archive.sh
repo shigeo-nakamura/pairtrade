@@ -85,6 +85,18 @@ persist_seal_sidecars() (
     echo "Invalid canonical archive URI in seal: $canonical_uri" >&2
     exit 1
   fi
+  # Recovery bypasses the full-DB preflight, and reconciled indexes can be
+  # larger than the source journal. Budget each actual download independently.
+  "$PYTHON_BIN" - "$DATA_DIR" "$MIN_FREE_BYTES" "$trade_index" "$seal" <<'PYSIDECARSPACE'
+from pathlib import Path
+import shutil
+import sys
+
+free = shutil.disk_usage(sys.argv[1]).free
+required = int(sys.argv[2]) + sum(Path(path).stat().st_size for path in sys.argv[3:])
+if free < required:
+    raise SystemExit(f"insufficient seal sidecar scratch space: free={free} required={required}")
+PYSIDECARSPACE
   remote_trade_index=$(mktemp "$DATA_DIR/.seal-index.remote.XXXXXX.sqlite3")
   remote_seal=$(mktemp "$DATA_DIR/.seal.remote.XXXXXX.json")
   trap 'rm -f -- "$remote_trade_index" "$remote_seal"' EXIT

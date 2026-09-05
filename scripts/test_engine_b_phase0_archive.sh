@@ -467,6 +467,24 @@ canonical_sha=$(sha256sum "$archive" | cut -d' ' -f1)
 trade_index_sha=$(sha256sum "$trade_index" | cut -d' ' -f1)
 rm -f -- "$remote_trade_index" "$remote_seal"
 cp "$restored_db" "$old_db"
+# Interrupted recovery must preserve the reserve before any sidecar upload.
+if FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
+    ENGINE_B_PHASE0_DATA_DIR="$DATA_DIR" \
+    ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
+    ENGINE_B_PHASE0_S3_PREFIX=changed-prefix \
+    ENGINE_B_PHASE0_PYTHON=python3 \
+    ENGINE_B_PHASE0_MIN_FREE_BYTES=999999999999999 \
+    ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true \
+    bash "$(dirname "$0")/engine_b_phase0_archive.sh" > "$ROOT/recovery-space.log" 2>&1; then
+  echo "Sealed recovery ignored the free-space reserve" >&2
+  exit 1
+fi
+grep -q 'insufficient seal sidecar scratch space' "$ROOT/recovery-space.log"
+test -f "$old_db"
+test ! -e "$remote_trade_index"
+test ! -e "$remote_seal"
+test "$(sha256sum "$trade_index" | cut -d' ' -f1)" = "$trade_index_sha"
+test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$canonical_sha"
 FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
 ENGINE_B_PHASE0_DATA_DIR="$DATA_DIR" \
 ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
