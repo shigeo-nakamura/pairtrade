@@ -63,7 +63,10 @@
 //!   exits are confirmed against the exchange's own
 //!   position (`get_positions()`, WS-fed `account_all`) within
 //!   `fill_confirm_timeout_secs` (polled once per 5 s tick, never a
-//!   blocking wait in the select loop), an IOC that leaves no position is
+//!   blocking wait in the select loop; the window starts from a clock
+//!   read taken after the send returns), `RiskState.last_session_date` is
+//!   persisted *before* the send so a restart mid-confirmation cannot
+//!   re-submit, an IOC that leaves no position is
 //!   treated as unfilled (no retry that day), at most one entry `sendTx`
 //!   is ever sent per session day (a send error is followed by the same
 //!   position watch, never by a re-submit -- REST and WS limits are
@@ -1721,7 +1724,21 @@ impl EngineBLiveEngine {
         // negative because REST and WS limits are coupled (the same stress
         // delays the account_all fill update), so the same tick-driven
         // confirmation watches the exchange either way.
+        // Durable "today's entry was attempted" marker BEFORE the send
+        // (pairtrade#275 Codex review): if the process dies between
+        // sendTx reaching Lighter and the in-memory `pending` resolving,
+        // a restart must not evaluate today again -- roll_day_if_needed
+        // reads this and sets day.entered. The position itself is still
+        // not persisted (KNOWN GAPS): after such a restart the operator
+        // checks the exchange, which is the documented recovery.
+        self.state.last_session_date = self.current_date.map(|d| d.to_string());
+        atomic_write_json(&self.cfg.state_path, &self.state);
         let submit = self.submit_order(side, size, false).await;
+        // Fresh clock: `now_us` is the tick's start time and the
+        // eligibility fetch / position read / sendTx above can take
+        // seconds, so a deadline based on it could already be expired
+        // when `pending` is installed (pairtrade#275 Codex review).
+        let sent_at_us = crate::now_us(); // the `now_us` parameter shadows the fn
         if self.cfg.dry_run {
             match submit {
                 Ok(requested) => self.record_entry(
@@ -1731,7 +1748,7 @@ impl EngineBLiveEngine {
                         entry_price_estimated: false,
                         size: requested.to_f64().unwrap_or(size),
                         open_size: requested.to_f64().unwrap_or(size),
-                        entered_at_us: now_us,
+                        entered_at_us: sent_at_us,
                     },
                     epsilon,
                     notional_usd,
@@ -1764,7 +1781,7 @@ impl EngineBLiveEngine {
             price,
             epsilon,
             notional_usd,
-            deadline_us: now_us + self.cfg.fill_confirm_timeout_secs.max(1) * 1_000_000,
+            deadline_us: sent_at_us + self.cfg.fill_confirm_timeout_secs.max(1) * 1_000_000,
             after_send_error,
             saw_reading: false,
         });
@@ -1872,7 +1889,8 @@ impl EngineBLiveEngine {
         // tick with the then-current remainder.
         self.pending = Some(PendingConfirm::Exit {
             exit_price: price,
-            deadline_us: now_us + self.cfg.fill_confirm_timeout_secs.max(1) * 1_000_000,
+            // Fresh clock after the send, same reason as the entry path.
+            deadline_us: crate::now_us() + self.cfg.fill_confirm_timeout_secs.max(1) * 1_000_000,
             saw_reading: false,
         });
     }

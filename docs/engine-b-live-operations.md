@@ -72,8 +72,11 @@ GAPS section -- do not duplicate that list here; read it there.
   manually before the exit window. Partial exits shrink only the tracked
   *open* size; PnL and the drawdown halt are booked on the size confirmed
   at entry. **At most one entry `sendTx` per session day** --
-  a send error is never followed by a re-submit, only by the same
-  position watch. A position the exchange already holds before submit is
+  `risk_state.json`'s `last_session_date` is written *before* the send
+  (so a crash/restart mid-confirmation cannot re-submit; after such a
+  restart, check the exchange for a position this process no longer
+  tracks), and a send error is never followed by a re-submit, only by
+  the same position watch. A position the exchange already holds before submit is
   adopted (`adopted_from_exchange=true origin=unknown`) instead of
   re-ordered, and a position carried over from a previous session (exit
   kept failing) blocks today's entry entirely. **Side mismatch** between
