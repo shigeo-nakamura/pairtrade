@@ -9,6 +9,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+import os
 import subprocess
 import tempfile
 import types
@@ -2113,8 +2114,10 @@ class DeploymentTests(unittest.TestCase):
         # bot-strategy#908 item 8: the observer keeps writing while the
         # installer re-owns /var/lib/engine-b-phase0, so SQLite -shm/-wal
         # side files can vanish between find and chgrp. `chgrp -R` made that
-        # fail the whole deploy; the walk must skip vanished paths and still
-        # fail on a real permission problem.
+        # fail the whole deploy; the walk must skip vanished paths, never
+        # follow a symlink (root-run chgrp/chmod over an observer-writable
+        # tree), surface find's own failures, and still fail on a real
+        # permission problem.
         installer = INSTALLER_PATH.read_text()
         self.assertNotIn('chgrp -R "$SERVICE_GROUP" "$STATE_DIR"', installer)
         self.assertIn("reown_state_tree", installer)
@@ -2129,40 +2132,60 @@ class DeploymentTests(unittest.TestCase):
         group = subprocess.run(
             ["id", "-gn"], capture_output=True, text=True, check=True
         ).stdout.strip()
-        with tempfile.TemporaryDirectory() as tmp:
-            state_dir = Path(tmp) / "state"
-            (state_dir / "data").mkdir(parents=True)
-            (state_dir / "data" / "engine_b_phase0_20260823_00.sqlite3").write_text("x")
-            # A dangling symlink behaves like a file that vanished after the
-            # walk enumerated it: chgrp fails and `-e` is false.
-            (state_dir / "data" / "engine_b_phase0_20260823_00.sqlite3-shm").symlink_to(
-                state_dir / "data" / "gone-shm"
-            )
+
+        def run(state_dir: Path, *, service_group: str, prelude: str = "") -> subprocess.CompletedProcess[str]:
             script = (
                 "set -euo pipefail\n"
-                f"SERVICE_GROUP={group}\n"
+                f"SERVICE_GROUP={service_group}\n"
                 f"STATE_DIR={state_dir}\n"
+                f"{prelude}"
                 f"{function_source}\n"
                 "reown_state_tree\n"
             )
-            result = subprocess.run(
-                ["bash", "-c", script], capture_output=True, text=True
+            return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            data_dir = state_dir / "data"
+            data_dir.mkdir(parents=True)
+            partition = data_dir / "engine_b_phase0_20260823_00.sqlite3"
+            partition.write_text("x")
+            partition.chmod(0o644)
+            outside = Path(tmp) / "outside-privileged-file"
+            outside.write_text("y")
+            outside.chmod(0o644)
+            (data_dir / "link-to-outside").symlink_to(outside)
+
+            # A path that the walk enumerated but that is gone by the time
+            # chgrp runs (shadow `find` appends one) is skipped, not fatal.
+            vanished = data_dir / "engine_b_phase0_20260823_00.sqlite3-shm"
+            prelude = (
+                "find() { command find \"$@\"; "
+                f"printf '%s\\0' '{vanished}'; }}\n"
             )
+            result = run(state_dir, service_group=group, prelude=prelude)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("vanished during re-own", result.stderr)
+            self.assertEqual(partition.stat().st_mode & 0o777, 0o660)
+            # The symlink was neither followed nor re-owned through.
+            self.assertEqual(outside.stat().st_mode & 0o777, 0o644)
+
             # A path that exists but cannot be re-owned is still fatal.
-            script_fail = (
-                "set -euo pipefail\n"
-                "SERVICE_GROUP=no-such-group-engine-b\n"
-                f"STATE_DIR={state_dir}\n"
-                f"{function_source}\n"
-                "reown_state_tree\n"
-            )
-            failure = subprocess.run(
-                ["bash", "-c", script_fail], capture_output=True, text=True
-            )
+            failure = run(state_dir, service_group="no-such-group-engine-b")
             self.assertNotEqual(failure.returncode, 0)
             self.assertIn("failed to re-own", failure.stderr)
+
+            # find's own failures (other than a vanished entry) propagate.
+            if os.geteuid() != 0:
+                sealed = state_dir / "sealed"
+                sealed.mkdir()
+                sealed.chmod(0o000)
+                try:
+                    unreadable = run(state_dir, service_group=group)
+                finally:
+                    sealed.chmod(0o755)
+                self.assertNotEqual(unreadable.returncode, 0)
+                self.assertIn("failed to enumerate", unreadable.stderr)
 
     def test_installer_records_commit_and_installs_all_units(self) -> None:
         installer = INSTALLER_PATH.read_text()

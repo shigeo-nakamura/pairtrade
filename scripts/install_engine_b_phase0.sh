@@ -84,21 +84,42 @@ install -o root -g "$SERVICE_GROUP" -m 0440 "$REQUIREMENTS" \
 # item 8: engine_b_phase0_20260823_00.sqlite3-shm). A path that no longer
 # exists is not an error; any other failure still aborts the install.
 reown_state_tree() {
-  local path mode
+  local path mode list err
+  list=$(mktemp)
+  err=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$list' '$err'" RETURN
+  # Directories and regular files only: the observer can write this tree,
+  # so a symlink must never be followed by a root-run chgrp/chmod (the old
+  # `chgrp -R` did not dereference symlinks met during traversal either).
+  # find's own status is checked -- only "No such file or directory"
+  # (an entry that vanished during the walk) is tolerated.
+  if ! find "$STATE_DIR" \( -type d -o -type f \) -print0 >"$list" 2>"$err"; then
+    if grep -qv 'No such file or directory' "$err"; then
+      cat "$err" >&2
+      echo "failed to enumerate $STATE_DIR" >&2
+      return 1
+    fi
+  fi
   while IFS= read -r -d '' path; do
+    if [ -L "$path" ]; then
+      # Replaced by a symlink since the walk enumerated it: never follow.
+      echo "skipping $path: symlink" >&2
+      continue
+    fi
     if [ -d "$path" ]; then
       mode=g+rwx,o-rwx
     else
       mode=g+rw,o-rwx
     fi
-    if ! { chgrp "$SERVICE_GROUP" "$path" && chmod "$mode" "$path"; } 2>/dev/null; then
+    if ! { chgrp -h "$SERVICE_GROUP" "$path" && chmod "$mode" "$path"; } 2>/dev/null; then
       if [ -e "$path" ]; then
         echo "failed to re-own $path for $SERVICE_GROUP" >&2
         return 1
       fi
       echo "skipping $path: vanished during re-own" >&2
     fi
-  done < <(find "$STATE_DIR" -print0)
+  done <"$list"
 }
 
 if [ -d "$STATE_DIR" ]; then

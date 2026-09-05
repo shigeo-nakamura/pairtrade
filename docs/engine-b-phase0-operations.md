@@ -449,8 +449,10 @@ manual install, provide both values explicitly. Because the observer keeps
 writing while the installer re-owns `/var/lib/engine-b-phase0`, a state file
 that vanishes mid-walk (SQLite `-wal` / `-shm` side files, a partition being
 sealed) is skipped with a `vanished during re-own` notice rather than
-failing the deploy (bot-strategy#908 item 8); a path that exists but cannot
-be re-owned still aborts the install.
+failing the deploy (bot-strategy#908 item 8); the walk covers directories
+and regular files only and never follows a symlink; a path that exists but
+cannot be re-owned, or a `find` failure other than a vanished entry, still
+aborts the install.
 
 The first operator-controlled restart also completes the identity handoff.
 After systemd stops the legacy `ec2-user` observer, root-privileged pre-start
