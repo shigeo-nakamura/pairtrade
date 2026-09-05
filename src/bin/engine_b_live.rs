@@ -55,9 +55,18 @@
 //!   yet at any meaningful sample size) -- see bot-strategy#872.
 //! - Entry/exit price is the WS mid at/after the boundary, not a full
 //!   top-5-depth VWAP walk (requirements doc §4.5.2's `P_exec_entry`/
-//!   `P_exec_exit`). No slippage/partial-fill modeling beyond what
+//!   `P_exec_exit`). No slippage modeling beyond what
 //!   `create_order(price=None)` (Lighter-native IOC + 20% protection
-//!   price) already gives.
+//!   price) already gives. Fill *quantity* is no longer assumed from the
+//!   HTTP 200 (bot-strategy#875 G-2/G-4, `docs/engine-b-order-spec.md`
+//!   §4): live entries and exits are confirmed against the exchange's own
+//!   position (`get_positions()`, WS-fed `account_all`) within
+//!   `fill_confirm_timeout_secs`, an IOC that leaves no position is
+//!   treated as unfilled (no retry that day), a position the exchange
+//!   already reports before we submit is adopted instead of re-submitted,
+//!   and every exit is sized to the exchange's current position, not to
+//!   this process's memory of the entry. PnL still uses the WS mid as the
+//!   exit price (the fill price itself is not read back).
 //! - No out-of-sample validation (Phase 0B) or paper-trade rehearsal
 //!   (Phase 1) of this code before it places real orders.
 //! - KR/US primary symbols and `epsilon_threshold` are operator config,
@@ -100,7 +109,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
-use dex_connector::{DexConnector, OrderSide, PriceUpdate};
+use dex_connector::{DexConnector, OrderSide, PositionSnapshot, PriceUpdate};
 use reqwest::Client;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -260,6 +269,12 @@ struct EngineBLiveConfig {
     signal_model: String,
     entry_deadline_secs: i64,
     exit_deadline_secs: i64,
+    /// How long to wait for the exchange's WS-fed position to reflect an
+    /// accepted IOC before treating it as unfilled (entry) or as
+    /// still-open (exit). Lighter's `account_all` update normally lands
+    /// within ~1 s of the fill; 15 s leaves room for a WS hiccup without
+    /// eating the 180 s entry window (bot-strategy#875 G-2).
+    fill_confirm_timeout_secs: i64,
     lighter_rest_url: String,
     min_daily_volume_usd: f64,
     equity_usd_reference: f64,
@@ -342,6 +357,7 @@ impl EngineBLiveConfig {
             signal_model: env_string("ENGINE_B_LIVE_SIGNAL_MODEL", "diff"),
             entry_deadline_secs: env_i64("ENGINE_B_LIVE_ENTRY_DEADLINE_SECS", 180),
             exit_deadline_secs: env_i64("ENGINE_B_LIVE_EXIT_DEADLINE_SECS", 900),
+            fill_confirm_timeout_secs: env_i64("ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS", 15),
             lighter_rest_url: env_string(
                 "ENGINE_B_LIVE_LIGHTER_REST_URL",
                 "https://mainnet.zklighter.elliot.ai",
@@ -530,6 +546,46 @@ struct OpenPosition {
     entry_price: f64,
     size: f64,
     entered_at_us: i64,
+}
+
+/// The exchange's own view of one symbol's position, reduced from the
+/// connector's `PositionSnapshot` (abs `size` + `sign`, Lighter: `1` long,
+/// `-1` short). This -- not `OpenPosition`, which is only this process's
+/// memory -- is what live entry confirmation and exit sizing use
+/// (bot-strategy#875 G-2/G-4).
+#[derive(Debug, Clone, PartialEq)]
+struct ExchangePosition {
+    side: OrderSide,
+    size: f64,
+    entry_price: Option<f64>,
+}
+
+/// Find `symbol`'s open position in a `get_positions()` result. A zero /
+/// negative size or a zero sign counts as flat (`None`), matching how the
+/// Lighter connector drops zero-size positions from its snapshot.
+fn exchange_position_for(positions: &[PositionSnapshot], symbol: &str) -> Option<ExchangePosition> {
+    let p = positions.iter().find(|p| p.symbol == symbol)?;
+    let size = p.size.abs().to_f64().unwrap_or(0.0);
+    if size <= 0.0 {
+        return None;
+    }
+    let side = match p.sign {
+        s if s > 0 => OrderSide::Long,
+        s if s < 0 => OrderSide::Short,
+        _ => return None,
+    };
+    Some(ExchangePosition {
+        side,
+        size,
+        entry_price: p.entry_price.and_then(|d| d.to_f64()).filter(|v| *v > 0.0),
+    })
+}
+
+fn opposite(side: OrderSide) -> OrderSide {
+    match side {
+        OrderSide::Long => OrderSide::Short,
+        OrderSide::Short => OrderSide::Long,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1044,6 +1100,79 @@ impl EngineBLiveEngine {
         }
     }
 
+    /// Poll the exchange's WS-fed position for `us_primary` until it is
+    /// open (`want_open = true`) or flat (`want_open = false`), or until
+    /// `fill_confirm_timeout_secs` elapses. `Ok(..)` is the last observed
+    /// state either way; `Err` means `get_positions()` never answered
+    /// during the whole window (e.g. the account channel is not ready), so
+    /// the caller must not assume anything about the position.
+    async fn await_exchange_position(&self, want_open: bool) -> Result<Option<ExchangePosition>> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(self.cfg.fill_confirm_timeout_secs.max(1) as u64);
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut last_seen: Option<Option<ExchangePosition>> = None;
+        loop {
+            match self.connector.get_positions().await {
+                Ok(positions) => {
+                    let seen = exchange_position_for(&positions, &self.cfg.us_primary_symbol);
+                    if seen.is_some() == want_open {
+                        return Ok(seen);
+                    }
+                    last_seen = Some(seen);
+                }
+                Err(e) => last_err = Some(anyhow::anyhow!("{e:?}")),
+            }
+            if std::time::Instant::now() >= deadline {
+                return match last_seen {
+                    Some(seen) => Ok(seen),
+                    None => Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no position reading"))),
+                };
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Shared tail of a successful (or adopted) entry: record the
+    /// position, mark the day as acted on, persist, log, notify.
+    fn record_entry(&mut self, pos: OpenPosition, epsilon: f64, notional_usd: f64, note: &str) {
+        let side = pos.side;
+        let price = pos.entry_price;
+        let size = pos.size;
+        self.position = Some(pos);
+        self.day.entered = true;
+        // Persist immediately, matching the no-entry and exit paths:
+        // without this, a restart between entry and exit finds
+        // state.last_session_date still pointing at a prior day, so
+        // roll_day_if_needed does not set day.entered and maybe_enter
+        // would re-evaluate and potentially re-enter the same day,
+        // doubling notional exposure. This does not by itself recover the
+        // in-memory OpenPosition after a restart (see
+        // docs/engine-b-live-operations.md's Stop and recovery section)
+        // -- it only prevents a second entry.
+        self.state.last_session_date = self.current_date.map(|d| d.to_string());
+        atomic_write_json(&self.cfg.state_path, &self.state);
+        log::info!(
+            "[ENTRY] side={side} epsilon={epsilon:.5} price={price:.4} notional=${notional_usd:.0} size={size:.6}{note}"
+        );
+        send_notification(
+            format!("Han Bridge ENTRY {} {}", self.cfg.us_primary_symbol, side),
+            format!(
+                "epsilon={epsilon:.5} threshold={:.5} price={price:.4} notional=${notional_usd:.0} size={size:.6} dry_run={}{note}",
+                self.cfg.epsilon_threshold, self.cfg.dry_run
+            ),
+        );
+    }
+
+    /// Mark today as acted on without a position (signal fired, order
+    /// path ended flat): no retry today, same persistence as the
+    /// no-signal path.
+    fn record_no_position_today(&mut self) {
+        self.position = None;
+        self.day.entered = true;
+        self.state.last_session_date = self.current_date.map(|d| d.to_string());
+        atomic_write_json(&self.cfg.state_path, &self.state);
+    }
+
     async fn maybe_enter(&mut self, now_us: i64) {
         let Some((_t0, t1, _t2)) = self.window else {
             return;
@@ -1189,6 +1318,51 @@ impl EngineBLiveEngine {
         let size = notional_usd / price;
 
         if !self.cfg.dry_run {
+            // Exchange truth before we send anything (bot-strategy#875
+            // G-4): a previous tick's `sendTx` may have timed out on our
+            // side after Lighter accepted it. If the account already
+            // holds `us_primary`, adopt that position instead of
+            // submitting a second order. Fail closed on an unreadable
+            // account -- the next 5 s tick retries while still inside
+            // `entry_deadline_secs`.
+            match self.connector.get_positions().await {
+                Ok(positions) => {
+                    if let Some(existing) =
+                        exchange_position_for(&positions, &self.cfg.us_primary_symbol)
+                    {
+                        log::warn!(
+                            "[ENTRY] exchange already holds {} {} size={:.6} before submit -- adopting it \
+                             instead of sending a second order (prior sendTx likely accepted after a \
+                             local timeout)",
+                            existing.side,
+                            self.cfg.us_primary_symbol,
+                            existing.size
+                        );
+                        let entry_price = existing.entry_price.unwrap_or(price);
+                        self.record_entry(
+                            OpenPosition {
+                                side: existing.side,
+                                entry_price,
+                                size: existing.size,
+                                entered_at_us: now_us,
+                            },
+                            epsilon,
+                            notional_usd,
+                            " adopted_from_exchange=true",
+                        );
+                        return;
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[ENTRY] cannot read exchange positions before submit ({e:?}); not sending \
+                         this tick, will retry within the entry window"
+                    );
+                    return;
+                }
+            }
+            // NOTE: a no-op on the Lighter connector (logs at debug and
+            // returns Ok) -- `leverage` only feeds max_notional_usd().
             if let Err(e) = self
                 .connector
                 .set_leverage(&self.cfg.us_primary_symbol, self.cfg.leverage)
@@ -1198,39 +1372,94 @@ impl EngineBLiveEngine {
                 return;
             }
         }
-        match self.submit_order(side, size, false).await {
-            Ok(filled) => {
-                let filled_f = filled.to_f64().unwrap_or(size);
-                self.position = Some(OpenPosition {
+        let requested = match self.submit_order(side, size, false).await {
+            Ok(requested) => requested.to_f64().unwrap_or(size),
+            Err(e) => {
+                // Not marking the day as acted: the next tick re-checks the
+                // exchange position first (above) and only then re-submits.
+                log::error!("[ENTRY] order failed: {e:?}");
+                return;
+            }
+        };
+        if self.cfg.dry_run {
+            self.record_entry(
+                OpenPosition {
                     side,
                     entry_price: price,
-                    size: filled_f,
+                    size: requested,
                     entered_at_us: now_us,
-                });
-                self.day.entered = true;
-                // Persist immediately, matching the no-entry and exit
-                // paths: without this, a restart between entry and exit
-                // finds state.last_session_date still pointing at a prior
-                // day, so roll_day_if_needed does not set day.entered and
-                // maybe_enter would re-evaluate and potentially re-enter
-                // the same day, doubling notional exposure. This does not
-                // by itself recover the in-memory OpenPosition after a
-                // restart (see docs/engine-b-live-operations.md's Stop and
-                // recovery section) -- it only prevents a second entry.
-                self.state.last_session_date = self.current_date.map(|d| d.to_string());
-                atomic_write_json(&self.cfg.state_path, &self.state);
-                log::info!(
-                    "[ENTRY] side={side} epsilon={epsilon:.5} price={price:.4} notional=${notional_usd:.0} size={filled_f:.6}"
-                );
-                send_notification(
-                    format!("Han Bridge ENTRY {} {}", self.cfg.us_primary_symbol, side),
-                    format!(
-                        "epsilon={epsilon:.5} threshold={:.5} price={price:.4} notional=${notional_usd:.0} dry_run={}",
-                        self.cfg.epsilon_threshold, self.cfg.dry_run
-                    ),
+                },
+                epsilon,
+                notional_usd,
+                "",
+            );
+            return;
+        }
+        // HTTP 200 from sendTx means "accepted by the API servers", not
+        // "executed" (Lighter docs; bot-strategy#875 G-2). Confirm the
+        // fill against the exchange's own position before believing we
+        // hold anything.
+        match self.await_exchange_position(true).await {
+            Ok(Some(filled)) => {
+                if filled.side != side {
+                    log::error!(
+                        "[ENTRY] exchange reports {} but we submitted {} -- recording the exchange's \
+                         side; investigate before the exit window",
+                        filled.side,
+                        side
+                    );
+                }
+                if (filled.size - requested).abs() > 1e-9 {
+                    log::warn!(
+                        "[ENTRY] partial fill: requested={requested:.6} exchange size={:.6}",
+                        filled.size
+                    );
+                }
+                let entry_price = filled.entry_price.unwrap_or(price);
+                self.record_entry(
+                    OpenPosition {
+                        side: filled.side,
+                        entry_price,
+                        size: filled.size,
+                        entered_at_us: now_us,
+                    },
+                    epsilon,
+                    notional_usd,
+                    &format!(" requested={requested:.6} confirmed_by=exchange_position"),
                 );
             }
-            Err(e) => log::error!("[ENTRY] order failed: {e:?}"),
+            Ok(None) => {
+                log::warn!(
+                    "[ENTRY] IOC accepted (HTTP 200) but no {} position appeared on the exchange within \
+                     {}s -- treating as unfilled; no retry today (requirements doc §6.3 step 3)",
+                    self.cfg.us_primary_symbol,
+                    self.cfg.fill_confirm_timeout_secs
+                );
+                send_notification(
+                    format!("Han Bridge ENTRY UNFILLED {}", self.cfg.us_primary_symbol),
+                    format!(
+                        "IOC accepted but no position within {}s; epsilon={epsilon:.5} side={side} requested={requested:.6}",
+                        self.cfg.fill_confirm_timeout_secs
+                    ),
+                );
+                self.record_no_position_today();
+            }
+            Err(e) => {
+                log::error!(
+                    "[ENTRY] order accepted but exchange positions unreadable for {}s ({e:?}) -- position \
+                     UNKNOWN; marking today as acted, NOT tracking a position. Check the exchange \
+                     account manually before the exit window.",
+                    self.cfg.fill_confirm_timeout_secs
+                );
+                send_notification(
+                    format!("Han Bridge ENTRY UNCONFIRMED {}", self.cfg.us_primary_symbol),
+                    format!(
+                        "sendTx accepted but get_positions failed for {}s: {e:?}. Manual check required.",
+                        self.cfg.fill_confirm_timeout_secs
+                    ),
+                );
+                self.record_no_position_today();
+            }
         }
     }
 
@@ -1251,13 +1480,83 @@ impl EngineBLiveEngine {
         let Some(price) = self.latest_price.get(&self.cfg.us_primary_symbol).copied() else {
             return;
         };
-        let exit_side = match pos.side {
-            OrderSide::Long => OrderSide::Short,
-            OrderSide::Short => OrderSide::Long,
+        if self.cfg.dry_run {
+            match self.submit_order(opposite(pos.side), pos.size, true).await {
+                Ok(_) => self.on_exit(price, now_us),
+                Err(e) => log::error!("[EXIT] order failed, position still open: {e:?}"),
+            }
+            return;
+        }
+        // Size the reduce-only to the exchange's *current* position, not
+        // to our memory of the entry (requirements doc §5.4 "再指値前に最新
+        // 建玉を再照会", bot-strategy#875 G-2). reduce_only=true remains
+        // the exchange-side guard against ever flipping.
+        let (exit_side, exit_size) = match self.connector.get_positions().await {
+            Ok(positions) => match exchange_position_for(&positions, &self.cfg.us_primary_symbol) {
+                Some(live) => {
+                    if live.side != pos.side || (live.size - pos.size).abs() > 1e-9 {
+                        log::warn!(
+                            "[EXIT] exchange position {} size={:.6} differs from tracked {} size={:.6}; \
+                             sizing the reduce-only to the exchange",
+                            live.side,
+                            live.size,
+                            pos.side,
+                            pos.size
+                        );
+                        if let Some(p) = self.position.as_mut() {
+                            p.side = live.side;
+                            p.size = live.size;
+                        }
+                    }
+                    (opposite(live.side), live.size)
+                }
+                None => {
+                    log::warn!(
+                        "[EXIT] exchange is already flat in {} -- recording the exit at mid without \
+                         sending an order (closed externally, or the entry never filled)",
+                        self.cfg.us_primary_symbol
+                    );
+                    self.on_exit(price, now_us);
+                    return;
+                }
+            },
+            Err(e) if emergency => {
+                log::error!(
+                    "[EXIT] exchange positions unreadable ({e:?}) past exit_deadline -- sending a \
+                     reduce-only for the tracked size {:.6} anyway (reduce_only caps it at the real \
+                     position)",
+                    pos.size
+                );
+                (opposite(pos.side), pos.size)
+            }
+            Err(e) => {
+                log::warn!(
+                    "[EXIT] exchange positions unreadable ({e:?}); not sending a blind reduce-only this \
+                     tick (emergency path takes over after exit_deadline)"
+                );
+                return;
+            }
         };
-        match self.submit_order(exit_side, pos.size, true).await {
-            Ok(_) => self.on_exit(price, now_us),
-            Err(e) => log::error!("[EXIT] order failed, position still open: {e:?}"),
+        if let Err(e) = self.submit_order(exit_side, exit_size, true).await {
+            log::error!("[EXIT] order failed, position still open: {e:?}");
+            return;
+        }
+        // Same rule as entry: HTTP 200 is acceptance, not execution. Only
+        // a flat exchange position ends the day; anything else is retried
+        // on the next tick with the then-current remainder.
+        match self.await_exchange_position(false).await {
+            Ok(None) => self.on_exit(price, now_us),
+            Ok(Some(remaining)) => log::error!(
+                "[EXIT] reduce-only accepted but exchange still holds {} size={:.6} after {}s; \
+                 retrying next tick with the remainder",
+                remaining.side,
+                remaining.size,
+                self.cfg.fill_confirm_timeout_secs
+            ),
+            Err(e) => log::error!(
+                "[EXIT] reduce-only accepted but exchange positions unreadable ({e:?}); assuming NOT \
+                 exited, retrying next tick"
+            ),
         }
     }
 
@@ -1650,6 +1949,7 @@ mod tests {
             signal_model: "diff".to_string(),
             entry_deadline_secs: 180,
             exit_deadline_secs: 900,
+            fill_confirm_timeout_secs: 15,
             lighter_rest_url: "https://mainnet.zklighter.elliot.ai".to_string(),
             min_daily_volume_usd: 100_000.0,
             equity_usd_reference: 1000.0,
@@ -2164,5 +2464,62 @@ mod tests {
                 "missing han_bridge field: {key}"
             );
         }
+    }
+
+    // -------------------------------------------------------------
+    // exchange_position_for (bot-strategy#875 G-2/G-4)
+    // -------------------------------------------------------------
+
+    fn snap(symbol: &str, size: &str, sign: i32, entry: Option<&str>) -> PositionSnapshot {
+        PositionSnapshot {
+            symbol: symbol.to_string(),
+            size: Decimal::from_str(size).unwrap(),
+            sign,
+            entry_price: entry.map(|e| Decimal::from_str(e).unwrap()),
+        }
+    }
+
+    #[test]
+    fn exchange_position_long_with_entry_price() {
+        let ps = vec![
+            snap("SOXL", "1.5", 1, None),
+            snap("SNDK", "0.0582", 1, Some("1600.64")),
+        ];
+        let got = exchange_position_for(&ps, "SNDK").unwrap();
+        assert_eq!(got.side, OrderSide::Long);
+        assert!((got.size - 0.0582).abs() < 1e-12);
+        assert!((got.entry_price.unwrap() - 1600.64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exchange_position_short_uses_sign_not_size_sign() {
+        // Lighter reports abs size + sign=-1 for shorts; a defensive
+        // negative size must still resolve to the same short.
+        for size in ["0.0582", "-0.0582"] {
+            let got = exchange_position_for(&[snap("SNDK", size, -1, None)], "SNDK").unwrap();
+            assert_eq!(got.side, OrderSide::Short);
+            assert!((got.size - 0.0582).abs() < 1e-12);
+            assert!(got.entry_price.is_none());
+        }
+    }
+
+    #[test]
+    fn exchange_position_flat_cases() {
+        assert!(exchange_position_for(&[], "SNDK").is_none());
+        assert!(exchange_position_for(&[snap("MU", "1", 1, None)], "SNDK").is_none());
+        assert!(exchange_position_for(&[snap("SNDK", "0", 1, None)], "SNDK").is_none());
+        assert!(exchange_position_for(&[snap("SNDK", "0.01", 0, None)], "SNDK").is_none());
+    }
+
+    #[test]
+    fn exchange_position_ignores_non_positive_entry_price() {
+        let got = exchange_position_for(&[snap("SNDK", "0.01", 1, Some("0"))], "SNDK").unwrap();
+        assert!(got.entry_price.is_none());
+    }
+
+    #[test]
+    fn opposite_flips_side() {
+        assert_eq!(opposite(OrderSide::Long), OrderSide::Short);
+        assert_eq!(opposite(OrderSide::Short), OrderSide::Long);
     }
 }

@@ -54,6 +54,23 @@ GAPS section -- do not duplicate that list here; read it there.
   placeholder value as `engine_b_phase0.py`'s `MIN_DAILY_VOLUME_USD` --
   keep both in sync until #872 freezes a data-driven value). Fails open
   (proceeds without the gate, logged as a warning) on a fetch/parse error.
+- **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
+  `docs/engine-b-order-spec.md` §4): a live entry is only recorded once
+  the WS-fed `get_positions()` shows the `us_primary` position, polled for
+  up to `ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS` (default 15) after the
+  IOC's HTTP 200 -- Lighter's 200 means "accepted", not "executed". No
+  position within the window → `[ENTRY] IOC accepted ... treating as
+  unfilled`, a `Han Bridge ENTRY UNFILLED` notification, and no retry that
+  day. Before submitting, the engine also reads the exchange position and
+  *adopts* an existing one instead of sending a second order (a prior
+  `sendTx` that timed out locally after Lighter accepted it). Every exit
+  is sized to the exchange's current position and only counts as done
+  when the exchange reports flat; if the account channel is unreadable the
+  exit waits, except past `exit_deadline` where a reduce-only for the
+  tracked size is sent anyway (reduce-only caps it at the real position).
+  `Han Bridge ENTRY UNCONFIRMED` means the order was accepted but the
+  account could not be read for the whole window: check the exchange
+  manually before the exit window.
 - **No SIGTERM-graceful-close handling exists in this prototype.** An open
   position is not reduce-only-closed on service stop/restart. Before any
   planned restart, check `status.json`'s `has_position` field and either
