@@ -154,7 +154,7 @@ states plainly which parts are **not** done online.
 | sequence check (A-10) | (Mechanics also summarised in "Host and service" below; this row is the requirement mapping.) `BookState.apply_snapshot` requires `nonce` (else the book is dropped, reason `snapshot_missing_nonce`). `BookState.apply_delta` requires `synced && begin_nonce == last_nonce` and a present `nonce`; any failure clears the book, marks it unsynced, increments `engine_b_phase0_sequence_gap_total`, writes a `data_gap` row (`channel = order_book`, `expected_sequence` = last `nonce`, `observed_sequence` = offending `begin_nonce`, reason `delta_missing_begin_nonce` / `delta_missing_nonce` / `begin_nonce_mismatch_or_unsynced_delta`), and **unsubscribes + resubscribes that one channel** to force a fresh snapshot. |
 | no analysis on an unsynced book (F0-08) | `book_synced` per (venue, market) drives the `engine_b_phase0_book_synced` gauge; `reconstructed` rows are only produced while synced, and the `data_gap` row stays open (`ts_end_us IS NULL`) until the next synced snapshot emits a `gap_close` event, which sets `ts_end_us` on the open rows for that (venue, market) -- there is no separate column for this; query `ts_end_us`. Offline, §4.5.2's synced-and-no-gap condition is evaluated as: no `data_gap` for that (venue, market) overlapping the boundary window, and the boundary snapshot is an `is_complete_snapshot = 1` row (a `snapshot` or a synced `reconstructed` row -- see the F0-02 row). |
 | server timestamp meaning | `normalize_exchange_timestamp_us`: integers below `10^14` are treated as milliseconds and scaled ×1000, larger ones as microseconds (Lighter mixes the two: book `last_updated_at` / `timestamp` are µs, trade `timestamp` is ms). Book: `last_updated_at` from the payload, else the message, else `timestamp`. Trade: per-trade `timestamp`, else message `timestamp`; a trade message with any trade lacking an exchange timestamp is **rejected whole** (`RuntimeError`), as is one whose timestamp is outside `[recv − 7 d, recv + 5 min]` (`validate_trade_timestamp_us`); `event_ts_us` (partitioning, OHLCV bucket, synthetic IDs) is the exchange time, never the receive time. `transaction_time` is not consumed but survives in `raw_public_json`. Market stats: message `timestamp`. |
-| gap detection on disconnect (F0-07) | (Reconnect/resubscribe mechanics are also described in "Host and service" below.) `feed_loop`: on any exception or close, one `data_gap` row per subscribed market with `channel = connection`, `reason = connection_error:<ExceptionType>` (or `normal_stop` / `task_cancelled`), `ts_start_us` = disconnect time (or attempt start when the connect itself failed); every `BookState` is marked unsynced; reconnect after exponential backoff 1 s → 60 s (doubling), `websockets.connect(ping_interval=20, ping_timeout=15, open_timeout=20, max_queue=4096)`, then resubscribe all `order_book` / `trade` / `market_stats` channels. Partial unique indexes guarantee at most one open gap per (venue, market, channel). |
+| gap detection on disconnect (F0-07) | (Reconnect/resubscribe mechanics are also described in "Host and service" below.) `feed_loop`: on any exception or close, a `data_gap` row per subscribed market with `channel = connection`, `reason = connection_error:<ExceptionType>` (or `normal_stop` / `task_cancelled`), `ts_start_us` = disconnect time (or attempt start when the connect itself failed) -- **coalesced**: the insert is `INSERT OR IGNORE` against the one-open-gap-per-(venue, market, channel) index, so a market whose previous `connection` gap is still open (it never got its post-reconnect snapshot, bot-strategy#908) gets no new row for a later disconnect; the existing gap silently spans the connected-but-unsynced period and the next outage, and the later disconnect's time and reason survive only in `ws_connection` (`ended_ts_recv_us`, `end_reason`). Use `ws_connection` for per-session disconnects, `data_gap` for "book unusable" intervals; every `BookState` is marked unsynced; reconnect after exponential backoff 1 s → 60 s (doubling), `websockets.connect(ping_interval=20, ping_timeout=15, open_timeout=20, max_queue=4096)`, then resubscribe all `order_book` / `trade` / `market_stats` channels. Partial unique indexes guarantee at most one open gap per (venue, market, channel). |
 | gap bounds survive a crash | Two mechanisms on the next start. `_recover_orphaned_sessions` ends a dead `ws_connection` segment at its last proven receive time (`last_activity_ts_recv_us`, bumped on **every** received frame since schema v9) with a durable `end_reason`. `_journal_stale_open_gaps` closes any `data_gap` still open in an *older* partition at that partition's hour boundary (`partition_start + 1 h`) and re-opens a continuation row in the next partition -- i.e. a crash bounds gaps at partition granularity, not at the exact last frame; read the `ws_connection` row for a tighter bound -- `last_activity_ts_recv_us` is the last *proven* frame, so after a quiet period the real disconnect/crash lies somewhere between it and the restart; it is a conservative bound, not the exact time. |
 | replay / duplicate handling | trade identities are `trade_id_str` when present, otherwise a versioned synthetic ID scoped by exchange `nonce` for incremental messages (an ID-less incremental message **without** a nonce is refused); reconnect snapshots deduplicate via the replay-alias multiset. See the "Host and service" section below for the sealed-partition side of this. |
 
@@ -195,9 +195,12 @@ states plainly which parts are **not** done online.
 3. **Clock offset is not measured by the collector.** `max_clock_offset_us`
    is never populated and there is no NTP check in the process; §7's
    "offset > 250 ms → warning, > 1 s → halt" rule is a host-level
-   property. Two proxies exist: the host's `chronyd` tracking, and
-   `ts_recv_us − ts_srv_us` on `order_book` deltas (network latency +
-   clock offset, so an upper bound).
+   property. The absolute offset comes only from the host's `chronyd`
+   tracking. `ts_recv_us − ts_srv_us` on `order_book` deltas is a
+   *signed* latency-plus-skew diagnostic: a host clock running behind the
+   exchange subtracts from the network delay, so a small or even negative
+   value does not exclude an offset above the 1 s threshold. Use it to
+   spot drift trends, never as a bound for the §7 thresholds.
 
 ### How to verify on the host
 
@@ -221,8 +224,8 @@ states plainly which parts are **not** done online.
   message was; a NULL on a `snapshot` or `delta` row means the exchange
   message carried no parseable `last_updated_at` / `timestamp` (the row is
   still stored) -- a non-trivial count there is a schema-drift / malformed-
-  feed signal, not noise. A `recv − srv` distribution on deltas is the
-  latency-plus-offset upper bound.
+  feed signal, not noise. A `recv − srv` distribution on deltas is a
+  signed latency/skew diagnostic (see item 3 above), not an offset bound.
 - Deploy ≠ restart: the deploy workflow does **not** restart
   `engine-b-phase0.service`. Compare `/opt/engine-b-phase0/release.env`
   with the running process start time (`systemctl show -p
