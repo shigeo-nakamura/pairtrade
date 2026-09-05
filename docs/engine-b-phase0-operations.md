@@ -478,6 +478,85 @@ that approval, set `ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true` in a systemd
 override for `engine-b-phase0-archive.service`, reload systemd, and enable the
 timer. Never enable deletion merely to bypass a failed archive check.
 
+### Capacity recovery and bounded archive runs (#915)
+
+At 2026-09-05 19:09 UTC the Tokyo root had 1,645,625,344 bytes free
+(93% used); Phase 0 data occupied about 15.16 GB. The archive timer was
+inactive and its configured S3 prefix had zero objects. Daily SQLite sizes
+were 5,171,081,216 bytes on September 2 and 5,368,737,792 on September 3.
+The observer was restored separately under #908; low throughput during its
+outage is not a capacity estimate for the recovered collector.
+
+Proposed initial hot retention is **24 hours**, pending operator approval.
+At the larger observed daily rate, budget about 5.37 GB for hot DBs, 4.60 GB
+for other existing root usage, 2.18 GB for a largest-partition verification
+(4 × 410,894,336 bytes plus a 512 MiB reserve), and 5.37 GB for one day
+of archive failure. That totals about 17.52 GB within the 21.40 GB usable
+filesystem. This is a provisional budget, not evidence of sufficient capacity
+under the recovered mainnet workload; remeasure through a full active session.
+No volume expansion is included in this proposal. S3 storage/requests and any
+cross-region transfer remain chargeable; this runbook does not quote prices.
+
+Archive controls (environment variables):
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `ENGINE_B_PHASE0_RETENTION_HOURS` | `0` | Skip partitions whose **end** is newer than now minus this many hours; also protects interrupted-seal recovery. Set `24` for the proposed hot window. |
+| `ENGINE_B_PHASE0_MAX_PARTITIONS` | `0` | Maximum eligible partitions attempted per invocation, oldest first; `0` is unlimited. Busy/skipped attempts count. |
+| `ENGINE_B_PHASE0_ARCHIVE_PARTITION` | empty | Restrict a verification/recovery run to one `YYYYMMDD_HH`; never bypasses hot/current-hour protection. Missing or invalid targets fail. |
+| `ENGINE_B_PHASE0_MIN_FREE_BYTES` | `536870912` | Reserve left after the estimated scratch budget of four times DB plus WAL size. An insufficient full-DB preflight fails before checkpoint/upload. Every sidecar publication (including interrupted-seal recovery and reconciled-index republication) also checks the actual index plus seal download sizes against the remaining free space and this reserve. |
+
+All values are validated before modifying a partition. The space estimate is
+conservative planning, not a reservation: concurrent collection, sidecar sizes,
+and compression can still exhaust space. Do not lower the reserve merely to
+force a failed run. A bounded **nondeleting** run will revisit the same oldest
+DBs on repetition; use an explicit partition for subsequent verification.
+
+1. Check current free space, sizes and archive state. With only 1.65 GB free,
+   the largest partition fails the 2.18 GB preflight. Start with a small closed
+   hour; do not start the entire backlog without a capacity check.
+2. After approval to archive to the configured private destination, run a
+   **nondeleting** single-partition check with the reviewed script. For example,
+   after deploying this change:
+
+   ```bash
+   sudo -u engine-b-phase0 env \
+     ENGINE_B_PHASE0_ARCHIVE_PARTITION=20260901_23 \
+     ENGINE_B_PHASE0_MAX_PARTITIONS=1 \
+     ENGINE_B_PHASE0_RETENTION_HOURS=24 \
+     ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false \
+     bash /opt/engine-b-phase0/engine_b_phase0_archive.sh
+   ```
+
+   Destination:
+   `s3://debot-dashboard/debot/engine-b/phase0/raw/debot-robinhood-lighter/2026/09/engine_b_phase0_20260901_23.sqlite3.gz`
+   plus `.sha256`. The existing script downloads and checks the compressed
+   bytes, decompressed SHA-256 and SQLite integrity. Keep the output and
+   independently download the objects to a separate restore directory.
+   Nondeleting mode does **not** create the trade index or seal; this check
+   alone is not complete seal-sidecar disaster-recovery acceptance.
+3. Only after explicit approval for verified local deletion, run small batches
+   with `RETENTION_HOURS=24`, `MAX_PARTITIONS=24` and
+   `DELETE_VERIFIED_LOCAL=true` (all with the `ENGINE_B_PHASE0_` prefix).
+   Verify S3 DB/checksum/index/seal together in an independent restore directory
+   using `--verify-sealed-partition` before accepting the recovery workflow.
+   The canonical gzip and its original SHA must also be rechecked when
+   investigating an interrupted run; local seal validation alone does not
+   establish current remote availability.
+4. Once the backlog has cleared and full restoration is demonstrated, enable
+   the timer with an approved override retaining 24 hours. Do not leave a
+   one-partition target in the recurring service. An initial batch limit of
+   24 is for supervised recovery; confirm sustained throughput exceeds arrivals
+   before choosing a recurring cap. Check exit status and free bytes after
+   each run. Disabling the timer stops future deletion but does not restore
+   removed DBs; use the verified remote artifacts for restoration.
+
+Remaining acceptance for #915: successful real uploads and independent restore
+(including sidecar/seal binding), approved deletion, at least one retention
+cycle, recovered-feed write-rate measurement, and persistent monitoring/alerts
+for free space, archive failure and last successful archive age. The controls
+above do not by themselves complete those operational requirements.
+
 Verification:
 
 ```bash

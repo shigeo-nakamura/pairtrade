@@ -467,6 +467,24 @@ canonical_sha=$(sha256sum "$archive" | cut -d' ' -f1)
 trade_index_sha=$(sha256sum "$trade_index" | cut -d' ' -f1)
 rm -f -- "$remote_trade_index" "$remote_seal"
 cp "$restored_db" "$old_db"
+# Interrupted recovery must preserve the reserve before any sidecar upload.
+if FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
+    ENGINE_B_PHASE0_DATA_DIR="$DATA_DIR" \
+    ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
+    ENGINE_B_PHASE0_S3_PREFIX=changed-prefix \
+    ENGINE_B_PHASE0_PYTHON=python3 \
+    ENGINE_B_PHASE0_MIN_FREE_BYTES=999999999999999 \
+    ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true \
+    bash "$(dirname "$0")/engine_b_phase0_archive.sh" > "$ROOT/recovery-space.log" 2>&1; then
+  echo "Sealed recovery ignored the free-space reserve" >&2
+  exit 1
+fi
+grep -q 'insufficient seal sidecar scratch space' "$ROOT/recovery-space.log"
+test -f "$old_db"
+test ! -e "$remote_trade_index"
+test ! -e "$remote_seal"
+test "$(sha256sum "$trade_index" | cut -d' ' -f1)" = "$trade_index_sha"
+test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$canonical_sha"
 FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
 ENGINE_B_PHASE0_DATA_DIR="$DATA_DIR" \
 ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
@@ -541,3 +559,63 @@ fi
 test -f "$corrupt_db"
 
 echo "Engine B archive test passed"
+
+# Retention and bounded batches must apply before any DB mutation/S3 upload.
+LIMIT_DATA="$ROOT/limits/data"
+mkdir -p "$LIMIT_DATA"
+# Leave 23 hours of headroom inside the 24-hour retention window: crossing
+# a UTC hour between run_limits calls must not make this fixture eligible.
+recent=$(date -u -d '1 hour ago' +%Y%m%d_%H)
+python3 - "$LIMIT_DATA" "$recent" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+for partition in ('20000101_00', '20000101_01', '20000101_02', sys.argv[2]):
+    with sqlite3.connect(Path(sys.argv[1]) / f'engine_b_phase0_{partition}.sqlite3') as db:
+        db.execute('CREATE TABLE sample(value TEXT)')
+        db.execute("INSERT INTO sample VALUES ('retained')")
+PY
+run_limits() {
+  env FAKE_S3="$FAKE_S3" PATH="$FAKE_BIN:$PATH" \
+    ENGINE_B_PHASE0_DATA_DIR="$LIMIT_DATA" \
+    ENGINE_B_PHASE0_S3_BUCKET=test-bucket \
+    ENGINE_B_PHASE0_S3_PREFIX=test-limits \
+    ENGINE_B_PHASE0_PYTHON=python3 \
+    ENGINE_B_PHASE0_RETENTION_HOURS=24 \
+    ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=false \
+    "$@" bash "$(dirname "$0")/engine_b_phase0_archive.sh"
+}
+for assignment in ENGINE_B_PHASE0_RETENTION_HOURS=-1 \
+    ENGINE_B_PHASE0_RETENTION_HOURS=87601 \
+    ENGINE_B_PHASE0_MAX_PARTITIONS=no \
+    ENGINE_B_PHASE0_MAX_PARTITIONS=01 \
+    ENGINE_B_PHASE0_MIN_FREE_BYTES=-1 \
+    ENGINE_B_PHASE0_ARCHIVE_PARTITION=20260230_00 \
+    ENGINE_B_PHASE0_ARCHIVE_PARTITION=19990101_00; do
+  if run_limits "$assignment"; then
+    echo "Invalid archive control accepted: $assignment" >&2
+    exit 1
+  fi
+done
+if run_limits ENGINE_B_PHASE0_MIN_FREE_BYTES=999999999999999; then
+  echo 'Insufficient scratch space was accepted' >&2
+  exit 1
+fi
+test ! -e "$FAKE_S3/test-limits"
+run_limits ENGINE_B_PHASE0_MAX_PARTITIONS=1
+test "$(find "$FAKE_S3/test-limits" -name '*.gz' | wc -l)" -eq 1
+run_limits ENGINE_B_PHASE0_ARCHIVE_PARTITION=20000101_02
+test "$(find "$FAKE_S3/test-limits" -name '*.gz' | wc -l)" -eq 2
+# An explicitly targeted hot partition must still be retained, even with deletion enabled.
+run_limits ENGINE_B_PHASE0_ARCHIVE_PARTITION="$recent" ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true
+test "$(find "$FAKE_S3/test-limits" -name '*.gz' | wc -l)" -eq 2
+test -f "$LIMIT_DATA/engine_b_phase0_${recent}.sqlite3"
+run_limits
+test "$(find "$FAKE_S3/test-limits" -name '*.gz' | wc -l)" -eq 3
+test "$(find "$LIMIT_DATA" -name '*.sqlite3' | wc -l)" -eq 4
+# Interrupted-seal recovery must also obey retention before it can delete.
+mkdir -p "$ROOT/limits/sealed"
+printf '{}' > "$ROOT/limits/sealed/$recent.json"
+run_limits ENGINE_B_PHASE0_ARCHIVE_PARTITION="$recent" ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL=true
+test -f "$LIMIT_DATA/engine_b_phase0_${recent}.sqlite3"
+echo 'Engine B archive retention/batch tests passed'

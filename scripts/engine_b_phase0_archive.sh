@@ -8,7 +8,32 @@ S3_PREFIX=${ENGINE_B_PHASE0_S3_PREFIX:-debot/engine-b/phase0/raw}
 PYTHON_BIN=${ENGINE_B_PHASE0_PYTHON:-/opt/engine-b-phase0/venv/bin/python}
 OBSERVER_SCRIPT=${ENGINE_B_PHASE0_OBSERVER_SCRIPT:-$(dirname "$0")/engine_b_phase0.py}
 DELETE_VERIFIED_LOCAL=${ENGINE_B_PHASE0_DELETE_VERIFIED_LOCAL:-false}
-CURRENT_PARTITION=$(date -u +%Y%m%d_%H)
+# Partition end, not mtime, defines hot retention. Limits apply to recovery too.
+RETENTION_HOURS=${ENGINE_B_PHASE0_RETENTION_HOURS:-0}
+MAX_PARTITIONS=${ENGINE_B_PHASE0_MAX_PARTITIONS:-0}
+TARGET_PARTITION=${ENGINE_B_PHASE0_ARCHIVE_PARTITION:-}
+MIN_FREE_BYTES=${ENGINE_B_PHASE0_MIN_FREE_BYTES:-536870912}
+read -r CURRENT_PARTITION RETENTION_CUTOFF < <(
+  "$PYTHON_BIN" - "$RETENTION_HOURS" "$MAX_PARTITIONS" "$TARGET_PARTITION" "$MIN_FREE_BYTES" <<'PYCONFIG'
+from datetime import datetime, timedelta, timezone
+import re
+import sys
+
+for value in (sys.argv[1], sys.argv[2], sys.argv[4]):
+    if not re.fullmatch(r"0|[1-9][0-9]{0,14}", value):
+        raise SystemExit("archive limits must be nonnegative decimal integers")
+hours = int(sys.argv[1])
+if hours > 87600:
+    raise SystemExit("retention exceeds 10 years")
+if sys.argv[3]:
+    if not re.fullmatch(r"[0-9]{8}_[0-9]{2}", sys.argv[3]):
+        raise SystemExit("archive partition must be YYYYMMDD_HH")
+    datetime.strptime(sys.argv[3], "%Y%m%d_%H")
+now = datetime.now(timezone.utc)
+print(now.strftime("%Y%m%d_%H"), (now - timedelta(hours=hours)).strftime("%Y%m%d_%H"))
+PYCONFIG
+)
+processed=0
 HOST_ID=$(hostname -s)
 STATE_DIR=${ENGINE_B_PHASE0_STATE_DIR:-$(dirname "$DATA_DIR")}
 LOCK_DIR="$STATE_DIR/locks"
@@ -60,6 +85,18 @@ persist_seal_sidecars() (
     echo "Invalid canonical archive URI in seal: $canonical_uri" >&2
     exit 1
   fi
+  # Recovery bypasses the full-DB preflight, and reconciled indexes can be
+  # larger than the source journal. Budget each actual download independently.
+  "$PYTHON_BIN" - "$DATA_DIR" "$MIN_FREE_BYTES" "$trade_index" "$seal" <<'PYSIDECARSPACE'
+from pathlib import Path
+import shutil
+import sys
+
+free = shutil.disk_usage(sys.argv[1]).free
+required = int(sys.argv[2]) + sum(Path(path).stat().st_size for path in sys.argv[3:])
+if free < required:
+    raise SystemExit(f"insufficient seal sidecar scratch space: free={free} required={required}")
+PYSIDECARSPACE
   remote_trade_index=$(mktemp "$DATA_DIR/.seal-index.remote.XXXXXX.sqlite3")
   remote_seal=$(mktemp "$DATA_DIR/.seal.remote.XXXXXX.json")
   trap 'rm -f -- "$remote_trade_index" "$remote_seal"' EXIT
@@ -152,7 +189,12 @@ PY
 
 if [ ! -d "$DATA_DIR" ]; then
   echo "No Engine B data directory yet: $DATA_DIR"
+  [ -z "$TARGET_PARTITION" ] || exit 1
   exit 0
+fi
+if [ -n "$TARGET_PARTITION" ] && [ ! -f "$DATA_DIR/engine_b_phase0_${TARGET_PARTITION}.sqlite3" ]; then
+  echo "Requested archive partition does not exist: $TARGET_PARTITION" >&2
+  exit 1
 fi
 install -d -m 0750 "$LOCK_DIR" "$SEALED_DIR" "$GAP_CONTINUATION_DIR" "$SESSION_CONTINUATION_DIR"
 
@@ -164,6 +206,17 @@ for db in "$DATA_DIR"/engine_b_phase0_*.sqlite3; do
   if [[ "$partition" == "$CURRENT_PARTITION" || "$partition" > "$CURRENT_PARTITION" ]]; then
     continue
   fi
+  # For hourly partitions, start < cutoff guarantees end <= now - retention.
+  if [[ "$partition" == "$RETENTION_CUTOFF" || "$partition" > "$RETENTION_CUTOFF" ]]; then
+    continue
+  fi
+  if [ -n "$TARGET_PARTITION" ] && [ "$partition" != "$TARGET_PARTITION" ]; then
+    continue
+  fi
+  if [ "$MAX_PARTITIONS" -gt 0 ] && [ "$processed" -ge "$MAX_PARTITIONS" ]; then
+    break
+  fi
+  processed=$((processed + 1))
   seal_path="$SEALED_DIR/$partition.json"
   year=${partition:0:4}
   month=${partition:4:2}
@@ -204,6 +257,23 @@ PY
     echo "Recovered and removed verified sealed partition left by an interrupted archive: $db"
     continue
   fi
+  # Budget for two gzip copies, restored DB and identity index, plus a reserve.
+  # This is a preflight estimate; concurrent writers can still consume space.
+  "$PYTHON_BIN" - "$db" "$MIN_FREE_BYTES" <<'PYSPACE'
+from pathlib import Path
+import shutil
+import sys
+
+path = Path(sys.argv[1])
+size = path.stat().st_size
+wal = Path(str(path) + "-wal")
+if wal.exists():
+    size += wal.stat().st_size
+free = shutil.disk_usage(path.parent).free
+required = 4 * size + int(sys.argv[2])
+if free < required:
+    raise SystemExit(f"insufficient archive scratch space: free={free} required={required} db={path}")
+PYSPACE
   set +e
   "$PYTHON_BIN" - "$db" "$partition" "$GAP_CONTINUATION_DIR" "$SESSION_CONTINUATION_DIR" <<'PY'
 from datetime import datetime, timedelta, timezone
