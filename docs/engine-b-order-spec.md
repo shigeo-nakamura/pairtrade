@@ -16,7 +16,10 @@ Sources, all read 2026-09-04:
   `.../docs/trading`, `.../docs/websocket-reference`
 - Lighter mainnet `GET /api/v1/orderBookDetails` (public, fetched
   2026-09-04 ~18:00 UTC)
-- `dex-connector` at the tag `pairtrade` pins (`v4.7.18`):
+- `dex-connector` at the tag `pairtrade` pins (`v4.7.18`; code paths
+  read on a local checkout and then diffed against the tag — the only
+  order-path difference was the `sendTx` response classification, which
+  is what §2.2 describes):
   `src/lighter_connector/{dex_impl,orders,order_payload,protocol,
   market_cache,parsing,rest,ticker,ws}.rs`, `src/lighter_waf_cooldown.rs`,
   `src/ws_reconnect.rs`, `crates/lighter-ratelimit/src/{bucket,client,
@@ -170,13 +173,19 @@ tier). Design against 60 req/min.
   (60s): k | Rate: k/min` on every REST call, with an extra warning line
   above 45 calls / 60 s.
 - **Retry conditions**: the connector itself does **not** retry a failed
-  `sendTx` / `nextNonce` / `account` call — a non-2xx (or transport error)
-  is returned as `DexError::Transient`, and on `sendTx` failure the cached
-  nonce is invalidated so the next attempt re-fetches it. Startup market
-  metadata is the one path with a built-in retry loop (§1.3). Whether to
-  retry is the caller's decision; `engine_b_live.rs` re-attempts entry on
-  the next 5 s tick until `entry_deadline_secs` (180 s) and re-attempts
-  exit on every tick until it succeeds (see §4 G-4 for why that matters).
+  `sendTx` / `nextNonce` / `account` call. A `sendTx` response is
+  classified (v4.7.18, `orders.rs`): 429 / 405 / WAF challenge →
+  `DexError::RateLimited` and the host-shared cooldown is engaged (nonce
+  cache untouched); any other 4xx except 408 / 421 / 425 →
+  `DexError::ServerResponse` (a genuine rejection such as insufficient
+  margin or a bad size — do not blindly resend) with the nonce cache
+  invalidated; 5xx, 408 / 421 / 425 and transport errors →
+  `DexError::Transient` with the nonce cache invalidated so the next
+  attempt re-fetches it. Startup market metadata is the one path with a
+  built-in retry loop (§1.3). Whether to retry is the caller's decision;
+  `engine_b_live.rs` re-attempts entry on the next 5 s tick until
+  `entry_deadline_secs` (180 s) and re-attempts exit on every tick until
+  it succeeds (see §4 G-4 for why that matters).
 
 ### 2.3 What `engine-b-live` actually consumes
 
@@ -300,7 +309,8 @@ property, not a nicety.
 - Nonce: "handled per API key", strictly `old + 1` (skipping ahead is
   allowed up to `2^47 - 1`). The connector fetches `nextNonce` once,
   caches `next_nonce` with a TTL, increments locally per tx, and drops the
-  cache on any `sendTx` non-2xx. There is no on-disk nonce; a restart
+  cache on any `sendTx` failure other than a rate-limit response (a 429 /
+  405 never consumed the nonce). There is no on-disk nonce; a restart
   simply re-fetches. This satisfies A-9's "nonce は API key ごと" clause
   as long as **only one process uses this API key** — the dedicated
   `engine-b-live` account/key is not shared with the Robinhood arms
