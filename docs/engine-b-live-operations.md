@@ -56,25 +56,34 @@ GAPS section -- do not duplicate that list here; read it there.
   (proceeds without the gate, logged as a warning) on a fetch/parse error.
 - **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
   `docs/engine-b-order-spec.md` §4): a live entry is only recorded once
-  the WS-fed `get_positions()` shows the `us_primary` position, polled for
-  up to `ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS` (default 15) after the
-  IOC's HTTP 200 -- Lighter's 200 means "accepted", not "executed". No
-  position within the window → `[ENTRY] IOC accepted ... treating as
-  unfilled`, a `Han Bridge ENTRY UNFILLED` notification, and no retry that
-  day. **At most one entry `sendTx` is sent per session day**: a send error
-  (timeout, 5xx, rate limit, rejection) is never followed by a re-submit;
-  the engine watches the exchange position for the same window and adopts
-  a position if one appears (`Han Bridge ENTRY FAILED` if none does).
-  Before submitting, the engine also reads the exchange position and
-  *adopts* an existing one instead of sending a second order (a position
-  left by a prior process). Every exit
-  is sized to the exchange's current position and only counts as done
-  when the exchange reports flat; if the account channel is unreadable the
-  exit waits, except past `exit_deadline` where a reduce-only for the
-  tracked size is sent anyway (reduce-only caps it at the real position).
-  `Han Bridge ENTRY UNCONFIRMED` means the order was accepted but the
-  account could not be read for the whole window: check the exchange
-  manually before the exit window.
+  the WS-fed `get_positions()` shows the `us_primary` position. The check
+  is a small state machine advanced once per 5 s tick (never a blocking
+  wait in the select loop) for up to `ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS`
+  (default 15) after the sendTx -- Lighter's HTTP 200 means "accepted",
+  not "executed". Outcomes: position seen → `[ENTRY] ... confirmed_by=
+  exchange_position` (partial fills logged; `entry_price_estimated=true`
+  when the exchange gave no `avg_entry_price` and the WS mid was used);
+  none within the window → `Han Bridge ENTRY UNFILLED` (or `ENTRY FAILED`
+  if the sendTx itself had errored), day marked acted, **no retry**;
+  account unreadable for the whole window → `Han Bridge ENTRY UNCONFIRMED`,
+  day marked acted, no position tracked: check the exchange manually
+  before the exit window. **At most one entry `sendTx` per session day** --
+  a send error is never followed by a re-submit, only by the same
+  position watch. A position the exchange already holds before submit is
+  adopted (`adopted_from_exchange=true origin=unknown`) instead of
+  re-ordered, and a position carried over from a previous session (exit
+  kept failing) blocks today's entry entirely. **Side mismatch** between
+  what was submitted and what the exchange holds (entry or exit) records
+  the exchange's side and entry price, then engages the sticky session
+  halt (`Han Bridge SESSION HALT`, cleared by RISK_ACK) -- same bar as
+  pairtrade's SignFlip verdict. Every exit is sized to the exchange's
+  current position (capped at 1.5× the tracked size against a transient
+  over-report) and only counts as done when the exchange reports flat; if
+  the account channel is unreadable the exit waits, except past
+  `exit_deadline` where a reduce-only for the tracked size is sent anyway
+  (reduce-only caps it at the real position). Known caveat: dex-connector's
+  `positions_ready` is not reset on WS reconnect (bot-strategy#911), so a
+  read right after a reconnect can be stale.
 - **No SIGTERM-graceful-close handling exists in this prototype.** An open
   position is not reduce-only-closed on service stop/restart. Before any
   planned restart, check `status.json`'s `has_position` field and either
