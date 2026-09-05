@@ -587,11 +587,15 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         frames.extend([t0] * initial)
         for key in list(collector.book_subscribe_us):
             collector.book_subscribe_us[key] = t0
-        for second in range(11, 71, 1):
+        for second in range(11, 60):
             await collector.watchdog_books(ws, venue, connection, t0 + second * 1_000_000)
         # Within the first rolling minute the total (initial + watchdog) stays capped.
         self.assertLessEqual(len(ws.messages), engine_b.WATCHDOG_MAX_FRAMES_PER_MIN)
         self.assertGreater(len(ws.messages), initial)
+        # Once the initial frames age out of the window, the budget frees up again.
+        before = len(ws.messages)
+        await collector.watchdog_books(ws, venue, connection, t0 + 75 * 1_000_000)
+        self.assertGreater(len(ws.messages), before)
 
     async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
         # A quiet market (no trades, no stats either) is just quiet, not stalled.
