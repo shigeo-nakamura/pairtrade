@@ -272,14 +272,21 @@ the per-disconnect record is `ws_connection` -- `order_book` sequence
 breaks are likewise coalesced into one open `order_book` gap per market
 until the replacement snapshot arrives (`idx_data_gap_open_order_book`;
 the per-break count lives only in `engine_b_phase0_sequence_gap_total`),
-and server versus receive time are both kept in a known unit. One
-interval is **not** recorded anywhere: from a connection's start until
-its first complete snapshot for a market (`BookState` starts unsynced,
-but a `connection` gap is opened only on disconnect), so a delayed or
-missing initial snapshot is unusable time that `missing_duration_us`
-derived from the tables will omit -- bound it offline as `ws_connection.
-started_ts_recv_us` → first `is_complete_snapshot = 1` row of that
-session and market. Items 1–3 above are
+and server versus receive time are both kept in a known unit. Two
+intervals are **not** recorded anywhere and must be bounded offline:
+(a) from a connection's start until its first complete snapshot for a
+market (`BookState` starts unsynced, but a `connection` gap is opened
+only on disconnect) -- bound it as `ws_connection.started_ts_recv_us` →
+first `is_complete_snapshot = 1` row of that session and market; (b) an
+`order_book` subscription that silently stops delivering while `trade` /
+`market_stats` keep the socket alive -- the collector tracks liveness per
+venue, not per market channel, so `BookState.synced` stays true and the
+book looks current until the next invalid delta or disconnect. Detect it
+offline as an anomalously long interval between consecutive `book_event`
+rows for a market relative to that market's own cadence (or to its
+`trade` / `price_observation` activity in the same interval) and treat
+the interval as unusable; per-market book-channel liveness in the
+collector is tracked as a follow-up under bot-strategy#908. Items 1–3 above are
 analysis-time obligations (1, 2) and a host-level check (3). "Resolved"
 here means *detected and recorded*, not *self-healing*: the collector has
 no automatic resubscribe when a post-reconnect snapshot never arrives, so
