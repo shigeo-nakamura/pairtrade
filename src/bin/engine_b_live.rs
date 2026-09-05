@@ -1222,17 +1222,36 @@ impl EngineBLiveEngine {
             .latest_price
             .get(&self.cfg.us_primary_symbol)
             .copied()
-            .unwrap_or(0.0);
-        let entry_price_estimated = live.entry_price.is_none();
-        let entry_price = live.entry_price.unwrap_or(ws_price);
+            .filter(|p| *p > 0.0);
+        // Never adopt with a zero cost basis: without the exchange's
+        // avg_entry_price and without a positive WS price yet (e.g. right
+        // after a restart), wait for the next tick (pairtrade#275 Codex
+        // review).
+        let (entry_price, entry_price_estimated) = match (live.entry_price, ws_price) {
+            (Some(e), _) => (e, false),
+            (None, Some(w)) => (w, true),
+            (None, None) => {
+                log::warn!(
+                    "[ENTRY] exchange shows {} {} size={:.6} after an UNCONFIRMED send but neither an \
+                     exchange entry price nor a WS price is available yet -- deferring adoption",
+                    live.side,
+                    self.cfg.us_primary_symbol,
+                    live.size
+                );
+                return;
+            }
+        };
+        // `position_unconfirmed` deliberately stays set: the adopted
+        // OpenPosition is memory-only, so a restart before the exit would
+        // lose it again -- the persisted flag is what makes the restarted
+        // process re-run this adoption. Only RISK_ACK clears it.
         log::warn!(
             "[ENTRY] exchange now shows {} {} size={:.6} after an UNCONFIRMED send -- adopting it; \
-             session halt stays until RISK_ACK",
+             position_unconfirmed and the session halt stay until RISK_ACK",
             live.side,
             self.cfg.us_primary_symbol,
             live.size
         );
-        self.state.position_unconfirmed = false;
         self.position = Some(OpenPosition {
             side: live.side,
             entry_price,
@@ -1242,7 +1261,6 @@ impl EngineBLiveEngine {
             realized_partial_pnl: 0.0,
             entered_at_us: now_us,
         });
-        atomic_write_json(&self.cfg.state_path, &self.state);
         send_notification(
             format!("Han Bridge ENTRY ADOPTED {} {}", self.cfg.us_primary_symbol, live.side),
             format!(
@@ -1405,7 +1423,7 @@ impl EngineBLiveEngine {
                                     // this attempt's price; only the open
                                     // remainder carries to the next tick.
                                     self.book_partial_close(
-                                        remaining.size,
+                                        &remaining,
                                         exit_price,
                                         "reduce-only partially filled",
                                     );
@@ -1501,7 +1519,8 @@ impl EngineBLiveEngine {
     /// closed it) and shrink `open_size`. A *larger* quantity is not a
     /// close; it is only recorded (an external add or an over-report the
     /// cap handles at the next send).
-    fn book_partial_close(&mut self, new_open_size: f64, price: f64, context: &str) {
+    fn book_partial_close(&mut self, live: &ExchangePosition, price: f64, context: &str) {
+        let new_open_size = live.size;
         let Some(p) = self.position.as_mut() else {
             return;
         };
@@ -1519,10 +1538,32 @@ impl EngineBLiveEngine {
                 p.realized_partial_pnl
             );
         } else if new_open_size > p.open_size + 1e-12 {
-            log::warn!(
-                "[EXIT] exchange open size grew ({context}): tracked {:.6} -> exchange {new_open_size:.6}",
-                p.open_size
+            // Same-side growth outside our own orders (a late partial fill
+            // of the entry IOC after its confirmation snapshot, or an
+            // external add). Take the exchange's average entry price as
+            // the new cost basis for the whole position and grow the
+            // entry quantity, so on_exit does not apply the old basis to
+            // quantity bought at another price; and halt new entries
+            // because the growth cannot be attributed (pairtrade#275 Codex
+            // review).
+            let grown = new_open_size - p.open_size;
+            let old_basis = p.entry_price;
+            if let Some(e) = live.entry_price {
+                p.entry_price = e;
+                p.entry_price_estimated = false;
+            } else {
+                p.entry_price_estimated = true;
+            }
+            p.size += grown;
+            let reason = format!(
+                "position grew outside our orders ({context}): tracked open {:.6} -> exchange {new_open_size:.6} \
+                 (+{grown:.6}); cost basis {old_basis:.4} -> {:.4} (estimated={})",
+                p.open_size, p.entry_price, p.entry_price_estimated
             );
+            log::error!("[EXIT] {reason}");
+            p.open_size = new_open_size;
+            self.halt_session(reason);
+            return;
         }
         p.open_size = new_open_size;
     }
@@ -1978,7 +2019,7 @@ impl EngineBLiveEngine {
                             // Reduced (or grown) outside our own attempts:
                             // book the reduction at the current mid.
                             self.book_partial_close(
-                                live.size,
+                                &live,
                                 price,
                                 "exchange open size differs from tracked before exit",
                             );

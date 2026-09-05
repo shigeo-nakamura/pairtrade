@@ -76,9 +76,13 @@ GAPS section -- do not duplicate that list here; read it there.
   the day roll) and engages the session halt: `status.json` publishes
   `positions_ready=false` and `han_bridge.position_unconfirmed=true`, the
   engine keeps reading the exchange every tick and adopts the position if
-  it appears (`Han Bridge ENTRY ADOPTED`), and only RISK_ACK -- after the
-  operator has reconciled against the exchange -- clears the flag and the
-  halt. `status.json`'s position `size` is the live open quantity, not the
+  it appears (`Han Bridge ENTRY ADOPTED`; deferred while no entry price
+  or WS price is available), the flag stays set even after adoption
+  (the adopted position is memory-only, so a restart re-runs the
+  adoption), and only RISK_ACK -- after the operator has reconciled
+  against the exchange -- clears the flag and the halt. A same-side
+  position that grows outside the engine's own orders re-bases the cost
+  on the exchange's average entry price and halts new entries. `status.json`'s position `size` is the live open quantity, not the
   entry quantity. The pre-send
   marker write is checked: if `risk_state.json` cannot be written the
   order is not sent that tick. **At most one entry `sendTx` per session day** --
