@@ -631,10 +631,11 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
         key = (venue.name, 216)
         t0 = 1_774_884_000_000_000
-        fill = engine_b.WATCHDOG_MAX_FRAMES_PER_MIN - engine_b.SEQUENCE_BREAK_RESERVE_FRAMES
+        fill = collector.watchdog_share(venue)
+        self.assertEqual(fill, engine_b.WATCHDOG_MAX_FRAMES_PER_MIN - 2 * len(venue.markets))
         collector.watchdog_frames_us[venue.name].extend([t0 - 1_000_000] * fill)
         # Watchdog (silence-inferred) is refused at this level...
-        self.assertFalse(collector.can_send_frames(venue.name, t0, 2))
+        self.assertFalse(collector.can_send_frames(venue, t0, 2))
         # ...but a proven break on a synced book still goes out.
         collector.book_subscribe_us[key] = t0 - 30_000_000
         state = collector.books.setdefault(key, engine_b.BookState())
@@ -659,7 +660,7 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         config, venue, sink, collector = self._collector()
         ws = FakeWebSocket()
         now = engine_b.now_us()
-        limit = engine_b.WATCHDOG_MAX_FRAMES_PER_MIN - engine_b.SEQUENCE_BREAK_RESERVE_FRAMES
+        limit = collector.watchdog_share(venue)
         collector.watchdog_frames_us[venue.name].extend([now - 1_000_000] * limit)
         slept: list[float] = []
 
@@ -1354,6 +1355,18 @@ class ConfigTests(unittest.TestCase):
             path = Path(tmp) / "phase0.json"
             path.write_text(json.dumps(raw))
             with self.assertRaisesRegex(ValueError, "book_stall_after_ms must be >="):
+                engine_b.load_config(path, LOCK_PATH)
+
+    def test_too_many_markets_for_the_reserve_is_rejected(self) -> None:
+        base = json.loads(CONFIG_PATH.read_text())
+        raw = json.loads(json.dumps(base))
+        venue = raw["venues"][0]
+        extra = [{"symbol": f"X{i}", "market_id": 1000 + i, "role": "exploratory"} for i in range(30)]
+        venue["markets"] = venue["markets"] + extra  # 44 markets -> reserve 88 > 80
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "phase0.json"
+            path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "sequence-break reserve"):
                 engine_b.load_config(path, LOCK_PATH)
 
     def test_watchdog_settings_default_when_absent(self) -> None:

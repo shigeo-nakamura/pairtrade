@@ -145,8 +145,10 @@ actually sent). At most `book_watchdog_batch`
 (default 5) subscribe frames per venue per second, and at most 100
 (re)subscribe frames per venue per rolling minute across the reconnect
 burst, the watchdog and sequence-break recovery (half of Lighter's 200
-client messages / minute per IP); a reconnect burst waits for budget, and
-20 of the 100 are reserved for proven sequence breaks. All three keys are
+client messages / minute per IP); a reconnect burst subscribes market by market, waiting for budget, and
+2 frames per configured market are reserved for proven sequence breaks
+(`load_config` rejects a venue whose reserve would leave the watchdog
+fewer than 20 frames/min). All three keys are
 optional in `phase0.json`. A feed task cancelled without `stop_event`
 set is now recorded as `task_cancelled_unexpected` with a logged stack.
 
