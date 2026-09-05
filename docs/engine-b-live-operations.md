@@ -60,6 +60,61 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   placeholder value as `engine_b_phase0.py`'s `MIN_DAILY_VOLUME_USD` --
   keep both in sync until #872 freezes a data-driven value). Fails open
   (proceeds without the gate, logged as a warning) on a fetch/parse error.
+- **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
+  `docs/engine-b-order-spec.md` §4 -- introduced by pairtrade#272, so the
+  file is absent until that PR merges): a live entry is only recorded once
+  the WS-fed `get_positions()` shows the `us_primary` position. The check
+  is a small state machine advanced once per 5 s tick (never a blocking
+  wait in the select loop) for up to `ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS`
+  (default 15) after the sendTx -- Lighter's HTTP 200 means "accepted",
+  not "executed". Outcomes: position seen → `[ENTRY] ... confirmed_by=
+  exchange_position` (partial fills logged; `entry_price_estimated=true`
+  when the exchange gave no `avg_entry_price` and the WS mid was used);
+  none within the window → `Han Bridge ENTRY UNFILLED` (or `ENTRY FAILED`
+  if the sendTx itself had errored), day marked acted, **no retry**;
+  account unreadable at the end of the window (even if an earlier read was
+  flat -- a fill update can land after a flat reading) → `Han Bridge ENTRY
+  UNCONFIRMED`, day marked acted, no position tracked: check the exchange
+  manually before the exit window. Partial exits: each observed reduction is booked as realized at the WS
+  mid of the attempt that closed it, and the final flat books only the
+  last remainder, so the drawdown halt sees the aggregate. An `UNCONFIRMED` entry
+  sets `risk_state.json`'s `position_unconfirmed` (persisted, survives
+  the day roll) and engages the session halt: `status.json` publishes
+  `positions_ready=false` and `han_bridge.position_unconfirmed=true`, the
+  engine keeps reading the exchange every tick and adopts the position if
+  it appears (`Han Bridge ENTRY ADOPTED`; deferred while no entry price
+  or WS price is available), the flag stays set even after adoption
+  (the adopted position is memory-only, so a restart re-runs the
+  adoption), and only RISK_ACK -- after the operator has reconciled
+  against the exchange -- clears the flag and the halt. A same-side
+  position that grows outside the engine's own orders re-bases the cost
+  on the exchange's average entry price and halts new entries. Any
+  position that is not today's own confirmed entry (adopted with unknown
+  origin, recovered after `UNCONFIRMED`, or carried over midnight) is
+  flattened on the next tick with emergency semantics instead of waiting
+  for today's `t2` -- its intended exit window is unknown or already past. `status.json`'s position `size` is the live open quantity, not the
+  entry quantity. The pre-send
+  marker write is checked: if `risk_state.json` cannot be written the
+  order is not sent that tick. **At most one entry `sendTx` per session day** --
+  `risk_state.json`'s `last_session_date` is written *before* the send
+  (so a crash/restart mid-confirmation cannot re-submit; after such a
+  restart, check the exchange for a position this process no longer
+  tracks), and a send error is never followed by a re-submit, only by
+  the same position watch. A position the exchange already holds before submit is
+  adopted (`adopted_from_exchange=true origin=unknown`) instead of
+  re-ordered, and a position carried over from a previous session (exit
+  kept failing) blocks today's entry entirely. **Side mismatch** between
+  what was submitted and what the exchange holds (entry or exit) records
+  the exchange's side and entry price, then engages the sticky session
+  halt (`Han Bridge SESSION HALT`, cleared by RISK_ACK) -- same bar as
+  pairtrade's SignFlip verdict. Every exit is sized to the exchange's
+  current position (capped at 1.5× the tracked size against a transient
+  over-report) and only counts as done when the exchange reports flat; if
+  the account channel is unreadable the exit waits, except past
+  `exit_deadline` where a reduce-only for the tracked size is sent anyway
+  (reduce-only caps it at the real position). Known caveat: dex-connector's
+  `positions_ready` is not reset on WS reconnect (bot-strategy#911), so a
+  read right after a reconnect can be stale.
 - **No SIGTERM-graceful-close handling exists in this prototype.** An open
   position is not reduce-only-closed on service stop/restart. Before any
   planned restart, check `status.json`'s `has_position` field and either
