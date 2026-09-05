@@ -59,7 +59,8 @@
 //!   `create_order(price=None)` (Lighter-native IOC + 20% protection
 //!   price) already gives. Fill *quantity* is no longer assumed from the
 //!   HTTP 200 (bot-strategy#875 G-2/G-4, `docs/engine-b-order-spec.md`
-//!   §4): live entries and exits are confirmed against the exchange's own
+//!   §4 -- that document lands with pairtrade#272): live entries and
+//!   exits are confirmed against the exchange's own
 //!   position (`get_positions()`, WS-fed `account_all`) within
 //!   `fill_confirm_timeout_secs` (polled once per 5 s tick, never a
 //!   blocking wait in the select loop), an IOC that leaves no position is
@@ -553,7 +554,12 @@ struct OpenPosition {
     /// than the exchange's own `avg_entry_price` -- the booked PnL is then
     /// an estimate (pairtrade#275 review finding 7).
     entry_price_estimated: bool,
+    /// Quantity confirmed at entry. PnL is booked on this, not on whatever
+    /// remains after partial exits (pairtrade#275 Codex review).
     size: f64,
+    /// Quantity the exchange still reports open; shrinks across partial
+    /// exit retries and is what the next reduce-only is sized from.
+    open_size: f64,
     entered_at_us: i64,
 }
 
@@ -1240,33 +1246,27 @@ impl EngineBLiveEngine {
                         }
                     }
                     Err(e) if expired => {
+                        // An earlier flat reading does NOT prove the IOC
+                        // stayed unfilled -- the fill update can land after
+                        // it, exactly during the WS hiccup that made the last
+                        // read fail. Unknown, not unfilled (pairtrade#275
+                        // Codex review).
                         self.pending = None;
-                        if saw_reading {
-                            // We did read the account at least once during
-                            // the window and it was flat then; the final
-                            // read failing does not change the conclusion.
-                            log::warn!(
-                                "[ENTRY] confirm window ended with an unreadable account ({e:?}) after \
-                                 earlier flat readings -- treating as unfilled; no retry today"
-                            );
-                            self.record_no_position_today();
-                        } else {
-                            log::error!(
-                                "[ENTRY] sendTx {} but exchange positions unreadable for the whole {}s \
-                                 window ({e:?}) -- position UNKNOWN; marking today as acted, NOT tracking \
-                                 a position. Check the exchange account manually before the exit window.",
-                                if after_send_error.is_some() { "errored" } else { "accepted" },
-                                self.cfg.fill_confirm_timeout_secs
-                            );
-                            send_notification(
-                                format!("Han Bridge ENTRY UNCONFIRMED {}", self.cfg.us_primary_symbol),
-                                format!(
-                                    "get_positions failed for {}s ({e:?}); send_error={:?}. Manual check required.",
-                                    self.cfg.fill_confirm_timeout_secs, after_send_error
-                                ),
-                            );
-                            self.record_no_position_today();
-                        }
+                        log::error!(
+                            "[ENTRY] sendTx {} but the final exchange position read failed ({e:?}; \
+                             saw_reading={saw_reading}) -- position UNKNOWN; marking today as acted, NOT \
+                             tracking a position. Check the exchange account manually before the exit \
+                             window.",
+                            if after_send_error.is_some() { "errored" } else { "accepted" }
+                        );
+                        send_notification(
+                            format!("Han Bridge ENTRY UNCONFIRMED {}", self.cfg.us_primary_symbol),
+                            format!(
+                                "get_positions failed at the end of the {}s window ({e:?}); saw_reading={saw_reading}; send_error={:?}. Manual check required.",
+                                self.cfg.fill_confirm_timeout_secs, after_send_error
+                            ),
+                        );
+                        self.record_no_position_today();
                     }
                     Err(_) => {
                         // keep waiting; nothing to update
@@ -1286,28 +1286,39 @@ impl EngineBLiveEngine {
                                 self.pending = None;
                                 self.on_exit(exit_price, now_us);
                             }
-                            Some(remaining) if expired => {
-                                self.pending = None;
-                                log::error!(
-                                    "[EXIT] reduce-only accepted but exchange still holds {} size={:.6} \
-                                     after {}s; retrying next tick with the remainder",
-                                    remaining.side,
-                                    remaining.size,
-                                    self.cfg.fill_confirm_timeout_secs
-                                );
-                                if let Some(p) = self.position.as_mut() {
-                                    p.size = remaining.size;
-                                    if p.side != remaining.side {
-                                        p.side = remaining.side;
-                                    }
-                                }
-                            }
-                            Some(_) => {
-                                self.pending = Some(PendingConfirm::Exit {
+                            Some(remaining) => {
+                                // A side flip while the exit is pending is
+                                // the same anomaly as in maybe_exit: halt and
+                                // reconcile, whether or not the window ended
+                                // (pairtrade#275 Codex review).
+                                self.reconcile_side_flip_if_any(
+                                    &remaining,
                                     exit_price,
-                                    deadline_us,
-                                    saw_reading: true,
-                                });
+                                    "exit confirm",
+                                );
+                                if expired {
+                                    self.pending = None;
+                                    log::error!(
+                                        "[EXIT] reduce-only accepted but exchange still holds {} size={:.6} \
+                                         after {}s; retrying next tick with the remainder (PnL stays booked \
+                                         on the original size)",
+                                        remaining.side,
+                                        remaining.size,
+                                        self.cfg.fill_confirm_timeout_secs
+                                    );
+                                    if let Some(p) = self.position.as_mut() {
+                                        // Only the open remainder shrinks; `size`
+                                        // (what we entered with) is what on_exit
+                                        // books PnL and drawdown on.
+                                        p.open_size = remaining.size;
+                                    }
+                                } else {
+                                    self.pending = Some(PendingConfirm::Exit {
+                                        exit_price,
+                                        deadline_us,
+                                        saw_reading: true,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1378,12 +1389,44 @@ impl EngineBLiveEngine {
                 entry_price,
                 entry_price_estimated,
                 size: filled.size,
+                open_size: filled.size,
                 entered_at_us: now_us,
             },
             epsilon,
             notional_usd,
             &format!("{note} confirmed_by=exchange_position"),
         );
+    }
+
+    /// If the exchange holds the opposite side of what we track, record the
+    /// exchange's side / open size / entry price (WS mid when it gives
+    /// none) and engage the session halt. Used by `maybe_exit` and by the
+    /// pending-exit confirmation so a flip can never be silently absorbed.
+    fn reconcile_side_flip_if_any(
+        &mut self,
+        live: &ExchangePosition,
+        ws_price: f64,
+        context: &str,
+    ) {
+        let Some(pos) = self.position.as_ref() else {
+            return;
+        };
+        if live.side == pos.side {
+            return;
+        }
+        let reason = format!(
+            "{context}: side flip -- tracked {} size={:.6}, exchange holds {} size={:.6}",
+            pos.side, pos.open_size, live.side, live.size
+        );
+        log::error!("[EXIT] {reason}");
+        if let Some(p) = self.position.as_mut() {
+            p.side = live.side;
+            p.size = live.size;
+            p.open_size = live.size;
+            p.entry_price_estimated = live.entry_price.is_none();
+            p.entry_price = live.entry_price.unwrap_or(ws_price);
+        }
+        self.halt_session(reason);
     }
 
     /// Sticky session halt (same on-disk RISK_ACK contract as the drawdown
@@ -1638,6 +1681,7 @@ impl EngineBLiveEngine {
                                 entry_price,
                                 entry_price_estimated,
                                 size: existing.size,
+                                open_size: existing.size,
                                 entered_at_us: now_us,
                             },
                             epsilon,
@@ -1686,6 +1730,7 @@ impl EngineBLiveEngine {
                         entry_price: price,
                         entry_price_estimated: false,
                         size: requested.to_f64().unwrap_or(size),
+                        open_size: requested.to_f64().unwrap_or(size),
                         entered_at_us: now_us,
                     },
                     epsilon,
@@ -1762,39 +1807,29 @@ impl EngineBLiveEngine {
                         // entry price so the PnL we book is at least the
                         // exchange's, and halt new entries (pairtrade#275
                         // review findings 2 and 5).
-                        let reason = format!(
-                            "exit_side_mismatch: tracked {} size={:.6}, exchange holds {} size={:.6}",
-                            pos.side, pos.size, live.side, live.size
-                        );
-                        log::error!("[EXIT] {reason}");
-                        self.halt_session(reason);
-                        if let Some(p) = self.position.as_mut() {
-                            p.side = live.side;
-                            p.size = live.size;
-                            p.entry_price_estimated = live.entry_price.is_none();
-                            p.entry_price = live.entry_price.unwrap_or(price);
-                        }
+                        self.reconcile_side_flip_if_any(&live, price, "exit_side_mismatch");
                         (opposite(live.side), live.size)
                     } else {
-                        let (size, capped) = cap_exit_size(live.size, pos.size);
+                        let (size, capped) = cap_exit_size(live.size, pos.open_size);
                         if capped {
                             log::error!(
-                                "[EXIT] exchange reports size={:.6}, more than {}x the tracked {:.6}; \
+                                "[EXIT] exchange reports size={:.6}, more than {}x the tracked open {:.6}; \
                                  capping the reduce-only to the tracked size (an over-report leaves a \
                                  remainder that the next tick re-reads)",
                                 live.size,
                                 EXIT_SIZE_CAP_RATIO,
-                                pos.size
+                                pos.open_size
                             );
-                        } else if (live.size - pos.size).abs() > 1e-9 {
+                        } else if (live.size - pos.open_size).abs() > 1e-9 {
                             log::warn!(
-                                "[EXIT] exchange size={:.6} differs from tracked {:.6}; sizing the \
-                                 reduce-only to the exchange",
+                                "[EXIT] exchange open size={:.6} differs from tracked {:.6}; sizing the \
+                                 reduce-only to the exchange (PnL stays on the entry size {:.6})",
                                 live.size,
+                                pos.open_size,
                                 pos.size
                             );
                             if let Some(p) = self.position.as_mut() {
-                                p.size = live.size;
+                                p.open_size = live.size;
                             }
                         }
                         (opposite(live.side), size)

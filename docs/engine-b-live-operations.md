@@ -55,7 +55,8 @@ GAPS section -- do not duplicate that list here; read it there.
   keep both in sync until #872 freezes a data-driven value). Fails open
   (proceeds without the gate, logged as a warning) on a fetch/parse error.
 - **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
-  `docs/engine-b-order-spec.md` §4): a live entry is only recorded once
+  `docs/engine-b-order-spec.md` §4 -- introduced by pairtrade#272, so the
+  file is absent until that PR merges): a live entry is only recorded once
   the WS-fed `get_positions()` shows the `us_primary` position. The check
   is a small state machine advanced once per 5 s tick (never a blocking
   wait in the select loop) for up to `ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS`
@@ -65,9 +66,12 @@ GAPS section -- do not duplicate that list here; read it there.
   when the exchange gave no `avg_entry_price` and the WS mid was used);
   none within the window → `Han Bridge ENTRY UNFILLED` (or `ENTRY FAILED`
   if the sendTx itself had errored), day marked acted, **no retry**;
-  account unreadable for the whole window → `Han Bridge ENTRY UNCONFIRMED`,
-  day marked acted, no position tracked: check the exchange manually
-  before the exit window. **At most one entry `sendTx` per session day** --
+  account unreadable at the end of the window (even if an earlier read was
+  flat -- a fill update can land after a flat reading) → `Han Bridge ENTRY
+  UNCONFIRMED`, day marked acted, no position tracked: check the exchange
+  manually before the exit window. Partial exits shrink only the tracked
+  *open* size; PnL and the drawdown halt are booked on the size confirmed
+  at entry. **At most one entry `sendTx` per session day** --
   a send error is never followed by a re-submit, only by the same
   position watch. A position the exchange already holds before submit is
   adopted (`adopted_from_exchange=true origin=unknown`) instead of
