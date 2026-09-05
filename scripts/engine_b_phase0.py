@@ -52,9 +52,15 @@ UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
 SCHEMA_VERSION = 9
-# Ceiling for watchdog-originated WS frames per venue per rolling minute:
-# half of Lighter's documented 200 client messages / minute per IP.
+# Ceiling for (re)subscribe WS frames per venue per rolling minute: half of
+# Lighter's documented 200 client messages / minute per IP, leaving the other
+# half to the trading bots sharing the IP.
 WATCHDOG_MAX_FRAMES_PER_MIN = 100
+# Part of that ceiling reserved for recovering *proven* sequence breaks on a
+# synced book (bot-strategy#908): the initial subscription burst and the
+# watchdog's silence-inferred retries stop at the ceiling minus this, so a
+# real nonce mismatch can always be recovered immediately.
+SEQUENCE_BREAK_RESERVE_FRAMES = 20
 MAX_TRADE_EVENT_AGE_US = 7 * 24 * 60 * 60 * 1_000_000
 MAX_TRADE_EVENT_FUTURE_US = 5 * 60 * 1_000_000
 OHLCV_FINALIZE_GRACE_US = 120_000_000
@@ -3433,7 +3439,36 @@ class Collector:
                     pass
                 backoff = min(backoff * 2, 60)
 
+    async def wait_for_frame_budget(self, venue: VenueConfig, frames: int) -> None:
+        """Block until ``frames`` more (re)subscribe frames fit under the
+        watchdog share of the rolling per-minute cap, so a run of short-lived
+        connections cannot push the reconnect bursts past the exchange limit
+        (bot-strategy#908)."""
+        limit = WATCHDOG_MAX_FRAMES_PER_MIN - SEQUENCE_BREAK_RESERVE_FRAMES
+        while not self.stop_event.is_set():
+            current_us = now_us()
+            sent = self.watchdog_frames_us[venue.name]
+            while sent and current_us - sent[0] > 60_000_000:
+                sent.popleft()
+            room = limit - len(sent)
+            if room >= frames:
+                return
+            # Oldest frame expires first; sleep until enough of them have.
+            need = frames - room
+            expiry_us = sent[min(need, len(sent)) - 1] + 60_000_000
+            wait_s = max(0.2, min(5.0, (expiry_us - current_us) / 1_000_000))
+            LOG.warning(
+                "delaying %d subscribe frames venue=%s for %.1fs: %d frames already sent in the last minute",
+                frames,
+                venue.name,
+                wait_s,
+                len(sent),
+            )
+            self.metrics.inc("engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name})
+            await asyncio.sleep(wait_s)
+
     async def subscribe_public_channels(self, ws: Any, venue: VenueConfig) -> None:
+        await self.wait_for_frame_budget(venue, 3 * len(venue.markets))
         subscribed_us = now_us()
         sent = self.watchdog_frames_us[venue.name]
         while sent and subscribed_us - sent[0] > 60_000_000:
@@ -3492,7 +3527,14 @@ class Collector:
         while sent and recv_us - sent[0] > 60_000_000:
             sent.popleft()
         frames = 2 if unsubscribe_first else 1
-        if len(sent) + frames > WATCHDOG_MAX_FRAMES_PER_MIN:
+        # A proven sequence break may dip into the reserve; silence-inferred
+        # retries (and the reconnect burst) stop short of it.
+        limit = (
+            WATCHDOG_MAX_FRAMES_PER_MIN
+            if bypass_spacing
+            else WATCHDOG_MAX_FRAMES_PER_MIN - SEQUENCE_BREAK_RESERVE_FRAMES
+        )
+        if len(sent) + frames > limit:
             self.metrics.inc("engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name})
             return False
         if unsubscribe_first:
@@ -3508,7 +3550,7 @@ class Collector:
         sent = self.watchdog_frames_us[venue_name]
         while sent and recv_us - sent[0] > 60_000_000:
             sent.popleft()
-        return len(sent) + frames <= WATCHDOG_MAX_FRAMES_PER_MIN
+        return len(sent) + frames <= WATCHDOG_MAX_FRAMES_PER_MIN - SEQUENCE_BREAK_RESERVE_FRAMES
 
     async def watchdog_books(
         self,

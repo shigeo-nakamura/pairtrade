@@ -623,6 +623,55 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ws.messages, [])
         self.assertEqual(sink.commands, [])
 
+    async def test_proven_sequence_break_can_use_the_reserve(self) -> None:
+        # Codex on pairtrade#277: watchdog/reconnect traffic stops at
+        # 100 - reserve; a real nonce mismatch on a synced book still recovers.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        fill = engine_b.WATCHDOG_MAX_FRAMES_PER_MIN - engine_b.SEQUENCE_BREAK_RESERVE_FRAMES
+        collector.watchdog_frames_us[venue.name].extend([t0 - 1_000_000] * fill)
+        # Watchdog (silence-inferred) is refused at this level...
+        self.assertFalse(collector.can_send_frames(venue.name, t0, 2))
+        # ...but a proven break on a synced book still goes out.
+        collector.book_subscribe_us[key] = t0 - 30_000_000
+        state = collector.books.setdefault(key, engine_b.BookState())
+        state.synced = True
+        state.last_nonce = "10"
+        await collector.handle_book(
+            ws,
+            venue,
+            connection,
+            {
+                "type": "update/order_book",
+                "channel": "order_book/216",
+                "order_book": {"begin_nonce": 99, "nonce": 100, "bids": [], "asks": []},
+            },
+            t0,
+        )
+        self.assertEqual(len(ws.messages), 2)
+
+    async def test_reconnect_burst_waits_for_frame_budget(self) -> None:
+        # Codex on pairtrade#277: five short-lived connections must not send
+        # 5 x 42 frames in a minute; the burst waits for budget instead.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        now = engine_b.now_us()
+        limit = engine_b.WATCHDOG_MAX_FRAMES_PER_MIN - engine_b.SEQUENCE_BREAK_RESERVE_FRAMES
+        collector.watchdog_frames_us[venue.name].extend([now - 1_000_000] * limit)
+        slept: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+            collector.watchdog_frames_us[venue.name].clear()  # budget freed
+
+        with mock.patch.object(engine_b.asyncio, "sleep", fake_sleep):
+            await collector.subscribe_public_channels(ws, venue)
+        self.assertEqual(len(slept), 1)
+        self.assertEqual(len(ws.messages), 3 * len(venue.markets))
+
     async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
         # A quiet market (no trades, no stats either) is just quiet, not stalled.
         config, venue, sink, collector = self._collector()
