@@ -63,6 +63,10 @@ WATCHDOG_MAX_FRAMES_PER_MIN = 100
 # `load_config` rejects venues where that reserve would leave the watchdog
 # fewer than WATCHDOG_MIN_SHARE_FRAMES.
 WATCHDOG_MIN_SHARE_FRAMES = 20
+# Frames per minute set aside for the WebSocket library's automatic keepalive
+# (`ping_interval=20` -> 3 protocol pings/min, plus protocol pong replies to
+# server pings), which never pass through the application-level accounting.
+KEEPALIVE_RESERVE_FRAMES = 6
 MAX_TRADE_EVENT_AGE_US = 7 * 24 * 60 * 60 * 1_000_000
 MAX_TRADE_EVENT_FUTURE_US = 5 * 60 * 1_000_000
 OHLCV_FINALIZE_GRACE_US = 120_000_000
@@ -927,7 +931,7 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         )
     for venue in venues:
         reserve = 2 * len(venue.markets)
-        if reserve > WATCHDOG_MAX_FRAMES_PER_MIN - WATCHDOG_MIN_SHARE_FRAMES:
+        if reserve > WATCHDOG_MAX_FRAMES_PER_MIN - KEEPALIVE_RESERVE_FRAMES - WATCHDOG_MIN_SHARE_FRAMES:
             raise ValueError(
                 f"venue {venue.name} has {len(venue.markets)} markets; the sequence-break reserve "
                 f"({reserve} frames) would leave the watchdog fewer than {WATCHDOG_MIN_SHARE_FRAMES} of "
@@ -3467,7 +3471,7 @@ class Collector:
         """Frames per rolling minute available to the reconnect burst and the
         silence-inferred watchdog; the rest (2 per market) is reserved for
         proven sequence breaks."""
-        return WATCHDOG_MAX_FRAMES_PER_MIN - 2 * len(venue.markets)
+        return WATCHDOG_MAX_FRAMES_PER_MIN - KEEPALIVE_RESERVE_FRAMES - 2 * len(venue.markets)
 
     async def wait_for_frame_budget(self, venue: VenueConfig, frames: int) -> None:
         """Block until ``frames`` more (re)subscribe frames fit under the
@@ -3582,7 +3586,7 @@ class Collector:
             if not (
                 bypass_spacing
                 and reserve_free
-                and len(sent) + frames <= WATCHDOG_MAX_FRAMES_PER_MIN
+                and len(sent) + frames <= WATCHDOG_MAX_FRAMES_PER_MIN - KEEPALIVE_RESERVE_FRAMES
             ):
                 self.metrics.inc(
                     "engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name}
