@@ -15,15 +15,15 @@ use chrono::{DateTime, NaiveDate, Utc};
 use debot::arcus_spot::event_record;
 use debot::arcus_spot::{
     build_arcus_spot_kms_signer, is_supported_live_route,
-    manual_reconciled_runtime_fill_for_attempt, verify_archive_events, verify_record,
-    ArcusSpotChainClient, ArcusSpotChainConfig, ArcusSpotDecision, ArcusSpotDirection,
-    ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerStore,
-    ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner,
-    ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventPublisher,
-    ArcusSpotLiveTickEventRecord, ArcusSpotLiveTickEventStream, ArcusSpotRegime,
-    ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger, ArcusSpotRuntime,
-    ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent,
-    ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    manual_reconciled_runtime_fill_for_attempt, open_exit_fixed_sell_amount_row_for,
+    verify_archive_events, verify_record, ArcusSpotChainClient, ArcusSpotChainConfig,
+    ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
+    ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig,
+    ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig,
+    ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventRecord, ArcusSpotLiveTickEventStream,
+    ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger,
+    ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig,
+    ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
 use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
@@ -1170,6 +1170,26 @@ fn build_manual_reconcile_report(
 /// require the symbol's *currently configured* address to match the
 /// address the attempt was actually signed and dispatched against before
 /// trusting its decimals pin (Codex P1 follow-up, pairtrade#241).
+/// The administrator-pinned decimals for `symbol` alone, from
+/// `CONFIG_YAML.router.trusted_token_decimals` -- shared by every call site
+/// that only needs the pin itself (one that must also cross-check the
+/// pinned token address is `trusted_token_decimals_for_address`, below).
+/// `caller` names the calling context for the error message (e.g.
+/// "manual-reconcile", "acceptance", "live-tick").
+fn trusted_token_decimals_for_symbol(
+    config: &ArcusSpotExecuteOnceConfig,
+    symbol: &str,
+    caller: &str,
+) -> Result<u32> {
+    config
+        .router
+        .trusted_token_decimals
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
+        .map(|(_, decimals)| *decimals)
+        .with_context(|| format!("Arcus {caller} has no decimals pin for {symbol}"))
+}
+
 fn trusted_token_decimals_for_address(
     config: &ArcusSpotExecuteOnceConfig,
     symbol: &str,
@@ -1190,13 +1210,7 @@ fn trusted_token_decimals_for_address(
              signed; refusing to guess its decimals"
         );
     }
-    config
-        .router
-        .trusted_token_decimals
-        .iter()
-        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
-        .map(|(_, decimals)| *decimals)
-        .with_context(|| format!("Arcus manual-reconcile has no decimals pin for {symbol}"))
+    trusted_token_decimals_for_symbol(config, symbol, "manual-reconcile")
 }
 
 fn finalize_manual_reconciled_attempt(
@@ -1429,6 +1443,35 @@ fn append_declined_route(
         .with_context(|| format!("failed to append to {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("failed to flush {}", path.display()))
+}
+
+/// The extra recorder row live-tick requests while the checkpointed
+/// position is rotated: the exit direction at exactly the open rotation
+/// quantity, in raw units of the token that exit sells, using the
+/// administrator-pinned `router.trusted_token_decimals` (a missing pin is
+/// a configuration error -- the live path could not execute that exit
+/// anyway). `None` when there is no checkpoint yet or it is neutral.
+fn live_tick_open_quantity_exit_row(
+    config: &ArcusSpotExecuteOnceConfig,
+) -> Result<Option<dex_connector::ArcusSpotFixedSellAmountRow>> {
+    // A cheap peek at the checkpoint file, not the full config-validated
+    // `load_or_create`/`load_existing`: this only decides what to request
+    // before the network fetch below, the locked load further down is what
+    // the actual decision is made against, and a full load here would pay
+    // for (and, on a state-preserving config change, log) the same drift
+    // comparison twice per tick for no benefit.
+    let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+    let Some((regime, rotated_quantity)) = store.peek_regime_and_rotated_quantity()? else {
+        return Ok(None);
+    };
+    let sell_symbol = match (regime, rotated_quantity) {
+        (_, None) | (ArcusSpotRegime::Neutral, _) => return Ok(None),
+        (ArcusSpotRegime::RotatedAToB, Some(_)) => &config.runtime.pair.buy_symbol,
+        (ArcusSpotRegime::RotatedBToA, Some(_)) => &config.runtime.pair.sell_symbol,
+    };
+    let decimals = trusted_token_decimals_for_symbol(config, sell_symbol, "live-tick")?;
+    open_exit_fixed_sell_amount_row_for(regime, rotated_quantity, &config.runtime.pair, decimals)
+        .map_err(anyhow::Error::msg)
 }
 
 fn live_tick_observation_evidence_path(config: &ArcusSpotExecuteOnceConfig) -> Result<PathBuf> {
@@ -2366,13 +2409,7 @@ fn require_acceptance_plan_matches_config(
         if !address.eq_ignore_ascii_case(trusted_address) {
             bail!("Arcus acceptance plan token address does not match its configured pin");
         }
-        let decimals = config
-            .router
-            .trusted_token_decimals
-            .iter()
-            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
-            .map(|(_, decimals)| *decimals)
-            .with_context(|| format!("Arcus acceptance has no decimals pin for {symbol}"))?;
+        let decimals = trusted_token_decimals_for_symbol(config, symbol, "acceptance")?;
         if quantity_to_raw_for_continuity(quantity, decimals)? != raw {
             bail!("Arcus acceptance plan raw amount does not match its decimal quantity");
         }
@@ -2670,18 +2707,7 @@ fn require_acceptance_entry_within_strategy_limits(
             config.runtime.max_all_in_round_trip_cost_bps
         );
     }
-    let sell_decimals = config
-        .router
-        .trusted_token_decimals
-        .iter()
-        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&plan.sell_symbol))
-        .map(|(_, decimals)| *decimals)
-        .with_context(|| {
-            format!(
-                "Arcus acceptance has no decimals pin for {}",
-                plan.sell_symbol
-            )
-        })?;
+    let sell_decimals = trusted_token_decimals_for_symbol(config, &plan.sell_symbol, "acceptance")?;
     let raw_scale = 10_i128
         .checked_pow(sell_decimals)
         .context("Arcus acceptance token decimals exceed Decimal range")?;
@@ -4178,13 +4204,23 @@ async fn main() -> Result<()> {
             // than merely asserted.
             let client = ArcusSpotClient::new(config.router.clone())
                 .context("invalid Arcus router configuration")?;
-            let recorder_config = ArcusSpotRecorderConfig::from_csv(
+            let mut recorder_config = ArcusSpotRecorderConfig::from_csv(
                 &config.runtime.bidirectional_recorder_pairs_csv(),
                 &config.runtime.notional_usd.normalize().to_string(),
             )
             .context(
                 "failed to build a bidirectional recorder config from the runtime pair/notional",
             )?;
+            // A rotated position exits by selling exactly the quantity it
+            // acquired, so the snapshot must carry a quote at that exact
+            // size (bot-strategy#906). This unlocked peek at the checkpoint
+            // only decides which rows to *request*; the locked load below
+            // is what the decision is made against, and step_at matches
+            // the row by exact raw amount, so a checkpoint that moves in
+            // between (a concurrent fill) simply leaves this row unused.
+            if let Some(row) = live_tick_open_quantity_exit_row(&config)? {
+                recorder_config = recorder_config.with_fixed_sell_amount_row(row);
+            }
             let recorder = ArcusSpotRecorder::new(client, recorder_config)
                 .context("invalid Arcus recorder configuration")?;
             let snapshot: ArcusSpotRecorderSnapshot = recorder.collect_once().await;

@@ -7,8 +7,9 @@
 //! atomic-write and validated-restore logic rather than two independently
 //! maintained copies of it.
 
-use super::{ArcusSpotRuntime, ArcusSpotRuntimeConfig, ArcusSpotRuntimeState};
+use super::{ArcusSpotRegime, ArcusSpotRuntime, ArcusSpotRuntimeConfig, ArcusSpotRuntimeState};
 use anyhow::{bail, Context, Result};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -254,6 +255,37 @@ impl ArcusSpotRuntimeCheckpointStore {
             return ArcusSpotRuntime::new(config.clone()).map_err(anyhow::Error::msg);
         }
         self.load_existing(config)
+    }
+
+    /// Read just the persisted regime and open rotation quantity, `None` if
+    /// no checkpoint exists yet. Unlike `load_existing`/`load_or_create`,
+    /// this does not compare the checkpoint against any config (so it does
+    /// nothing on a state-preserving config change -- see
+    /// `classify_config_drift` -- and cannot itself detect a
+    /// state-invalidating one) or construct a runtime; it exists for a
+    /// caller that only needs to decide, cheaply and without the
+    /// once-per-tick drift-check log noise a full load produces, whether a
+    /// snapshot collector should request an exit-sized quote before the
+    /// locked, config-validated load that the actual decision is made
+    /// against (bot-strategy#906: live-tick's snapshot fetch happens before
+    /// it takes the checkpoint lock, so this peek necessarily precedes that
+    /// lock too).
+    pub fn peek_regime_and_rotated_quantity(
+        &self,
+    ) -> Result<Option<(ArcusSpotRegime, Option<Decimal>)>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_private_regular_file(&self.path, "runtime checkpoint")?;
+        let checkpoint: ArcusSpotRuntimeCheckpoint = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid runtime checkpoint {}", self.path.display()))?;
+        if checkpoint.schema_version != RUNTIME_CHECKPOINT_SCHEMA_VERSION {
+            bail!("unsupported Arcus runtime checkpoint schema");
+        }
+        Ok(Some((
+            checkpoint.state.regime,
+            checkpoint.state.rotated_quantity,
+        )))
     }
 
     /// Load and validate an already-persisted checkpoint without creating
