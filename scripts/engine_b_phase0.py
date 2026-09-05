@@ -3441,7 +3441,16 @@ class Collector:
         budget = self.config.book_watchdog_batch
         resubscribe_after_us = self.config.book_resubscribe_after_ms * 1_000
         stall_after_us = self.config.book_stall_after_ms * 1_000
-        for market in venue.markets:
+        # Oldest subscribe deadline first, so a batch smaller than the number
+        # of unsynced markets rotates through all of them instead of retrying
+        # the first `book_watchdog_batch` in config order forever (a
+        # re-subscribed market gets the newest timestamp and moves to the
+        # back of the line).
+        ordered_markets = sorted(
+            venue.markets,
+            key=lambda m: self.book_subscribe_us.get((venue.name, m.market_id), 0),
+        )
+        for market in ordered_markets:
             if budget <= 0:
                 return
             key = (venue.name, market.market_id)
@@ -3488,6 +3497,7 @@ class Collector:
                 market.symbol,
                 (recv_us - last_book_us) / 1_000_000,
             )
+            last_accepted_nonce = state.last_nonce
             state.synced = False
             state.last_nonce = None
             state.bids.clear()
@@ -3515,7 +3525,7 @@ class Collector:
                     "market_id": market.market_id,
                     "symbol": market.symbol,
                     "channel": "order_book",
-                    "expected_sequence": state.last_nonce,
+                    "expected_sequence": last_accepted_nonce,
                     "observed_sequence": None,
                     "reason": "book_channel_stalled",
                 },

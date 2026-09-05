@@ -376,6 +376,13 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         # Throttled to once per second per venue.
         await collector.watchdog_books(ws, venue, connection, t0 + 11_500_000)
         self.assertEqual(len(ws.messages), config.book_watchdog_batch)
+        # Next eligible pass rotates to markets not yet retried (oldest
+        # subscribe first), instead of the same first batch again.
+        first_batch = {m["channel"] for m in ws.messages}
+        await collector.watchdog_books(ws, venue, connection, t0 + 22_000_000)
+        second_batch = {m["channel"] for m in ws.messages[config.book_watchdog_batch :]}
+        self.assertEqual(len(second_batch), config.book_watchdog_batch)
+        self.assertTrue(first_batch.isdisjoint(second_batch))
         self.assertEqual(sink.commands, [])
 
     async def test_synced_market_with_silent_book_is_marked_stale(self) -> None:
@@ -423,6 +430,7 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gaps[0]["start_us"], t0)
         self.assertEqual(gaps[0]["partition_us"], t0)
         self.assertEqual(gaps[0]["market_id"], 216)
+        self.assertEqual(gaps[0]["expected_sequence"], "10")
 
     async def test_stale_activity_does_not_declare_a_stall(self) -> None:
         # One stats message shortly after the last book message, then a
