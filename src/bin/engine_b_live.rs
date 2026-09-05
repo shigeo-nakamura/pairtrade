@@ -498,6 +498,16 @@ struct RiskState {
     t0_snapshot_date: Option<String>,
     #[serde(default)]
     t0_prices: HashMap<String, f64>,
+    /// A sendTx went out (or errored ambiguously) and the exchange position
+    /// could not be read for the whole confirm window, so a live position
+    /// may exist that this process does not track. Persisted (not
+    /// day-scoped) so a midnight `roll_day_if_needed` cannot make the
+    /// status look trustworthy again; cleared only by adopting the
+    /// position from the exchange or by the operator's RISK_ACK, which
+    /// also lifts the session halt raised at the same time
+    /// (pairtrade#275 Codex review).
+    #[serde(default)]
+    position_unconfirmed: bool,
 }
 
 fn load_state(path: &Path) -> RiskState {
@@ -694,12 +704,6 @@ struct DaySnapshot {
     /// the one entry opportunity for the day on a single hiccup
     /// (bot-strategy#872 PR #266 self-review, non-blocking finding).
     eligibility_confirmed: bool,
-    /// Set when a sendTx went out (or errored ambiguously) and the exchange
-    /// position could not be read for the whole confirm window: a live
-    /// position may exist that this process does not track. Drives
-    /// `positions_ready = false` in the dashboard status until the day
-    /// rolls (pairtrade#275 Codex review).
-    position_unconfirmed: bool,
     /// One entry per ineligible symbol found (`kr_primary`/`us_primary`,
     /// either or both) -- kept as a `Vec` rather than the first-match-wins
     /// `Option<String>` this started as, so a same-day gate on an
@@ -964,7 +968,7 @@ struct HanBridgeStatus {
     day_entered: bool,
     day_exited: bool,
     /// True while today's entry sendTx has an unknown outcome (see
-    /// `DaySnapshot.position_unconfirmed`); `positions_ready` is false too.
+    /// `RiskState.position_unconfirmed`); `positions_ready` is false too.
     position_unconfirmed: bool,
     ineligible_reasons: Vec<String>,
     session_halt_reason: Option<String>,
@@ -1013,6 +1017,13 @@ impl EngineBLiveEngine {
             );
             self.state.session_halted = false;
             self.state.session_halt_reason = None;
+            if self.state.position_unconfirmed {
+                log::warn!(
+                    "[RISK_ACK] clearing position_unconfirmed -- operator asserts the exchange was \
+                     reconciled"
+                );
+                self.state.position_unconfirmed = false;
+            }
             self.state.peak_equity =
                 self.state.session_start_equity + self.state.realized_pnl_session;
             atomic_write_json(&self.cfg.state_path, &self.state);
@@ -1194,6 +1205,53 @@ impl EngineBLiveEngine {
         }
     }
 
+    /// While `RiskState.position_unconfirmed` is set and nothing is
+    /// tracked, read the exchange once per tick: a `us_primary` position
+    /// showing up is adopted (origin = the unconfirmed send) and clears the
+    /// flag; a flat reading is *not* evidence of anything and leaves the
+    /// flag (and the halt) for the operator. Runs on every tick including
+    /// after a day roll, so the exposure never goes unmanaged.
+    async fn try_adopt_unconfirmed(&mut self, now_us: i64) {
+        let Ok(positions) = self.connector.get_positions().await else {
+            return;
+        };
+        let Some(live) = exchange_position_for(&positions, &self.cfg.us_primary_symbol) else {
+            return;
+        };
+        let ws_price = self
+            .latest_price
+            .get(&self.cfg.us_primary_symbol)
+            .copied()
+            .unwrap_or(0.0);
+        let entry_price_estimated = live.entry_price.is_none();
+        let entry_price = live.entry_price.unwrap_or(ws_price);
+        log::warn!(
+            "[ENTRY] exchange now shows {} {} size={:.6} after an UNCONFIRMED send -- adopting it; \
+             session halt stays until RISK_ACK",
+            live.side,
+            self.cfg.us_primary_symbol,
+            live.size
+        );
+        self.state.position_unconfirmed = false;
+        self.position = Some(OpenPosition {
+            side: live.side,
+            entry_price,
+            entry_price_estimated,
+            size: live.size,
+            open_size: live.size,
+            realized_partial_pnl: 0.0,
+            entered_at_us: now_us,
+        });
+        atomic_write_json(&self.cfg.state_path, &self.state);
+        send_notification(
+            format!("Han Bridge ENTRY ADOPTED {} {}", self.cfg.us_primary_symbol, live.side),
+            format!(
+                "unconfirmed send resolved: exchange holds size={:.6} entry_price={entry_price:.4} estimated={entry_price_estimated}",
+                live.size
+            ),
+        );
+    }
+
     /// One poll of the pending fill/exit confirmation, called from `tick`
     /// every 5 s while `self.pending` is set. Deliberately *not* a blocking
     /// wait inside `maybe_enter`/`maybe_exit`: a 15 s `await` there would
@@ -1296,7 +1354,13 @@ impl EngineBLiveEngine {
                                 self.cfg.fill_confirm_timeout_secs, after_send_error
                             ),
                         );
-                        self.day.position_unconfirmed = true;
+                        self.state.position_unconfirmed = true;
+                        self.halt_session(format!(
+                            "entry_unconfirmed: sendTx sent but exchange position unreadable for {}s; \
+                             a live {} position may exist untracked -- reconcile against the exchange, \
+                             then RISK_ACK",
+                            self.cfg.fill_confirm_timeout_secs, self.cfg.us_primary_symbol
+                        ));
                         self.record_no_position_today();
                     }
                     Err(_) => {
@@ -2055,6 +2119,9 @@ impl EngineBLiveEngine {
         self.roll_day_if_needed(now);
         self.maybe_clear_halt();
         self.maybe_capture_t0(now);
+        if self.state.position_unconfirmed && self.position.is_none() && self.pending.is_none() {
+            self.try_adopt_unconfirmed(now).await;
+        }
         if self.pending.is_some() {
             // One exchange read per tick until the in-flight entry/exit is
             // confirmed or its window ends; no new decisions meanwhile.
@@ -2086,7 +2153,9 @@ impl EngineBLiveEngine {
                     dex_connector::OrderSide::Long => "long",
                     dex_connector::OrderSide::Short => "short",
                 },
-                size: pos.size.to_string(),
+                // Live exposure (shrinks across partial exits); `size`
+                // is the historical entry quantity used for PnL.
+                size: pos.open_size.to_string(),
                 entry_price: pos.entry_price.to_string(),
             }],
             None => vec![],
@@ -2137,7 +2206,7 @@ impl EngineBLiveEngine {
             us_primary_symbol: self.cfg.us_primary_symbol.clone(),
             day_entered: extra.day_entered,
             day_exited: extra.day_exited,
-            position_unconfirmed: self.day.position_unconfirmed,
+            position_unconfirmed: self.state.position_unconfirmed,
             ineligible_reasons: extra.eligibility_ineligible_reasons.clone(),
             session_halt_reason: extra.session_halt_reason.clone(),
         };
@@ -2156,7 +2225,7 @@ impl EngineBLiveEngine {
                 // persisted, see KNOWN GAPS), so debot-dashboard's
                 // "positions_ready !== false means trustworthy" read must
                 // not be told otherwise.
-                positions_ready: !(self.day.restart_recovered || self.day.position_unconfirmed),
+                positions_ready: !(self.day.restart_recovered || self.state.position_unconfirmed),
                 positions,
                 pnl_total: self.state.realized_pnl_session,
                 pnl_today: self.state.pnl_today,
