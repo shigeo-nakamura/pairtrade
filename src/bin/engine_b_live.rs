@@ -1054,6 +1054,19 @@ impl EngineBLiveEngine {
         }
         self.current_date = Some(today);
         self.day = DaySnapshot::default();
+        if self.position.is_some() || self.pending.is_some() {
+            // Carry-over across midnight (an exit still failing or still
+            // being confirmed): today's entry is blocked outright, and it
+            // must be blocked *now* -- if the pending exit resolves flat
+            // before t1 the position is gone and a t1-time check would
+            // let a new entry through (pairtrade#275 Codex review).
+            log::warn!(
+                "[DAY] {today} starts with a carried-over position/exit in flight; no new entry today"
+            );
+            self.day.entered = true;
+            self.state.last_session_date = Some(today.to_string());
+            atomic_write_json(&self.cfg.state_path, &self.state);
+        }
         // Keyed off the *persisted* pnl_today_date, not the in-memory
         // current_date this function just reset -- current_date is always
         // None right after process start (main() initializes it that way),
@@ -1590,6 +1603,24 @@ impl EngineBLiveEngine {
         );
         log::error!("[EXIT] {reason}");
         if let Some(p) = self.position.as_mut() {
+            // The tracked leg was necessarily closed for the side to
+            // flip: realize it at the current mid before installing the
+            // exchange's replacement leg, so its loss/gain reaches
+            // on_exit's drawdown accounting (pairtrade#275 Codex review).
+            let old_sign = match p.side {
+                OrderSide::Long => 1.0,
+                OrderSide::Short => -1.0,
+            };
+            let old_leg_pnl = old_sign * (ws_price - p.entry_price) * p.open_size;
+            p.realized_partial_pnl += old_leg_pnl;
+            log::error!(
+                "[EXIT] booked the flipped-away {} leg: size={:.6} entry={:.4} at mid {ws_price:.4} \
+                 pnl=${old_leg_pnl:.2}; realized_so_far=${:.2}",
+                p.side,
+                p.open_size,
+                p.entry_price,
+                p.realized_partial_pnl
+            );
             p.side = live.side;
             p.size = live.size;
             p.open_size = live.size;
@@ -2005,23 +2036,32 @@ impl EngineBLiveEngine {
                         self.reconcile_side_flip_if_any(&live, price, "exit_side_mismatch");
                         (opposite(live.side), live.size)
                     } else {
-                        let (size, capped) = cap_exit_size(live.size, pos.open_size);
-                        if capped {
-                            log::error!(
-                                "[EXIT] exchange reports size={:.6}, more than {}x the tracked open {:.6}; \
-                                 capping the reduce-only to the tracked size (an over-report leaves a \
-                                 remainder that the next tick re-reads)",
-                                live.size,
-                                EXIT_SIZE_CAP_RATIO,
-                                pos.open_size
-                            );
-                        } else if (live.size - pos.open_size).abs() > 1e-9 {
-                            // Reduced (or grown) outside our own attempts:
-                            // book the reduction at the current mid.
+                        let tracked_open = pos.open_size;
+                        if (live.size - tracked_open).abs() > 1e-9 {
+                            // Reduced or grown outside our own attempts:
+                            // reconcile the accounting first (a reduction is
+                            // booked at the current mid; growth re-bases the
+                            // cost on the exchange's average entry price and
+                            // halts), independent of how much we send below.
                             self.book_partial_close(
                                 &live,
                                 price,
                                 "exchange open size differs from tracked before exit",
+                            );
+                        }
+                        // The order itself is still capped against a
+                        // transient over-report; a real add above the cap
+                        // has been reconciled above and its remainder is
+                        // re-read and re-sent on the next tick.
+                        let (size, capped) = cap_exit_size(live.size, tracked_open);
+                        if capped {
+                            log::error!(
+                                "[EXIT] exchange reports size={:.6}, more than {}x the previously tracked \
+                                 open {:.6}; sending a reduce-only for {:.6} this tick (remainder next tick)",
+                                live.size,
+                                EXIT_SIZE_CAP_RATIO,
+                                tracked_open,
+                                size
                             );
                         }
                         (opposite(live.side), size)
