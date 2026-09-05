@@ -217,11 +217,24 @@ Per-boundary REST cost of the order path, worst case:
 | `sendTx` (entry) | 1 | 6 | |
 | exit: same as entry minus the eligibility gate | 1–3 | | |
 
-Total ≤ ~8 requests per trading day against a 60 / min budget. The shared
-IP also carries the three Robinhood arms and the Phase 0 observer; the
-sidecar's `stats 60s` line on 2026-09-04 shows `tokens_remaining≈59,430
-/ 60,000` at rest, i.e. the whole host is nowhere near the weighted
-budget either.
+Happy path: ≤ ~8 requests per trading day against a 60 / min budget.
+
+Failure-path ceiling (this is what A-8 has to be judged on, not the happy
+path). With the binary running today (before pairtrade#275): a `sendTx`
+that keeps failing is retried on every 5 s tick for the whole 180 s entry
+window, and each attempt costs `nextNonce` (cache invalidated by the
+failure) + `sendTx` + `recentTrades` whenever the WS price is stale, i.e.
+**up to 3 requests / 5 s = 36 / min for 3 minutes (≈ 108 requests)**, of
+which only the two sidecar-charged ones are paced at all. The exit path
+retries every tick **indefinitely** while it fails, at the same 24–36 /
+min. Either alone is a majority of the Standard-tier 60 / min that this
+host shares with the three Robinhood arms and the observer, so a stuck
+exit can rate-limit the whole host. pairtrade#275 reduces the entry to
+one `sendTx` per session day; its exit still re-sends once per tick while
+failing (bounded only by reduce-only and the operator), which is the
+remaining A-8 exposure. The sidecar's `stats 60s` line on 2026-09-04
+(`tokens_remaining≈59,430 / 60,000` at rest) describes the happy path
+only.
 
 WS footprint: **one connection**, 13 subscriptions (`account_all/{idx}`
 + `order_book/{id}` × 6 + `market_stats/{id}` × 6) against 500 / conn.
@@ -347,7 +360,7 @@ below.
 | G-1 | `set_leverage` is a **no-op** on the Lighter connector (`dex_impl.rs`: logs at debug, returns `Ok`). `ENGINE_B_LIVE_LEVERAGE=2` only feeds the notional cap (`equity × leverage × 0.9`); the exchange applies its per-market default margin (SNDK `default_initial_margin_fraction=666`, `maintenance=300`, raw units — interpret under A-5 / #877). | entry | none: $100 notional on ~$1,000 equity is far below any margin bound | document; do not read `leverage=2` as an exchange setting |
 | G-2 | **Fill was assumed on HTTP 200.** `OpenPosition.size` = requested size, `entry_price` = last WS mid. If the IOC filled partially or not at all, the engine held a phantom position, logged a fictitious PnL, and sent a reduce-only exit sized to a position that might not exist. | entry → exit | real for the smoke test — exactly the class of bug the test is meant to surface | **Addressed in pairtrade#275 (open, not yet merged -- the running binary still has this gap)**: after an accepted IOC the engine polls the WS-fed `get_positions()` for up to `ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS` (15 s) and records the exchange's side / size / entry price; no position → treated as unfilled, no retry that day; exits are sized to the exchange's current position and only complete once it reports flat. Verify on the first live cycle. |
 | G-3 | Entry/exit is MARKET+IOC with a **±20 % protection price**, not the doc's "marketable limit ≤ 50 bps from mid" (§6.3). No limit-IOC path exists in the connector for Lighter. | entry, exit | low: SNDK does ~$15 M/day with ~1.3 bps spread; observed top-5 depth ≈ $83 k vs a $100 order | accept for the smoke test; open a dex-connector item (LIMIT + TIF_IOC) before any Phase 2 sizing |
-| G-4 | **No idempotency journal.** A `sendTx` that timed out after Lighter accepted it returned `Transient`; `day.entered` stayed `false`, and the next 5 s tick re-submitted → possible double entry (2 × notional). §6.5 (persist intent, then send; on timeout query by client ID) is unimplemented. A position check alone does not close this: REST and WS rate limits are coupled (§2.1), so the same stress that timed out the `sendTx` can delay the WS `account_all` update, and a single `get_positions()` read right after the timeout can be a false negative. | entry | bounded (2 × $100), but a correctness hole | **Addressed in pairtrade#275 (open, not yet merged) by construction: at most one entry `sendTx` per session day.** Any `submit_order` outcome (Ok, `Transient`, `RateLimited`, `ServerResponse`) ends the day's submitting; after an error the engine still polls the exchange position for the full confirm window and adopts a position if one appears. The exchange position is also read before the single submit (catches a position left by a crashed prior process). A persisted `order_intent` journal remains Phase 2 work. |
+| G-4 | **No idempotency journal.** A `sendTx` that timed out after Lighter accepted it returned `Transient`; `day.entered` stayed `false`, and the next 5 s tick re-submitted → possible double entry (2 × notional). §6.5 (persist intent, then send; on timeout query by client ID) is unimplemented. A position check alone does not close this: REST and WS rate limits are coupled (§2.1), so the same stress that timed out the `sendTx` can delay the WS `account_all` update, and a single `get_positions()` read right after the timeout can be a false negative. | entry | **not** bounded at 2×: before #275, `day.entered` stays false after every error and the tick loop re-submits every 5 s for the 180 s window, so if every acknowledgment is lost up to ~36 orders × $100 can be accepted (the notional cap is per order, not cumulative) | **Addressed in pairtrade#275 (open, not yet merged) by construction: at most one entry `sendTx` per session day.** Any `submit_order` outcome (Ok, `Transient`, `RateLimited`, `ServerResponse`) ends the day's submitting; after an error the engine still polls the exchange position for the full confirm window and adopts a position if one appears. The exchange position is also read before the single submit (catches a position left by a crashed prior process). A persisted `order_intent` journal remains Phase 2 work. |
 | G-5 | Rate limiter sidecar models a 60,000-weight/min bucket; Standard tier is 60 req/min unweighted. The connector's real Standard-tier protection is reactive (429 → 90–120 s cooldown) plus the `[API_TRACKER]` warning at 45/60 s. | REST | none at ≤ 8 req/day | do not add REST polling loops to this binary without revisiting; if `reconcile` polling is added for G-2, poll ≤ 1/s and prefer the WS-fed `get_positions()` |
 | G-6 | Startup / reconnect reconcile (§6.4) is not implemented: the engine does not compare its state file with exchange positions at boot and does not cancel unknown open orders. `OpenPosition` is in-memory only (already in the binary's KNOWN GAPS). | boot | matters only if the service restarts between entry and exit | keep the documented manual rule (check the exchange before trusting `status.json`); Phase 2 item |
 | G-7 | No `min_base_amount` / `min_quote_amount` / decimals guard in the engine; sizing relies on connector truncation, and the connector silently substitutes `base_amount = 1` (one size tick) when truncation yields zero rather than refusing — on a thin symbol that is a different order than the one intended, not a rejection. | entry | none at $100 / SNDK (11× the minimum) | add an explicit floor check (and reject a zero-after-truncation size) when `lot_usd` becomes `Q_gate`-driven |
@@ -366,11 +379,16 @@ here so the requirements doc v0.4 (bot-strategy#879) can mark A-3/A-8/A-9
   `size_decimals` must be ≥ `min_base_amount` and × price ≥ $10. Read
   both from the `[MARKET_INFO]` line for `us_primary` in the current
   journal.
-- After an entry, the lines to expect, in order:
-  `[ENTRY] side=… notional=$… size=…` → `[API_TRACKER] … POST
-  /api/v1/sendTx` → `✅ [FILL_DETECTION] Trade detected: order_id=<ms
-  timestamp> size=… price=…` → `Updated cached positions: 1 positions`.
-  A missing `[FILL_DETECTION]` after a live `[ENTRY]` is G-2 happening.
+- After an entry, the lines to expect: `[API_TRACKER] … POST
+  /api/v1/sendTx` (emitted inside the connector call) → `[ENTRY] side=…
+  notional=$… size=…` (emitted after the call returns). `✅
+  [FILL_DETECTION] Trade detected: order_id=<ms timestamp> size=… price=…`
+  and `Updated cached positions: 1 positions` come from the WS account
+  channel and are **asynchronous** -- they can land before or after
+  `[ENTRY]`. Judge a fill by their presence within a few seconds of the
+  `sendTx`, not by their order relative to `[ENTRY]`; no fill lines at all
+  after a live `sendTx` is G-2 happening (before #275) or an
+  `ENTRY UNFILLED` notification (after #275).
 - A `[Lighter rate-limit] cooldown engaged for …s` line means a 429/405
   hit somewhere on the host (shared IP); every Lighter REST call from
   this process fails fast until the deadline. WS keeps running.
