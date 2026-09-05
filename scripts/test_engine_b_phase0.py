@@ -508,6 +508,26 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         await collector.watchdog_books(ws, venue, connection, t0 + 1_500_000)
         self.assertEqual(len(ws.messages), 2)  # watchdog stays quiet inside the spacing
 
+    async def test_watchdog_frames_are_capped_per_minute(self) -> None:
+        # Runtime cap independent of config: even with a pathological
+        # interval the watchdog never sends more than
+        # WATCHDOG_MAX_FRAMES_PER_MIN frames per venue per rolling minute.
+        import dataclasses
+
+        config, venue, sink, collector = self._collector()
+        collector.config = dataclasses.replace(
+            config, book_resubscribe_after_ms=1_000, book_watchdog_batch=14
+        )
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            collector.book_subscribe_us[(venue.name, market.market_id)] = t0 - 10_000_000
+        for second in range(0, 60):
+            await collector.watchdog_books(ws, venue, connection, t0 + second * 1_000_000)
+        self.assertLessEqual(len(ws.messages), engine_b.WATCHDOG_MAX_FRAMES_PER_MIN)
+        self.assertGreater(len(ws.messages), 0)
+
     async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
         # A quiet market (no trades, no stats either) is just quiet, not stalled.
         config, venue, sink, collector = self._collector()
@@ -1170,6 +1190,16 @@ class ConfigTests(unittest.TestCase):
                     path.write_text(json.dumps(raw))
                     with self.assertRaisesRegex(ValueError, f"{key} must be positive"):
                         engine_b.load_config(path, LOCK_PATH)
+
+    def test_rate_unsafe_watchdog_settings_are_rejected(self) -> None:
+        base = json.loads(CONFIG_PATH.read_text())
+        raw = dict(base)
+        raw["book_resubscribe_after_ms"] = 1_000  # 2*5*60 = 600 frames/min
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "phase0.json"
+            path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "WS frames/min"):
+                engine_b.load_config(path, LOCK_PATH)
 
     def test_watchdog_settings_default_when_absent(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)

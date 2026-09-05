@@ -36,7 +36,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
@@ -52,6 +52,9 @@ UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
 SCHEMA_VERSION = 9
+# Ceiling for watchdog-originated WS frames per venue per rolling minute:
+# half of Lighter's documented 200 client messages / minute per IP.
+WATCHDOG_MAX_FRAMES_PER_MIN = 100
 MAX_TRADE_EVENT_AGE_US = 7 * 24 * 60 * 60 * 1_000_000
 MAX_TRADE_EVENT_FUTURE_US = 5 * 60 * 1_000_000
 OHLCV_FINALIZE_GRACE_US = 120_000_000
@@ -893,6 +896,23 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         # (batch <= 0) or turn it into a subscribe storm (after_ms <= 0).
         if int(raw.get(key, default)) <= 0:
             raise ValueError(f"{key} must be positive")
+    # Worst case the watchdog can send: one pass per second, up to
+    # `book_watchdog_batch` markets per pass, two frames (unsubscribe +
+    # subscribe) per market, each market eligible again after the shorter of
+    # the two intervals. Keep that under half of Lighter's documented
+    # 200 client messages / minute per IP so the trading bots sharing the IP
+    # keep the other half (bot-strategy#908, Codex review on pairtrade#277).
+    shortest_ms = min(
+        int(raw.get("book_resubscribe_after_ms", 10_000)),
+        int(raw.get("book_stall_after_ms", 60_000)),
+    )
+    worst_frames_per_min = 2 * int(raw.get("book_watchdog_batch", 5)) * 60_000 / shortest_ms
+    if worst_frames_per_min > WATCHDOG_MAX_FRAMES_PER_MIN:
+        raise ValueError(
+            "book watchdog settings could send "
+            f"{worst_frames_per_min:.0f} WS frames/min (> {WATCHDOG_MAX_FRAMES_PER_MIN}); "
+            "raise book_resubscribe_after_ms/book_stall_after_ms or lower book_watchdog_batch"
+        )
     host, port_text = raw["metrics_listen"].rsplit(":", 1)
     return AppConfig(
         raw=raw,
@@ -3219,6 +3239,9 @@ class Collector:
         self.book_last_recv_us: dict[tuple[str, int], int] = {}
         self.market_last_activity_us: dict[tuple[str, int], int] = {}
         self.last_book_watchdog_us: dict[str, int] = {}
+        # Runtime enforcement of WATCHDOG_MAX_FRAMES_PER_MIN, independent of
+        # config: timestamps (us) of watchdog-sent frames per venue.
+        self.watchdog_frames_us: defaultdict[str, deque[int]] = defaultdict(deque)
         self.market_stats_rejections: defaultdict[tuple[str, int], int] = defaultdict(int)
         self.local_sequences: defaultdict[tuple[str, str, int], int] = defaultdict(int)
         self.last_health_error: str | None = None
@@ -3447,7 +3470,15 @@ class Collector:
         if recv_us - last < 1_000_000:
             return
         self.last_book_watchdog_us[venue.name] = recv_us
-        budget = self.config.book_watchdog_batch
+        sent = self.watchdog_frames_us[venue.name]
+        while sent and recv_us - sent[0] > 60_000_000:
+            sent.popleft()
+        frames_left = WATCHDOG_MAX_FRAMES_PER_MIN - len(sent)
+        if frames_left < 2:
+            self.metrics.inc("engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name})
+            return
+        # Each stall recovery costs two frames; never start one we cannot pay.
+        budget = min(self.config.book_watchdog_batch, frames_left // 2)
         resubscribe_after_us = self.config.book_resubscribe_after_ms * 1_000
         stall_after_us = self.config.book_stall_after_ms * 1_000
         # Oldest subscribe deadline first, so a batch smaller than the number
@@ -3483,6 +3514,7 @@ class Collector:
                 await send_public_control(
                     ws, {"type": "subscribe", "channel": f"order_book/{market.market_id}"}
                 )
+                sent.append(recv_us)
                 self.book_subscribe_us[key] = recv_us
                 budget -= 1
                 continue
@@ -3553,6 +3585,7 @@ class Collector:
             await send_public_control(
                 ws, {"type": "subscribe", "channel": f"order_book/{market.market_id}"}
             )
+            sent.extend((recv_us, recv_us))
             self.book_subscribe_us[key] = recv_us
             budget -= 1
 
