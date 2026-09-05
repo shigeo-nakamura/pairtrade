@@ -449,10 +449,12 @@ manual install, provide both values explicitly. Because the observer keeps
 writing while the installer re-owns `/var/lib/engine-b-phase0`, a state file
 that vanishes mid-walk (SQLite `-wal` / `-shm` side files, a partition being
 sealed) is skipped with a `vanished during re-own` notice rather than
-failing the deploy (bot-strategy#908 item 8); the walk covers directories
-and regular files only and never follows a symlink; a path that exists but
-cannot be re-owned, or a `find` failure other than a vanished entry, still
-aborts the install.
+failing the deploy (bot-strategy#908 item 8). The re-own is a
+descriptor-anchored Python walk (`os.fwalk` + `O_NOFOLLOW` + `fchown` /
+`fchmod`) over directories and regular files only, so a symlink -- leaf or
+an ancestor swapped in by the running observer -- is never followed by the
+root-run installer; an entry that cannot be re-owned for any other reason,
+or an unknown service group, still aborts the install.
 
 The first operator-controlled restart also completes the identity handoff.
 After systemd stops the legacy `ec2-user` observer, root-privileged pre-start

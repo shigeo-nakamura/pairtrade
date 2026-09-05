@@ -84,42 +84,87 @@ install -o root -g "$SERVICE_GROUP" -m 0440 "$REQUIREMENTS" \
 # item 8: engine_b_phase0_20260823_00.sqlite3-shm). A path that no longer
 # exists is not an error; any other failure still aborts the install.
 reown_state_tree() {
-  local path mode list err
-  list=$(mktemp)
-  err=$(mktemp)
-  # shellcheck disable=SC2064
-  trap "rm -f '$list' '$err'" RETURN
-  # Directories and regular files only: the observer can write this tree,
-  # so a symlink must never be followed by a root-run chgrp/chmod (the old
-  # `chgrp -R` did not dereference symlinks met during traversal either).
-  # find's own status is checked -- only "No such file or directory"
-  # (an entry that vanished during the walk) is tolerated.
-  if ! find "$STATE_DIR" \( -type d -o -type f \) -print0 >"$list" 2>"$err"; then
-    if grep -qv 'No such file or directory' "$err"; then
-      cat "$err" >&2
-      echo "failed to enumerate $STATE_DIR" >&2
-      return 1
-    fi
-  fi
-  while IFS= read -r -d '' path; do
-    if [ -L "$path" ]; then
-      # Replaced by a symlink since the walk enumerated it: never follow.
-      echo "skipping $path: symlink" >&2
-      continue
-    fi
-    if [ -d "$path" ]; then
-      mode=g+rwx,o-rwx
-    else
-      mode=g+rw,o-rwx
-    fi
-    if ! { chgrp -h "$SERVICE_GROUP" "$path" && chmod "$mode" "$path"; } 2>/dev/null; then
-      if [ -e "$path" ]; then
-        echo "failed to re-own $path for $SERVICE_GROUP" >&2
+  # Descriptor-anchored walk (os.fwalk + O_NOFOLLOW + fchown/fchmod), never
+  # following symlinks: the observer can rename entries under STATE_DIR
+  # while this runs as root, so a pathname-based chgrp/chmod could be
+  # redirected outside the tree through a swapped-in symlinked ancestor
+  # (Codex review on pairtrade#280). Only directories and regular files are
+  # touched; an entry that vanished mid-walk or turned into a symlink is
+  # skipped, any other error aborts the install.
+  "$PYTHON_BIN" - "$STATE_DIR" "$SERVICE_GROUP" <<'PY'
+import errno
+import grp
+import os
+import stat
+import sys
+
+root, group = sys.argv[1], sys.argv[2]
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def fix_fd(fd, gid):
+    st = os.fstat(fd)
+    if stat.S_ISDIR(st.st_mode):
+        wanted = (stat.S_IMODE(st.st_mode) | 0o070) & ~0o007
+    elif stat.S_ISREG(st.st_mode):
+        wanted = (stat.S_IMODE(st.st_mode) | 0o060) & ~0o007
+    else:
+        return
+    if st.st_gid != gid:
+        os.fchown(fd, -1, gid)
+    if stat.S_IMODE(st.st_mode) != wanted:
+        os.fchmod(fd, wanted)
+
+
+def fix_entry(dirfd, name, is_dir, gid, label):
+    try:
+        fd = os.open(name, DIR_FLAGS if is_dir else FILE_FLAGS, dir_fd=dirfd)
+    except FileNotFoundError:
+        print(f"skipping {label}: vanished during re-own", file=sys.stderr)
+        return
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENXIO):
+            print(f"skipping {label}: not a directory or regular file", file=sys.stderr)
+            return
+        raise
+    try:
+        fix_fd(fd, gid)
+    finally:
+        os.close(fd)
+
+
+def on_walk_error(exc):
+    if isinstance(exc, FileNotFoundError):
+        print(f"skipping {exc.filename}: vanished during re-own", file=sys.stderr)
+        return
+    raise exc
+
+
+def main():
+    try:
+        gid = grp.getgrnam(group).gr_gid
+    except KeyError:
+        print(f"failed to re-own {root}: unknown group {group}", file=sys.stderr)
         return 1
-      fi
-      echo "skipping $path: vanished during re-own" >&2
-    fi
-  done <"$list"
+    try:
+        for dirpath, dirnames, filenames, dirfd in os.fwalk(
+            root, topdown=True, onerror=on_walk_error, follow_symlinks=False
+        ):
+            if dirpath == root:
+                fix_fd(dirfd, gid)
+            for name in dirnames:
+                fix_entry(dirfd, name, True, gid, os.path.join(dirpath, name))
+            for name in filenames:
+                fix_entry(dirfd, name, False, gid, os.path.join(dirpath, name))
+    except OSError as exc:
+        print(f"failed to re-own {exc.filename or root} for {group}: {exc.strerror}", file=sys.stderr)
+        return 1
+    return 0
+
+
+sys.exit(main())
+PY
 }
 
 if [ -d "$STATE_DIR" ]; then
