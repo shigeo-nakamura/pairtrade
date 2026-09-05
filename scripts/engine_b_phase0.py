@@ -841,6 +841,11 @@ class AppConfig:
     db_batch_max: int
     db_flush_interval_ms: int
     venues: tuple[VenueConfig, ...]
+    # Per-market book watchdog (bot-strategy#908). Optional keys in
+    # phase0.json so an existing deployment keeps working unchanged.
+    book_resubscribe_after_ms: int = 10_000
+    book_stall_after_ms: int = 60_000
+    book_watchdog_batch: int = 5
 
 
 def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
@@ -901,6 +906,9 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         db_batch_max=int(raw["db_batch_max"]),
         db_flush_interval_ms=int(raw["db_flush_interval_ms"]),
         venues=tuple(venues),
+        book_resubscribe_after_ms=int(raw.get("book_resubscribe_after_ms", 10_000)),
+        book_stall_after_ms=int(raw.get("book_stall_after_ms", 60_000)),
+        book_watchdog_batch=int(raw.get("book_watchdog_batch", 5)),
     )
 
 
@@ -3197,6 +3205,12 @@ class Collector:
         self.metrics = metrics
         self.stop_event = asyncio.Event()
         self.books: dict[tuple[str, int], BookState] = {}
+        # bot-strategy#908 watchdog state, keyed by (venue, market_id).
+        self.book_subscribe_us: dict[tuple[str, int], int] = {}
+        self.book_last_recv_us: dict[tuple[str, int], int] = {}
+        self.market_last_activity_us: dict[tuple[str, int], int] = {}
+        self.last_book_watchdog_us: dict[str, int] = {}
+        self.market_stats_rejections: defaultdict[tuple[str, int], int] = defaultdict(int)
         self.local_sequences: defaultdict[tuple[str, str, int], int] = defaultdict(int)
         self.last_health_error: str | None = None
         self.trading_calendar = (
@@ -3319,10 +3333,24 @@ class Collector:
                         else:
                             self.metrics.inc("engine_b_phase0_unhandled_message_total", {"venue": venue.name, "type": message_type or "missing"})
                             LOG.warning("Unhandled public WS message venue=%s type=%s", venue.name, message_type)
+                        await self.watchdog_books(ws, venue, connection, recv_us)
                         if self.stop_event.is_set():
                             break
             except asyncio.CancelledError:
-                reason = "task_cancelled"
+                # Attribute the cancel: a real shutdown has stop_event set;
+                # anything else is a cancel from an unexpected source and is
+                # labelled as such so the data_gap reason stays honest
+                # (bot-strategy#908 item 3).
+                if self.stop_event.is_set():
+                    reason = "task_cancelled"
+                else:
+                    reason = "task_cancelled_unexpected"
+                    LOG.warning(
+                        "feed_loop cancelled without stop_event venue=%s connection=%s",
+                        venue.name,
+                        connection["id"],
+                        exc_info=True,
+                    )
                 raise
             except Exception as exc:
                 reason = f"connection_error:{type(exc).__name__}"
@@ -3370,12 +3398,129 @@ class Collector:
                 backoff = min(backoff * 2, 60)
 
     async def subscribe_public_channels(self, ws: Any, venue: VenueConfig) -> None:
+        subscribed_us = now_us()
         for market in venue.markets:
             for channel in ("order_book", "trade", "market_stats"):
                 await send_public_control(
                     ws, {"type": "subscribe", "channel": f"{channel}/{market.market_id}"}
                 )
+            self.book_subscribe_us[(venue.name, market.market_id)] = subscribed_us
         LOG.info("Subscribed to public channels venue=%s markets=%d", venue.name, len(venue.markets))
+
+    async def watchdog_books(
+        self,
+        ws: Any,
+        venue: VenueConfig,
+        connection: dict[str, Any],
+        recv_us: int,
+    ) -> None:
+        """Per-market order_book liveness (bot-strategy#908 items 2 and 6).
+
+        Runs at most once per second per venue, from the message loop, so it
+        needs some other channel to still be delivering -- which is exactly
+        the failure shape it targets: the socket is alive but one market's
+        book is not. Two cases:
+
+        * a market still unsynced ``book_resubscribe_after_ms`` after its last
+          ``subscribe`` (the post-reconnect snapshot never arrived, e.g. the
+          subscribe frame was dropped under Lighter's client-message limit)
+          gets its ``order_book`` channel re-subscribed;
+        * a market that is synced but whose book has been silent for
+          ``book_stall_after_ms`` while its own trade / market_stats channels
+          kept delivering is declared stale: unsynced, an ``order_book``
+          ``data_gap`` (``reason=book_channel_stalled``) is opened, and the
+          channel is re-subscribed.
+
+        At most ``book_watchdog_batch`` subscribe frames per call, to stay
+        well inside the per-IP client-message budget.
+        """
+        last = self.last_book_watchdog_us.get(venue.name, 0)
+        if recv_us - last < 1_000_000:
+            return
+        self.last_book_watchdog_us[venue.name] = recv_us
+        budget = self.config.book_watchdog_batch
+        resubscribe_after_us = self.config.book_resubscribe_after_ms * 1_000
+        stall_after_us = self.config.book_stall_after_ms * 1_000
+        for market in venue.markets:
+            if budget <= 0:
+                return
+            key = (venue.name, market.market_id)
+            state = self.books.setdefault(key, BookState())
+            subscribed_us = self.book_subscribe_us.get(key)
+            if subscribed_us is None:
+                continue
+            if not state.synced:
+                if recv_us - subscribed_us < resubscribe_after_us:
+                    continue
+                LOG.warning(
+                    "order_book still unsynced %.0fs after subscribe venue=%s symbol=%s; re-subscribing",
+                    (recv_us - subscribed_us) / 1_000_000,
+                    venue.name,
+                    market.symbol,
+                )
+                self.metrics.inc(
+                    "engine_b_phase0_book_resubscribe_total",
+                    {"venue": venue.name, "symbol": market.symbol, "reason": "unsynced"},
+                )
+                await send_public_control(
+                    ws, {"type": "subscribe", "channel": f"order_book/{market.market_id}"}
+                )
+                self.book_subscribe_us[key] = recv_us
+                budget -= 1
+                continue
+            last_book_us = self.book_last_recv_us.get(key)
+            last_activity_us = self.market_last_activity_us.get(key)
+            if (
+                last_book_us is None
+                or last_activity_us is None
+                or last_activity_us <= last_book_us
+                or recv_us - last_book_us < stall_after_us
+            ):
+                continue
+            LOG.warning(
+                "order_book channel stalled venue=%s symbol=%s: no book message for %.0fs while "
+                "trade/market_stats kept arriving; marking unsynced and re-subscribing",
+                venue.name,
+                market.symbol,
+                (recv_us - last_book_us) / 1_000_000,
+            )
+            state.synced = False
+            state.last_nonce = None
+            state.bids.clear()
+            state.asks.clear()
+            self.metrics.book_synced[key] = False
+            self.metrics.inc(
+                "engine_b_phase0_book_stall_total",
+                {"venue": venue.name, "symbol": market.symbol},
+            )
+            self.metrics.inc(
+                "engine_b_phase0_book_resubscribe_total",
+                {"venue": venue.name, "symbol": market.symbol, "reason": "stalled"},
+            )
+            await self.sink.put(
+                "gap",
+                {
+                    "recv_us": recv_us,
+                    "start_us": last_book_us,
+                    "partition_us": recv_us,
+                    "connection_id": connection["id"],
+                    "venue": venue.name,
+                    "market_id": market.market_id,
+                    "symbol": market.symbol,
+                    "channel": "order_book",
+                    "expected_sequence": state.last_nonce,
+                    "observed_sequence": None,
+                    "reason": "book_channel_stalled",
+                },
+            )
+            await send_public_control(
+                ws, {"type": "unsubscribe", "channel": f"order_book/{market.market_id}"}
+            )
+            await send_public_control(
+                ws, {"type": "subscribe", "channel": f"order_book/{market.market_id}"}
+            )
+            self.book_subscribe_us[key] = recv_us
+            budget -= 1
 
     async def handle_book(
         self,
@@ -3392,6 +3537,7 @@ class Collector:
         payload = message.get("order_book", {})
         levels = BookState.raw_levels(payload)
         state = self.books.setdefault((venue.name, market_id), BookState())
+        self.book_last_recv_us[(venue.name, market_id)] = recv_us
         message_type = message["type"]
         local_sequence = self.next_sequence(venue.name, "order_book", market_id)
         srv_us = normalize_exchange_timestamp_us(
@@ -3496,6 +3642,7 @@ class Collector:
         market = venue.market_by_id.get(market_id)
         if market is None:
             return
+        self.market_last_activity_us[(venue.name, market_id)] = recv_us
         exchange_sequence = str(message["nonce"]) if message.get("nonce") is not None else None
         message_type = str(message.get("type", "update/trade"))
         trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
@@ -3608,6 +3755,7 @@ class Collector:
         market = venue.market_by_id.get(market_id)
         if market is None:
             return
+        self.market_last_activity_us[(venue.name, market_id)] = recv_us
         stats = message.get("market_stats", {})
         srv_us = normalize_exchange_timestamp_us(message.get("timestamp"))
         prices: list[tuple[str, str]] = []
@@ -3621,7 +3769,47 @@ class Collector:
             if value not in (None, ""):
                 price = canonical_decimal(value)
                 if Decimal(price) <= 0:
-                    raise RuntimeError("non-positive market-stat price")
+                    # Fail closed on the *message*, not on the connection:
+                    # raising here used to tear down the whole venue feed
+                    # (all markets) over one illiquid market's zero stat and
+                    # loop through reconnects until the stat turned positive
+                    # (bot-strategy#908 item 1). Record the rejection as a
+                    # point gap on the market_stats channel and skip the
+                    # message entirely (prices and funding alike).
+                    key = (venue.name, market_id)
+                    self.market_stats_rejections[key] += 1
+                    count = self.market_stats_rejections[key]
+                    if count == 1 or count % 100 == 0:
+                        LOG.warning(
+                            "rejecting market_stats with non-positive %s venue=%s symbol=%s "
+                            "(rejections so far: %d)",
+                            field_name,
+                            venue.name,
+                            market.symbol,
+                            count,
+                        )
+                    self.metrics.inc(
+                        "engine_b_phase0_market_stats_rejected_total",
+                        {"venue": venue.name, "symbol": market.symbol, "field": field_name},
+                    )
+                    await self.sink.put(
+                        "gap",
+                        {
+                            "recv_us": recv_us,
+                            "start_us": recv_us,
+                            "end_us": recv_us,
+                            "partition_us": recv_us,
+                            "connection_id": None,
+                            "venue": venue.name,
+                            "market_id": market_id,
+                            "symbol": market.symbol,
+                            "channel": "market_stats",
+                            "expected_sequence": None,
+                            "observed_sequence": None,
+                            "reason": f"non_positive_{field_name}",
+                        },
+                    )
+                    return
                 prices.append((price_type, price))
         for price_type, price in prices:
             await self.sink.put(

@@ -123,6 +123,23 @@ it through the same S3 release prefix as the rest of the Phase 0 release.
 - Health: `/run/engine-b-phase0/status.json`
 - Metrics: `127.0.0.1:9472/metrics`
 
+Per-market book watchdog (bot-strategy#908): the collector no longer tears
+the venue connection down when one market's `market_stats` carries a
+non-positive price -- that message is skipped, counted in
+`engine_b_phase0_market_stats_rejected_total{field=...}` and recorded as a
+point `data_gap` on the `market_stats` channel. A market still unsynced
+`book_resubscribe_after_ms` (default 10 s) after its last subscribe gets
+its `order_book` channel re-subscribed
+(`engine_b_phase0_book_resubscribe_total{reason="unsynced"}`), and a
+synced market whose book has been silent for `book_stall_after_ms`
+(default 60 s) while its own trade / market_stats kept arriving is
+declared stale: unsynced, `data_gap(channel=order_book,
+reason=book_channel_stalled)`, re-subscribed
+(`engine_b_phase0_book_stall_total`). At most `book_watchdog_batch`
+(default 5) subscribe frames per venue per second. All three keys are
+optional in `phase0.json`. A feed task cancelled without `stop_event`
+set is now recorded as `task_cancelled_unexpected` with a logged stack.
+
 The databases rotate hourly because the normalized public feed is too large
 for the host's 20 GiB root volume. At minute 10, the archive timer checkpoints
 an abandoned WAL for each closed partition, finalizes its remaining closed

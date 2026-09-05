@@ -279,30 +279,163 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MarketStatsHandlingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_non_positive_price_rejects_entire_message_before_enqueue(
-        self,
-    ) -> None:
+    async def test_non_positive_price_rejects_message_without_raising(self) -> None:
+        # bot-strategy#908 item 1: one illiquid market's zero stat must not
+        # tear down the venue connection; the message is skipped and the
+        # rejection is recorded as a point gap on the market_stats channel.
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "lighter")
+        sink = RecordingSink()
+        metrics = engine_b.Metrics()
+        collector = engine_b.Collector(config, sink, metrics)
+
+        await collector.handle_market_stats(
+            venue,
+            {
+                "type": "update/market_stats",
+                "channel": "market_stats/216",
+                "timestamp": 1_774_884_082_400,
+                "market_stats": {
+                    "mark_price": "159.71",
+                    "index_price": "0",
+                    "last_trade_price": "159.70",
+                    "funding_rate": "0.0001",
+                },
+            },
+            1_774_884_082_400_000,
+        )
+
+        kinds = [kind for kind, _ in sink.commands]
+        self.assertEqual(kinds, ["gap"])
+        gap = sink.commands[0][1]
+        self.assertEqual(gap["channel"], "market_stats")
+        self.assertEqual(gap["reason"], "non_positive_index_price")
+        self.assertEqual(gap["start_us"], gap["end_us"])
+        self.assertEqual(gap["market_id"], 216)
+        rendered = metrics.render(queue_size=0)
+        self.assertIn(
+            'engine_b_phase0_market_stats_rejected_total{field="index_price",symbol="SKHY",venue="lighter"} 1',
+            rendered,
+        )
+
+    async def test_positive_prices_are_stored(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
 
-        with self.assertRaisesRegex(RuntimeError, "non-positive market-stat price"):
-            await collector.handle_market_stats(
-                venue,
-                {
-                    "type": "update/market_stats",
-                    "channel": "market_stats/216",
-                    "timestamp": 1_774_884_082_400,
-                    "market_stats": {
-                        "mark_price": "159.71",
-                        "index_price": "0",
-                        "last_trade_price": "159.70",
-                    },
-                },
-                1_774_884_082_400_000,
-            )
+        await collector.handle_market_stats(
+            venue,
+            {
+                "type": "update/market_stats",
+                "channel": "market_stats/216",
+                "timestamp": 1_774_884_082_400,
+                "market_stats": {"mark_price": "159.71", "index_price": "159.60"},
+            },
+            1_774_884_082_400_000,
+        )
 
+        self.assertEqual([kind for kind, _ in sink.commands], ["price", "price"])
+
+
+class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    def _collector(self) -> tuple[object, object, object, object]:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "lighter")
+        sink = RecordingSink()
+        metrics = engine_b.Metrics()
+        collector = engine_b.Collector(config, sink, metrics)
+        return config, venue, sink, collector
+
+    async def test_unsynced_market_is_resubscribed_after_threshold(self) -> None:
+        # bot-strategy#908 item 2: a market whose post-(re)connect snapshot
+        # never arrived gets its order_book channel re-subscribed, at most
+        # book_watchdog_batch markets per pass.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        await collector.subscribe_public_channels(ws, venue)
+        for key in list(collector.book_subscribe_us):
+            collector.book_subscribe_us[key] = t0
+        ws.messages.clear()
+
+        # Too early: nothing happens.
+        await collector.watchdog_books(ws, venue, connection, t0 + 5_000_000)
+        self.assertEqual(ws.messages, [])
+
+        # Past the threshold: a batch of order_book re-subscribes goes out.
+        await collector.watchdog_books(ws, venue, connection, t0 + 11_000_000)
+        self.assertEqual(len(ws.messages), config.book_watchdog_batch)
+        for message in ws.messages:
+            self.assertEqual(message["type"], "subscribe")
+            self.assertTrue(message["channel"].startswith("order_book/"))
+        # Re-subscribed markets get a fresh subscribe timestamp.
+        refreshed = [k for k, v in collector.book_subscribe_us.items() if v == t0 + 11_000_000]
+        self.assertEqual(len(refreshed), config.book_watchdog_batch)
+        # Throttled to once per second per venue.
+        await collector.watchdog_books(ws, venue, connection, t0 + 11_500_000)
+        self.assertEqual(len(ws.messages), config.book_watchdog_batch)
+        self.assertEqual(sink.commands, [])
+
+    async def test_synced_market_with_silent_book_is_marked_stale(self) -> None:
+        # bot-strategy#908 item 6: synced book, no book message for
+        # book_stall_after_ms while the market's own trade/market_stats kept
+        # arriving -> unsynced + order_book gap + re-subscribe.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        state = collector.books.setdefault(key, engine_b.BookState())
+        state.synced = True
+        state.last_nonce = "10"
+        collector.book_subscribe_us[key] = t0
+        collector.book_last_recv_us[key] = t0
+        collector.market_last_activity_us[key] = t0 + 50_000_000
+        # Other markets: keep them out of the way (synced, fresh).
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            if other == key:
+                continue
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = t0
+            collector.book_last_recv_us[other] = t0 + 59_000_000
+
+        await collector.watchdog_books(ws, venue, connection, t0 + 30_000_000)
+        self.assertEqual(ws.messages, [])
+        self.assertTrue(state.synced)
+
+        await collector.watchdog_books(ws, venue, connection, t0 + 61_000_000)
+        self.assertFalse(state.synced)
+        self.assertFalse(collector.metrics.book_synced[key])
+        self.assertEqual(
+            ws.messages,
+            [
+                {"type": "unsubscribe", "channel": "order_book/216"},
+                {"type": "subscribe", "channel": "order_book/216"},
+            ],
+        )
+        gaps = [payload for kind, payload in sink.commands if kind == "gap"]
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["channel"], "order_book")
+        self.assertEqual(gaps[0]["reason"], "book_channel_stalled")
+        self.assertEqual(gaps[0]["start_us"], t0)
+        self.assertEqual(gaps[0]["market_id"], 216)
+
+    async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
+        # A quiet market (no trades, no stats either) is just quiet, not stalled.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            key = (venue.name, market.market_id)
+            collector.books.setdefault(key, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[key] = t0
+            collector.book_last_recv_us[key] = t0
+        await collector.watchdog_books(ws, venue, connection, t0 + 600_000_000)
+        self.assertEqual(ws.messages, [])
         self.assertEqual(sink.commands, [])
 
 
