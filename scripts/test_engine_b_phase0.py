@@ -715,6 +715,22 @@ class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(slept), 1)
         self.assertEqual(len(ws.messages), 3 * len(venue.markets))
 
+    async def test_shutdown_during_budget_wait_sends_nothing_more(self) -> None:
+        # Codex on pairtrade#277: stop_event during the wait must not fall
+        # through into sending the remaining subscriptions.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        now = engine_b.now_us()
+        collector._clock = engine_b.now_us
+        collector.watchdog_frames_us[venue.name].extend([now - 1_000_000] * collector.watchdog_share(venue))
+
+        async def fake_sleep(seconds: float) -> None:
+            collector.stop_event.set()
+
+        with mock.patch.object(engine_b.asyncio, "sleep", fake_sleep):
+            await collector.subscribe_public_channels(ws, venue)
+        self.assertEqual(ws.messages, [])
+
     async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
         # A quiet market (no trades, no stats either) is just quiet, not stalled.
         config, venue, sink, collector = self._collector()

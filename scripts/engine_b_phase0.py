@@ -3473,7 +3473,7 @@ class Collector:
         proven sequence breaks."""
         return WATCHDOG_MAX_FRAMES_PER_MIN - KEEPALIVE_RESERVE_FRAMES - 2 * len(venue.markets)
 
-    async def wait_for_frame_budget(self, venue: VenueConfig, frames: int) -> None:
+    async def wait_for_frame_budget(self, venue: VenueConfig, frames: int) -> bool:
         """Block until ``frames`` more (re)subscribe frames fit under the
         watchdog share of the rolling per-minute cap, so a run of short-lived
         connections cannot push the reconnect bursts past the exchange limit
@@ -3481,14 +3481,18 @@ class Collector:
         limit = self.watchdog_share(venue)
         if frames > limit:
             raise ValueError(f"{frames} frames can never fit the watchdog share of {limit}")
-        while not self.stop_event.is_set():
+        while True:
+            if self.stop_event.is_set():
+                # Shutdown while waiting: report it so the caller sends nothing
+                # more, instead of falling through as if budget were available.
+                return False
             current_us = self._clock()
             sent = self.watchdog_frames_us[venue.name]
             while sent and current_us - sent[0] > 60_000_000:
                 sent.popleft()
             room = limit - len(sent)
             if room >= frames:
-                return
+                return True
             # Oldest frame expires first; sleep until enough of them have
             # (`sent` is non-empty here because frames <= limit and room < frames).
             need = frames - room
@@ -3511,7 +3515,13 @@ class Collector:
             # market count the exchange allows (500 subscriptions/connection)
             # subscribes in budget-sized steps instead of one unbounded burst
             # (bot-strategy#908).
-            await self.wait_for_frame_budget(venue, 3)
+            if not await self.wait_for_frame_budget(venue, 3):
+                LOG.info(
+                    "shutdown during subscription budget wait venue=%s; %d market(s) left unsubscribed",
+                    venue.name,
+                    len(venue.markets) - venue.markets.index(market),
+                )
+                return
             for channel in ("order_book", "trade", "market_stats"):
                 await send_public_control(
                     ws, {"type": "subscribe", "channel": f"{channel}/{market.market_id}"}
