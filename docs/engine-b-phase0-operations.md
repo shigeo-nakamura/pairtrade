@@ -115,6 +115,185 @@ installs it read-only alongside `phase0.json`
 (`$INSTALL_DIR/trading_calendar.json`, mode 0440); the deploy workflow ships
 it through the same S3 release prefix as the rest of the Phase 0 release.
 
+## A-10: WS sequence, snapshot/delta, server timestamps, gap detection
+
+Resolution record for bot-strategy#874 (requirements doc
+`engine_b_requirements_0.3.md` §3 A-10 / §10 TBD-8, and the F0-03 /
+F0-07 / F0-08 / F0-10 functional requirements that depend on it). The
+observer has been in production since 2026-09-02 with this logic, so this
+section pins the requirement wording to the Lighter semantics (official
+`apidocs.lighter.xyz/docs/websocket-reference`, read 2026-09-04) and to
+the code path in `scripts/engine_b_phase0.py` that implements it, and
+states plainly which parts are **not** done online.
+
+### What Lighter guarantees
+
+- `order_book/{market_id}`: `subscribed/order_book` is a full snapshot
+  carrying `offset`, `nonce`, `begin_nonce` and `timestamp` (µs);
+  `update/order_book` is a delta carrying `begin_nonce`, `nonce`, `offset`.
+  Continuity rule (verbatim intent): the current message's `begin_nonce`
+  must equal the previous message's `nonce`. `offset` "will increase, but
+  it's not guaranteed to be continuous" and "you can expect the offset to
+  change drastically on reconnection if you're routed to a different
+  server" -- so **`nonce` is the sequence, `offset` is not** (it is stored
+  for provenance only). Server time is `last_updated_at`, microseconds.
+- `trade/{market_id}`: per-trade `trade_id` / `trade_id_str`, `price` /
+  `size` as strings, `timestamp` in **milliseconds**, `transaction_time`
+  in microseconds, `ask_id` / `bid_id`, `is_maker_ask`; the message also
+  carries a `nonce`. No documented continuity rule for this channel.
+- `market_stats/{market_id}`: periodic stats (mark / index / mid, funding,
+  volumes) with a message-level `timestamp`; no sequence.
+- Keepalive: the client must send at least one frame every 2 minutes.
+
+### How the observer implements it
+
+| requirement | implementation (`scripts/engine_b_phase0.py`) |
+|---|---|
+| F0-03 receive time, server time, connection session, local sequence, exchange sequence on every event | `book_event`: `ts_recv_us` (monotonic-free wall clock at receive, `now_us()`), `ts_srv_us`, `connection_session_id`, `local_sequence` (per venue/channel/market counter, `UNIQUE(connection_session_id, market_id, local_sequence)`), `exchange_sequence` = `nonce`, plus `begin_sequence` and `exchange_offset` (present since schema v1; beyond the requirements doc's minimum). `trade`: same set with `exchange_sequence` = the message `nonce`. **Scope: book and trade rows only.** Rows derived from `market_stats` (`price_observation`, `funding`) carry `observed_ts_us` (+ `ts_srv_us` on `price_observation` only) but no `connection_session_id`, `local_sequence` or `exchange_sequence`, so they cannot be tied to a WS session -- an unresolved F0-03 obligation if A-4 / A-6 analyses ever need per-session provenance for mark/index/funding. |
+| snapshot vs delta identity (F0-02) | `event_kind` ∈ {`snapshot`, `delta`, `reconstructed`}. `is_complete_snapshot = 1` on two kinds of row: a `subscribed/order_book` message that carries a `nonce` (`event_kind = snapshot`, exchange-originated), and a `reconstructed` top-N emitted from the in-memory `BookState` at most once per `reconstructed_snapshot_interval_ms` while the book is synced (both from `phase0.json`: `top_levels`, floor 5, currently 5; interval currently 1000 ms), tagged with the last applied `nonce`. `delta` rows are always `0`. Offline code that wants only exchange-originated snapshots must filter on `event_kind`, not on `is_complete_snapshot` alone. |
+| sequence check (A-10) | (Mechanics also summarised in "Host and service" below; this row is the requirement mapping.) `BookState.apply_snapshot` requires `nonce` (else the book is dropped, reason `snapshot_missing_nonce`). `BookState.apply_delta` requires `synced && begin_nonce == last_nonce` and a present `nonce`; any failure clears the book, marks it unsynced, increments `engine_b_phase0_sequence_gap_total`, writes a `data_gap` row (`channel = order_book`, `expected_sequence` = last `nonce`, `observed_sequence` = offending `begin_nonce`, reason `delta_missing_begin_nonce` / `delta_missing_nonce` / `begin_nonce_mismatch_or_unsynced_delta`), and **unsubscribes + resubscribes that one channel** to force a fresh snapshot. |
+| no analysis on an unsynced book (F0-08) | `book_synced` per (venue, market) drives the `engine_b_phase0_book_synced` gauge; `reconstructed` rows are only produced while synced, and the `data_gap` row stays open (`ts_end_us IS NULL`) until the next synced snapshot emits a `gap_close` event, which sets `ts_end_us` on the open rows for that (venue, market) -- there is no separate column for this; query `ts_end_us`. Offline, §4.5.2's synced-and-no-gap condition is evaluated as: no `data_gap` **and no `sealed_gap_interval`** for that (venue, market) overlapping the boundary window (a gap whose continuation landed in an already-sealed hour is recorded only as `sealed_gap_interval` in a later retained partition, with no `data_gap` row covering the sealed hour), and the boundary snapshot is an `is_complete_snapshot = 1` row (a `snapshot` or a synced `reconstructed` row -- see the F0-02 row). |
+| server timestamp meaning | `normalize_exchange_timestamp_us`: integers below `10^14` are treated as milliseconds and scaled ×1000, larger ones as microseconds (Lighter mixes the two: book `last_updated_at` / `timestamp` are µs, trade `timestamp` is ms). Book: `last_updated_at` from the payload, else the message, else `timestamp`. Trade: per-trade `timestamp`, else message `timestamp`; a trade message with any trade lacking an exchange timestamp is **rejected whole** (`RuntimeError`), as is one whose timestamp is outside `[recv − 7 d, recv + 5 min]` (`validate_trade_timestamp_us`); `event_ts_us` (partitioning, OHLCV bucket, synthetic IDs) is the exchange time, never the receive time. `transaction_time` is not consumed but survives in `raw_public_json`. Market stats: message `timestamp`. |
+| gap detection on disconnect (F0-07) | (Reconnect/resubscribe mechanics are also described in "Host and service" below.) `feed_loop`: on any exception or close, a `data_gap` row per subscribed market with `channel = connection`, `reason = connection_error:<ExceptionType>` (or `normal_stop` / `task_cancelled`), `ts_start_us` = disconnect time (or attempt start when the connect itself failed) -- **coalesced**: the insert is `INSERT OR IGNORE` against the one-open-gap-per-(venue, market, channel) index, so a market whose previous `connection` gap is still open (it never got its post-reconnect snapshot, bot-strategy#908) gets no new row for a later disconnect; the existing gap silently spans the connected-but-unsynced period and the next outage, and the later disconnect's time and reason survive only in `ws_connection` (`ended_ts_recv_us`, `end_reason`). Use `ws_connection` for per-session disconnects, `data_gap` for "book unusable" intervals; every `BookState` is marked unsynced; reconnect after exponential backoff 1 s → 60 s (doubling), `websockets.connect(ping_interval=20, ping_timeout=15, open_timeout=20, max_queue=4096)`, then resubscribe all `order_book` / `trade` / `market_stats` channels. Partial unique indexes guarantee at most one open gap per (venue, market, channel). |
+| gap bounds survive a crash | Two mechanisms on the next start. `_recover_orphaned_sessions` ends a dead `ws_connection` segment at its last proven receive time (`last_activity_ts_recv_us`, bumped on **every** received frame since schema v9) with a durable `end_reason`. `_journal_stale_open_gaps` closes any `data_gap` still open in an *older* partition at that partition's hour boundary (`partition_start + 1 h`) and re-opens a continuation row in the next partition -- i.e. a crash bounds gaps at partition granularity, not at the exact last frame; read the `ws_connection` row for a tighter bound -- `last_activity_ts_recv_us` is the last *proven* frame, so after a quiet period the real disconnect/crash lies somewhere between it and the restart; it is a conservative bound, not the exact time. |
+| replay / duplicate handling | trade identities are, in order of preference, the exchange's `trade_id_str`, else its numeric `trade_id`, else a versioned synthetic ID scoped by exchange `nonce` for incremental messages (an ID-less incremental message **without** a nonce is refused); reconnect snapshots deduplicate via the replay-alias multiset. See the "Host and service" section below for the sealed-partition side of this. |
+
+### What is deliberately *not* done online (and where it lands instead)
+
+1. **Trade-channel sequence continuity is not checked.** The message
+   `nonce` is stored and used for dedup scoping, but a missed
+   `update/trade` between two received ones while the socket stays up is
+   **not detectable at all** -- neither online nor offline (see below:
+   `trade_id`s are not contiguous, so a jump proves nothing); only a
+   `connection` gap covering the window can flag it. F0-07's per-channel / per-sequence granularity is therefore fully met for
+   `order_book` and only at connection granularity for `trade` /
+   `market_stats`. Lighter documents no continuity rule for the trade
+   channel, so there is nothing to check online. **Consequence for OHLCV
+   (F0-04)**: `ohlcv_1m` is built by merging every received trade into
+   its 1-minute bucket, and `is_complete` is set purely by bucket age
+   (`OHLCV_FINALIZE_GRACE_US` after the bucket closes), *not* by any
+   trade-completeness or book-snapshot criterion -- a trade silently
+   missed while the socket stayed connected leaves a bucket marked
+   complete with wrong OHLC / volume / trade count. §4.5.2's boundary
+   prices are unaffected (they come from book snapshots). **Trade
+   completeness within a connected session cannot be verified from the
+   collected data**: Lighter gives no continuity rule for the channel,
+   `trade_id`s are not guaranteed contiguous per market (100 → 102 is not
+   evidence of a miss), and ID-less trades carry non-orderable synthetic
+   IDs. Only the `connection`-gap overlap can invalidate a bucket; a miss
+   with the socket up is undetectable. F0-04's own remedy -- a second,
+   API-sourced OHLCV series for cross-checking -- is **not collected**
+   by this observer (no candle channel or REST kline poll; `ohlcv_1m`
+   has a single WS-trade `source`), so `ohlcv_1m` must be treated as
+   best-effort and `is_complete = 1` as "finalised", never as "verified
+   complete", until that cross-check source is added (tracked as a
+   follow-up under bot-strategy#908).
+2. **`daily_data_quality` is created by the schema but has no writer.**
+   `event_count`, `missing_duration_us`, `out_of_order_count`,
+   `duplicate_count`, `sequence_gap_count`, `stale_quote_duration_us`,
+   `crossed_book_duration_us` (F0-10) must be derived at analysis time
+   from `book_event` / `trade` / `data_gap` / **`sealed_gap_interval`** /
+   `ws_connection` -- `missing_duration_us` in particular must union
+   `data_gap` with `sealed_gap_interval`, since a gap whose continuation
+   landed in an already-sealed hour exists only in the latter.
+   `reconnect_count`, `duplicate_count` and `sequence_gap_count` are the
+   exceptions (`sequence_gap_count`: repeated invalid deltas before the
+   replacement snapshot are coalesced into the one open `order_book` gap
+   row, so only the Prometheus counter has the per-break count).
+   `duplicate_count`: replayed / duplicate trades are discarded by the
+   replay-alias check, the sealed-index check or `INSERT OR IGNORE`
+   without a rejection row or a durable counter, and `local_sequence`
+   gaps cannot recover a duplicate that was the last message, so it is
+   not derivable from SQLite. `reconnect_count`: a run of failed connection
+   attempts creates no `ws_connection` row and, because of the
+   one-open-gap-per-(venue, market, channel) partial unique index, only
+   one coalesced `connection` gap -- the attempt count survives solely in
+   the in-memory `engine_b_phase0_reconnect_total` gauge (scraped by
+   Alloy), not in SQLite; `engine_b_phase0_sequence_gap_total` and
+   `engine_b_phase0_reconnect_total` give the live counts in Prometheus
+   meanwhile.
+3. **Clock offset is not measured by the collector.** `max_clock_offset_us`
+   is never populated and there is no NTP check in the process; §7's
+   "offset > 250 ms → warning, > 1 s → halt" rule is a host-level
+   property. The absolute offset comes only from the host's `chronyd`
+   tracking. `ts_recv_us − ts_srv_us` on `order_book` deltas is a
+   *signed* latency-plus-skew diagnostic: a host clock running behind the
+   exchange subtracts from the network delay, so a small or even negative
+   value does not exclude an offset above the 1 s threshold. Use it to
+   spot drift trends, never as a bound for the §7 thresholds.
+
+### How to verify on the host
+
+- Host clock: `chronyc tracking` (the host is NTP-disciplined; §7's 250 ms /
+  1 s thresholds are a host property, not something the collector measures).
+- Gap inventory for a partition:
+  `SELECT channel, reason, COUNT(*) FROM data_gap GROUP BY 1, 2`,
+  `SELECT venue, symbol, channel, reason FROM data_gap WHERE ts_end_us IS NULL`
+  (open gaps), and `SELECT venue, symbol, channel, sealed_partition FROM
+  sealed_gap_interval` (intervals known unusable whose original gap row
+  lives in an already-sealed hour -- always union these with `data_gap`). `channel = order_book` rows are sequence breaks; `channel =
+  connection` rows are disconnects.
+- Live sync state: `engine_b_phase0_book_synced{market_id=...}` on
+  `127.0.0.1:9472/metrics` -- a market stuck at `0` while
+  `engine_b_phase0_feed_connected` is `1` has not received its
+  post-reconnect snapshot, and the collector has **no automatic
+  resubscribe for that case**; `engine_b_phase0_sequence_gap_total` and
+  `engine_b_phase0_reconnect_total` are the live counters behind the
+  `data_gap` table.
+- Server-time coverage: `SELECT event_kind, COUNT(*) FROM book_event WHERE
+  ts_srv_us IS NULL GROUP BY 1`. A `reconstructed` row inherits the
+  triggering message's server time, so it can only be NULL when that raw
+  message was; a NULL on a `snapshot` or `delta` row means the exchange
+  message carried no parseable `last_updated_at` / `timestamp` (the row is
+  still stored) -- a non-trivial count there is a schema-drift / malformed-
+  feed signal, not noise. A `recv − srv` distribution on deltas is a
+  signed latency/skew diagnostic (see item 3 above), not an offset bound.
+- Deploy ≠ restart: the deploy workflow does **not** restart
+  `engine-b-phase0.service`. Compare `/opt/engine-b-phase0/release.env`
+  with the running process start time (`systemctl show -p
+  ActiveEnterTimestamp`) and `collector_manifest` before trusting that the
+  running observer matches `origin/master`.
+
+Known limitations of the running collector (tracked in bot-strategy#908,
+with the 2026-09-04 measurements in bot-strategy#874): a single
+non-positive `market_stats` price tears down the whole venue connection;
+markets that miss their post-reconnect snapshot stay unsynced until the
+next reconnect; the `task_cancelled` gap reason is not reliably
+attributed.
+
+### Resolution
+
+For the Phase 0 logger's purpose A-10 is resolved: every stored book
+snapshot can be proven synced or not, every interval in which a market's
+book was unusable is covered by a bounded `data_gap` (or
+`sealed_gap_interval`) row -- coalesced, not one row per disconnect: a
+disconnect while a market is already unsynced extends the open gap, and
+the per-disconnect record is `ws_connection` -- `order_book` sequence
+breaks are likewise coalesced into one open `order_book` gap per market
+until the replacement snapshot arrives (`idx_data_gap_open_order_book`;
+the per-break count lives only in `engine_b_phase0_sequence_gap_total`),
+and server versus receive time are both kept in a known unit. Two
+intervals are **not** recorded anywhere and must be bounded offline:
+(a) from a connection's start until its first complete snapshot for a
+market (`BookState` starts unsynced, but a `connection` gap is opened
+only on disconnect) -- bound it as `ws_connection.started_ts_recv_us` →
+first `is_complete_snapshot = 1` row of that session and market; (b) an
+`order_book` subscription that silently stops delivering while `trade` /
+`market_stats` keep the socket alive -- the collector tracks liveness per
+venue, not per market channel, so `BookState.synced` stays true and the
+book looks current until the next invalid delta or disconnect. Detect it
+offline as an anomalously long interval between consecutive `book_event`
+rows for a market relative to that market's own cadence (or to its
+`trade` / `price_observation` activity in the same interval) and treat
+the interval as unusable; per-market book-channel liveness in the
+collector is tracked as a follow-up under bot-strategy#908. Items 1–3 above are
+analysis-time obligations (1, 2) and a host-level check (3). "Resolved"
+here means *detected and recorded*, not *self-healing*: the collector has
+no automatic resubscribe when a post-reconnect snapshot never arrives, so
+a market can sit unsynced (its `connection` gap open, later bounded by
+`_journal_stale_open_gaps`) until the next reconnect -- that recovery gap
+and the other collector limitations are tracked in bot-strategy#908.
+
 ## Host and service
 
 - EC2: `debot-robinhood-lighter` (`i-0095af4fe0efbc5dd`, `ap-northeast-1`)
