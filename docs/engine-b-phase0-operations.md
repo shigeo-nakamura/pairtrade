@@ -174,11 +174,19 @@ states plainly which parts are **not** done online.
    trade-completeness or book-snapshot criterion -- a trade silently
    missed while the socket stayed connected leaves a bucket marked
    complete with wrong OHLC / volume / trade count. §4.5.2's boundary
-   prices are unaffected (they come from book snapshots), but any analysis
-   that consumes `ohlcv_1m` or trade counts must first run the offline
-   trade-gap check (per-market `trade_id` monotonicity, plus overlap with
-   `connection` gaps) and invalidate the affected buckets; treat
-   `is_complete = 1` as "finalised", never as "verified complete".
+   prices are unaffected (they come from book snapshots). **Trade
+   completeness within a connected session cannot be verified from the
+   collected data**: Lighter gives no continuity rule for the channel,
+   `trade_id`s are not guaranteed contiguous per market (100 → 102 is not
+   evidence of a miss), and ID-less trades carry non-orderable synthetic
+   IDs. Only the `connection`-gap overlap can invalidate a bucket; a miss
+   with the socket up is undetectable. F0-04's own remedy -- a second,
+   API-sourced OHLCV series for cross-checking -- is **not collected**
+   by this observer (no candle channel or REST kline poll; `ohlcv_1m`
+   has a single WS-trade `source`), so `ohlcv_1m` must be treated as
+   best-effort and `is_complete = 1` as "finalised", never as "verified
+   complete", until that cross-check source is added (tracked as a
+   follow-up under bot-strategy#908).
 2. **`daily_data_quality` is created by the schema but has no writer.**
    `event_count`, `missing_duration_us`, `out_of_order_count`,
    `duplicate_count`, `sequence_gap_count`, `stale_quote_duration_us`,
