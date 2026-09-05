@@ -563,8 +563,9 @@ echo "Engine B archive test passed"
 # Retention and bounded batches must apply before any DB mutation/S3 upload.
 LIMIT_DATA="$ROOT/limits/data"
 mkdir -p "$LIMIT_DATA"
-# The hour starting 24h ago is still hot until its END is 24h old.
-recent=$(date -u -d '24 hours ago' +%Y%m%d_%H)
+# Leave 23 hours of headroom inside the 24-hour retention window: crossing
+# a UTC hour between run_limits calls must not make this fixture eligible.
+recent=$(date -u -d '1 hour ago' +%Y%m%d_%H)
 python3 - "$LIMIT_DATA" "$recent" <<'PY'
 from pathlib import Path
 import sqlite3
