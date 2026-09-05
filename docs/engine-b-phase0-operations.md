@@ -445,7 +445,16 @@ exact dependencies and the three staged systemd units, and writes the required
 full Git commit to `/opt/engine-b-phase0/release.env`. It runs
 `daemon-reload` but never starts or restarts a service. The normal
 Robinhood deploy workflow stages the units and passes `GITHUB_SHA`; for a
-manual install, provide both values explicitly.
+manual install, provide both values explicitly. Because the observer keeps
+writing while the installer re-owns `/var/lib/engine-b-phase0`, a state file
+that vanishes mid-walk (SQLite `-wal` / `-shm` side files, a partition being
+sealed) is skipped with a `vanished during re-own` notice rather than
+failing the deploy (bot-strategy#908 item 8). The re-own is a
+descriptor-anchored Python walk (`os.fwalk` + `O_NOFOLLOW` + `fchown` /
+`fchmod`) over directories and regular files only, so a symlink -- leaf or
+an ancestor swapped in by the running observer -- is never followed by the
+root-run installer; an entry that cannot be re-owned for any other reason,
+or an unknown service group, still aborts the install.
 
 The first operator-controlled restart also completes the identity handoff.
 After systemd stops the legacy `ec2-user` observer, root-privileged pre-start

@@ -9,6 +9,8 @@ import importlib.util
 import json
 import sqlite3
 import sys
+import os
+import subprocess
 import tempfile
 import types
 import unittest
@@ -2108,6 +2110,92 @@ class RestPollingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_installer_reowns_state_tree_without_following_symlinks(self) -> None:
+        # bot-strategy#908 item 8: the observer keeps writing while the
+        # installer re-owns /var/lib/engine-b-phase0. `chgrp -R` failed the
+        # whole deploy on a SQLite -shm file that vanished mid-walk; the
+        # replacement is a descriptor-anchored walk that skips vanished
+        # entries, never follows a symlink (leaf or swapped-in ancestor --
+        # root-run chgrp/chmod over an observer-writable tree), and still
+        # fails on a real permission problem or an unknown group.
+        installer = INSTALLER_PATH.read_text()
+        self.assertNotIn('chgrp -R "$SERVICE_GROUP" "$STATE_DIR"', installer)
+        self.assertIn("reown_state_tree", installer)
+        self.assertIn("os.fwalk(", installer)
+        self.assertIn("follow_symlinks=False", installer)
+        syntax = subprocess.run(
+            ["bash", "-n", str(INSTALLER_PATH)], capture_output=True, text=True
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        start = installer.index("reown_state_tree() {")
+        end = installer.index("\n}\n", start) + 3
+        function_source = installer[start:end]
+        group = subprocess.run(
+            ["id", "-gn"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        def run(state_dir: Path, *, service_group: str) -> subprocess.CompletedProcess[str]:
+            script = (
+                "set -euo pipefail\n"
+                f"PYTHON_BIN={sys.executable}\n"
+                f"SERVICE_GROUP={service_group}\n"
+                f"STATE_DIR={state_dir}\n"
+                f"{function_source}\n"
+                "reown_state_tree\n"
+            )
+            return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            data_dir = state_dir / "data"
+            data_dir.mkdir(parents=True)
+            partition = data_dir / "engine_b_phase0_20260823_00.sqlite3"
+            partition.write_text("x")
+            partition.chmod(0o644)
+            outside_file = Path(tmp) / "outside-privileged-file"
+            outside_file.write_text("y")
+            outside_file.chmod(0o644)
+            outside_dir = Path(tmp) / "outside-dir"
+            outside_dir.mkdir()
+            outside_dir.chmod(0o755)
+            inner = outside_dir / "passwd"
+            inner.write_text("z")
+            inner.chmod(0o644)
+            (data_dir / "link-to-file").symlink_to(outside_file)
+            (data_dir / "link-to-dir").symlink_to(outside_dir)
+            (data_dir / "dangling").symlink_to(Path(tmp) / "gone")
+            os.mkfifo(data_dir / "fifo")
+
+            result = run(state_dir, service_group=group)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(partition.stat().st_mode & 0o777, 0o660)
+            self.assertEqual(data_dir.stat().st_mode & 0o007, 0)
+            # Nothing outside the tree was touched through a symlink, and the
+            # symlinked directory was not descended into.
+            self.assertEqual(outside_file.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(outside_dir.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(inner.stat().st_mode & 0o777, 0o644)
+            self.assertIn("not a directory or regular file", result.stderr)
+
+            # An unknown group is fatal.
+            failure = run(state_dir, service_group="no-such-group-engine-b")
+            self.assertNotEqual(failure.returncode, 0)
+            self.assertIn("unknown group", failure.stderr)
+
+            # A real permission failure propagates instead of being skipped.
+            if os.geteuid() != 0:
+                sealed = state_dir / "sealed"
+                sealed.mkdir()
+                (sealed / "x").write_text("s")
+                sealed.chmod(0o000)
+                try:
+                    unreadable = run(state_dir, service_group=group)
+                finally:
+                    sealed.chmod(0o755)
+                self.assertNotEqual(unreadable.returncode, 0)
+                self.assertIn("failed to re-own", unreadable.stderr)
+
     def test_installer_records_commit_and_installs_all_units(self) -> None:
         installer = INSTALLER_PATH.read_text()
         workflow = DEPLOY_WORKFLOW_PATH.read_text()
