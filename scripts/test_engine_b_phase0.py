@@ -1035,7 +1035,11 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "type": "update/trade",
                     "channel": "trade/216",
-                    "trades": [{"price": "101", "size": "2"}],
+                    # Timestamp present: the row survives validation, so the
+                    # nonce rule (not a per-row rejection) is what fires.
+                    "trades": [
+                        {"timestamp": 1_774_884_082_309, "price": "101", "size": "2"}
+                    ],
                 },
                 1_774_884_082_400_000,
             )
@@ -1294,6 +1298,62 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
                     'engine_b_phase0_trade_total{symbol="SKHY",venue="lighter"} 1',
                     rendered,
                 )
+
+    async def test_rejected_idless_row_does_not_trip_missing_nonce_rule(self) -> None:
+        # Codex review on pairtrade#279: the nonce rule is evaluated on the
+        # rows that survive validation, so an ID-less row that is rejected
+        # anyway (here: zero price) neither raises nor drops its ID-bearing
+        # sibling in a nonce-less incremental message.
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "lighter")
+        recv_us = 1_774_884_082_400_000
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        connection = {
+            "id": "nonce-less-with-rejected-idless-row",
+            "venue": venue.name,
+            "started_us": recv_us,
+            "api_schema_version": config.api_schema_version,
+        }
+        await collector.handle_trades(
+            venue,
+            connection,
+            {
+                "type": "update/trade",
+                "channel": "trade/216",
+                "trades": [
+                    {"timestamp": recv_us, "price": "0", "size": "2"},
+                    {
+                        "trade_id": "with-id",
+                        "timestamp": recv_us,
+                        "price": "101",
+                        "size": "2",
+                    },
+                ],
+            },
+            recv_us,
+        )
+        kinds = [kind for kind, _ in sink.commands]
+        self.assertEqual(kinds, ["gap", "trade"])
+        self.assertEqual(sink.commands[0][1]["reason"], "non_positive_price")
+        self.assertEqual(sink.commands[1][1]["trade_id"], "with-id")
+
+        # A surviving ID-less row in a nonce-less incremental message is
+        # still a message-level protocol error.
+        sink = RecordingSink()
+        collector = engine_b.Collector(config, sink, engine_b.Metrics())
+        with self.assertRaisesRegex(RuntimeError, "without exchange nonce"):
+            await collector.handle_trades(
+                venue,
+                connection,
+                {
+                    "type": "update/trade",
+                    "channel": "trade/216",
+                    "trades": [{"timestamp": recv_us, "price": "101", "size": "2"}],
+                },
+                recv_us,
+            )
+        self.assertEqual(sink.commands, [])
 
     async def test_boundary_exchange_timestamps_are_accepted(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)

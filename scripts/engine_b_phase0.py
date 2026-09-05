@@ -4004,13 +4004,6 @@ class Collector:
         exchange_sequence = str(message["nonce"]) if message.get("nonce") is not None else None
         message_type = str(message.get("type", "update/trade"))
         trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
-        if message_type != "subscribed/trade" and exchange_sequence is None and any(
-            trade.get("trade_id_str", trade.get("trade_id")) is None
-            for trade in trades
-        ):
-            raise RuntimeError(
-                "refusing ID-less incremental trade message without exchange nonce"
-            )
         # Fail closed on the *trade*, not on the connection (same rule as
         # market_stats, bot-strategy#908 item 1): raising here tore the whole
         # venue feed down and looped through reconnects, each one re-sending
@@ -4063,6 +4056,17 @@ class Collector:
             parsed_trades.append((trade, srv_us, price_text, size_text))
         if not parsed_trades:
             return
+        # Protocol-level check, kept message-level: a synthetic identity for
+        # an ID-less incremental trade needs the exchange nonce as its scope.
+        # Evaluated on the surviving rows only, so a rejected ID-less row
+        # cannot drag its ID-bearing siblings (and the connection) down.
+        if message_type != "subscribed/trade" and exchange_sequence is None and any(
+            trade.get("trade_id_str", trade.get("trade_id")) is None
+            for trade, _, _, _ in parsed_trades
+        ):
+            raise RuntimeError(
+                "refusing ID-less incremental trade message without exchange nonce"
+            )
         message_scope = trade_message_scope(
             message_type, exchange_sequence, recv_us
         )
