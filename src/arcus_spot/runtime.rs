@@ -4,7 +4,7 @@ use dex_connector::{
     ArcusSpotCapture, ArcusSpotOverviewEntry, ArcusSpotRecorderSnapshot, ArcusSpotRoundTripRecord,
     ArcusSpotRouteObservation, ArcusSpotToken,
 };
-use dex_connector::{ArcusSpotFixedSellAmountRow, ArcusSpotPair};
+use dex_connector::{ArcusSpotFixedSellAmountRow, ArcusSpotPair, ArcusSpotRecorderStage};
 use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -433,21 +433,12 @@ impl ArcusSpotRuntime {
         &self,
         sell_token_decimals: u32,
     ) -> Result<Option<ArcusSpotFixedSellAmountRow>, String> {
-        let Some((direction, open_quantity)) = self.open_exit_leg() else {
-            return Ok(None);
-        };
-        let (sell_symbol, buy_symbol) = self.direction_symbols(direction);
-        let sell_amount_raw =
-            quantity_to_raw_amount(open_quantity, sell_token_decimals).map_err(|detail| {
-                format!("open rotation quantity {open_quantity} {sell_symbol}: {detail}")
-            })?;
-        Ok(Some(ArcusSpotFixedSellAmountRow {
-            pair: ArcusSpotPair {
-                sell_symbol: sell_symbol.to_string(),
-                buy_symbol: buy_symbol.to_string(),
-            },
-            sell_amount_raw,
-        }))
+        open_exit_fixed_sell_amount_row_for(
+            self.state.regime,
+            self.state.rotated_quantity,
+            &self.config.pair,
+            sell_token_decimals,
+        )
     }
 
     /// `(sell_symbol, buy_symbol)` for `direction` under the configured pair.
@@ -1468,6 +1459,27 @@ impl ArcusSpotRuntime {
             })
             .collect::<Vec<_>>();
         if matching_rows.is_empty() {
+            // A fixed row exists for this pair but at a different amount:
+            // the collector requested the wrong size (e.g. its decimals
+            // pin disagrees with this snapshot's token metadata), and
+            // silently falling back to the legacy notional-cycle path
+            // would look identical to a collector that never requested an
+            // exit-sized row at all -- surface it distinctly instead.
+            if let Some(mismatched) = snapshot.round_trips.iter().find(|row| {
+                row.pair.sell_symbol.eq_ignore_ascii_case(sell_symbol)
+                    && row.pair.buy_symbol.eq_ignore_ascii_case(buy_symbol)
+                    && row.fixed_sell_amount.is_some()
+            }) {
+                return Err(ArcusSpotHold::new(
+                    ArcusSpotHoldCode::InvalidSnapshot,
+                    format!(
+                        "{sell_symbol}/{buy_symbol} fixed-amount row was quoted at {:?}, not the \
+                         open rotation quantity {open_raw}; the requesting collector's decimals \
+                         pin likely disagrees with this snapshot's token metadata",
+                        mismatched.fixed_sell_amount
+                    ),
+                ));
+            }
             return Ok(None);
         }
         if matching_rows.len() != 1 {
@@ -1481,13 +1493,21 @@ impl ArcusSpotRuntime {
             ));
         }
         let row = matching_rows[0];
-        if !row.errors.is_empty() {
+        // Only the forward leg is executed by this exit (see the freshness
+        // comment below); a failure recorded against the reverse leg or
+        // its round-trip-cost derivation must not block a position close
+        // that the forward leg itself quoted successfully -- the same
+        // reasoning `max_hold_secs`'s guarantee already relies on for the
+        // legacy entry-cycle exit path.
+        if let Some(blocking) = row.errors.iter().find(|error| {
+            error.stage != ArcusSpotRecorderStage::ReversePrice
+                && error.stage != ArcusSpotRecorderStage::RoundTripCalculation
+        }) {
             return Err(ArcusSpotHold::new(
                 ArcusSpotHoldCode::RouteUnavailable,
                 format!(
-                    "open-quantity exit row contains {} error(s): {}",
-                    row.errors.len(),
-                    row.errors[0].message
+                    "open-quantity exit row's forward leg failed: {}",
+                    blocking.message
                 ),
             ));
         }
@@ -1530,10 +1550,15 @@ impl ArcusSpotRuntime {
                 ),
             ));
         }
-        let verified_round_trip_loss_bps = parse_positive_or_zero(
-            "optimistic_round_trip_loss_bps",
-            row.optimistic_round_trip_loss_bps.as_deref(),
-        )?;
+        // Informational only for an exit (the cost cap is entry-only, see
+        // build_plan): a reverse-leg failure already tolerated above can
+        // leave this absent, so default rather than hold on it.
+        let verified_round_trip_loss_bps = row
+            .optimistic_round_trip_loss_bps
+            .as_deref()
+            .map(|value| parse_positive_or_zero("optimistic_round_trip_loss_bps", Some(value)))
+            .transpose()?
+            .unwrap_or(Decimal::ZERO);
         Ok(Some(SnapshotContext {
             token_a: price.token_a.clone(),
             token_b: price.token_b.clone(),
@@ -2110,6 +2135,40 @@ fn find_token(
         ));
     }
     Ok(token.clone())
+}
+
+/// Standalone form of `ArcusSpotRuntime::open_exit_fixed_sell_amount_row`
+/// for a caller that only has the checkpointed regime/rotated_quantity and
+/// the configured pair, not a full `ArcusSpotRuntime` -- e.g. live-tick's
+/// unlocked pre-fetch peek at the checkpoint (bot-strategy#906), which must
+/// not pay for `ArcusSpotRuntimeCheckpointStore::load_existing`'s config
+/// drift comparison and journal logging twice on top of the locked load
+/// the actual decision is made against.
+pub fn open_exit_fixed_sell_amount_row_for(
+    regime: ArcusSpotRegime,
+    rotated_quantity: Option<Decimal>,
+    pair: &ArcusSpotPair,
+    sell_token_decimals: u32,
+) -> Result<Option<ArcusSpotFixedSellAmountRow>, String> {
+    let Some(open_quantity) = rotated_quantity else {
+        return Ok(None);
+    };
+    let (sell_symbol, buy_symbol) = match regime {
+        ArcusSpotRegime::Neutral => return Ok(None),
+        ArcusSpotRegime::RotatedAToB => (pair.buy_symbol.clone(), pair.sell_symbol.clone()),
+        ArcusSpotRegime::RotatedBToA => (pair.sell_symbol.clone(), pair.buy_symbol.clone()),
+    };
+    let sell_amount_raw =
+        quantity_to_raw_amount(open_quantity, sell_token_decimals).map_err(|detail| {
+            format!("open rotation quantity {open_quantity} {sell_symbol}: {detail}")
+        })?;
+    Ok(Some(ArcusSpotFixedSellAmountRow {
+        pair: ArcusSpotPair {
+            sell_symbol,
+            buy_symbol,
+        },
+        sell_amount_raw,
+    }))
 }
 
 fn find_reference_price(
@@ -4893,9 +4952,12 @@ mod tests {
 
     #[test]
     fn open_quantity_exit_row_is_matched_by_exact_raw_amount_only() {
-        // A fixed row at a *different* amount is not "close enough": it is
-        // not the row for this position, so the legacy cycle is consulted
-        // and (being oversized) still holds.
+        // A fixed row at a *different* amount is not "close enough": a
+        // collector that requested the wrong size (e.g. its decimals pin
+        // disagrees with this snapshot's token metadata) must surface
+        // distinctly, not blend into the legacy notional-cycle path as if
+        // no exit-sized row had ever been requested at all (2026-09-04
+        // review).
         let mut runtime = rotated_runtime_with_open_amd(40);
         let mut snapshot = snapshot_with_valid_row(event_time());
         snapshot.round_trips.push(fixed_exit_row(
@@ -4909,14 +4971,14 @@ mod tests {
         let event = runtime.step_at(&snapshot, event_time());
         match event.decision {
             ArcusSpotDecision::Observe { hold } => {
-                assert_eq!(hold.code, ArcusSpotHoldCode::RotationLimit);
+                assert_eq!(hold.code, ArcusSpotHoldCode::InvalidSnapshot);
                 assert!(
-                    hold.detail.contains("exceeds the open rotation quantity"),
+                    hold.detail.contains("not the open rotation quantity"),
                     "unexpected hold detail: {}",
                     hold.detail
                 );
             }
-            other => panic!("expected the legacy oversized-exit hold, got {other:?}"),
+            other => panic!("expected a mismatch hold, got {other:?}"),
         }
         assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
     }
@@ -5011,8 +5073,17 @@ mod tests {
     #[test]
     fn open_quantity_exit_row_is_ignored_while_neutral() {
         // A leftover fixed row (e.g. collected for a position that has
-        // since closed) must not influence an entry decision.
+        // since closed) must not influence an entry decision: a selector
+        // that matched by pair alone, ignoring fixed_sell_amount, would let
+        // this row's amount leak into the entry plan instead of the
+        // notional cycle's own row.
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        // Warm the signal window with a tight cluster so this snapshot's
+        // relative_log_price (ln(200/100) ~= 0.693, from
+        // snapshot_with_valid_row's 200/100 prices) is many standard
+        // deviations away and reliably crosses entry_z_score (1.0),
+        // driving a real EntrySignal rather than a Warmup hold.
+        runtime.state.relative_log_price_history = vec![0.0, 0.1];
         let mut snapshot = snapshot_with_valid_row(event_time());
         snapshot.round_trips.push(fixed_exit_row(
             "AMD",
@@ -5023,13 +5094,20 @@ mod tests {
             event_time(),
         ));
         let event = runtime.step_at(&snapshot, event_time());
-        match event.decision {
-            ArcusSpotDecision::Observe { hold } => {
-                assert_eq!(hold.code, ArcusSpotHoldCode::Warmup);
-            }
-            other => panic!("expected a warmup hold, got {other:?}"),
-        }
-        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+        let plan = match event.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => plan,
+            other => panic!("expected the entry to fire, got {other:?}"),
+        };
+        assert_eq!(plan.trigger, ArcusSpotRotationTrigger::EntrySignal);
+        assert_eq!(plan.direction, ArcusSpotDirection::TokenAToTokenB);
+        assert_eq!(plan.sell_symbol, "NVDA");
+        assert_eq!(plan.buy_symbol, "AMD");
+        // The notional row's own requested amount ($5 at 200 -> 18
+        // decimals), not the leftover fixed row's 40000000000000000: proof
+        // the entry was selected by (pair, notional_usd), not by pair
+        // alone.
+        assert_eq!(plan.sell_amount_raw, "25000000000000000");
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::RotatedAToB);
     }
 
     #[test]

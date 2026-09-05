@@ -428,11 +428,36 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
 
     let client = ArcusSpotClient::new(config.router.clone())
         .context("invalid Arcus router configuration")?;
-    let recorder_config = ArcusSpotRecorderConfig::from_csv(
+    let mut recorder_config = ArcusSpotRecorderConfig::from_csv(
         &config.runtime.bidirectional_recorder_pairs_csv(),
         &config.runtime.notional_usd.normalize().to_string(),
     )
     .context("failed to build a bidirectional recorder config from the runtime pair/notional")?;
+    // A rotated position exits by selling exactly the quantity it
+    // acquired, so the snapshot must carry a quote at that exact size
+    // (bot-strategy#906), the same as live-tick. Unlike live-tick,
+    // `runtime` here is already the locked, config-validated instance the
+    // decision itself is made against, so this can query it directly
+    // rather than peeking the checkpoint file separately. This binary has
+    // no `trusted_token_decimals` administrator pin (it never signs), so
+    // it resolves the exit sell token's decimals from the same verified
+    // token lookup the router client itself uses for every quote.
+    if let Some((direction, _)) = runtime.open_exit_leg() {
+        let (sell_symbol, _) = runtime.direction_symbols(direction);
+        let decimals = client
+            .verified_token(sell_symbol)
+            .await
+            .with_context(|| {
+                format!("failed to resolve decimals for exit sell token {sell_symbol}")
+            })?
+            .decimals;
+        if let Some(row) = runtime
+            .open_exit_fixed_sell_amount_row(decimals)
+            .map_err(anyhow::Error::msg)?
+        {
+            recorder_config = recorder_config.with_fixed_sell_amount_row(row);
+        }
+    }
     let recorder = ArcusSpotRecorder::new(client, recorder_config)
         .context("invalid Arcus recorder configuration")?;
 
