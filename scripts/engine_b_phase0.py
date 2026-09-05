@@ -3471,7 +3471,7 @@ class Collector:
         if frames > limit:
             raise ValueError(f"{frames} frames can never fit the watchdog share of {limit}")
         while not self.stop_event.is_set():
-            current_us = now_us()
+            current_us = self._clock()
             sent = self.watchdog_frames_us[venue.name]
             while sent and current_us - sent[0] > 60_000_000:
                 sent.popleft()
@@ -3501,17 +3501,21 @@ class Collector:
             # subscribes in budget-sized steps instead of one unbounded burst
             # (bot-strategy#908).
             await self.wait_for_frame_budget(venue, 3)
-            subscribed_us = now_us()
             for channel in ("order_book", "trade", "market_stats"):
                 await send_public_control(
                     ws, {"type": "subscribe", "channel": f"{channel}/{market.market_id}"}
                 )
-                # The initial subscriptions draw from the same rolling frame
+                # Stamp each frame as it is actually sent (a backpressured
+                # send must not make the frame look older than it is), and
+                # take the book's retry deadline from its own send. The
+                # initial subscriptions draw from the same rolling frame
                 # budget the watchdog uses, so a reconnect burst plus recovery
                 # frames together stay within the observer's share of
                 # Lighter's per-IP client-message limit.
-                sent.append(subscribed_us)
-            self.book_subscribe_us[(venue.name, market.market_id)] = subscribed_us
+                sent_us = self._clock()
+                sent.append(sent_us)
+                if channel == "order_book":
+                    self.book_subscribe_us[(venue.name, market.market_id)] = sent_us
         LOG.info("Subscribed to public channels venue=%s markets=%d", venue.name, len(venue.markets))
 
     async def resubscribe_book(
