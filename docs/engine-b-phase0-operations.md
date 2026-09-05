@@ -302,6 +302,39 @@ and the other collector limitations are tracked in bot-strategy#908.
 - Health: `/run/engine-b-phase0/status.json`
 - Metrics: `127.0.0.1:9472/metrics`
 
+Per-market book watchdog (bot-strategy#908): the collector no longer tears
+the venue connection down when one market's `market_stats` carries a
+non-positive price -- that message is skipped, counted in
+`engine_b_phase0_market_stats_rejected_total{field=...}` and recorded as a
+point `data_gap` on the `market_stats` channel. A market still unsynced
+`book_resubscribe_after_ms` (default 10 s) after its last subscribe gets
+its `order_book` channel re-subscribed
+(`engine_b_phase0_book_resubscribe_total{reason="unsynced"}`), and a
+synced market whose book has been silent while its own trade /
+market_stats have been arriving for `book_stall_after_ms` (default 60 s,
+measured from the first auxiliary message after the last book message,
+with at least one within the last half of that window) is declared stale
+-- the gap starts where the auxiliary traffic was observably flowing: unsynced, `data_gap(channel=order_book,
+reason=book_channel_stalled)` written to the detecting partition with its
+start clamped to that partition's beginning (a sealed hour never receives
+new rows); the portion of the stall in earlier hours is preserved as
+`sealed_gap_interval` rows in the detecting partition, one per hour, so
+`missing_duration_us` (union of both tables) still covers it;
+re-subscribed (`engine_b_phase0_book_stall_total` counts detections,
+`engine_b_phase0_book_resubscribe_total{reason="stalled"}` counts frames
+actually sent). At most `book_watchdog_batch`
+(default 5) subscribe frames per venue per second, and at most 100
+(re)subscribe frames per venue per rolling minute across the reconnect
+burst, the watchdog and sequence-break recovery (half of Lighter's 200
+client messages / minute per IP); a reconnect burst subscribes market by market, waiting for budget;
+10 frames/min are set aside for keepalive traffic (library protocol
+pings/pongs and application-level pong replies, which are never withheld)
+and 2 frames per configured market for proven sequence breaks
+(`load_config` rejects a venue whose reserve would leave the watchdog
+fewer than 20 frames/min). All three keys are
+optional in `phase0.json`. A feed task cancelled without `stop_event`
+set is now recorded as `task_cancelled_unexpected` with a logged stack.
+
 The databases rotate hourly because the normalized public feed is too large
 for the host's 20 GiB root volume. At minute 10, the archive timer checkpoints
 an abandoned WAL for each closed partition, finalizes its remaining closed

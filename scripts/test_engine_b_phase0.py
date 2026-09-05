@@ -279,30 +279,505 @@ class BookHandlingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MarketStatsHandlingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_non_positive_price_rejects_entire_message_before_enqueue(
-        self,
-    ) -> None:
+    async def test_non_positive_price_rejects_message_without_raising(self) -> None:
+        # bot-strategy#908 item 1: one illiquid market's zero stat must not
+        # tear down the venue connection; the message is skipped and the
+        # rejection is recorded as a point gap on the market_stats channel.
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "lighter")
+        sink = RecordingSink()
+        metrics = engine_b.Metrics()
+        collector = engine_b.Collector(config, sink, metrics)
+
+        await collector.handle_market_stats(
+            venue,
+            {
+                "type": "update/market_stats",
+                "channel": "market_stats/216",
+                "timestamp": 1_774_884_082_400,
+                "market_stats": {
+                    "mark_price": "159.71",
+                    "index_price": "0",
+                    "last_trade_price": "159.70",
+                    "funding_rate": "0.0001",
+                },
+            },
+            1_774_884_082_400_000,
+        )
+
+        kinds = [kind for kind, _ in sink.commands]
+        self.assertEqual(kinds, ["gap"])
+        gap = sink.commands[0][1]
+        self.assertEqual(gap["channel"], "market_stats")
+        self.assertEqual(gap["reason"], "non_positive_index_price")
+        self.assertEqual(gap["start_us"], gap["end_us"])
+        self.assertEqual(gap["market_id"], 216)
+        rendered = metrics.render(queue_size=0)
+        self.assertIn(
+            'engine_b_phase0_market_stats_rejected_total{field="index_price",symbol="SKHY",venue="lighter"} 1',
+            rendered,
+        )
+
+    async def test_positive_prices_are_stored(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         venue = next(item for item in config.venues if item.name == "lighter")
         sink = RecordingSink()
         collector = engine_b.Collector(config, sink, engine_b.Metrics())
 
-        with self.assertRaisesRegex(RuntimeError, "non-positive market-stat price"):
-            await collector.handle_market_stats(
-                venue,
-                {
-                    "type": "update/market_stats",
-                    "channel": "market_stats/216",
-                    "timestamp": 1_774_884_082_400,
-                    "market_stats": {
-                        "mark_price": "159.71",
-                        "index_price": "0",
-                        "last_trade_price": "159.70",
-                    },
-                },
-                1_774_884_082_400_000,
-            )
+        await collector.handle_market_stats(
+            venue,
+            {
+                "type": "update/market_stats",
+                "channel": "market_stats/216",
+                "timestamp": 1_774_884_082_400,
+                "market_stats": {"mark_price": "159.71", "index_price": "159.60"},
+            },
+            1_774_884_082_400_000,
+        )
 
+        self.assertEqual([kind for kind, _ in sink.commands], ["price", "price"])
+
+
+class BookWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    def _collector(self) -> tuple[object, object, object, object]:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        venue = next(item for item in config.venues if item.name == "lighter")
+        sink = RecordingSink()
+        metrics = engine_b.Metrics()
+        collector = engine_b.Collector(config, sink, metrics)
+        collector._clock = lambda: 0  # send-time stamps fall back to the test clock
+        return config, venue, sink, collector
+
+    async def test_sequence_break_reserve_is_per_market(self) -> None:
+        # Codex on pairtrade#277: one noisy market cannot spend the reserve
+        # meant for the others -- each market gets one reserved recovery per
+        # rolling minute once the shared share is exhausted.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        collector.watchdog_frames_us[venue.name].extend(
+            [t0 - 1_000_000] * collector.watchdog_share(venue)
+        )
+
+        async def proven_break(market_id: int, at_us: int) -> int:
+            key = (venue.name, market_id)
+            state = collector.books.setdefault(key, engine_b.BookState())
+            state.synced = True
+            state.last_nonce = "10"
+            before = len(ws.messages)
+            await collector.handle_book(
+                ws,
+                venue,
+                connection,
+                {
+                    "type": "update/order_book",
+                    "channel": f"order_book/{market_id}",
+                    "order_book": {"begin_nonce": 99, "nonce": 100, "bids": [], "asks": []},
+                },
+                at_us,
+            )
+            return len(ws.messages) - before
+
+        self.assertEqual(await proven_break(216, t0), 2)  # SKHY: reserve used
+        self.assertEqual(await proven_break(216, t0 + 20_000_000), 0)  # SKHY again: refused
+        self.assertEqual(await proven_break(139, t0 + 21_000_000), 2)  # SNDK: its own reserve
+        self.assertEqual(await proven_break(216, t0 + 61_000_000), 2)  # SKHY: reserve back after 60 s
+
+    async def test_unsynced_market_is_resubscribed_after_threshold(self) -> None:
+        # bot-strategy#908 item 2: a market whose post-(re)connect snapshot
+        # never arrived gets its order_book channel re-subscribed, at most
+        # book_watchdog_batch markets per pass.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        await collector.subscribe_public_channels(ws, venue)
+        for key in list(collector.book_subscribe_us):
+            collector.book_subscribe_us[key] = t0
+        ws.messages.clear()
+
+        # Too early: nothing happens.
+        await collector.watchdog_books(ws, venue, connection, t0 + 5_000_000)
+        self.assertEqual(ws.messages, [])
+
+        # Past the threshold: a batch of order_book re-subscribes goes out.
+        await collector.watchdog_books(ws, venue, connection, t0 + 11_000_000)
+        self.assertEqual(len(ws.messages), config.book_watchdog_batch)
+        for message in ws.messages:
+            self.assertEqual(message["type"], "subscribe")
+            self.assertTrue(message["channel"].startswith("order_book/"))
+        # Re-subscribed markets get a fresh subscribe timestamp.
+        refreshed = [k for k, v in collector.book_subscribe_us.items() if v == t0 + 11_000_000]
+        self.assertEqual(len(refreshed), config.book_watchdog_batch)
+        # Throttled to once per second per venue.
+        await collector.watchdog_books(ws, venue, connection, t0 + 11_500_000)
+        self.assertEqual(len(ws.messages), config.book_watchdog_batch)
+        # Next eligible pass rotates to markets not yet retried (oldest
+        # subscribe first), instead of the same first batch again.
+        first_batch = {m["channel"] for m in ws.messages}
+        await collector.watchdog_books(ws, venue, connection, t0 + 22_000_000)
+        second_batch = {m["channel"] for m in ws.messages[config.book_watchdog_batch :]}
+        self.assertEqual(len(second_batch), config.book_watchdog_batch)
+        self.assertTrue(first_batch.isdisjoint(second_batch))
+        self.assertEqual(sink.commands, [])
+
+    async def test_synced_market_with_silent_book_is_marked_stale(self) -> None:
+        # bot-strategy#908 item 6: synced book, no book message for
+        # book_stall_after_ms while the market's own trade/market_stats kept
+        # arriving -> unsynced + order_book gap + re-subscribe.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        state = collector.books.setdefault(key, engine_b.BookState())
+        state.synced = True
+        state.last_nonce = "10"
+        collector.book_subscribe_us[key] = t0
+        collector.book_last_recv_us[key] = t0
+        collector.aux_since_book_us[key] = t0 + 1_000_000
+        collector.market_last_activity_us[key] = t0 + 50_000_000
+        # Other markets: keep them out of the way (synced, fresh).
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            if other == key:
+                continue
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = t0
+            collector.book_last_recv_us[other] = t0 + 59_000_000
+
+        await collector.watchdog_books(ws, venue, connection, t0 + 30_000_000)
+        self.assertEqual(ws.messages, [])
+        self.assertTrue(state.synced)
+
+        await collector.watchdog_books(ws, venue, connection, t0 + 61_000_000)
+        self.assertFalse(state.synced)
+        self.assertFalse(collector.metrics.book_synced[key])
+        self.assertEqual(
+            ws.messages,
+            [
+                {"type": "unsubscribe", "channel": "order_book/216"},
+                {"type": "subscribe", "channel": "order_book/216"},
+            ],
+        )
+        gaps = [payload for kind, payload in sink.commands if kind == "gap"]
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["channel"], "order_book")
+        self.assertEqual(gaps[0]["reason"], "book_channel_stalled")
+        self.assertEqual(gaps[0]["start_us"], t0 + 1_000_000)  # where aux traffic resumed
+        self.assertEqual(gaps[0]["partition_us"], t0 + 61_000_000)
+        self.assertEqual(gaps[0]["market_id"], 216)
+        self.assertEqual(gaps[0]["expected_sequence"], "10")
+        self.assertEqual(gaps[0]["sealed_intervals"], [])
+        rendered = collector.metrics.render(queue_size=0)
+        self.assertIn('engine_b_phase0_book_stall_total{symbol="SKHY",venue="lighter"} 1', rendered)
+        self.assertIn(
+            'engine_b_phase0_book_resubscribe_total{reason="stalled",symbol="SKHY",venue="lighter"} 1',
+            rendered,
+        )
+
+    async def test_stall_gap_start_is_clamped_to_the_detecting_partition(self) -> None:
+        # Codex on pairtrade#277: a stall whose last book message lies in an
+        # earlier (possibly sealed) hour must not target that partition.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        hour = 3_600_000_000
+        boundary = (1_774_884_000_000_000 // hour + 1) * hour
+        last_book = boundary - 30_000_000
+        now = boundary + 40_000_000
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = last_book
+            collector.book_last_recv_us[other] = now - 1_000_000
+        collector.book_last_recv_us[key] = last_book
+        aux_since = last_book + 1_000_000
+        collector.aux_since_book_us[key] = aux_since
+        collector.market_last_activity_us[key] = now - 1_000_000
+        await collector.watchdog_books(ws, venue, connection, now)
+        gaps = [payload for kind, payload in sink.commands if kind == "gap"]
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["start_us"], boundary)
+        self.assertEqual(gaps[0]["partition_us"], now)
+        self.assertEqual(
+            engine_b.partition_for_us(gaps[0]["partition_us"]),
+            engine_b.partition_for_us(gaps[0]["start_us"]),
+        )
+        # The 30 s before the boundary are not dropped: they travel as a
+        # sealed interval for the previous hour inside the same gap command.
+        self.assertEqual(
+            [(i["start_us"], i["end_us"], i["sealed_partition"]) for i in gaps[0]["sealed_intervals"]],
+            [(aux_since, boundary, engine_b.partition_for_us(aux_since))],
+        )
+        self.assertTrue(gaps[0]["sealed_intervals"][0]["interval_id"].startswith("stalled-book:"))
+
+    async def test_stale_activity_does_not_declare_a_stall(self) -> None:
+        # One stats message shortly after the last book message, then a
+        # fully quiet market: quiet, not stalled.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = t0
+            collector.book_last_recv_us[other] = t0
+        collector.aux_since_book_us[key] = t0 + 1_000_000
+        collector.market_last_activity_us[key] = t0 + 1_000_000
+        await collector.watchdog_books(ws, venue, connection, t0 + 61_000_000)
+        self.assertTrue(collector.books[key].synced)
+        self.assertEqual(ws.messages, [])
+        self.assertEqual(sink.commands, [])
+
+    async def test_handle_book_resubscribe_refreshes_watchdog_deadline(self) -> None:
+        # bot-strategy#908 / Codex: handle_book's own unsubscribe+subscribe on
+        # a sequence break must restart the watchdog spacing, or the watchdog
+        # fires a second subscribe in the same iteration.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        collector.book_subscribe_us[key] = t0 - 60_000_000
+        state = collector.books.setdefault(key, engine_b.BookState())
+        state.synced = True
+        state.last_nonce = "10"
+        await collector.handle_book(
+            ws,
+            venue,
+            connection,
+            {
+                "type": "update/order_book",
+                "channel": "order_book/216",
+                "order_book": {"begin_nonce": 99, "nonce": 100, "bids": [], "asks": []},
+            },
+            t0,
+        )
+        self.assertEqual(collector.book_subscribe_us[key], t0)
+        self.assertEqual(len(ws.messages), 2)  # unsubscribe + subscribe from handle_book
+        await collector.watchdog_books(ws, venue, connection, t0 + 1_500_000)
+        self.assertEqual(len(ws.messages), 2)  # watchdog stays quiet inside the spacing
+
+    async def test_watchdog_frames_are_capped_per_minute(self) -> None:
+        # Runtime cap independent of config: even with a pathological
+        # interval the watchdog never sends more than
+        # WATCHDOG_MAX_FRAMES_PER_MIN frames per venue per rolling minute.
+        import dataclasses
+
+        config, venue, sink, collector = self._collector()
+        collector.config = dataclasses.replace(
+            config, book_resubscribe_after_ms=1_000, book_watchdog_batch=14
+        )
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            collector.book_subscribe_us[(venue.name, market.market_id)] = t0 - 10_000_000
+        for second in range(0, 60):
+            await collector.watchdog_books(ws, venue, connection, t0 + second * 1_000_000)
+        self.assertLessEqual(len(ws.messages), engine_b.WATCHDOG_MAX_FRAMES_PER_MIN)
+        self.assertGreater(len(ws.messages), 0)
+
+    async def test_burst_of_stale_deltas_resubscribes_once(self) -> None:
+        # Codex on pairtrade#277: queued deltas against an unsynced book must
+        # not each send unsubscribe/subscribe; only the first within
+        # book_resubscribe_after_ms does, the rest are suppressed.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        # Subscribed 2 s ago: still inside the spacing, yet the FIRST break on
+        # a synced book must recover immediately; only the follow-ups are
+        # suppressed.
+        collector.book_subscribe_us[key] = t0 - 2_000_000
+        state = collector.books.setdefault(key, engine_b.BookState())
+        state.synced = True
+        state.last_nonce = "10"
+        for i in range(5):
+            await collector.handle_book(
+                ws,
+                venue,
+                connection,
+                {
+                    "type": "update/order_book",
+                    "channel": "order_book/216",
+                    "order_book": {"begin_nonce": 50 + i, "nonce": 51 + i, "bids": [], "asks": []},
+                },
+                t0 + i * 200_000,
+            )
+        self.assertEqual(len(ws.messages), 2)  # one unsubscribe + one subscribe
+        self.assertEqual(collector.book_subscribe_us[key], t0)
+
+    async def test_initial_subscriptions_consume_the_frame_budget(self) -> None:
+        # Codex on pairtrade#277: the 42 subscribe frames of a (re)connect
+        # count against the same 100/min budget as watchdog re-subscribes.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        await collector.subscribe_public_channels(ws, venue)
+        initial = len(ws.messages)
+        self.assertEqual(initial, 3 * len(venue.markets))
+        self.assertEqual(len(collector.watchdog_frames_us[venue.name]), initial)
+        # Re-anchor the real-clock timestamps onto the test clock.
+        frames = collector.watchdog_frames_us[venue.name]
+        frames.clear()
+        frames.extend([t0] * initial)
+        for key in list(collector.book_subscribe_us):
+            collector.book_subscribe_us[key] = t0
+        for second in range(11, 60):
+            await collector.watchdog_books(ws, venue, connection, t0 + second * 1_000_000)
+        # Within the first rolling minute the total (initial + watchdog) stays capped.
+        self.assertLessEqual(len(ws.messages), engine_b.WATCHDOG_MAX_FRAMES_PER_MIN)
+        self.assertGreater(len(ws.messages), initial)
+        # Once the initial frames age out of the window, the budget frees up again.
+        before = len(ws.messages)
+        await collector.watchdog_books(ws, venue, connection, t0 + 75 * 1_000_000)
+        self.assertGreater(len(ws.messages), before)
+
+    async def test_stall_is_not_declared_when_the_frame_cap_is_exhausted(self) -> None:
+        # Codex on pairtrade#277: a stall is inferred from silence; do not
+        # invalidate the book if the recovery frames cannot be sent right now.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = t0 - 120_000_000
+            collector.book_last_recv_us[other] = t0 + 59_000_000
+        collector.book_last_recv_us[key] = t0
+        collector.aux_since_book_us[key] = t0 + 1_000_000
+        collector.market_last_activity_us[key] = t0 + 60_000_000
+        collector.watchdog_frames_us[venue.name].extend(
+            [t0 + 30_000_000] * engine_b.WATCHDOG_MAX_FRAMES_PER_MIN
+        )
+        await collector.watchdog_books(ws, venue, connection, t0 + 61_000_000)
+        self.assertTrue(collector.books[key].synced)
+        self.assertEqual(ws.messages, [])
+        self.assertEqual(sink.commands, [])
+
+    async def test_proven_sequence_break_can_use_the_reserve(self) -> None:
+        # Codex on pairtrade#277: watchdog/reconnect traffic stops at
+        # 100 - reserve; a real nonce mismatch on a synced book still recovers.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        fill = collector.watchdog_share(venue)
+        self.assertEqual(
+            fill,
+            engine_b.WATCHDOG_MAX_FRAMES_PER_MIN
+            - engine_b.KEEPALIVE_RESERVE_FRAMES
+            - 2 * len(venue.markets),
+        )
+        collector.watchdog_frames_us[venue.name].extend([t0 - 1_000_000] * fill)
+        # Watchdog (silence-inferred) is refused at this level...
+        self.assertFalse(collector.can_send_frames(venue, t0, 2))
+        # ...but a proven break on a synced book still goes out.
+        collector.book_subscribe_us[key] = t0 - 30_000_000
+        state = collector.books.setdefault(key, engine_b.BookState())
+        state.synced = True
+        state.last_nonce = "10"
+        await collector.handle_book(
+            ws,
+            venue,
+            connection,
+            {
+                "type": "update/order_book",
+                "channel": "order_book/216",
+                "order_book": {"begin_nonce": 99, "nonce": 100, "bids": [], "asks": []},
+            },
+            t0,
+        )
+        self.assertEqual(len(ws.messages), 2)
+
+    async def test_reconnect_burst_waits_for_frame_budget(self) -> None:
+        # Codex on pairtrade#277: five short-lived connections must not send
+        # 5 x 42 frames in a minute; the burst waits for budget instead.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        now = engine_b.now_us()
+        limit = collector.watchdog_share(venue)
+        collector.watchdog_frames_us[venue.name].extend([now - 1_000_000] * limit)
+        slept: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+            collector.watchdog_frames_us[venue.name].clear()  # budget freed
+
+        with mock.patch.object(engine_b.asyncio, "sleep", fake_sleep):
+            await collector.subscribe_public_channels(ws, venue)
+        self.assertEqual(len(slept), 1)
+        self.assertEqual(len(ws.messages), 3 * len(venue.markets))
+
+    async def test_shutdown_during_budget_wait_sends_nothing_more(self) -> None:
+        # Codex on pairtrade#277: stop_event during the wait must not fall
+        # through into sending the remaining subscriptions.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        now = engine_b.now_us()
+        collector._clock = engine_b.now_us
+        collector.watchdog_frames_us[venue.name].extend([now - 1_000_000] * collector.watchdog_share(venue))
+
+        async def fake_sleep(seconds: float) -> None:
+            collector.stop_event.set()
+
+        with mock.patch.object(engine_b.asyncio, "sleep", fake_sleep):
+            await collector.subscribe_public_channels(ws, venue)
+        self.assertEqual(ws.messages, [])
+
+    async def test_quiet_market_waking_up_is_not_backfilled_as_a_stall(self) -> None:
+        # Codex on pairtrade#277: book at T, everything quiet for 10 min, then
+        # one stats message -> not a 10-minute book outage; the stall clock
+        # only starts when auxiliary traffic resumes.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        key = (venue.name, 216)
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            other = (venue.name, market.market_id)
+            collector.books.setdefault(other, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[other] = t0 - 120_000_000
+            collector.book_last_recv_us[other] = t0 + 600_000_000
+        collector.book_last_recv_us[key] = t0
+        collector.note_aux_activity(venue.name, 216, t0 + 600_000_000)
+        await collector.watchdog_books(ws, venue, connection, t0 + 601_000_000)
+        self.assertTrue(collector.books[key].synced)
+        self.assertEqual(sink.commands, [])
+        # A book message resets the observation window.
+        collector.aux_since_book_us[key] = t0
+        await collector.handle_book(
+            ws, venue, connection,
+            {"type": "subscribed/order_book", "channel": "order_book/216",
+             "order_book": {"nonce": 1, "bids": [], "asks": []}},
+            t0 + 602_000_000,
+        )
+        self.assertNotIn(key, collector.aux_since_book_us)
+
+    async def test_silent_book_without_other_activity_is_not_stale(self) -> None:
+        # A quiet market (no trades, no stats either) is just quiet, not stalled.
+        config, venue, sink, collector = self._collector()
+        ws = FakeWebSocket()
+        connection = {"id": "c1", "venue": venue.name, "api_schema_version": "x"}
+        t0 = 1_774_884_000_000_000
+        for market in venue.markets:
+            key = (venue.name, market.market_id)
+            collector.books.setdefault(key, engine_b.BookState()).synced = True
+            collector.book_subscribe_us[key] = t0
+            collector.book_last_recv_us[key] = t0
+        await collector.watchdog_books(ws, venue, connection, t0 + 600_000_000)
+        self.assertEqual(ws.messages, [])
         self.assertEqual(sink.commands, [])
 
 
@@ -939,6 +1414,59 @@ class TradeIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_non_positive_watchdog_settings_are_rejected(self) -> None:
+        # bot-strategy#908 / Codex: a zero or negative watchdog setting must
+        # fail config loading, not silently disable recovery or storm subscribes.
+        base = json.loads(CONFIG_PATH.read_text())
+        for key in ("book_resubscribe_after_ms", "book_stall_after_ms", "book_watchdog_batch"):
+            for bad in (0, -1):
+                raw = dict(base)
+                raw[key] = bad
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "phase0.json"
+                    path.write_text(json.dumps(raw))
+                    with self.assertRaisesRegex(ValueError, f"{key} must be positive"):
+                        engine_b.load_config(path, LOCK_PATH)
+
+    def test_rate_unsafe_watchdog_settings_are_rejected(self) -> None:
+        base = json.loads(CONFIG_PATH.read_text())
+        raw = dict(base)
+        raw["book_resubscribe_after_ms"] = 1_000  # 2*5*60 = 600 frames/min
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "phase0.json"
+            path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "WS frames/min"):
+                engine_b.load_config(path, LOCK_PATH)
+
+    def test_stall_shorter_than_resubscribe_spacing_is_rejected(self) -> None:
+        base = json.loads(CONFIG_PATH.read_text())
+        raw = dict(base)
+        raw["book_resubscribe_after_ms"] = 30_000
+        raw["book_stall_after_ms"] = 20_000
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "phase0.json"
+            path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "book_stall_after_ms must be >="):
+                engine_b.load_config(path, LOCK_PATH)
+
+    def test_too_many_markets_for_the_reserve_is_rejected(self) -> None:
+        base = json.loads(CONFIG_PATH.read_text())
+        raw = json.loads(json.dumps(base))
+        venue = raw["venues"][0]
+        extra = [{"symbol": f"X{i}", "market_id": 1000 + i, "role": "exploratory"} for i in range(30)]
+        venue["markets"] = venue["markets"] + extra  # 44 markets -> reserve 88 > 100-6-20
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "phase0.json"
+            path.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(ValueError, "sequence-break reserve"):
+                engine_b.load_config(path, LOCK_PATH)
+
+    def test_watchdog_settings_default_when_absent(self) -> None:
+        config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
+        self.assertEqual(config.book_resubscribe_after_ms, 10_000)
+        self.assertEqual(config.book_stall_after_ms, 60_000)
+        self.assertEqual(config.book_watchdog_batch, 5)
+
     def test_config_lighter_venue_has_no_missing_symbols(self) -> None:
         config = engine_b.load_config(CONFIG_PATH, LOCK_PATH)
         lighter = next(venue for venue in config.venues if venue.name == "lighter")

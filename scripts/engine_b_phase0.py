@@ -36,7 +36,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
@@ -52,6 +52,27 @@ UTC = timezone.utc
 ALLOWED_MESSAGE_TYPES = frozenset({"subscribe", "unsubscribe", "ping", "pong"})
 ALLOWED_CHANNEL_PREFIXES = frozenset({"order_book", "trade", "market_stats"})
 SCHEMA_VERSION = 9
+# Ceiling for (re)subscribe WS frames per venue per rolling minute: half of
+# Lighter's documented 200 client messages / minute per IP, leaving the other
+# half to the trading bots sharing the IP.
+WATCHDOG_MAX_FRAMES_PER_MIN = 100
+# Part of that ceiling is reserved for recovering *proven* sequence breaks on
+# synced books (bot-strategy#908): two frames (unsubscribe + subscribe) per
+# configured market of the venue, so every book can recover once within the
+# minute even if the initial burst and the watchdog have used their share.
+# `load_config` rejects venues where that reserve would leave the watchdog
+# fewer than WATCHDOG_MIN_SHARE_FRAMES.
+WATCHDOG_MIN_SHARE_FRAMES = 20
+# Frames per minute set aside for keepalive traffic that is never gated:
+# the WebSocket library's automatic protocol pings (`ping_interval=20` -> 3/min)
+# and pong replies to server protocol pings (~3/min), plus application-level
+# pong replies to server `{"type":"ping"}` frames (Lighter currently sends
+# none; 4/min budgeted). Keepalive replies are deliberately never withheld --
+# a dropped pong can cost the whole connection, i.e. a 42-frame resubscribe
+# burst -- so they draw from this reserve and, only if a server ever pinged
+# faster than budgeted, from the subscription share (which then backs off
+# because the pongs are counted in the same window).
+KEEPALIVE_RESERVE_FRAMES = 10
 MAX_TRADE_EVENT_AGE_US = 7 * 24 * 60 * 60 * 1_000_000
 MAX_TRADE_EVENT_FUTURE_US = 5 * 60 * 1_000_000
 OHLCV_FINALIZE_GRACE_US = 120_000_000
@@ -841,6 +862,11 @@ class AppConfig:
     db_batch_max: int
     db_flush_interval_ms: int
     venues: tuple[VenueConfig, ...]
+    # Per-market book watchdog (bot-strategy#908). Optional keys in
+    # phase0.json so an existing deployment keeps working unchanged.
+    book_resubscribe_after_ms: int = 10_000
+    book_stall_after_ms: int = 60_000
+    book_watchdog_batch: int = 5
 
 
 def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
@@ -879,6 +905,44 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         )
     if int(raw["top_levels"]) < 5:
         raise ValueError("top_levels must be at least 5")
+    for key, default in (
+        ("book_resubscribe_after_ms", 10_000),
+        ("book_stall_after_ms", 60_000),
+        ("book_watchdog_batch", 5),
+    ):
+        # Optional keys, but a typo must not silently disable the watchdog
+        # (batch <= 0) or turn it into a subscribe storm (after_ms <= 0).
+        if int(raw.get(key, default)) <= 0:
+            raise ValueError(f"{key} must be positive")
+    # Worst case the watchdog can send: one pass per second, up to
+    # `book_watchdog_batch` markets per pass, two frames (unsubscribe +
+    # subscribe) per market, each market eligible again after the shorter of
+    # the two intervals. Keep that under half of Lighter's documented
+    # 200 client messages / minute per IP so the trading bots sharing the IP
+    # keep the other half (bot-strategy#908, Codex review on pairtrade#277).
+    resubscribe_after_ms = int(raw.get("book_resubscribe_after_ms", 10_000))
+    stall_after_ms = int(raw.get("book_stall_after_ms", 60_000))
+    if stall_after_ms < resubscribe_after_ms:
+        # A stall declared before the per-market re-subscribe spacing allows
+        # a frame would sit unsynced with no recovery until that spacing
+        # elapses; require the stall threshold to be the longer of the two.
+        raise ValueError("book_stall_after_ms must be >= book_resubscribe_after_ms")
+    shortest_ms = min(resubscribe_after_ms, stall_after_ms)
+    worst_frames_per_min = 2 * int(raw.get("book_watchdog_batch", 5)) * 60_000 / shortest_ms
+    if worst_frames_per_min > WATCHDOG_MAX_FRAMES_PER_MIN:
+        raise ValueError(
+            "book watchdog settings could send "
+            f"{worst_frames_per_min:.0f} WS frames/min (> {WATCHDOG_MAX_FRAMES_PER_MIN}); "
+            "raise book_resubscribe_after_ms/book_stall_after_ms or lower book_watchdog_batch"
+        )
+    for venue in venues:
+        reserve = 2 * len(venue.markets)
+        if reserve > WATCHDOG_MAX_FRAMES_PER_MIN - KEEPALIVE_RESERVE_FRAMES - WATCHDOG_MIN_SHARE_FRAMES:
+            raise ValueError(
+                f"venue {venue.name} has {len(venue.markets)} markets; the sequence-break reserve "
+                f"({reserve} frames) would leave the watchdog fewer than {WATCHDOG_MIN_SHARE_FRAMES} of "
+                f"{WATCHDOG_MAX_FRAMES_PER_MIN} frames/min"
+            )
     host, port_text = raw["metrics_listen"].rsplit(":", 1)
     return AppConfig(
         raw=raw,
@@ -901,6 +965,9 @@ def load_config(path: Path, dependency_lock_path: Path) -> AppConfig:
         db_batch_max=int(raw["db_batch_max"]),
         db_flush_interval_ms=int(raw["db_flush_interval_ms"]),
         venues=tuple(venues),
+        book_resubscribe_after_ms=int(raw.get("book_resubscribe_after_ms", 10_000)),
+        book_stall_after_ms=int(raw.get("book_stall_after_ms", 60_000)),
+        book_watchdog_batch=int(raw.get("book_watchdog_batch", 5)),
     )
 
 
@@ -3197,6 +3264,25 @@ class Collector:
         self.metrics = metrics
         self.stop_event = asyncio.Event()
         self.books: dict[tuple[str, int], BookState] = {}
+        # bot-strategy#908 watchdog state, keyed by (venue, market_id).
+        self.book_subscribe_us: dict[tuple[str, int], int] = {}
+        self.book_last_recv_us: dict[tuple[str, int], int] = {}
+        self.market_last_activity_us: dict[tuple[str, int], int] = {}
+        # First trade/market_stats message seen *after* the market's last
+        # book message: the point from which "auxiliary channels alive, book
+        # silent" is observable. Reset by every book message.
+        self.aux_since_book_us: dict[tuple[str, int], int] = {}
+        self.last_book_watchdog_us: dict[str, int] = {}
+        # Runtime enforcement of WATCHDOG_MAX_FRAMES_PER_MIN, independent of
+        # config: timestamps (us) of watchdog-sent frames per venue.
+        self.watchdog_frames_us: defaultdict[str, deque[int]] = defaultdict(deque)
+        # When each market last spent its reserved sequence-break recovery
+        # (one unsubscribe+subscribe per market per rolling minute).
+        self.break_reserve_used_us: dict[tuple[str, int], int] = {}
+        # Wall clock for send-time stamps; tests pin it to 0 so stamps fall
+        # back to the message clock they drive.
+        self._clock = now_us
+        self.market_stats_rejections: defaultdict[tuple[str, int], int] = defaultdict(int)
         self.local_sequences: defaultdict[tuple[str, str, int], int] = defaultdict(int)
         self.last_health_error: str | None = None
         self.trading_calendar = (
@@ -3314,15 +3400,38 @@ class Collector:
                             await self.handle_market_stats(venue, message, recv_us)
                         elif message_type == "ping":
                             await send_public_control(ws, {"type": "pong"})
+                            # Every outbound client message counts against the
+                            # per-IP budget, pongs included; they are budgeted
+                            # in KEEPALIVE_RESERVE_FRAMES and never withheld,
+                            # and the limiter's window sees them so subscribe
+                            # traffic backs off if a server ever pinged faster
+                            # than budgeted (bot-strategy#908).
+                            self.watchdog_frames_us[venue.name].append(
+                                self._clock_at_least(recv_us)
+                            )
                         elif message_type == "pong":
                             pass
                         else:
                             self.metrics.inc("engine_b_phase0_unhandled_message_total", {"venue": venue.name, "type": message_type or "missing"})
                             LOG.warning("Unhandled public WS message venue=%s type=%s", venue.name, message_type)
+                        await self.watchdog_books(ws, venue, connection, recv_us)
                         if self.stop_event.is_set():
                             break
             except asyncio.CancelledError:
-                reason = "task_cancelled"
+                # Attribute the cancel: a real shutdown has stop_event set;
+                # anything else is a cancel from an unexpected source and is
+                # labelled as such so the data_gap reason stays honest
+                # (bot-strategy#908 item 3).
+                if self.stop_event.is_set():
+                    reason = "task_cancelled"
+                else:
+                    reason = "task_cancelled_unexpected"
+                    LOG.warning(
+                        "feed_loop cancelled without stop_event venue=%s connection=%s",
+                        venue.name,
+                        connection["id"],
+                        exc_info=True,
+                    )
                 raise
             except Exception as exc:
                 reason = f"connection_error:{type(exc).__name__}"
@@ -3369,13 +3478,353 @@ class Collector:
                     pass
                 backoff = min(backoff * 2, 60)
 
+    @staticmethod
+    def watchdog_share(venue: VenueConfig) -> int:
+        """Frames per rolling minute available to the reconnect burst and the
+        silence-inferred watchdog; the rest (2 per market) is reserved for
+        proven sequence breaks."""
+        return WATCHDOG_MAX_FRAMES_PER_MIN - KEEPALIVE_RESERVE_FRAMES - 2 * len(venue.markets)
+
+    async def wait_for_frame_budget(self, venue: VenueConfig, frames: int) -> bool:
+        """Block until ``frames`` more (re)subscribe frames fit under the
+        watchdog share of the rolling per-minute cap, so a run of short-lived
+        connections cannot push the reconnect bursts past the exchange limit
+        (bot-strategy#908)."""
+        limit = self.watchdog_share(venue)
+        if frames > limit:
+            raise ValueError(f"{frames} frames can never fit the watchdog share of {limit}")
+        while True:
+            if self.stop_event.is_set():
+                # Shutdown while waiting: report it so the caller sends nothing
+                # more, instead of falling through as if budget were available.
+                return False
+            current_us = self._clock()
+            sent = self.watchdog_frames_us[venue.name]
+            while sent and current_us - sent[0] > 60_000_000:
+                sent.popleft()
+            room = limit - len(sent)
+            if room >= frames:
+                return True
+            # Oldest frame expires first; sleep until enough of them have
+            # (`sent` is non-empty here because frames <= limit and room < frames).
+            need = frames - room
+            expiry_us = sent[min(need, len(sent)) - 1] + 60_000_000
+            wait_s = max(0.2, min(5.0, (expiry_us - current_us) / 1_000_000))
+            LOG.warning(
+                "delaying %d subscribe frames venue=%s for %.1fs: %d frames already sent in the last minute",
+                frames,
+                venue.name,
+                wait_s,
+                len(sent),
+            )
+            self.metrics.inc("engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name})
+            await asyncio.sleep(wait_s)
+
     async def subscribe_public_channels(self, ws: Any, venue: VenueConfig) -> None:
+        sent = self.watchdog_frames_us[venue.name]
         for market in venue.markets:
+            # Chunked per market (3 frames) against the rolling budget, so any
+            # market count the exchange allows (500 subscriptions/connection)
+            # subscribes in budget-sized steps instead of one unbounded burst
+            # (bot-strategy#908).
+            if not await self.wait_for_frame_budget(venue, 3):
+                LOG.info(
+                    "shutdown during subscription budget wait venue=%s; %d market(s) left unsubscribed",
+                    venue.name,
+                    len(venue.markets) - venue.markets.index(market),
+                )
+                return
             for channel in ("order_book", "trade", "market_stats"):
                 await send_public_control(
                     ws, {"type": "subscribe", "channel": f"{channel}/{market.market_id}"}
                 )
+                # Stamp each frame as it is actually sent (a backpressured
+                # send must not make the frame look older than it is), and
+                # take the book's retry deadline from its own send. The
+                # initial subscriptions draw from the same rolling frame
+                # budget the watchdog uses, so a reconnect burst plus recovery
+                # frames together stay within the observer's share of
+                # Lighter's per-IP client-message limit.
+                sent_us = self._clock()
+                sent.append(sent_us)
+                if channel == "order_book":
+                    self.book_subscribe_us[(venue.name, market.market_id)] = sent_us
         LOG.info("Subscribed to public channels venue=%s markets=%d", venue.name, len(venue.markets))
+
+    async def resubscribe_book(
+        self,
+        ws: Any,
+        venue: VenueConfig,
+        market_id: int,
+        recv_us: int,
+        *,
+        unsubscribe_first: bool,
+        reason: str,
+        bypass_spacing: bool = False,
+    ) -> bool:
+        """Single choke point for every order_book (re)subscribe frame this
+        process sends after the initial subscription (bot-strategy#908):
+        spaced at least ``book_resubscribe_after_ms`` per market and capped
+        at ``WATCHDOG_MAX_FRAMES_PER_MIN`` frames per venue per rolling
+        minute, whichever path asks -- the watchdog or ``handle_book``'s
+        sequence-break handler (a burst of already-queued deltas against an
+        unsynced book must not turn into a burst of subscribe frames).
+        ``bypass_spacing`` is for the *first* recovery after a proven
+        sequence break on a synced book, which must go out immediately (as
+        the pre-watchdog code did); follow-up attempts keep the spacing.
+        Returns True when frames were sent."""
+        key = (venue.name, market_id)
+        last_subscribe_us = self.book_subscribe_us.get(key)
+        if (
+            not bypass_spacing
+            and last_subscribe_us is not None
+            and recv_us - last_subscribe_us < self.config.book_resubscribe_after_ms * 1_000
+        ):
+            LOG.debug(
+                "suppressing order_book re-subscribe venue=%s market_id=%s (%s): last subscribe %.1fs ago",
+                venue.name,
+                market_id,
+                reason,
+                (recv_us - last_subscribe_us) / 1_000_000,
+            )
+            return False
+        # Stamp at send time, not with the message's receive time: awaited
+        # sink/WS calls before this point can be delayed under backpressure,
+        # and a stale stamp would age out of the window (and re-arm the retry
+        # spacing) too early.
+        stamp_us = max(recv_us, self._clock())
+        sent = self.watchdog_frames_us[venue.name]
+        while sent and stamp_us - sent[0] > 60_000_000:
+            sent.popleft()
+        frames = 2 if unsubscribe_first else 1
+        fits_shared = len(sent) + frames <= self.watchdog_share(venue)
+        if not fits_shared:
+            # The shared share is spent. A proven sequence break may use this
+            # market's *own* reserved recovery (2 frames, once per rolling
+            # minute), so one noisy market cannot consume the slots meant for
+            # the others; silence-inferred retries never touch the reserve.
+            reserve_used_us = self.break_reserve_used_us.get(key)
+            reserve_free = reserve_used_us is None or stamp_us - reserve_used_us > 60_000_000
+            if not (
+                bypass_spacing
+                and reserve_free
+                and len(sent) + frames <= WATCHDOG_MAX_FRAMES_PER_MIN - KEEPALIVE_RESERVE_FRAMES
+            ):
+                self.metrics.inc(
+                    "engine_b_phase0_book_watchdog_throttled_total", {"venue": venue.name}
+                )
+                return False
+            self.break_reserve_used_us[key] = stamp_us
+        # Account each frame right after its own send: if the socket dies
+        # between the two awaited sends, the unsubscribe that did go out is
+        # still counted (and the retry deadline only moves once the subscribe
+        # actually went out).
+        if unsubscribe_first:
+            await send_public_control(ws, {"type": "unsubscribe", "channel": f"order_book/{market_id}"})
+            sent.append(self._clock_at_least(stamp_us))
+        await send_public_control(ws, {"type": "subscribe", "channel": f"order_book/{market_id}"})
+        subscribed_us = self._clock_at_least(stamp_us)
+        sent.append(subscribed_us)
+        self.book_subscribe_us[key] = subscribed_us
+        return True
+
+    def _clock_at_least(self, floor_us: int) -> int:
+        """Send-time stamp: wall clock, never earlier than the message time
+        that drove this call (tests pin the clock to 0)."""
+        return max(floor_us, self._clock())
+
+    def note_aux_activity(self, venue_name: str, market_id: int, recv_us: int) -> None:
+        key = (venue_name, market_id)
+        self.market_last_activity_us[key] = recv_us
+        self.aux_since_book_us.setdefault(key, recv_us)
+
+    def can_send_frames(self, venue: VenueConfig, recv_us: int, frames: int) -> bool:
+        """True if ``frames`` more WS frames fit under the watchdog share of
+        the rolling per-minute cap right now (no side effects)."""
+        sent = self.watchdog_frames_us[venue.name]
+        while sent and recv_us - sent[0] > 60_000_000:
+            sent.popleft()
+        return len(sent) + frames <= self.watchdog_share(venue)
+
+    async def watchdog_books(
+        self,
+        ws: Any,
+        venue: VenueConfig,
+        connection: dict[str, Any],
+        recv_us: int,
+    ) -> None:
+        """Per-market order_book liveness (bot-strategy#908 items 2 and 6).
+
+        Runs at most once per second per venue, from the message loop, so it
+        needs some other channel to still be delivering -- which is exactly
+        the failure shape it targets: the socket is alive but one market's
+        book is not. Two cases:
+
+        * a market still unsynced ``book_resubscribe_after_ms`` after its last
+          ``subscribe`` (the post-reconnect snapshot never arrived, e.g. the
+          subscribe frame was dropped under Lighter's client-message limit)
+          gets its ``order_book`` channel re-subscribed;
+        * a market that is synced but whose book has been silent for
+          ``book_stall_after_ms`` while its own trade / market_stats channels
+          kept delivering is declared stale: unsynced, an ``order_book``
+          ``data_gap`` (``reason=book_channel_stalled``) is opened, and the
+          channel is re-subscribed.
+
+        At most ``book_watchdog_batch`` subscribe frames per call, to stay
+        well inside the per-IP client-message budget.
+        """
+        last = self.last_book_watchdog_us.get(venue.name, 0)
+        if recv_us - last < 1_000_000:
+            return
+        self.last_book_watchdog_us[venue.name] = recv_us
+        budget = self.config.book_watchdog_batch
+        resubscribe_after_us = self.config.book_resubscribe_after_ms * 1_000
+        stall_after_us = self.config.book_stall_after_ms * 1_000
+        # Oldest subscribe deadline first, so a batch smaller than the number
+        # of unsynced markets rotates through all of them instead of retrying
+        # the first `book_watchdog_batch` in config order forever (a
+        # re-subscribed market gets the newest timestamp and moves to the
+        # back of the line).
+        ordered_markets = sorted(
+            venue.markets,
+            key=lambda m: self.book_subscribe_us.get((venue.name, m.market_id), 0),
+        )
+        for market in ordered_markets:
+            if budget <= 0:
+                return
+            key = (venue.name, market.market_id)
+            state = self.books.setdefault(key, BookState())
+            subscribed_us = self.book_subscribe_us.get(key)
+            if subscribed_us is None:
+                continue
+            if not state.synced:
+                if recv_us - subscribed_us < resubscribe_after_us:
+                    continue
+                LOG.warning(
+                    "order_book still unsynced %.0fs after subscribe venue=%s symbol=%s; re-subscribing",
+                    (recv_us - subscribed_us) / 1_000_000,
+                    venue.name,
+                    market.symbol,
+                )
+                if await self.resubscribe_book(
+                    ws, venue, market.market_id, recv_us, unsubscribe_first=False, reason="unsynced"
+                ):
+                    self.metrics.inc(
+                        "engine_b_phase0_book_resubscribe_total",
+                        {"venue": venue.name, "symbol": market.symbol, "reason": "unsynced"},
+                    )
+                    budget -= 1
+                else:
+                    return  # per-minute cap reached; nothing more this pass
+                continue
+            last_book_us = self.book_last_recv_us.get(key)
+            last_activity_us = self.market_last_activity_us.get(key)
+            aux_since_us = self.aux_since_book_us.get(key)
+            # "Stalled" needs the market's *own* other channels to have been
+            # alive for the whole stall window -- from the first auxiliary
+            # message after the last book message (`aux_since_us`) until now
+            # -- not merely once: a market that was quiet on every channel and
+            # just woke up is quiet, not stalled, and its silence is not a
+            # book outage.
+            if (
+                last_book_us is None
+                or last_activity_us is None
+                or aux_since_us is None
+                or last_activity_us <= last_book_us
+                or recv_us - last_activity_us > stall_after_us // 2
+                or recv_us - aux_since_us < stall_after_us
+                # Never invalidate a book we could not re-subscribe right now
+                # (per-market spacing, or the per-minute frame cap); a stall is
+                # inferred from silence, so collector-imposed downtime without
+                # a recovery frame is worse than waiting one more pass.
+                or recv_us - subscribed_us < resubscribe_after_us
+                or not self.can_send_frames(venue, recv_us, 2)
+            ):
+                continue
+            # The gap row is written to the partition that detects it, so an
+            # hour that may already be sealed never receives a new non-trade
+            # row (`_write_batch` raises on that). The part of the stall that
+            # lies in earlier hours is not dropped: it is recorded, hour by
+            # hour, as `sealed_gap_interval` rows in the detecting partition
+            # -- the same representation the gap-continuation machinery uses
+            # for intervals whose home partition is unavailable.
+            # The evidence-backed outage starts where auxiliary traffic was
+            # observably flowing while the book was not, i.e. at
+            # `aux_since_us`, not at the last book message (the interval
+            # between the two could be an all-quiet market).
+            partition_floor_us = partition_start_us(partition_for_us(recv_us))
+            gap_start_us = max(aux_since_us, partition_floor_us)
+            sealed_intervals: list[dict[str, Any]] = []
+            cursor_us = aux_since_us
+            while cursor_us < partition_floor_us:
+                hour_partition = partition_for_us(cursor_us)
+                hour_end_us = partition_start_us(hour_partition) + 3_600_000_000
+                interval_end_us = min(hour_end_us, partition_floor_us)
+                interval_id = "stalled-book:" + hashlib.sha256(
+                    f"{venue.name}:{market.market_id}:{cursor_us}:{interval_end_us}".encode("utf-8")
+                ).hexdigest()
+                sealed_intervals.append(
+                    {
+                        "interval_id": interval_id,
+                        "sealed_partition": hour_partition,
+                        "start_us": cursor_us,
+                        "end_us": interval_end_us,
+                    }
+                )
+                cursor_us = interval_end_us
+            LOG.warning(
+                "order_book channel stalled venue=%s symbol=%s: no book message since %d "
+                "while trade/market_stats kept arriving for %.0fs (since %d); marking unsynced and "
+                "re-subscribing%s",
+                venue.name,
+                market.symbol,
+                last_book_us,
+                (recv_us - aux_since_us) / 1_000_000,
+                aux_since_us,
+                ""
+                if gap_start_us == aux_since_us
+                else f" (gap row starts at partition {gap_start_us}; earlier portion recorded as {len(sealed_intervals)} sealed interval(s))",
+            )
+            last_accepted_nonce = state.last_nonce
+            state.synced = False
+            state.last_nonce = None
+            state.bids.clear()
+            state.asks.clear()
+            self.metrics.book_synced[key] = False
+            # Counts detections; the re-subscribe counter below counts only
+            # frames actually sent.
+            self.metrics.inc(
+                "engine_b_phase0_book_stall_total",
+                {"venue": venue.name, "symbol": market.symbol},
+            )
+            await self.sink.put(
+                "gap",
+                {
+                    "recv_us": recv_us,
+                    "start_us": gap_start_us,
+                    "partition_us": recv_us,
+                    "connection_id": connection["id"],
+                    "venue": venue.name,
+                    "market_id": market.market_id,
+                    "symbol": market.symbol,
+                    "channel": "order_book",
+                    "expected_sequence": last_accepted_nonce,
+                    "observed_sequence": None,
+                    "reason": "book_channel_stalled",
+                    "sealed_intervals": sealed_intervals,
+                },
+            )
+            # The market was synced, so its last subscribe is old: the
+            # spacing check passes; only the per-minute cap can refuse.
+            if not await self.resubscribe_book(
+                ws, venue, market.market_id, recv_us, unsubscribe_first=True, reason="stalled"
+            ):
+                return
+            self.metrics.inc(
+                "engine_b_phase0_book_resubscribe_total",
+                {"venue": venue.name, "symbol": market.symbol, "reason": "stalled"},
+            )
+            budget -= 1
 
     async def handle_book(
         self,
@@ -3392,6 +3841,8 @@ class Collector:
         payload = message.get("order_book", {})
         levels = BookState.raw_levels(payload)
         state = self.books.setdefault((venue.name, market_id), BookState())
+        self.book_last_recv_us[(venue.name, market_id)] = recv_us
+        self.aux_since_book_us.pop((venue.name, market_id), None)
         message_type = message["type"]
         local_sequence = self.next_sequence(venue.name, "order_book", market_id)
         srv_us = normalize_exchange_timestamp_us(
@@ -3417,6 +3868,7 @@ class Collector:
                 "levels": levels,
             },
         )
+        was_synced = state.synced
         if event_kind == "snapshot":
             applied = state.apply_snapshot(payload)
             expected = None
@@ -3449,8 +3901,23 @@ class Collector:
                     "reason": reason,
                 },
             )
-            await send_public_control(ws, {"type": "unsubscribe", "channel": f"order_book/{market_id}"})
-            await send_public_control(ws, {"type": "subscribe", "channel": f"order_book/{market_id}"})
+            # Through the shared limiter: a queue of stale deltas against an
+            # unsynced book must not become a burst of subscribe frames
+            # (bot-strategy#908); the watchdog retries if this one is
+            # suppressed.
+            await self.resubscribe_book(
+                ws,
+                venue,
+                market_id,
+                recv_us,
+                unsubscribe_first=True,
+                reason=reason,
+                # A break on a book that was synced a moment ago is a proven
+                # sequence error: recover immediately. Deltas that keep
+                # failing against an already-unsynced book are the burst the
+                # spacing exists for.
+                bypass_spacing=was_synced,
+            )
             self.metrics.book_synced[(venue.name, market_id)] = False
             return
         self.metrics.book_synced[(venue.name, market_id)] = state.synced
@@ -3496,6 +3963,7 @@ class Collector:
         market = venue.market_by_id.get(market_id)
         if market is None:
             return
+        self.note_aux_activity(venue.name, market_id, recv_us)
         exchange_sequence = str(message["nonce"]) if message.get("nonce") is not None else None
         message_type = str(message.get("type", "update/trade"))
         trades = [*message.get("trades", []), *message.get("liquidation_trades", [])]
@@ -3608,6 +4076,7 @@ class Collector:
         market = venue.market_by_id.get(market_id)
         if market is None:
             return
+        self.note_aux_activity(venue.name, market_id, recv_us)
         stats = message.get("market_stats", {})
         srv_us = normalize_exchange_timestamp_us(message.get("timestamp"))
         prices: list[tuple[str, str]] = []
@@ -3621,7 +4090,47 @@ class Collector:
             if value not in (None, ""):
                 price = canonical_decimal(value)
                 if Decimal(price) <= 0:
-                    raise RuntimeError("non-positive market-stat price")
+                    # Fail closed on the *message*, not on the connection:
+                    # raising here used to tear down the whole venue feed
+                    # (all markets) over one illiquid market's zero stat and
+                    # loop through reconnects until the stat turned positive
+                    # (bot-strategy#908 item 1). Record the rejection as a
+                    # point gap on the market_stats channel and skip the
+                    # message entirely (prices and funding alike).
+                    key = (venue.name, market_id)
+                    self.market_stats_rejections[key] += 1
+                    count = self.market_stats_rejections[key]
+                    if count == 1 or count % 100 == 0:
+                        LOG.warning(
+                            "rejecting market_stats with non-positive %s venue=%s symbol=%s "
+                            "(rejections so far: %d)",
+                            field_name,
+                            venue.name,
+                            market.symbol,
+                            count,
+                        )
+                    self.metrics.inc(
+                        "engine_b_phase0_market_stats_rejected_total",
+                        {"venue": venue.name, "symbol": market.symbol, "field": field_name},
+                    )
+                    await self.sink.put(
+                        "gap",
+                        {
+                            "recv_us": recv_us,
+                            "start_us": recv_us,
+                            "end_us": recv_us,
+                            "partition_us": recv_us,
+                            "connection_id": None,
+                            "venue": venue.name,
+                            "market_id": market_id,
+                            "symbol": market.symbol,
+                            "channel": "market_stats",
+                            "expected_sequence": None,
+                            "observed_sequence": None,
+                            "reason": f"non_positive_{field_name}",
+                        },
+                    )
+                    return
                 prices.append((price_type, price))
         for price_type, price in prices:
             await self.sink.put(
