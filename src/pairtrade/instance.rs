@@ -14,7 +14,7 @@ use dex_connector::DexConnector;
 use super::config::PairParams;
 use super::pnl_log::PnlLogger;
 use super::risk_io;
-use super::state::PairState;
+use super::state::{PairState, Position};
 use super::status::StatusReporter;
 
 /// Fill-cache baseline captured immediately before an out-of-band flatten
@@ -35,6 +35,12 @@ pub(in crate::pairtrade) struct ExternalFlattenFills {
     /// flatten was submitted. Their fills close the same position, so they
     /// are attributable even when they already sat in the baseline.
     pub(in crate::pairtrade) attributable_order_ids: HashSet<String>,
+    /// The positions (per pair key) as they were when the flatten was
+    /// submitted. The per-tick exchange-snapshot sync rewrites the local
+    /// position's sizes from the venue, so an intermediate partially-closed
+    /// snapshot would otherwise shrink the "held" quantities the booking
+    /// prices the flatten against.
+    pub(in crate::pairtrade) positions: HashMap<String, Position>,
     /// Wall-clock submit time; bounds how long the snapshot clear waits for
     /// the flatten fills to land before falling back to `recovery_no_pnl`.
     pub(in crate::pairtrade) submitted_at: Instant,

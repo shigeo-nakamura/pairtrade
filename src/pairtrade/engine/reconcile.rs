@@ -879,11 +879,23 @@ impl PairTradeEngine {
         } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
             let max_retries = self.cfg.entry_partial_fill_max_retries;
             let giveup_retries = self.cfg.entry_partial_fill_giveup_retries;
-            let decision = Self::decide_partial_fill_reissue(
+            let mut decision = Self::decide_partial_fill_reissue(
                 pending.hedge_retry_count,
                 max_retries,
                 giveup_retries,
             );
+            // bot-strategy#932 (Codex review, pairtrade#282): a session-halted
+            // instance must never complete a partial entry with fresh opening
+            // orders — a pending entry retained because its halt-time cancel
+            // failed or went unconfirmed takes the give-up path instead
+            // (cancel the rest, flatten the filled legs).
+            if self.instances[inst_idx].session_halted && !decision.give_up {
+                log::warn!(
+                    "[ORDER][GIVEUP] {} partial entry on a session-halted instance; flattening instead of reissuing",
+                    key
+                );
+                decision.give_up = true;
+            }
             let next_retry = decision.next_retry;
             // bot-strategy#480: hard cap on the reissue loop. Once
             // `hedge_retry_count` crosses this, give up entirely —

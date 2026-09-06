@@ -4725,3 +4725,113 @@ async fn halted_instance_does_not_reflatten_when_flat_or_exit_pending() {
     assert!(engine.evaluate_session_dd(0).await);
     assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 0);
 }
+
+/// Codex P1 (pairtrade#282): the booking must price the flatten against the
+/// position as it stood at the flatten, not a residual the per-tick snapshot
+/// sync wrote from an intermediate partially-closed venue state.
+#[tokio::test]
+async fn flatten_booking_uses_position_snapshot_taken_at_arm() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    // Simulate the sync having rewritten the local sizes from a half-closed
+    // intermediate snapshot.
+    {
+        let pos = engine.instances[0]
+            .states
+            .get_mut("AAA/BBB")
+            .unwrap()
+            .position
+            .as_mut()
+            .unwrap();
+        pos.entry_size_a = Some(dec("0.004"));
+        pos.entry_size_b = Some(dec("0.008"));
+    }
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!(
+        (pnl + 0.05).abs() < 1e-9,
+        "full-size economics expected, got pnl={pnl}"
+    );
+}
+
+/// Codex P1 (pairtrade#282): a partially filled entry on a session-halted
+/// instance must not be completed with fresh opening orders — the reconcile
+/// takes the give-up path (cancel the rest, flatten filled legs).
+#[tokio::test]
+async fn halted_instance_partial_entry_gives_up_instead_of_reissuing() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].session_halted = true;
+    let mut state = positionless_pending_entry_state();
+    state.pending_entry.as_mut().unwrap().placed_at = Instant::now();
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    // One leg partially filled, nothing open on the venue.
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from([vec![("en-1".to_string(), dec("0.004"))]]),
+    );
+    let mut price_map = HashMap::new();
+    for (sym, px) in [("AAA", "100"), ("BBB", "50")] {
+        price_map.insert(
+            sym.to_string(),
+            SymbolSnapshot {
+                price: dec(px),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        );
+    }
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(
+        connector.calls.lock().unwrap().is_empty(),
+        "no opening order may be (re)issued while halted"
+    );
+    assert!(
+        connector.modify_calls.lock().unwrap().is_empty(),
+        "no amend either"
+    );
+    assert!(engine.instances[0]
+        .states
+        .get("AAA/BBB")
+        .unwrap()
+        .pending_entry
+        .is_none());
+    assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
+}

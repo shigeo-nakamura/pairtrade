@@ -823,10 +823,16 @@ impl PairTradeEngine {
         now_ts: i64,
     ) {
         let inst = &mut self.instances[inst_idx];
+        let positions: HashMap<String, Position> = inst
+            .states
+            .iter()
+            .filter_map(|(key, state)| state.position.clone().map(|p| (key.clone(), p)))
+            .collect();
         inst.external_flatten_reason = Some(reason);
         inst.external_flatten_fills = Some(ExternalFlattenFills {
             baseline,
             attributable_order_ids,
+            positions,
             submitted_at: Instant::now(),
             submitted_ts: now_ts,
         });
@@ -1082,11 +1088,15 @@ impl PairTradeEngine {
         let Some((base, quote)) = key.split_once('/') else {
             return FlattenBooking::Unavailable;
         };
-        let Some(pos) = self.instances[inst_idx]
-            .states
-            .get(key)
-            .and_then(|s| s.position.clone())
-        else {
+        // Price the flatten against the position as it stood when the
+        // flatten was submitted, not the residual the per-tick snapshot
+        // sync may have written since (Codex review, pairtrade#282).
+        let Some(pos) = flatten.positions.get(key).cloned().or_else(|| {
+            self.instances[inst_idx]
+                .states
+                .get(key)
+                .and_then(|s| s.position.clone())
+        }) else {
             return FlattenBooking::Unavailable;
         };
         let (Some(size_a), Some(size_b)) = (pos.entry_size_a, pos.entry_size_b) else {
