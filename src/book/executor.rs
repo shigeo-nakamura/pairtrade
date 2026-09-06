@@ -1,0 +1,513 @@
+//! Venue access behind one trait so DRY_RUN, live and replay share every
+//! other code path (`docs/book-runtime.md` §6).
+//!
+//! - [`PaperExecutor`]: in-memory positions, fills at `mid * (1 ± slippage)`,
+//!   prices pushed in by the caller (WS feed or replay bars).
+//! - [`LiveExecutor`]: `DexConnector`-backed. Orders go out as
+//!   `create_order(price=None)` (venue-native market/IOC with protection
+//!   price); the fill is what the venue position says it is, never the
+//!   HTTP acknowledgement (bot-strategy#875 G-2).
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use dex_connector::{DexConnector, OrderSide, PositionSnapshot};
+use rust_decimal::prelude::ToPrimitive;
+
+use rust_decimal::Decimal;
+use serde::Serialize;
+use tokio::sync::{Mutex, RwLock};
+
+use super::rebalance::{LotMeta, OrderIntent, Side};
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Default)]
+pub struct VenuePosition {
+    /// Signed base quantity.
+    pub qty: f64,
+    pub entry_price: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FillReport {
+    pub requested_qty: f64,
+    /// Absolute filled quantity as confirmed by the venue position (paper:
+    /// always the request).
+    pub filled_qty: f64,
+    pub fill_price: f64,
+    /// `paper` | `venue_fills` | `mid_estimate`
+    pub fill_price_source: &'static str,
+    pub fee_usd: f64,
+    pub order_id: Option<String>,
+    pub venue_error: Option<String>,
+    pub latency_ms: i64,
+    /// Venue position after the order (signed), when readable.
+    pub position_after: Option<f64>,
+}
+
+#[async_trait]
+pub trait Executor: Send + Sync {
+    fn is_paper(&self) -> bool;
+    /// Latest mid per symbol; symbols without a price are absent.
+    async fn prices(&self, symbols: &[String]) -> HashMap<String, f64>;
+    async fn lot_meta(&self, symbol: &str) -> Result<LotMeta>;
+    async fn positions(&self) -> Result<BTreeMap<String, VenuePosition>>;
+    /// Venue equity in USD; `None` for paper (the engine derives it).
+    async fn equity(&self) -> Result<Option<f64>>;
+    /// Current funding rate per hour (fraction of notional, positive =
+    /// longs pay), when the venue reports one.
+    async fn funding_rate_hourly(&self, symbol: &str) -> Option<f64>;
+    async fn execute(&self, intent: &OrderIntent) -> Result<FillReport>;
+}
+
+// ---------------------------------------------------------------- paper
+
+pub struct PaperExecutor {
+    prices: RwLock<HashMap<String, f64>>,
+    lots: RwLock<HashMap<String, LotMeta>>,
+    funding: RwLock<HashMap<String, f64>>,
+    positions: Mutex<BTreeMap<String, VenuePosition>>,
+    slippage_bps: f64,
+    fee_bps: f64,
+}
+
+impl PaperExecutor {
+    pub fn new(slippage_bps: f64, fee_bps: f64) -> Self {
+        Self {
+            prices: RwLock::new(HashMap::new()),
+            lots: RwLock::new(HashMap::new()),
+            funding: RwLock::new(HashMap::new()),
+            positions: Mutex::new(BTreeMap::new()),
+            slippage_bps,
+            fee_bps,
+        }
+    }
+
+    pub async fn set_price(&self, symbol: &str, mid: f64) {
+        if mid.is_finite() && mid > 0.0 {
+            self.prices.write().await.insert(symbol.to_string(), mid);
+        }
+    }
+
+    pub async fn set_lot(&self, symbol: &str, lot: LotMeta) {
+        self.lots.write().await.insert(symbol.to_string(), lot);
+    }
+
+    pub async fn set_funding_rate_hourly(&self, symbol: &str, rate: f64) {
+        self.funding.write().await.insert(symbol.to_string(), rate);
+    }
+
+    /// Seed the paper book (restart: from `state.json`).
+    pub async fn seed_positions(&self, positions: BTreeMap<String, VenuePosition>) {
+        *self.positions.lock().await = positions;
+    }
+}
+
+#[async_trait]
+impl Executor for PaperExecutor {
+    fn is_paper(&self) -> bool {
+        true
+    }
+
+    async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
+        let p = self.prices.read().await;
+        symbols
+            .iter()
+            .filter_map(|s| p.get(s).map(|v| (s.clone(), *v)))
+            .collect()
+    }
+
+    async fn lot_meta(&self, symbol: &str) -> Result<LotMeta> {
+        self.lots
+            .read()
+            .await
+            .get(symbol)
+            .copied()
+            .ok_or_else(|| anyhow!("no lot metadata for {symbol}"))
+    }
+
+    async fn positions(&self) -> Result<BTreeMap<String, VenuePosition>> {
+        Ok(self.positions.lock().await.clone())
+    }
+
+    async fn equity(&self) -> Result<Option<f64>> {
+        Ok(None)
+    }
+
+    async fn funding_rate_hourly(&self, symbol: &str) -> Option<f64> {
+        self.funding.read().await.get(symbol).copied()
+    }
+
+    async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
+        let started = Instant::now();
+        let mid = self
+            .prices
+            .read()
+            .await
+            .get(&intent.symbol)
+            .copied()
+            .ok_or_else(|| anyhow!("paper: no price for {}", intent.symbol))?;
+        let slip = self.slippage_bps / 10_000.0;
+        let price = match intent.side {
+            Side::Buy => mid * (1.0 + slip),
+            Side::Sell => mid * (1.0 - slip),
+        };
+        let signed = match intent.side {
+            Side::Buy => intent.qty,
+            Side::Sell => -intent.qty,
+        };
+        let mut book = self.positions.lock().await;
+        let entry = book.entry(intent.symbol.clone()).or_default();
+        let mut filled = intent.qty;
+        if intent.reduce_only {
+            // A reduce-only IOC never crosses zero at the venue either.
+            let reducible = entry.qty.abs();
+            if reducible == 0.0 || (entry.qty > 0.0) != (signed < 0.0) {
+                filled = 0.0;
+            } else {
+                filled = filled.min(reducible);
+            }
+        }
+        let signed_filled = if signed > 0.0 { filled } else { -filled };
+        entry.qty += signed_filled;
+        if entry.qty.abs() < 1e-12 {
+            entry.qty = 0.0;
+        }
+        if entry.qty == 0.0 {
+            book.remove(&intent.symbol);
+        } else if entry.entry_price.is_none() || (entry.qty - signed_filled).abs() < 1e-12 {
+            entry.entry_price = Some(price);
+        }
+        let position_after = book.get(&intent.symbol).map(|p| p.qty).or(Some(0.0));
+        Ok(FillReport {
+            requested_qty: intent.qty,
+            filled_qty: filled,
+            fill_price: price,
+            fill_price_source: "paper",
+            fee_usd: filled * price * self.fee_bps / 10_000.0,
+            order_id: None,
+            venue_error: None,
+            latency_ms: started.elapsed().as_millis() as i64,
+            position_after,
+        })
+    }
+}
+
+// ----------------------------------------------------------------- live
+
+pub struct LiveExecutor {
+    connector: Arc<dyn DexConnector + Send + Sync>,
+    prices: RwLock<HashMap<String, f64>>,
+    fill_confirm_timeout_secs: i64,
+}
+
+impl LiveExecutor {
+    pub fn new(
+        connector: Arc<dyn DexConnector + Send + Sync>,
+        fill_confirm_timeout_secs: i64,
+    ) -> Self {
+        Self {
+            connector,
+            prices: RwLock::new(HashMap::new()),
+            fill_confirm_timeout_secs,
+        }
+    }
+
+    pub async fn set_price(&self, symbol: &str, mid: f64) {
+        if mid.is_finite() && mid > 0.0 {
+            self.prices.write().await.insert(symbol.to_string(), mid);
+        }
+    }
+
+    async fn venue_position(&self, symbol: &str) -> Result<Option<VenuePosition>> {
+        let snaps = self
+            .connector
+            .get_positions()
+            .await
+            .map_err(|e| anyhow!("get_positions: {e:?}"))?;
+        Ok(position_from_snapshots(&snaps, symbol))
+    }
+}
+
+pub fn position_from_snapshots(snaps: &[PositionSnapshot], symbol: &str) -> Option<VenuePosition> {
+    let s = snaps.iter().find(|p| p.symbol == symbol)?;
+    let size = s.size.abs().to_f64().unwrap_or(0.0);
+    if size == 0.0 || s.sign == 0 {
+        return None;
+    }
+    let qty = if s.sign < 0 { -size } else { size };
+    Some(VenuePosition {
+        qty,
+        entry_price: s.entry_price.and_then(|p| p.to_f64()).filter(|p| *p > 0.0),
+    })
+}
+
+fn decimal(v: f64) -> Result<Decimal> {
+    Decimal::from_f64_retain(v).ok_or_else(|| anyhow!("{v} is not representable as Decimal"))
+}
+
+#[async_trait]
+impl Executor for LiveExecutor {
+    fn is_paper(&self) -> bool {
+        false
+    }
+
+    async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
+        let p = self.prices.read().await;
+        symbols
+            .iter()
+            .filter_map(|s| p.get(s).map(|v| (s.clone(), *v)))
+            .collect()
+    }
+
+    async fn lot_meta(&self, symbol: &str) -> Result<LotMeta> {
+        let t = self
+            .connector
+            .get_ticker(symbol, None)
+            .await
+            .map_err(|e| anyhow!("get_ticker {symbol}: {e:?}"))?;
+        let size_decimals = t
+            .size_decimals
+            .with_context(|| format!("venue reports no size_decimals for {symbol}"))?;
+        Ok(LotMeta {
+            size_decimals,
+            min_order_qty: t.min_order.and_then(|m| m.to_f64()).filter(|m| *m > 0.0),
+        })
+    }
+
+    async fn positions(&self) -> Result<BTreeMap<String, VenuePosition>> {
+        let snaps = self
+            .connector
+            .get_positions()
+            .await
+            .map_err(|e| anyhow!("get_positions: {e:?}"))?;
+        let mut out = BTreeMap::new();
+        for s in &snaps {
+            if let Some(p) = position_from_snapshots(&snaps, &s.symbol) {
+                out.insert(s.symbol.clone(), p);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn equity(&self) -> Result<Option<f64>> {
+        let b = self
+            .connector
+            .get_balance(None)
+            .await
+            .map_err(|e| anyhow!("get_balance: {e:?}"))?;
+        Ok(b.equity.to_f64())
+    }
+
+    async fn funding_rate_hourly(&self, symbol: &str) -> Option<f64> {
+        self.connector
+            .get_ticker(symbol, None)
+            .await
+            .ok()
+            .and_then(|t| t.funding_rate)
+            .and_then(|r| r.to_f64())
+    }
+
+    async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
+        let started = Instant::now();
+        let before = self
+            .venue_position(&intent.symbol)
+            .await?
+            .map(|p| p.qty)
+            .unwrap_or(0.0);
+        let side = match intent.side {
+            Side::Buy => OrderSide::Long,
+            Side::Sell => OrderSide::Short,
+        };
+        let size = decimal(intent.qty)?;
+        let sent = self
+            .connector
+            .create_order(
+                &intent.symbol,
+                size,
+                side,
+                None,
+                None,
+                intent.reduce_only,
+                None,
+            )
+            .await;
+        let (order_id, venue_error) = match sent {
+            Ok(r) => (Some(r.order_id), None),
+            Err(e) => (None, Some(format!("{e:?}"))),
+        };
+        // Confirm against the venue position regardless of the ack: a send
+        // error can still have executed (REST/WS limits are coupled).
+        let expected_delta = match intent.side {
+            Side::Buy => intent.qty,
+            Side::Sell => -intent.qty,
+        };
+        let deadline = Instant::now()
+            + std::time::Duration::from_secs(self.fill_confirm_timeout_secs.max(1) as u64);
+        let mut after = before;
+        let mut last_read_ok;
+        loop {
+            match self.venue_position(&intent.symbol).await {
+                Ok(p) => {
+                    last_read_ok = true;
+                    after = p.map(|p| p.qty).unwrap_or(0.0);
+                    let delta = after - before;
+                    if (delta - expected_delta).abs() <= intent.qty * 1e-6
+                        || (expected_delta > 0.0 && delta >= expected_delta)
+                        || (expected_delta < 0.0 && delta <= expected_delta)
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last_read_ok = false;
+                    log::warn!(
+                        "[EXEC] position read failed while confirming {}: {e}",
+                        intent.symbol
+                    );
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+        if !last_read_ok {
+            return Err(anyhow!(
+                "fill confirmation for {} unreadable after {}s (order_id={:?}, send_error={:?})",
+                intent.symbol,
+                self.fill_confirm_timeout_secs,
+                order_id,
+                venue_error
+            ));
+        }
+        let delta = after - before;
+        let same_dir = (delta > 0.0) == (expected_delta > 0.0);
+        let filled = if same_dir {
+            delta.abs().min(intent.qty)
+        } else {
+            0.0
+        };
+        if same_dir && delta.abs() > intent.qty * (1.0 + 1e-6) {
+            log::warn!(
+                "[EXEC] {} filled more than requested: delta={} requested={}",
+                intent.symbol,
+                delta,
+                intent.qty
+            );
+        }
+        // Fill price: venue fill records when they can be matched, else mid.
+        let mut fill_price = intent.reference_price;
+        let mut source = "mid_estimate";
+        let mut fee_usd = 0.0;
+        if let Some(oid) = order_id.as_deref() {
+            if let Ok(f) = self.connector.get_filled_orders(&intent.symbol).await {
+                let mut value = 0.0;
+                let mut size = 0.0;
+                for o in f
+                    .orders
+                    .iter()
+                    .filter(|o| o.order_id == oid && !o.is_rejected)
+                {
+                    let s = o.filled_size.and_then(|d| d.to_f64()).unwrap_or(0.0);
+                    let v = o.filled_value.and_then(|d| d.to_f64()).unwrap_or(0.0);
+                    fee_usd += o.filled_fee.and_then(|d| d.to_f64()).unwrap_or(0.0);
+                    if s > 0.0 && v > 0.0 {
+                        size += s;
+                        value += v;
+                    }
+                }
+                if size > 0.0 {
+                    fill_price = value / size;
+                    source = "venue_fills";
+                }
+            }
+        }
+        Ok(FillReport {
+            requested_qty: intent.qty,
+            filled_qty: filled,
+            fill_price,
+            fill_price_source: source,
+            fee_usd,
+            order_id,
+            venue_error,
+            latency_ms: started.elapsed().as_millis() as i64,
+            position_after: Some(after),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::book::rebalance::IntentKind;
+
+    fn intent(symbol: &str, side: Side, qty: f64, reduce_only: bool) -> OrderIntent {
+        OrderIntent {
+            symbol: symbol.into(),
+            side,
+            qty,
+            reference_price: 100.0,
+            notional_usd: qty * 100.0,
+            reduce_only,
+            kind: IntentKind::Open,
+        }
+    }
+
+    #[tokio::test]
+    async fn paper_fills_with_slippage_and_reduce_only_never_crosses_zero() {
+        let ex = PaperExecutor::new(10.0, 2.0);
+        ex.set_price("SOL", 100.0).await;
+        let f = ex
+            .execute(&intent("SOL", Side::Buy, 2.0, false))
+            .await
+            .unwrap();
+        assert_eq!(f.filled_qty, 2.0);
+        assert!((f.fill_price - 100.1).abs() < 1e-9);
+        assert!((f.fee_usd - 2.0 * 100.1 * 0.0002).abs() < 1e-9);
+        assert_eq!(f.position_after, Some(2.0));
+        // reduce-only sell of 5 on a 2 long fills 2
+        let f = ex
+            .execute(&intent("SOL", Side::Sell, 5.0, true))
+            .await
+            .unwrap();
+        assert_eq!(f.filled_qty, 2.0);
+        assert!((f.fill_price - 99.9).abs() < 1e-9);
+        assert_eq!(f.position_after, Some(0.0));
+        assert!(ex.positions().await.unwrap().is_empty());
+        // reduce-only on flat fills nothing
+        let f = ex
+            .execute(&intent("SOL", Side::Sell, 1.0, true))
+            .await
+            .unwrap();
+        assert_eq!(f.filled_qty, 0.0);
+        // no price → error
+        assert!(ex
+            .execute(&intent("DOT", Side::Buy, 1.0, false))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn position_from_snapshots_uses_sign_not_size_sign() {
+        let snaps = vec![PositionSnapshot {
+            symbol: "SNDK".into(),
+            size: Decimal::new(15, 1),
+            sign: -1,
+            entry_price: Some(Decimal::new(1000, 1)),
+        }];
+        let p = position_from_snapshots(&snaps, "SNDK").unwrap();
+        assert_eq!(p.qty, -1.5);
+        assert_eq!(p.entry_price, Some(100.0));
+        assert!(position_from_snapshots(&snaps, "MU").is_none());
+        let flat = vec![PositionSnapshot {
+            symbol: "SNDK".into(),
+            size: Decimal::ZERO,
+            sign: 0,
+            entry_price: None,
+        }];
+        assert!(position_from_snapshots(&flat, "SNDK").is_none());
+    }
+}

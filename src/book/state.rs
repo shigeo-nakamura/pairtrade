@@ -1,0 +1,340 @@
+//! Persistent runtime state (`state.json`), see `docs/book-runtime.md` §8.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+use crate::directional::{load_json, persist_json};
+
+pub const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Position {
+    /// Signed base quantity (long positive).
+    pub qty: f64,
+    /// Volume-weighted average entry price of the current leg.
+    pub avg_price: f64,
+    /// Unix seconds the leg was opened (reset when it flips or is closed).
+    pub opened_at: i64,
+    /// Last funding accrual timestamp (unix seconds).
+    #[serde(default)]
+    pub funding_accrued_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionOutcome {
+    /// Every intent filled (or nothing to do).
+    Applied,
+    /// Plan executed but a residual is still pending.
+    Partial,
+    /// Signal or plan rejected; book untouched.
+    Rejected,
+    /// Window closed without a valid signal; book untouched.
+    Skipped,
+    /// Halted by risk; book flattened.
+    Halted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionRecord {
+    pub key: String,
+    pub outcome: DecisionOutcome,
+    /// Unix seconds of the last update to this record.
+    pub at: i64,
+    #[serde(default)]
+    pub signal_sha256: Option<String>,
+    #[serde(default)]
+    pub reject_reason: Option<String>,
+    /// Rebalance attempts spent on this key (plan → execute rounds).
+    #[serde(default)]
+    pub attempts: u32,
+    /// Fixed-window flatten completed for this key.
+    #[serde(default)]
+    pub flatten_done: bool,
+    /// Signed target quantity per symbol the last plan aimed at; used to
+    /// re-plan a residual after a partial fill or a restart.
+    #[serde(default)]
+    pub target_qty: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SessionRisk {
+    pub start_equity: f64,
+    pub start_at: i64,
+    pub halted: bool,
+    #[serde(default)]
+    pub halt_reason: Option<String>,
+    #[serde(default)]
+    pub halted_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DailyRisk {
+    /// `YYYY-MM-DD` UTC.
+    pub date: String,
+    pub start_equity: f64,
+    pub halted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BookState {
+    pub schema_version: u32,
+    pub instance_id: String,
+    #[serde(default)]
+    pub positions: BTreeMap<String, Position>,
+    #[serde(default)]
+    pub last_decision: Option<DecisionRecord>,
+    #[serde(default)]
+    pub session: SessionRisk,
+    #[serde(default)]
+    pub daily: DailyRisk,
+    #[serde(default)]
+    pub peak_equity: f64,
+    #[serde(default)]
+    pub cum_realized_usd: f64,
+    #[serde(default)]
+    pub cum_fees_usd: f64,
+    #[serde(default)]
+    pub cum_funding_est_usd: f64,
+    #[serde(default)]
+    pub last_mark_date: Option<String>,
+    /// Last equity observation (unix secs, usd).
+    #[serde(default)]
+    pub last_equity: Option<(i64, f64)>,
+    #[serde(default)]
+    pub trades_closed: u64,
+    #[serde(default)]
+    pub trades_won: u64,
+    #[serde(default)]
+    pub max_drawdown_usd: f64,
+}
+
+impl BookState {
+    pub fn new(instance_id: &str) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            instance_id: instance_id.to_string(),
+            positions: BTreeMap::new(),
+            last_decision: None,
+            session: SessionRisk::default(),
+            daily: DailyRisk::default(),
+            peak_equity: 0.0,
+            cum_realized_usd: 0.0,
+            cum_fees_usd: 0.0,
+            cum_funding_est_usd: 0.0,
+            last_mark_date: None,
+            last_equity: None,
+            trades_closed: 0,
+            trades_won: 0,
+            max_drawdown_usd: 0.0,
+        }
+    }
+
+    /// Load from disk. Missing file → fresh state; corrupt file → error (a
+    /// silently reset book would double-open positions).
+    pub fn load_or_new(path: &Path, instance_id: &str) -> Result<Self> {
+        match load_json::<BookState>(path)? {
+            Some(s) => {
+                if s.schema_version != SCHEMA_VERSION {
+                    anyhow::bail!(
+                        "state {} has schema_version {} (expected {})",
+                        path.display(),
+                        s.schema_version,
+                        SCHEMA_VERSION
+                    );
+                }
+                if s.instance_id != instance_id {
+                    anyhow::bail!(
+                        "state {} belongs to instance {:?}, config says {:?}",
+                        path.display(),
+                        s.instance_id,
+                        instance_id
+                    );
+                }
+                Ok(s)
+            }
+            None => Ok(Self::new(instance_id)),
+        }
+    }
+
+    pub fn persist(&self, path: &Path) -> Result<()> {
+        persist_json(path, self)
+    }
+
+    /// Signed quantity per held symbol (zero legs omitted).
+    pub fn signed_qty(&self) -> BTreeMap<String, f64> {
+        self.positions
+            .iter()
+            .filter(|(_, p)| p.qty != 0.0)
+            .map(|(s, p)| (s.clone(), p.qty))
+            .collect()
+    }
+
+    pub fn is_flat(&self) -> bool {
+        self.positions.values().all(|p| p.qty == 0.0)
+    }
+
+    pub fn gross_usd(&self, prices: &std::collections::HashMap<String, f64>) -> f64 {
+        self.positions
+            .iter()
+            .map(|(s, p)| p.qty.abs() * prices.get(s).copied().unwrap_or(p.avg_price))
+            .sum()
+    }
+
+    pub fn net_usd(&self, prices: &std::collections::HashMap<String, f64>) -> f64 {
+        self.positions
+            .iter()
+            .map(|(s, p)| p.qty * prices.get(s).copied().unwrap_or(p.avg_price))
+            .sum()
+    }
+
+    pub fn unrealized_usd(&self, prices: &std::collections::HashMap<String, f64>) -> f64 {
+        self.positions
+            .iter()
+            .map(|(s, p)| {
+                let px = prices.get(s).copied().unwrap_or(p.avg_price);
+                p.qty * (px - p.avg_price)
+            })
+            .sum()
+    }
+
+    /// Apply a fill to the book. `signed_qty` is +buy / -sell in base units.
+    /// Returns the realized PnL this fill produced (0 for opens/increases).
+    pub fn apply_fill(&mut self, symbol: &str, signed_qty: f64, price: f64, now: i64) -> f64 {
+        if signed_qty == 0.0 {
+            return 0.0;
+        }
+        let pos = self
+            .positions
+            .entry(symbol.to_string())
+            .or_insert(Position {
+                qty: 0.0,
+                avg_price: price,
+                opened_at: now,
+                funding_accrued_at: Some(now),
+            });
+        let mut realized = 0.0;
+        let same_side = pos.qty == 0.0 || (pos.qty > 0.0) == (signed_qty > 0.0);
+        if same_side {
+            let new_qty = pos.qty + signed_qty;
+            if pos.qty == 0.0 {
+                pos.avg_price = price;
+                pos.opened_at = now;
+                pos.funding_accrued_at = Some(now);
+            } else {
+                pos.avg_price =
+                    (pos.avg_price * pos.qty.abs() + price * signed_qty.abs()) / new_qty.abs();
+            }
+            pos.qty = new_qty;
+        } else {
+            // Reducing (possibly through zero).
+            let closing = signed_qty.abs().min(pos.qty.abs());
+            let dir = if pos.qty > 0.0 { 1.0 } else { -1.0 };
+            realized = (price - pos.avg_price) * closing * dir;
+            let remaining = pos.qty + signed_qty;
+            if remaining == 0.0 || (remaining > 0.0) != (pos.qty > 0.0) {
+                // Closed, maybe flipped.
+                self.trades_closed += 1;
+                if realized > 0.0 {
+                    self.trades_won += 1;
+                }
+                if remaining != 0.0 {
+                    pos.avg_price = price;
+                    pos.opened_at = now;
+                    pos.funding_accrued_at = Some(now);
+                }
+                pos.qty = remaining;
+            } else {
+                pos.qty = remaining;
+            }
+            self.cum_realized_usd += realized;
+        }
+        // Drop empty legs so `positions` is always the live book.
+        if pos.qty == 0.0 {
+            self.positions.remove(symbol);
+        }
+        // Normalise float noise on tiny residuals.
+        if let Some(p) = self.positions.get_mut(symbol) {
+            if p.qty.abs() < 1e-12 {
+                self.positions.remove(symbol);
+            }
+        }
+        realized
+    }
+
+    /// Record an equity observation and update peak / drawdown.
+    pub fn observe_equity(&mut self, now: i64, equity: f64) {
+        self.last_equity = Some((now, equity));
+        if equity > self.peak_equity {
+            self.peak_equity = equity;
+        }
+        let dd = self.peak_equity - equity;
+        if dd > self.max_drawdown_usd {
+            self.max_drawdown_usd = dd;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fills_track_average_price_and_realize_on_reduce_and_flip() {
+        let mut s = BookState::new("t");
+        assert_eq!(s.apply_fill("BTC", 1.0, 100.0, 1), 0.0);
+        assert_eq!(s.apply_fill("BTC", 1.0, 120.0, 2), 0.0);
+        assert_eq!(s.positions["BTC"].avg_price, 110.0);
+        // reduce half at 130 → realized (130-110)*1 = 20
+        assert_eq!(s.apply_fill("BTC", -1.0, 130.0, 3), 20.0);
+        assert_eq!(s.positions["BTC"].qty, 1.0);
+        assert_eq!(s.trades_closed, 0);
+        // flip through zero: close 1 @ 90 (realized -20), open short 1 @ 90
+        let r = s.apply_fill("BTC", -2.0, 90.0, 4);
+        assert_eq!(r, -20.0);
+        assert_eq!(s.positions["BTC"].qty, -1.0);
+        assert_eq!(s.positions["BTC"].avg_price, 90.0);
+        assert_eq!(s.trades_closed, 1);
+        assert_eq!(s.trades_won, 0);
+        assert_eq!(s.cum_realized_usd, 0.0);
+        // close the short at 80 → +10, leg removed
+        assert_eq!(s.apply_fill("BTC", 1.0, 80.0, 5), 10.0);
+        assert!(!s.positions.contains_key("BTC"));
+        assert_eq!(s.trades_won, 1);
+        assert!(s.is_flat());
+    }
+
+    #[test]
+    fn persist_roundtrip_and_instance_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        let mut s = BookState::new("a");
+        s.apply_fill("ETH", 2.0, 10.0, 1);
+        s.persist(&p).unwrap();
+        let back = BookState::load_or_new(&p, "a").unwrap();
+        assert_eq!(back, s);
+        assert!(BookState::load_or_new(&p, "b").is_err());
+        std::fs::write(&p, "{").unwrap();
+        assert!(BookState::load_or_new(&p, "a").is_err());
+        let fresh = BookState::load_or_new(&dir.path().join("none.json"), "a").unwrap();
+        assert!(fresh.positions.is_empty());
+    }
+
+    #[test]
+    fn marks_and_drawdown() {
+        let mut s = BookState::new("t");
+        s.apply_fill("SOL", 10.0, 100.0, 1);
+        let px: std::collections::HashMap<String, f64> = [("SOL".to_string(), 90.0)].into();
+        assert_eq!(s.unrealized_usd(&px), -100.0);
+        assert_eq!(s.gross_usd(&px), 900.0);
+        assert_eq!(s.net_usd(&px), 900.0);
+        s.observe_equity(1, 1000.0);
+        s.observe_equity(2, 950.0);
+        s.observe_equity(3, 980.0);
+        assert_eq!(s.peak_equity, 1000.0);
+        assert_eq!(s.max_drawdown_usd, 50.0);
+    }
+}

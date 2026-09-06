@@ -1,6 +1,7 @@
 // src/lib.rs
 #[cfg(feature = "arcus-spot-sdk")]
 pub mod arcus_spot;
+pub mod book;
 pub mod config;
 pub mod directional;
 pub mod email_client;
