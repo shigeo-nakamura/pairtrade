@@ -40,6 +40,7 @@ jobs:
           bash -n debot/scripts/install_engine_b_live.sh
           python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
+          python3 -m py_compile debot/scripts/book_signal_file.py debot/scripts/test_book_signal_file.py
 
       - name: Test Engine B Phase 0 observer
         run: |

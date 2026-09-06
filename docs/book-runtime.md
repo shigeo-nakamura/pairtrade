@@ -245,18 +245,47 @@ reduce_only }`.
 
 ## 9. Replay
 
-`book-runtime --replay <dir> --out <dir>` runs the same engine against
-`bars.jsonl` (`{"date","symbol","close"}` rows) and `signals/<key>.json`
-files with a synthetic clock stepping one decision at a time (mark every
-day, decide on decision days, flatten on flatten times). Fills are paper
-fills at the bar close. Given identical inputs the ledger and `pnl.jsonl`
-are byte-identical run to run, which is what the shadow → live comparison
-for XSMOM relies on.
+`book-runtime --config <yaml> --replay <dir> --out <dir>` runs the same
+engine against `bars.jsonl` (`{"date","symbol","close"[,"funding_rate_hourly"]}`
+rows), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
+default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
+for every bar date `D` the closes of `D` become the prices, each decision /
+flatten scheduled inside `D` is ticked at its exact time (paper fills at
+the close of `D`), and a final tick at `D+1 00:00:00` writes the daily
+mark. The config's paths are redirected into `--out` and `dry_run` is
+forced on. Given identical inputs `ledger.jsonl`, `pnl.jsonl` and
+`state.json` are byte-identical run to run (covered by a test), which is
+what the shadow → live comparison for XSMOM relies on.
+
+Signal fixtures are written with `scripts/book_signal_file.py` (the same
+helper producers import), e.g.
+
+```bash
+scripts/book_signal_file.py --out replay/signals/2026-07-03.json \
+  --producer xsmom_695_L28_H5_q20_riskadj --decision-key 2026-07-03 \
+  --as-of 2026-07-03T00:00:00Z --generated-at 2026-07-03T00:20:00Z \
+  BTC=0.0625 ETH=-0.0625 ...
+```
+
+`generated_at` must fall inside `[decision_at - max_age_secs, decision_at
++ 60 s]` for the replay clock to accept it.
 
 ## 10. Live gate and hosts
 
 - `dry_run: false` refuses to start unless `BOOK_CONFIRM_LIVE=yes-i-mean-it`
   is also set (two-variable rule, same as `engine_b_live`).
+- Live execution is **Lighter-only** for now: orders go out as
+  `create_order(price=None)` (venue-native market/IOC with Lighter's 20 %
+  protection price — bot-strategy#918 tracks a price-constrained IOC).
+  dex-connector v4.7.20's Hyperliquid `create_order_taker_ioc` is
+  spot-only, so `venue: hyperliquid` is DRY_RUN-only until a perp IOC path
+  exists there; the runtime refuses `dry_run: false` on any other venue.
+- SIGTERM does **not** reduce-only close the book (same as `engine_b_live`);
+  the state is persisted and the next start resumes from it (live: from
+  the venue position, which is adopted if it differs).
+- Binary: `ci.yml` builds and uploads `bin/book_runtime` to S3 next to
+  `engine_b_live`; host installation (unit, identity, secrets) is the
+  follow-up PR together with the XSMOM producer.
 - Building this runtime is **not** capital approval. XSMOM goes live only
   if the pre-registered 2026-10-02 readout on bot-strategy#695 passes;
   Engine B only after #876's Phase 1 gate.
