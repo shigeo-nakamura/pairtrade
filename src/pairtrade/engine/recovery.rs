@@ -823,19 +823,45 @@ impl PairTradeEngine {
         now_ts: i64,
     ) {
         let inst = &mut self.instances[inst_idx];
-        let positions: HashMap<String, Position> = inst
+        let positions_now: HashMap<String, Position> = inst
             .states
             .iter()
             .filter_map(|(key, state)| state.position.clone().map(|p| (key.clone(), p)))
             .collect();
-        inst.external_flatten_reason = Some(reason);
-        inst.external_flatten_fills = Some(ExternalFlattenFills {
-            baseline,
-            attributable_order_ids,
-            positions,
-            submitted_at: Instant::now(),
-            submitted_ts: now_ts,
-        });
+        match inst.external_flatten_fills.as_mut() {
+            // Re-arm (halted-exposure retry while the first flatten is still
+            // being booked): merge, never overwrite — the original baseline
+            // and full-size position snapshot must survive until the whole
+            // close is booked, otherwise the first flatten's fills would be
+            // excluded and PnL computed on the residual (Codex review,
+            // pairtrade#282). Only pairs/symbols new to this retry are added.
+            Some(existing) => {
+                for (symbol, seen) in baseline {
+                    existing.baseline.entry(symbol).or_insert(seen);
+                }
+                existing
+                    .attributable_order_ids
+                    .extend(attributable_order_ids);
+                for (key, pos) in positions_now {
+                    existing.positions.entry(key).or_insert(pos);
+                }
+                existing.submitted_at = Instant::now();
+                existing.submitted_ts = now_ts;
+                if inst.external_flatten_reason.is_none() {
+                    inst.external_flatten_reason = Some(reason);
+                }
+            }
+            None => {
+                inst.external_flatten_reason = Some(reason);
+                inst.external_flatten_fills = Some(ExternalFlattenFills {
+                    baseline,
+                    attributable_order_ids,
+                    positions: positions_now,
+                    submitted_at: Instant::now(),
+                    submitted_ts: now_ts,
+                });
+            }
+        }
     }
 
     /// Session-halt hygiene, run *before* the bulk flatten is submitted:
@@ -861,10 +887,17 @@ impl PairTradeEngine {
             };
             let inst_id = self.instances[inst_idx].id.clone();
             let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+            let mut fill_ids: Vec<(String, Vec<String>)> = Vec::new();
             for leg in &pending.legs {
                 match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
                     Some((_, ids)) => ids.push(leg.order_id.clone()),
                     None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                }
+                let mut ids = vec![leg.order_id.clone()];
+                ids.extend(leg.exchange_order_id.clone());
+                match fill_ids.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                    Some((_, v)) => v.extend(ids),
+                    None => fill_ids.push((leg.symbol.clone(), ids)),
                 }
             }
             let mut cancel_failed = false;
@@ -885,7 +918,13 @@ impl PairTradeEngine {
                     cancel_failed = true;
                 }
             }
-            let confirmed = !cancel_failed && self.tracked_orders_gone(&per_symbol).await;
+            // "Gone from open orders" does not distinguish cancelled from
+            // executed: if any tracked leg shows a fill, keep the pending so
+            // the (halt-aware) reconcile flattens what filled instead of the
+            // fill vanishing unbooked (Codex review, pairtrade#282).
+            let confirmed = !cancel_failed
+                && self.tracked_orders_gone(&per_symbol).await
+                && !self.tracked_orders_filled(&fill_ids).await;
             if confirmed {
                 log::warn!(
                     "[FLATTEN_PNL] {} {} pending entry cancelled ahead of session halt (legs={})",
@@ -909,6 +948,31 @@ impl PairTradeEngine {
                 }
             }
         }
+    }
+
+    /// `true` when the connector's fill cache holds a fill for any of the
+    /// given tracked order ids (client or exchange form). A fetch error
+    /// counts as "filled" so the caller keeps the pending rather than
+    /// dropping an order that may have executed. bot-strategy#932.
+    pub(in crate::pairtrade) async fn tracked_orders_filled(
+        &self,
+        per_symbol: &[(String, Vec<String>)],
+    ) -> bool {
+        for (symbol, ids) in per_symbol {
+            match self.connector.get_filled_orders(symbol).await {
+                Ok(resp) => {
+                    if resp
+                        .orders
+                        .iter()
+                        .any(|f| !f.is_rejected && ids.contains(&f.order_id))
+                    {
+                        return true;
+                    }
+                }
+                Err(_) => return true,
+            }
+        }
+        false
     }
 
     /// Poll the venue (bounded, ~1.5 s worst case) until none of the given
@@ -1034,7 +1098,11 @@ impl PairTradeEngine {
         if fills.submitted_at.elapsed() >= EXTERNAL_FLATTEN_FILL_GRACE {
             return false;
         }
-        inst.states.get(key).is_some_and(|s| s.position.is_some())
+        // Only a position the flatten actually covered is "being booked";
+        // exposure that appeared afterwards on another pair must not hide
+        // behind this marker (Codex review, pairtrade#282).
+        fills.positions.contains_key(key)
+            && inst.states.get(key).is_some_and(|s| s.position.is_some())
     }
 
     /// Try to book an out-of-band flatten (session-DD halt) as a real

@@ -1047,6 +1047,18 @@ impl PairTradeEngine {
                 state.pending_entry = None;
             }
             return Ok(true);
+        } else if pending.post_only_hybrid && self.instances[inst_idx].session_halted {
+            // bot-strategy#932 (Codex review, pairtrade#282): a zero-fill
+            // post-only entry retained across a session halt must neither be
+            // kept alive nor fall back to taker — cancel it and let it go.
+            log::warn!(
+                "[ORDER] {} post-only entry on a session-halted instance; cancelling instead of taker fallback",
+                key
+            );
+            self.cancel_pending_orders(&pending).await?;
+            if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                state.pending_entry = None;
+            }
         } else if pending.post_only_hybrid {
             let recon_pp = self.pair_params_for(inst_idx, key).clone();
             let recon_pp = &recon_pp;

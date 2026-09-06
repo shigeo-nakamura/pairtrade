@@ -4835,3 +4835,204 @@ async fn halted_instance_partial_entry_gives_up_instead_of_reissuing() {
         .is_none());
     assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
 }
+
+/// Codex P1 (pairtrade#282): exposure on a pair the flatten did not cover
+/// must not hide behind the marker.
+#[tokio::test]
+async fn flatten_booking_in_progress_requires_pair_covered_by_marker() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    engine.cfg.universe.push(PairSpec {
+        base: "CCC".to_string(),
+        quote: "DDD".to_string(),
+    });
+    // A position that appeared after the flatten was armed.
+    engine.instances[0]
+        .states
+        .insert("CCC/DDD".to_string(), seeded_position_state());
+    assert!(engine.flatten_booking_in_progress(0, "AAA/BBB"));
+    assert!(
+        !engine.flatten_booking_in_progress(0, "CCC/DDD"),
+        "uncovered exposure is not 'being booked'"
+    );
+}
+
+/// Codex P1 (pairtrade#282): a re-arm (halted-exposure retry) must merge
+/// into the existing attribution state, keeping the original baseline and
+/// full-size position snapshot.
+#[tokio::test]
+async fn rearm_external_flatten_merges_instead_of_overwriting() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    let first = engine.instances[0].external_flatten_fills.clone().unwrap();
+    // First flatten half-filled; sync rewrote the local sizes; a retry arms again.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill(
+            "cl-1",
+            "t-1",
+            Some(OrderSide::Short),
+            "0.005",
+            Some("0.495"),
+        ),
+    );
+    {
+        let pos = engine.instances[0]
+            .states
+            .get_mut("AAA/BBB")
+            .unwrap()
+            .position
+            .as_mut()
+            .unwrap();
+        pos.entry_size_a = Some(dec("0.005"));
+    }
+    let baseline2 = engine.snapshot_fill_baseline(0).await;
+    assert_eq!(
+        baseline2["AAA"].len(),
+        2,
+        "retry baseline would include the first flatten's fill"
+    );
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test_reflatten".to_string(),
+        baseline2,
+        HashSet::from(["ex-9".to_string()]),
+        1_700_000_400,
+    );
+    let merged = engine.instances[0].external_flatten_fills.clone().unwrap();
+    assert_eq!(
+        merged.baseline["AAA"], first.baseline["AAA"],
+        "original baseline kept"
+    );
+    assert_eq!(
+        merged.positions["AAA/BBB"].entry_size_a,
+        Some(dec("0.01")),
+        "full-size snapshot kept"
+    );
+    assert!(merged.attributable_order_ids.contains("ex-9"));
+    assert_eq!(
+        engine.instances[0].external_flatten_reason.as_deref(),
+        Some("session_dd_test"),
+        "original reason kept"
+    );
+
+    // And the booking still prices the whole position: second half lands.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill(
+            "cl-3",
+            "t-3",
+            Some(OrderSide::Short),
+            "0.005",
+            Some("0.495"),
+        ),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!((pnl + 0.05).abs() < 1e-9, "pnl={pnl}");
+}
+
+/// Codex P2 (pairtrade#282): "gone from open orders" may mean executed. A
+/// tracked entry leg that shows a fill keeps the pending so the halt-aware
+/// reconcile flattens it.
+#[tokio::test]
+async fn cancel_pending_entries_for_halt_keeps_entry_that_filled_during_cancel() {
+    let connector = Arc::new(DummyConnector::default());
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("en-1", "t-1", Some(OrderSide::Long), "0.01", Some("1.00")),
+    );
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+
+    engine.cancel_pending_entries_for_halt(0).await;
+
+    assert!(
+        engine.instances[0]
+            .states
+            .get("AAA/BBB")
+            .unwrap()
+            .pending_entry
+            .is_some(),
+        "an executed leg must stay owned by the reconcile loop"
+    );
+}
+
+/// Codex P1 (pairtrade#282): a zero-fill post-only entry retained across a
+/// halt must be cancelled, never kept alive or reissued as taker.
+#[tokio::test]
+async fn halted_zero_fill_post_only_entry_is_cancelled_not_reissued() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].session_halted = true;
+    let mut state = positionless_pending_entry_state();
+    {
+        let pending = state.pending_entry.as_mut().unwrap();
+        pending.post_only_hybrid = true;
+        pending.placed_at = Instant::now();
+    }
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    let mut price_map = HashMap::new();
+    for (sym, px) in [("AAA", "100"), ("BBB", "50")] {
+        price_map.insert(
+            sym.to_string(),
+            SymbolSnapshot {
+                price: dec(px),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        );
+    }
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(
+        connector.calls.lock().unwrap().is_empty(),
+        "no taker reissue"
+    );
+    assert!(engine.instances[0]
+        .states
+        .get("AAA/BBB")
+        .unwrap()
+        .pending_entry
+        .is_none());
+    assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
+}
