@@ -1833,7 +1833,7 @@ impl PairTradeEngine {
         // Entry legs still awaiting reconciliation must not fill after
         // the flatten on a halted instance: cancel them first (tracked
         // ids only). Exits stay live until the flatten is submitted.
-        self.cancel_pending_entries_for_halt(inst_idx).await;
+        let cancelled_entry_ids = self.cancel_pending_entries_for_halt(inst_idx).await;
         let fill_baseline = self.snapshot_fill_baseline(inst_idx).await;
         if let Err(err) = self.connector.close_all_positions(None).await {
             log::error!(
@@ -1876,6 +1876,7 @@ impl PairTradeEngine {
                 reason.to_string(),
                 fill_baseline,
                 attributable_order_ids,
+                cancelled_entry_ids,
                 now_ts,
             );
         }

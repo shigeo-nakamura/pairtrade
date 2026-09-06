@@ -40,6 +40,11 @@ pub(in crate::pairtrade) struct ExternalFlattenFills {
     /// and must never enter the flatten VWAP, even when the connector
     /// reports them side-less.
     pub(in crate::pairtrade) excluded_order_ids: HashSet<String>,
+    /// Pair keys the flatten covers: every pair that held a position or a
+    /// retained pending entry when it was armed. Drives the planning gate
+    /// and the marker liveness, independent of whether the pair's position
+    /// has been promoted locally yet.
+    pub(in crate::pairtrade) covered_pairs: HashSet<String>,
     /// The positions (per pair key) as they were when the flatten was
     /// submitted. The per-tick exchange-snapshot sync rewrites the local
     /// position's sizes from the venue, so an intermediate partially-closed

@@ -741,7 +741,7 @@ impl PairTradeEngine {
             let positions_remain = self.instances[inst_idx]
                 .states
                 .values()
-                .any(|s| s.position.is_some());
+                .any(|s| s.position.is_some() || s.pending_entry.is_some());
             if !flatten_deferred && !positions_remain {
                 let inst = &mut self.instances[inst_idx];
                 inst.external_flatten_reason = None;
@@ -833,6 +833,7 @@ impl PairTradeEngine {
         reason: String,
         baseline: HashMap<String, HashSet<String>>,
         attributable_order_ids: HashSet<String>,
+        excluded_order_ids: HashSet<String>,
         now_ts: i64,
     ) {
         let inst = &mut self.instances[inst_idx];
@@ -841,7 +842,7 @@ impl PairTradeEngine {
             .iter()
             .filter_map(|(key, state)| state.position.clone().map(|p| (key.clone(), p)))
             .collect();
-        let excluded_now: HashSet<String> = inst
+        let mut excluded_now: HashSet<String> = inst
             .states
             .values()
             .filter_map(|state| state.pending_entry.as_ref())
@@ -849,6 +850,16 @@ impl PairTradeEngine {
             .flat_map(|leg| {
                 std::iter::once(leg.order_id.clone()).chain(leg.exchange_order_id.clone())
             })
+            .collect();
+        // Entry ids cancelled just before the flatten stay excluded even
+        // when the cancel looked confirmed: a fill event can arrive later
+        // than the open-orders removal (Codex review, pairtrade#282).
+        excluded_now.extend(excluded_order_ids);
+        let covered_now: HashSet<String> = inst
+            .states
+            .iter()
+            .filter(|(_, state)| state.position.is_some() || state.pending_entry.is_some())
+            .map(|(key, _)| key.clone())
             .collect();
         match inst.external_flatten_fills.as_mut() {
             // Re-arm (halted-exposure retry while the first flatten is still
@@ -865,6 +876,7 @@ impl PairTradeEngine {
                     .attributable_order_ids
                     .extend(attributable_order_ids);
                 existing.excluded_order_ids.extend(excluded_now);
+                existing.covered_pairs.extend(covered_now);
                 for (key, pos) in positions_now {
                     existing.positions.entry(key).or_insert(pos);
                 }
@@ -880,6 +892,7 @@ impl PairTradeEngine {
                     baseline,
                     attributable_order_ids,
                     excluded_order_ids: excluded_now,
+                    covered_pairs: covered_now,
                     positions: positions_now,
                     submitted_at: Instant::now(),
                     submitted_ts: now_ts,
@@ -898,7 +911,11 @@ impl PairTradeEngine {
     /// is kept, so the normal reconcile loop keeps managing (and, on fill,
     /// hedging/flattening) it. Cancels target the tracked order ids only.
     /// bot-strategy#932.
-    pub(in crate::pairtrade) async fn cancel_pending_entries_for_halt(&mut self, inst_idx: usize) {
+    pub(in crate::pairtrade) async fn cancel_pending_entries_for_halt(
+        &mut self,
+        inst_idx: usize,
+    ) -> HashSet<String> {
+        let mut processed_ids: HashSet<String> = HashSet::new();
         let universe = self.cfg.universe.clone();
         for pair in &universe {
             let key = format!("{}/{}", pair.base, pair.quote);
@@ -923,6 +940,9 @@ impl PairTradeEngine {
                     Some((_, v)) => v.extend(ids),
                     None => fill_ids.push((leg.symbol.clone(), ids)),
                 }
+            }
+            for (_, ids) in &fill_ids {
+                processed_ids.extend(ids.iter().cloned());
             }
             let mut cancel_failed = false;
             for (symbol, ids) in &per_symbol {
@@ -972,6 +992,7 @@ impl PairTradeEngine {
                 }
             }
         }
+        processed_ids
     }
 
     /// `true` when the connector's fill cache holds a fill for any of the
@@ -1125,7 +1146,7 @@ impl PairTradeEngine {
         // Only a position the flatten actually covered is "being booked";
         // exposure that appeared afterwards on another pair must not hide
         // behind this marker (Codex review, pairtrade#282).
-        fills.positions.contains_key(key)
+        fills.covered_pairs.contains(key)
             && inst.states.get(key).is_some_and(|s| s.position.is_some())
     }
 

@@ -4000,6 +4000,7 @@ async fn armed_flatten_engine(
         "session_dd_test".to_string(),
         baseline,
         HashSet::new(),
+        HashSet::new(),
         1_700_000_300,
     );
     engine
@@ -4430,6 +4431,7 @@ async fn session_dd_flatten_books_tracked_exit_leg_fill_from_baseline() {
         "session_dd_test".to_string(),
         baseline,
         ids,
+        HashSet::new(),
         1_700_000_300,
     );
     // The flatten closes the remaining BBB leg.
@@ -4597,6 +4599,7 @@ async fn flatten_marker_stays_armed_until_every_pair_is_booked() {
         0,
         "session_dd_test".to_string(),
         baseline,
+        HashSet::new(),
         HashSet::new(),
         1_700_000_300,
     );
@@ -4914,6 +4917,7 @@ async fn rearm_external_flatten_merges_instead_of_overwriting() {
         "session_dd_test_reflatten".to_string(),
         baseline2,
         HashSet::from(["ex-9".to_string()]),
+        HashSet::new(),
         1_700_000_400,
     );
     let merged = engine.instances[0].external_flatten_fills.clone().unwrap();
@@ -5213,6 +5217,7 @@ async fn flatten_booking_declines_when_covered_pairs_share_a_symbol() {
         "session_dd_test".to_string(),
         baseline,
         HashSet::new(),
+        HashSet::new(),
         1_700_000_300,
     );
     engine.instances[0]
@@ -5320,6 +5325,7 @@ async fn flatten_booking_excludes_retained_entry_fills() {
         "session_dd_test".to_string(),
         baseline,
         HashSet::new(),
+        HashSet::new(),
         1_700_000_300,
     );
     // Post-baseline: the retained entry leg fills side-less, then the flatten.
@@ -5374,4 +5380,93 @@ async fn halted_instance_reflattens_even_when_threshold_disabled() {
 
     assert!(engine.evaluate_session_dd(0).await, "stays halted");
     assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Codex P1/P2 (pairtrade#282): a pair whose entry was retained through the
+/// halt is covered by the flatten — the planning gate applies once it is
+/// promoted, and the marker stays armed while it awaits reconciliation.
+#[tokio::test]
+async fn flatten_covers_retained_pending_entry_pairs() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        HashSet::new(),
+        1_700_000_300,
+    );
+    let fills = engine.instances[0].external_flatten_fills.as_ref().unwrap();
+    assert!(fills.covered_pairs.contains("AAA/BBB"));
+    assert!(fills.excluded_order_ids.contains("en-1") && fills.excluded_order_ids.contains("en-2"));
+    // Not yet promoted: nothing to gate.
+    assert!(!engine.flatten_booking_in_progress(0, "AAA/BBB"));
+    // Promoted by reconcile: planning stands down.
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .position = seeded_position_state().position;
+    assert!(engine.flatten_booking_in_progress(0, "AAA/BBB"));
+}
+
+/// Codex P1 (pairtrade#282): entry ids cancelled right before the flatten
+/// stay excluded from attribution even when the cancel looked confirmed.
+#[tokio::test]
+async fn halt_flatten_keeps_cancelled_entry_ids_excluded() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    engine.cfg.universe.push(PairSpec {
+        base: "CCC".to_string(),
+        quote: "DDD".to_string(),
+    });
+    let mut other = PairState::new(2.0);
+    other.pending_entry = Some(PendingOrders {
+        legs: vec![
+            flatten_test_leg("CCC", "en-7", OrderSide::Long, "0.01"),
+            flatten_test_leg("DDD", "en-8", OrderSide::Short, "0.02"),
+        ],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    engine.instances[0]
+        .states
+        .insert("CCC/DDD".to_string(), other);
+
+    engine
+        .submit_halt_flatten(0, "session_dd_test", 1_700_000_300)
+        .await;
+
+    let inst = &engine.instances[0];
+    assert!(
+        inst.states.get("CCC/DDD").unwrap().pending_entry.is_none(),
+        "cancel confirmed (no open orders, no fills) drops the pending"
+    );
+    let fills = inst.external_flatten_fills.as_ref().unwrap();
+    assert!(
+        fills.excluded_order_ids.contains("en-7") && fills.excluded_order_ids.contains("en-8"),
+        "cancelled entry ids remain excluded for late fill events"
+    );
 }
