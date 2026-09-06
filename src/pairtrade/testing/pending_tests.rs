@@ -3958,6 +3958,9 @@ async fn armed_flatten_engine(
     let mut engine = PairTradeEngine::test_instance(connector.clone());
     engine.cfg.dry_run = false;
     engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.to_path_buf()));
+    // A successful booking persists risk state; keep it inside the temp dir
+    // instead of the CWD-relative default (Codex review, pairtrade#282).
+    engine.risk_state_path = dir.join("risk_state.json");
     engine.instances[0]
         .states
         .insert("AAA/BBB".to_string(), seeded_position_state());
