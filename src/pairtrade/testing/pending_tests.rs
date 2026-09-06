@@ -10,7 +10,7 @@ use dex_connector::{
     OrderBookSnapshot, OrderSide, PositionSnapshot, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use rust_decimal::Decimal;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -68,6 +68,9 @@ pub(in crate::pairtrade) struct DummyConnector {
     modify_calls: Mutex<Vec<ModifyCall>>,
     cancel_order_calls: AtomicUsize,
     cancel_orders_calls: AtomicUsize,
+    /// bot-strategy#932: `(symbol, order_ids)` per `cancel_orders` call.
+    cancel_orders_detail: Mutex<Vec<(Option<String>, Vec<String>)>>,
+    cancel_orders_should_fail: AtomicBool,
     modify_should_fail: AtomicBool,
     reject_priced_orders: AtomicBool,
     /// Codex review PR #159: count of `get_ticker` calls and an optional
@@ -107,6 +110,12 @@ pub(in crate::pairtrade) struct DummyConnector {
     /// produce, so tests can exercise the capital-guard unlatch path
     /// that only fires on a definitive no-order-created rejection.
     reject_orders_with_server_response: AtomicBool,
+    /// bot-strategy#932: a Lighter-style persistent per-symbol fill cache
+    /// (never popped, returned verbatim on every `get_filled_orders` call
+    /// while non-empty for that symbol) so the pre-flatten baseline and the
+    /// post-flatten attribution can both read the same growing cache.
+    /// Takes precedence over `filled_by_symbol` for symbols it holds.
+    fill_cache: Mutex<HashMap<String, Vec<dex_connector::FilledOrder>>>,
 }
 
 /// Scripted `(order_id, filled_size)` rows for one `get_filled_orders` call.
@@ -166,6 +175,13 @@ impl DexConnector for DummyConnector {
     }
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
+        if let Some(rows) = self.fill_cache.lock().unwrap().get(symbol) {
+            if !rows.is_empty() {
+                return Ok(FilledOrdersResponse {
+                    orders: rows.clone(),
+                });
+            }
+        }
         if let Some(queue) = self.filled_by_symbol.lock().unwrap().get_mut(symbol) {
             if let Some(rows) = pop_scripted(queue) {
                 return Ok(FilledOrdersResponse {
@@ -410,10 +426,19 @@ impl DexConnector for DummyConnector {
 
     async fn cancel_orders(
         &self,
-        _symbol: Option<String>,
-        _order_ids: Vec<String>,
+        symbol: Option<String>,
+        order_ids: Vec<String>,
     ) -> Result<(), DexError> {
         self.cancel_orders_calls.fetch_add(1, Ordering::SeqCst);
+        self.cancel_orders_detail
+            .lock()
+            .unwrap()
+            .push((symbol, order_ids));
+        if self.cancel_orders_should_fail.load(Ordering::SeqCst) {
+            return Err(DexError::Transient(
+                "cancel_orders forced failure (test)".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -3899,4 +3924,1627 @@ async fn entry_reconcile_clean_read_with_failed_rereads_fails_closed() {
         "clean-then-failed settle reads must fail closed, not record ok"
     );
     let _ = std::fs::remove_file(&engine.risk_state_path);
+}
+
+// ---------------------------------------------------------------------------
+// bot-strategy#932: out-of-band (session-DD) flatten books real exit PnL
+// ---------------------------------------------------------------------------
+
+fn cached_fill(
+    order_id: &str,
+    trade_id: &str,
+    side: Option<OrderSide>,
+    size: &str,
+    value: Option<&str>,
+) -> dex_connector::FilledOrder {
+    dex_connector::FilledOrder {
+        order_id: order_id.to_string(),
+        is_rejected: false,
+        trade_id: trade_id.to_string(),
+        filled_side: side,
+        filled_size: Some(dec(size)),
+        filled_value: value.map(dec),
+        filled_fee: None,
+        filled_ts_ms: None,
+    }
+}
+
+fn push_fill(connector: &DummyConnector, symbol: &str, fill: dex_connector::FilledOrder) {
+    connector
+        .fill_cache
+        .lock()
+        .unwrap()
+        .entry(symbol.to_string())
+        .or_default()
+        .push(fill);
+}
+
+/// Engine with a held AAA/BBB LongSpread (0.01 @100 / 0.02 @50), a stale
+/// closing-side AAA fill already in the connector cache (must be excluded
+/// via the baseline), and the flatten marker armed exactly as
+/// `evaluate_session_dd` arms it. The exchange snapshot is already flat.
+///
+/// `risk_dir` receives the persisted risk state (a successful booking calls
+/// `persist_risk_state`); it must be separate from the PnL `dir` because
+/// `read_single_pnl_record` expects that directory to hold only the PnL log
+/// (Codex review, pairtrade#282).
+async fn armed_flatten_engine(
+    connector: &Arc<DummyConnector>,
+    dir: &std::path::Path,
+    risk_dir: &std::path::Path,
+) -> PairTradeEngine {
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.to_path_buf()));
+    engine.risk_state_path = risk_dir.join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    // Stale fill from an earlier cycle: same closing side, different price.
+    push_fill(
+        connector,
+        "AAA",
+        cached_fill(
+            "old-1",
+            "t-old",
+            Some(OrderSide::Short),
+            "0.01",
+            Some("0.95"),
+        ),
+    );
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    assert_eq!(baseline.get("AAA").map(|s| s.len()), Some(1));
+    assert_eq!(baseline.get("BBB").map(|s| s.len()), Some(0));
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        HashSet::new(),
+        1_700_000_300,
+    );
+    engine
+}
+
+#[tokio::test]
+async fn session_dd_flatten_books_exit_fill_from_post_flatten_fills() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    // Flatten fills land: AAA sold 0.01 @99, BBB bought 0.02 @52.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    assert_eq!(json["close_reason"], "session_dd_test");
+    assert!(json.get("pnl_available").is_none());
+    assert!(json.get("recovery_reason").is_none());
+    assert_eq!(json["exit_price_a"], 99.0);
+    assert_eq!(json["exit_price_b"], 52.0);
+    // (99-100)*0.01 + (50-52)*0.02 = -0.01 - 0.04
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!((pnl + 0.05).abs() < 1e-9, "pnl={pnl}");
+
+    let inst = &engine.instances[0];
+    assert!((inst.realized_pnl_today + 0.05).abs() < 1e-9);
+    assert!((inst.total_pnl + 0.05).abs() < 1e-9);
+    {
+        let state = inst.states.get("AAA/BBB").unwrap();
+        assert!(
+            state.last_exit_ts.is_some(),
+            "post-exit transition must stamp the exit cooldown"
+        );
+        assert!(state.pending_exit_reason.is_none());
+    }
+    assert_eq!(inst.total_trades, 1);
+    assert_eq!(
+        inst.consecutive_losses, 1,
+        "loss must advance the circuit breaker"
+    );
+    assert!(inst.external_flatten_reason.is_none());
+    assert!(inst.external_flatten_fills.is_none());
+    let state = inst.states.get("AAA/BBB").unwrap();
+    assert!(state.position.is_none());
+    assert!(!state.recovery_recorded);
+}
+
+#[tokio::test]
+async fn session_dd_flatten_defers_clear_until_fills_arrive() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+
+    // Exchange already flat but the WS fill events have not landed yet.
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "no record while the flatten fills are pending"
+    );
+    let inst = &engine.instances[0];
+    assert!(inst.states.get("AAA/BBB").unwrap().position.is_some());
+    assert!(inst.external_flatten_reason.is_some());
+    assert!(inst.external_flatten_fills.is_some());
+    assert_eq!(inst.total_trades, 0);
+
+    // Only one leg has landed: still deferred, never a half-booked cycle.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    assert!(engine.instances[0]
+        .states
+        .get("AAA/BBB")
+        .unwrap()
+        .position
+        .is_some());
+
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    assert_eq!(json["close_reason"], "session_dd_test");
+    assert!(engine.instances[0]
+        .states
+        .get("AAA/BBB")
+        .unwrap()
+        .position
+        .is_none());
+}
+
+#[tokio::test]
+async fn session_dd_flatten_without_value_coverage_falls_back_to_recovery_record() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    // Fills arrive but the venue reported no value for BBB: never blend a
+    // mark snapshot in (bot-strategy#750) — context record instead.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", None),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "recovery_no_pnl");
+    assert_eq!(json["pnl_available"], false);
+    assert_eq!(json["recovery_reason"], "session_dd_test");
+    let inst = &engine.instances[0];
+    assert_eq!(inst.total_trades, 0);
+    assert_eq!(inst.realized_pnl_today, 0.0);
+    assert_eq!(inst.consecutive_losses, 0);
+    assert!(inst.external_flatten_reason.is_none());
+    assert!(inst.external_flatten_fills.is_none());
+    assert!(inst.states.get("AAA/BBB").unwrap().position.is_none());
+}
+
+#[tokio::test]
+async fn session_dd_flatten_gives_up_after_grace_when_fills_never_land() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    engine.instances[0]
+        .external_flatten_fills
+        .as_mut()
+        .unwrap()
+        .submitted_at = Instant::now() - std::time::Duration::from_secs(120);
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "recovery_no_pnl");
+    assert_eq!(json["recovery_reason"], "session_dd_test");
+    let inst = &engine.instances[0];
+    assert!(inst.states.get("AAA/BBB").unwrap().position.is_none());
+    assert!(inst.external_flatten_reason.is_none());
+}
+
+fn flatten_test_leg(symbol: &str, order_id: &str, side: OrderSide, target: &str) -> PendingLeg {
+    PendingLeg {
+        symbol: symbol.to_string(),
+        order_id: order_id.to_string(),
+        exchange_order_id: None,
+        target: dec(target),
+        filled: Decimal::ZERO,
+        side,
+        submitted_qty: dec(target),
+        limit_price: None,
+        reference_price: None,
+        submit_ts_ms: 0,
+        ack_ts_ms: None,
+        decision_ts_ms: 0,
+        submit_reference_price: None,
+        submit_mid: None,
+        submit_bid: None,
+        submit_ask: None,
+        client_order_id: None,
+        reduce_only: true,
+        post_only: false,
+    }
+}
+
+fn pending_exit_for_seeded_position() -> PendingOrders {
+    PendingOrders {
+        legs: vec![
+            PendingLeg {
+                exchange_order_id: Some("x-ex-1".to_string()),
+                ..flatten_test_leg("AAA", "ex-1", OrderSide::Short, "0.01")
+            },
+            flatten_test_leg("BBB", "ex-2", OrderSide::Long, "0.02"),
+        ],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    }
+}
+
+/// Codex P1 (pairtrade#282): a session-DD halt that fires while a strategy
+/// exit is still pending must retire that exit (cancel its tracked orders on
+/// the venue — never a symbol-wide sweep that could catch the flatten
+/// orders — drop it locally) and hand its leg ids to the attribution.
+#[tokio::test]
+async fn retire_pending_exits_for_flatten_cancels_tracked_ids_and_collects_legs() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let mut state = seeded_position_state();
+    state.pending_exit = Some(pending_exit_for_seeded_position());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+
+    let ids = engine.retire_pending_exits_for_flatten(0).await;
+
+    assert_eq!(
+        ids,
+        HashSet::from(["ex-1".to_string(), "x-ex-1".to_string(), "ex-2".to_string()]),
+        "retired exit legs must become attributable under both id forms"
+    );
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.pending_exit.is_none());
+    assert!(
+        state.position.is_some(),
+        "position stays until the venue confirms"
+    );
+    assert_eq!(
+        *connector.cancel_orders_detail.lock().unwrap(),
+        vec![
+            (Some("AAA".to_string()), vec!["ex-1".to_string()]),
+            (Some("BBB".to_string()), vec!["ex-2".to_string()]),
+        ],
+        "only the tracked exit orders are cancelled"
+    );
+    assert_eq!(
+        connector.cancel_all_calls.load(Ordering::SeqCst),
+        0,
+        "no symbol-wide cancel that could sweep the just-submitted flatten"
+    );
+}
+
+fn positionless_pending_entry_state() -> PairState {
+    let mut state = PairState::new(2.0);
+    state.pending_entry = Some(PendingOrders {
+        legs: vec![
+            flatten_test_leg("AAA", "en-1", OrderSide::Long, "0.01"),
+            flatten_test_leg("BBB", "en-2", OrderSide::Short, "0.02"),
+        ],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    state
+}
+
+/// Codex P1 (pairtrade#282): an entry still awaiting reconciliation (no
+/// local position yet) must be cancelled on a session halt, or it can fill
+/// after the flatten and recreate exposure nobody closes.
+#[tokio::test]
+async fn cancel_pending_entries_for_halt_cancels_positionless_entry() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+
+    engine.cancel_pending_entries_for_halt(0).await;
+
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.pending_entry.is_none());
+    let mut detail = connector.cancel_orders_detail.lock().unwrap().clone();
+    detail.sort();
+    assert_eq!(
+        detail,
+        vec![
+            (Some("AAA".to_string()), vec!["en-1".to_string()]),
+            (Some("BBB".to_string()), vec!["en-2".to_string()]),
+        ]
+    );
+}
+
+/// The local pending entry must survive a failed cancel: the reconcile loop
+/// keeps managing it (and hedging a late fill) instead of it vanishing from
+/// local state while still live on the venue.
+#[tokio::test]
+async fn cancel_pending_entries_for_halt_keeps_entry_when_cancel_fails() {
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .cancel_orders_should_fail
+        .store(true, Ordering::SeqCst);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+
+    engine.cancel_pending_entries_for_halt(0).await;
+
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(
+        state.pending_entry.is_some(),
+        "pending entry kept on cancel failure"
+    );
+}
+
+/// Same when the venue accepts the cancel but still reports the order open
+/// after the bounded acknowledgement wait.
+#[tokio::test]
+async fn cancel_pending_entries_for_halt_keeps_entry_when_still_open() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.open_ids_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from([vec!["en-1".to_string()]]),
+    );
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+
+    engine.cancel_pending_entries_for_halt(0).await;
+
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(
+        state.pending_entry.is_some(),
+        "pending entry kept while the venue still shows it open"
+    );
+    assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
+async fn retire_pending_exits_for_flatten_is_noop_without_pending_exit() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+
+    let ids = engine.retire_pending_exits_for_flatten(0).await;
+    engine.cancel_pending_entries_for_halt(0).await;
+
+    assert!(ids.is_empty());
+    assert_eq!(connector.cancel_orders_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(connector.cancel_all_calls.load(Ordering::SeqCst), 0);
+}
+
+/// A retired exit leg may already have filled before the fill baseline was
+/// taken; that fill still closes the position and must count towards the
+/// flatten VWAP even though it is in the baseline.
+#[tokio::test]
+async fn session_dd_flatten_books_tracked_exit_leg_fill_from_baseline() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    let mut state = seeded_position_state();
+    state.pending_exit = Some(pending_exit_for_seeded_position());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    // The AAA exit leg filled before the halt: it is in the baseline, and the
+    // venue reports the fill under the exchange order id (Codex review).
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill(
+            "x-ex-1",
+            "t-1",
+            Some(OrderSide::Short),
+            "0.01",
+            Some("0.99"),
+        ),
+    );
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    let ids = engine.retire_pending_exits_for_flatten(0).await;
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        ids,
+        HashSet::new(),
+        1_700_000_300,
+    );
+    // The flatten closes the remaining BBB leg.
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    assert_eq!(json["exit_price_a"], 99.0);
+    assert_eq!(json["exit_price_b"], 52.0);
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!((pnl + 0.05).abs() < 1e-9, "pnl={pnl}");
+}
+
+/// Codex P1 (pairtrade#282): if a pending exit is still installed when the
+/// armed flatten empties the venue (e.g. a race that installed it after the
+/// halt), the snapshot sync must supersede it instead of skipping the pair
+/// forever.
+#[tokio::test]
+async fn snapshot_clear_supersedes_pending_exit_when_flatten_armed_and_venue_flat() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_exit = Some(pending_exit_for_seeded_position());
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.pending_exit.is_none());
+    assert!(state.position.is_none());
+}
+
+/// Without the flatten marker a pending exit still shields the pair from
+/// the snapshot clear (pre-existing contract).
+#[tokio::test]
+async fn snapshot_clear_keeps_pending_exit_when_no_flatten_armed() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let mut state = seeded_position_state();
+    state.pending_exit = Some(pending_exit_for_seeded_position());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.pending_exit.is_some());
+    assert!(state.position.is_some());
+}
+
+/// Codex P1 (pairtrade#282): planning must stand down while the flatten
+/// booking is pending, but only within the grace window and only while a
+/// local position remains.
+#[tokio::test]
+async fn flatten_booking_in_progress_is_bounded_by_grace_and_position() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    assert!(engine.flatten_booking_in_progress(0, "AAA/BBB"));
+    assert!(!engine.flatten_booking_in_progress(0, "CCC/DDD"));
+
+    engine.instances[0]
+        .external_flatten_fills
+        .as_mut()
+        .unwrap()
+        .submitted_at = Instant::now() - std::time::Duration::from_secs(120);
+    assert!(
+        !engine.flatten_booking_in_progress(0, "AAA/BBB"),
+        "a flatten older than the grace window must not suppress planning"
+    );
+
+    engine.instances[0]
+        .external_flatten_fills
+        .as_mut()
+        .unwrap()
+        .submitted_at = Instant::now();
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .position = None;
+    assert!(!engine.flatten_booking_in_progress(0, "AAA/BBB"));
+
+    let mut plain = PairTradeEngine::test_instance(connector.clone());
+    plain.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    assert!(!plain.flatten_booking_in_progress(0, "AAA/BBB"));
+}
+
+/// Codex P2 (pairtrade#282): a bulk flatten over two pairs can surface pair
+/// by pair across snapshots. The marker must stay armed until every held
+/// position has been booked (or fallen back), not be consumed by the first.
+#[tokio::test]
+async fn flatten_marker_stays_armed_until_every_pair_is_booked() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.universe = vec![
+        PairSpec {
+            base: "AAA".to_string(),
+            quote: "BBB".to_string(),
+        },
+        PairSpec {
+            base: "CCC".to_string(),
+            quote: "DDD".to_string(),
+        },
+    ];
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    engine.instances[0]
+        .states
+        .insert("CCC/DDD".to_string(), seeded_position_state());
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    assert_eq!(baseline.len(), 4, "baseline covers both pairs' legs");
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        HashSet::new(),
+        1_700_000_300,
+    );
+
+    // First snapshot: AAA/BBB already flat and filled, CCC/DDD still open.
+    *connector.positions_to_return.lock().unwrap() = vec![
+        PositionSnapshot {
+            symbol: "CCC".to_string(),
+            size: dec("0.01"),
+            sign: 1,
+            entry_price: Some(dec("100")),
+        },
+        PositionSnapshot {
+            symbol: "DDD".to_string(),
+            size: dec("0.02"),
+            sign: -1,
+            entry_price: Some(dec("50")),
+        },
+    ];
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    assert_eq!(engine.instances[0].total_trades, 1, "first pair booked");
+    assert!(
+        engine.instances[0].external_flatten_reason.is_some(),
+        "marker must survive while CCC/DDD is still open"
+    );
+
+    // Second snapshot: CCC/DDD flat and filled.
+    connector.positions_to_return.lock().unwrap().clear();
+    push_fill(
+        &connector,
+        "CCC",
+        cached_fill("cl-3", "t-3", Some(OrderSide::Short), "0.01", Some("0.98")),
+    );
+    push_fill(
+        &connector,
+        "DDD",
+        cached_fill("cl-4", "t-4", Some(OrderSide::Long), "0.02", Some("1.02")),
+    );
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.instances[0].total_trades, 2,
+        "second pair booked too"
+    );
+    assert!(engine.instances[0].external_flatten_reason.is_none());
+    assert!(engine.instances[0].external_flatten_fills.is_none());
+    let content = std::fs::read_to_string(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert_eq!(content.lines().count(), 2);
+    assert!(content
+        .lines()
+        .all(|l| l.contains("\"source\":\"exit_fill\"")));
+}
+
+/// Codex P1 (pairtrade#282): a sticky halt must keep the account flat. A
+/// position that (re)appears on a halted instance — e.g. an entry leg whose
+/// cancel went unconfirmed and filled after the one-shot flatten — is
+/// flattened again (rate-limited), and the retry arms the booking marker.
+#[tokio::test]
+async fn halted_instance_reflattens_reappeared_exposure_once_per_interval() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.risk.max_session_loss_bps = 250;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0].session_halted = true;
+    engine.instances[0].session_halt_reason = Some("session_dd_250bps_lev5.0".to_string());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+
+    assert!(engine.evaluate_session_dd(0).await, "stays halted");
+    assert_eq!(
+        connector.close_all_calls.load(Ordering::SeqCst),
+        1,
+        "exposure on a halted instance is flattened again"
+    );
+    assert_eq!(
+        engine.instances[0].external_flatten_reason.as_deref(),
+        Some("session_dd_250bps_lev5.0_reflatten")
+    );
+    assert!(engine.instances[0].external_flatten_fills.is_some());
+
+    // Same tick family again: booking is in progress for that pair, and the
+    // retry is rate-limited — no second flatten.
+    assert!(engine.evaluate_session_dd(0).await);
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn halted_instance_does_not_reflatten_when_flat_or_exit_pending() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.risk.max_session_loss_bps = 250;
+    engine.instances[0].session_halted = true;
+
+    // Flat: nothing to do.
+    assert!(engine.evaluate_session_dd(0).await);
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 0);
+
+    // A strategy exit already closing the position: leave it alone.
+    let mut state = seeded_position_state();
+    state.pending_exit = Some(pending_exit_for_seeded_position());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    assert!(engine.evaluate_session_dd(0).await);
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 0);
+}
+
+/// Codex P1 (pairtrade#282): the booking must price the flatten against the
+/// position as it stood at the flatten, not a residual the per-tick snapshot
+/// sync wrote from an intermediate partially-closed venue state.
+#[tokio::test]
+async fn flatten_booking_uses_position_snapshot_taken_at_arm() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    // Simulate the sync having rewritten the local sizes from a half-closed
+    // intermediate snapshot.
+    {
+        let pos = engine.instances[0]
+            .states
+            .get_mut("AAA/BBB")
+            .unwrap()
+            .position
+            .as_mut()
+            .unwrap();
+        pos.entry_size_a = Some(dec("0.004"));
+        pos.entry_size_b = Some(dec("0.008"));
+    }
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!(
+        (pnl + 0.05).abs() < 1e-9,
+        "full-size economics expected, got pnl={pnl}"
+    );
+}
+
+/// Codex P1 (pairtrade#282): a partially filled entry on a session-halted
+/// instance must not be completed with fresh opening orders — the reconcile
+/// takes the give-up path (cancel the rest, flatten filled legs).
+#[tokio::test]
+async fn halted_instance_partial_entry_gives_up_instead_of_reissuing() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].session_halted = true;
+    let mut state = positionless_pending_entry_state();
+    state.pending_entry.as_mut().unwrap().placed_at = Instant::now();
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    // One leg partially filled, nothing open on the venue.
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from([vec![("en-1".to_string(), dec("0.004"))]]),
+    );
+    let mut price_map = HashMap::new();
+    for (sym, px) in [("AAA", "100"), ("BBB", "50")] {
+        price_map.insert(
+            sym.to_string(),
+            SymbolSnapshot {
+                price: dec(px),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        );
+    }
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(
+        connector.calls.lock().unwrap().is_empty(),
+        "no opening order may be (re)issued while halted"
+    );
+    assert!(
+        connector.modify_calls.lock().unwrap().is_empty(),
+        "no amend either"
+    );
+    assert!(engine.instances[0]
+        .states
+        .get("AAA/BBB")
+        .unwrap()
+        .pending_entry
+        .is_none());
+    assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
+}
+
+/// Codex P1 (pairtrade#282): exposure on a pair the flatten did not cover
+/// must not hide behind the marker.
+#[tokio::test]
+async fn flatten_booking_in_progress_requires_pair_covered_by_marker() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    engine.cfg.universe.push(PairSpec {
+        base: "CCC".to_string(),
+        quote: "DDD".to_string(),
+    });
+    // A position that appeared after the flatten was armed.
+    engine.instances[0]
+        .states
+        .insert("CCC/DDD".to_string(), seeded_position_state());
+    assert!(engine.flatten_booking_in_progress(0, "AAA/BBB"));
+    assert!(
+        !engine.flatten_booking_in_progress(0, "CCC/DDD"),
+        "uncovered exposure is not 'being booked'"
+    );
+}
+
+/// Codex P1 (pairtrade#282): a re-arm (halted-exposure retry) must merge
+/// into the existing attribution state, keeping the original baseline and
+/// full-size position snapshot.
+#[tokio::test]
+async fn rearm_external_flatten_merges_instead_of_overwriting() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    let first = engine.instances[0].external_flatten_fills.clone().unwrap();
+    // First flatten half-filled; sync rewrote the local sizes; a retry arms again.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill(
+            "cl-1",
+            "t-1",
+            Some(OrderSide::Short),
+            "0.005",
+            Some("0.495"),
+        ),
+    );
+    {
+        let pos = engine.instances[0]
+            .states
+            .get_mut("AAA/BBB")
+            .unwrap()
+            .position
+            .as_mut()
+            .unwrap();
+        pos.entry_size_a = Some(dec("0.005"));
+    }
+    let baseline2 = engine.snapshot_fill_baseline(0).await;
+    assert_eq!(
+        baseline2["AAA"].len(),
+        2,
+        "retry baseline would include the first flatten's fill"
+    );
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test_reflatten".to_string(),
+        baseline2,
+        HashSet::from(["ex-9".to_string()]),
+        HashSet::new(),
+        1_700_000_400,
+    );
+    let merged = engine.instances[0].external_flatten_fills.clone().unwrap();
+    assert_eq!(
+        merged.baseline["AAA"], first.baseline["AAA"],
+        "original baseline kept"
+    );
+    assert_eq!(
+        merged.positions["AAA/BBB"].entry_size_a,
+        Some(dec("0.01")),
+        "full-size snapshot kept"
+    );
+    assert!(merged.attributable_order_ids.contains("ex-9"));
+    assert_eq!(
+        engine.instances[0].external_flatten_reason.as_deref(),
+        Some("session_dd_test"),
+        "original reason kept"
+    );
+
+    // And the booking still prices the whole position: second half lands.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill(
+            "cl-3",
+            "t-3",
+            Some(OrderSide::Short),
+            "0.005",
+            Some("0.495"),
+        ),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!((pnl + 0.05).abs() < 1e-9, "pnl={pnl}");
+}
+
+/// Codex P2 (pairtrade#282): "gone from open orders" may mean executed. A
+/// tracked entry leg that shows a fill keeps the pending so the halt-aware
+/// reconcile flattens it.
+#[tokio::test]
+async fn cancel_pending_entries_for_halt_keeps_entry_that_filled_during_cancel() {
+    let connector = Arc::new(DummyConnector::default());
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("en-1", "t-1", Some(OrderSide::Long), "0.01", Some("1.00")),
+    );
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+
+    engine.cancel_pending_entries_for_halt(0).await;
+
+    assert!(
+        engine.instances[0]
+            .states
+            .get("AAA/BBB")
+            .unwrap()
+            .pending_entry
+            .is_some(),
+        "an executed leg must stay owned by the reconcile loop"
+    );
+}
+
+/// Codex P1 (pairtrade#282): a zero-fill post-only entry retained across a
+/// halt must be cancelled, never kept alive or reissued as taker.
+#[tokio::test]
+async fn halted_zero_fill_post_only_entry_is_cancelled_not_reissued() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].session_halted = true;
+    let mut state = positionless_pending_entry_state();
+    {
+        let pending = state.pending_entry.as_mut().unwrap();
+        pending.post_only_hybrid = true;
+        pending.placed_at = Instant::now();
+    }
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    let mut price_map = HashMap::new();
+    for (sym, px) in [("AAA", "100"), ("BBB", "50")] {
+        price_map.insert(
+            sym.to_string(),
+            SymbolSnapshot {
+                price: dec(px),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        );
+    }
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(
+        connector.calls.lock().unwrap().is_empty(),
+        "no taker reissue"
+    );
+    assert!(engine.instances[0]
+        .states
+        .get("AAA/BBB")
+        .unwrap()
+        .pending_entry
+        .is_none());
+    assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
+}
+
+/// Codex P1 (pairtrade#282): the halted give-up path must keep the tracked
+/// ids while the venue still lists the remainder open, so a later pass can
+/// cancel it; nothing may be reissued meanwhile.
+#[tokio::test]
+async fn halted_partial_entry_keeps_pending_until_cancel_confirmed() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].session_halted = true;
+    let mut state = positionless_pending_entry_state();
+    state.pending_entry.as_mut().unwrap().placed_at = Instant::now();
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from([vec![("en-1".to_string(), dec("0.004"))]]),
+    );
+    // The BBB remainder stays listed open after the cancel request.
+    connector.open_ids_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from([vec!["en-2".to_string()]]),
+    );
+    let mut price_map = HashMap::new();
+    for (sym, px) in [("AAA", "100"), ("BBB", "50")] {
+        price_map.insert(
+            sym.to_string(),
+            SymbolSnapshot {
+                price: dec(px),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        );
+    }
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(connector.calls.lock().unwrap().is_empty(), "no reissue");
+    assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
+    assert!(
+        engine.instances[0]
+            .states
+            .get("AAA/BBB")
+            .unwrap()
+            .pending_entry
+            .is_some(),
+        "tracked ids kept while the remainder is still open"
+    );
+}
+
+/// Codex P1 (pairtrade#282): the halted zero-fill post-only branch keeps the
+/// pending while the venue still lists the order open.
+#[tokio::test]
+async fn halted_zero_fill_post_only_entry_kept_when_cancel_unconfirmed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.open_ids_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from([vec!["en-1".to_string()]]),
+    );
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].session_halted = true;
+    let mut state = positionless_pending_entry_state();
+    state.pending_entry.as_mut().unwrap().post_only_hybrid = true;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    let price_map: HashMap<String, SymbolSnapshot> = HashMap::new();
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(connector.calls.lock().unwrap().is_empty(), "no reissue");
+    assert!(
+        engine.instances[0]
+            .states
+            .get("AAA/BBB")
+            .unwrap()
+            .pending_entry
+            .is_some(),
+        "pending kept while still listed open"
+    );
+}
+
+/// Codex P2 (pairtrade#282): a pending entry retained because it executed
+/// during its halt-time cancel is covered by the flatten attribution —
+/// baseline over its symbols and marker armed — even though no local
+/// position exists yet.
+#[tokio::test]
+async fn halt_flatten_arms_attribution_for_entry_filled_during_cancel() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("en-1", "t-1", Some(OrderSide::Long), "0.01", Some("1.00")),
+    );
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+
+    engine
+        .submit_halt_flatten(0, "session_dd_test", 1_700_000_300)
+        .await;
+
+    let inst = &engine.instances[0];
+    assert!(
+        inst.states.get("AAA/BBB").unwrap().pending_entry.is_some(),
+        "executed-during-cancel entry stays owned"
+    );
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 1);
+    assert!(inst.external_flatten_reason.is_some(), "marker armed");
+    let fills = inst.external_flatten_fills.as_ref().unwrap();
+    assert!(fills.baseline.contains_key("AAA") && fills.baseline.contains_key("BBB"));
+}
+
+/// Codex P1 (pairtrade#282): two flattened pairs sharing a leg symbol would
+/// both absorb the same per-symbol fills; attribution declines instead.
+#[tokio::test]
+async fn flatten_booking_declines_when_covered_pairs_share_a_symbol() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.universe = vec![
+        PairSpec {
+            base: "AAA".to_string(),
+            quote: "BBB".to_string(),
+        },
+        PairSpec {
+            base: "AAA".to_string(),
+            quote: "CCC".to_string(),
+        },
+    ];
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    engine.instances[0]
+        .states
+        .insert("AAA/CCC".to_string(), seeded_position_state());
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        HashSet::new(),
+        1_700_000_300,
+    );
+    engine.instances[0]
+        .external_flatten_fills
+        .as_mut()
+        .unwrap()
+        .submitted_at = Instant::now() - std::time::Duration::from_secs(120);
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.02", Some("1.98")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+    push_fill(
+        &connector,
+        "CCC",
+        cached_fill("cl-3", "t-3", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let content = std::fs::read_to_string(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert_eq!(content.lines().count(), 2);
+    assert!(content
+        .lines()
+        .all(|l| l.contains("\"source\":\"recovery_no_pnl\"")));
+    assert_eq!(engine.instances[0].total_trades, 0);
+}
+
+/// Codex P1 (pairtrade#282): the stale-entry timeout branch keeps the
+/// tracked ids while the venue still lists the legs open after the cancel.
+#[tokio::test]
+async fn stale_entry_timeout_keeps_pending_until_cancel_confirmed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.open_ids_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from([vec!["en-1".to_string()]]),
+    );
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.order_timeout_secs = 1;
+    let mut state = positionless_pending_entry_state();
+    state.pending_entry.as_mut().unwrap().placed_at =
+        Instant::now() - std::time::Duration::from_secs(5);
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    let price_map: HashMap<String, SymbolSnapshot> = HashMap::new();
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(connector.calls.lock().unwrap().is_empty(), "no reissue");
+    assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
+    assert!(
+        engine.instances[0]
+            .states
+            .get("AAA/BBB")
+            .unwrap()
+            .pending_entry
+            .is_some(),
+        "tracked ids kept while still listed open"
+    );
+}
+
+/// Codex P1 (pairtrade#282): an opening fill of an entry retained through
+/// the halt must not enter the flatten VWAP even when reported side-less.
+#[tokio::test]
+async fn flatten_booking_excludes_retained_entry_fills() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    let mut state = seeded_position_state();
+    state.pending_entry = positionless_pending_entry_state().pending_entry;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        HashSet::new(),
+        1_700_000_300,
+    );
+    // Post-baseline: the retained entry leg fills side-less, then the flatten.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("en-1", "t-0", None, "0.01", Some("1.00")),
+    );
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    assert_eq!(
+        json["exit_price_a"], 99.0,
+        "opening fill excluded from the VWAP"
+    );
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!((pnl + 0.05).abs() < 1e-9, "pnl={pnl}");
+}
+
+/// Codex P1 (pairtrade#282): a persisted halt restored after the trigger was
+/// disabled (max_session_loss_bps = 0) still re-flattens residual exposure.
+#[tokio::test]
+async fn halted_instance_reflattens_even_when_threshold_disabled() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.risk.max_session_loss_bps = 0;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0].session_halted = true;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+
+    assert!(engine.evaluate_session_dd(0).await, "stays halted");
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Codex P1/P2 (pairtrade#282): a pair whose entry was retained through the
+/// halt is covered by the flatten — the planning gate applies once it is
+/// promoted, and the marker stays armed while it awaits reconciliation.
+#[tokio::test]
+async fn flatten_covers_retained_pending_entry_pairs() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        HashSet::new(),
+        1_700_000_300,
+    );
+    let fills = engine.instances[0].external_flatten_fills.as_ref().unwrap();
+    assert!(fills.covered_pairs.contains("AAA/BBB"));
+    assert!(fills.excluded_order_ids.contains("en-1") && fills.excluded_order_ids.contains("en-2"));
+    // Not yet promoted: nothing to gate.
+    assert!(!engine.flatten_booking_in_progress(0, "AAA/BBB"));
+    // Promoted by reconcile: planning stands down.
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .position = seeded_position_state().position;
+    assert!(engine.flatten_booking_in_progress(0, "AAA/BBB"));
+}
+
+/// Codex P1 (pairtrade#282): entry ids cancelled right before the flatten
+/// stay excluded from attribution even when the cancel looked confirmed.
+#[tokio::test]
+async fn halt_flatten_keeps_cancelled_entry_ids_excluded() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    engine.cfg.universe.push(PairSpec {
+        base: "CCC".to_string(),
+        quote: "DDD".to_string(),
+    });
+    let mut other = PairState::new(2.0);
+    other.pending_entry = Some(PendingOrders {
+        legs: vec![
+            flatten_test_leg("CCC", "en-7", OrderSide::Long, "0.01"),
+            flatten_test_leg("DDD", "en-8", OrderSide::Short, "0.02"),
+        ],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    engine.instances[0]
+        .states
+        .insert("CCC/DDD".to_string(), other);
+
+    engine
+        .submit_halt_flatten(0, "session_dd_test", 1_700_000_300)
+        .await;
+
+    let inst = &engine.instances[0];
+    assert!(
+        inst.states.get("CCC/DDD").unwrap().pending_entry.is_none(),
+        "cancel confirmed (no open orders, no fills) drops the pending"
+    );
+    let fills = inst.external_flatten_fills.as_ref().unwrap();
+    assert!(
+        fills.excluded_order_ids.contains("en-7") && fills.excluded_order_ids.contains("en-8"),
+        "cancelled entry ids remain excluded for late fill events"
+    );
+}
+
+/// Codex P1 (pairtrade#282): the shared-symbol guard must also see a
+/// retained pending entry on an overlapping pair, not only positions.
+#[tokio::test]
+async fn flatten_booking_declines_when_retained_entry_pair_shares_a_symbol() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.universe = vec![
+        PairSpec {
+            base: "AAA".to_string(),
+            quote: "BBB".to_string(),
+        },
+        PairSpec {
+            base: "AAA".to_string(),
+            quote: "CCC".to_string(),
+        },
+    ];
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    let mut other = PairState::new(2.0);
+    other.pending_entry = Some(PendingOrders {
+        legs: vec![
+            flatten_test_leg("AAA", "en-7", OrderSide::Long, "0.01"),
+            flatten_test_leg("CCC", "en-8", OrderSide::Short, "0.02"),
+        ],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    engine.instances[0]
+        .states
+        .insert("AAA/CCC".to_string(), other);
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        HashSet::new(),
+        1_700_000_300,
+    );
+    engine.instances[0]
+        .external_flatten_fills
+        .as_mut()
+        .unwrap()
+        .submitted_at = Instant::now() - std::time::Duration::from_secs(120);
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.02", Some("1.98")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "recovery_no_pnl");
+    assert_eq!(engine.instances[0].total_trades, 0);
 }

@@ -61,6 +61,22 @@ struct ExitFillPnlContext<'a> {
     now_ts: i64,
 }
 
+/// Inputs for `PairTradeEngine::exit_pnl_record_from_prices`: everything the
+/// exit-PnL record needs once the per-leg exit prices are known.
+/// bot-strategy#932.
+pub(in crate::pairtrade) struct ExitPnlInputs<'a> {
+    pub(in crate::pairtrade) inst_id: &'a str,
+    pub(in crate::pairtrade) key: &'a str,
+    pub(in crate::pairtrade) pos: &'a Position,
+    pub(in crate::pairtrade) exit_price_a: Decimal,
+    pub(in crate::pairtrade) exit_price_b: Decimal,
+    pub(in crate::pairtrade) funding_history: &'a funding_history::FundingHistory,
+    pub(in crate::pairtrade) z_exit: Option<f64>,
+    pub(in crate::pairtrade) beta_val: Option<f64>,
+    pub(in crate::pairtrade) now_ts: i64,
+    pub(in crate::pairtrade) reason: &'a str,
+}
+
 /// Pure outcome of the entry partial-fill reissue policy. Extracted from
 /// `reconcile_pending_orders` so the retry/escalation thresholds are
 /// auditable and unit-testable without driving the async state machine
@@ -163,8 +179,37 @@ impl PairTradeEngine {
             "exit",
             quote,
         )?;
+        let reason = ctx.state.pending_exit_reason.unwrap_or("unknown");
+        Self::exit_pnl_record_from_prices(ExitPnlInputs {
+            inst_id: ctx.inst_id,
+            key: ctx.key,
+            pos,
+            exit_price_a,
+            exit_price_b,
+            funding_history: ctx.funding_history,
+            z_exit: ctx.z_exit,
+            beta_val: ctx.beta_val,
+            now_ts: ctx.now_ts,
+            reason,
+        })
+    }
+
+    /// Shared tail of the exit-PnL record assembly: given the actual exit
+    /// prices (fill VWAP for a strategy exit, or the post-flatten fill VWAP
+    /// for an out-of-band risk flatten, bot-strategy#932), compute realized
+    /// PnL, fold in funding carry, emit the close gross/funding bps
+    /// histograms, and stamp the close reason. Returns
+    /// `(record, realized_pnl, funding_carry_usd)`; `None` when the
+    /// position lacks entry prices/sizes.
+    pub(in crate::pairtrade) fn exit_pnl_record_from_prices(
+        inp: ExitPnlInputs<'_>,
+    ) -> Option<(PnlLogRecord, f64, f64)> {
+        let pos = inp.pos;
+        let (base, quote) = inp.key.split_once('/')?;
+        let exit_price_a = inp.exit_price_a;
+        let exit_price_b = inp.exit_price_b;
         let pnl = compute_pnl(pos, exit_price_a, exit_price_b).and_then(|p| p.to_f64())?;
-        let hold_secs = Some(ctx.now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
+        let hold_secs = Some(inp.now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
         let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
         let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
         let (carry_usd, ticks_observed) = match (
@@ -175,11 +220,11 @@ impl PairTradeEngine {
         ) {
             (Some(sa), Some(pa), Some(sb), Some(pb)) => {
                 funding_history::compute_carry_usd(funding_history::FundingCarryInput {
-                    history: ctx.funding_history,
+                    history: inp.funding_history,
                     base_symbol: base,
                     quote_symbol: quote,
                     open_ts: pos.entered_ts,
-                    close_ts: ctx.now_ts,
+                    close_ts: inp.now_ts,
                     direction: pos.direction,
                     entry_size_a: sa,
                     entry_price_a: pa,
@@ -190,15 +235,15 @@ impl PairTradeEngine {
             _ => (0.0, 0),
         };
         let mut record =
-            PnlLogRecord::new(base, quote, pos.direction, pnl, ctx.now_ts, "exit_fill")
+            PnlLogRecord::new(base, quote, pos.direction, pnl, inp.now_ts, "exit_fill")
                 .with_trade_details(PnlTradeDetails {
                     entry_a,
                     entry_b,
                     exit_a: exit_price_a.to_f64(),
                     exit_b: exit_price_b.to_f64(),
-                    beta: ctx.beta_val,
+                    beta: inp.beta_val,
                     z_entry: pos.entry_z,
-                    z_exit: ctx.z_exit,
+                    z_exit: inp.z_exit,
                     hold_secs,
                 });
         if ticks_observed > 0 {
@@ -210,7 +255,7 @@ impl PairTradeEngine {
         // Option<&'static str> that apply_post_exit_state consumes
         // immediately after this — read without .take() so the
         // close-reason counter still receives it (bot-strategy#421).
-        let reason = ctx.state.pending_exit_reason.unwrap_or("unknown");
+        let reason = inp.reason;
         if let (Some(sa), Some(pa), Some(sb), Some(pb)) = (
             pos.entry_size_a,
             pos.entry_price_a,
@@ -223,11 +268,11 @@ impl PairTradeEngine {
                 let notional = a + b;
                 if notional > 0.0 {
                     super::super::prom::CLOSE_GROSS_PNL_BPS
-                        .with_label_values(&[ctx.inst_id, ctx.key, reason])
+                        .with_label_values(&[inp.inst_id, inp.key, reason])
                         .observe(pnl / notional * 10_000.0);
                     if ticks_observed > 0 {
                         super::super::prom::CLOSE_FUNDING_BPS
-                            .with_label_values(&[ctx.inst_id, ctx.key])
+                            .with_label_values(&[inp.inst_id, inp.key])
                             .observe(carry_usd / notional * 10_000.0);
                     }
                 }
@@ -276,7 +321,7 @@ impl PairTradeEngine {
     /// `write_pnl_record` always bumps total_trades / total_pnl (persisted,
     /// bot-strategy#320), so the snapshot is dirty regardless of pnl sign.
     /// Pure relocation from `reconcile_exit` (bot-strategy#502).
-    fn record_exit_realized_pnl(
+    pub(in crate::pairtrade) fn record_exit_realized_pnl(
         &mut self,
         inst_idx: usize,
         now_ts: i64,
@@ -834,11 +879,23 @@ impl PairTradeEngine {
         } else if filled_qtys.values().any(|qty| *qty > Decimal::ZERO) {
             let max_retries = self.cfg.entry_partial_fill_max_retries;
             let giveup_retries = self.cfg.entry_partial_fill_giveup_retries;
-            let decision = Self::decide_partial_fill_reissue(
+            let mut decision = Self::decide_partial_fill_reissue(
                 pending.hedge_retry_count,
                 max_retries,
                 giveup_retries,
             );
+            // bot-strategy#932 (Codex review, pairtrade#282): a session-halted
+            // instance must never complete a partial entry with fresh opening
+            // orders — a pending entry retained because its halt-time cancel
+            // failed or went unconfirmed takes the give-up path instead
+            // (cancel the rest, flatten the filled legs).
+            if self.instances[inst_idx].session_halted && !decision.give_up {
+                log::warn!(
+                    "[ORDER][GIVEUP] {} partial entry on a session-halted instance; flattening instead of reissuing",
+                    key
+                );
+                decision.give_up = true;
+            }
             let next_retry = decision.next_retry;
             // bot-strategy#480: hard cap on the reissue loop. Once
             // `hedge_retry_count` crosses this, give up entirely —
@@ -885,18 +942,42 @@ impl PairTradeEngine {
                     );
                 let variant_id = self.instances[inst_idx].id.clone();
                 self.cancel_pending_orders(&pending).await?;
-                self.write_recovery_no_pnl_record(
-                    inst_idx,
-                    key,
-                    pending.direction,
-                    "entry_reissue_giveup",
-                    now_ts,
-                    price_map,
-                );
+                // bot-strategy#932 (Codex review, pairtrade#282): the tracked
+                // ids must survive until the venue confirms the cancel.
+                // Otherwise a still-live remainder keeps filling after the
+                // flatten below with nobody able to cancel it. Flatten what
+                // filled either way; keep the pending (and retry next tick)
+                // when the cancel is unconfirmed.
+                let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+                for leg in &pending.legs {
+                    match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                        Some((_, ids)) => ids.push(leg.order_id.clone()),
+                        None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                    }
+                }
+                let cancel_confirmed = self.tracked_orders_gone(&per_symbol).await;
+                if cancel_confirmed {
+                    self.write_recovery_no_pnl_record(
+                        inst_idx,
+                        key,
+                        pending.direction,
+                        "entry_reissue_giveup",
+                        now_ts,
+                        price_map,
+                    );
+                }
                 self.force_close_all_positions(key, "entry_reissue_giveup")
                     .await;
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                    state.pending_entry = None;
+                    if cancel_confirmed {
+                        state.pending_entry = None;
+                    } else {
+                        log::warn!(
+                            "[ORDER][GIVEUP] {} cancel not confirmed by the venue; keeping pending entry for retry",
+                            key
+                        );
+                        state.pending_entry = Some(pending);
+                    }
                 }
                 super::super::prom::ENTRY_REISSUE_GIVEUP_TOTAL
                     .with_label_values(&[&variant_id, key])
@@ -990,6 +1071,36 @@ impl PairTradeEngine {
                 state.pending_entry = None;
             }
             return Ok(true);
+        } else if pending.post_only_hybrid && self.instances[inst_idx].session_halted {
+            // bot-strategy#932 (Codex review, pairtrade#282): a zero-fill
+            // post-only entry retained across a session halt must neither be
+            // kept alive nor fall back to taker — cancel it and let it go.
+            log::warn!(
+                "[ORDER] {} post-only entry on a session-halted instance; cancelling instead of taker fallback",
+                key
+            );
+            self.cancel_pending_orders(&pending).await?;
+            let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+            for leg in &pending.legs {
+                match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                    Some((_, ids)) => ids.push(leg.order_id.clone()),
+                    None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                }
+            }
+            // Keep the tracked ids until the venue confirms the cancel; a
+            // live non-reduce-only order must never lose its owner.
+            let cancel_confirmed = self.tracked_orders_gone(&per_symbol).await;
+            if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
+                state.pending_entry = if cancel_confirmed {
+                    None
+                } else {
+                    log::warn!(
+                        "[ORDER] {} cancel not confirmed by the venue; keeping halted pending entry for retry",
+                        key
+                    );
+                    Some(pending)
+                };
+            }
         } else if pending.post_only_hybrid {
             let recon_pp = self.pair_params_for(inst_idx, key).clone();
             let recon_pp = &recon_pp;
@@ -1043,6 +1154,7 @@ impl PairTradeEngine {
             }
         } else if pending.placed_at.elapsed() >= timeout {
             // Partial fill or stuck orders; cancel and flatten any filled leg
+            let mut cancel_confirmed = true;
             if status.open_remaining > 0 {
                 log::warn!(
                     "[ORDER] {} entry orders stale ({}s), cancelling {} legs",
@@ -1067,6 +1179,17 @@ impl PairTradeEngine {
                         );
                 }
                 self.cancel_pending_orders(&pending).await?;
+                // bot-strategy#932 (Codex review, pairtrade#282): keep the
+                // tracked ids until the venue confirms the cancel, otherwise
+                // a live non-reduce-only remainder loses its owner.
+                let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+                for leg in &pending.legs {
+                    match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                        Some((_, ids)) => ids.push(leg.order_id.clone()),
+                        None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                    }
+                }
+                cancel_confirmed = self.tracked_orders_gone(&per_symbol).await;
             }
             let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
             let mut retry_count = pending.hedge_retry_count;
@@ -1092,6 +1215,17 @@ impl PairTradeEngine {
                     );
                     pending.placed_at = Instant::now();
                     state.pending_entry = Some(pending);
+                } else if !cancel_confirmed {
+                    log::warn!(
+                        "[ORDER] {} stale entry cancel not confirmed by the venue; keeping pending for retry",
+                        key
+                    );
+                    pending.placed_at = Instant::now();
+                    state.pending_entry = Some(pending);
+                    if flattened_any {
+                        state.position = None;
+                        state.recovery_recorded = false;
+                    }
                 } else {
                     state.last_exit_at = Some(Instant::now());
                     state.last_exit_ts = Some(now_ts);

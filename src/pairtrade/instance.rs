@@ -5,7 +5,7 @@
 //! reporter, risk counters, and pair-parameter overlay. The engine holds a
 //! `Vec<StrategyInstance>` and addresses them by index.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,8 +14,49 @@ use dex_connector::DexConnector;
 use super::config::PairParams;
 use super::pnl_log::PnlLogger;
 use super::risk_io;
-use super::state::PairState;
+use super::state::{PairState, Position};
 use super::status::StatusReporter;
+
+/// Fill-cache baseline captured immediately before an out-of-band flatten
+/// (session-DD halt) was submitted, so the exchange-snapshot clear can
+/// isolate the flatten's own fills from anything already sitting in the
+/// connector's per-symbol fill cache and book real exit PnL from them.
+/// Lighter fills carry no timestamp (`filled_ts_ms = None`), so "new since
+/// the flatten" can only be established by set difference against this
+/// baseline. bot-strategy#932.
+#[derive(Debug, Clone)]
+pub(in crate::pairtrade) struct ExternalFlattenFills {
+    /// symbol -> identity keys (`PairTradeEngine::fill_identity`) of every
+    /// fill present in the cache when the flatten was submitted. A symbol
+    /// missing from the map means the baseline fetch failed for it; the
+    /// booking path then refuses to attribute fills for that symbol.
+    pub(in crate::pairtrade) baseline: HashMap<String, HashSet<String>>,
+    /// Order ids of the strategy exit legs that were still pending when the
+    /// flatten was submitted. Their fills close the same position, so they
+    /// are attributable even when they already sat in the baseline.
+    pub(in crate::pairtrade) attributable_order_ids: HashSet<String>,
+    /// Order ids (client and exchange form) of entry legs that were still
+    /// pending when the flatten was armed. Their fills are *opening* fills
+    /// and must never enter the flatten VWAP, even when the connector
+    /// reports them side-less.
+    pub(in crate::pairtrade) excluded_order_ids: HashSet<String>,
+    /// Pair keys the flatten covers: every pair that held a position or a
+    /// retained pending entry when it was armed. Drives the planning gate
+    /// and the marker liveness, independent of whether the pair's position
+    /// has been promoted locally yet.
+    pub(in crate::pairtrade) covered_pairs: HashSet<String>,
+    /// The positions (per pair key) as they were when the flatten was
+    /// submitted. The per-tick exchange-snapshot sync rewrites the local
+    /// position's sizes from the venue, so an intermediate partially-closed
+    /// snapshot would otherwise shrink the "held" quantities the booking
+    /// prices the flatten against.
+    pub(in crate::pairtrade) positions: HashMap<String, Position>,
+    /// Wall-clock submit time; bounds how long the snapshot clear waits for
+    /// the flatten fills to land before falling back to `recovery_no_pnl`.
+    pub(in crate::pairtrade) submitted_at: Instant,
+    /// Replay-aware submit timestamp (seconds), for diagnostics.
+    pub(in crate::pairtrade) submitted_ts: i64,
+}
 
 /// Max age of the per-instance equity cache before `refresh_equity_if_needed`
 /// fetches a fresh value from the exchange. Now a low-frequency dashboard tick:
@@ -223,6 +264,15 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// of the generic `exchange_snapshot_clear`. Not persisted.
     /// bot-strategy#514.
     pub(in crate::pairtrade) external_flatten_reason: Option<String>,
+    /// Companion to `external_flatten_reason`: the fill-cache baseline
+    /// taken right before the flatten was submitted. Set and cleared
+    /// together with the reason marker. Not persisted. bot-strategy#932.
+    pub(in crate::pairtrade) external_flatten_fills: Option<ExternalFlattenFills>,
+    /// Last time the sticky session halt re-issued a flatten because a
+    /// position (re)appeared on a halted instance — e.g. an entry leg that
+    /// filled after the one-shot halt flatten. Rate-limits the retry. Not
+    /// persisted. bot-strategy#932.
+    pub(in crate::pairtrade) halt_reflatten_at: Option<Instant>,
     /// Pairs whose NEW entries are fail-closed because the post-entry
     /// venue-position reconciliation (bot-strategy#721) found an exposure
     /// mismatch it could not repair (trim failed, position fetch failed,

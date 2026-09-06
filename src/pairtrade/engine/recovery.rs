@@ -22,16 +22,35 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use dex_connector::{DexError, PositionSnapshot};
+use dex_connector::{DexError, FilledOrder, OrderSide, PositionSnapshot};
 use rust_decimal::Decimal;
 use tokio::time::sleep;
 
 use super::super::engine;
+use super::super::instance::ExternalFlattenFills;
 use super::super::market::SymbolSnapshot;
 use super::super::pnl_log;
 use super::super::state::{Position, PositionDirection};
 use super::super::PairTradeEngine;
+use super::reconcile::ExitPnlInputs;
 use crate::email_client::EmailClient;
+
+/// How long the exchange-snapshot clear waits for an out-of-band flatten's
+/// fill events before giving up on booking them (bot-strategy#932). Also
+/// bounds `flatten_booking_in_progress`, so a flatten that never clears on
+/// the venue cannot suppress normal exit planning for longer than this.
+pub(in crate::pairtrade) const EXTERNAL_FLATTEN_FILL_GRACE: Duration = Duration::from_secs(30);
+
+/// Outcome of `PairTradeEngine::try_book_external_flatten`. bot-strategy#932.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pairtrade) enum FlattenBooking {
+    /// `exit_fill` record written and realized PnL recorded.
+    Booked,
+    /// Flatten fills not visible yet; keep the local position and retry.
+    Deferred,
+    /// Cannot attribute fills with full coverage; write `recovery_no_pnl`.
+    Unavailable,
+}
 
 impl PairTradeEngine {
     fn configured_startup_symbols(&self) -> Vec<String> {
@@ -496,6 +515,7 @@ impl PairTradeEngine {
         // is deferred past the loop so the recovery_no_pnl context record is
         // written while the entry context (z/beta/hold) is still in state.
         let mut cleared_positions: Vec<(String, &'static str, bool)> = Vec::new();
+        let flatten_armed = self.instances[inst_idx].external_flatten_reason.is_some();
         for pair in &self.cfg.universe {
             let key = format!("{}/{}", pair.base, pair.quote);
             let log_warn = self.should_log_position_warn(&key);
@@ -509,7 +529,22 @@ impl PairTradeEngine {
 
             if state.pending_entry.is_some() || state.pending_exit.is_some() {
                 // Keep pending orders; reconciliation handles timeouts/hedging.
-                continue;
+                // Exception (bot-strategy#932): an armed out-of-band flatten
+                // that already emptied the venue supersedes whatever was
+                // pending — retire it locally so the clear below can book
+                // the flatten instead of waiting on orders that can no
+                // longer fill against a position.
+                let superseded =
+                    flatten_armed && base.is_none() && quote.is_none() && state.position.is_some();
+                if !superseded {
+                    continue;
+                }
+                log::warn!(
+                    "[FLATTEN_PNL] {} pending orders superseded by out-of-band flatten (venue flat)",
+                    key
+                );
+                state.pending_entry = None;
+                state.pending_exit = None;
             }
 
             match (base, quote) {
@@ -629,7 +664,8 @@ impl PairTradeEngine {
         // z/beta/hold context. Skipped when the reconcile recovery path
         // already recorded this close (`recovery_recorded`).
         if !cleared_positions.is_empty() {
-            let flatten_reason = self.instances[inst_idx].external_flatten_reason.take();
+            let flatten_reason = self.instances[inst_idx].external_flatten_reason.clone();
+            let mut flatten_deferred = false;
             for (key, kind, guard_after) in cleared_positions {
                 let record_direction = match self.instances[inst_idx].states.get(&key) {
                     Some(state) => match state.position.as_ref() {
@@ -639,6 +675,50 @@ impl PairTradeEngine {
                     None => continue,
                 };
                 if let Some(direction) = record_direction {
+                    // bot-strategy#932: an out-of-band risk flatten realises
+                    // PnL on the venue. Book it from the flatten's own fills
+                    // (isolated via the pre-flatten cache baseline) as a
+                    // normal `exit_fill` so trade stats, realized_pnl_today
+                    // and the circuit breaker see the loss. Only the
+                    // pnl-less context record is written when the fills
+                    // cannot be attributed with full value coverage.
+                    if kind == "exchange_snapshot_clear" {
+                        if let Some(reason) = flatten_reason.as_deref() {
+                            match self
+                                .try_book_external_flatten(inst_idx, &key, reason, now_ts)
+                                .await
+                            {
+                                FlattenBooking::Booked => {
+                                    // Same post-exit transition as a filled
+                                    // strategy exit (cooldown stamps, defer
+                                    // window release, close-reason counter)
+                                    // so the pair does not re-enter without
+                                    // the exit cooldown after an ack (Codex
+                                    // review, pairtrade#282).
+                                    let inst_id = self.instances[inst_idx].id.clone();
+                                    let shared = self.per_pair_state.get(&key);
+                                    if let Some(state) =
+                                        self.instances[inst_idx].states.get_mut(&key)
+                                    {
+                                        state.pending_exit_reason = Some("risk_flatten");
+                                        super::super::apply_post_exit_state(
+                                            state, shared, direction, now_ts, &inst_id, &key,
+                                        );
+                                        state.position_guard = guard_after;
+                                    }
+                                    continue;
+                                }
+                                FlattenBooking::Deferred => {
+                                    // Keep the local position one more tick
+                                    // so the next snapshot sync retries once
+                                    // the fill events have landed.
+                                    flatten_deferred = true;
+                                    continue;
+                                }
+                                FlattenBooking::Unavailable => {}
+                            }
+                        }
+                    }
                     let reason = match kind {
                         "exchange_snapshot_clear" => flatten_reason.as_deref().unwrap_or(kind),
                         other => other,
@@ -653,6 +733,20 @@ impl PairTradeEngine {
                     state.recovery_recorded = false;
                 }
             }
+            // One-shot marker: consumed once every position this flatten
+            // covered has been booked or fallen back. A bulk close can
+            // surface pair by pair across snapshots, so keep it armed while
+            // any local position remains (Codex review, pairtrade#282). The
+            // risk-ack path drops it regardless.
+            let positions_remain = self.instances[inst_idx]
+                .states
+                .values()
+                .any(|s| s.position.is_some() || s.pending_entry.is_some());
+            if !flatten_deferred && !positions_remain {
+                let inst = &mut self.instances[inst_idx];
+                inst.external_flatten_reason = None;
+                inst.external_flatten_fills = None;
+            }
         }
 
         for (key, symbol, sign, size) in unhedged_closures {
@@ -661,6 +755,590 @@ impl PairTradeEngine {
         }
 
         Ok(())
+    }
+
+    /// Identity of a cached fill for set-difference against the pre-flatten
+    /// baseline. Lighter reports `trade_id` (unique per fill) but some
+    /// connectors leave it empty/zero, so the key also folds in order id,
+    /// size and value. bot-strategy#932.
+    pub(in crate::pairtrade) fn fill_identity(order: &FilledOrder) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            order.order_id,
+            order.trade_id,
+            order.filled_size.map(|v| v.to_string()).unwrap_or_default(),
+            order
+                .filled_value
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+        )
+    }
+
+    /// Snapshot the connector's per-symbol fill cache for every symbol of a
+    /// pair this instance currently holds. Call immediately *before*
+    /// submitting an out-of-band flatten (`close_all_positions`). A symbol
+    /// whose fetch fails is left out of the map, which makes
+    /// `try_book_external_flatten` refuse to attribute fills for it rather
+    /// than mistake stale cache entries for the flatten. bot-strategy#932.
+    pub(in crate::pairtrade) async fn snapshot_fill_baseline(
+        &self,
+        inst_idx: usize,
+    ) -> HashMap<String, HashSet<String>> {
+        let mut symbols: Vec<String> = Vec::new();
+        for pair in &self.cfg.universe {
+            let key = format!("{}/{}", pair.base, pair.quote);
+            // Pairs with a retained pending entry are included too: if that
+            // entry executed during its halt-time cancel, the flatten closes
+            // it and its fills must be attributable.
+            let held = self.instances[inst_idx]
+                .states
+                .get(&key)
+                .is_some_and(|s| s.position.is_some() || s.pending_entry.is_some());
+            if held {
+                symbols.push(pair.base.clone());
+                symbols.push(pair.quote.clone());
+            }
+        }
+        symbols.sort();
+        symbols.dedup();
+        let mut baseline: HashMap<String, HashSet<String>> = HashMap::new();
+        for symbol in symbols {
+            match self.connector.get_filled_orders(&symbol).await {
+                Ok(resp) => {
+                    baseline.insert(
+                        symbol,
+                        resp.orders.iter().map(Self::fill_identity).collect(),
+                    );
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[FLATTEN_PNL] {} fill baseline fetch failed for {}: {:?}",
+                        self.instances[inst_idx].id,
+                        symbol,
+                        err
+                    );
+                }
+            }
+        }
+        baseline
+    }
+
+    /// Arm the one-shot out-of-band flatten marker together with its fill
+    /// baseline. Called right after a successful flatten submission while
+    /// a local position still exists for the snapshot clear to consume it
+    /// on. bot-strategy#514 / #932.
+    pub(in crate::pairtrade) fn arm_external_flatten(
+        &mut self,
+        inst_idx: usize,
+        reason: String,
+        baseline: HashMap<String, HashSet<String>>,
+        attributable_order_ids: HashSet<String>,
+        excluded_order_ids: HashSet<String>,
+        now_ts: i64,
+    ) {
+        let inst = &mut self.instances[inst_idx];
+        let positions_now: HashMap<String, Position> = inst
+            .states
+            .iter()
+            .filter_map(|(key, state)| state.position.clone().map(|p| (key.clone(), p)))
+            .collect();
+        let mut excluded_now: HashSet<String> = inst
+            .states
+            .values()
+            .filter_map(|state| state.pending_entry.as_ref())
+            .flat_map(|pending| pending.legs.iter())
+            .flat_map(|leg| {
+                std::iter::once(leg.order_id.clone()).chain(leg.exchange_order_id.clone())
+            })
+            .collect();
+        // Entry ids cancelled just before the flatten stay excluded even
+        // when the cancel looked confirmed: a fill event can arrive later
+        // than the open-orders removal (Codex review, pairtrade#282).
+        excluded_now.extend(excluded_order_ids);
+        let covered_now: HashSet<String> = inst
+            .states
+            .iter()
+            .filter(|(_, state)| state.position.is_some() || state.pending_entry.is_some())
+            .map(|(key, _)| key.clone())
+            .collect();
+        match inst.external_flatten_fills.as_mut() {
+            // Re-arm (halted-exposure retry while the first flatten is still
+            // being booked): merge, never overwrite — the original baseline
+            // and full-size position snapshot must survive until the whole
+            // close is booked, otherwise the first flatten's fills would be
+            // excluded and PnL computed on the residual (Codex review,
+            // pairtrade#282). Only pairs/symbols new to this retry are added.
+            Some(existing) => {
+                for (symbol, seen) in baseline {
+                    existing.baseline.entry(symbol).or_insert(seen);
+                }
+                existing
+                    .attributable_order_ids
+                    .extend(attributable_order_ids);
+                existing.excluded_order_ids.extend(excluded_now);
+                existing.covered_pairs.extend(covered_now);
+                for (key, pos) in positions_now {
+                    existing.positions.entry(key).or_insert(pos);
+                }
+                existing.submitted_at = Instant::now();
+                existing.submitted_ts = now_ts;
+                if inst.external_flatten_reason.is_none() {
+                    inst.external_flatten_reason = Some(reason);
+                }
+            }
+            None => {
+                inst.external_flatten_reason = Some(reason);
+                inst.external_flatten_fills = Some(ExternalFlattenFills {
+                    baseline,
+                    attributable_order_ids,
+                    excluded_order_ids: excluded_now,
+                    covered_pairs: covered_now,
+                    positions: positions_now,
+                    submitted_at: Instant::now(),
+                    submitted_ts: now_ts,
+                });
+            }
+        }
+    }
+
+    /// Session-halt hygiene, run *before* the bulk flatten is submitted:
+    /// cancel every pending **entry** order of this instance (with or
+    /// without a local position — entry legs awaiting reconciliation are
+    /// exactly the case). A halted instance never retries the flatten, so an
+    /// entry leg that filled after it would recreate exposure nobody closes.
+    /// The local `pending_entry` is dropped only once the venue confirms the
+    /// tracked orders are gone; on a cancel error or an unconfirmed cancel it
+    /// is kept, so the normal reconcile loop keeps managing (and, on fill,
+    /// hedging/flattening) it. Cancels target the tracked order ids only.
+    /// bot-strategy#932.
+    pub(in crate::pairtrade) async fn cancel_pending_entries_for_halt(
+        &mut self,
+        inst_idx: usize,
+    ) -> HashSet<String> {
+        let mut processed_ids: HashSet<String> = HashSet::new();
+        let universe = self.cfg.universe.clone();
+        for pair in &universe {
+            let key = format!("{}/{}", pair.base, pair.quote);
+            let Some(pending) = self.instances[inst_idx]
+                .states
+                .get_mut(&key)
+                .and_then(|state| state.pending_entry.take())
+            else {
+                continue;
+            };
+            let inst_id = self.instances[inst_idx].id.clone();
+            let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+            let mut fill_ids: Vec<(String, Vec<String>)> = Vec::new();
+            for leg in &pending.legs {
+                match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                    Some((_, ids)) => ids.push(leg.order_id.clone()),
+                    None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                }
+                let mut ids = vec![leg.order_id.clone()];
+                ids.extend(leg.exchange_order_id.clone());
+                match fill_ids.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                    Some((_, v)) => v.extend(ids),
+                    None => fill_ids.push((leg.symbol.clone(), ids)),
+                }
+            }
+            for (_, ids) in &fill_ids {
+                processed_ids.extend(ids.iter().cloned());
+            }
+            let mut cancel_failed = false;
+            for (symbol, ids) in &per_symbol {
+                if let Err(err) = self
+                    .connector
+                    .cancel_orders(Some(symbol.clone()), ids.clone())
+                    .await
+                {
+                    log::warn!(
+                        "[FLATTEN_PNL] {} {} cancel_orders({}, {:?}) before halt flatten failed: {:?}",
+                        inst_id,
+                        key,
+                        symbol,
+                        ids,
+                        err
+                    );
+                    cancel_failed = true;
+                }
+            }
+            // "Gone from open orders" does not distinguish cancelled from
+            // executed: if any tracked leg shows a fill, keep the pending so
+            // the (halt-aware) reconcile flattens what filled instead of the
+            // fill vanishing unbooked (Codex review, pairtrade#282).
+            let confirmed = !cancel_failed
+                && self.tracked_orders_gone(&per_symbol).await
+                && !self.tracked_orders_filled(&fill_ids).await;
+            if confirmed {
+                log::warn!(
+                    "[FLATTEN_PNL] {} {} pending entry cancelled ahead of session halt (legs={})",
+                    inst_id,
+                    key,
+                    pending.legs.len()
+                );
+            } else {
+                log::warn!(
+                    "[FLATTEN_PNL] {} {} pending entry kept: cancel {} — reconcile keeps managing it",
+                    inst_id,
+                    key,
+                    if cancel_failed {
+                        "failed"
+                    } else {
+                        "not confirmed by the venue"
+                    }
+                );
+                if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                    state.pending_entry = Some(pending);
+                }
+            }
+        }
+        processed_ids
+    }
+
+    /// `true` when the connector's fill cache holds a fill for any of the
+    /// given tracked order ids (client or exchange form). A fetch error
+    /// counts as "filled" so the caller keeps the pending rather than
+    /// dropping an order that may have executed. bot-strategy#932.
+    pub(in crate::pairtrade) async fn tracked_orders_filled(
+        &self,
+        per_symbol: &[(String, Vec<String>)],
+    ) -> bool {
+        for (symbol, ids) in per_symbol {
+            match self.connector.get_filled_orders(symbol).await {
+                Ok(resp) => {
+                    if resp
+                        .orders
+                        .iter()
+                        .any(|f| !f.is_rejected && ids.contains(&f.order_id))
+                    {
+                        return true;
+                    }
+                }
+                Err(_) => return true,
+            }
+        }
+        false
+    }
+
+    /// Poll the venue (bounded, ~1.5 s worst case) until none of the given
+    /// tracked orders remain open. `true` only on positive confirmation; an
+    /// open-orders fetch error counts as "still open". Skipped (returns
+    /// `true`) in backtest replay where cancels are synchronous.
+    /// bot-strategy#932.
+    pub(in crate::pairtrade) async fn tracked_orders_gone(
+        &self,
+        per_symbol: &[(String, Vec<String>)],
+    ) -> bool {
+        const CANCEL_ACK_ATTEMPTS: usize = 10;
+        const CANCEL_ACK_DELAY_MS: u64 = 150;
+        if self.cfg.backtest_mode {
+            return true;
+        }
+        for attempt in 0..CANCEL_ACK_ATTEMPTS {
+            if attempt > 0 {
+                sleep(Duration::from_millis(CANCEL_ACK_DELAY_MS)).await;
+            }
+            let mut any_open = false;
+            for (symbol, ids) in per_symbol {
+                match self.connector.get_open_orders(symbol).await {
+                    Ok(open) => {
+                        if open.orders.iter().any(|o| ids.contains(&o.order_id)) {
+                            any_open = true;
+                        }
+                    }
+                    Err(_) => any_open = true,
+                }
+            }
+            if !any_open {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Right after an out-of-band flatten was submitted successfully: cancel
+    /// the still-open strategy **exit** legs of every pair this instance
+    /// holds a position in (by their tracked order ids — never a symbol-wide
+    /// sweep, which could catch the just-submitted flatten orders on an
+    /// asynchronous venue) and drop the local `pending_exit` so the snapshot
+    /// clear can consume the flatten. Returns the identifiers (client order
+    /// id and exchange order id, whichever the connector reports fills under)
+    /// of the retired exit legs — their fills close the same position and are
+    /// attributable to the flatten even when they pre-date the fill baseline.
+    /// Must not run before the flatten submission succeeded: on failure the
+    /// pendings stay live and keep closing the exposure. bot-strategy#932.
+    pub(in crate::pairtrade) async fn retire_pending_exits_for_flatten(
+        &mut self,
+        inst_idx: usize,
+    ) -> HashSet<String> {
+        let mut attributable: HashSet<String> = HashSet::new();
+        let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+        for pair in &self.cfg.universe {
+            let key = format!("{}/{}", pair.base, pair.quote);
+            let Some(state) = self.instances[inst_idx].states.get_mut(&key) else {
+                continue;
+            };
+            if state.position.is_none() {
+                continue;
+            }
+            let Some(pending) = state.pending_exit.take() else {
+                continue;
+            };
+            for leg in &pending.legs {
+                attributable.insert(leg.order_id.clone());
+                if let Some(exchange_id) = &leg.exchange_order_id {
+                    attributable.insert(exchange_id.clone());
+                }
+                match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                    Some((_, ids)) => ids.push(leg.order_id.clone()),
+                    None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                }
+            }
+            log::warn!(
+                "[FLATTEN_PNL] {} {} pending exit retired after out-of-band flatten (legs={})",
+                self.instances[inst_idx].id,
+                key,
+                pending.legs.len()
+            );
+        }
+        for (symbol, ids) in per_symbol {
+            if let Err(err) = self
+                .connector
+                .cancel_orders(Some(symbol.clone()), ids.clone())
+                .await
+            {
+                log::warn!(
+                    "[FLATTEN_PNL] {} cancel_orders({}, {:?}) after flatten failed: {:?}",
+                    self.instances[inst_idx].id,
+                    symbol,
+                    ids,
+                    err
+                );
+            }
+        }
+        attributable
+    }
+
+    /// `true` while an out-of-band flatten is armed for this instance, the
+    /// pair still has a local position (venue confirmation / fill booking
+    /// pending) and the flatten is younger than
+    /// `EXTERNAL_FLATTEN_FILL_GRACE`. Exit / re-hedge planning must stand
+    /// down in that window: the venue position is already gone, so a normal
+    /// exit would only submit a spurious close and install a `pending_exit`
+    /// that stops the fill attribution retries. The time bound keeps a
+    /// flatten that never clears from suppressing exits for good.
+    /// bot-strategy#932.
+    pub(in crate::pairtrade) fn flatten_booking_in_progress(
+        &self,
+        inst_idx: usize,
+        key: &str,
+    ) -> bool {
+        let inst = &self.instances[inst_idx];
+        if inst.external_flatten_reason.is_none() {
+            return false;
+        }
+        let Some(fills) = inst.external_flatten_fills.as_ref() else {
+            return false;
+        };
+        if fills.submitted_at.elapsed() >= EXTERNAL_FLATTEN_FILL_GRACE {
+            return false;
+        }
+        // Only a position the flatten actually covered is "being booked";
+        // exposure that appeared afterwards on another pair must not hide
+        // behind this marker (Codex review, pairtrade#282).
+        fills.covered_pairs.contains(key)
+            && inst.states.get(key).is_some_and(|s| s.position.is_some())
+    }
+
+    /// Try to book an out-of-band flatten (session-DD halt) as a real
+    /// `exit_fill` from the venue fills that arrived after the flatten was
+    /// submitted. Fill attribution rules (bot-strategy#932 / #750):
+    /// - only fills absent from the pre-flatten baseline count;
+    /// - a fill must be on the closing side of its leg (or side-less);
+    /// - attributed quantity must cover the held size of both legs;
+    /// - every attributed fill must report a value — no snapshot blending.
+    ///
+    /// While the fills have not landed yet, the clear is deferred for up to
+    /// `EXTERNAL_FLATTEN_FILL_GRACE`; afterwards, or when attribution is
+    /// impossible, the caller falls back to the pnl-less context record.
+    pub(in crate::pairtrade) async fn try_book_external_flatten(
+        &mut self,
+        inst_idx: usize,
+        key: &str,
+        reason: &str,
+        now_ts: i64,
+    ) -> FlattenBooking {
+        let inst_id = self.instances[inst_idx].id.clone();
+        let Some(flatten) = self.instances[inst_idx].external_flatten_fills.clone() else {
+            log::warn!(
+                "[FLATTEN_PNL] {} {} flatten marker has no fill baseline; cannot attribute fills",
+                inst_id,
+                key
+            );
+            return FlattenBooking::Unavailable;
+        };
+        let within_grace = flatten.submitted_at.elapsed() < EXTERNAL_FLATTEN_FILL_GRACE;
+        let pending_or_unavailable = |what: &str| {
+            if within_grace {
+                log::info!(
+                    "[FLATTEN_PNL] {} {} waiting for flatten fills ({})",
+                    inst_id,
+                    key,
+                    what
+                );
+                FlattenBooking::Deferred
+            } else {
+                log::warn!(
+                    "[FLATTEN_PNL] {} {} flatten fills not attributable after {}s ({}); falling back to recovery_no_pnl",
+                    inst_id,
+                    key,
+                    EXTERNAL_FLATTEN_FILL_GRACE.as_secs(),
+                    what
+                );
+                FlattenBooking::Unavailable
+            }
+        };
+        let Some((base, quote)) = key.split_once('/') else {
+            return FlattenBooking::Unavailable;
+        };
+        // Price the flatten against the position as it stood when the
+        // flatten was submitted, not the residual the per-tick snapshot
+        // sync may have written since (Codex review, pairtrade#282).
+        let Some(pos) = flatten.positions.get(key).cloned().or_else(|| {
+            self.instances[inst_idx]
+                .states
+                .get(key)
+                .and_then(|s| s.position.clone())
+        }) else {
+            return FlattenBooking::Unavailable;
+        };
+        let (Some(size_a), Some(size_b)) = (pos.entry_size_a, pos.entry_size_b) else {
+            return FlattenBooking::Unavailable;
+        };
+        // Fills are attributed per symbol; two covered positions sharing a
+        // leg symbol (BTC/ETH + BTC/SOL) would both absorb the same BTC
+        // fills. Decline rather than corrupt both records (Codex review,
+        // pairtrade#282).
+        // Scan every covered pair — a retained pending entry that executed
+        // during the halt cancel is not in `positions` yet but its close
+        // fills land on the same symbols (Codex review, pairtrade#282).
+        let shares_symbol = flatten
+            .covered_pairs
+            .iter()
+            .any(|other| other != key && other.split('/').any(|sym| sym == base || sym == quote));
+        if shares_symbol {
+            log::warn!(
+                "[FLATTEN_PNL] {} {} shares a leg symbol with another flattened pair; not attributing fills",
+                inst_id,
+                key
+            );
+            return FlattenBooking::Unavailable;
+        }
+        // Closing side per leg: LongSpread = long base / short quote.
+        let (close_side_a, close_side_b) = match pos.direction {
+            PositionDirection::LongSpread => (OrderSide::Short, OrderSide::Long),
+            PositionDirection::ShortSpread => (OrderSide::Long, OrderSide::Short),
+        };
+        let mut vwaps: Vec<Decimal> = Vec::with_capacity(2);
+        for (symbol, close_side, held) in
+            [(base, close_side_a, size_a), (quote, close_side_b, size_b)]
+        {
+            let Some(seen) = flatten.baseline.get(symbol) else {
+                return pending_or_unavailable(&format!("no baseline for {}", symbol));
+            };
+            let fills = match self.connector.get_filled_orders(symbol).await {
+                Ok(resp) => resp.orders,
+                Err(err) => {
+                    return pending_or_unavailable(&format!(
+                        "fill fetch failed for {}: {:?}",
+                        symbol, err
+                    ));
+                }
+            };
+            let mut qty = Decimal::ZERO;
+            let mut value = Decimal::ZERO;
+            let mut value_missing = false;
+            for fill in fills.iter().filter(|f| !f.is_rejected) {
+                // Opening fills of an entry retained through the halt are
+                // never part of the flatten, side-reported or not.
+                if flatten.excluded_order_ids.contains(&fill.order_id) {
+                    continue;
+                }
+                if seen.contains(&Self::fill_identity(fill))
+                    && !flatten.attributable_order_ids.contains(&fill.order_id)
+                {
+                    continue;
+                }
+                if fill.filled_side.is_some_and(|side| side != close_side) {
+                    continue;
+                }
+                let Some(sz) = fill.filled_size.filter(|v| *v > Decimal::ZERO) else {
+                    continue;
+                };
+                qty += sz;
+                match fill.filled_value {
+                    Some(v) => value += v,
+                    None => value_missing = true,
+                }
+            }
+            // Allow venue size rounding, but never book a partially
+            // covered flatten as if it were the whole position.
+            let coverage_floor = held * Decimal::new(99, 2);
+            if qty < coverage_floor {
+                return pending_or_unavailable(&format!(
+                    "{} attributed qty {} < held {}",
+                    symbol, qty, held
+                ));
+            }
+            if value_missing || value <= Decimal::ZERO {
+                log::warn!(
+                    "[FLATTEN_PNL] {} {} {} flatten fills lack value coverage; not booking",
+                    inst_id,
+                    key,
+                    symbol
+                );
+                return FlattenBooking::Unavailable;
+            }
+            vwaps.push(value / qty);
+        }
+        let (exit_price_a, exit_price_b) = (vwaps[0], vwaps[1]);
+        let z_exit = self
+            .per_pair_state
+            .get(key)
+            .and_then(|s| s.z_score().map(|(z, _)| z));
+        let beta_val = pos
+            .entry_beta
+            .or_else(|| self.per_pair_state.get(key).map(|s| s.beta));
+        let Some((record, pnl_value, funding_value)) =
+            Self::exit_pnl_record_from_prices(ExitPnlInputs {
+                inst_id: &inst_id,
+                key,
+                pos: &pos,
+                exit_price_a,
+                exit_price_b,
+                funding_history: &self.funding_history,
+                z_exit,
+                beta_val,
+                now_ts,
+                reason,
+            })
+        else {
+            return FlattenBooking::Unavailable;
+        };
+        log::warn!(
+            "[FLATTEN_PNL] {} {} booked out-of-band flatten as exit_fill reason={} exit_a={} exit_b={} pnl={:.4} funding={:.4} submitted_ts={}",
+            inst_id,
+            key,
+            reason,
+            exit_price_a,
+            exit_price_b,
+            pnl_value,
+            funding_value,
+            flatten.submitted_ts
+        );
+        self.write_pnl_record(inst_idx, record);
+        self.record_exit_realized_pnl(inst_idx, now_ts, pnl_value, funding_value);
+        FlattenBooking::Booked
     }
 
     async fn try_close_unhedged_leg(

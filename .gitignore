@@ -20,3 +20,6 @@ pairtrade_history.json
 *.jsonl
 *.bin
 .claude/
+
+# per-instance runtime state written by the engine (tests must redirect it)
+/risk_state.json
