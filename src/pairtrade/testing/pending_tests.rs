@@ -107,6 +107,12 @@ pub(in crate::pairtrade) struct DummyConnector {
     /// produce, so tests can exercise the capital-guard unlatch path
     /// that only fires on a definitive no-order-created rejection.
     reject_orders_with_server_response: AtomicBool,
+    /// bot-strategy#932: a Lighter-style persistent per-symbol fill cache
+    /// (never popped, returned verbatim on every `get_filled_orders` call
+    /// while non-empty for that symbol) so the pre-flatten baseline and the
+    /// post-flatten attribution can both read the same growing cache.
+    /// Takes precedence over `filled_by_symbol` for symbols it holds.
+    fill_cache: Mutex<HashMap<String, Vec<dex_connector::FilledOrder>>>,
 }
 
 /// Scripted `(order_id, filled_size)` rows for one `get_filled_orders` call.
@@ -166,6 +172,13 @@ impl DexConnector for DummyConnector {
     }
 
     async fn get_filled_orders(&self, symbol: &str) -> Result<FilledOrdersResponse, DexError> {
+        if let Some(rows) = self.fill_cache.lock().unwrap().get(symbol) {
+            if !rows.is_empty() {
+                return Ok(FilledOrdersResponse {
+                    orders: rows.clone(),
+                });
+            }
+        }
         if let Some(queue) = self.filled_by_symbol.lock().unwrap().get_mut(symbol) {
             if let Some(rows) = pop_scripted(queue) {
                 return Ok(FilledOrdersResponse {
@@ -3899,4 +3912,249 @@ async fn entry_reconcile_clean_read_with_failed_rereads_fails_closed() {
         "clean-then-failed settle reads must fail closed, not record ok"
     );
     let _ = std::fs::remove_file(&engine.risk_state_path);
+}
+
+// ---------------------------------------------------------------------------
+// bot-strategy#932: out-of-band (session-DD) flatten books real exit PnL
+// ---------------------------------------------------------------------------
+
+fn cached_fill(
+    order_id: &str,
+    trade_id: &str,
+    side: Option<OrderSide>,
+    size: &str,
+    value: Option<&str>,
+) -> dex_connector::FilledOrder {
+    dex_connector::FilledOrder {
+        order_id: order_id.to_string(),
+        is_rejected: false,
+        trade_id: trade_id.to_string(),
+        filled_side: side,
+        filled_size: Some(dec(size)),
+        filled_value: value.map(dec),
+        filled_fee: None,
+        filled_ts_ms: None,
+    }
+}
+
+fn push_fill(connector: &DummyConnector, symbol: &str, fill: dex_connector::FilledOrder) {
+    connector
+        .fill_cache
+        .lock()
+        .unwrap()
+        .entry(symbol.to_string())
+        .or_default()
+        .push(fill);
+}
+
+/// Engine with a held AAA/BBB LongSpread (0.01 @100 / 0.02 @50), a stale
+/// closing-side AAA fill already in the connector cache (must be excluded
+/// via the baseline), and the flatten marker armed exactly as
+/// `evaluate_session_dd` arms it. The exchange snapshot is already flat.
+async fn armed_flatten_engine(
+    connector: &Arc<DummyConnector>,
+    dir: &std::path::Path,
+) -> PairTradeEngine {
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.to_path_buf()));
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    // Stale fill from an earlier cycle: same closing side, different price.
+    push_fill(
+        connector,
+        "AAA",
+        cached_fill(
+            "old-1",
+            "t-old",
+            Some(OrderSide::Short),
+            "0.01",
+            Some("0.95"),
+        ),
+    );
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    assert_eq!(baseline.get("AAA").map(|s| s.len()), Some(1));
+    assert_eq!(baseline.get("BBB").map(|s| s.len()), Some(0));
+    engine.arm_external_flatten(0, "session_dd_test".to_string(), baseline, 1_700_000_300);
+    engine
+}
+
+#[tokio::test]
+async fn session_dd_flatten_books_exit_fill_from_post_flatten_fills() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path()).await;
+    // Flatten fills land: AAA sold 0.01 @99, BBB bought 0.02 @52.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    assert_eq!(json["close_reason"], "session_dd_test");
+    assert!(json.get("pnl_available").is_none());
+    assert!(json.get("recovery_reason").is_none());
+    assert_eq!(json["exit_price_a"], 99.0);
+    assert_eq!(json["exit_price_b"], 52.0);
+    // (99-100)*0.01 + (50-52)*0.02 = -0.01 - 0.04
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!((pnl + 0.05).abs() < 1e-9, "pnl={pnl}");
+
+    let inst = &engine.instances[0];
+    assert!((inst.realized_pnl_today + 0.05).abs() < 1e-9);
+    assert!((inst.total_pnl + 0.05).abs() < 1e-9);
+    assert_eq!(inst.total_trades, 1);
+    assert_eq!(
+        inst.consecutive_losses, 1,
+        "loss must advance the circuit breaker"
+    );
+    assert!(inst.external_flatten_reason.is_none());
+    assert!(inst.external_flatten_fills.is_none());
+    let state = inst.states.get("AAA/BBB").unwrap();
+    assert!(state.position.is_none());
+    assert!(!state.recovery_recorded);
+}
+
+#[tokio::test]
+async fn session_dd_flatten_defers_clear_until_fills_arrive() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path()).await;
+
+    // Exchange already flat but the WS fill events have not landed yet.
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "no record while the flatten fills are pending"
+    );
+    let inst = &engine.instances[0];
+    assert!(inst.states.get("AAA/BBB").unwrap().position.is_some());
+    assert!(inst.external_flatten_reason.is_some());
+    assert!(inst.external_flatten_fills.is_some());
+    assert_eq!(inst.total_trades, 0);
+
+    // Only one leg has landed: still deferred, never a half-booked cycle.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    assert!(engine.instances[0]
+        .states
+        .get("AAA/BBB")
+        .unwrap()
+        .position
+        .is_some());
+
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    assert_eq!(json["close_reason"], "session_dd_test");
+    assert!(engine.instances[0]
+        .states
+        .get("AAA/BBB")
+        .unwrap()
+        .position
+        .is_none());
+}
+
+#[tokio::test]
+async fn session_dd_flatten_without_value_coverage_falls_back_to_recovery_record() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path()).await;
+    // Fills arrive but the venue reported no value for BBB: never blend a
+    // mark snapshot in (bot-strategy#750) — context record instead.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", None),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "recovery_no_pnl");
+    assert_eq!(json["pnl_available"], false);
+    assert_eq!(json["recovery_reason"], "session_dd_test");
+    let inst = &engine.instances[0];
+    assert_eq!(inst.total_trades, 0);
+    assert_eq!(inst.realized_pnl_today, 0.0);
+    assert_eq!(inst.consecutive_losses, 0);
+    assert!(inst.external_flatten_reason.is_none());
+    assert!(inst.external_flatten_fills.is_none());
+    assert!(inst.states.get("AAA/BBB").unwrap().position.is_none());
+}
+
+#[tokio::test]
+async fn session_dd_flatten_gives_up_after_grace_when_fills_never_land() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path()).await;
+    engine.instances[0]
+        .external_flatten_fills
+        .as_mut()
+        .unwrap()
+        .submitted_at = Instant::now() - std::time::Duration::from_secs(120);
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "recovery_no_pnl");
+    assert_eq!(json["recovery_reason"], "session_dd_test");
+    let inst = &engine.instances[0];
+    assert!(inst.states.get("AAA/BBB").unwrap().position.is_none());
+    assert!(inst.external_flatten_reason.is_none());
 }

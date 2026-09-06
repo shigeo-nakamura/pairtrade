@@ -569,6 +569,7 @@ impl PairTradeEngine {
                 // the halt — after an ack the next snapshot clear belongs to
                 // a new incident and must not inherit this halt's reason.
                 inst.external_flatten_reason = None;
+                inst.external_flatten_fills = None;
                 cleared_any = true;
                 cleared_indices.push((inst_idx, prior_reason));
             }
@@ -1802,6 +1803,11 @@ impl PairTradeEngine {
         // pointed at `instances[inst_idx].connector` by the caller in
         // `step()`, so close_all_positions hits the right sub-account.
         if !self.cfg.dry_run && !self.cfg.observe_only {
+            // bot-strategy#932: snapshot the connector fill cache *before*
+            // submitting the flatten so the exchange-snapshot clear can
+            // isolate the flatten's own fills and book the realised exit
+            // PnL instead of a pnl-less `recovery_no_pnl` record.
+            let fill_baseline = self.snapshot_fill_baseline(inst_idx).await;
             if let Err(err) = self.connector.close_all_positions(None).await {
                 log::error!(
                     "[SESSION_DD] {} close_all_positions failed: {:?}",
@@ -1820,9 +1826,12 @@ impl PairTradeEngine {
                 // when a local position exists for the snapshot clear to
                 // consume it on — otherwise the one-shot marker would leak
                 // onto a future unrelated clear and mislabel it.
-                let inst_mut = &mut self.instances[inst_idx];
-                if inst_mut.states.values().any(|s| s.position.is_some()) {
-                    inst_mut.external_flatten_reason = Some(reason.clone());
+                if self.instances[inst_idx]
+                    .states
+                    .values()
+                    .any(|s| s.position.is_some())
+                {
+                    self.arm_external_flatten(inst_idx, reason.clone(), fill_baseline, now_ts);
                 }
             }
         }

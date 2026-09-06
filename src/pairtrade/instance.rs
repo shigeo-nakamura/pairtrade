@@ -5,7 +5,7 @@
 //! reporter, risk counters, and pair-parameter overlay. The engine holds a
 //! `Vec<StrategyInstance>` and addresses them by index.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,6 +16,27 @@ use super::pnl_log::PnlLogger;
 use super::risk_io;
 use super::state::PairState;
 use super::status::StatusReporter;
+
+/// Fill-cache baseline captured immediately before an out-of-band flatten
+/// (session-DD halt) was submitted, so the exchange-snapshot clear can
+/// isolate the flatten's own fills from anything already sitting in the
+/// connector's per-symbol fill cache and book real exit PnL from them.
+/// Lighter fills carry no timestamp (`filled_ts_ms = None`), so "new since
+/// the flatten" can only be established by set difference against this
+/// baseline. bot-strategy#932.
+#[derive(Debug, Clone)]
+pub(in crate::pairtrade) struct ExternalFlattenFills {
+    /// symbol -> identity keys (`PairTradeEngine::fill_identity`) of every
+    /// fill present in the cache when the flatten was submitted. A symbol
+    /// missing from the map means the baseline fetch failed for it; the
+    /// booking path then refuses to attribute fills for that symbol.
+    pub(in crate::pairtrade) baseline: HashMap<String, HashSet<String>>,
+    /// Wall-clock submit time; bounds how long the snapshot clear waits for
+    /// the flatten fills to land before falling back to `recovery_no_pnl`.
+    pub(in crate::pairtrade) submitted_at: Instant,
+    /// Replay-aware submit timestamp (seconds), for diagnostics.
+    pub(in crate::pairtrade) submitted_ts: i64,
+}
 
 /// Max age of the per-instance equity cache before `refresh_equity_if_needed`
 /// fetches a fresh value from the exchange. Now a low-frequency dashboard tick:
@@ -223,6 +244,10 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// of the generic `exchange_snapshot_clear`. Not persisted.
     /// bot-strategy#514.
     pub(in crate::pairtrade) external_flatten_reason: Option<String>,
+    /// Companion to `external_flatten_reason`: the fill-cache baseline
+    /// taken right before the flatten was submitted. Set and cleared
+    /// together with the reason marker. Not persisted. bot-strategy#932.
+    pub(in crate::pairtrade) external_flatten_fills: Option<ExternalFlattenFills>,
     /// Pairs whose NEW entries are fail-closed because the post-entry
     /// venue-position reconciliation (bot-strategy#721) found an exposure
     /// mismatch it could not repair (trim failed, position fetch failed,

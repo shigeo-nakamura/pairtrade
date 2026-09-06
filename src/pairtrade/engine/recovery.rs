@@ -22,16 +22,29 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use dex_connector::{DexError, PositionSnapshot};
+use dex_connector::{DexError, FilledOrder, OrderSide, PositionSnapshot};
 use rust_decimal::Decimal;
 use tokio::time::sleep;
 
 use super::super::engine;
+use super::super::instance::ExternalFlattenFills;
 use super::super::market::SymbolSnapshot;
 use super::super::pnl_log;
 use super::super::state::{Position, PositionDirection};
 use super::super::PairTradeEngine;
+use super::reconcile::ExitPnlInputs;
 use crate::email_client::EmailClient;
+
+/// Outcome of `PairTradeEngine::try_book_external_flatten`. bot-strategy#932.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pairtrade) enum FlattenBooking {
+    /// `exit_fill` record written and realized PnL recorded.
+    Booked,
+    /// Flatten fills not visible yet; keep the local position and retry.
+    Deferred,
+    /// Cannot attribute fills with full coverage; write `recovery_no_pnl`.
+    Unavailable,
+}
 
 impl PairTradeEngine {
     fn configured_startup_symbols(&self) -> Vec<String> {
@@ -629,7 +642,8 @@ impl PairTradeEngine {
         // z/beta/hold context. Skipped when the reconcile recovery path
         // already recorded this close (`recovery_recorded`).
         if !cleared_positions.is_empty() {
-            let flatten_reason = self.instances[inst_idx].external_flatten_reason.take();
+            let flatten_reason = self.instances[inst_idx].external_flatten_reason.clone();
+            let mut flatten_deferred = false;
             for (key, kind, guard_after) in cleared_positions {
                 let record_direction = match self.instances[inst_idx].states.get(&key) {
                     Some(state) => match state.position.as_ref() {
@@ -639,6 +653,40 @@ impl PairTradeEngine {
                     None => continue,
                 };
                 if let Some(direction) = record_direction {
+                    // bot-strategy#932: an out-of-band risk flatten realises
+                    // PnL on the venue. Book it from the flatten's own fills
+                    // (isolated via the pre-flatten cache baseline) as a
+                    // normal `exit_fill` so trade stats, realized_pnl_today
+                    // and the circuit breaker see the loss. Only the
+                    // pnl-less context record is written when the fills
+                    // cannot be attributed with full value coverage.
+                    if kind == "exchange_snapshot_clear" {
+                        if let Some(reason) = flatten_reason.as_deref() {
+                            match self
+                                .try_book_external_flatten(inst_idx, &key, reason, now_ts)
+                                .await
+                            {
+                                FlattenBooking::Booked => {
+                                    if let Some(state) =
+                                        self.instances[inst_idx].states.get_mut(&key)
+                                    {
+                                        state.position = None;
+                                        state.position_guard = guard_after;
+                                        state.recovery_recorded = false;
+                                    }
+                                    continue;
+                                }
+                                FlattenBooking::Deferred => {
+                                    // Keep the local position one more tick
+                                    // so the next snapshot sync retries once
+                                    // the fill events have landed.
+                                    flatten_deferred = true;
+                                    continue;
+                                }
+                                FlattenBooking::Unavailable => {}
+                            }
+                        }
+                    }
                     let reason = match kind {
                         "exchange_snapshot_clear" => flatten_reason.as_deref().unwrap_or(kind),
                         other => other,
@@ -653,6 +701,12 @@ impl PairTradeEngine {
                     state.recovery_recorded = false;
                 }
             }
+            if !flatten_deferred {
+                // One-shot marker: consumed by the clear batch it belonged to.
+                let inst = &mut self.instances[inst_idx];
+                inst.external_flatten_reason = None;
+                inst.external_flatten_fills = None;
+            }
         }
 
         for (key, symbol, sign, size) in unhedged_closures {
@@ -661,6 +715,251 @@ impl PairTradeEngine {
         }
 
         Ok(())
+    }
+
+    /// Identity of a cached fill for set-difference against the pre-flatten
+    /// baseline. Lighter reports `trade_id` (unique per fill) but some
+    /// connectors leave it empty/zero, so the key also folds in order id,
+    /// size and value. bot-strategy#932.
+    pub(in crate::pairtrade) fn fill_identity(order: &FilledOrder) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            order.order_id,
+            order.trade_id,
+            order.filled_size.map(|v| v.to_string()).unwrap_or_default(),
+            order
+                .filled_value
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+        )
+    }
+
+    /// Snapshot the connector's per-symbol fill cache for every symbol of a
+    /// pair this instance currently holds. Call immediately *before*
+    /// submitting an out-of-band flatten (`close_all_positions`). A symbol
+    /// whose fetch fails is left out of the map, which makes
+    /// `try_book_external_flatten` refuse to attribute fills for it rather
+    /// than mistake stale cache entries for the flatten. bot-strategy#932.
+    pub(in crate::pairtrade) async fn snapshot_fill_baseline(
+        &self,
+        inst_idx: usize,
+    ) -> HashMap<String, HashSet<String>> {
+        let mut symbols: Vec<String> = Vec::new();
+        for pair in &self.cfg.universe {
+            let key = format!("{}/{}", pair.base, pair.quote);
+            let held = self.instances[inst_idx]
+                .states
+                .get(&key)
+                .is_some_and(|s| s.position.is_some());
+            if held {
+                symbols.push(pair.base.clone());
+                symbols.push(pair.quote.clone());
+            }
+        }
+        symbols.sort();
+        symbols.dedup();
+        let mut baseline: HashMap<String, HashSet<String>> = HashMap::new();
+        for symbol in symbols {
+            match self.connector.get_filled_orders(&symbol).await {
+                Ok(resp) => {
+                    baseline.insert(
+                        symbol,
+                        resp.orders.iter().map(Self::fill_identity).collect(),
+                    );
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[FLATTEN_PNL] {} fill baseline fetch failed for {}: {:?}",
+                        self.instances[inst_idx].id,
+                        symbol,
+                        err
+                    );
+                }
+            }
+        }
+        baseline
+    }
+
+    /// Arm the one-shot out-of-band flatten marker together with its fill
+    /// baseline. Called right after a successful flatten submission while
+    /// a local position still exists for the snapshot clear to consume it
+    /// on. bot-strategy#514 / #932.
+    pub(in crate::pairtrade) fn arm_external_flatten(
+        &mut self,
+        inst_idx: usize,
+        reason: String,
+        baseline: HashMap<String, HashSet<String>>,
+        now_ts: i64,
+    ) {
+        let inst = &mut self.instances[inst_idx];
+        inst.external_flatten_reason = Some(reason);
+        inst.external_flatten_fills = Some(ExternalFlattenFills {
+            baseline,
+            submitted_at: Instant::now(),
+            submitted_ts: now_ts,
+        });
+    }
+
+    /// Try to book an out-of-band flatten (session-DD halt) as a real
+    /// `exit_fill` from the venue fills that arrived after the flatten was
+    /// submitted. Fill attribution rules (bot-strategy#932 / #750):
+    /// - only fills absent from the pre-flatten baseline count;
+    /// - a fill must be on the closing side of its leg (or side-less);
+    /// - attributed quantity must cover the held size of both legs;
+    /// - every attributed fill must report a value — no snapshot blending.
+    ///
+    /// While the fills have not landed yet, the clear is deferred for up to
+    /// `EXTERNAL_FLATTEN_FILL_GRACE`; afterwards, or when attribution is
+    /// impossible, the caller falls back to the pnl-less context record.
+    pub(in crate::pairtrade) async fn try_book_external_flatten(
+        &mut self,
+        inst_idx: usize,
+        key: &str,
+        reason: &str,
+        now_ts: i64,
+    ) -> FlattenBooking {
+        const EXTERNAL_FLATTEN_FILL_GRACE: Duration = Duration::from_secs(30);
+        let inst_id = self.instances[inst_idx].id.clone();
+        let Some(flatten) = self.instances[inst_idx].external_flatten_fills.clone() else {
+            log::warn!(
+                "[FLATTEN_PNL] {} {} flatten marker has no fill baseline; cannot attribute fills",
+                inst_id,
+                key
+            );
+            return FlattenBooking::Unavailable;
+        };
+        let within_grace = flatten.submitted_at.elapsed() < EXTERNAL_FLATTEN_FILL_GRACE;
+        let pending_or_unavailable = |what: &str| {
+            if within_grace {
+                log::info!(
+                    "[FLATTEN_PNL] {} {} waiting for flatten fills ({})",
+                    inst_id,
+                    key,
+                    what
+                );
+                FlattenBooking::Deferred
+            } else {
+                log::warn!(
+                    "[FLATTEN_PNL] {} {} flatten fills not attributable after {}s ({}); falling back to recovery_no_pnl",
+                    inst_id,
+                    key,
+                    EXTERNAL_FLATTEN_FILL_GRACE.as_secs(),
+                    what
+                );
+                FlattenBooking::Unavailable
+            }
+        };
+        let Some((base, quote)) = key.split_once('/') else {
+            return FlattenBooking::Unavailable;
+        };
+        let Some(pos) = self.instances[inst_idx]
+            .states
+            .get(key)
+            .and_then(|s| s.position.clone())
+        else {
+            return FlattenBooking::Unavailable;
+        };
+        let (Some(size_a), Some(size_b)) = (pos.entry_size_a, pos.entry_size_b) else {
+            return FlattenBooking::Unavailable;
+        };
+        // Closing side per leg: LongSpread = long base / short quote.
+        let (close_side_a, close_side_b) = match pos.direction {
+            PositionDirection::LongSpread => (OrderSide::Short, OrderSide::Long),
+            PositionDirection::ShortSpread => (OrderSide::Long, OrderSide::Short),
+        };
+        let mut vwaps: Vec<Decimal> = Vec::with_capacity(2);
+        for (symbol, close_side, held) in
+            [(base, close_side_a, size_a), (quote, close_side_b, size_b)]
+        {
+            let Some(seen) = flatten.baseline.get(symbol) else {
+                return pending_or_unavailable(&format!("no baseline for {}", symbol));
+            };
+            let fills = match self.connector.get_filled_orders(symbol).await {
+                Ok(resp) => resp.orders,
+                Err(err) => {
+                    return pending_or_unavailable(&format!(
+                        "fill fetch failed for {}: {:?}",
+                        symbol, err
+                    ));
+                }
+            };
+            let mut qty = Decimal::ZERO;
+            let mut value = Decimal::ZERO;
+            let mut value_missing = false;
+            for fill in fills.iter().filter(|f| !f.is_rejected) {
+                if seen.contains(&Self::fill_identity(fill)) {
+                    continue;
+                }
+                if fill.filled_side.is_some_and(|side| side != close_side) {
+                    continue;
+                }
+                let Some(sz) = fill.filled_size.filter(|v| *v > Decimal::ZERO) else {
+                    continue;
+                };
+                qty += sz;
+                match fill.filled_value {
+                    Some(v) => value += v,
+                    None => value_missing = true,
+                }
+            }
+            // Allow venue size rounding, but never book a partially
+            // covered flatten as if it were the whole position.
+            let coverage_floor = held * Decimal::new(99, 2);
+            if qty < coverage_floor {
+                return pending_or_unavailable(&format!(
+                    "{} attributed qty {} < held {}",
+                    symbol, qty, held
+                ));
+            }
+            if value_missing || value <= Decimal::ZERO {
+                log::warn!(
+                    "[FLATTEN_PNL] {} {} {} flatten fills lack value coverage; not booking",
+                    inst_id,
+                    key,
+                    symbol
+                );
+                return FlattenBooking::Unavailable;
+            }
+            vwaps.push(value / qty);
+        }
+        let (exit_price_a, exit_price_b) = (vwaps[0], vwaps[1]);
+        let z_exit = self
+            .per_pair_state
+            .get(key)
+            .and_then(|s| s.z_score().map(|(z, _)| z));
+        let beta_val = pos
+            .entry_beta
+            .or_else(|| self.per_pair_state.get(key).map(|s| s.beta));
+        let Some((record, pnl_value, funding_value)) =
+            Self::exit_pnl_record_from_prices(ExitPnlInputs {
+                inst_id: &inst_id,
+                key,
+                pos: &pos,
+                exit_price_a,
+                exit_price_b,
+                funding_history: &self.funding_history,
+                z_exit,
+                beta_val,
+                now_ts,
+                reason,
+            })
+        else {
+            return FlattenBooking::Unavailable;
+        };
+        log::warn!(
+            "[FLATTEN_PNL] {} {} booked out-of-band flatten as exit_fill reason={} exit_a={} exit_b={} pnl={:.4} funding={:.4} submitted_ts={}",
+            inst_id,
+            key,
+            reason,
+            exit_price_a,
+            exit_price_b,
+            pnl_value,
+            funding_value,
+            flatten.submitted_ts
+        );
+        self.write_pnl_record(inst_idx, record);
+        self.record_exit_realized_pnl(inst_idx, now_ts, pnl_value, funding_value);
+        FlattenBooking::Booked
     }
 
     async fn try_close_unhedged_leg(

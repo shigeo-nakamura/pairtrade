@@ -61,6 +61,22 @@ struct ExitFillPnlContext<'a> {
     now_ts: i64,
 }
 
+/// Inputs for `PairTradeEngine::exit_pnl_record_from_prices`: everything the
+/// exit-PnL record needs once the per-leg exit prices are known.
+/// bot-strategy#932.
+pub(in crate::pairtrade) struct ExitPnlInputs<'a> {
+    pub(in crate::pairtrade) inst_id: &'a str,
+    pub(in crate::pairtrade) key: &'a str,
+    pub(in crate::pairtrade) pos: &'a Position,
+    pub(in crate::pairtrade) exit_price_a: Decimal,
+    pub(in crate::pairtrade) exit_price_b: Decimal,
+    pub(in crate::pairtrade) funding_history: &'a funding_history::FundingHistory,
+    pub(in crate::pairtrade) z_exit: Option<f64>,
+    pub(in crate::pairtrade) beta_val: Option<f64>,
+    pub(in crate::pairtrade) now_ts: i64,
+    pub(in crate::pairtrade) reason: &'a str,
+}
+
 /// Pure outcome of the entry partial-fill reissue policy. Extracted from
 /// `reconcile_pending_orders` so the retry/escalation thresholds are
 /// auditable and unit-testable without driving the async state machine
@@ -163,8 +179,37 @@ impl PairTradeEngine {
             "exit",
             quote,
         )?;
+        let reason = ctx.state.pending_exit_reason.unwrap_or("unknown");
+        Self::exit_pnl_record_from_prices(ExitPnlInputs {
+            inst_id: ctx.inst_id,
+            key: ctx.key,
+            pos,
+            exit_price_a,
+            exit_price_b,
+            funding_history: ctx.funding_history,
+            z_exit: ctx.z_exit,
+            beta_val: ctx.beta_val,
+            now_ts: ctx.now_ts,
+            reason,
+        })
+    }
+
+    /// Shared tail of the exit-PnL record assembly: given the actual exit
+    /// prices (fill VWAP for a strategy exit, or the post-flatten fill VWAP
+    /// for an out-of-band risk flatten, bot-strategy#932), compute realized
+    /// PnL, fold in funding carry, emit the close gross/funding bps
+    /// histograms, and stamp the close reason. Returns
+    /// `(record, realized_pnl, funding_carry_usd)`; `None` when the
+    /// position lacks entry prices/sizes.
+    pub(in crate::pairtrade) fn exit_pnl_record_from_prices(
+        inp: ExitPnlInputs<'_>,
+    ) -> Option<(PnlLogRecord, f64, f64)> {
+        let pos = inp.pos;
+        let (base, quote) = inp.key.split_once('/')?;
+        let exit_price_a = inp.exit_price_a;
+        let exit_price_b = inp.exit_price_b;
         let pnl = compute_pnl(pos, exit_price_a, exit_price_b).and_then(|p| p.to_f64())?;
-        let hold_secs = Some(ctx.now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
+        let hold_secs = Some(inp.now_ts.saturating_sub(pos.entered_ts).max(0) as f64);
         let entry_a = pos.entry_price_a.and_then(|v| v.to_f64());
         let entry_b = pos.entry_price_b.and_then(|v| v.to_f64());
         let (carry_usd, ticks_observed) = match (
@@ -175,11 +220,11 @@ impl PairTradeEngine {
         ) {
             (Some(sa), Some(pa), Some(sb), Some(pb)) => {
                 funding_history::compute_carry_usd(funding_history::FundingCarryInput {
-                    history: ctx.funding_history,
+                    history: inp.funding_history,
                     base_symbol: base,
                     quote_symbol: quote,
                     open_ts: pos.entered_ts,
-                    close_ts: ctx.now_ts,
+                    close_ts: inp.now_ts,
                     direction: pos.direction,
                     entry_size_a: sa,
                     entry_price_a: pa,
@@ -190,15 +235,15 @@ impl PairTradeEngine {
             _ => (0.0, 0),
         };
         let mut record =
-            PnlLogRecord::new(base, quote, pos.direction, pnl, ctx.now_ts, "exit_fill")
+            PnlLogRecord::new(base, quote, pos.direction, pnl, inp.now_ts, "exit_fill")
                 .with_trade_details(PnlTradeDetails {
                     entry_a,
                     entry_b,
                     exit_a: exit_price_a.to_f64(),
                     exit_b: exit_price_b.to_f64(),
-                    beta: ctx.beta_val,
+                    beta: inp.beta_val,
                     z_entry: pos.entry_z,
-                    z_exit: ctx.z_exit,
+                    z_exit: inp.z_exit,
                     hold_secs,
                 });
         if ticks_observed > 0 {
@@ -210,7 +255,7 @@ impl PairTradeEngine {
         // Option<&'static str> that apply_post_exit_state consumes
         // immediately after this — read without .take() so the
         // close-reason counter still receives it (bot-strategy#421).
-        let reason = ctx.state.pending_exit_reason.unwrap_or("unknown");
+        let reason = inp.reason;
         if let (Some(sa), Some(pa), Some(sb), Some(pb)) = (
             pos.entry_size_a,
             pos.entry_price_a,
@@ -223,11 +268,11 @@ impl PairTradeEngine {
                 let notional = a + b;
                 if notional > 0.0 {
                     super::super::prom::CLOSE_GROSS_PNL_BPS
-                        .with_label_values(&[ctx.inst_id, ctx.key, reason])
+                        .with_label_values(&[inp.inst_id, inp.key, reason])
                         .observe(pnl / notional * 10_000.0);
                     if ticks_observed > 0 {
                         super::super::prom::CLOSE_FUNDING_BPS
-                            .with_label_values(&[ctx.inst_id, ctx.key])
+                            .with_label_values(&[inp.inst_id, inp.key])
                             .observe(carry_usd / notional * 10_000.0);
                     }
                 }
@@ -276,7 +321,7 @@ impl PairTradeEngine {
     /// `write_pnl_record` always bumps total_trades / total_pnl (persisted,
     /// bot-strategy#320), so the snapshot is dirty regardless of pnl sign.
     /// Pure relocation from `reconcile_exit` (bot-strategy#502).
-    fn record_exit_realized_pnl(
+    pub(in crate::pairtrade) fn record_exit_realized_pnl(
         &mut self,
         inst_idx: usize,
         now_ts: i64,
