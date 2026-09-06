@@ -1807,6 +1807,10 @@ impl PairTradeEngine {
             // submitting the flatten so the exchange-snapshot clear can
             // isolate the flatten's own fills and book the realised exit
             // PnL instead of a pnl-less `recovery_no_pnl` record.
+            // Entry legs still awaiting reconciliation must not fill after
+            // the flatten on a halted instance: cancel them first (tracked
+            // ids only). Exits stay live until the flatten is submitted.
+            self.cancel_pending_entries_for_halt(inst_idx).await;
             let fill_baseline = self.snapshot_fill_baseline(inst_idx).await;
             if let Err(err) = self.connector.close_all_positions(None).await {
                 log::error!(
@@ -1838,7 +1842,7 @@ impl PairTradeEngine {
                     // submission the pendings stay live and keep closing the
                     // exposure on their own (Codex review, pairtrade#282).
                     let attributable_order_ids =
-                        self.retire_pending_orders_for_flatten(inst_idx).await;
+                        self.retire_pending_exits_for_flatten(inst_idx).await;
                     self.arm_external_flatten(
                         inst_idx,
                         reason.clone(),

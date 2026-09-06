@@ -723,8 +723,16 @@ impl PairTradeEngine {
                     state.recovery_recorded = false;
                 }
             }
-            if !flatten_deferred {
-                // One-shot marker: consumed by the clear batch it belonged to.
+            // One-shot marker: consumed once every position this flatten
+            // covered has been booked or fallen back. A bulk close can
+            // surface pair by pair across snapshots, so keep it armed while
+            // any local position remains (Codex review, pairtrade#282). The
+            // risk-ack path drops it regardless.
+            let positions_remain = self.instances[inst_idx]
+                .states
+                .values()
+                .any(|s| s.position.is_some());
+            if !flatten_deferred && !positions_remain {
                 let inst = &mut self.instances[inst_idx];
                 inst.external_flatten_reason = None;
                 inst.external_flatten_fills = None;
@@ -824,22 +832,70 @@ impl PairTradeEngine {
         });
     }
 
+    /// Session-halt hygiene, run *before* the bulk flatten is submitted:
+    /// cancel every pending **entry** order of this instance (with or
+    /// without a local position — entry legs awaiting reconciliation are
+    /// exactly the case) and drop the local `pending_entry`. A halted
+    /// instance never retries the flatten, so an entry leg that filled after
+    /// it would recreate exposure nobody closes. Cancels target the tracked
+    /// order ids only. Failures are logged, not fatal. bot-strategy#932.
+    pub(in crate::pairtrade) async fn cancel_pending_entries_for_halt(&mut self, inst_idx: usize) {
+        let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+        for pair in &self.cfg.universe {
+            let key = format!("{}/{}", pair.base, pair.quote);
+            let Some(state) = self.instances[inst_idx].states.get_mut(&key) else {
+                continue;
+            };
+            let Some(pending) = state.pending_entry.take() else {
+                continue;
+            };
+            for leg in &pending.legs {
+                match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                    Some((_, ids)) => ids.push(leg.order_id.clone()),
+                    None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                }
+            }
+            log::warn!(
+                "[FLATTEN_PNL] {} {} pending entry cancelled ahead of session halt (legs={})",
+                self.instances[inst_idx].id,
+                key,
+                pending.legs.len()
+            );
+        }
+        for (symbol, ids) in per_symbol {
+            if let Err(err) = self
+                .connector
+                .cancel_orders(Some(symbol.clone()), ids.clone())
+                .await
+            {
+                log::warn!(
+                    "[FLATTEN_PNL] {} cancel_orders({}, {:?}) before halt flatten failed: {:?}",
+                    self.instances[inst_idx].id,
+                    symbol,
+                    ids,
+                    err
+                );
+            }
+        }
+    }
+
     /// Right after an out-of-band flatten was submitted successfully: cancel
-    /// the venue orders of every pair this instance holds a position in and
-    /// drop the local `pending_entry` / `pending_exit` so the snapshot clear
-    /// can consume the flatten. Returns the identifiers (client order id and
-    /// exchange order id, whichever the connector reports fills under) of the
-    /// retired exit legs — their fills close the same position and are
+    /// the still-open strategy **exit** legs of every pair this instance
+    /// holds a position in (by their tracked order ids — never a symbol-wide
+    /// sweep, which could catch the just-submitted flatten orders on an
+    /// asynchronous venue) and drop the local `pending_exit` so the snapshot
+    /// clear can consume the flatten. Returns the identifiers (client order
+    /// id and exchange order id, whichever the connector reports fills under)
+    /// of the retired exit legs — their fills close the same position and are
     /// attributable to the flatten even when they pre-date the fill baseline.
-    /// Cancel failures are logged, not fatal. Must not run before the flatten
-    /// submission succeeded: on failure the pendings stay live and keep
-    /// closing the exposure. bot-strategy#932.
-    pub(in crate::pairtrade) async fn retire_pending_orders_for_flatten(
+    /// Must not run before the flatten submission succeeded: on failure the
+    /// pendings stay live and keep closing the exposure. bot-strategy#932.
+    pub(in crate::pairtrade) async fn retire_pending_exits_for_flatten(
         &mut self,
         inst_idx: usize,
     ) -> HashSet<String> {
         let mut attributable: HashSet<String> = HashSet::new();
-        let mut symbols: Vec<String> = Vec::new();
+        let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
         for pair in &self.cfg.universe {
             let key = format!("{}/{}", pair.base, pair.quote);
             let Some(state) = self.instances[inst_idx].states.get_mut(&key) else {
@@ -848,35 +904,37 @@ impl PairTradeEngine {
             if state.position.is_none() {
                 continue;
             }
-            if state.pending_entry.is_none() && state.pending_exit.is_none() {
+            let Some(pending) = state.pending_exit.take() else {
                 continue;
-            }
-            if let Some(pending) = state.pending_exit.take() {
-                for leg in &pending.legs {
-                    attributable.insert(leg.order_id.clone());
-                    if let Some(exchange_id) = &leg.exchange_order_id {
-                        attributable.insert(exchange_id.clone());
-                    }
+            };
+            for leg in &pending.legs {
+                attributable.insert(leg.order_id.clone());
+                if let Some(exchange_id) = &leg.exchange_order_id {
+                    attributable.insert(exchange_id.clone());
+                }
+                match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                    Some((_, ids)) => ids.push(leg.order_id.clone()),
+                    None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
                 }
             }
-            state.pending_entry = None;
-            symbols.push(pair.base.clone());
-            symbols.push(pair.quote.clone());
             log::warn!(
-                "[FLATTEN_PNL] {} {} pending orders retired ahead of out-of-band flatten (exit legs={})",
+                "[FLATTEN_PNL] {} {} pending exit retired after out-of-band flatten (legs={})",
                 self.instances[inst_idx].id,
                 key,
-                attributable.len()
+                pending.legs.len()
             );
         }
-        symbols.sort();
-        symbols.dedup();
-        for symbol in symbols {
-            if let Err(err) = self.connector.cancel_all_orders(Some(symbol.clone())).await {
+        for (symbol, ids) in per_symbol {
+            if let Err(err) = self
+                .connector
+                .cancel_orders(Some(symbol.clone()), ids.clone())
+                .await
+            {
                 log::warn!(
-                    "[FLATTEN_PNL] {} cancel_all_orders({}) before flatten failed: {:?}",
+                    "[FLATTEN_PNL] {} cancel_orders({}, {:?}) after flatten failed: {:?}",
                     self.instances[inst_idx].id,
                     symbol,
+                    ids,
                     err
                 );
             }
