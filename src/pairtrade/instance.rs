@@ -31,6 +31,10 @@ pub(in crate::pairtrade) struct ExternalFlattenFills {
     /// missing from the map means the baseline fetch failed for it; the
     /// booking path then refuses to attribute fills for that symbol.
     pub(in crate::pairtrade) baseline: HashMap<String, HashSet<String>>,
+    /// Order ids of the strategy exit legs that were still pending when the
+    /// flatten was submitted. Their fills close the same position, so they
+    /// are attributable even when they already sat in the baseline.
+    pub(in crate::pairtrade) attributable_order_ids: HashSet<String>,
     /// Wall-clock submit time; bounds how long the snapshot clear waits for
     /// the flatten fills to land before falling back to `recovery_no_pnl`.
     pub(in crate::pairtrade) submitted_at: Instant,

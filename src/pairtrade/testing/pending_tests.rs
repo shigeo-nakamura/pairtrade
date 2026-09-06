@@ -10,7 +10,7 @@ use dex_connector::{
     OrderBookSnapshot, OrderSide, PositionSnapshot, TickerResponse, TpSl, TriggerOrderStyle,
 };
 use rust_decimal::Decimal;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3983,7 +3983,13 @@ async fn armed_flatten_engine(
     let baseline = engine.snapshot_fill_baseline(0).await;
     assert_eq!(baseline.get("AAA").map(|s| s.len()), Some(1));
     assert_eq!(baseline.get("BBB").map(|s| s.len()), Some(0));
-    engine.arm_external_flatten(0, "session_dd_test".to_string(), baseline, 1_700_000_300);
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        1_700_000_300,
+    );
     engine
 }
 
@@ -4168,4 +4174,255 @@ async fn session_dd_flatten_gives_up_after_grace_when_fills_never_land() {
     let inst = &engine.instances[0];
     assert!(inst.states.get("AAA/BBB").unwrap().position.is_none());
     assert!(inst.external_flatten_reason.is_none());
+}
+
+fn flatten_test_leg(symbol: &str, order_id: &str, side: OrderSide, target: &str) -> PendingLeg {
+    PendingLeg {
+        symbol: symbol.to_string(),
+        order_id: order_id.to_string(),
+        exchange_order_id: None,
+        target: dec(target),
+        filled: Decimal::ZERO,
+        side,
+        submitted_qty: dec(target),
+        limit_price: None,
+        reference_price: None,
+        submit_ts_ms: 0,
+        ack_ts_ms: None,
+        decision_ts_ms: 0,
+        submit_reference_price: None,
+        submit_mid: None,
+        submit_bid: None,
+        submit_ask: None,
+        client_order_id: None,
+        reduce_only: true,
+        post_only: false,
+    }
+}
+
+fn pending_exit_for_seeded_position() -> PendingOrders {
+    PendingOrders {
+        legs: vec![
+            flatten_test_leg("AAA", "ex-1", OrderSide::Short, "0.01"),
+            flatten_test_leg("BBB", "ex-2", OrderSide::Long, "0.02"),
+        ],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    }
+}
+
+/// Codex P1 (pairtrade#282): a session-DD halt that fires while a strategy
+/// exit is still pending must retire that exit (cancel on the venue, drop
+/// locally) and hand its leg ids to the flatten attribution.
+#[tokio::test]
+async fn retire_pending_orders_for_flatten_cancels_and_collects_exit_legs() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let mut state = seeded_position_state();
+    state.pending_exit = Some(pending_exit_for_seeded_position());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+
+    let ids = engine.retire_pending_orders_for_flatten(0).await;
+
+    assert_eq!(
+        ids,
+        HashSet::from(["ex-1".to_string(), "ex-2".to_string()]),
+        "retired exit legs must become attributable"
+    );
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.pending_exit.is_none());
+    assert!(
+        state.position.is_some(),
+        "position stays until the venue confirms"
+    );
+    assert_eq!(
+        *connector.cancel_all_symbols.lock().unwrap(),
+        vec![Some("AAA".to_string()), Some("BBB".to_string())],
+        "open orders of both legs are cancelled before the flatten"
+    );
+}
+
+#[tokio::test]
+async fn retire_pending_orders_for_flatten_is_noop_without_pending_or_position() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+
+    let ids = engine.retire_pending_orders_for_flatten(0).await;
+
+    assert!(ids.is_empty());
+    assert_eq!(connector.cancel_all_calls.load(Ordering::SeqCst), 0);
+}
+
+/// A retired exit leg may already have filled before the fill baseline was
+/// taken; that fill still closes the position and must count towards the
+/// flatten VWAP even though it is in the baseline.
+#[tokio::test]
+async fn session_dd_flatten_books_tracked_exit_leg_fill_from_baseline() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    let mut state = seeded_position_state();
+    state.pending_exit = Some(pending_exit_for_seeded_position());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    // The AAA exit leg filled before the halt: it is in the baseline.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("ex-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    let ids = engine.retire_pending_orders_for_flatten(0).await;
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        ids,
+        1_700_000_300,
+    );
+    // The flatten closes the remaining BBB leg.
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    assert_eq!(json["exit_price_a"], 99.0);
+    assert_eq!(json["exit_price_b"], 52.0);
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!((pnl + 0.05).abs() < 1e-9, "pnl={pnl}");
+}
+
+/// Codex P1 (pairtrade#282): if a pending exit is still installed when the
+/// armed flatten empties the venue (e.g. a race that installed it after the
+/// halt), the snapshot sync must supersede it instead of skipping the pair
+/// forever.
+#[tokio::test]
+async fn snapshot_clear_supersedes_pending_exit_when_flatten_armed_and_venue_flat() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .pending_exit = Some(pending_exit_for_seeded_position());
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.pending_exit.is_none());
+    assert!(state.position.is_none());
+}
+
+/// Without the flatten marker a pending exit still shields the pair from
+/// the snapshot clear (pre-existing contract).
+#[tokio::test]
+async fn snapshot_clear_keeps_pending_exit_when_no_flatten_armed() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    let mut state = seeded_position_state();
+    state.pending_exit = Some(pending_exit_for_seeded_position());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(state.pending_exit.is_some());
+    assert!(state.position.is_some());
+}
+
+/// Codex P1 (pairtrade#282): planning must stand down while the flatten
+/// booking is pending, but only within the grace window and only while a
+/// local position remains.
+#[tokio::test]
+async fn flatten_booking_in_progress_is_bounded_by_grace_and_position() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
+    assert!(engine.flatten_booking_in_progress(0, "AAA/BBB"));
+    assert!(!engine.flatten_booking_in_progress(0, "CCC/DDD"));
+
+    engine.instances[0]
+        .external_flatten_fills
+        .as_mut()
+        .unwrap()
+        .submitted_at = Instant::now() - std::time::Duration::from_secs(120);
+    assert!(
+        !engine.flatten_booking_in_progress(0, "AAA/BBB"),
+        "a flatten older than the grace window must not suppress planning"
+    );
+
+    engine.instances[0]
+        .external_flatten_fills
+        .as_mut()
+        .unwrap()
+        .submitted_at = Instant::now();
+    engine.instances[0]
+        .states
+        .get_mut("AAA/BBB")
+        .unwrap()
+        .position = None;
+    assert!(!engine.flatten_booking_in_progress(0, "AAA/BBB"));
+
+    let mut plain = PairTradeEngine::test_instance(connector.clone());
+    plain.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    assert!(!plain.flatten_booking_in_progress(0, "AAA/BBB"));
 }

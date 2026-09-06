@@ -1808,6 +1808,10 @@ impl PairTradeEngine {
             // isolate the flatten's own fills and book the realised exit
             // PnL instead of a pnl-less `recovery_no_pnl` record.
             let fill_baseline = self.snapshot_fill_baseline(inst_idx).await;
+            // Retire in-flight strategy exits first: their tracked fills are
+            // folded into the flatten attribution, and a still-open entry
+            // order must not re-open exposure on a halted instance.
+            let attributable_order_ids = self.retire_pending_orders_for_flatten(inst_idx).await;
             if let Err(err) = self.connector.close_all_positions(None).await {
                 log::error!(
                     "[SESSION_DD] {} close_all_positions failed: {:?}",
@@ -1831,7 +1835,13 @@ impl PairTradeEngine {
                     .values()
                     .any(|s| s.position.is_some())
                 {
-                    self.arm_external_flatten(inst_idx, reason.clone(), fill_baseline, now_ts);
+                    self.arm_external_flatten(
+                        inst_idx,
+                        reason.clone(),
+                        fill_baseline,
+                        attributable_order_ids,
+                        now_ts,
+                    );
                 }
             }
         }

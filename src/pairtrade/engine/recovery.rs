@@ -35,6 +35,12 @@ use super::super::PairTradeEngine;
 use super::reconcile::ExitPnlInputs;
 use crate::email_client::EmailClient;
 
+/// How long the exchange-snapshot clear waits for an out-of-band flatten's
+/// fill events before giving up on booking them (bot-strategy#932). Also
+/// bounds `flatten_booking_in_progress`, so a flatten that never clears on
+/// the venue cannot suppress normal exit planning for longer than this.
+pub(in crate::pairtrade) const EXTERNAL_FLATTEN_FILL_GRACE: Duration = Duration::from_secs(30);
+
 /// Outcome of `PairTradeEngine::try_book_external_flatten`. bot-strategy#932.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pairtrade) enum FlattenBooking {
@@ -509,6 +515,7 @@ impl PairTradeEngine {
         // is deferred past the loop so the recovery_no_pnl context record is
         // written while the entry context (z/beta/hold) is still in state.
         let mut cleared_positions: Vec<(String, &'static str, bool)> = Vec::new();
+        let flatten_armed = self.instances[inst_idx].external_flatten_reason.is_some();
         for pair in &self.cfg.universe {
             let key = format!("{}/{}", pair.base, pair.quote);
             let log_warn = self.should_log_position_warn(&key);
@@ -522,7 +529,22 @@ impl PairTradeEngine {
 
             if state.pending_entry.is_some() || state.pending_exit.is_some() {
                 // Keep pending orders; reconciliation handles timeouts/hedging.
-                continue;
+                // Exception (bot-strategy#932): an armed out-of-band flatten
+                // that already emptied the venue supersedes whatever was
+                // pending — retire it locally so the clear below can book
+                // the flatten instead of waiting on orders that can no
+                // longer fill against a position.
+                let superseded =
+                    flatten_armed && base.is_none() && quote.is_none() && state.position.is_some();
+                if !superseded {
+                    continue;
+                }
+                log::warn!(
+                    "[FLATTEN_PNL] {} pending orders superseded by out-of-band flatten (venue flat)",
+                    key
+                );
+                state.pending_entry = None;
+                state.pending_exit = None;
             }
 
             match (base, quote) {
@@ -789,15 +811,96 @@ impl PairTradeEngine {
         inst_idx: usize,
         reason: String,
         baseline: HashMap<String, HashSet<String>>,
+        attributable_order_ids: HashSet<String>,
         now_ts: i64,
     ) {
         let inst = &mut self.instances[inst_idx];
         inst.external_flatten_reason = Some(reason);
         inst.external_flatten_fills = Some(ExternalFlattenFills {
             baseline,
+            attributable_order_ids,
             submitted_at: Instant::now(),
             submitted_ts: now_ts,
         });
+    }
+
+    /// Before an out-of-band flatten is submitted: cancel the venue orders of
+    /// every pair this instance holds a position in and drop the local
+    /// `pending_entry` / `pending_exit` so the snapshot clear can consume the
+    /// flatten. Returns the order ids of the retired exit legs — their fills
+    /// close the same position and are attributable to the flatten even when
+    /// they pre-date the fill baseline. Cancel failures are logged, not
+    /// fatal: the reduce-only flatten still goes out. bot-strategy#932.
+    pub(in crate::pairtrade) async fn retire_pending_orders_for_flatten(
+        &mut self,
+        inst_idx: usize,
+    ) -> HashSet<String> {
+        let mut attributable: HashSet<String> = HashSet::new();
+        let mut symbols: Vec<String> = Vec::new();
+        for pair in &self.cfg.universe {
+            let key = format!("{}/{}", pair.base, pair.quote);
+            let Some(state) = self.instances[inst_idx].states.get_mut(&key) else {
+                continue;
+            };
+            if state.position.is_none() {
+                continue;
+            }
+            if state.pending_entry.is_none() && state.pending_exit.is_none() {
+                continue;
+            }
+            if let Some(pending) = state.pending_exit.take() {
+                attributable.extend(pending.legs.iter().map(|leg| leg.order_id.clone()));
+            }
+            state.pending_entry = None;
+            symbols.push(pair.base.clone());
+            symbols.push(pair.quote.clone());
+            log::warn!(
+                "[FLATTEN_PNL] {} {} pending orders retired ahead of out-of-band flatten (exit legs={})",
+                self.instances[inst_idx].id,
+                key,
+                attributable.len()
+            );
+        }
+        symbols.sort();
+        symbols.dedup();
+        for symbol in symbols {
+            if let Err(err) = self.connector.cancel_all_orders(Some(symbol.clone())).await {
+                log::warn!(
+                    "[FLATTEN_PNL] {} cancel_all_orders({}) before flatten failed: {:?}",
+                    self.instances[inst_idx].id,
+                    symbol,
+                    err
+                );
+            }
+        }
+        attributable
+    }
+
+    /// `true` while an out-of-band flatten is armed for this instance, the
+    /// pair still has a local position (venue confirmation / fill booking
+    /// pending) and the flatten is younger than
+    /// `EXTERNAL_FLATTEN_FILL_GRACE`. Exit / re-hedge planning must stand
+    /// down in that window: the venue position is already gone, so a normal
+    /// exit would only submit a spurious close and install a `pending_exit`
+    /// that stops the fill attribution retries. The time bound keeps a
+    /// flatten that never clears from suppressing exits for good.
+    /// bot-strategy#932.
+    pub(in crate::pairtrade) fn flatten_booking_in_progress(
+        &self,
+        inst_idx: usize,
+        key: &str,
+    ) -> bool {
+        let inst = &self.instances[inst_idx];
+        if inst.external_flatten_reason.is_none() {
+            return false;
+        }
+        let Some(fills) = inst.external_flatten_fills.as_ref() else {
+            return false;
+        };
+        if fills.submitted_at.elapsed() >= EXTERNAL_FLATTEN_FILL_GRACE {
+            return false;
+        }
+        inst.states.get(key).is_some_and(|s| s.position.is_some())
     }
 
     /// Try to book an out-of-band flatten (session-DD halt) as a real
@@ -818,7 +921,6 @@ impl PairTradeEngine {
         reason: &str,
         now_ts: i64,
     ) -> FlattenBooking {
-        const EXTERNAL_FLATTEN_FILL_GRACE: Duration = Duration::from_secs(30);
         let inst_id = self.instances[inst_idx].id.clone();
         let Some(flatten) = self.instances[inst_idx].external_flatten_fills.clone() else {
             log::warn!(
@@ -887,7 +989,9 @@ impl PairTradeEngine {
             let mut value = Decimal::ZERO;
             let mut value_missing = false;
             for fill in fills.iter().filter(|f| !f.is_rejected) {
-                if seen.contains(&Self::fill_identity(fill)) {
+                if seen.contains(&Self::fill_identity(fill))
+                    && !flatten.attributable_order_ids.contains(&fill.order_id)
+                {
                     continue;
                 }
                 if fill.filled_side.is_some_and(|side| side != close_side) {

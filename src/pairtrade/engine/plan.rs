@@ -337,6 +337,19 @@ impl PairTradeEngine {
                 continue;
             }
 
+            // bot-strategy#932: the risk layer has flattened this pair on the
+            // venue and the fill booking is still pending. Stand down exit /
+            // re-hedge planning — a normal exit here would only submit a
+            // spurious close and install a pending_exit that blocks the
+            // booking retries. Bounded by EXTERNAL_FLATTEN_FILL_GRACE.
+            if self.flatten_booking_in_progress(inst_idx, &key) {
+                log::debug!(
+                    "[FLATTEN_PNL] {} planning skipped: out-of-band flatten booking in progress",
+                    key
+                );
+                continue;
+            }
+
             let mut action = TradeAction::None;
 
             // Read pair-level shared state (bot-strategy#413). β / spread /
