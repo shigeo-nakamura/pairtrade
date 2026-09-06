@@ -689,12 +689,22 @@ impl PairTradeEngine {
                                 .await
                             {
                                 FlattenBooking::Booked => {
+                                    // Same post-exit transition as a filled
+                                    // strategy exit (cooldown stamps, defer
+                                    // window release, close-reason counter)
+                                    // so the pair does not re-enter without
+                                    // the exit cooldown after an ack (Codex
+                                    // review, pairtrade#282).
+                                    let inst_id = self.instances[inst_idx].id.clone();
+                                    let shared = self.per_pair_state.get(&key);
                                     if let Some(state) =
                                         self.instances[inst_idx].states.get_mut(&key)
                                     {
-                                        state.position = None;
+                                        state.pending_exit_reason = Some("risk_flatten");
+                                        super::super::apply_post_exit_state(
+                                            state, shared, direction, now_ts, &inst_id, &key,
+                                        );
                                         state.position_guard = guard_after;
-                                        state.recovery_recorded = false;
                                     }
                                     continue;
                                 }
@@ -1173,6 +1183,22 @@ impl PairTradeEngine {
         let (Some(size_a), Some(size_b)) = (pos.entry_size_a, pos.entry_size_b) else {
             return FlattenBooking::Unavailable;
         };
+        // Fills are attributed per symbol; two covered positions sharing a
+        // leg symbol (BTC/ETH + BTC/SOL) would both absorb the same BTC
+        // fills. Decline rather than corrupt both records (Codex review,
+        // pairtrade#282).
+        let shares_symbol = flatten
+            .positions
+            .keys()
+            .any(|other| other != key && other.split('/').any(|sym| sym == base || sym == quote));
+        if shares_symbol {
+            log::warn!(
+                "[FLATTEN_PNL] {} {} shares a leg symbol with another flattened pair; not attributing fills",
+                inst_id,
+                key
+            );
+            return FlattenBooking::Unavailable;
+        }
         // Closing side per leg: LongSpread = long base / short quote.
         let (close_side_a, close_side_b) = match pos.direction {
             PositionDirection::LongSpread => (OrderSide::Short, OrderSide::Long),

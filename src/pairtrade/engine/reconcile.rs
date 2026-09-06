@@ -1154,6 +1154,7 @@ impl PairTradeEngine {
             }
         } else if pending.placed_at.elapsed() >= timeout {
             // Partial fill or stuck orders; cancel and flatten any filled leg
+            let mut cancel_confirmed = true;
             if status.open_remaining > 0 {
                 log::warn!(
                     "[ORDER] {} entry orders stale ({}s), cancelling {} legs",
@@ -1178,6 +1179,17 @@ impl PairTradeEngine {
                         );
                 }
                 self.cancel_pending_orders(&pending).await?;
+                // bot-strategy#932 (Codex review, pairtrade#282): keep the
+                // tracked ids until the venue confirms the cancel, otherwise
+                // a live non-reduce-only remainder loses its owner.
+                let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+                for leg in &pending.legs {
+                    match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                        Some((_, ids)) => ids.push(leg.order_id.clone()),
+                        None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                    }
+                }
+                cancel_confirmed = self.tracked_orders_gone(&per_symbol).await;
             }
             let filled_qtys = Self::filled_by_leg(&pending, &status.fills);
             let mut retry_count = pending.hedge_retry_count;
@@ -1203,6 +1215,17 @@ impl PairTradeEngine {
                     );
                     pending.placed_at = Instant::now();
                     state.pending_entry = Some(pending);
+                } else if !cancel_confirmed {
+                    log::warn!(
+                        "[ORDER] {} stale entry cancel not confirmed by the venue; keeping pending for retry",
+                        key
+                    );
+                    pending.placed_at = Instant::now();
+                    state.pending_entry = Some(pending);
+                    if flattened_any {
+                        state.position = None;
+                        state.recovery_recorded = false;
+                    }
                 } else {
                     state.last_exit_at = Some(Instant::now());
                     state.last_exit_ts = Some(now_ts);
