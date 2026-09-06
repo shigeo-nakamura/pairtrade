@@ -1,6 +1,6 @@
 [Unit]
 Description="debot-bull-holder (bot-strategy#893 bull-mode holder: HL spot 1x + Lighter perp 0.5x, operator-armed)"
-After=network-online.target debot-pair-btceth.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

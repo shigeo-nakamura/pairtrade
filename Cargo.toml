@@ -99,17 +99,9 @@ arcus-spot-live = [
 hyperliquid-sdk = ["dex-connector/hyperliquid-sdk"]
 
 [[bin]]
-name = "debot"
-path = "src/main.rs"
-
-[[bin]]
 name = "bull-holder"
 path = "src/bin/bull_holder.rs"
 required-features = ["lighter-sdk", "hyperliquid-sdk"]
-
-[[bin]]
-name = "convert-data"
-path = "src/bin/convert_data.rs"
 
 [[bin]]
 name = "arcus-spot-runtime"

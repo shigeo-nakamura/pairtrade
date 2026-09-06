@@ -1,5 +1,15 @@
 # Robinhood Lighter operations
 
+> **Frozen deployment (2026-09-06, bot-strategy#937).** The BTC/ETH pairtrade
+> engine, its `debot` binary, and the Robinhood deploy scripts/units this
+> runbook references were removed from the repository with the pairtrade
+> sunset. `debot-pair-robinhood-lighter` keeps running on the Tokyo host
+> exactly as last deployed (points farming) and is no longer updated from
+> this repo; CI no longer ships anything to it except `engine_b_live` and
+> the Engine B Phase 0 observer. To rebuild or change it, check out a
+> commit before the sunset (`git log --diff-filter=D -- src/main.rs`).
+> The operational steps below are kept for reference only.
+
 This runbook covers the dedicated `debot-pair-robinhood-lighter` deployment.
 Use UTC in every check and preserve venue exports under `~/bot/logs/`.
 
