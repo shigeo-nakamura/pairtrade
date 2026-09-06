@@ -5036,3 +5036,63 @@ async fn halted_zero_fill_post_only_entry_is_cancelled_not_reissued() {
         .is_none());
     assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
 }
+
+/// Codex P1 (pairtrade#282): the halted give-up path must keep the tracked
+/// ids while the venue still lists the remainder open, so a later pass can
+/// cancel it; nothing may be reissued meanwhile.
+#[tokio::test]
+async fn halted_partial_entry_keeps_pending_until_cancel_confirmed() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].session_halted = true;
+    let mut state = positionless_pending_entry_state();
+    state.pending_entry.as_mut().unwrap().placed_at = Instant::now();
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    connector.filled_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from([vec![("en-1".to_string(), dec("0.004"))]]),
+    );
+    // The BBB remainder stays listed open after the cancel request.
+    connector.open_ids_by_symbol.lock().unwrap().insert(
+        "BBB".to_string(),
+        VecDeque::from([vec!["en-2".to_string()]]),
+    );
+    let mut price_map = HashMap::new();
+    for (sym, px) in [("AAA", "100"), ("BBB", "50")] {
+        price_map.insert(
+            sym.to_string(),
+            SymbolSnapshot {
+                price: dec(px),
+                funding_rate: Decimal::ZERO,
+                bid_price: None,
+                ask_price: None,
+                bid_size: Decimal::ZERO,
+                ask_size: Decimal::ZERO,
+                min_order: Some(dec("0.001")),
+                min_tick: Some(dec("0.001")),
+                size_decimals: Some(3),
+                exchange_ts: None,
+            },
+        );
+    }
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(connector.calls.lock().unwrap().is_empty(), "no reissue");
+    assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
+    assert!(
+        engine.instances[0]
+            .states
+            .get("AAA/BBB")
+            .unwrap()
+            .pending_entry
+            .is_some(),
+        "tracked ids kept while the remainder is still open"
+    );
+}

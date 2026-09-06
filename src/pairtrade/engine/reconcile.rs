@@ -942,18 +942,42 @@ impl PairTradeEngine {
                     );
                 let variant_id = self.instances[inst_idx].id.clone();
                 self.cancel_pending_orders(&pending).await?;
-                self.write_recovery_no_pnl_record(
-                    inst_idx,
-                    key,
-                    pending.direction,
-                    "entry_reissue_giveup",
-                    now_ts,
-                    price_map,
-                );
+                // bot-strategy#932 (Codex review, pairtrade#282): the tracked
+                // ids must survive until the venue confirms the cancel.
+                // Otherwise a still-live remainder keeps filling after the
+                // flatten below with nobody able to cancel it. Flatten what
+                // filled either way; keep the pending (and retry next tick)
+                // when the cancel is unconfirmed.
+                let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+                for leg in &pending.legs {
+                    match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                        Some((_, ids)) => ids.push(leg.order_id.clone()),
+                        None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                    }
+                }
+                let cancel_confirmed = self.tracked_orders_gone(&per_symbol).await;
+                if cancel_confirmed {
+                    self.write_recovery_no_pnl_record(
+                        inst_idx,
+                        key,
+                        pending.direction,
+                        "entry_reissue_giveup",
+                        now_ts,
+                        price_map,
+                    );
+                }
                 self.force_close_all_positions(key, "entry_reissue_giveup")
                     .await;
                 if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                    state.pending_entry = None;
+                    if cancel_confirmed {
+                        state.pending_entry = None;
+                    } else {
+                        log::warn!(
+                            "[ORDER][GIVEUP] {} cancel not confirmed by the venue; keeping pending entry for retry",
+                            key
+                        );
+                        state.pending_entry = Some(pending);
+                    }
                 }
                 super::super::prom::ENTRY_REISSUE_GIVEUP_TOTAL
                     .with_label_values(&[&variant_id, key])
