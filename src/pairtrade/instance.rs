@@ -252,6 +252,11 @@ pub(in crate::pairtrade) struct StrategyInstance {
     /// taken right before the flatten was submitted. Set and cleared
     /// together with the reason marker. Not persisted. bot-strategy#932.
     pub(in crate::pairtrade) external_flatten_fills: Option<ExternalFlattenFills>,
+    /// Last time the sticky session halt re-issued a flatten because a
+    /// position (re)appeared on a halted instance — e.g. an entry leg that
+    /// filled after the one-shot halt flatten. Rate-limits the retry. Not
+    /// persisted. bot-strategy#932.
+    pub(in crate::pairtrade) halt_reflatten_at: Option<Instant>,
     /// Pairs whose NEW entries are fail-closed because the post-entry
     /// venue-position reconciliation (bot-strategy#721) found an exposure
     /// mismatch it could not repair (trim failed, position fetch failed,

@@ -4665,3 +4665,63 @@ async fn flatten_marker_stays_armed_until_every_pair_is_booked() {
         .lines()
         .all(|l| l.contains("\"source\":\"exit_fill\"")));
 }
+
+/// Codex P1 (pairtrade#282): a sticky halt must keep the account flat. A
+/// position that (re)appears on a halted instance — e.g. an entry leg whose
+/// cancel went unconfirmed and filled after the one-shot flatten — is
+/// flattened again (rate-limited), and the retry arms the booking marker.
+#[tokio::test]
+async fn halted_instance_reflattens_reappeared_exposure_once_per_interval() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.risk.max_session_loss_bps = 250;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0].session_halted = true;
+    engine.instances[0].session_halt_reason = Some("session_dd_250bps_lev5.0".to_string());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+
+    assert!(engine.evaluate_session_dd(0).await, "stays halted");
+    assert_eq!(
+        connector.close_all_calls.load(Ordering::SeqCst),
+        1,
+        "exposure on a halted instance is flattened again"
+    );
+    assert_eq!(
+        engine.instances[0].external_flatten_reason.as_deref(),
+        Some("session_dd_250bps_lev5.0_reflatten")
+    );
+    assert!(engine.instances[0].external_flatten_fills.is_some());
+
+    // Same tick family again: booking is in progress for that pair, and the
+    // retry is rate-limited — no second flatten.
+    assert!(engine.evaluate_session_dd(0).await);
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn halted_instance_does_not_reflatten_when_flat_or_exit_pending() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.risk.max_session_loss_bps = 250;
+    engine.instances[0].session_halted = true;
+
+    // Flat: nothing to do.
+    assert!(engine.evaluate_session_dd(0).await);
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 0);
+
+    // A strategy exit already closing the position: leave it alone.
+    let mut state = seeded_position_state();
+    state.pending_exit = Some(pending_exit_for_seeded_position());
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    assert!(engine.evaluate_session_dd(0).await);
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 0);
+}

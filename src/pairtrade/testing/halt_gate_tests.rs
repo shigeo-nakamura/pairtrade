@@ -506,6 +506,7 @@ impl Harness {
             default_pair_params: pp,
             external_flatten_reason: None,
             external_flatten_fills: None,
+            halt_reflatten_at: None,
             entry_blocked_pairs: HashMap::new(),
         });
     }

@@ -1740,13 +1740,16 @@ impl PairTradeEngine {
         if threshold_bps == 0 {
             return self.instances[inst_idx].session_halted;
         }
-        let inst = &self.instances[inst_idx];
-        if inst.session_halted {
-            // Halt is sticky — once tripped, stay halted until ack'd.
-            // No need to re-flatten on every tick; one shot is enough,
-            // and `close_all_positions` was already invoked on trip.
+        if self.instances[inst_idx].session_halted {
+            // Halt is sticky — once tripped, stay halted until ack'd. The
+            // trip already flattened once; the only reason to act again is
+            // exposure that (re)appeared afterwards — an entry leg whose
+            // cancel was not confirmed and filled later, or a leg the bulk
+            // close missed. bot-strategy#932 (Codex review, pairtrade#282).
+            self.reflatten_if_exposed_while_halted(inst_idx).await;
             return true;
         }
+        let inst = &self.instances[inst_idx];
         // bot-strategy#366: refuse to trip until the connector has fed at
         // least one real balance into `equity_cache`. Otherwise the seed
         // `equity_reference_usd` races the persisted-peak `equity_samples`
@@ -1807,53 +1810,117 @@ impl PairTradeEngine {
             // submitting the flatten so the exchange-snapshot clear can
             // isolate the flatten's own fills and book the realised exit
             // PnL instead of a pnl-less `recovery_no_pnl` record.
-            // Entry legs still awaiting reconciliation must not fill after
-            // the flatten on a halted instance: cancel them first (tracked
-            // ids only). Exits stay live until the flatten is submitted.
-            self.cancel_pending_entries_for_halt(inst_idx).await;
-            let fill_baseline = self.snapshot_fill_baseline(inst_idx).await;
-            if let Err(err) = self.connector.close_all_positions(None).await {
-                log::error!(
-                    "[SESSION_DD] {} close_all_positions failed: {:?}",
-                    self.instances[inst_idx].id,
-                    err
-                );
-            } else {
-                log::warn!(
-                    "[SESSION_DD] {} close_all_positions invoked",
-                    self.instances[inst_idx].id
-                );
-                // bot-strategy#514: tag the out-of-band flatten so the
-                // exchange-snapshot clear writes a recovery_no_pnl record
-                // with the real trigger instead of `exchange_snapshot_clear`.
-                // Armed only after a successful close submission AND only
-                // when a local position exists for the snapshot clear to
-                // consume it on — otherwise the one-shot marker would leak
-                // onto a future unrelated clear and mislabel it.
-                if self.instances[inst_idx]
-                    .states
-                    .values()
-                    .any(|s| s.position.is_some())
-                {
-                    // Only once the flatten is actually submitted: retire the
-                    // in-flight strategy exits (their tracked fills fold into
-                    // the flatten attribution; a still-open entry order must
-                    // not re-open exposure on a halted instance). On a failed
-                    // submission the pendings stay live and keep closing the
-                    // exposure on their own (Codex review, pairtrade#282).
-                    let attributable_order_ids =
-                        self.retire_pending_exits_for_flatten(inst_idx).await;
-                    self.arm_external_flatten(
-                        inst_idx,
-                        reason.clone(),
-                        fill_baseline,
-                        attributable_order_ids,
-                        now_ts,
-                    );
-                }
-            }
+            self.submit_halt_flatten(inst_idx, &reason, now_ts).await;
         }
         true
+    }
+
+    /// The halt's flatten sequence (bot-strategy#514 / #932): cancel pending
+    /// entries (tracked ids, confirmed), snapshot the fill baseline, submit
+    /// `close_all_positions`, and on success retire the pending exits and arm
+    /// the one-shot flatten marker so the exchange-snapshot clear books the
+    /// realised PnL. Shared by the trip and by the halted-exposure retry.
+    async fn submit_halt_flatten(&mut self, inst_idx: usize, reason: &str, now_ts: i64) {
+        // Entry legs still awaiting reconciliation must not fill after
+        // the flatten on a halted instance: cancel them first (tracked
+        // ids only). Exits stay live until the flatten is submitted.
+        self.cancel_pending_entries_for_halt(inst_idx).await;
+        let fill_baseline = self.snapshot_fill_baseline(inst_idx).await;
+        if let Err(err) = self.connector.close_all_positions(None).await {
+            log::error!(
+                "[SESSION_DD] {} close_all_positions failed: {:?}",
+                self.instances[inst_idx].id,
+                err
+            );
+            return;
+        }
+        log::warn!(
+            "[SESSION_DD] {} close_all_positions invoked (reason={})",
+            self.instances[inst_idx].id,
+            reason
+        );
+        // bot-strategy#514: tag the out-of-band flatten so the
+        // exchange-snapshot clear writes a recovery_no_pnl record
+        // with the real trigger instead of `exchange_snapshot_clear`.
+        // Armed only after a successful close submission AND only
+        // when a local position exists for the snapshot clear to
+        // consume it on — otherwise the one-shot marker would leak
+        // onto a future unrelated clear and mislabel it.
+        if self.instances[inst_idx]
+            .states
+            .values()
+            .any(|s| s.position.is_some())
+        {
+            // Only once the flatten is actually submitted: retire the
+            // in-flight strategy exits (their tracked fills fold into
+            // the flatten attribution; a still-open entry order must
+            // not re-open exposure on a halted instance). On a failed
+            // submission the pendings stay live and keep closing the
+            // exposure on their own (Codex review, pairtrade#282).
+            let attributable_order_ids = self.retire_pending_exits_for_flatten(inst_idx).await;
+            self.arm_external_flatten(
+                inst_idx,
+                reason.to_string(),
+                fill_baseline,
+                attributable_order_ids,
+                now_ts,
+            );
+        }
+    }
+
+    /// While the session halt is sticky, keep the account flat: if a pair
+    /// holds a local position that is neither being booked by the halt
+    /// flatten (`flatten_booking_in_progress`) nor already closing through a
+    /// strategy exit (`pending_exit`), re-run the flatten sequence. Covers
+    /// an entry leg whose pre-flatten cancel failed / went unconfirmed and
+    /// filled afterwards, and a leg the bulk close missed. Rate-limited to
+    /// one attempt per `HALT_REFLATTEN_MIN_INTERVAL`. bot-strategy#932.
+    pub(in crate::pairtrade) async fn reflatten_if_exposed_while_halted(
+        &mut self,
+        inst_idx: usize,
+    ) {
+        const HALT_REFLATTEN_MIN_INTERVAL: Duration = Duration::from_secs(60);
+        if self.cfg.dry_run || self.cfg.observe_only {
+            return;
+        }
+        let exposed: Vec<String> = self
+            .cfg
+            .universe
+            .iter()
+            .map(|pair| format!("{}/{}", pair.base, pair.quote))
+            .filter(|key| {
+                self.instances[inst_idx]
+                    .states
+                    .get(key)
+                    .is_some_and(|s| s.position.is_some() && s.pending_exit.is_none())
+                    && !self.flatten_booking_in_progress(inst_idx, key)
+            })
+            .collect();
+        if exposed.is_empty() {
+            return;
+        }
+        if self.instances[inst_idx]
+            .halt_reflatten_at
+            .is_some_and(|t| t.elapsed() < HALT_REFLATTEN_MIN_INTERVAL)
+        {
+            return;
+        }
+        self.instances[inst_idx].halt_reflatten_at = Some(Instant::now());
+        let reason = format!(
+            "{}_reflatten",
+            self.instances[inst_idx]
+                .session_halt_reason
+                .clone()
+                .unwrap_or_else(|| "session_halted".to_string())
+        );
+        log::error!(
+            "[SESSION_DD] {} exposure while halted on {:?}; re-flattening (reason={})",
+            self.instances[inst_idx].id,
+            exposed,
+            reason
+        );
+        let now_ts = self.current_now_ts();
+        self.submit_halt_flatten(inst_idx, &reason, now_ts).await;
     }
 }
 
