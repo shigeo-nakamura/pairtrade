@@ -1820,7 +1820,12 @@ impl PairTradeEngine {
     /// `close_all_positions`, and on success retire the pending exits and arm
     /// the one-shot flatten marker so the exchange-snapshot clear books the
     /// realised PnL. Shared by the trip and by the halted-exposure retry.
-    async fn submit_halt_flatten(&mut self, inst_idx: usize, reason: &str, now_ts: i64) {
+    pub(in crate::pairtrade) async fn submit_halt_flatten(
+        &mut self,
+        inst_idx: usize,
+        reason: &str,
+        now_ts: i64,
+    ) {
         // Entry legs still awaiting reconciliation must not fill after
         // the flatten on a halted instance: cancel them first (tracked
         // ids only). Exits stay live until the flatten is submitted.
@@ -1846,10 +1851,14 @@ impl PairTradeEngine {
         // when a local position exists for the snapshot clear to
         // consume it on — otherwise the one-shot marker would leak
         // onto a future unrelated clear and mislabel it.
+        // A pending entry retained because it (may have) executed during
+        // its halt-time cancel will be promoted to a position and closed by
+        // this flatten too — arm for it as well so that close is booked
+        // (Codex review, pairtrade#282).
         if self.instances[inst_idx]
             .states
             .values()
-            .any(|s| s.position.is_some())
+            .any(|s| s.position.is_some() || s.pending_entry.is_some())
         {
             // Only once the flatten is actually submitted: retire the
             // in-flight strategy exits (their tracked fills fold into

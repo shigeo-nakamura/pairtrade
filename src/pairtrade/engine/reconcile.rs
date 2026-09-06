@@ -1080,8 +1080,26 @@ impl PairTradeEngine {
                 key
             );
             self.cancel_pending_orders(&pending).await?;
+            let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
+            for leg in &pending.legs {
+                match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
+                    Some((_, ids)) => ids.push(leg.order_id.clone()),
+                    None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
+                }
+            }
+            // Keep the tracked ids until the venue confirms the cancel; a
+            // live non-reduce-only order must never lose its owner.
+            let cancel_confirmed = self.tracked_orders_gone(&per_symbol).await;
             if let Some(state) = self.instances[inst_idx].states.get_mut(key) {
-                state.pending_entry = None;
+                state.pending_entry = if cancel_confirmed {
+                    None
+                } else {
+                    log::warn!(
+                        "[ORDER] {} cancel not confirmed by the venue; keeping halted pending entry for retry",
+                        key
+                    );
+                    Some(pending)
+                };
             }
         } else if pending.post_only_hybrid {
             let recon_pp = self.pair_params_for(inst_idx, key).clone();

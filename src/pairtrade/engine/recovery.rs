@@ -777,10 +777,13 @@ impl PairTradeEngine {
         let mut symbols: Vec<String> = Vec::new();
         for pair in &self.cfg.universe {
             let key = format!("{}/{}", pair.base, pair.quote);
+            // Pairs with a retained pending entry are included too: if that
+            // entry executed during its halt-time cancel, the flatten closes
+            // it and its fills must be attributable.
             let held = self.instances[inst_idx]
                 .states
                 .get(&key)
-                .is_some_and(|s| s.position.is_some());
+                .is_some_and(|s| s.position.is_some() || s.pending_entry.is_some());
             if held {
                 symbols.push(pair.base.clone());
                 symbols.push(pair.quote.clone());

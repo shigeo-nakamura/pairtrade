@@ -5096,3 +5096,76 @@ async fn halted_partial_entry_keeps_pending_until_cancel_confirmed() {
         "tracked ids kept while the remainder is still open"
     );
 }
+
+/// Codex P1 (pairtrade#282): the halted zero-fill post-only branch keeps the
+/// pending while the venue still lists the order open.
+#[tokio::test]
+async fn halted_zero_fill_post_only_entry_kept_when_cancel_unconfirmed() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.open_ids_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from([vec!["en-1".to_string()]]),
+    );
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].session_halted = true;
+    let mut state = positionless_pending_entry_state();
+    state.pending_entry.as_mut().unwrap().post_only_hybrid = true;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    let price_map: HashMap<String, SymbolSnapshot> = HashMap::new();
+
+    engine
+        .reconcile_pending_orders(0, "AAA/BBB", &price_map)
+        .await
+        .unwrap();
+
+    assert!(connector.calls.lock().unwrap().is_empty(), "no reissue");
+    assert!(
+        engine.instances[0]
+            .states
+            .get("AAA/BBB")
+            .unwrap()
+            .pending_entry
+            .is_some(),
+        "pending kept while still listed open"
+    );
+}
+
+/// Codex P2 (pairtrade#282): a pending entry retained because it executed
+/// during its halt-time cancel is covered by the flatten attribution —
+/// baseline over its symbols and marker armed — even though no local
+/// position exists yet.
+#[tokio::test]
+async fn halt_flatten_arms_attribution_for_entry_filled_during_cancel() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("en-1", "t-1", Some(OrderSide::Long), "0.01", Some("1.00")),
+    );
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+
+    engine
+        .submit_halt_flatten(0, "session_dd_test", 1_700_000_300)
+        .await;
+
+    let inst = &engine.instances[0];
+    assert!(
+        inst.states.get("AAA/BBB").unwrap().pending_entry.is_some(),
+        "executed-during-cancel entry stays owned"
+    );
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 1);
+    assert!(inst.external_flatten_reason.is_some(), "marker armed");
+    let fills = inst.external_flatten_fills.as_ref().unwrap();
+    assert!(fills.baseline.contains_key("AAA") && fills.baseline.contains_key("BBB"));
+}
