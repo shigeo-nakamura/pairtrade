@@ -835,48 +835,110 @@ impl PairTradeEngine {
     /// Session-halt hygiene, run *before* the bulk flatten is submitted:
     /// cancel every pending **entry** order of this instance (with or
     /// without a local position — entry legs awaiting reconciliation are
-    /// exactly the case) and drop the local `pending_entry`. A halted
-    /// instance never retries the flatten, so an entry leg that filled after
-    /// it would recreate exposure nobody closes. Cancels target the tracked
-    /// order ids only. Failures are logged, not fatal. bot-strategy#932.
+    /// exactly the case). A halted instance never retries the flatten, so an
+    /// entry leg that filled after it would recreate exposure nobody closes.
+    /// The local `pending_entry` is dropped only once the venue confirms the
+    /// tracked orders are gone; on a cancel error or an unconfirmed cancel it
+    /// is kept, so the normal reconcile loop keeps managing (and, on fill,
+    /// hedging/flattening) it. Cancels target the tracked order ids only.
+    /// bot-strategy#932.
     pub(in crate::pairtrade) async fn cancel_pending_entries_for_halt(&mut self, inst_idx: usize) {
-        let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
-        for pair in &self.cfg.universe {
+        let universe = self.cfg.universe.clone();
+        for pair in &universe {
             let key = format!("{}/{}", pair.base, pair.quote);
-            let Some(state) = self.instances[inst_idx].states.get_mut(&key) else {
+            let Some(pending) = self.instances[inst_idx]
+                .states
+                .get_mut(&key)
+                .and_then(|state| state.pending_entry.take())
+            else {
                 continue;
             };
-            let Some(pending) = state.pending_entry.take() else {
-                continue;
-            };
+            let inst_id = self.instances[inst_idx].id.clone();
+            let mut per_symbol: Vec<(String, Vec<String>)> = Vec::new();
             for leg in &pending.legs {
                 match per_symbol.iter_mut().find(|(sym, _)| *sym == leg.symbol) {
                     Some((_, ids)) => ids.push(leg.order_id.clone()),
                     None => per_symbol.push((leg.symbol.clone(), vec![leg.order_id.clone()])),
                 }
             }
-            log::warn!(
-                "[FLATTEN_PNL] {} {} pending entry cancelled ahead of session halt (legs={})",
-                self.instances[inst_idx].id,
-                key,
-                pending.legs.len()
-            );
-        }
-        for (symbol, ids) in per_symbol {
-            if let Err(err) = self
-                .connector
-                .cancel_orders(Some(symbol.clone()), ids.clone())
-                .await
-            {
+            let mut cancel_failed = false;
+            for (symbol, ids) in &per_symbol {
+                if let Err(err) = self
+                    .connector
+                    .cancel_orders(Some(symbol.clone()), ids.clone())
+                    .await
+                {
+                    log::warn!(
+                        "[FLATTEN_PNL] {} {} cancel_orders({}, {:?}) before halt flatten failed: {:?}",
+                        inst_id,
+                        key,
+                        symbol,
+                        ids,
+                        err
+                    );
+                    cancel_failed = true;
+                }
+            }
+            let confirmed = !cancel_failed && self.tracked_orders_gone(&per_symbol).await;
+            if confirmed {
                 log::warn!(
-                    "[FLATTEN_PNL] {} cancel_orders({}, {:?}) before halt flatten failed: {:?}",
-                    self.instances[inst_idx].id,
-                    symbol,
-                    ids,
-                    err
+                    "[FLATTEN_PNL] {} {} pending entry cancelled ahead of session halt (legs={})",
+                    inst_id,
+                    key,
+                    pending.legs.len()
                 );
+            } else {
+                log::warn!(
+                    "[FLATTEN_PNL] {} {} pending entry kept: cancel {} — reconcile keeps managing it",
+                    inst_id,
+                    key,
+                    if cancel_failed {
+                        "failed"
+                    } else {
+                        "not confirmed by the venue"
+                    }
+                );
+                if let Some(state) = self.instances[inst_idx].states.get_mut(&key) {
+                    state.pending_entry = Some(pending);
+                }
             }
         }
+    }
+
+    /// Poll the venue (bounded, ~1.5 s worst case) until none of the given
+    /// tracked orders remain open. `true` only on positive confirmation; an
+    /// open-orders fetch error counts as "still open". Skipped (returns
+    /// `true`) in backtest replay where cancels are synchronous.
+    /// bot-strategy#932.
+    pub(in crate::pairtrade) async fn tracked_orders_gone(
+        &self,
+        per_symbol: &[(String, Vec<String>)],
+    ) -> bool {
+        const CANCEL_ACK_ATTEMPTS: usize = 10;
+        const CANCEL_ACK_DELAY_MS: u64 = 150;
+        if self.cfg.backtest_mode {
+            return true;
+        }
+        for attempt in 0..CANCEL_ACK_ATTEMPTS {
+            if attempt > 0 {
+                sleep(Duration::from_millis(CANCEL_ACK_DELAY_MS)).await;
+            }
+            let mut any_open = false;
+            for (symbol, ids) in per_symbol {
+                match self.connector.get_open_orders(symbol).await {
+                    Ok(open) => {
+                        if open.orders.iter().any(|o| ids.contains(&o.order_id)) {
+                            any_open = true;
+                        }
+                    }
+                    Err(_) => any_open = true,
+                }
+            }
+            if !any_open {
+                return true;
+            }
+        }
+        false
     }
 
     /// Right after an out-of-band flatten was submitted successfully: cancel

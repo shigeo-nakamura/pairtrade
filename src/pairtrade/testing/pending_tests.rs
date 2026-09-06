@@ -70,6 +70,7 @@ pub(in crate::pairtrade) struct DummyConnector {
     cancel_orders_calls: AtomicUsize,
     /// bot-strategy#932: `(symbol, order_ids)` per `cancel_orders` call.
     cancel_orders_detail: Mutex<Vec<(Option<String>, Vec<String>)>>,
+    cancel_orders_should_fail: AtomicBool,
     modify_should_fail: AtomicBool,
     reject_priced_orders: AtomicBool,
     /// Codex review PR #159: count of `get_ticker` calls and an optional
@@ -433,6 +434,11 @@ impl DexConnector for DummyConnector {
             .lock()
             .unwrap()
             .push((symbol, order_ids));
+        if self.cancel_orders_should_fail.load(Ordering::SeqCst) {
+            return Err(DexError::Transient(
+                "cancel_orders forced failure (test)".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -4267,14 +4273,7 @@ async fn retire_pending_exits_for_flatten_cancels_tracked_ids_and_collects_legs(
     );
 }
 
-/// Codex P1 (pairtrade#282): an entry still awaiting reconciliation (no
-/// local position yet) must be cancelled on a session halt, or it can fill
-/// after the flatten and recreate exposure nobody closes.
-#[tokio::test]
-async fn cancel_pending_entries_for_halt_cancels_positionless_entry() {
-    let connector = Arc::new(DummyConnector::default());
-    let mut engine = PairTradeEngine::test_instance(connector.clone());
-    engine.cfg.dry_run = false;
+fn positionless_pending_entry_state() -> PairState {
     let mut state = PairState::new(2.0);
     state.pending_entry = Some(PendingOrders {
         legs: vec![
@@ -4288,21 +4287,83 @@ async fn cancel_pending_entries_for_halt_cancels_positionless_entry() {
         post_only_hybrid: false,
         exit_taker_takeover_at: None,
     });
+    state
+}
+
+/// Codex P1 (pairtrade#282): an entry still awaiting reconciliation (no
+/// local position yet) must be cancelled on a session halt, or it can fill
+/// after the flatten and recreate exposure nobody closes.
+#[tokio::test]
+async fn cancel_pending_entries_for_halt_cancels_positionless_entry() {
+    let connector = Arc::new(DummyConnector::default());
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
     engine.instances[0]
         .states
-        .insert("AAA/BBB".to_string(), state);
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
 
     engine.cancel_pending_entries_for_halt(0).await;
 
     let state = engine.instances[0].states.get("AAA/BBB").unwrap();
     assert!(state.pending_entry.is_none());
+    let mut detail = connector.cancel_orders_detail.lock().unwrap().clone();
+    detail.sort();
     assert_eq!(
-        *connector.cancel_orders_detail.lock().unwrap(),
+        detail,
         vec![
             (Some("AAA".to_string()), vec!["en-1".to_string()]),
             (Some("BBB".to_string()), vec!["en-2".to_string()]),
         ]
     );
+}
+
+/// The local pending entry must survive a failed cancel: the reconcile loop
+/// keeps managing it (and hedging a late fill) instead of it vanishing from
+/// local state while still live on the venue.
+#[tokio::test]
+async fn cancel_pending_entries_for_halt_keeps_entry_when_cancel_fails() {
+    let connector = Arc::new(DummyConnector::default());
+    connector
+        .cancel_orders_should_fail
+        .store(true, Ordering::SeqCst);
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+
+    engine.cancel_pending_entries_for_halt(0).await;
+
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(
+        state.pending_entry.is_some(),
+        "pending entry kept on cancel failure"
+    );
+}
+
+/// Same when the venue accepts the cancel but still reports the order open
+/// after the bounded acknowledgement wait.
+#[tokio::test]
+async fn cancel_pending_entries_for_halt_keeps_entry_when_still_open() {
+    let connector = Arc::new(DummyConnector::default());
+    connector.open_ids_by_symbol.lock().unwrap().insert(
+        "AAA".to_string(),
+        VecDeque::from([vec!["en-1".to_string()]]),
+    );
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), positionless_pending_entry_state());
+
+    engine.cancel_pending_entries_for_halt(0).await;
+
+    let state = engine.instances[0].states.get("AAA/BBB").unwrap();
+    assert!(
+        state.pending_entry.is_some(),
+        "pending entry kept while the venue still shows it open"
+    );
+    assert!(connector.cancel_orders_calls.load(Ordering::SeqCst) >= 1);
 }
 
 #[tokio::test]
