@@ -130,7 +130,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use debot::pairtrade::s3_mirror::S3Mirror;
+use debot::infra::s3_mirror::S3Mirror;
 
 fn init_logger() {
     let offset_seconds = std::env::var("TIMEZONE_OFFSET")

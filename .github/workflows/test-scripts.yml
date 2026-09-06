@@ -2,11 +2,11 @@ name: Script Tests
 
 # bot-strategy#765 round4: split out of ci.yml. ci.yml's resolve-ref job
 # makes should_deploy unconditional, so any path that fires ci.yml on
-# master also runs the arm64 build, S3 deploy, and the canary
-# auto-restart. deploy-configs.yml already syncs scripts/** to the host
-# with no restart in ~30s, so a scripts-only push has no business
-# reaching that pipeline — this workflow just runs the regression tests
-# for the scripts under test, decoupled from any deploy trigger.
+# master also runs the arm64 build and S3 deploy. deploy-configs.yml
+# already syncs scripts/** to the hosts with no restart in ~30s, so a
+# scripts-only push has no business reaching that pipeline — this
+# workflow just runs the regression tests for the scripts under test,
+# decoupled from any deploy trigger.
 on:
   push:
     paths:
@@ -32,10 +32,6 @@ jobs:
           python3 scripts/engine_b_trading_calendar_freeze.py \
             --start "$RANGE_START" --end "$RANGE_END" --out /tmp/trading_calendar_check.json
           diff configs/engine-b/trading_calendar.json /tmp/trading_calendar_check.json
-      - name: Run canary_diff_report.py unit tests
-        run: python3 scripts/test_canary_diff_report.py -v
-      - name: Run round_performance_report.py unit tests
-        run: python3 scripts/test_round_performance_report.py -v
       - name: Run Arcus live signal replay unit tests
         run: python3 scripts/test_arcus_live_tick_signal_replay.py -v
       - name: Run Arcus durable event stream unit tests
@@ -44,9 +40,3 @@ jobs:
         run: bash scripts/test_archive_arcus_live_tick_events.sh
       - name: Run Arcus event archive installer tests
         run: bash scripts/test_install_arcus_live_tick_event_archive.sh
-      - name: Run Robinhood sidecar bootstrap tests
-        run: bash scripts/test_bootstrap_robinhood_sidecar.sh
-      - name: Run Robinhood runtime staging tests
-        run: bash scripts/test_deploy_robinhood_runtime.sh
-      - name: Verify Robinhood deploy workflow isolation
-        run: python3 scripts/test_robinhood_deploy_workflows.py

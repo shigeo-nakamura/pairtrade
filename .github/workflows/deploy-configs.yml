@@ -33,19 +33,11 @@ jobs:
 
       - name: Validate shell wrappers
         run: |
-          bash -n debot/scripts/debot-pair-shadow-macro.sh
-          bash -n debot/scripts/debot-pair-robinhood-lighter.sh
-          bash -n debot/scripts/bootstrap-robinhood-sidecar.sh
-          bash -n debot/scripts/activate-robinhood-sidecar.sh
-          bash -n debot/scripts/deploy-robinhood-config.sh
-          bash -n debot/scripts/deploy-robinhood-runtime.sh
+          bash -n debot/scripts/debot-bull-holder.sh
           bash -n debot/scripts/engine_b_phase0_archive.sh
           bash -n debot/scripts/install_engine_b_phase0.sh
           bash -n debot/scripts/run_engine_b_phase0.sh
           bash -n debot/scripts/install_engine_b_live.sh
-          bash -n debot/scripts/test_bootstrap_robinhood_sidecar.sh
-          bash -n debot/scripts/test_deploy_robinhood_runtime.sh
-          python3 -m py_compile debot/scripts/test_robinhood_deploy_workflows.py
           python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
 
@@ -65,29 +57,12 @@ jobs:
             --start "$RANGE_START" --end "$RANGE_END" --out /tmp/trading_calendar_check.json
           diff debot/configs/engine-b/trading_calendar.json /tmp/trading_calendar_check.json
 
-      - name: Test Robinhood sidecar bootstrap
-        run: bash debot/scripts/test_bootstrap_robinhood_sidecar.sh
-
-      - name: Test Robinhood runtime staging
-        run: bash debot/scripts/test_deploy_robinhood_runtime.sh
-
-      - name: Verify Robinhood deploy workflow isolation
-        run: python3 debot/scripts/test_robinhood_deploy_workflows.py
-
-      - name: Validate Robinhood systemd units
+      - name: Validate systemd units
         run: |
-          systemd-analyze verify debot/deploy/debot-pair-robinhood-sidecar-activation.service
-          systemd-analyze verify debot/deploy/debot-pair-robinhood-lighter.service
+          systemd-analyze verify debot/deploy/engine-b-live.service
           systemd-analyze verify debot/deploy/engine-b-phase0.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.timer
-
-      - name: Validate Lighter market preflight
-        run: |
-          python3 -m py_compile debot/scripts/check_lighter_config_markets.py
-          python3 debot/scripts/check_lighter_config_markets.py \
-            debot/configs/pairtrade/debot-pair-shadow-macro.yaml \
-            --markets-json debot/.github/fixtures/lighter_order_book_details_macro.json
 
   deploy-configs:
     needs: validate-config-artifacts
@@ -101,17 +76,11 @@ jobs:
           path: debot
 
       - name: Forbid bot auto-restart in CI workflows
-        # bot-strategy#269: main trading bots (debot-pair-btceth,
-        # debot-pair-btceth-extended) must be restarted manually only.
-        # Auto-restart from CI force-closes open positions inside systemd's
-        # 90s TimeoutStopSec window. Sidecar `lighter-ratelimit` is exempt
-        # and intentionally not matched.
-        # bot-strategy#376 exception: debot-pair-canary is the only
-        # debot-pair-* unit allowed to auto-restart on every deploy. Keep
-        # this regex aligned with the matching guard in `ci.yml`.
+        # bot-strategy#269: trading services are restarted manually only.
+        # Keep this regex aligned with the matching guard in `ci.yml`.
         run: |
-          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+debot-pair-(btceth|extended)([[:space:]]|$)' debot/.github/workflows/*.yml; then
-            echo "::error::CI workflow contains forbidden 'systemctl restart/start debot-pair-(btceth|extended)' — main bots must be restarted manually only (bot-strategy#269). Canary (debot-pair-canary) is the only exception."
+          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+(debot-pair-[a-z-]+|engine-b-live|debot-bull-holder)([[:space:]]|$)' debot/.github/workflows/*.yml; then
+            echo "::error::CI workflow contains a forbidden 'systemctl restart/start <trading unit>' — trading services must be restarted manually only (bot-strategy#269)."
             exit 1
           fi
 
@@ -152,12 +121,7 @@ jobs:
             --exclude "*.pyc" \
             --exclude "*.env"
           aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/" --exact-timestamps
-          aws s3 cp debot/deploy/debot-pair-btceth.service "s3://${S3_BUCKET}/deploy/debot-pair-btceth.service"
-          aws s3 cp debot/deploy/pair-data-collector.service "s3://${S3_BUCKET}/deploy/pair-data-collector.service"
-          aws s3 cp debot/deploy/debot-pair-shadow.service "s3://${S3_BUCKET}/deploy/debot-pair-shadow.service"
-          aws s3 cp debot/deploy/debot-pair-shadow-macro.service "s3://${S3_BUCKET}/deploy/debot-pair-shadow-macro.service"
-          aws s3 cp debot/deploy/debot-pair-robinhood-sidecar-activation.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-sidecar-activation.service"
-          aws s3 cp debot/deploy/debot-pair-robinhood-lighter.service "s3://${S3_BUCKET}/deploy/debot-pair-robinhood-lighter.service"
+          aws s3 cp debot/deploy/engine-b-live.service "s3://${S3_BUCKET}/deploy/engine-b-live.service"
           aws s3 cp debot/deploy/engine-b-phase0.service "s3://${S3_BUCKET}/deploy/engine-b-phase0.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.service "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.timer "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.timer"
@@ -172,7 +136,11 @@ jobs:
           aws s3 cp debot/deploy/engine-b-phase0-archive.service "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/deploy/engine-b-phase0-archive.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.timer "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/deploy/engine-b-phase0-archive.timer"
 
-      - name: Deploy via SSM (no restart)
+      - name: Deploy scripts/configs to Frankfurt via SSM (no restart)
+        # Frankfurt (bot-strategy#937 sunset) only hosts debot-bull-holder,
+        # whose launcher reads /opt/debot/scripts/debot-bull-holder.env;
+        # this step keeps the shared scripts/configs tree in sync and does
+        # nothing else. Unit files are owned by deploy-bull-holder.yml.
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
@@ -182,9 +150,8 @@ jobs:
             "commands": [
               "sudo mkdir -p __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exact-timestamps --exclude '*.env'",
-              "/bin/bash -lc 'set -e; CFG_OUT=$(aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs --exact-timestamps); printf \"%s\\n\" \"$CFG_OUT\"; CHANGED=$(printf \"%s\\n\" \"$CFG_OUT\" | grep -E \"to .*/configs/pairtrade/debot-pair-btceth[.]yaml$\" | sed -E \"s/.* to //\" | sort -u || true); if [ -n \"$CHANGED\" ]; then { echo \"deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)\"; echo \"changed:\"; printf \"%s\\n\" \"$CHANGED\"; echo \"ACTION: bot-strategy#269 deploy is no-restart. Restart the affected service to LOAD this config, then verify with scripts/check_config_drift.sh (the [CONFIG] fingerprint at startup confirms what loaded).\"; } | sudo tee __INSTALL_DIR__/RESTART_PENDING >/dev/null; echo \"WARNING RESTART REQUIRED: pairtrade config changed but the running process was NOT restarted (deploy != restart, bot-strategy#269/#580). RESTART_PENDING marker dropped:\"; printf \"%s\\n\" \"$CHANGED\"; fi; if [ -f __INSTALL_DIR__/RESTART_PENDING ]; then echo \"NOTE: __INSTALL_DIR__/RESTART_PENDING still present from a prior config deploy — a restart+load is still owed (cleared only by the service launch script on restart).\"; fi'",
-              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
-              "/bin/bash -lc 'set -e; UPDATED=0; for svc in debot-pair-btceth pair-data-collector debot-pair-shadow debot-pair-shadow-macro; do aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo mv /tmp/$svc.service /etc/systemd/system/$svc.service; UPDATED=1; else rm /tmp/$svc.service; fi; done; if [ $UPDATED -eq 1 ]; then sudo systemctl daemon-reload; fi'"
+              "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs --exact-timestamps",
+              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh"
             ]
           }
           JSON
@@ -239,24 +206,20 @@ jobs:
           # array (as the "Deploy via SSM (no restart)" step above already
           # uses) avoids that ambiguity entirely; each command is its own
           # JSON string, quoted, no shorthand involved.
+          # The frozen Robinhood Chain pairtrade service on this host
+          # (`debot-pair-robinhood-lighter`) is deliberately NOT touched:
+          # its config and units stay as last deployed (bot-strategy#937).
           cat > /tmp/ssm-robinhood-params.json <<'JSON'
           {
             "commands": [
               "set -e",
-              "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs __INSTALL_DIR__/configs/pairtrade /opt/debot-robinhood-lighter /home/ec2-user/debot_status",
+              "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exclude '*.env'",
-              "sudo bash __INSTALL_DIR__/scripts/deploy-robinhood-config.sh __S3_BUCKET__ __INSTALL_DIR__",
+              "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
               "install -d -m 0755 /tmp/engine-b-phase0-__GITHUB_SHA__",
               "aws s3 sync s3://__S3_BUCKET__/debot/engine-b-phase0/releases/__GITHUB_SHA__/ /tmp/engine-b-phase0-__GITHUB_SHA__/ --exact-timestamps",
-              "sudo env ENGINE_B_PHASE0_CODE_COMMIT=__GITHUB_SHA__ ENGINE_B_PHASE0_REQUIREMENTS=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_requirements.txt ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0.py ENGINE_B_PHASE0_ARCHIVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_archive.sh ENGINE_B_PHASE0_CONFIG_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/phase0.json ENGINE_B_PHASE0_CALENDAR_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/trading_calendar.json ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/tmp/engine-b-phase0-__GITHUB_SHA__/deploy bash /tmp/engine-b-phase0-__GITHUB_SHA__/scripts/install_engine_b_phase0.sh",
-              "aws s3 cp s3://__S3_BUCKET__/deploy/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-sidecar-activation.service",
-              "aws s3 cp s3://__S3_BUCKET__/deploy/debot-pair-robinhood-lighter.service /tmp/debot-pair-robinhood-lighter.service",
-              "sudo systemd-analyze verify /tmp/debot-pair-robinhood-sidecar-activation.service /tmp/debot-pair-robinhood-lighter.service",
-              "sudo mv /tmp/debot-pair-robinhood-sidecar-activation.service /etc/systemd/system/debot-pair-robinhood-sidecar-activation.service",
-              "sudo mv /tmp/debot-pair-robinhood-lighter.service /etc/systemd/system/debot-pair-robinhood-lighter.service",
-              "sudo systemctl daemon-reload",
-              "sudo chown -R ec2-user:ec2-user /opt/debot-robinhood-lighter /home/ec2-user/debot_status"
+              "sudo env ENGINE_B_PHASE0_CODE_COMMIT=__GITHUB_SHA__ ENGINE_B_PHASE0_REQUIREMENTS=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_requirements.txt ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0.py ENGINE_B_PHASE0_ARCHIVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_archive.sh ENGINE_B_PHASE0_CONFIG_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/phase0.json ENGINE_B_PHASE0_CALENDAR_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/trading_calendar.json ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/tmp/engine-b-phase0-__GITHUB_SHA__/deploy bash /tmp/engine-b-phase0-__GITHUB_SHA__/scripts/install_engine_b_phase0.sh"
             ]
           }
           JSON
@@ -265,7 +228,7 @@ jobs:
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
-            --comment "Deploy Robinhood Lighter pairtrade and Engine B artifacts; no start or restart" \
+            --comment "Deploy Engine B Phase 0 artifacts; no start or restart" \
             --parameters file:///tmp/ssm-robinhood-params.json \
             --query Command.CommandId --output text)
           set +e
