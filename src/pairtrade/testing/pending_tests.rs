@@ -3951,16 +3951,20 @@ fn push_fill(connector: &DummyConnector, symbol: &str, fill: dex_connector::Fill
 /// closing-side AAA fill already in the connector cache (must be excluded
 /// via the baseline), and the flatten marker armed exactly as
 /// `evaluate_session_dd` arms it. The exchange snapshot is already flat.
+///
+/// `risk_dir` receives the persisted risk state (a successful booking calls
+/// `persist_risk_state`); it must be separate from the PnL `dir` because
+/// `read_single_pnl_record` expects that directory to hold only the PnL log
+/// (Codex review, pairtrade#282).
 async fn armed_flatten_engine(
     connector: &Arc<DummyConnector>,
     dir: &std::path::Path,
+    risk_dir: &std::path::Path,
 ) -> PairTradeEngine {
     let mut engine = PairTradeEngine::test_instance(connector.clone());
     engine.cfg.dry_run = false;
     engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.to_path_buf()));
-    // A successful booking persists risk state; keep it inside the temp dir
-    // instead of the CWD-relative default (Codex review, pairtrade#282).
-    engine.risk_state_path = dir.join("risk_state.json");
+    engine.risk_state_path = risk_dir.join("risk_state.json");
     engine.instances[0]
         .states
         .insert("AAA/BBB".to_string(), seeded_position_state());
@@ -3989,7 +3993,8 @@ async fn session_dd_flatten_books_exit_fill_from_post_flatten_fills() {
 
     let connector = Arc::new(DummyConnector::default());
     let dir = TempDir::new().unwrap();
-    let mut engine = armed_flatten_engine(&connector, dir.path()).await;
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
     // Flatten fills land: AAA sold 0.01 @99, BBB bought 0.02 @52.
     push_fill(
         &connector,
@@ -4040,7 +4045,8 @@ async fn session_dd_flatten_defers_clear_until_fills_arrive() {
 
     let connector = Arc::new(DummyConnector::default());
     let dir = TempDir::new().unwrap();
-    let mut engine = armed_flatten_engine(&connector, dir.path()).await;
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
 
     // Exchange already flat but the WS fill events have not landed yet.
     let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
@@ -4102,7 +4108,8 @@ async fn session_dd_flatten_without_value_coverage_falls_back_to_recovery_record
 
     let connector = Arc::new(DummyConnector::default());
     let dir = TempDir::new().unwrap();
-    let mut engine = armed_flatten_engine(&connector, dir.path()).await;
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
     // Fills arrive but the venue reported no value for BBB: never blend a
     // mark snapshot in (bot-strategy#750) — context record instead.
     push_fill(
@@ -4141,7 +4148,8 @@ async fn session_dd_flatten_gives_up_after_grace_when_fills_never_land() {
 
     let connector = Arc::new(DummyConnector::default());
     let dir = TempDir::new().unwrap();
-    let mut engine = armed_flatten_engine(&connector, dir.path()).await;
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = armed_flatten_engine(&connector, dir.path(), risk_dir.path()).await;
     engine.instances[0]
         .external_flatten_fills
         .as_mut()
