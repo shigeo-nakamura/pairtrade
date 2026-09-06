@@ -5295,3 +5295,83 @@ async fn stale_entry_timeout_keeps_pending_until_cancel_confirmed() {
         "tracked ids kept while still listed open"
     );
 }
+
+/// Codex P1 (pairtrade#282): an opening fill of an entry retained through
+/// the halt must not enter the flatten VWAP even when reported side-less.
+#[tokio::test]
+async fn flatten_booking_excludes_retained_entry_fills() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    let mut state = seeded_position_state();
+    state.pending_entry = positionless_pending_entry_state().pending_entry;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), state);
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        1_700_000_300,
+    );
+    // Post-baseline: the retained entry leg fills side-less, then the flatten.
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("en-1", "t-0", None, "0.01", Some("1.00")),
+    );
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "exit_fill");
+    assert_eq!(
+        json["exit_price_a"], 99.0,
+        "opening fill excluded from the VWAP"
+    );
+    let pnl = json["pnl"].as_f64().unwrap();
+    assert!((pnl + 0.05).abs() < 1e-9, "pnl={pnl}");
+}
+
+/// Codex P1 (pairtrade#282): a persisted halt restored after the trigger was
+/// disabled (max_session_loss_bps = 0) still re-flattens residual exposure.
+#[tokio::test]
+async fn halted_instance_reflattens_even_when_threshold_disabled() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.risk.max_session_loss_bps = 0;
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0].session_halted = true;
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+
+    assert!(engine.evaluate_session_dd(0).await, "stays halted");
+    assert_eq!(connector.close_all_calls.load(Ordering::SeqCst), 1);
+}

@@ -841,6 +841,15 @@ impl PairTradeEngine {
             .iter()
             .filter_map(|(key, state)| state.position.clone().map(|p| (key.clone(), p)))
             .collect();
+        let excluded_now: HashSet<String> = inst
+            .states
+            .values()
+            .filter_map(|state| state.pending_entry.as_ref())
+            .flat_map(|pending| pending.legs.iter())
+            .flat_map(|leg| {
+                std::iter::once(leg.order_id.clone()).chain(leg.exchange_order_id.clone())
+            })
+            .collect();
         match inst.external_flatten_fills.as_mut() {
             // Re-arm (halted-exposure retry while the first flatten is still
             // being booked): merge, never overwrite — the original baseline
@@ -855,6 +864,7 @@ impl PairTradeEngine {
                 existing
                     .attributable_order_ids
                     .extend(attributable_order_ids);
+                existing.excluded_order_ids.extend(excluded_now);
                 for (key, pos) in positions_now {
                     existing.positions.entry(key).or_insert(pos);
                 }
@@ -869,6 +879,7 @@ impl PairTradeEngine {
                 inst.external_flatten_fills = Some(ExternalFlattenFills {
                     baseline,
                     attributable_order_ids,
+                    excluded_order_ids: excluded_now,
                     positions: positions_now,
                     submitted_at: Instant::now(),
                     submitted_ts: now_ts,
@@ -1224,6 +1235,11 @@ impl PairTradeEngine {
             let mut value = Decimal::ZERO;
             let mut value_missing = false;
             for fill in fills.iter().filter(|f| !f.is_rejected) {
+                // Opening fills of an entry retained through the halt are
+                // never part of the flatten, side-reported or not.
+                if flatten.excluded_order_ids.contains(&fill.order_id) {
+                    continue;
+                }
                 if seen.contains(&Self::fill_identity(fill))
                     && !flatten.attributable_order_ids.contains(&fill.order_id)
                 {

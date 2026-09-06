@@ -1736,10 +1736,10 @@ impl PairTradeEngine {
         if self.cfg.backtest_mode || self.cfg.observe_only {
             return false;
         }
-        let threshold_bps = self.cfg.risk.max_session_loss_bps;
-        if threshold_bps == 0 {
-            return self.instances[inst_idx].session_halted;
-        }
+        // An already-halted instance is handled before the threshold check:
+        // disabling the trigger (max_session_loss_bps = 0) after a persisted
+        // halt must not leave residual exposure without the re-flatten
+        // (Codex review, pairtrade#282).
         if self.instances[inst_idx].session_halted {
             // Halt is sticky — once tripped, stay halted until ack'd. The
             // trip already flattened once; the only reason to act again is
@@ -1748,6 +1748,10 @@ impl PairTradeEngine {
             // close missed. bot-strategy#932 (Codex review, pairtrade#282).
             self.reflatten_if_exposed_while_halted(inst_idx).await;
             return true;
+        }
+        let threshold_bps = self.cfg.risk.max_session_loss_bps;
+        if threshold_bps == 0 {
+            return false;
         }
         let inst = &self.instances[inst_idx];
         // bot-strategy#366: refuse to trip until the connector has fed at

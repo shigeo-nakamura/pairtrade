@@ -35,6 +35,11 @@ pub(in crate::pairtrade) struct ExternalFlattenFills {
     /// flatten was submitted. Their fills close the same position, so they
     /// are attributable even when they already sat in the baseline.
     pub(in crate::pairtrade) attributable_order_ids: HashSet<String>,
+    /// Order ids (client and exchange form) of entry legs that were still
+    /// pending when the flatten was armed. Their fills are *opening* fills
+    /// and must never enter the flatten VWAP, even when the connector
+    /// reports them side-less.
+    pub(in crate::pairtrade) excluded_order_ids: HashSet<String>,
     /// The positions (per pair key) as they were when the flatten was
     /// submitted. The per-tick exchange-snapshot sync rewrites the local
     /// position's sizes from the venue, so an intermediate partially-closed
