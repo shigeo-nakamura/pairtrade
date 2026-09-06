@@ -98,6 +98,13 @@ arcus-spot-live = [
 ]
 hyperliquid-sdk = ["dex-connector/hyperliquid-sdk"]
 
+# Slow cross-sectional book runtime (bot-strategy#937). No required
+# features: the venue arm is selected at runtime through DexConnectorBox,
+# so the default (lighter-sdk) build carries it.
+[[bin]]
+name = "book-runtime"
+path = "src/bin/book_runtime.rs"
+
 [[bin]]
 name = "bull-holder"
 path = "src/bin/bull_holder.rs"
