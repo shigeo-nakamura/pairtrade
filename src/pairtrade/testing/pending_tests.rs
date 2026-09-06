@@ -4203,7 +4203,10 @@ fn flatten_test_leg(symbol: &str, order_id: &str, side: OrderSide, target: &str)
 fn pending_exit_for_seeded_position() -> PendingOrders {
     PendingOrders {
         legs: vec![
-            flatten_test_leg("AAA", "ex-1", OrderSide::Short, "0.01"),
+            PendingLeg {
+                exchange_order_id: Some("x-ex-1".to_string()),
+                ..flatten_test_leg("AAA", "ex-1", OrderSide::Short, "0.01")
+            },
             flatten_test_leg("BBB", "ex-2", OrderSide::Long, "0.02"),
         ],
         direction: PositionDirection::LongSpread,
@@ -4233,8 +4236,8 @@ async fn retire_pending_orders_for_flatten_cancels_and_collects_exit_legs() {
 
     assert_eq!(
         ids,
-        HashSet::from(["ex-1".to_string(), "ex-2".to_string()]),
-        "retired exit legs must become attributable"
+        HashSet::from(["ex-1".to_string(), "x-ex-1".to_string(), "ex-2".to_string()]),
+        "retired exit legs must become attributable under both id forms"
     );
     let state = engine.instances[0].states.get("AAA/BBB").unwrap();
     assert!(state.pending_exit.is_none());
@@ -4283,11 +4286,18 @@ async fn session_dd_flatten_books_tracked_exit_leg_fill_from_baseline() {
     engine.instances[0]
         .states
         .insert("AAA/BBB".to_string(), state);
-    // The AAA exit leg filled before the halt: it is in the baseline.
+    // The AAA exit leg filled before the halt: it is in the baseline, and the
+    // venue reports the fill under the exchange order id (Codex review).
     push_fill(
         &connector,
         "AAA",
-        cached_fill("ex-1", "t-1", Some(OrderSide::Short), "0.01", Some("0.99")),
+        cached_fill(
+            "x-ex-1",
+            "t-1",
+            Some(OrderSide::Short),
+            "0.01",
+            Some("0.99"),
+        ),
     );
     let baseline = engine.snapshot_fill_baseline(0).await;
     let ids = engine.retire_pending_orders_for_flatten(0).await;

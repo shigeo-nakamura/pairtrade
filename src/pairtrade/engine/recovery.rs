@@ -824,13 +824,16 @@ impl PairTradeEngine {
         });
     }
 
-    /// Before an out-of-band flatten is submitted: cancel the venue orders of
-    /// every pair this instance holds a position in and drop the local
-    /// `pending_entry` / `pending_exit` so the snapshot clear can consume the
-    /// flatten. Returns the order ids of the retired exit legs — their fills
-    /// close the same position and are attributable to the flatten even when
-    /// they pre-date the fill baseline. Cancel failures are logged, not
-    /// fatal: the reduce-only flatten still goes out. bot-strategy#932.
+    /// Right after an out-of-band flatten was submitted successfully: cancel
+    /// the venue orders of every pair this instance holds a position in and
+    /// drop the local `pending_entry` / `pending_exit` so the snapshot clear
+    /// can consume the flatten. Returns the identifiers (client order id and
+    /// exchange order id, whichever the connector reports fills under) of the
+    /// retired exit legs — their fills close the same position and are
+    /// attributable to the flatten even when they pre-date the fill baseline.
+    /// Cancel failures are logged, not fatal. Must not run before the flatten
+    /// submission succeeded: on failure the pendings stay live and keep
+    /// closing the exposure. bot-strategy#932.
     pub(in crate::pairtrade) async fn retire_pending_orders_for_flatten(
         &mut self,
         inst_idx: usize,
@@ -849,7 +852,12 @@ impl PairTradeEngine {
                 continue;
             }
             if let Some(pending) = state.pending_exit.take() {
-                attributable.extend(pending.legs.iter().map(|leg| leg.order_id.clone()));
+                for leg in &pending.legs {
+                    attributable.insert(leg.order_id.clone());
+                    if let Some(exchange_id) = &leg.exchange_order_id {
+                        attributable.insert(exchange_id.clone());
+                    }
+                }
             }
             state.pending_entry = None;
             symbols.push(pair.base.clone());
