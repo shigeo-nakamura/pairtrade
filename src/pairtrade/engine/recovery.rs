@@ -1219,9 +1219,12 @@ impl PairTradeEngine {
         // leg symbol (BTC/ETH + BTC/SOL) would both absorb the same BTC
         // fills. Decline rather than corrupt both records (Codex review,
         // pairtrade#282).
+        // Scan every covered pair — a retained pending entry that executed
+        // during the halt cancel is not in `positions` yet but its close
+        // fills land on the same symbols (Codex review, pairtrade#282).
         let shares_symbol = flatten
-            .positions
-            .keys()
+            .covered_pairs
+            .iter()
             .any(|other| other != key && other.split('/').any(|sym| sym == base || sym == quote));
         if shares_symbol {
             log::warn!(

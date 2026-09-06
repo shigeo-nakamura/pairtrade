@@ -5470,3 +5470,81 @@ async fn halt_flatten_keeps_cancelled_entry_ids_excluded() {
         "cancelled entry ids remain excluded for late fill events"
     );
 }
+
+/// Codex P1 (pairtrade#282): the shared-symbol guard must also see a
+/// retained pending entry on an overlapping pair, not only positions.
+#[tokio::test]
+async fn flatten_booking_declines_when_retained_entry_pair_shares_a_symbol() {
+    use tempfile::TempDir;
+
+    let connector = Arc::new(DummyConnector::default());
+    let dir = TempDir::new().unwrap();
+    let risk_dir = TempDir::new().unwrap();
+    let mut engine = PairTradeEngine::test_instance(connector.clone());
+    engine.cfg.dry_run = false;
+    engine.cfg.universe = vec![
+        PairSpec {
+            base: "AAA".to_string(),
+            quote: "BBB".to_string(),
+        },
+        PairSpec {
+            base: "AAA".to_string(),
+            quote: "CCC".to_string(),
+        },
+    ];
+    engine.instances[0].pnl_logger = Some(PnlLogger::for_test(dir.path().to_path_buf()));
+    engine.risk_state_path = risk_dir.path().join("risk_state.json");
+    engine.instances[0]
+        .states
+        .insert("AAA/BBB".to_string(), seeded_position_state());
+    let mut other = PairState::new(2.0);
+    other.pending_entry = Some(PendingOrders {
+        legs: vec![
+            flatten_test_leg("AAA", "en-7", OrderSide::Long, "0.01"),
+            flatten_test_leg("CCC", "en-8", OrderSide::Short, "0.02"),
+        ],
+        direction: PositionDirection::LongSpread,
+        placed_at: Instant::now(),
+        placed_ts_ms: 0,
+        hedge_retry_count: 0,
+        post_only_hybrid: false,
+        exit_taker_takeover_at: None,
+    });
+    engine.instances[0]
+        .states
+        .insert("AAA/CCC".to_string(), other);
+    let baseline = engine.snapshot_fill_baseline(0).await;
+    engine.arm_external_flatten(
+        0,
+        "session_dd_test".to_string(),
+        baseline,
+        HashSet::new(),
+        HashSet::new(),
+        1_700_000_300,
+    );
+    engine.instances[0]
+        .external_flatten_fills
+        .as_mut()
+        .unwrap()
+        .submitted_at = Instant::now() - std::time::Duration::from_secs(120);
+    push_fill(
+        &connector,
+        "AAA",
+        cached_fill("cl-1", "t-1", Some(OrderSide::Short), "0.02", Some("1.98")),
+    );
+    push_fill(
+        &connector,
+        "BBB",
+        cached_fill("cl-2", "t-2", Some(OrderSide::Long), "0.02", Some("1.04")),
+    );
+
+    let prices: HashMap<String, SymbolSnapshot> = HashMap::new();
+    engine
+        .sync_positions_from_exchange(0, &prices)
+        .await
+        .unwrap();
+
+    let json = read_single_pnl_record(dir.path());
+    assert_eq!(json["source"], "recovery_no_pnl");
+    assert_eq!(engine.instances[0].total_trades, 0);
+}
