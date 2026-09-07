@@ -797,6 +797,10 @@ impl BookEngine {
         // sending the opening without a confirmed close would double the
         // venue exposure rather than complete the flip.
         let mut plan = plan;
+        // Distinguish "nothing to do" from "everything dropped for budget"
+        // before the filter below can turn either into the same empty
+        // `plan.intents`.
+        let planned_no_intents = plan.intents.is_empty();
         let max = self.cfg.execution.max_attempts;
         // A symbol only has a live flip in *this* plan when both its
         // reduce-only close and its opening leg are still present -- once
@@ -835,7 +839,49 @@ impl BookEngine {
             );
         }
         if plan.intents.is_empty() {
-            log::debug!("[REBALANCE] key={} nothing left to retry this tick", d.key);
+            if !planned_no_intents {
+                // Every remaining intent was dropped for exhausted budget,
+                // not because the target is met: the residual is real but
+                // unactionable this window.
+                log::debug!("[REBALANCE] key={} nothing left to retry this tick", d.key);
+                return;
+            }
+            // `plan_targets` itself found nothing to do: the persisted
+            // target is already met (e.g. a restart's reconcile adopted a
+            // fill the crashed process sent but never confirmed before
+            // persisting). Leaving the record `Partial` here would keep
+            // `pending_residual` true and repeat this no-op replan every
+            // eligible tick for the rest of the window.
+            log::info!(
+                "[DECISION] key={} residual already satisfied on replan; marking applied",
+                d.key
+            );
+            self.signal_status = format!(
+                "applied:{}",
+                rec.signal_sha256
+                    .as_deref()
+                    .map(|s| &s[..12.min(s.len())])
+                    .unwrap_or("-")
+            );
+            if let Some(r) = self.state.last_decision.as_mut() {
+                r.outcome = DecisionOutcome::Applied;
+                r.at = now;
+                r.reject_reason = None;
+            }
+            self.ledger.write(
+                now,
+                "decision",
+                Some(&d.key),
+                json!({
+                    "outcome": "applied",
+                    "retry": rec.attempts,
+                    "signal_sha256": rec.signal_sha256,
+                    "reason": "residual_already_satisfied",
+                }),
+            );
+            status::DECISION_TOTAL
+                .with_label_values(&[&self.cfg.instance_id, "applied"])
+                .inc();
             return;
         }
         let attempts = rec.attempts + 1;
@@ -2057,6 +2103,7 @@ mod tests {
     use crate::book::executor::{FillReport, PaperExecutor, VenuePosition};
     use crate::book::schedule::CalendarEntry;
     use crate::book::signal::testutil::signal_json;
+    use crate::book::state::Position;
     use async_trait::async_trait;
     use chrono::{DateTime, Duration};
     use serde_json::Value;
@@ -2358,6 +2405,61 @@ mod tests {
             .expect("applied retry row");
         assert_eq!(retry["retry"], 1);
         assert_eq!(retry["signal_sha256"], rec.signal_sha256.clone().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_retry_whose_target_is_already_met_is_marked_applied_not_left_partial_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("DOT", -0.5)]);
+        let (mut engine, _) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        std::fs::write(&cfg.risk.kill_switch_path, "").unwrap();
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Partial);
+        let (btc_target, dot_target) = (rec.target_qty["BTC"], rec.target_qty["DOT"]);
+
+        // Simulate a restart whose reconcile already found the venue at
+        // the persisted target (a fill the crashed process sent but never
+        // confirmed before its last state persist) -- nothing left for
+        // `plan_targets` to do on the next eligible tick.
+        engine.state.positions.insert(
+            "BTC".to_string(),
+            Position {
+                qty: btc_target,
+                avg_price: 100_000.0,
+                opened_at: d.timestamp(),
+                funding_accrued_at: None,
+                realized_pnl: 0.0,
+            },
+        );
+        engine.state.positions.insert(
+            "DOT".to_string(),
+            Position {
+                qty: dot_target,
+                avg_price: 4.0,
+                opened_at: d.timestamp(),
+                funding_accrued_at: None,
+                realized_pnl: 0.0,
+            },
+        );
+        std::fs::remove_file(&cfg.risk.kill_switch_path).unwrap();
+        engine.tick(d.timestamp() + 5).await.unwrap();
+
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(
+            rec.outcome,
+            DecisionOutcome::Applied,
+            "an already-satisfied residual must not stay Partial forever"
+        );
+        assert!(engine.signal_status.starts_with("applied:"));
+        let applied = rows(&cfg.paths.ledger)
+            .into_iter()
+            .find(|r| r["event"] == "decision" && r["outcome"] == "applied")
+            .expect("applied row");
+        assert_eq!(applied["reason"], "residual_already_satisfied");
     }
 
     #[tokio::test]
