@@ -75,9 +75,9 @@ When that fires: add the symbols to `universe.symbols`, open a PR, let
 open for 90 minutes after 00:30 UTC, so a same-morning fix still lands.
 
 Making the bound dynamic (accept any symbol the venue lists, keeping the
-per-symbol and gross/net caps as the real guard) is the proper fix and is
-tracked separately; until then this is a recurring, expected maintenance
-step.
+per-symbol and gross/net caps as the real guard) is the proper fix,
+tracked as bot-strategy#941. Until that lands this is a recurring,
+expected maintenance step.
 
 ## Host install (CI, no start)
 
