@@ -165,6 +165,36 @@ impl BookEngine {
         status::CONFIG_INFO
             .with_label_values(&[&cfg.instance_id, &config_fp])
             .set(1);
+        // Reconstruct the process-local telemetry mirror from the
+        // persisted decision record so a restart doesn't report
+        // `signal_status: "none"` (and a bogus signal age) for up to a
+        // full schedule period even though the book already holds an
+        // accepted or partially applied signal.
+        let (last_signal_generated_at, signal_status) = match state.last_decision.as_ref() {
+            Some(r) => {
+                let sha_prefix = r
+                    .signal_sha256
+                    .as_deref()
+                    .map(|s| s[..12.min(s.len())].to_string());
+                let status = match r.outcome {
+                    DecisionOutcome::Applied => {
+                        format!("applied:{}", sha_prefix.as_deref().unwrap_or("-"))
+                    }
+                    DecisionOutcome::Partial => {
+                        format!("partial:{}", sha_prefix.as_deref().unwrap_or("-"))
+                    }
+                    DecisionOutcome::Rejected => {
+                        format!("rejected:{}", r.reject_reason.as_deref().unwrap_or("-"))
+                    }
+                    DecisionOutcome::Skipped => {
+                        format!("skipped:{}", r.reject_reason.as_deref().unwrap_or("-"))
+                    }
+                    DecisionOutcome::Halted => "halted".to_string(),
+                };
+                (Some(r.at), status)
+            }
+            None => (None, "none".to_string()),
+        };
         Ok(Self {
             cfg,
             scheduler,
@@ -176,8 +206,8 @@ impl BookEngine {
             signals,
             state,
             lots: HashMap::new(),
-            last_signal_generated_at: None,
-            signal_status: "none".to_string(),
+            last_signal_generated_at,
+            signal_status,
             last_status_write: 0,
             status_interval_secs: 30,
             mark_on_date_change: true,
@@ -2072,6 +2102,35 @@ mod tests {
         let signals = Box::new(DirSignalSource::new(dir.join("signals")));
         let engine = BookEngine::new(cfg, scheduler, exec.clone(), signals, status).unwrap();
         (engine, exec)
+    }
+
+    #[tokio::test]
+    async fn a_restart_restores_signal_telemetry_from_the_persisted_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("DOT", -0.5)]);
+        let (mut engine, _) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Applied);
+        assert!(engine.signal_status.starts_with("applied:"));
+        assert!(engine.last_signal_generated_at.is_some());
+        drop(engine);
+
+        // "Restart": a brand new engine over the same persisted state,
+        // before any new decision has ticked. Its process-local telemetry
+        // must reflect the already-accepted signal, not the zero-value
+        // defaults a fresh process starts with.
+        let (restarted, _) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        assert_eq!(restarted.state.last_decision, Some(rec.clone()));
+        assert!(
+            restarted.signal_status.starts_with("applied:"),
+            "{}",
+            restarted.signal_status
+        );
+        assert_eq!(restarted.last_signal_generated_at, Some(rec.at));
     }
 
     #[tokio::test]

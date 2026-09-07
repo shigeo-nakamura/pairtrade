@@ -148,7 +148,7 @@ impl BookConfig {
             .with_context(|| format!("read book config {}", path.display()))?;
         let cfg: BookConfig = serde_yaml::from_str(&text)
             .with_context(|| format!("parse book config {}", path.display()))?;
-        cfg.validate()?;
+        cfg.validate_impl(Some(path))?;
         Ok(cfg)
     }
 
@@ -159,6 +159,10 @@ impl BookConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_impl(None)
+    }
+
+    fn validate_impl(&self, config_path: Option<&Path>) -> Result<()> {
         if self.schema_version != SCHEMA_VERSION {
             bail!(
                 "book config schema_version {} unsupported (expected {})",
@@ -347,6 +351,9 @@ impl BookConfig {
         ];
         if let Some(calendar_path) = &self.schedule.calendar_path {
             named.push(("schedule.calendar_path", calendar_path));
+        }
+        if let Some(config_path) = config_path {
+            named.push(("<--config>", config_path));
         }
         let mut seen: Vec<(&str, PathBuf, Option<(u64, u64)>)> = Vec::new();
         for (name, path) in named {
@@ -669,6 +676,30 @@ mod tests {
         c.signal.path = c.paths.ledger.clone();
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("signal.path"), "{e}");
+    }
+
+    #[test]
+    fn load_rejects_a_config_file_that_aliases_one_of_its_own_runtime_paths() {
+        // `BookConfig::validate` alone can't see this collision: the
+        // `--config` file itself is never one of the `named` runtime
+        // paths, so only `load` (which knows the file it just parsed) can
+        // catch a YAML that points an output at itself.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("book.yaml");
+        let mut cfg: BookConfig = serde_yaml::from_str(&test_config_yaml()).unwrap();
+        cfg.paths.ledger = config_path.clone();
+        std::fs::write(&config_path, serde_yaml::to_string(&cfg).unwrap()).unwrap();
+        let e = BookConfig::load(&config_path).unwrap_err().to_string();
+        assert!(
+            e.contains("paths.ledger") && e.contains("<--config>"),
+            "{e}"
+        );
+        // A config file that only shares a path with another runtime
+        // output, not itself, still loads fine.
+        let config_path2 = dir.path().join("ok.yaml");
+        let cfg2: BookConfig = serde_yaml::from_str(&test_config_yaml()).unwrap();
+        std::fs::write(&config_path2, serde_yaml::to_string(&cfg2).unwrap()).unwrap();
+        assert!(BookConfig::load(&config_path2).is_ok());
     }
 
     #[test]
