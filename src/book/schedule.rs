@@ -98,9 +98,17 @@ impl Scheduler {
                 // decision accepted late in the window would otherwise open
                 // legs after their own mandated exit (the tick processes
                 // flattens before decisions). Same invariant the config
-                // enforces for `flatten_after_secs`.
-                let window_end = e.decision_at + Duration::seconds(cfg.signal_grace_secs.max(0));
-                if f <= window_end {
+                // enforces for `flatten_after_secs`. Validated on the same
+                // `ceil_secs`-rounded seconds `calendar_decision` actually
+                // runs on, not the raw fractional instants: a decision at
+                // `T.1` with 10s grace and flatten at `T+10.2` looks fine
+                // compared as DateTimes, but both round up to the same
+                // second `T+11` at runtime, and the tick that accepts a
+                // signal at that inclusive final second processes the
+                // flatten before the decision, opening a leg after its own
+                // mandated exit.
+                let window_end = ceil_secs(e.decision_at) + cfg.signal_grace_secs.max(0);
+                if ceil_secs(f) <= window_end {
                     bail!(
                         "calendar entry {} has flatten_at {} inside its signal window (ends {})",
                         e.decision_key,
@@ -112,18 +120,19 @@ impl Scheduler {
         }
         // No overlap: an entry's signal window and exit must be over before
         // the next decision starts (the runtime keeps a single decision
-        // record).
+        // record). Same rounded seconds as above.
         for w in calendar.windows(2) {
-            let grace = Duration::seconds(cfg.signal_grace_secs.max(0));
-            let first_end =
-                (w[0].decision_at + grace).max(w[0].flatten_at.unwrap_or(w[0].decision_at));
+            let grace = cfg.signal_grace_secs.max(0);
+            let d0 = ceil_secs(w[0].decision_at);
+            let first_end = (d0 + grace).max(w[0].flatten_at.map(ceil_secs).unwrap_or(d0));
             // Equality is overlap too: the window end is inclusive, but at
             // that exact instant `Scheduler::current` already selects the
             // next entry, so a first-entry signal arriving at its last
             // permitted second would never be read, and an absent first
             // entry could never be recorded as skipped before the second
             // key replaces it.
-            if first_end >= w[1].decision_at {
+            let d1 = ceil_secs(w[1].decision_at);
+            if first_end >= d1 {
                 bail!(
                     "calendar entries {} and {} overlap: the first's window runs through {} (inclusive) but the second starts at {}",
                     w[0].decision_key,
@@ -469,5 +478,36 @@ mod tests {
         let d = s.current(ts("2026-09-08T06:30:01Z")).unwrap();
         assert_eq!(d.decision_at, ts("2026-09-08T06:30:01Z"));
         assert_eq!(d.flatten_at, Some(ts("2026-09-08T13:30:01Z")));
+    }
+
+    #[test]
+    fn calendar_validation_uses_the_same_rounded_seconds_as_the_runtime() {
+        // decision_at = T+0.1s, flatten_at = T+10.2s, grace = 10s:
+        // compared as raw DateTimes the flatten (10.2s after T) looks
+        // safely past the window's raw end (0.1 + 10 = 10.1s after T),
+        // but calendar_decision rounds both up to the same runtime second
+        // (1 and 11) -- the flatten lands inside, not after, the window
+        // it is supposed to clear. Validation must reject this the same
+        // way it already rejects two DateTimes that were equal to begin
+        // with.
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        cfg.schedule.kind = ScheduleKind::Calendar;
+        cfg.schedule.flatten_after_secs = None;
+        cfg.schedule.signal_grace_secs = 10;
+        let entries = vec![CalendarEntry {
+            decision_key: "2026-09-08".into(),
+            decision_at: DateTime::parse_from_rfc3339("2026-09-08T00:00:00.1Z")
+                .unwrap()
+                .into(),
+            flatten_at: Some(
+                DateTime::parse_from_rfc3339("2026-09-08T00:00:10.2Z")
+                    .unwrap()
+                    .into(),
+            ),
+        }];
+        let e = Scheduler::build(&cfg.schedule, entries)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("inside its signal window"), "{e}");
     }
 }
