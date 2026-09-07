@@ -449,31 +449,42 @@ fn stop_distance_pct(mark: f64, stop_level: f64) -> f64 {
 /// recorded book and the venue's actual position. A venue position bigger than
 /// the book is exactly the case `reconcile` halts on, and valuing collateral
 /// off the smaller recorded size there would understate the notional and hide
-/// a real shortfall. Venue symbols that are not configured cannot be priced by
-/// this bot and are returned separately so the caller can fail closed rather
-/// than silently ignore collateral they consume.
+/// a real shortfall.
+///
+/// The second return lists exposure this guard cannot model and must fail
+/// closed on: venue symbols that are not configured (no price here, yet they
+/// consume the same cross collateral) and SHORT venue positions (this bot is
+/// long-only; a short loses on the way up, where the long's sell stop offers
+/// no protection at all). A short still contributes its magnitude to the
+/// margin requirement, so it is counted in `sizes` as well as flagged.
 fn merge_perp_sizes(
     configured: &[String],
     recorded: &BTreeMap<String, f64>,
-    venue: &[(String, f64)],
+    venue: &[(String, f64, i32)],
 ) -> (BTreeMap<String, f64>, Vec<String>) {
     let mut sizes: BTreeMap<String, f64> = configured
         .iter()
         .map(|s| (s.clone(), recorded.get(s).copied().unwrap_or(0.0).max(0.0)))
         .collect();
-    let mut unpriced = Vec::new();
-    for (sym, size) in venue {
+    let mut unsupported = Vec::new();
+    for (sym, size, sign) in venue {
         let size = size.abs();
         if size <= 0.0 {
             continue;
         }
-        match sizes.get_mut(&sym.to_ascii_uppercase()) {
-            Some(v) => *v = v.max(size),
-            None => unpriced.push(sym.clone()),
+        let key = sym.to_ascii_uppercase();
+        match sizes.get_mut(&key) {
+            Some(v) => {
+                *v = v.max(size);
+                if *sign < 0 {
+                    unsupported.push(format!("{key} (short)"));
+                }
+            }
+            None => unsupported.push(format!("{key} (not configured)")),
         }
     }
     sizes.retain(|_, v| *v > 0.0);
-    (sizes, unpriced)
+    (sizes, unsupported)
 }
 
 /// Perp notional (USD) for the given sizes at the given marks.
@@ -1041,9 +1052,9 @@ impl Engine {
             .get_positions()
             .await
             .map_err(|e| anyhow!("Lighter get_positions: {e:?}"))?;
-        let venue: Vec<(String, f64)> = positions
+        let venue: Vec<(String, f64, i32)> = positions
             .iter()
-            .map(|p| (p.symbol.clone(), p.size.to_f64().unwrap_or(0.0)))
+            .map(|p| (p.symbol.clone(), p.size.to_f64().unwrap_or(0.0), p.sign))
             .collect();
         let recorded: BTreeMap<String, f64> = self
             .state
@@ -1080,7 +1091,7 @@ impl Engine {
         };
         if !unpriced.is_empty() && !self.cfg.dry_run {
             return Ok(Some(format!(
-                "Lighter holds position(s) in {} which this bot does not price; they consume the same cross collateral, so the shortfall cannot be computed — close them or add them to BULL_HOLDER_SYMBOLS",
+                "Lighter holds exposure the collateral guard cannot model ({}); it consumes the same cross collateral and the long-only stop cannot cover a short, so the shortfall cannot be computed — close it (or add the symbol to BULL_HOLDER_SYMBOLS) before arming",
                 unpriced.join(", ")
             )));
         }
@@ -1147,7 +1158,7 @@ impl Engine {
         };
         if !unpriced.is_empty() {
             log::error!(
-                "[MARGIN] Lighter holds unpriced position(s) in {} on the same cross collateral; the guard cannot be trusted until they are closed or configured",
+                "[MARGIN] Lighter holds exposure the guard cannot model ({}) on the same cross collateral; the guard cannot be trusted until it is closed or configured",
                 unpriced.join(", ")
             );
         }
@@ -1187,6 +1198,10 @@ impl Engine {
         };
         let notional = perp_notional_usd(&sizes, &marks);
         if notional <= 0.0 {
+            // Zero priced notional is only good news when there is nothing
+            // the guard failed to model: an unconfigured or short venue
+            // position prices to nothing here yet still consumes collateral.
+            let ok = unpriced.is_empty();
             self.last_margin = Some(MarginSnapshot {
                 ts: now,
                 equity_usd: None,
@@ -1194,8 +1209,15 @@ impl Engine {
                 margin_pct: None,
                 liq_distance_pct: None,
                 worst_stop_distance_pct: None,
-                ok: true,
-                detail: "no perp exposure".into(),
+                ok,
+                detail: if ok {
+                    "no perp exposure".into()
+                } else {
+                    format!(
+                        "Lighter exposure the guard cannot model: {}",
+                        unpriced.join(", ")
+                    )
+                },
             });
             return;
         }
@@ -2405,25 +2427,43 @@ mod tests {
         // The venue holds twice the recorded BTC (the case reconcile halts
         // on) and a short ETH leg; both must be valued, ETH by magnitude.
         let venue = vec![
-            ("BTC".to_string(), 0.02),
-            ("ETH".to_string(), -0.5),
-            ("SOL".to_string(), 3.0),
+            ("BTC".to_string(), 0.02, 1),
+            ("ETH".to_string(), 0.5, -1),
+            ("SOL".to_string(), 3.0, 1),
         ];
-        let (sizes, unpriced) = merge_perp_sizes(&configured, &recorded, &venue);
+        let (sizes, unsupported) = merge_perp_sizes(&configured, &recorded, &venue);
         assert_eq!(sizes.get("BTC"), Some(&0.02));
+        // A short still consumes margin: counted, and flagged as unmodellable
+        // because the long-only sell stop cannot cover an upward move.
         assert_eq!(sizes.get("ETH"), Some(&0.5));
-        assert_eq!(unpriced, vec!["SOL".to_string()]);
+        assert_eq!(
+            unsupported,
+            vec![
+                "ETH (short)".to_string(),
+                "SOL (not configured)".to_string()
+            ]
+        );
         // Recorded larger than the venue reports (a stale or partial venue
         // read): keep the recorded size, never undercount the notional.
-        let (stale, _) = merge_perp_sizes(
+        let (stale, none) = merge_perp_sizes(
             &configured,
             &[("BTC".to_string(), 0.03)].into_iter().collect(),
-            &[("BTC".to_string(), 0.02)],
+            &[("BTC".to_string(), 0.02, 1)],
         );
         assert_eq!(stale.get("BTC"), Some(&0.03));
+        assert!(none.is_empty());
         // Nothing anywhere → nothing to price (no venue read needed).
-        let (empty, none) = merge_perp_sizes(&configured, &BTreeMap::new(), &[]);
-        assert!(empty.is_empty() && none.is_empty());
+        let (empty, clean) = merge_perp_sizes(&configured, &BTreeMap::new(), &[]);
+        assert!(empty.is_empty() && clean.is_empty());
+        // Only an unconfigured position open: nothing priceable, but the
+        // caller must NOT read that as "no exposure".
+        let (no_sizes, flagged) = merge_perp_sizes(
+            &configured,
+            &BTreeMap::new(),
+            &[("SOL".to_string(), 3.0, 1)],
+        );
+        assert!(no_sizes.is_empty());
+        assert_eq!(flagged, vec!["SOL (not configured)".to_string()]);
         // Notional uses only the symbols that carry size.
         let marks: BTreeMap<String, f64> =
             [("BTC".to_string(), 80_000.0), ("ETH".to_string(), 2_500.0)]
