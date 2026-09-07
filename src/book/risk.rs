@@ -136,6 +136,26 @@ impl RiskRails {
         events
     }
 
+    /// Read-only check of the two loss rails against `equity`, without
+    /// engaging a halt or touching state. Used mid-plan, after a fill has
+    /// moved the accounting, to stop the openings that follow: the tick's
+    /// own `evaluate` still owns the actual halt and its flatten.
+    pub fn loss_rail_breached(&self, state: &BookState, equity: f64) -> Option<&'static str> {
+        if state.session.start_equity > 0.0 {
+            let limit = self.cfg.max_session_loss_bps / 10_000.0 * state.session.start_equity;
+            if state.session.start_equity - equity > limit {
+                return Some("session_loss_limit");
+            }
+        }
+        if state.daily.start_equity > 0.0 {
+            let limit = self.cfg.max_daily_loss_bps / 10_000.0 * state.daily.start_equity;
+            if state.daily.start_equity - equity > limit {
+                return Some("daily_loss_limit");
+            }
+        }
+        None
+    }
+
     /// Whether opening / increasing intents may be sent right now.
     pub fn opens_allowed(&self, state: &BookState) -> bool {
         !state.session.halted && !state.daily.halted && !self.kill_switch_engaged()
@@ -205,6 +225,23 @@ mod tests {
         std::fs::write(dir.path().join("RISK_ACK"), "").unwrap();
         assert!(r.maybe_clear_halt(&mut s, T0 + 1, 1000.0).is_none());
         assert!(!dir.path().join("RISK_ACK").exists());
+    }
+
+    #[test]
+    fn loss_rail_breached_reads_the_limits_without_engaging_a_halt() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = rails(dir.path());
+        let mut s = BookState::new("t");
+        r.evaluate(&mut s, T0, 1000.0);
+        assert_eq!(r.loss_rail_breached(&s, 1000.0), None);
+        // 3% daily on $1000 = $30.
+        assert_eq!(r.loss_rail_breached(&s, 965.0), Some("daily_loss_limit"));
+        // 5% session = $50; the session rail is reported first.
+        assert_eq!(r.loss_rail_breached(&s, 940.0), Some("session_loss_limit"));
+        // Nothing was mutated: no halt engaged, no equity observed.
+        assert!(!s.session.halted);
+        assert!(!s.daily.halted);
+        assert_eq!(s.last_equity, Some((T0, 1000.0)));
     }
 
     #[test]

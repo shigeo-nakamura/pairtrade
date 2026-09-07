@@ -198,6 +198,12 @@ reduce_only }`.
    validated target, and the opening is blocked
    (`order_blocked reason=cap_gross(...)`) rather than compounding the
    breach. Reductions and flattens are never blocked this way.
+7. Once a fill in this plan has moved the accounting, the loss rails are
+   re-read (against fresh equity) before the next opening: a reduction
+   that fills adversely, or its fees, can cross a session or daily limit
+   part-way through a plan whose rails were evaluated before the first
+   order. The tick's own evaluation still owns the actual halt and the
+   flatten that follows.
 
 ## 6. Execution and fill confirmation
 
@@ -222,7 +228,11 @@ reduce_only }`.
   changed elsewhere, or by a crashed previous run) is adopted at the
   venue's quantity **and** average entry price (mid when the venue reports
   none) and logged `[ADOPT]`; the stored leg's funding is settled up to
-  that instant first. When the venue shows *less* exposure than the book
+  that instant first. The stored basis is only replaced when the venue
+  reports its own average entry, or when the leg has no valid basis,
+  flipped, or appeared from nowhere: a same-side reduction keeps its
+  basis, so the remaining leg's unrealized PnL is not erased by the mark
+  used to book the recovered part. When the venue shows *less* exposure than the book
   (a close that filled after the last persist, or a crash between the send
   and the booking), the missing reduction is booked at the current mark so
   realized PnL and the trade counters are recovered: a `recovered_close`

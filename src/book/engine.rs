@@ -326,10 +326,16 @@ impl BookEngine {
             if (venue_qty - book_qty).abs() <= tol && book_basis_ok {
                 continue;
             }
-            let entry = venue
+            // The venue's own average entry, when it reports one. Only
+            // this re-bases a leg the book already holds on the same side:
+            // a mark is a fine price for *booking* a recovered reduction,
+            // but writing it into `avg_price` would erase the remaining
+            // leg's unrealized PnL.
+            let venue_entry = venue
                 .get(&sym)
                 .and_then(|p| p.entry_price)
-                .filter(|e| *e > 0.0)
+                .filter(|e| *e > 0.0);
+            let entry = venue_entry
                 .or_else(|| prices.get(&sym).copied().filter(|p| *p > 0.0))
                 .or_else(|| {
                     self.state
@@ -427,12 +433,18 @@ impl BookEngine {
                         opened_at: now,
                         funding_accrued_at: Some(now),
                     });
+                let kept_same_side = book_qty != 0.0 && (venue_qty > 0.0) == (book_qty > 0.0);
                 p.qty = venue_qty;
                 p.funding_accrued_at = Some(now);
-                // The venue's average entry is the only consistent basis
-                // once the book and the venue disagree (externally placed
-                // fill, or a crash between execution and persistence).
-                if entry > 0.0 {
+                // Re-base on the venue's own average entry when it gives
+                // one. Otherwise keep the stored basis for a leg that is
+                // still on the same side (a recovered reduction already
+                // realized its part against it); only a leg with no valid
+                // basis, or one that flipped or appeared from nowhere,
+                // falls back to the mark.
+                if let Some(v) = venue_entry {
+                    p.avg_price = v;
+                } else if entry > 0.0 && (!kept_same_side || p.avg_price <= 0.0) {
                     p.avg_price = entry;
                 }
             }
@@ -925,16 +937,30 @@ impl BookEngine {
             errors: 0,
             residual: BTreeMap::new(),
         };
+        // Set once a fill has moved the accounting, so the loss rails are
+        // re-read before the next opening: a reduction that fills
+        // adversely (or its fees) can cross a limit mid-plan, and the
+        // tick's own evaluation already ran before this loop.
+        let mut fills_since_check = false;
         for (idx, intent) in plan.intents.iter().enumerate() {
             // Re-check the caps against the book that actually exists (see
             // `opening_cap_breach`): reductions ahead of this intent may
             // have failed, in which case the plan's end state is no longer
             // the target the planner validated.
-            let cap_breach = if intent.reduce_only {
+            let mut cap_breach = if intent.reduce_only {
                 None
             } else {
                 self.opening_cap_breach(&plan.intents[idx..], prices)
             };
+            if !intent.reduce_only && cap_breach.is_none() && fills_since_check {
+                fills_since_check = false;
+                let (equity, ready) = self.compute_equity(prices).await;
+                if ready {
+                    if let Some(rail) = self.risk.loss_rail_breached(&self.state, equity) {
+                        cap_breach = Some(rail.to_string());
+                    }
+                }
+            }
             if !intent.reduce_only && (cap_breach.is_some() || !self.opens_allowed()) {
                 let reason = cap_breach.unwrap_or_else(|| self.block_reason().to_string());
                 log::warn!(
@@ -968,6 +994,7 @@ impl BookEngine {
                 Ok(fill) => {
                     if fill.filled_qty > 0.0 {
                         self.accrue_funding(&intent.symbol, now, intent.reference_price, rate);
+                        fills_since_check = true;
                     }
                     let result = self.book_fill(now, key, intent, &fill);
                     match result {
@@ -1732,6 +1759,46 @@ mod tests {
         assert!(rows(&cfg.paths.pnl)
             .iter()
             .any(|r| r["event"] == "exit" && r["recovered"] == true));
+    }
+
+    #[tokio::test]
+    async fn a_recovered_reduction_keeps_the_remaining_legs_basis() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // Book: long 2 SOL @ 100. Venue: long 1, no entry price reported.
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 2.0, 100.0, secs("2026-09-05T23:00:00Z"));
+        state.persist(&cfg.paths.state).unwrap();
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 130.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 1.0,
+                        entry_price: None,
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        let p = &engine.state.positions["SOL"];
+        assert_eq!(p.qty, 1.0);
+        // The closed half realized (130-100)*1; the remaining half keeps
+        // its $100 basis, so its $30 unrealized gain survives.
+        assert!((engine.state.cum_realized_usd - 30.0).abs() < 1e-9);
+        assert_eq!(p.avg_price, 100.0);
+        let px: HashMap<String, f64> = [("SOL".to_string(), 130.0)].into();
+        assert!((engine.state.unrealized_usd(&px) - 30.0).abs() < 1e-9);
     }
 
     #[tokio::test]
