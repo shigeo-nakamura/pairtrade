@@ -84,6 +84,10 @@ pub struct BookEngine {
     signal_status: String,
     last_status_write: i64,
     pub status_interval_secs: i64,
+    /// Write the daily mark on the first tick of a new UTC date (live).
+    /// Replay turns this off and calls [`BookEngine::daily_mark_now`] at
+    /// the last tick of each bar date instead.
+    pub mark_on_date_change: bool,
     last_flatten_attempt: i64,
     /// Whether the last venue reconcile succeeded (live) — trading is
     /// suppressed while it is false.
@@ -139,6 +143,7 @@ impl BookEngine {
             signal_status: "none".to_string(),
             last_status_write: 0,
             status_interval_secs: 30,
+            mark_on_date_change: true,
             last_flatten_attempt: 0,
             positions_ready: true,
             equity_ready: true,
@@ -259,7 +264,9 @@ impl BookEngine {
             self.process_decision(now, &prices).await;
         }
 
-        self.maybe_daily_mark(now, &prices).await;
+        if self.mark_on_date_change {
+            self.maybe_daily_mark(now, &prices).await;
+        }
 
         let (equity, _) = self.compute_equity(&prices).await;
         self.write_status(now, &prices, equity);
@@ -285,6 +292,19 @@ impl BookEngine {
                 symbols.push(s.clone());
             }
         }
+        // A venue-discovered leg outside the tracked set has no price in
+        // `prices`; ask the executor (WS mid or ticker fallback) for it so
+        // adoption is not deferred forever.
+        let extra: Vec<String> = symbols
+            .iter()
+            .filter(|s| !prices.contains_key(*s))
+            .cloned()
+            .collect();
+        let mut prices = prices.clone();
+        if !extra.is_empty() {
+            prices.extend(self.exec.prices(&extra).await);
+        }
+        let prices = &prices;
         for sym in symbols {
             let venue_qty = venue.get(&sym).map(|p| p.qty).unwrap_or(0.0);
             let book_qty = self.state.positions.get(&sym).map(|p| p.qty).unwrap_or(0.0);
@@ -1101,6 +1121,22 @@ impl BookEngine {
         if self.state.last_mark_date.as_deref() == Some(date.as_str()) {
             return;
         }
+        self.write_daily_mark(now, prices).await;
+    }
+
+    /// Write the daily mark for `now` unconditionally (replay: at the last
+    /// tick of a bar date, after every decision/flatten of that date).
+    pub async fn daily_mark_now(&mut self, now: i64) {
+        let symbols = self.tracked_symbols();
+        let prices = self.exec.prices(&symbols).await;
+        self.write_daily_mark(now, &prices).await;
+        if let Err(e) = self.state.persist(&self.cfg.paths.state) {
+            log::error!("[MARK] persist failed: {e}");
+        }
+    }
+
+    async fn write_daily_mark(&mut self, now: i64, prices: &HashMap<String, f64>) {
+        let date = utc_date(now);
         // Funding accrual per leg (estimate from the current rate).
         let mut funding_detail = serde_json::Map::new();
         let symbols: Vec<String> = self.state.positions.keys().cloned().collect();

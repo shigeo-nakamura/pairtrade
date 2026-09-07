@@ -284,7 +284,9 @@ default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
 for every bar date `D` the closes of `D` become the prices, each decision /
 flatten scheduled inside `D` (a midnight decision belongs to the date it
 starts) is ticked at its exact time (paper fills at the close of `D`), and
-a final tick at `D 23:59:59` writes the daily mark labelled `D`. The config's paths are redirected into `--out` and `dry_run` is
+after the final tick at `D 23:59:59` the daily mark labelled `D` is written
+(replay never marks at a decision tick, so funding intervals line up with
+the dates whose rates they use). The config's paths are redirected into `--out` and `dry_run` is
 forced on. Given identical inputs `ledger.jsonl`, `pnl.jsonl` and
 `state.json` are byte-identical run to run (covered by a test), which is
 what the shadow → live comparison for XSMOM relies on.

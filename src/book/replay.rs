@@ -11,9 +11,10 @@
 //!
 //! For each bar date `D` (ascending): closes of `D` become the prices, every
 //! decision / flatten scheduled inside `D` is ticked at its exact time, and
-//! a final tick at `D 23:59:59` writes the daily mark (labelled `D`). Fills
-//! are paper fills at the close of `D`. A decision at the next midnight is
-//! ticked in the next iteration, after that date's closes are loaded.
+//! after the final tick at `D 23:59:59` the daily mark (labelled `D`) is
+//! written. Fills are paper fills at the close of `D`. A decision at the
+//! next midnight is ticked in the next iteration, after that date's closes
+//! are loaded.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -136,6 +137,7 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         status,
     )?;
     engine.status_interval_secs = 0;
+    engine.mark_on_date_change = false;
 
     let mut summary = ReplaySummary::default();
     for (date, rows) in &bars {
@@ -176,9 +178,10 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
                 _ => break,
             }
         }
-        // Daily mark at the last second of the bar date, so a decision
-        // scheduled at the next midnight is ticked in the next iteration
-        // with that date's own closes loaded.
+        // Final engine tick at the last second of the bar date (the daily
+        // mark is written right after it, see below); a decision at the
+        // next midnight is ticked in the next iteration with that date's
+        // own closes loaded.
         ticks.push(day_end - 1);
         ticks.sort_unstable();
         ticks.dedup();
@@ -186,6 +189,10 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
             engine.tick(t).await?;
             summary.ticks += 1;
         }
+        // The mark belongs to the last instant of the bar date, after every
+        // decision/flatten of the date, so funding intervals line up with
+        // the dates whose rates they use.
+        engine.daily_mark_now(day_end - 1).await;
         summary.days += 1;
     }
     let prices = exec.prices(&cfg.universe.symbols).await;
@@ -318,13 +325,20 @@ mod tests {
 
         let pnl = read_rows(&out1.join("pnl.jsonl"));
         let marks: Vec<_> = pnl.iter().filter(|r| r["event"] == "mark").collect();
-        // One mark per bar date (the 07-03 one is the startup tick; the
-        // 23:59:59 tick of the same date does not mark twice).
+        // Exactly one mark per bar date, written at 23:59:59 after every
+        // decision of the date (never at the decision tick).
         assert_eq!(marks.len(), 12);
         assert_eq!(marks[0]["date"], "2026-07-03");
+        assert_eq!(
+            marks[0]["ts_ms"],
+            ts("2026-07-03T23:59:59Z").timestamp_millis()
+        );
+        assert_eq!(marks[0]["n_positions"], 2);
         assert_eq!(marks[1]["date"], "2026-07-04");
-        assert_eq!(marks[1]["n_positions"], 2);
         assert_eq!(marks[11]["date"], "2026-07-14");
+        assert!(marks
+            .iter()
+            .all(|m| m["ts_ms"].as_i64().unwrap() % 86_400_000 == 86_399_000));
         // Funding estimate accrues on both legs (rate 1e-5/h, ~24h): the long
         // pays, the short receives; net is non-zero because notionals differ
         // after rounding.

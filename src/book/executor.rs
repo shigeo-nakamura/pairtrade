@@ -310,6 +310,36 @@ impl LiveExecutor {
         }
     }
 
+    /// Current price for `symbol`: the WS mid when the feed carries it,
+    /// otherwise the ticker fallback (cached `FALLBACK_PRICE_TTL_SECS`).
+    /// Used both by the planner (`prices`) and at send time (`execute`) so
+    /// an adopted out-of-universe leg can be planned *and* sent.
+    async fn price_for(&self, symbol: &str) -> Option<f64> {
+        if let Some(px) = self.prices.read().await.get(symbol).copied() {
+            return Some(px);
+        }
+        let cached = self.fallback_prices.read().await.get(symbol).copied();
+        if let Some((px, at)) = cached {
+            if at.elapsed().as_secs() < FALLBACK_PRICE_TTL_SECS {
+                return Some(px);
+            }
+        }
+        match self.connector.get_ticker(symbol, None).await {
+            Ok(t) => {
+                let px = t.price.to_f64().filter(|p| *p > 0.0)?;
+                self.fallback_prices
+                    .write()
+                    .await
+                    .insert(symbol.to_string(), (px, Instant::now()));
+                Some(px)
+            }
+            Err(e) => {
+                log::warn!("[PRICE] no WS mid for {symbol} and ticker fallback failed: {e:?}");
+                None
+            }
+        }
+    }
+
     async fn venue_position(&self, symbol: &str) -> Result<Option<VenuePosition>> {
         let snaps = self
             .connector
@@ -344,34 +374,10 @@ impl Executor for LiveExecutor {
     }
 
     async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
-        let mut out: HashMap<String, f64> = {
-            let p = self.prices.read().await;
-            symbols
-                .iter()
-                .filter_map(|s| p.get(s).map(|v| (s.clone(), *v)))
-                .collect()
-        };
-        let missing: Vec<&String> = symbols.iter().filter(|s| !out.contains_key(*s)).collect();
-        for s in missing {
-            let cached = self.fallback_prices.read().await.get(s).copied();
-            match cached {
-                Some((px, at)) if at.elapsed().as_secs() < FALLBACK_PRICE_TTL_SECS => {
-                    out.insert(s.clone(), px);
-                }
-                _ => match self.connector.get_ticker(s, None).await {
-                    Ok(t) => {
-                        if let Some(px) = t.price.to_f64().filter(|p| *p > 0.0) {
-                            self.fallback_prices
-                                .write()
-                                .await
-                                .insert(s.clone(), (px, Instant::now()));
-                            out.insert(s.clone(), px);
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("[PRICE] no WS mid for {s} and ticker fallback failed: {e:?}")
-                    }
-                },
+        let mut out = HashMap::new();
+        for s in symbols {
+            if let Some(px) = self.price_for(s).await {
+                out.insert(s.clone(), px);
             }
         }
         out
@@ -431,11 +437,8 @@ impl Executor for LiveExecutor {
         // has already moved past the slippage budget the order is not sent
         // (the engine re-plans on the next tick with fresh prices).
         let mid = self
-            .prices
-            .read()
+            .price_for(&intent.symbol)
             .await
-            .get(&intent.symbol)
-            .copied()
             .ok_or_else(|| anyhow!("live: no price for {}", intent.symbol))?;
         if !within_slippage(intent.reference_price, mid, intent.side, self.slippage_bps) {
             return Err(anyhow!(
