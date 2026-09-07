@@ -358,19 +358,11 @@ fn signal_generated_at(replay_dir: &Path, key: &str) -> Option<i64> {
     // arrival-tick schedule and letting its grace window close (recorded
     // as skipped) even though the engine would have accepted it.
     let dt = DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc);
-    // The engine's own acceptance check compares whole-second tick times
-    // against `window_end` (`now <= d.window_end`); a live poll can only
-    // ever observe this file at or after its real arrival instant. Ceiling
-    // instead of `.timestamp()`'s floor, so a file generated at, say,
-    // `window_end + 0.5s` schedules its arrival tick at `window_end + 1`
-    // (correctly outside the window) rather than at `window_end` itself
-    // (which would let replay accept a signal live would have rejected).
-    let secs = dt.timestamp();
-    Some(if dt.timestamp_subsec_nanos() > 0 {
-        secs + 1
-    } else {
-        secs
-    })
+    // Rounded up (`signal::arrival_secs`), the same visibility rule
+    // `DirSignalSource` applies: a file generated at `window_end + 0.5s`
+    // schedules its arrival tick at `window_end + 1` (correctly outside
+    // the window) rather than at `window_end` itself.
+    Some(super::signal::arrival_secs(dt))
 }
 
 /// Convenience for callers that hold a config path.

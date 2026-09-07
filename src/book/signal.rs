@@ -13,6 +13,22 @@ use sha2::{Digest, Sha256};
 
 use super::config::{SignalConfig, SizingConfig, UniverseConfig};
 
+/// The first whole second at which a file generated at `t` can be
+/// observed: `t` rounded *up* when it carries a fractional remainder. The
+/// engine's tick times, window ends and arrival checks are all whole
+/// seconds, and a poll can only ever see a file at or after its real
+/// generation instant -- flooring (`timestamp()`) would instead expose a
+/// file generated at `T + 0.5s` to the tick at `T`, letting replay accept
+/// a signal (or fill it on the previous bar date) that live never could.
+pub fn arrival_secs(t: DateTime<Utc>) -> i64 {
+    let secs = t.timestamp();
+    if t.timestamp_subsec_nanos() > 0 {
+        secs + 1
+    } else {
+        secs
+    }
+}
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Raw on-disk shape. `weights` is a `BTreeMap` so the canonical JSON used

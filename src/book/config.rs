@@ -425,6 +425,15 @@ impl BookConfig {
         if r.max_session_loss_bps <= 0.0 || r.max_daily_loss_bps <= 0.0 {
             bail!("risk.max_*_loss_bps must be > 0");
         }
+        // At 100% or more a rail can never fire: `compute_equity` only
+        // treats strictly positive venue equity as ready, and `evaluate`
+        // halts on loss strictly greater than the limit, so the threshold
+        // would need negative equity -- which takes the unavailable-equity
+        // path and skips evaluation altogether, silently disabling the
+        // advertised halt.
+        if r.max_session_loss_bps >= 10_000.0 || r.max_daily_loss_bps >= 10_000.0 {
+            bail!("risk.max_*_loss_bps must be < 10000 (100%): such a rail could never fire");
+        }
         Ok(())
     }
 
@@ -989,6 +998,18 @@ mod tests {
         assert!(BookConfig::from_yaml_str(&bad).is_err());
         let bad = test_config_yaml().replace("max_net_usd: 150", "max_net_usd: .nan");
         assert!(BookConfig::from_yaml_str(&bad).is_err());
+        // A loss limit at or above 100% is a rail that can never fire
+        // (it would need negative equity, which skips evaluation).
+        for (field, from) in [
+            ("max_session_loss_bps", "max_session_loss_bps: 500"),
+            ("max_daily_loss_bps", "max_daily_loss_bps: 300"),
+        ] {
+            let bad = test_config_yaml().replace(from, &format!("{field}: 10000"));
+            let e = BookConfig::from_yaml_str(&bad).unwrap_err().to_string();
+            assert!(e.contains("10000"), "{field}: {e}");
+            let ok = test_config_yaml().replace(from, &format!("{field}: 9999"));
+            BookConfig::from_yaml_str(&ok).unwrap();
+        }
         // 5-day cadence: a 6-day flatten overlaps the next decision.
         let bad = test_config_yaml().replace(
             "signal_grace_secs: 3600",

@@ -116,9 +116,15 @@ impl Scheduler {
             let grace = Duration::seconds(cfg.signal_grace_secs.max(0));
             let first_end =
                 (w[0].decision_at + grace).max(w[0].flatten_at.unwrap_or(w[0].decision_at));
-            if first_end > w[1].decision_at {
+            // Equality is overlap too: the window end is inclusive, but at
+            // that exact instant `Scheduler::current` already selects the
+            // next entry, so a first-entry signal arriving at its last
+            // permitted second would never be read, and an absent first
+            // entry could never be recorded as skipped before the second
+            // key replaces it.
+            if first_end >= w[1].decision_at {
                 bail!(
-                    "calendar entries {} and {} overlap: the first ends at {} but the second starts at {}",
+                    "calendar entries {} and {} overlap: the first's window runs through {} (inclusive) but the second starts at {}",
                     w[0].decision_key,
                     w[1].decision_key,
                     first_end,
@@ -414,5 +420,19 @@ mod tests {
         let mut bad = entries.clone();
         bad[0].flatten_at = Some(bad[0].decision_at);
         assert!(Scheduler::build(&cfg.schedule, bad).is_err());
+        // A first window ending *exactly* when the second decision starts
+        // is overlap too: at that instant `current` already selects the
+        // second entry, so the first's last permitted arrival second is
+        // unreachable and an absent first entry is never recorded skipped.
+        let mut touching = entries.clone();
+        touching[0].flatten_at = Some(
+            DateTime::parse_from_rfc3339("2026-09-09T06:30:00Z")
+                .unwrap()
+                .into(),
+        );
+        let e = Scheduler::build(&cfg.schedule, touching)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("overlap") && e.contains("inclusive"), "{e}");
     }
 }
