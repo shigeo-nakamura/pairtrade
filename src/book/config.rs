@@ -498,55 +498,20 @@ fn file_identity(_p: &Path) -> Option<(u64, u64)> {
 /// path resolved through symlinks and `..` when it exists, so a leaf alias
 /// (`ledger.jsonl -> state.json`) and not just a `..` in the directory
 /// (`a/../a/b.json`) is caught. Before that file exists -- the common case
-/// on first run -- the *longest existing ancestor directory* is
-/// canonicalized (so a symlinked ancestor with not-yet-created
-/// subdirectories below it, e.g. `link/new/state.json` with only `link`
-/// existing, still resolves through the symlink) and every missing path
-/// component is appended lexically on top; that still catches
-/// directory-level aliasing for everything but a leaf symlink that does
-/// not exist yet either. Before even the closest existing ancestor can be
-/// found, the path is folded lexically.
+/// on first run -- each iteration canonicalizes the *longest existing
+/// ancestor directory* of the current candidate (so a symlinked ancestor
+/// with not-yet-created subdirectories below it, e.g. `link/new/state.json`
+/// with only `link` existing, still resolves through the symlink) and
+/// appends the missing components lexically; if that yields a leaf that is
+/// itself an existing symlink (dangling or not), it is followed and the
+/// whole process repeats -- so a chain whose next hop re-enters another
+/// symlinked-but-incomplete ancestor (`ledger.jsonl -> link/new/state.json`
+/// with `link -> real` and `real/new/` not created yet) still resolves
+/// through every hop, not just the first. A hop that revisits an
+/// already-seen candidate (a symlink cycle) stops and falls back to the
+/// lexical form of where it landed.
 fn resolved_path(p: &Path) -> PathBuf {
-    if let Ok(full) = p.canonicalize() {
-        return full;
-    }
-    let (Some(mut dir), Some(name)) = (p.parent(), p.file_name()) else {
-        return anchored_path(p);
-    };
-    if dir.as_os_str().is_empty() {
-        return anchored_path(p);
-    }
-    let mut missing = Vec::new();
-    loop {
-        if let Ok(canon_dir) = dir.canonicalize() {
-            let mut base = canon_dir;
-            for comp in missing.into_iter().rev() {
-                base.push(comp);
-            }
-            return resolve_leaf(&base, name);
-        }
-        let Some(comp) = dir.file_name() else {
-            return anchored_path(p);
-        };
-        missing.push(comp);
-        match dir.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => dir = parent,
-            _ => return anchored_path(p),
-        }
-    }
-}
-
-/// `dir` is already canonical; `name` is the leaf under it, and the whole
-/// path failed to canonicalize (so the leaf itself does not exist, or is a
-/// symlink whose target does not exist yet). Follow the symlink chain --
-/// possibly several hops, e.g. `ledger.jsonl -> alias -> state.json` while
-/// `state.json` does not exist yet -- so it still resolves to the same
-/// path as `state.json` before any file in the chain is created, instead
-/// of comparing an intermediate link name as if it were distinct. A hop
-/// that revisits an already-seen path (a symlink cycle) stops following
-/// and falls back to the lexical form of where it landed.
-fn resolve_leaf(dir: &Path, name: &OsStr) -> PathBuf {
-    let mut current = dir.join(name);
+    let mut current = p.to_path_buf();
     let mut seen = std::collections::HashSet::new();
     loop {
         if let Ok(full) = current.canonicalize() {
@@ -555,20 +520,68 @@ fn resolve_leaf(dir: &Path, name: &OsStr) -> PathBuf {
         if !seen.insert(current.clone()) {
             return anchored_path(&current);
         }
-        let Ok(meta) = std::fs::symlink_metadata(&current) else {
-            return current;
+        let (Some(dir), Some(name)) = (current.parent(), current.file_name()) else {
+            return anchored_path(&current);
+        };
+        if dir.as_os_str().is_empty() {
+            return anchored_path(&current);
+        }
+        let (resolved_dir, missing) = resolve_longest_existing_ancestor(dir);
+        if !missing.is_empty() {
+            // Some directory between the closest existing ancestor and
+            // this candidate's own parent does not exist yet, so the
+            // candidate itself cannot exist (or be a symlink) either --
+            // this is as far as resolution can go.
+            let mut base = resolved_dir;
+            for comp in missing.into_iter().rev() {
+                base.push(comp);
+            }
+            base.push(name);
+            return base;
+        }
+        let candidate = resolved_dir.join(name);
+        let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+            return candidate;
         };
         if !meta.file_type().is_symlink() {
-            return current;
+            return candidate;
         }
-        let Ok(target) = std::fs::read_link(&current) else {
-            return current;
+        let Ok(target) = std::fs::read_link(&candidate) else {
+            return candidate;
         };
         current = if target.is_absolute() {
             target
         } else {
-            current.parent().map(|p| p.join(&target)).unwrap_or(target)
+            resolved_dir.join(target)
         };
+    }
+}
+
+/// Canonicalize the longest existing prefix of `dir` (walking up until one
+/// canonicalizes), returning that canonical prefix plus the path
+/// components below it that do not exist yet, nearest-first (i.e. in
+/// reverse of the order they should be re-appended).
+fn resolve_longest_existing_ancestor(dir: &Path) -> (PathBuf, Vec<&OsStr>) {
+    let mut cur = dir;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(canon) = cur.canonicalize() {
+            return (canon, missing);
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(comp), Some(parent)) if !parent.as_os_str().is_empty() => {
+                missing.push(comp);
+                cur = parent;
+            }
+            // No existing ancestor at all (a relative path exhausted
+            // down to its implicit cwd root, or a component ending in
+            // `..` `file_name` can't name): fold *the original* `dir`
+            // lexically in one shot instead of re-anchoring `cur` here
+            // and separately re-appending whatever was already pushed
+            // onto `missing` -- doing both would double up the last
+            // component (e.g. `cwd/not-created-yet/not-created-yet`).
+            _ => return (anchored_path(dir), Vec::new()),
+        }
     }
 }
 
@@ -792,6 +805,32 @@ mod tests {
         let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
         c.paths.state = dir.path().join("real").join("new").join("state.json");
         c.paths.ledger = dir.path().join("link").join("new").join("state.json");
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_path_re_resolves_a_symlink_target_that_passes_through_a_symlinked_ancestor() {
+        // alias -> link/new/state.json, link -> real, real exists but
+        // real/new does not: following the dangling leaf `alias` lands on
+        // `link/new/state.json`, and `link` itself must still be resolved
+        // through to `real` (with `new` appended lexically) rather than
+        // returned as the raw post-follow path.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("link").join("new").join("state.json"),
+            dir.path().join("alias"),
+        )
+        .unwrap();
+        let via_alias = resolved_path(&dir.path().join("alias"));
+        let via_real = resolved_path(&dir.path().join("real").join("new").join("state.json"));
+        assert_eq!(via_alias, via_real, "{via_alias:?} vs {via_real:?}");
+
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.paths.state = dir.path().join("real").join("new").join("state.json");
+        c.paths.ledger = dir.path().join("alias");
         assert!(c.validate().is_err());
     }
 

@@ -523,11 +523,13 @@ impl BookEngine {
             // would fabricate a trade, and staying silent would lose it --
             // so the correction is recorded explicitly for reconciliation
             // against the venue's own trade history.
+            let mut basis_corrected_same_qty = false;
             if closed_qty == 0.0
                 && venue_qty != 0.0
                 && venue_basis_stale
                 && (venue_qty - book_qty).abs() <= tol
             {
+                basis_corrected_same_qty = true;
                 let old_basis = book_basis.unwrap_or(0.0);
                 log::warn!(
                     "[ADOPT] {sym}: same quantity {venue_qty} but the venue basis moved {old_basis} -> {entry};                      any realized PnL from that external close/reopen is NOT in this book's accounting"
@@ -588,6 +590,17 @@ impl BookEngine {
                         funding_accrued_at: Some(now),
                         realized_pnl: 0.0,
                     });
+                if basis_corrected_same_qty {
+                    // This is the same-quantity external close/reopen
+                    // logged above, not a continuation of the old leg:
+                    // its history must start fresh, or a realized_pnl
+                    // left over from a partial reduction against the OLD
+                    // leg gets combined with the NEW leg's eventual close
+                    // when apply_fill decides win/loss, corrupting the
+                    // trade count and win rate.
+                    p.opened_at = now;
+                    p.realized_pnl = 0.0;
+                }
                 let kept_same_side = book_qty != 0.0 && (venue_qty > 0.0) == (book_qty > 0.0);
                 p.qty = venue_qty;
                 p.funding_accrued_at = Some(now);
@@ -2977,6 +2990,65 @@ mod tests {
         assert!(rows(&cfg.paths.ledger)
             .iter()
             .any(|r| r["event"] == "adopt" && r["symbol"] == "SOL"));
+    }
+
+    #[tokio::test]
+    async fn a_venue_basis_correction_starts_a_fresh_leg_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // Book: opened long 4 @ 100, then reduced by 2 @ 120 -- a real
+        // partial reduction that already realized $40 onto this leg's
+        // history, leaving qty 2 with that $40 still carried on it.
+        let t0 = secs("2026-09-05T20:00:00Z");
+        let t1 = secs("2026-09-05T23:00:00Z");
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 4.0, 100.0, t0);
+        state.apply_fill("SOL", -2.0, 120.0, t1);
+        assert_eq!(state.positions["SOL"].realized_pnl, 40.0);
+        assert_eq!(state.positions["SOL"].opened_at, t0);
+        state.persist(&cfg.paths.state).unwrap();
+        // The venue reports the *same* quantity but a different basis:
+        // classified as an external close/reopen (basis_correction), not
+        // a continuation of the leg above.
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 130.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 2.0,
+                        entry_price: Some(112.0),
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: None,
+            half_fill_symbol: None,
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        let now = secs("2026-09-06T00:00:00Z");
+        engine.tick(now).await.unwrap();
+        let p = &engine.state.positions["SOL"];
+        assert_eq!(p.qty, 2.0);
+        assert_eq!(p.avg_price, 112.0);
+        assert_eq!(
+            p.realized_pnl, 0.0,
+            "the old leg's realized PnL must not carry into the new leg"
+        );
+        assert_eq!(
+            p.opened_at, now,
+            "a basis-corrected leg is a fresh leg, not a continuation"
+        );
+        assert!(rows(&cfg.paths.ledger)
+            .iter()
+            .any(|r| r["event"] == "basis_correction" && r["symbol"] == "SOL"));
     }
 
     #[tokio::test]
