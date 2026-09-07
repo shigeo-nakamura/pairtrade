@@ -312,16 +312,24 @@ impl Config {
         if self.equity_usd <= 0.0 {
             bail!("BULL_HOLDER_EQUITY_USD must be > 0");
         }
-        if !(0.0 < self.lighter_mmr_pct && self.lighter_mmr_pct < 10.0) {
-            bail!("BULL_HOLDER_LIGHTER_MMR_PCT must be in (0,10) (Lighter BTC/ETH maintenance margin is 1.2%)");
-        }
-        let floor = liquidation_floor_pct(self.stop_dd_pct, self.lighter_mmr_pct);
-        if !(self.perp_margin_min_pct > floor && self.perp_margin_min_pct <= 100.0) {
-            bail!(
-                "BULL_HOLDER_PERP_MARGIN_MIN_PCT={} must be > {floor:.2} and <= 100: below {floor:.2}% collateral a {}% drawdown liquidates the Lighter account before the exchange stop can fire (bot-strategy#909)",
-                self.perp_margin_min_pct,
-                self.stop_dd_pct
-            );
+        // Collateral settings only bind a book that actually opens perp legs.
+        // A spot-only book (`PERP_FRACTION=0`) never places a Lighter order
+        // and never runs the collateral check, so coupling these to
+        // `stop_dd_pct` there would let an irrelevant stop value refuse
+        // startup (e.g. STOP_DD_PCT=50 makes the floor 50.6 > the 47.55
+        // default).
+        if self.perp_fraction > 0.0 {
+            if !(0.0 < self.lighter_mmr_pct && self.lighter_mmr_pct < 10.0) {
+                bail!("BULL_HOLDER_LIGHTER_MMR_PCT must be in (0,10) (Lighter BTC/ETH maintenance margin is 1.2%)");
+            }
+            let floor = liquidation_floor_pct(self.stop_dd_pct, self.lighter_mmr_pct);
+            if !(self.perp_margin_min_pct > floor && self.perp_margin_min_pct <= 100.0) {
+                bail!(
+                    "BULL_HOLDER_PERP_MARGIN_MIN_PCT={} must be > {floor:.2} and <= 100: below {floor:.2}% collateral a {}% drawdown liquidates the Lighter account before the exchange stop can fire (bot-strategy#909)",
+                    self.perp_margin_min_pct,
+                    self.stop_dd_pct
+                );
+            }
         }
         if !(0.0 < self.spot_fraction && self.spot_fraction <= 1.0) {
             bail!("BULL_HOLDER_SPOT_FRACTION must be in (0,1]");
@@ -2583,6 +2591,17 @@ mod tests {
         cfg.perp_margin_min_pct = 47.55;
         cfg.lighter_mmr_pct = 0.0;
         assert!(cfg.validate().is_err());
+        // Spot-only: no Lighter order and no collateral check ever runs, so
+        // a stop value that would otherwise raise the floor above the
+        // default minimum must not refuse startup.
+        let mut spot_only = test_config();
+        spot_only.perp_fraction = 0.0;
+        spot_only.stop_dd_pct = 50.0;
+        assert!(spot_only.validate().is_ok());
+        // The same values with perp exposure are still rejected.
+        let mut with_perp = spot_only.clone();
+        with_perp.perp_fraction = 0.45;
+        assert!(with_perp.validate().is_err());
     }
 
     #[test]
