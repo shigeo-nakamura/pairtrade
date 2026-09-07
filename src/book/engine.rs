@@ -118,6 +118,45 @@ pub struct BookEngine {
     /// stale number); reductions and flattens still run.
     equity_ready: bool,
     config_fp: String,
+    /// Funding breakdown accrued but not yet durably written to
+    /// pnl.jsonl, from a live daily mark whose append failed: merged into
+    /// the next attempt's own accrual (see `tick`) so the eventual
+    /// successful row still reports the whole day's funding, not just
+    /// the sliver accrued since the last failed attempt.
+    /// `cum_funding_est_usd` itself is already correct regardless --
+    /// accrual and the row describing it are applied independently.
+    pending_funding_detail: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Fold `from` (a later accrual attempt's per-symbol breakdown) onto
+/// `into` (an earlier, unwritten one): `hours`/`est_usd` are summed so a
+/// retried mark still reports the whole day, not just the sliver accrued
+/// since the last failed attempt; every other field (`rate_hourly`,
+/// `price_available`, `settled_pending_only`) takes the newer attempt's
+/// value. A symbol absent from `into` is inserted as-is.
+fn merge_funding_detail(
+    into: &mut serde_json::Map<String, serde_json::Value>,
+    from: serde_json::Map<String, serde_json::Value>,
+) {
+    for (sym, new) in from {
+        let field = |v: &serde_json::Value, field: &str| v.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let (hours, est_usd) = match into.get(&sym) {
+            Some(prev) => (
+                field(prev, "hours") + field(&new, "hours"),
+                field(prev, "est_usd") + field(&new, "est_usd"),
+            ),
+            None => {
+                into.insert(sym, new);
+                continue;
+            }
+        };
+        let mut merged = new;
+        if let Some(obj) = merged.as_object_mut() {
+            obj.insert("hours".into(), json!(hours));
+            obj.insert("est_usd".into(), json!(est_usd));
+        }
+        into.insert(sym, merged);
+    }
 }
 
 /// The budget key for a flip's reduce-only close: kept separate from the
@@ -223,6 +262,7 @@ impl BookEngine {
             positions_ready: true,
             equity_ready: true,
             config_fp,
+            pending_funding_detail: serde_json::Map::new(),
         })
     }
 
@@ -301,11 +341,18 @@ impl BookEngine {
         // the same ordering replay's `daily_mark_now` already enforces.
         // A failed row write leaves `last_mark_date` unset so the next
         // tick retries; per-leg `funding_accrued_at` then only covers the
-        // seconds since this accrual, never double-charging.
+        // seconds since this accrual, never double-charging. That also
+        // means each retry's own `funding_detail` only describes its own
+        // sliver, not the whole day -- merged onto whatever a prior
+        // failed attempt already accrued (`pending_funding_detail`) so
+        // the eventual successful row still reports the full breakdown.
         let date = utc_date(now);
         let pending_mark =
             if self.mark_on_date_change && self.state.last_mark_date.as_deref() != Some(&date) {
-                Some(self.accrue_daily_funding(now, &prices).await)
+                let (date, funding_detail) = self.accrue_daily_funding(now, &prices).await;
+                let mut merged = std::mem::take(&mut self.pending_funding_detail);
+                merge_funding_detail(&mut merged, funding_detail);
+                Some((date, merged))
             } else {
                 None
             };
@@ -388,10 +435,16 @@ impl BookEngine {
 
         if let Some((date, funding_detail)) = pending_mark {
             // Error already logged inside; `last_mark_date` stays unset so
-            // the next tick retries the row (see the accrual above).
-            let _ = self
-                .write_daily_mark_row(now, &prices, &date, funding_detail)
-                .await;
+            // the next tick retries the row (see the accrual above). Keep
+            // this attempt's merged detail for that retry to build on;
+            // clear it once a row actually lands.
+            match self
+                .write_daily_mark_row(now, &prices, &date, funding_detail.clone())
+                .await
+            {
+                Ok(()) => self.pending_funding_detail.clear(),
+                Err(_) => self.pending_funding_detail = funding_detail,
+            }
         }
 
         let (equity, _) = self.compute_equity(&prices).await;
@@ -2260,6 +2313,35 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn merge_funding_detail_sums_hours_and_est_usd_across_retries() {
+        let mut retained = serde_json::Map::new();
+        // First (failed) attempt: 24h accrued for BTC, nothing yet for ETH.
+        retained.insert(
+            "BTC".to_string(),
+            json!({ "rate_hourly": 0.00001, "hours": 24.0, "est_usd": -2.4, "price_available": true }),
+        );
+        // Second attempt, a few seconds later: its own sliver for BTC,
+        // plus ETH's first-ever entry (opened between the two attempts).
+        let mut second = serde_json::Map::new();
+        second.insert(
+            "BTC".to_string(),
+            json!({ "rate_hourly": 0.00002, "hours": 0.0014, "est_usd": -0.00028, "price_available": true }),
+        );
+        second.insert(
+            "ETH".to_string(),
+            json!({ "rate_hourly": 0.00001, "hours": 0.0014, "est_usd": -0.000056, "price_available": true }),
+        );
+        merge_funding_detail(&mut retained, second);
+        // BTC: the whole day's hours/est_usd, not just the retry's sliver;
+        // rate_hourly (and every other field) takes the newer attempt's.
+        assert!((retained["BTC"]["hours"].as_f64().unwrap() - 24.0014).abs() < 1e-9);
+        assert!((retained["BTC"]["est_usd"].as_f64().unwrap() - (-2.40028)).abs() < 1e-9);
+        assert_eq!(retained["BTC"]["rate_hourly"], json!(0.00002));
+        // ETH: absent from the retained map, so inserted as-is.
+        assert_eq!(retained["ETH"]["hours"], json!(0.0014));
     }
 
     fn secs(s: &str) -> i64 {
