@@ -2413,6 +2413,14 @@ mod tests {
         assert_eq!(sizes.get("BTC"), Some(&0.02));
         assert_eq!(sizes.get("ETH"), Some(&0.5));
         assert_eq!(unpriced, vec!["SOL".to_string()]);
+        // Recorded larger than the venue reports (a stale or partial venue
+        // read): keep the recorded size, never undercount the notional.
+        let (stale, _) = merge_perp_sizes(
+            &configured,
+            &[("BTC".to_string(), 0.03)].into_iter().collect(),
+            &[("BTC".to_string(), 0.02)],
+        );
+        assert_eq!(stale.get("BTC"), Some(&0.03));
         // Nothing anywhere → nothing to price (no venue read needed).
         let (empty, none) = merge_perp_sizes(&configured, &BTreeMap::new(), &[]);
         assert!(empty.is_empty() && none.is_empty());
