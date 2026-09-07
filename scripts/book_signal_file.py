@@ -100,7 +100,7 @@ def write_signal(path: str, signal: dict) -> None:
     fd, tmp = tempfile.mkstemp(prefix=".signal.", suffix=".tmp", dir=d)
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(signal, f, sort_keys=True, indent=1)
+            json.dump(signal, f, sort_keys=True, indent=1, allow_nan=False)
             f.write("\n")
         os.replace(tmp, path)
     except BaseException:

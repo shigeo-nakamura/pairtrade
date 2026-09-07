@@ -38,9 +38,19 @@ jobs:
           bash -n debot/scripts/install_engine_b_phase0.sh
           bash -n debot/scripts/run_engine_b_phase0.sh
           bash -n debot/scripts/install_engine_b_live.sh
+          bash -n debot/scripts/install_book_runtime.sh
+          bash -n debot/scripts/book_signal_fetch.sh
+          bash -n debot/scripts/s3_object_present.sh
+          bash -n debot/scripts/fetch_book_bundle.sh
+          python3 -m py_compile debot/scripts/xsmom_signal_producer.py debot/scripts/test_xsmom_signal_producer.py
           python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
           python3 -m py_compile debot/scripts/book_signal_file.py debot/scripts/test_book_signal_file.py
+          python3 debot/scripts/test_book_signal_file.py
+          python3 debot/scripts/test_xsmom_signal_producer.py
+          bash debot/scripts/test_book_signal_fetch.sh
+          bash debot/scripts/test_s3_object_present.sh
+          bash debot/scripts/test_fetch_book_bundle.sh
 
       - name: Test Engine B Phase 0 observer
         run: |
@@ -66,6 +76,7 @@ jobs:
           systemd-analyze verify debot/deploy/engine-b-phase0.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.timer
+          systemd-analyze verify debot/deploy/book-signal-fetch-xsmom-695.timer
 
   deploy-configs:
     needs: validate-config-artifacts
@@ -82,7 +93,7 @@ jobs:
         # bot-strategy#269: trading services are restarted manually only.
         # Keep this regex aligned with the matching guard in `ci.yml`.
         run: |
-          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+(debot-pair-[a-z-]+|engine-b-live|debot-bull-holder)([[:space:]]|$)' debot/.github/workflows/*.yml; then
+          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+(debot-pair-[a-z-]+|engine-b-live|debot-bull-holder|book-runtime-[a-z0-9-]+)([[:space:]]|$)' debot/.github/workflows/*.yml; then
             echo "::error::CI workflow contains a forbidden 'systemctl restart/start <trading unit>' — trading services must be restarted manually only (bot-strategy#269)."
             exit 1
           fi
@@ -128,6 +139,9 @@ jobs:
           aws s3 cp debot/deploy/engine-b-phase0.service "s3://${S3_BUCKET}/deploy/engine-b-phase0.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.service "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.timer "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.timer"
+          for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do
+            aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
+          done
           ENGINE_B_PREFIX="debot/engine-b-phase0/releases/${GITHUB_SHA}"
           aws s3 cp debot/scripts/engine_b_phase0.py "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/engine_b_phase0.py"
           aws s3 cp debot/scripts/engine_b_phase0_archive.sh "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/engine_b_phase0_archive.sh"
@@ -220,8 +234,12 @@ jobs:
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exclude '*.env'",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
+              "install -d -m 0755 /tmp/book-units-__GITHUB_SHA__",
+              "for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u /tmp/book-units-__GITHUB_SHA__/$u; done",
+              "# Both install paths stage everything from S3 into a per-run dir, so neither depends on the other having run first: ci.yml owns the binary object, this job owns the config and unit objects, and whichever installs last promotes the newest of both under install_book_runtime.sh's flock.",
               "install -d -m 0755 /tmp/engine-b-phase0-__GITHUB_SHA__",
               "aws s3 sync s3://__S3_BUCKET__/debot/engine-b-phase0/releases/__GITHUB_SHA__/ /tmp/engine-b-phase0-__GITHUB_SHA__/ --exact-timestamps",
+              "/bin/bash -lc 'set -e; d=/tmp/book-units-__GITHUB_SHA__; rc=0; bash __INSTALL_DIR__/scripts/fetch_book_bundle.sh __S3_BUCKET__ $d || rc=$?; if [ $rc -eq 10 ]; then echo \"book runtime bundle not published to S3 yet (ci.yml uploads it); skipping\"; elif [ $rc -ne 0 ]; then exit $rc; else sudo env BOOK_INSTANCE=xsmom-695 BOOK_BINARY_SOURCE=$d/book_runtime BOOK_LIBSIGNER_SOURCE=$d/libsigner.so BOOK_UNIT_SOURCE_DIR=$d bash __INSTALL_DIR__/scripts/install_book_runtime.sh; fi'",
               "sudo env ENGINE_B_PHASE0_CODE_COMMIT=__GITHUB_SHA__ ENGINE_B_PHASE0_REQUIREMENTS=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_requirements.txt ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0.py ENGINE_B_PHASE0_ARCHIVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_archive.sh ENGINE_B_PHASE0_CONFIG_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/phase0.json ENGINE_B_PHASE0_CALENDAR_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/trading_calendar.json ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/tmp/engine-b-phase0-__GITHUB_SHA__/deploy bash /tmp/engine-b-phase0-__GITHUB_SHA__/scripts/install_engine_b_phase0.sh"
             ]
           }

@@ -1,0 +1,44 @@
+[Unit]
+Description=Book runtime xsmom-695 (bot-strategy#937 / #695) -- DRY_RUN paper book driven by the XSMOM shadow signal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=book-runtime
+Group=book-runtime
+WorkingDirectory=/opt/book-runtime
+# Host-only Lighter credentials for this identity (never synced from git),
+# created once per docs/book-runtime-operations.md.
+EnvironmentFile=/etc/book-runtime/xsmom-695-secrets.env
+Environment=RUST_LOG=info
+Environment=BOOK_CONFIG=/opt/book-runtime/xsmom-695.yaml
+Environment=PROM_LISTEN=127.0.0.1:9474
+Environment=STATUS_S3_BUCKET=debot-dashboard
+Environment=STATUS_S3_KEY_PREFIX=debot/status/book-xsmom-695
+Environment=LD_LIBRARY_PATH=/opt/book-runtime/lib
+ExecStart=/opt/book-runtime/bin/book_runtime
+Restart=on-failure
+RestartSec=15
+# SIGTERM does not reduce-only close the book (docs/book-runtime.md §10);
+# the state is persisted and the next start resumes from it.
+TimeoutStopSec=30
+
+# Same isolation as engine-b-live: this identity cannot read the Robinhood
+# trading bot's or Engine B's credentials.
+InaccessiblePaths=/opt/debot /opt/engine-b-phase0 /opt/engine-b-live /etc/engine-b-live
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+ReadWritePaths=/var/lib/book-runtime/xsmom-695
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

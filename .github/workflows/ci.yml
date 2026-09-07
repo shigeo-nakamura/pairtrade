@@ -70,7 +70,7 @@ jobs:
         # guard was written for were sunset on 2026-09-06 (bot-strategy#937);
         # the guard now covers every trading unit this repo still deploys.
         run: |
-          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+(debot-pair-[a-z-]+|engine-b-live|debot-bull-holder)([[:space:]]|$)' .github/workflows/*.yml; then
+          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+(debot-pair-[a-z-]+|engine-b-live|debot-bull-holder|book-runtime-[a-z0-9-]+)([[:space:]]|$)' .github/workflows/*.yml; then
             echo "::error::CI workflow contains a forbidden 'systemctl restart/start <trading unit>' — trading services must be restarted manually only (bot-strategy#269)."
             exit 1
           fi
@@ -244,6 +244,7 @@ jobs:
       libsigner_sha256: ${{ steps.package.outputs.libsigner_sha256 }}
       engine_b_live_sha256: ${{ steps.package.outputs.engine_b_live_sha256 }}
       book_runtime_sha256: ${{ steps.package.outputs.book_runtime_sha256 }}
+      book_prefix: ${{ steps.upload.outputs.book_prefix }}
     steps:
       - name: Checkout debot
         uses: actions/checkout@v5
@@ -362,7 +363,7 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          mkdir -p dist/bin dist/lib dist/scripts dist/configs
+          mkdir -p dist/bin dist/lib
           file debot/target/release/engine_b_live | grep -q aarch64
           file debot/target/release/book-runtime | grep -q aarch64
           file lighter-go/build/libsigner.so | grep -q aarch64
@@ -402,13 +403,6 @@ jobs:
           echo "libsigner_sha256=${LIBSIGNER_SHA256}" >> "${GITHUB_OUTPUT}"
           (cd dist && sha256sum -c checksums.sha256)
           jq . dist/manifest.json
-          rsync -a \
-            --exclude "venv/" \
-            --exclude "__pycache__/" \
-            --exclude "*.log" \
-            --exclude "*.pyc" \
-            debot/scripts/ dist/scripts/
-          rsync -a debot/configs/ dist/configs/
 
       - name: Configure AWS credentials
         if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
@@ -418,27 +412,41 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Upload artifacts to S3
+        id: upload
         if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
         run: |
           aws s3 cp dist/bin/engine_b_live "s3://${S3_BUCKET}/debot/engine_b_live"
-          aws s3 cp dist/bin/book_runtime "s3://${S3_BUCKET}/debot/book_runtime"
           aws s3 cp dist/lib/libsigner.so "s3://${S3_BUCKET}/debot/libsigner.so"
+          # The book runtime ships as an immutable per-commit bundle: its
+          # binary and the signer it was built against must never be taken
+          # from two independently-updated unversioned keys, or a deploy
+          # racing this upload can pair a new binary with the old signer.
+          # The pointer is written last, so a reader sees either the
+          # previous release or a complete new one. The prefix carries the
+          # run id/attempt, not just the SHA: a manual re-run of this
+          # workflow for a commit whose release already exists must land
+          # at a fresh prefix, or its sequential uploads would overwrite an
+          # already-published "immutable" release in place while a reader
+          # (deploy-configs.yml, install_book_runtime.sh) fetches it.
+          BOOK_PREFIX="debot/book-runtime/releases/${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          aws s3 cp dist/bin/book_runtime "s3://${S3_BUCKET}/${BOOK_PREFIX}/book_runtime"
+          aws s3 cp dist/lib/libsigner.so "s3://${S3_BUCKET}/${BOOK_PREFIX}/libsigner.so"
+          aws s3 cp dist/manifest.json "s3://${S3_BUCKET}/${BOOK_PREFIX}/manifest.json"
+          jq -n --arg sha "${GITHUB_SHA}" --arg prefix "${BOOK_PREFIX}" '{sha: $sha, prefix: $prefix}' > /tmp/book-current.json
+          aws s3 cp /tmp/book-current.json "s3://${S3_BUCKET}/debot/book-runtime/current.json"
+          echo "book_prefix=${BOOK_PREFIX}" >> "${GITHUB_OUTPUT}"
           aws s3 cp dist/checksums.sha256 "s3://${S3_BUCKET}/debot/checksums.sha256"
           aws s3 cp dist/manifest.json "s3://${S3_BUCKET}/debot/manifest.json"
-          aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot/scripts/" \
-            --exclude "venv/*" \
-            --exclude "venv/**" \
-            --exclude "__pycache__/*" \
-            --exclude "__pycache__/**" \
-            --exclude "*.log" \
-            --exclude "*.pyc"
-          aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/"
-          aws s3 cp debot/deploy/engine-b-live.service "s3://${S3_BUCKET}/deploy/engine-b-live.service"
+          # scripts/, configs/ and deploy/ units are NOT uploaded here:
+          # deploy-configs.yml is their single owner. This build may finish
+          # after a later config-only push has already deployed, and an
+          # unversioned re-upload of this commit's copies would roll the
+          # host back to older configuration (bot-strategy#937 review).
 
   deploy-robinhood-lighter:
-    name: Deploy Engine B live binary to Robinhood Lighter host
+    name: Deploy Engine B live + book runtime binaries to Robinhood Lighter host
     needs: deploy
     runs-on: ubuntu-latest
     if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
@@ -460,6 +468,8 @@ jobs:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           LIBSIGNER_SHA256: ${{ needs.deploy.outputs.libsigner_sha256 }}
           ENGINE_B_LIVE_SHA256: ${{ needs.deploy.outputs.engine_b_live_sha256 }}
+          BOOK_RUNTIME_SHA256: ${{ needs.deploy.outputs.book_runtime_sha256 }}
+          BOOK_PREFIX: ${{ needs.deploy.outputs.book_prefix }}
         run: |
           test -n "${INSTANCE_ID}"
           # JSON --parameters file, not inline shorthand: a shorthand
@@ -472,6 +482,12 @@ jobs:
           # (`debot-pair-robinhood-lighter`, points farming) is deliberately
           # NOT touched by this job any more: its binary, config, and units
           # stay exactly as last deployed (bot-strategy#937 sunset decision).
+          #
+          # The book runtime's sources are staged in a per-run /tmp dir, not
+          # in the shared /opt/debot tree: deploy-configs.yml can be inside
+          # install_book_runtime.sh at the same time, and writing the shared
+          # paths outside that script's flock could let it stage a mixed
+          # binary/signer pair.
           cat > /tmp/ssm-robinhood-deploy-params.json <<'JSON'
           {
             "commands": [
@@ -486,16 +502,18 @@ jobs:
               "aws s3 cp s3://__S3_BUCKET__/deploy/engine-b-live.service __INSTALL_DIR__/deploy/engine-b-live.service",
               "aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so __INSTALL_DIR__/deploy/engine-b-live-libsigner.so",
               "echo '__LIBSIGNER_SHA256__  __INSTALL_DIR__/deploy/engine-b-live-libsigner.so' | sha256sum -c -",
-              "sudo env ENGINE_B_LIVE_LIBSIGNER_SOURCE=__INSTALL_DIR__/deploy/engine-b-live-libsigner.so bash __INSTALL_DIR__/scripts/install_engine_b_live.sh"
+              "sudo env ENGINE_B_LIVE_LIBSIGNER_SOURCE=__INSTALL_DIR__/deploy/engine-b-live-libsigner.so bash __INSTALL_DIR__/scripts/install_engine_b_live.sh",
+              "/bin/bash -lc 'set -e; d=/tmp/book-runtime-__BOOK_STAGE__; units=\"book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer\"; probe=__INSTALL_DIR__/scripts/s3_object_present.sh; fetch=__INSTALL_DIR__/scripts/fetch_book_bundle.sh; published=1; if [ -x $probe ] && [ -x $fetch ]; then for u in $units; do rc=0; bash $probe __S3_BUCKET__ deploy/$u || rc=$?; if [ $rc -eq 10 ]; then published=0; elif [ $rc -ne 0 ]; then exit $rc; fi; done; else published=0; fi; if [ $published -eq 0 ] || [ ! -f __INSTALL_DIR__/scripts/install_book_runtime.sh ] || [ ! -f __INSTALL_DIR__/configs/book/xsmom-695.yaml ]; then echo \"book runtime units/config/installer not published yet; deploy-configs.yml bootstraps it from the versioned bundle uploaded above\"; else bash $fetch __S3_BUCKET__ $d __BOOK_PREFIX__; for u in $units; do aws s3 cp s3://__S3_BUCKET__/deploy/$u $d/$u; done; aws s3 cp s3://__S3_BUCKET__/debot/configs/book/xsmom-695.yaml $d/xsmom-695.yaml; aws s3 cp s3://__S3_BUCKET__/debot/scripts/book_signal_fetch.sh $d/book_signal_fetch.sh; sudo env BOOK_INSTANCE=xsmom-695 BOOK_BINARY_SOURCE=$d/book_runtime BOOK_LIBSIGNER_SOURCE=$d/libsigner.so BOOK_CONFIG_SOURCE=$d/xsmom-695.yaml BOOK_FETCH_SCRIPT_SOURCE=$d/book_signal_fetch.sh BOOK_UNIT_SOURCE_DIR=$d bash __INSTALL_DIR__/scripts/install_book_runtime.sh; fi'"
             ]
           }
           JSON
-          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g; s|__ENGINE_B_LIVE_SHA256__|${ENGINE_B_LIVE_SHA256}|g" /tmp/ssm-robinhood-deploy-params.json
+          test -n "${BOOK_PREFIX}"
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g; s|__ENGINE_B_LIVE_SHA256__|${ENGINE_B_LIVE_SHA256}|g; s|__BOOK_RUNTIME_SHA256__|${BOOK_RUNTIME_SHA256}|g; s|__GITHUB_SHA__|${GITHUB_SHA}|g; s|__BOOK_PREFIX__|${BOOK_PREFIX}|g; s|__BOOK_STAGE__|${BOOK_PREFIX##*/}|g" /tmp/ssm-robinhood-deploy-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
-            --comment "Deploy Engine B live artifacts; no start or restart" \
+            --comment "Deploy Engine B live + book runtime artifacts; no start or restart" \
             --parameters file:///tmp/ssm-robinhood-deploy-params.json \
             --query Command.CommandId --output text)
           set +e
