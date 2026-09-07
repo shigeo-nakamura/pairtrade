@@ -119,8 +119,10 @@ bot-strategy#580).
   valid "go flat" instruction.
 - `payload_sha256` is the sha256 of the canonical JSON
   (`separators=(",", ":")`, `sort_keys=True`) of
-  `{"as_of","decision_key","producer_id","weights"}`. The runtime recomputes
-  it; a mismatch rejects the file. The hash is written to the ledger and
+  `{"as_of","decision_key","producer_id","weights"}`, floats rendered as
+  Python `repr(float)` (fixed notation for decimal exponents in `[-4, 16)`,
+  otherwise `1e-05` style). The runtime recomputes it with a formatter that
+  matches Python for the full finite range; a mismatch rejects the file. The hash is written to the ledger and
   `state.json` so a rebalance is traceable to the exact vector that caused
   it.
 - Validation order: parse → schema_version → producer_id → hash →
@@ -147,10 +149,16 @@ bot-strategy#580).
   orders. This is an internal decision (`outcome=flatten`), no file
   required.
 - Restart safety: `state.json` carries `last_decision` (key + outcome +
-  applied hash) so a restart inside a window neither re-applies nor
-  double-trades; a restart *after* a partial rebalance resumes from the
-  venue position (the next tick re-plans the residual diff against the
-  same key, bounded by `max_attempts`).
+  applied hash + rounded target quantities + `flatten_at`) so a restart
+  inside a window neither re-applies nor double-trades. A `partial`
+  decision is retried from the **persisted target quantities**, never by
+  re-reading the producer file: one decision key stays tied to one
+  accepted vector even if the file is rewritten or removed, and the
+  retries are bounded by `max_attempts` inside the window.
+- An overdue flatten (`flatten_at` passed, book not flat) is processed
+  before any decision — including after a restart that lands past the
+  *next* decision time. The schedule does not advance onto a new key while
+  the previous key's flatten is still pending.
 
 ## 5. Rebalancer (pure, unit-tested)
 
@@ -186,10 +194,11 @@ reduce_only }`.
   `[REBALANCE] residual …` and carried in `state.json` as
   `pending_residual` so the next tick within the window retries, and the
   dashboard shows it.
-- Live position adoption: at every decision the venue position is the
-  source of truth for `current_qty`; a position the runtime does not
-  remember (opened elsewhere, or by a crashed previous run) is adopted
-  into the book at the venue's `entry_price` and logged `[ADOPT]`.
+- Live position adoption: every tick the venue position is the source of
+  truth; any leg whose venue quantity differs from the book (opened or
+  changed elsewhere, or by a crashed previous run) is adopted at the
+  venue's quantity **and** average entry price (mid when the venue reports
+  none) and logged `[ADOPT]`; a leg the venue no longer holds is dropped.
 - DRY_RUN: the paper book lives in `state.json`; fills are at
   `mid * (1 +/- paper_slippage_bps)` with `paper_fee_bps`; quantities are
   rounded the same way as live, so paper and live share every code path
@@ -215,11 +224,12 @@ reduce_only }`.
 - **Daily loss halt**: realized + unrealized loss since 00:00 UTC beyond
   `max_daily_loss_bps` blocks opening intents until the next UTC day; no
   flatten.
-- **Funding**: once per UTC day the runtime books an *estimated* funding
-  accrual per leg from the venue's current funding rate × notional ×
-  hours held (`funding_source=estimated_from_rate`). Realized funding from
-  the venue ledger is a producer-side reconciliation, not a runtime
-  input.
+- **Funding**: the runtime books an *estimated* funding accrual per leg
+  from the venue's current funding rate × notional × hours since the last
+  accrual, once per UTC day at the mark **and** right before any fill
+  touches the leg, so a leg closed between marks (fixed-window exits) is
+  not left unaccounted. Realized funding from the venue ledger is a
+  producer-side reconciliation, not a runtime input.
 
 ## 8. On-disk outputs
 

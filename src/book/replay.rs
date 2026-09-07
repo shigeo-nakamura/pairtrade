@@ -429,6 +429,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(out.join("state.json")).unwrap())
                 .unwrap();
         assert!(state["positions"].as_object().unwrap().is_empty());
+        // The ~6 h of funding on the closed leg is booked at the close.
+        assert!(state["cum_funding_est_usd"].as_f64().unwrap() < 0.0);
         // Days without a file are skipped, not errors.
         let decisions: Vec<_> = ledger.iter().filter(|r| r["event"] == "decision").collect();
         assert!(decisions.iter().any(|d| d["outcome"] == "skipped"));

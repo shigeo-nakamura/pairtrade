@@ -51,6 +51,11 @@ pub struct DecisionRecord {
     /// Rebalance attempts spent on this key (plan → execute rounds).
     #[serde(default)]
     pub attempts: u32,
+    /// Unix seconds at which this decision's book must be flat again
+    /// (fixed-window strategies); persisted so an overdue flatten survives
+    /// a restart that lands after the next decision time.
+    #[serde(default)]
+    pub flatten_at: Option<i64>,
     /// Fixed-window flatten completed for this key.
     #[serde(default)]
     pub flatten_done: bool,

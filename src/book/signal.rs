@@ -147,17 +147,48 @@ pub fn canonical_payload(
     out
 }
 
-/// Python `json.dumps` float formatting: `repr(float)`. For the weight
-/// magnitudes used here (|w| <= 1, a few decimals) Rust's shortest
-/// round-trip `{}` formatting agrees with Python's repr, except that Rust
-/// prints integral floats without a fractional part (`1` vs `1.0`), which
-/// this normalises.
+/// Python `json.dumps` float formatting, i.e. `repr(float)`: shortest
+/// round-trip digits, fixed notation when the decimal exponent is in
+/// `[-4, 16)`, otherwise scientific with a signed two-digit-minimum
+/// exponent (`1e-05`, `1.5e-07`, `1e+16`). Rust's `{}` already yields the
+/// shortest digits but never switches to exponent form for small values,
+/// so a producer weight of `1e-7` would hash differently; this matches
+/// Python for the full finite range.
 pub fn format_weight(v: f64) -> String {
-    let s = format!("{v}");
-    if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") {
-        s
+    if !v.is_finite() {
+        return format!("{v}");
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
+    }
+    let sign = if v < 0.0 { "-" } else { "" };
+    let sci = format!("{:e}", v.abs()); // e.g. "1.5e-7", "1e16", "1.23456e2"
+    let (mant, exp) = sci.split_once('e').expect("{:e} always has an exponent");
+    let exp: i32 = exp.parse().expect("exponent is an integer");
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    if (-4..16).contains(&exp) {
+        // Fixed notation: place the decimal point after `exp + 1` digits.
+        let point = exp + 1;
+        let body = if point <= 0 {
+            format!("0.{}{}", "0".repeat((-point) as usize), digits)
+        } else if (point as usize) >= digits.len() {
+            format!("{}{}.0", digits, "0".repeat(point as usize - digits.len()))
+        } else {
+            let (a, b) = digits.split_at(point as usize);
+            format!("{a}.{b}")
+        };
+        format!("{sign}{body}")
     } else {
-        format!("{s}.0")
+        let exp_s = if exp < 0 {
+            format!("-{:02}", -exp)
+        } else {
+            format!("+{:02}", exp)
+        };
+        format!("{sign}{mant}e{exp_s}")
     }
 }
 
@@ -560,11 +591,51 @@ mod tests {
     }
 
     #[test]
-    fn format_weight_matches_python_repr_for_common_values() {
-        assert_eq!(format_weight(0.1), "0.1");
-        assert_eq!(format_weight(-0.25), "-0.25");
-        assert_eq!(format_weight(1.0), "1.0");
-        assert_eq!(format_weight(0.0), "0.0");
-        assert_eq!(format_weight(0.045454545454545456), "0.045454545454545456");
+    fn format_weight_matches_python_repr() {
+        // Reference: python3 -c 'print(repr(v))' for each value.
+        for (v, want) in [
+            (0.1, "0.1"),
+            (-0.25, "-0.25"),
+            (1.0, "1.0"),
+            (0.0, "0.0"),
+            (100.0, "100.0"),
+            (123.456, "123.456"),
+            (0.045454545454545456, "0.045454545454545456"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1e-4, "0.0001"),
+            (0.000123, "0.000123"),
+            (9.9e-5, "9.9e-05"),
+            (4.5e-5, "4.5e-05"),
+            (1e-5, "1e-05"),
+            (1e-7, "1e-07"),
+            (1.5e-7, "1.5e-07"),
+            (-2.5e-9, "-2.5e-09"),
+            (1e15, "1000000000000000.0"),
+            (1234567890123456.0, "1234567890123456.0"),
+            (1e16, "1e+16"),
+            (1.2345678901234568e17, "1.2345678901234568e+17"),
+            (1e22, "1e+22"),
+            (5e-324, "5e-324"),
+        ] {
+            assert_eq!(format_weight(v), want, "v={v:e}");
+        }
+    }
+
+    #[test]
+    fn tiny_weight_hash_matches_python() {
+        // python3 -c 'import json,hashlib; s=json.dumps({"as_of":"2026-09-06T00:00:00Z","decision_key":"k","producer_id":"p","weights":{"A":1e-07,"B":-4.5e-05}},sort_keys=True,separators=(",",":")); print(s, hashlib.sha256(s.encode()).hexdigest())'
+        let w: BTreeMap<String, f64> = [("A", 1e-7), ("B", -4.5e-5)]
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let s = canonical_payload("p", &ts("2026-09-06T00:00:00Z"), "k", &w);
+        assert_eq!(
+            s,
+            r#"{"as_of":"2026-09-06T00:00:00Z","decision_key":"k","producer_id":"p","weights":{"A":1e-07,"B":-4.5e-05}}"#
+        );
+        assert_eq!(
+            sha256_hex(&s),
+            "201ad4492e66594c520ce52afba3d269c61d1b7158e334a4d0ec008ab14258af"
+        );
     }
 }

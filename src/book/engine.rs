@@ -233,8 +233,10 @@ impl BookEngine {
                 self.flatten_now(now, &prices, "session_halt_retry").await;
             }
         } else if self.positions_ready {
-            self.process_decision(now, &prices).await;
+            // An overdue fixed-window flatten always runs before a new
+            // decision can touch the book.
             self.process_flatten(now, &prices).await;
+            self.process_decision(now, &prices).await;
         }
 
         self.maybe_daily_mark(now, &prices).await;
@@ -308,7 +310,10 @@ impl BookEngine {
                         funding_accrued_at: Some(now),
                     });
                 p.qty = venue_qty;
-                if p.avg_price <= 0.0 {
+                // The venue's average entry is the only consistent basis
+                // once the book and the venue disagree (externally placed
+                // fill, or a crash between execution and persistence).
+                if entry > 0.0 {
                     p.avg_price = entry;
                 }
             }
@@ -335,11 +340,34 @@ impl BookEngine {
         }
     }
 
+    /// The previous decision's flatten obligation, if it is overdue and
+    /// not yet completed.
+    fn overdue_flatten(&self, now: i64) -> Option<(String, i64)> {
+        let r = self.state.last_decision.as_ref()?;
+        match r.flatten_at {
+            Some(f) if !r.flatten_done && now >= f => Some((r.key.clone(), f)),
+            _ => None,
+        }
+    }
+
     async fn process_decision(&mut self, now: i64, prices: &HashMap<String, f64>) {
         let Some(d) = self.scheduler.current(now) else {
             self.signal_status = "no_decision_yet".to_string();
             return;
         };
+        if let Some((key, f)) = self.overdue_flatten(now) {
+            if key != d.key && !self.state.is_flat() {
+                // Never advance the schedule over an unfinished exit.
+                log::warn!(
+                    "[DECISION] key={} deferred: flatten of {} (due {}) still pending",
+                    d.key,
+                    key,
+                    f
+                );
+                self.signal_status = format!("waiting_flatten:{key}");
+                return;
+            }
+        }
         let rec = self.state.last_decision.clone().filter(|r| r.key == d.key);
         match rec {
             None => {
@@ -359,11 +387,110 @@ impl BookEngine {
                 DecisionOutcome::Partial
                     if now <= d.window_end && r.attempts < self.cfg.execution.max_attempts =>
                 {
-                    self.try_apply(now, &d, prices, r.attempts).await;
+                    self.retry_residual(now, &d, &r, prices).await;
                 }
                 _ => {}
             },
         }
+    }
+
+    /// Re-plan a partially applied decision from its persisted target
+    /// quantities: one decision key stays tied to exactly one accepted
+    /// vector, whatever the producer file says now.
+    async fn retry_residual(
+        &mut self,
+        now: i64,
+        d: &Decision,
+        rec: &DecisionRecord,
+        prices: &HashMap<String, f64>,
+    ) {
+        let mut symbols: Vec<String> = rec.target_qty.keys().cloned().collect();
+        for s in self.state.positions.keys() {
+            if !symbols.contains(s) {
+                symbols.push(s.clone());
+            }
+        }
+        let lots = self.lots_for(&symbols).await;
+        let current = self.state.signed_qty();
+        let attempts = rec.attempts + 1;
+        let plan = match rebalance::plan_targets(
+            &rec.target_qty,
+            &current,
+            prices,
+            &lots,
+            &self.cfg.sizing,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "[REBALANCE] key={} retry {} cannot plan: {e}",
+                    d.key,
+                    attempts
+                );
+                if let Some(r) = self.state.last_decision.as_mut() {
+                    r.attempts = attempts;
+                    r.at = now;
+                    r.reject_reason = Some(e.to_string());
+                }
+                self.ledger.write(
+                    now,
+                    "decision",
+                    Some(&d.key),
+                    json!({ "outcome": "partial", "retry": attempts, "reason": e.label(), "detail": e.to_string() }),
+                );
+                return;
+            }
+        };
+        log::info!(
+            "[DECISION] key={} retry attempt={} intents={} residual_targets={}",
+            d.key,
+            attempts,
+            plan.intents.len(),
+            rec.target_qty.len()
+        );
+        let summary = self.execute_plan(now, &d.key, &plan, prices).await;
+        let outcome = if summary.residual.is_empty() {
+            DecisionOutcome::Applied
+        } else {
+            DecisionOutcome::Partial
+        };
+        if let Some(r) = self.state.last_decision.as_mut() {
+            r.outcome = outcome;
+            r.attempts = attempts;
+            r.at = now;
+            r.reject_reason = None;
+        }
+        let label = match outcome {
+            DecisionOutcome::Applied => "applied",
+            _ => "partial",
+        };
+        self.signal_status = format!(
+            "{label}:{}",
+            rec.signal_sha256
+                .as_deref()
+                .map(|s| &s[..12.min(s.len())])
+                .unwrap_or("-")
+        );
+        self.ledger.write(
+            now,
+            "decision",
+            Some(&d.key),
+            json!({
+                "outcome": label,
+                "retry": attempts,
+                "signal_sha256": rec.signal_sha256,
+                "intents": summary.intents,
+                "filled": summary.filled,
+                "partial": summary.partial,
+                "unfilled": summary.unfilled,
+                "blocked": summary.blocked,
+                "errors": summary.errors,
+                "residual_qty": summary.residual,
+            }),
+        );
+        status::DECISION_TOTAL
+            .with_label_values(&[&self.cfg.instance_id, label])
+            .inc();
     }
 
     fn finish_skipped(&mut self, now: i64, d: &Decision, reason: &str) {
@@ -376,6 +503,7 @@ impl BookEngine {
             signal_sha256: None,
             reject_reason: Some(reason.to_string()),
             attempts: prev.as_ref().map(|r| r.attempts).unwrap_or(0),
+            flatten_at: d.flatten_at,
             flatten_done: prev.map(|r| r.flatten_done).unwrap_or(false),
             target_qty: BTreeMap::new(),
         });
@@ -413,6 +541,7 @@ impl BookEngine {
             signal_sha256: None,
             reject_reason: Some(detail.clone()),
             attempts,
+            flatten_at: d.flatten_at,
             flatten_done: prev.map(|r| r.flatten_done).unwrap_or(false),
             target_qty: BTreeMap::new(),
         });
@@ -540,6 +669,7 @@ impl BookEngine {
             signal_sha256: Some(sig.payload_sha256.clone()),
             reject_reason: None,
             attempts,
+            flatten_at: d.flatten_at,
             flatten_done: false,
             target_qty: plan.target_qty.clone(),
         });
@@ -628,8 +758,16 @@ impl BookEngine {
             }
             self.ledger
                 .write(now, "order_intent", Some(key), json!({ "intent": intent }));
+            let rate = if self.state.positions.contains_key(&intent.symbol) {
+                self.exec.funding_rate_hourly(&intent.symbol).await
+            } else {
+                None
+            };
             match self.exec.execute(intent).await {
                 Ok(fill) => {
+                    if fill.filled_qty > 0.0 {
+                        self.accrue_funding(&intent.symbol, now, intent.reference_price, rate);
+                    }
                     let result = self.book_fill(now, key, intent, &fill);
                     match result {
                         "filled" => s.filled += 1,
@@ -817,44 +955,40 @@ impl BookEngine {
     }
 
     async fn process_flatten(&mut self, now: i64, prices: &HashMap<String, f64>) {
-        let Some(d) = self.scheduler.current(now) else {
+        let Some((key, _)) = self.overdue_flatten(now) else {
             return;
         };
-        let Some(flatten_at) = d.flatten_at else {
-            return;
-        };
-        if now < flatten_at {
-            return;
-        }
-        let done = self
-            .state
-            .last_decision
-            .as_ref()
-            .map(|r| r.key == d.key && r.flatten_done)
-            .unwrap_or(false);
-        if done {
-            return;
-        }
         if !self.state.is_flat() && now - self.last_flatten_attempt >= 30 {
             self.flatten_now(now, prices, "fixed_window").await;
         }
         if self.state.is_flat() {
-            match self.state.last_decision.as_mut() {
-                Some(r) if r.key == d.key => r.flatten_done = true,
-                _ => {
-                    self.state.last_decision = Some(DecisionRecord {
-                        key: d.key.clone(),
-                        outcome: DecisionOutcome::Skipped,
-                        at: now,
-                        signal_sha256: None,
-                        reject_reason: Some("flatten_only".to_string()),
-                        attempts: 0,
-                        flatten_done: true,
-                        target_qty: BTreeMap::new(),
-                    })
+            if let Some(r) = self.state.last_decision.as_mut() {
+                if r.key == key {
+                    r.flatten_done = true;
                 }
             }
         }
+    }
+
+    /// Book the funding estimate accrued on `symbol` since its last accrual
+    /// (used at daily marks and right before any fill touches the leg, so a
+    /// leg closed between marks is not left unaccounted).
+    fn accrue_funding(
+        &mut self,
+        symbol: &str,
+        now: i64,
+        price: f64,
+        rate_hourly: Option<f64>,
+    ) -> Option<f64> {
+        let p = self.state.positions.get_mut(symbol)?;
+        let since = p.funding_accrued_at.unwrap_or(p.opened_at);
+        let hours = ((now - since).max(0)) as f64 / 3600.0;
+        let est = rate_hourly
+            .map(|r| -p.qty * price * r * hours)
+            .unwrap_or(0.0);
+        p.funding_accrued_at = Some(now);
+        self.state.cum_funding_est_usd += est;
+        Some(est)
     }
 
     async fn maybe_daily_mark(&mut self, now: i64, prices: &HashMap<String, f64>) {
@@ -867,18 +1001,13 @@ impl BookEngine {
         let symbols: Vec<String> = self.state.positions.keys().cloned().collect();
         for sym in symbols {
             let rate = self.exec.funding_rate_hourly(&sym).await;
-            let Some(p) = self.state.positions.get_mut(&sym) else {
+            let Some(p) = self.state.positions.get(&sym) else {
                 continue;
             };
             let since = p.funding_accrued_at.unwrap_or(p.opened_at);
             let hours = ((now - since).max(0)) as f64 / 3600.0;
             let price = prices.get(&sym).copied().unwrap_or(p.avg_price);
-            let est = match rate {
-                Some(r) => -p.qty * price * r * hours,
-                None => 0.0,
-            };
-            p.funding_accrued_at = Some(now);
-            self.state.cum_funding_est_usd += est;
+            let est = self.accrue_funding(&sym, now, price, rate).unwrap_or(0.0);
             funding_detail.insert(
                 sym.clone(),
                 json!({ "rate_hourly": rate, "hours": hours, "est_usd": est }),
@@ -1030,5 +1159,298 @@ impl OrderIntent {
             IntentKind::Open => "open",
             IntentKind::Increase => "increase",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::book::config::{test_config_yaml, ScheduleKind};
+    use crate::book::executor::{FillReport, PaperExecutor, VenuePosition};
+    use crate::book::schedule::CalendarEntry;
+    use crate::book::signal::testutil::signal_json;
+    use async_trait::async_trait;
+    use chrono::{DateTime, Duration};
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn secs(s: &str) -> i64 {
+        ts(s).timestamp()
+    }
+
+    fn sandbox(cfg: &mut BookConfig, dir: &Path) {
+        cfg.paths.state = dir.join("state.json");
+        cfg.paths.ledger = dir.join("ledger.jsonl");
+        cfg.paths.pnl = dir.join("pnl.jsonl");
+        cfg.paths.status = dir.join("status.json");
+        cfg.risk.kill_switch_path = dir.join("KILL_SWITCH");
+        cfg.risk.risk_ack_path = dir.join("RISK_ACK");
+        cfg.signal.path = dir.join("signals").join("unused.json");
+        cfg.sizing.max_symbol_weight = 0.5;
+    }
+
+    fn write_signal(dir: &Path, key: &str, decision_at: DateTime<Utc>, weights: &[(&str, f64)]) {
+        let body = signal_json(
+            "test_producer",
+            decision_at - Duration::minutes(10),
+            decision_at - Duration::minutes(30),
+            key,
+            weights,
+        );
+        std::fs::create_dir_all(dir.join("signals")).unwrap();
+        std::fs::write(dir.join("signals").join(format!("{key}.json")), body).unwrap();
+    }
+
+    fn rows(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    async fn paper_engine(
+        cfg: BookConfig,
+        dir: &Path,
+        calendar: Vec<CalendarEntry>,
+    ) -> (BookEngine, Arc<PaperExecutor>) {
+        let exec = Arc::new(PaperExecutor::new(0.0, 0.0));
+        for (s, d) in [("BTC", 5u32), ("ETH", 4), ("SOL", 2), ("DOT", 1)] {
+            exec.set_lot(
+                s,
+                LotMeta {
+                    size_decimals: d,
+                    min_order_qty: None,
+                },
+            )
+            .await;
+        }
+        for (s, p) in [
+            ("BTC", 100_000.0),
+            ("ETH", 4_000.0),
+            ("SOL", 200.0),
+            ("DOT", 4.0),
+        ] {
+            exec.set_price(s, p).await;
+            exec.set_funding_rate_hourly(s, 0.0001).await;
+        }
+        let scheduler = Scheduler::build(&cfg.schedule, calendar).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.join("signals")));
+        let engine = BookEngine::new(cfg, scheduler, exec.clone(), signals, status).unwrap();
+        (engine, exec)
+    }
+
+    #[tokio::test]
+    async fn overdue_flatten_runs_before_the_next_decision_after_a_restart_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.schedule.kind = ScheduleKind::Calendar;
+        cfg.schedule.calendar_path = Some(dir.path().join("cal.json"));
+        cfg.signal.require_dollar_neutral = false;
+        cfg.sizing.max_net_usd = 1_000.0;
+        cfg.schedule.signal_grace_secs = 600;
+        let d1 = ts("2026-09-08T06:30:00Z");
+        let f1 = ts("2026-09-08T13:30:00Z");
+        let d2 = ts("2026-09-09T06:30:00Z");
+        let calendar = vec![
+            CalendarEntry {
+                decision_key: "2026-09-08".into(),
+                decision_at: d1,
+                flatten_at: Some(f1),
+            },
+            CalendarEntry {
+                decision_key: "2026-09-09".into(),
+                decision_at: d2,
+                flatten_at: Some(ts("2026-09-09T13:30:00Z")),
+            },
+        ];
+        write_signal(dir.path(), "2026-09-08", d1, &[("SOL", 0.5)]);
+        write_signal(dir.path(), "2026-09-09", d2, &[("SOL", -0.5)]);
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), calendar.clone()).await;
+        engine.tick(d1.timestamp()).await.unwrap();
+        assert!(engine.state.positions["SOL"].qty > 0.0);
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.flatten_at, Some(f1.timestamp()));
+        assert!(!rec.flatten_done);
+        drop(engine);
+
+        // "Restart" well past the flatten and after the next decision time:
+        // the new paper book is seeded from the persisted state, as the
+        // binary does at startup.
+        let held = exec.positions().await.unwrap();
+        let (mut engine, exec2) = paper_engine(cfg.clone(), dir.path(), calendar).await;
+        exec2.seed_positions(held).await;
+        let ledger_before = rows(&cfg.paths.ledger).len();
+        engine.tick(d2.timestamp() + 60).await.unwrap();
+        let ledger = rows(&cfg.paths.ledger);
+        let new_rows: Vec<&Value> = ledger[ledger_before..].iter().collect();
+        let flatten_idx = new_rows
+            .iter()
+            .position(|r| r["event"] == "flatten")
+            .expect("flatten row");
+        let decision_idx = new_rows
+            .iter()
+            .position(|r| r["event"] == "decision" && r["decision_key"] == "2026-09-09")
+            .expect("09-09 decision");
+        assert!(
+            flatten_idx < decision_idx,
+            "flatten must precede the next decision"
+        );
+        assert_eq!(new_rows[flatten_idx]["reason"], "fixed_window");
+        assert_eq!(new_rows[flatten_idx]["decision_key"], "2026-09-08");
+        // Then the 09-09 signal was applied onto a flat book: short SOL.
+        assert_eq!(new_rows[decision_idx]["outcome"], "applied");
+        assert!(engine.state.positions["SOL"].qty < 0.0);
+        // Funding for the 09-08 leg was accrued at its close, not lost.
+        assert!(engine.state.cum_funding_est_usd != 0.0);
+    }
+
+    #[tokio::test]
+    async fn partial_decision_retries_from_the_persisted_target_without_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("DOT", -0.5)]);
+        let (mut engine, _) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        // Kill switch on: both opens blocked → partial.
+        std::fs::write(&cfg.risk.kill_switch_path, "").unwrap();
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Partial);
+        assert_eq!(rec.attempts, 1);
+        assert_eq!(rec.target_qty.len(), 2);
+        assert!(engine.state.is_flat());
+        // Kill switch lifted, producer file gone (and even a different vector
+        // for the same key would be ignored): retry uses the persisted target.
+        std::fs::remove_file(&cfg.risk.kill_switch_path).unwrap();
+        write_signal(dir.path(), "2026-09-06", d, &[("ETH", 0.5), ("SOL", -0.5)]);
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Applied);
+        assert_eq!(rec.attempts, 2);
+        assert!(engine.state.positions["BTC"].qty > 0.0);
+        assert!(engine.state.positions["DOT"].qty < 0.0);
+        assert!(!engine.state.positions.contains_key("ETH"));
+        let ledger = rows(&cfg.paths.ledger);
+        let retry = ledger
+            .iter()
+            .find(|r| r["event"] == "decision" && r["retry"] == 2)
+            .expect("retry row");
+        assert_eq!(retry["outcome"], "applied");
+        assert_eq!(retry["signal_sha256"], rec.signal_sha256.clone().unwrap());
+    }
+
+    /// Minimal non-paper venue: canned positions and prices, full fills.
+    struct MockVenue {
+        prices: HashMap<String, f64>,
+        positions: Mutex<BTreeMap<String, VenuePosition>>,
+    }
+
+    #[async_trait]
+    impl Executor for MockVenue {
+        fn is_paper(&self) -> bool {
+            false
+        }
+        async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
+            symbols
+                .iter()
+                .filter_map(|s| self.prices.get(s).map(|p| (s.clone(), *p)))
+                .collect()
+        }
+        async fn lot_meta(&self, _symbol: &str) -> Result<LotMeta> {
+            Ok(LotMeta {
+                size_decimals: 2,
+                min_order_qty: None,
+            })
+        }
+        async fn positions(&self) -> Result<BTreeMap<String, VenuePosition>> {
+            Ok(self.positions.lock().unwrap().clone())
+        }
+        async fn equity(&self) -> Result<Option<f64>> {
+            Ok(Some(1000.0))
+        }
+        async fn funding_rate_hourly(&self, _symbol: &str) -> Option<f64> {
+            None
+        }
+        async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
+            let signed = match intent.side {
+                Side::Buy => intent.qty,
+                Side::Sell => -intent.qty,
+            };
+            let mut p = self.positions.lock().unwrap();
+            let e = p.entry(intent.symbol.clone()).or_default();
+            e.qty += signed;
+            if e.entry_price.is_none() {
+                e.entry_price = Some(intent.reference_price);
+            }
+            let after = e.qty;
+            if after == 0.0 {
+                p.remove(&intent.symbol);
+            }
+            Ok(FillReport {
+                requested_qty: intent.qty,
+                filled_qty: intent.qty,
+                fill_price: intent.reference_price,
+                fill_price_source: "mid_estimate",
+                fee_usd: 0.0,
+                order_id: Some("o".into()),
+                venue_error: None,
+                latency_ms: 0,
+                position_after: Some(after),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn live_reconcile_adopts_venue_quantity_and_entry_price() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // Book remembers 1 SOL @ 100; the venue says 3 SOL @ 150 (external add).
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 1.0, 100.0, 1);
+        state.persist(&cfg.paths.state).unwrap();
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 160.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 3.0,
+                        entry_price: Some(150.0),
+                    },
+                )]
+                .into(),
+            ),
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine =
+            BookEngine::new(cfg.clone(), scheduler, venue.clone(), signals, status).unwrap();
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        let p = &engine.state.positions["SOL"];
+        assert_eq!(p.qty, 3.0);
+        assert_eq!(p.avg_price, 150.0);
+        let adopt = rows(&cfg.paths.ledger)
+            .into_iter()
+            .find(|r| r["event"] == "adopt")
+            .unwrap();
+        assert_eq!(adopt["venue_qty"], 3.0);
+        assert_eq!(adopt["book_qty"], 1.0);
+        assert_eq!(adopt["entry_price"], 150.0);
+        // Venue flat → book leg removed.
+        venue.positions.lock().unwrap().clear();
+        engine.tick(secs("2026-09-06T00:00:05Z")).await.unwrap();
+        assert!(engine.state.is_flat());
     }
 }

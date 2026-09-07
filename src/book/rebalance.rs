@@ -145,6 +145,41 @@ fn sign(x: f64) -> i8 {
     }
 }
 
+/// Signed, lot-rounded target quantity per symbol from a weight vector.
+/// Symbols in `current` but absent from `weights` get a zero target.
+pub fn targets_from_weights(
+    weights: &BTreeMap<String, f64>,
+    current: &BTreeMap<String, f64>,
+    prices: &HashMap<String, f64>,
+    lots: &HashMap<String, LotMeta>,
+    sizing: &SizingConfig,
+) -> Result<BTreeMap<String, f64>, PlanReject> {
+    let mut out = BTreeMap::new();
+    for sym in current.keys() {
+        out.insert(sym.clone(), 0.0);
+    }
+    for (sym, w) in weights {
+        if *w == 0.0 {
+            out.insert(sym.clone(), 0.0);
+            continue;
+        }
+        let price = match prices.get(sym).copied() {
+            Some(p) if p.is_finite() && p > 0.0 => p,
+            _ => return Err(PlanReject::MissingPrice(sym.clone())),
+        };
+        let lot = lots
+            .get(sym)
+            .copied()
+            .ok_or_else(|| PlanReject::MissingLotMeta(sym.clone()))?;
+        let tq_abs = round_down_qty(
+            w.abs() * sizing.gross_notional_usd / price,
+            lot.size_decimals,
+        );
+        out.insert(sym.clone(), if *w < 0.0 { -tq_abs } else { tq_abs });
+    }
+    Ok(out)
+}
+
 /// Plan the rebalance from `current` (signed base qty per symbol) to
 /// `weights` (fraction of `sizing.gross_notional_usd`).
 pub fn plan(
@@ -154,7 +189,21 @@ pub fn plan(
     lots: &HashMap<String, LotMeta>,
     sizing: &SizingConfig,
 ) -> Result<Plan, PlanReject> {
-    let mut symbols: Vec<&String> = weights.keys().chain(current.keys()).collect();
+    let targets = targets_from_weights(weights, current, prices, lots, sizing)?;
+    plan_targets(&targets, current, prices, lots, sizing)
+}
+
+/// Plan from already-rounded signed target quantities (a persisted
+/// `DecisionRecord::target_qty` on a partial-fill retry, or a flatten).
+/// Caps are re-checked so a stale target can never exceed them.
+pub fn plan_targets(
+    targets: &BTreeMap<String, f64>,
+    current: &BTreeMap<String, f64>,
+    prices: &HashMap<String, f64>,
+    lots: &HashMap<String, LotMeta>,
+    sizing: &SizingConfig,
+) -> Result<Plan, PlanReject> {
+    let mut symbols: Vec<&String> = targets.keys().chain(current.keys()).collect();
     symbols.sort();
     symbols.dedup();
 
@@ -166,9 +215,9 @@ pub fn plan(
     let mut skipped = Vec::new();
 
     for sym in symbols {
-        let w = weights.get(sym).copied().unwrap_or(0.0);
+        let tq = targets.get(sym).copied().unwrap_or(0.0);
         let cur = current.get(sym).copied().unwrap_or(0.0);
-        if w == 0.0 && cur == 0.0 {
+        if tq == 0.0 && cur == 0.0 {
             target_qty.insert(sym.clone(), 0.0);
             continue;
         }
@@ -180,9 +229,7 @@ pub fn plan(
             .get(sym)
             .copied()
             .ok_or_else(|| PlanReject::MissingLotMeta(sym.clone()))?;
-        let raw_abs = w.abs() * sizing.gross_notional_usd / price;
-        let tq_abs = round_down_qty(raw_abs, lot.size_decimals);
-        let tq = if w < 0.0 { -tq_abs } else { tq_abs };
+        let tq_abs = tq.abs();
         target_qty.insert(sym.clone(), tq);
         let t_notional = tq_abs * price;
         gross += t_notional;
@@ -555,6 +602,25 @@ mod tests {
             .intents
             .iter()
             .all(|i| i.reduce_only && i.kind == IntentKind::Close));
+    }
+
+    #[test]
+    fn plan_targets_reproduces_plan_and_recomputes_caps() {
+        let cur = w(&[("BTC", 0.001)]);
+        let weights = w(&[("BTC", 0.25), ("DOT", -0.25)]);
+        let a = plan(&weights, &cur, &prices(), &lots(), &sizing()).unwrap();
+        let b = plan_targets(&a.target_qty, &cur, &prices(), &lots(), &sizing()).unwrap();
+        assert_eq!(a, b);
+        // A persisted target that no longer fits the caps is rejected.
+        let mut tight = sizing();
+        tight.max_gross_usd = tight.gross_notional_usd; // 1000
+        tight.max_symbol_weight = 0.1;
+        assert_eq!(
+            plan_targets(&a.target_qty, &cur, &prices(), &lots(), &tight)
+                .unwrap_err()
+                .label(),
+            "cap_symbol"
+        );
     }
 
     #[test]
