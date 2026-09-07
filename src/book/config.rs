@@ -473,20 +473,41 @@ fn file_identity(_p: &Path) -> Option<(u64, u64)> {
 /// path resolved through symlinks and `..` when it exists, so a leaf alias
 /// (`ledger.jsonl -> state.json`) and not just a `..` in the directory
 /// (`a/../a/b.json`) is caught. Before that file exists -- the common case
-/// on first run -- only its parent directory can be canonicalized, and the
-/// leaf name is appended lexically; that still catches directory-level
-/// aliasing for everything but a leaf symlink that does not exist yet
-/// either. Before even the directory exists, the path is folded lexically.
+/// on first run -- the *longest existing ancestor directory* is
+/// canonicalized (so a symlinked ancestor with not-yet-created
+/// subdirectories below it, e.g. `link/new/state.json` with only `link`
+/// existing, still resolves through the symlink) and every missing path
+/// component is appended lexically on top; that still catches
+/// directory-level aliasing for everything but a leaf symlink that does
+/// not exist yet either. Before even the closest existing ancestor can be
+/// found, the path is folded lexically.
 fn resolved_path(p: &Path) -> PathBuf {
     if let Ok(full) = p.canonicalize() {
         return full;
     }
-    match (p.parent(), p.file_name()) {
-        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => match dir.canonicalize() {
-            Ok(d) => resolve_leaf(&d, name),
-            Err(_) => anchored_path(p),
-        },
-        _ => anchored_path(p),
+    let (Some(mut dir), Some(name)) = (p.parent(), p.file_name()) else {
+        return anchored_path(p);
+    };
+    if dir.as_os_str().is_empty() {
+        return anchored_path(p);
+    }
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(canon_dir) = dir.canonicalize() {
+            let mut base = canon_dir;
+            for comp in missing.into_iter().rev() {
+                base.push(comp);
+            }
+            return resolve_leaf(&base, name);
+        }
+        let Some(comp) = dir.file_name() else {
+            return anchored_path(p);
+        };
+        missing.push(comp);
+        match dir.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => dir = parent,
+            _ => return anchored_path(p),
+        }
     }
 }
 
@@ -716,6 +737,25 @@ mod tests {
             resolved.ends_with("a") || resolved.ends_with("b"),
             "{resolved:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_path_follows_a_symlinked_ancestor_above_a_not_yet_created_directory() {
+        // link -> real, and real/new does not exist yet: link/new/state.json
+        // and real/new/state.json must resolve to the same path even
+        // though neither the `new` directory nor `state.json` exists.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let via_link = resolved_path(&dir.path().join("link").join("new").join("state.json"));
+        let via_real = resolved_path(&dir.path().join("real").join("new").join("state.json"));
+        assert_eq!(via_link, via_real, "{via_link:?} vs {via_real:?}");
+
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.paths.state = dir.path().join("real").join("new").join("state.json");
+        c.paths.ledger = dir.path().join("link").join("new").join("state.json");
+        assert!(c.validate().is_err());
     }
 
     #[test]

@@ -218,6 +218,20 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
             .timestamp();
         let day_end = day_start + 86_400;
         let mut ticks: Vec<i64> = Vec::new();
+        // A decision whose grace window was inherited from an earlier
+        // date (decision_at before today, window_end landing inside
+        // today) has no tick of its own scheduled today otherwise: the
+        // decisions_between loop below only sees decisions whose
+        // decision_at falls on *this* date. Live, the 5 s loop ticks
+        // through window_end regardless; without an explicit tick here,
+        // a later date's own decision can silently supersede this key
+        // once its own decision_at arrives, and the expired window is
+        // never recorded as `skipped` at all.
+        if let Some(d) = scheduler.current(day_start) {
+            if d.decision_at < day_start && (day_start..day_end).contains(&d.window_end) {
+                ticks.push((d.window_end + 1).min(day_end - 1));
+            }
+        }
         for d in scheduler.decisions_between(day_start, day_end - 1) {
             ticks.push(d.decision_at);
             if let Some(f) = d.flatten_at {
@@ -714,6 +728,36 @@ mod tests {
         // the next date at the stated arrival, which is what live would do.
         assert_eq!(outcomes, vec!["applied"]);
         assert_eq!(rows[0]["ts_ms"], arrival.timestamp_millis());
+    }
+
+    #[tokio::test]
+    async fn a_window_inherited_across_midnight_is_recorded_skipped_before_the_next_key_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        // Same cross-midnight setup as the late-arrival case above, but no
+        // signal ever arrives for 2026-07-05: its window (decision 23:30,
+        // grace 3600s -> closes 00:30 on 07-06) must still be explicitly
+        // recorded `skipped` on the 07-06 date, before 2026-07-06's own
+        // decision_at (23:30 same day) would otherwise silently supersede
+        // `last_decision` without ever recording the expiry.
+        let mut c = cfg();
+        c.schedule.kind = ScheduleKind::Daily;
+        c.schedule.decision_time_utc = Some("23:30".into());
+        let out = dir.path().join("out");
+        run(c, dir.path(), &out).await.unwrap();
+        let ledger = read_rows(&out.join("ledger.jsonl"));
+        let rows: Vec<_> = ledger
+            .iter()
+            .filter(|r| r["event"] == "decision" && r["decision_key"] == "2026-07-05")
+            .collect();
+        let outcomes: Vec<_> = rows
+            .iter()
+            .map(|r| r["outcome"].as_str().unwrap())
+            .collect();
+        assert!(
+            outcomes.contains(&"skipped"),
+            "2026-07-05 must be explicitly recorded skipped, not silently dropped: {outcomes:?}"
+        );
     }
 
     #[tokio::test]
