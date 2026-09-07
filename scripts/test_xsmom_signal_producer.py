@@ -82,6 +82,10 @@ class ProducerTests(unittest.TestCase):
             self.assertEqual(r.returncode, 2)
             r = subprocess.run(cmd + ["--date", "2026-09-04", "--allow-off-grid"], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
+            # a negative / zero / nan gross would invert or break every weight
+            for g in ["-1000", "0", "nan"]:
+                r = subprocess.run(cmd + ["--date", "2026-09-06", "--gross", g], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, g)
 
 
 if __name__ == "__main__":

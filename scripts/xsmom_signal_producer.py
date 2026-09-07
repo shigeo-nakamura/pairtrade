@@ -130,6 +130,9 @@ def main() -> int:
     ap.add_argument("--allow-off-grid", action="store_true",
                     help="emit even if the date is not on the anchor+5d grid (the runtime will reject it)")
     a = ap.parse_args()
+    if not (a.gross == a.gross and a.gross not in (float("inf"), float("-inf")) and a.gross > 0):
+        print(f"--gross must be a finite positive number, got {a.gross}", file=sys.stderr)
+        return 2
 
     today = date.fromisoformat(a.date) if a.date else datetime.now(timezone.utc).date()
     rows = load_rebalance_rows(a.ledger)
