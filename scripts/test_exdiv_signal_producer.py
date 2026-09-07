@@ -393,6 +393,23 @@ class SignalTests(unittest.TestCase):
         # one leg at the cap must stay inside the per-symbol weight cap
         self.assertLessEqual(xp.MAX_LEG_USD / xp.GROSS_USD, xp.MAX_SYMBOL_WEIGHT + 1e-12)
 
+        # The invariant that keeps the bot on the right side of the step:
+        # the runtime accepts a signal anywhere inside
+        # [decision_at, decision_at + signal_grace_secs] and acts on it
+        # immediately, so that window must CLOSE before the cash open. The
+        # producer's late-run refusal cannot help here -- the file is
+        # already written and valid (Codex P1, round 4).
+        grace = num("schedule", "signal_grace_secs")
+        entry_before_open = -xp.ENTRY_OFFSET_SECS
+        self.assertGreater(entry_before_open, 0)
+        self.assertLess(grace, entry_before_open,
+                        "the signal acceptance window must close before the cash open")
+        self.assertGreaterEqual(entry_before_open - grace, 10,
+                                "leave at least 10 s of margin before the open")
+        # max_age_secs must not be the binding constraint either: the file
+        # is written ~2 min before the decision, so it has to survive that.
+        self.assertGreater(num("signal", "max_age_secs"), entry_before_open + grace)
+
     def test_no_event_or_no_rows(self):
         self.assertIsNone(xp.build_signal(EVENTS, date(2026, 9, 17), [], [], NOW))
         sig = xp.build_signal(EVENTS, D, [], [], NOW)      # event day, logger dead

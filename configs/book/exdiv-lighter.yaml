@@ -43,10 +43,17 @@ schedule:
   # subcommand; installed next to this file by install_book_runtime.sh
   # (BOOK_CALENDAR_SOURCE). The runtime loads it at startup.
   calendar_path: /opt/book-runtime/exdiv-lighter.calendar.json
-  # Entry is time-only (one minute before the cash open): a signal that is
-  # not valid two minutes later is useless, because the step lands in the
-  # first minute of the session, so the window is deliberately short.
-  signal_grace_secs: 120
+  # Entry is time-only (one minute before the cash open) and the whole
+  # acceptance window must CLOSE before the open: the runtime applies a
+  # signal whenever it validates inside the window, so a window that ran
+  # past the open would let a delayed fetch (or a runtime that was briefly
+  # down at the decision) open the position after the dividend step -- a
+  # guaranteed loss, and exactly what this bot exists to be on the other
+  # side of. The producer's own late-run refusal cannot prevent that: the
+  # file is already written and valid. 45 s therefore ends the window 15 s
+  # before the open, and scripts/test_exdiv_signal_producer.py pins that
+  # invariant against the entry offset so it cannot drift.
+  signal_grace_secs: 45
 
 signal:
   path: /var/lib/book-runtime/exdiv-lighter/signal.json

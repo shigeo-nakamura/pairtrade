@@ -46,11 +46,11 @@ Extending past 2027 means regenerating that calendar first.
 |---|---|
 | `configs/book/exdiv-events.json` | human-maintained calendar: one row per (symbol, ex_date) with `dividend_usd`, `hedge`, `status` (`declared` / `estimated`), `source`. Only `declared` rows are used |
 | `configs/book/exdiv-lighter.calendar.json` | runtime calendar, **generated** from the events file (`decision_at 13:29:00Z`, `flatten_at 13:36:00Z`, one entry per date). CI fails if it is stale |
-| `configs/book/exdiv-lighter.yaml` | runtime config (`fp=6ba59389b7ce` at 2026-09-07): universe = event symbols + `US500`/`US100`, gross $8,000 (weights are fractions of it, one leg ≤ 0.25 = $2,000), grace 120 s, `max_age_secs 300`, `require_dollar_neutral: false` (single stocks are unhedged by design), `max_net_usd 2200` |
+| `configs/book/exdiv-lighter.yaml` | runtime config (`fp=08a901c93832` at 2026-09-07): universe = event symbols + `US500`/`US100`, gross $8,000 (weights are fractions of it, one leg ≤ 0.25 = $2,000), grace 45 s so the acceptance window closes 15 s before the open, `max_age_secs 300`, `require_dollar_neutral: false` (single stocks are unhedged by design), `max_net_usd 2200` |
 | `scripts/exdiv_signal_producer.py` | `calendar` (events → runtime calendar, `--check` for CI) and `signal` (pre-open cron: gates + sizing → `signal.json`, optional S3 upload). Both derive every instant from `configs/engine-b/trading_calendar.json` (`--trading-calendar` overrides) |
 | `scripts/test_exdiv_signal_producer.py` | unit tests (synthetic logger rows) |
 | `deploy/book-runtime-exdiv-lighter.service` | runtime unit, PROM `127.0.0.1:9475`, status → `s3://debot-dashboard/debot/status/book-exdiv-lighter/` |
-| `deploy/book-signal-fetch-exdiv-lighter.{service,timer}` | S3 → local signal fetch, `Mon..Fri 09:27:00–09:31:40 America/New_York every 20 s` (`AccuracySec=1s`, so it follows US daylight saving); nothing polls outside that span |
+| `deploy/book-signal-fetch-exdiv-lighter.{service,timer}` | S3 → local signal fetch, `Mon..Fri 09:27:00–09:29:40 America/New_York every 20 s` (`AccuracySec=1s`, so it follows US daylight saving); it stops before the open, and nothing polls outside that span |
 | `scripts/install_book_runtime.sh` | now also installs `BOOK_CALENDAR_SOURCE` (default `/opt/debot/configs/book/<instance>.calendar.json`) as `/opt/book-runtime/<instance>.calendar.json` — the service cannot read `/opt/debot` (`InaccessiblePaths`) |
 
 Observation side (bot-strategy repo, `scripts/strategy_probes/exdiv_948/`,
@@ -94,11 +94,22 @@ to the decision instant:
 Inputs are always bounded at the decision instant, never at wall-clock
 "now": a delayed run reads exactly the rows an on-time run would have
 read, so it cannot size from post-open prices. On top of that, **a run
-that starts after the decision refuses outright (exit 3)** — the runtime's
-120 s grace window would otherwise let a late file open the position at or
-after the open, past the very step the strategy exists to capture.
-`--allow-after-decision` overrides that for offline regeneration (replay,
-backfill) and must never appear in the cron. `as_of` = the last row
+that starts after the decision refuses outright (exit 3)**, so a late
+producer never publishes at all. `--allow-after-decision` overrides that
+for offline regeneration (replay, backfill) and must never appear in the
+cron.
+
+Refusing to *produce* late is only half of it: an on-time file can still
+be *consumed* late. The runtime applies a signal whenever it validates
+inside `[decision_at, decision_at + signal_grace_secs]`, so that window
+must close before the cash open — otherwise a delayed fetch, or a runtime
+that happened to be down at 09:29, would open the position after the
+dividend step, which is a guaranteed loss and the exact opposite of the
+trade. Hence `signal_grace_secs: 45` (window 09:29:00–09:29:45, ending 15 s
+before the open) and a fetch timer that stops at 09:29:40. A signal that
+misses the window is `skipped` and the book stays flat, which is the safe
+outcome. `scripts/test_exdiv_signal_producer.py` pins this invariant
+against the entry offset so the two cannot drift apart. `as_of` = the last row
 actually used (never after the decision, so never look-ahead);
 `decision_key` = the date, matching the calendar entry; `meta` records
 `decision_at`, `input_cutoff`, `session_open` and `prev_session`.
@@ -128,9 +139,9 @@ this decision.
 
 It exits 0 with "no declared ex-dividend event" on every other day. The
 fetch timer on the host polls S3 from 09:27:00 NY, so the upload has ~90 s
-of slack before the 09:29:00 decision; the 120 s grace closes the window
-two minutes later (entering after the step has landed is pointless, so a
-late signal is `skipped`, not applied).
+of slack before the 09:29:00 decision; the 45 s grace closes the window at
+09:29:45, before the open (entering after the step has landed is worse
+than not trading, so a late signal is `skipped`, not applied).
 
 ## Calendar updates (after the instance is installed)
 
@@ -188,7 +199,7 @@ for DRY_RUN but is for live, since two instances on one account would each
 adopt the other's positions), `systemctl enable --now
 book-signal-fetch-exdiv-lighter.timer`, `systemctl start
 book-runtime-exdiv-lighter`, and the standard post-start checks: `[CONFIG]
-… fp=6ba59389b7ce`, `status.json` `next_decision` = the next calendar
+… fp=08a901c93832`, `status.json` `next_decision` = the next calendar
 entry, no `[ADOPT]` rows.
 
 ## What to check after each event
