@@ -107,8 +107,9 @@ class CalendarTests(unittest.TestCase):
             xp.load_events(write([good, dict(good, dividend_usd=2.0)]))
 
 
-class MarketTimezoneTests(unittest.TestCase):
-    """The open is 13:30 UTC only under daylight saving (Codex P2 on #288)."""
+class TradingCalendarTests(unittest.TestCase):
+    """Every instant comes from the frozen XNYS session table: daylight
+    saving, market holidays and half days (Codex P2, rounds 1 and 2)."""
 
     def test_calendar_entries_follow_the_new_york_open(self):
         summer = [dict(EVENTS[0], ex_date=date(2026, 9, 18))]
@@ -120,9 +121,9 @@ class MarketTimezoneTests(unittest.TestCase):
         self.assertEqual((e_w["decision_at"], e_w["flatten_at"]),
                          ("2026-12-16T14:29:00Z", "2026-12-16T14:36:00Z"))
 
-    def test_prev_close_lookup_follows_the_new_york_close(self):
-        # NY 15:59 is 19:59 UTC in September and 20:59 UTC in December; a
-        # fixed 19:59 would silently disable the landed-step gate in winter.
+    def test_prev_close_lookup_follows_daylight_saving(self):
+        # close - 1 min is 19:59 UTC in September and 20:59 UTC in December;
+        # a fixed 19:59 would silently disable the landed-step gate in winter.
         sept = datetime(2026, 9, 17, 19, 59, tzinfo=timezone.utc)
         dec = datetime(2026, 12, 15, 20, 59, tzinfo=timezone.utc)
         self.assertEqual(xp.close_index([row("SPY", sept, 659.0, 661.0, index=660.0)],
@@ -133,11 +134,32 @@ class MarketTimezoneTests(unittest.TestCase):
         self.assertIsNone(xp.close_index([row("EWY", datetime(2026, 12, 15, 19, 59, tzinfo=timezone.utc),
                                               59.0, 61.0, index=60.0)], "EWY", date(2026, 12, 15)))
 
-    def test_window_start_follows_the_new_york_lookback(self):
-        winter_d = date(2026, 12, 16)
-        start = xp.market_instant(winter_d, xp.LOOKBACK_START_NY)
-        self.assertEqual(start.strftime("%H:%M"), "14:23")
-        self.assertEqual(xp.decision_at(winter_d).strftime("%H:%M"), "14:29")
+    def test_window_start_follows_the_session_open(self):
+        self.assertEqual(xp.lookback_start(date(2026, 12, 16)).strftime("%H:%M"), "14:23")
+        self.assertEqual(xp.decision_at(date(2026, 12, 16)).strftime("%H:%M"), "14:29")
+        self.assertEqual(xp.lookback_start(date(2026, 9, 18)).strftime("%H:%M"), "13:23")
+
+    def test_prev_session_skips_market_holidays_not_just_weekends(self):
+        # 2026-09-07 is Labor Day: T-1 for an 09-08 event is Friday 09-04,
+        # not the closed Monday a weekday-only rule would pick.
+        self.assertFalse(xp.is_us_session(date(2026, 9, 7)))
+        self.assertEqual(xp.prev_trading_day(date(2026, 9, 8)), date(2026, 9, 4))
+        self.assertEqual(xp.prev_trading_day(date(2026, 9, 21)), date(2026, 9, 18))
+
+    def test_prev_close_lookup_follows_a_half_day_close(self):
+        # 2026-11-27 (day after Thanksgiving) closes at 18:00 UTC, so a
+        # fixed 15:59-NY lookup would find nothing for a 11-30 event.
+        self.assertEqual(xp.session_close(date(2026, 11, 27)).strftime("%H:%M"), "18:00")
+        t = datetime(2026, 11, 27, 17, 59, tzinfo=timezone.utc)
+        self.assertEqual(xp.close_index([row("SPY", t, 659.0, 661.0, index=660.0)],
+                                        "SPY", date(2026, 11, 27)), 660.0)
+
+    def test_a_non_session_date_is_refused(self):
+        holiday = [dict(EVENTS[0], ex_date=date(2026, 9, 7))]
+        with self.assertRaises(SystemExit):
+            xp.calendar_from_events(holiday)
+        with self.assertRaises(SystemExit):        # outside the frozen range
+            xp.decision_at(date(2028, 1, 3))
 
 
 class SignalTests(unittest.TestCase):
@@ -257,8 +279,9 @@ class SignalTests(unittest.TestCase):
         # skip gate that the bounded run passes.
         rows = base_rows() + after
         dec = xp.decision_at(D)
-        bounded_win = xp.window_rows(rows, "SPY", dec)
-        unbounded_win = xp.window_rows(rows, "SPY", late_now)
+        start = xp.lookback_start(D)
+        bounded_win = xp.window_rows(rows, "SPY", dec, start)
+        unbounded_win = xp.window_rows(rows, "SPY", late_now, start)
         self.assertEqual(len(bounded_win), 5)          # the whole 09:23-09:29 window
         self.assertGreater(len(unbounded_win), len(bounded_win))
         self.assertTrue(any(r["_t"] > dec for r in unbounded_win))
@@ -353,16 +376,19 @@ class SignalTests(unittest.TestCase):
                                 "--date", "2026-09-17", "--log-dir", logdir], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertFalse(os.path.exists(out + ".2"))
-            # late run: writes with a warning by default, exit 3 with the flag
-            r = subprocess.run([sys.executable, script, "signal", "--events", ev, "--out", out,
-                                "--date", "2026-09-18", "--now", "2026-09-18T13:35:00Z", "--log-dir", logdir],
+            # late run: refused by default (the runtime's grace window would
+            # otherwise enter after the open), written only with the opt-out
+            late = ["--date", "2026-09-18", "--now", "2026-09-18T13:35:00Z", "--log-dir", logdir]
+            out_late = os.path.join(td, "late.json")
+            r = subprocess.run([sys.executable, script, "signal", "--events", ev, "--out", out_late] + late,
                                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+            self.assertFalse(os.path.exists(out_late))
+            r = subprocess.run([sys.executable, script, "signal", "--events", ev, "--out", out_late]
+                               + late + ["--allow-after-decision"], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("WARNING", r.stderr)
-            r = subprocess.run([sys.executable, script, "signal", "--events", ev, "--out", out,
-                                "--date", "2026-09-18", "--now", "2026-09-18T13:35:00Z", "--log-dir", logdir,
-                                "--refuse-after-decision"], capture_output=True, text=True)
-            self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+            self.assertTrue(os.path.exists(out_late))
             # symbol outside the deployed universe -> refuse (exit 2)
             with open(ev, "w") as f:
                 json.dump({"schema_version": 1, "events": [

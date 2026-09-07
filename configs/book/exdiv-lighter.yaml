@@ -5,9 +5,10 @@
 # This is a `schedule.kind: calendar` instance of the book runtime (#937):
 # every declared ex-dividend date in configs/book/exdiv-events.json becomes
 # one calendar entry, one minute before the US cash open to six minutes
-# after it. Those instants are generated in America/New_York and converted
-# per date, so a summer event is 13:29:00Z/13:36:00Z and a winter one
-# 14:29:00Z/14:36:00Z. scripts/exdiv_signal_producer.py writes the signal
+# after it. Those instants come from the frozen XNYS session table
+# (configs/engine-b/trading_calendar.json), so they follow daylight saving
+# (a summer event is 13:29:00Z/13:36:00Z, a winter one 14:29:00Z), market
+# holidays and half days rather than a fixed UTC clock. scripts/exdiv_signal_producer.py writes the signal
 # two minutes before the decision from the local Lighter WS logger (skip
 # gates + slippage-budget sizing live there, the runtime only executes);
 # an empty weights map is the valid "skip".

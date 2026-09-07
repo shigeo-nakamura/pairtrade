@@ -62,23 +62,29 @@ import re
 import statistics as st
 import subprocess
 import sys
-from datetime import date, datetime, time as dtime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import book_signal_file as bsf  # noqa: E402
 
 PRODUCER_ID = "exdiv_948_open_window_v1"
 CALENDAR_SCHEMA = 1
-# Every schedule instant is defined in US market local time and converted
-# per date: the US cash open is 13:30 UTC only under daylight saving, and
-# 14:30 UTC in winter (a December EWY event, say). Hard-coded UTC would
-# enter an hour early and disable the T-1 close lookup for those dates.
-MARKET_TZ = ZoneInfo("America/New_York")
-ENTRY_NY = (9, 29, 0)                   # one minute before the cash open
-FLATTEN_NY = (9, 36, 0)
-LOOKBACK_START_NY = (9, 23)             # rows [09:23 NY, decision] feed the gates
-PREV_CLOSE_NY = ((15, 59), (15, 55))    # T-1 close index, in preference order
+# Every schedule instant is derived from the frozen XNYS session table
+# (configs/engine-b/trading_calendar.json, the A-7 freeze CI already
+# diff-checks against its own generator), never from wall-clock UTC or
+# weekday arithmetic. That table carries the real open and close of each
+# session, so this handles all three ways a fixed schedule goes wrong:
+# daylight saving (the open is 13:30 UTC in summer, 14:30 in winter),
+# market holidays (2026-09-07 is Labor Day, so T-1 for an 09-08 event is
+# 09-04), and half days (2026-11-27 closes at 18:00 UTC, so a 15:59-NY
+# close lookup would find nothing).
+DEFAULT_TRADING_CALENDAR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "configs", "engine-b", "trading_calendar.json")
+ENTRY_OFFSET_SECS = -60                 # one minute before the cash open
+FLATTEN_OFFSET_SECS = 360               # six minutes after it
+LOOKBACK_OFFSET_SECS = -420             # gates read the seven minutes before the open
+PREV_CLOSE_OFFSETS_SECS = (-60, -300)   # T-1 close index, in preference order
 MIN_FRESH_ROWS = 3
 FRESH_OB_SECS = 90.0
 
@@ -144,32 +150,81 @@ def declared_on(events: list[dict], d: date) -> list[dict]:
     return [e for e in events if e["status"] == "declared" and e["ex_date"] == d]
 
 
-def market_instant(d: date, hms) -> datetime:
-    """A market-local wall time on date `d`, as an aware UTC datetime.
-
-    `d` is the trading date, so the NY calendar date is the same one; the
-    conversion is what moves with daylight saving."""
-    h, m = hms[0], hms[1]
-    sec = hms[2] if len(hms) > 2 else 0
-    return datetime.combine(d, dtime(h, m, sec), tzinfo=MARKET_TZ).astimezone(timezone.utc)
+_CAL_CACHE: dict[str, dict] = {}
 
 
-def _ts(d: date, hms) -> str:
-    return market_instant(d, hms).strftime("%Y-%m-%dT%H:%M:%SZ")
+def load_trading_calendar(path: str = DEFAULT_TRADING_CALENDAR) -> dict:
+    """The frozen XNYS/XKRX session table; only the `us_*` fields are read."""
+    if path not in _CAL_CACHE:
+        with open(path) as f:
+            d = json.load(f)
+        sessions = d.get("sessions")
+        rng = d.get("range") or {}
+        if not isinstance(sessions, dict) or not sessions:
+            raise SystemExit(f"{path}: no sessions table")
+        if not rng.get("start") or not rng.get("end"):
+            raise SystemExit(f"{path}: no range")
+        _CAL_CACHE[path] = d
+    return _CAL_CACHE[path]
 
 
-def decision_at(d: date) -> datetime:
-    return market_instant(d, ENTRY_NY)
+def _us_session(d: date, cal_path: str) -> dict:
+    cal = load_trading_calendar(cal_path)
+    rng = cal["range"]
+    if not (rng["start"] <= d.isoformat() <= rng["end"]):
+        raise SystemExit(
+            f"{d} is outside the frozen trading calendar ({rng['start']}..{rng['end']}); "
+            "regenerate configs/engine-b/trading_calendar.json before scheduling it")
+    s = cal["sessions"].get(d.isoformat())
+    if s is None:
+        raise SystemExit(f"{d} is missing from the frozen trading calendar")
+    return s
 
 
-def calendar_from_events(events: list[dict]) -> dict:
+def is_us_session(d: date, cal_path: str = DEFAULT_TRADING_CALENDAR) -> bool:
+    return bool(_us_session(d, cal_path).get("us_is_open"))
+
+
+def _session_edge(d: date, field: str, cal_path: str) -> datetime:
+    s = _us_session(d, cal_path)
+    if not s.get("us_is_open") or s.get(field) is None:
+        raise SystemExit(f"{d} is not a US trading session; it cannot carry an ex-dividend event")
+    return datetime.fromtimestamp(s[field] / 1_000_000, tz=timezone.utc)
+
+
+def session_open(d: date, cal_path: str = DEFAULT_TRADING_CALENDAR) -> datetime:
+    return _session_edge(d, "us_open_utc_us", cal_path)
+
+
+def session_close(d: date, cal_path: str = DEFAULT_TRADING_CALENDAR) -> datetime:
+    return _session_edge(d, "us_close_utc_us", cal_path)
+
+
+def _ts(t: datetime) -> str:
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def decision_at(d: date, cal_path: str = DEFAULT_TRADING_CALENDAR) -> datetime:
+    return session_open(d, cal_path) + timedelta(seconds=ENTRY_OFFSET_SECS)
+
+
+def flatten_at(d: date, cal_path: str = DEFAULT_TRADING_CALENDAR) -> datetime:
+    return session_open(d, cal_path) + timedelta(seconds=FLATTEN_OFFSET_SECS)
+
+
+def lookback_start(d: date, cal_path: str = DEFAULT_TRADING_CALENDAR) -> datetime:
+    return session_open(d, cal_path) + timedelta(seconds=LOOKBACK_OFFSET_SECS)
+
+
+def calendar_from_events(events: list[dict],
+                         cal_path: str = DEFAULT_TRADING_CALENDAR) -> dict:
     """Runtime calendar (docs/book-runtime.md §2/§4): one entry per date
     with a declared event; key = the date, so several events on one day
     share a decision and never overlap."""
     dates = sorted({e["ex_date"] for e in events if e["status"] == "declared"})
     entries = [{"decision_key": d.isoformat(),
-                "decision_at": _ts(d, ENTRY_NY),
-                "flatten_at": _ts(d, FLATTEN_NY)} for d in dates]
+                "decision_at": _ts(decision_at(d, cal_path)),
+                "flatten_at": _ts(flatten_at(d, cal_path))} for d in dates]
     canon = json.dumps(entries, sort_keys=True, separators=(",", ":"))
     version = "exdiv-948-v1-" + hashlib.sha256(canon.encode()).hexdigest()[:12]
     return {"calendar_version": version, "entries": entries}
@@ -232,31 +287,39 @@ def fresh(r, cutoff: datetime) -> bool:
     return age is not None and age <= FRESH_OB_SECS and (cutoff - r["_t"]).total_seconds() <= 600
 
 
-def window_rows(rows, sym: str, cutoff: datetime) -> list[dict]:
+def window_rows(rows, sym: str, cutoff: datetime, start: datetime) -> list[dict]:
     """Fresh rows in [09:23 NY, cutoff]. `cutoff` is min(now, decision_at):
     a run that starts late (or is retried inside the runtime's grace
     window) must not see prices published after the decision instant, and
     must not see a *smaller* window either -- everything is measured
     against the cutoff, so a retry reproduces the on-time file."""
-    start = market_instant(cutoff.date(), LOOKBACK_START_NY)
     return [r for r in rows if r.get("symbol") == sym and start <= r["_t"] <= cutoff
             and fresh(r, cutoff) and mid(r)]
 
 
-def prev_trading_day(d: date) -> date:
+def prev_trading_day(d: date, cal_path: str = DEFAULT_TRADING_CALENDAR) -> date:
+    """The previous US *session*, not merely the previous weekday: an event
+    the day after a market holiday would otherwise take its T-1 close from
+    a day the cash market never opened, where the venue's index is an
+    internal book price and the landed-step gate reads garbage."""
     p = d - timedelta(days=1)
-    while p.weekday() >= 5:
+    for _ in range(10):
+        if is_us_session(p, cal_path):
+            return p
         p -= timedelta(days=1)
-    return p
+    raise SystemExit(f"no US trading session in the 10 days before {d}")
 
 
-def close_index(rows_prev, sym: str, prev_day: date):
-    """T-1 index at the last regular-session minute (NY 15:59, fallback
-    15:55). Outside regular hours Lighter's index is an internal book price,
-    so only these rows count; the UTC minute they land on moves with
-    daylight saving, hence the per-date conversion."""
-    for hms in PREV_CLOSE_NY:
-        target = market_instant(prev_day, hms)
+def close_index(rows_prev, sym: str, prev_day: date,
+                cal_path: str = DEFAULT_TRADING_CALENDAR):
+    """T-1 index at the last minute of the previous session (close - 1 min,
+    fallback close - 5 min). Outside regular hours Lighter's index is an
+    internal book price, so only these rows count, and the minute they land
+    on moves with both daylight saving and half days (2026-11-27 closes at
+    18:00 UTC, not 21:00)."""
+    close = session_close(prev_day, cal_path)
+    for off in PREV_CLOSE_OFFSETS_SECS:
+        target = close + timedelta(seconds=off)
         xs = [_f(r.get("index_price")) for r in rows_prev
               if r.get("symbol") == sym and r["_t"].hour == target.hour
               and r["_t"].minute == target.minute]
@@ -290,12 +353,13 @@ def depth_median(win, band: int, side: str):
 
 # ---------------------------------------------------------------- decision
 
-def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date) -> dict:
+def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date,
+                   start: datetime, cal_path: str = DEFAULT_TRADING_CALENDAR) -> dict:
     """One event -> {"notional_usd", "skip": reason|None, diagnostics}."""
     sym, hedge = ev["symbol"], ev["hedge"]
     out = {"symbol": sym, "hedge": hedge, "ex_date": ev["ex_date"].isoformat(),
            "dividend_usd": ev["dividend_usd"], "skip": None, "notional_usd": 0.0}
-    win = window_rows(rows_t, sym, cutoff)
+    win = window_rows(rows_t, sym, cutoff, start)
     out["n_rows"] = len(win)
     if len(win) < MIN_FRESH_ROWS:
         out["skip"] = "no_fresh_book"
@@ -303,7 +367,7 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     sp = st.median([spread_bps(r) for r in win])
     l1 = st.median([v for v in (l1_usd(r) for r in win) if v is not None] or [0.0])
     m = st.median([mid(r) for r in win])
-    ref = close_index(rows_prev, sym, prev_day)
+    ref = close_index(rows_prev, sym, prev_day, cal_path)
     out["ref_index_source"] = "t-1_close" if ref else "current_mid"
     ref = ref or m
     div_bps = ev["dividend_usd"] / ref * 1e4
@@ -318,8 +382,8 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     # Landed-before-open gate: event index move since T-1 close, minus the
     # hedge's (or US500's) move over the same span. Needs a real T-1 close.
     ctl = hedge or "US500"
-    ctl_win = window_rows(rows_t, ctl, cutoff)
-    ctl_ref = close_index(rows_prev, ctl, prev_day)
+    ctl_win = window_rows(rows_t, ctl, cutoff, start)
+    ctl_ref = close_index(rows_prev, ctl, prev_day, cal_path)
     ev_now, ctl_now = latest_index(win), latest_index(ctl_win)
     if out["ref_index_source"] == "t-1_close" and ev_now and ctl_ref and ctl_now:
         adj = ((ev_now / ref - 1) - (ctl_now / ctl_ref - 1)) * 1e4
@@ -409,7 +473,8 @@ def weights_from_evals(evals: list[dict], gross: float,
 
 
 def build_signal(events, d: date, rows_t, rows_prev, now: datetime, gross: float = GROSS_USD,
-                 producer_id: str = PRODUCER_ID, max_net_usd: float = MAX_NET_USD) -> dict | None:
+                 producer_id: str = PRODUCER_ID, max_net_usd: float = MAX_NET_USD,
+                 cal_path: str = DEFAULT_TRADING_CALENDAR) -> dict | None:
     todays = declared_on(events, d)
     if not todays:
         return None
@@ -417,17 +482,20 @@ def build_signal(events, d: date, rows_t, rows_prev, now: datetime, gross: float
     # instant. A late run therefore produces the same file it would have
     # produced on time (minus rows that never arrived), instead of one
     # sized from post-decision prices and labelled as if it were not.
-    dec = decision_at(d)
+    dec = decision_at(d, cal_path)
     cutoff = min(now, dec)
-    prev_day = prev_trading_day(d)
-    evals = [evaluate_event(e, rows_t, rows_prev, cutoff, prev_day) for e in todays]
+    start = lookback_start(d, cal_path)
+    prev_day = prev_trading_day(d, cal_path)
+    evals = [evaluate_event(e, rows_t, rows_prev, cutoff, prev_day, start, cal_path)
+             for e in todays]
     weights, agg = weights_from_evals(evals, gross, max_net_usd)
-    used = [r["_t"] for e in todays for r in window_rows(rows_t, e["symbol"], cutoff)]
+    used = [r["_t"] for e in todays for r in window_rows(rows_t, e["symbol"], cutoff, start)]
     as_of = max(used) if used else cutoff
     meta = {"source": "lighter_exdiv_logger rows + configs/book/exdiv-events.json",
             "date": d.isoformat(), "events": evals, "gross_reference_usd": gross,
-            "decision_at": dec.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "input_cutoff": cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"), **agg}
+            "decision_at": _ts(dec), "input_cutoff": _ts(cutoff),
+            "session_open": _ts(session_open(d, cal_path)),
+            "prev_session": prev_day.isoformat(), **agg}
     return bsf.build_signal(producer_id, now, as_of, d.isoformat(), weights, meta)
 
 
@@ -450,7 +518,7 @@ def upload(path: str, s3_uri: str) -> None:
 # ---------------------------------------------------------------- CLI
 
 def cmd_calendar(a) -> int:
-    cal = calendar_from_events(load_events(a.events))
+    cal = calendar_from_events(load_events(a.events), a.trading_calendar)
     text = render_calendar(cal)
     if a.check:
         if not os.path.exists(a.out):
@@ -481,17 +549,25 @@ def cmd_signal(a) -> int:
     if not declared_on(events, d):
         print(f"no declared ex-dividend event on {d}; nothing written")
         return 0
-    dec = decision_at(d)
+    dec = decision_at(d, a.trading_calendar)
     if now > dec:
+        # Inputs are bounded at the decision either way, but the runtime
+        # would still ACT on a file that lands inside its grace window --
+        # entering at or after the open, i.e. after the very step this
+        # strategy exists to capture. Refusing is the default; the opt-out
+        # is for regenerating a file offline (replay, backfill), not for
+        # the unattended cron.
         late = (now - dec).total_seconds()
-        msg = (f"run started {late:.0f}s after the {dec:%Y-%m-%dT%H:%M:%SZ} decision; "
-               f"inputs are bounded at the decision instant")
-        if a.refuse_after_decision:
-            print(f"refusing: {msg}", file=sys.stderr)
+        msg = (f"run started {late:.0f}s after the {_ts(dec)} decision; "
+               f"entering now would be at or after the open")
+        if not a.allow_after_decision:
+            print(f"refusing: {msg} (pass --allow-after-decision to write anyway)", file=sys.stderr)
             return 3
-        print(f"WARNING: {msg}", file=sys.stderr)
-    rows_t, rows_prev = load_rows(a.log_dir, d), load_rows(a.log_dir, prev_trading_day(d))
-    sig = build_signal(events, d, rows_t, rows_prev, now, a.gross, a.producer_id, a.max_net_usd)
+        print(f"WARNING: {msg}; writing anyway (--allow-after-decision)", file=sys.stderr)
+    prev_day = prev_trading_day(d, a.trading_calendar)
+    rows_t, rows_prev = load_rows(a.log_dir, d), load_rows(a.log_dir, prev_day)
+    sig = build_signal(events, d, rows_t, rows_prev, now, a.gross, a.producer_id, a.max_net_usd,
+                       a.trading_calendar)
     bsf.write_signal(a.out, sig)
     ev_summary = ", ".join(f"{e['symbol']}:{e['skip'] or '$' + str(e['notional_usd'])}" for e in sig["meta"]["events"])
     print(f"wrote {a.out} key={sig['decision_key']} legs={len(sig['weights'])} gross=${sig['meta']['gross_usd']} "
@@ -508,6 +584,8 @@ def main() -> int:
     c = sub.add_parser("calendar", help="events.json -> runtime calendar json")
     c.add_argument("--events", required=True)
     c.add_argument("--out", required=True)
+    c.add_argument("--trading-calendar", default=DEFAULT_TRADING_CALENDAR,
+                   help="frozen XNYS session table; every instant is derived from it")
     c.add_argument("--check", action="store_true", help="exit 1 unless --out already equals the generated calendar")
     s = sub.add_parser("signal", help="write today's signal.json from the logger rows")
     s.add_argument("--events", required=True)
@@ -515,10 +593,14 @@ def main() -> int:
     s.add_argument("--config", default=None, help="deployed runtime config; refuse symbols outside its universe")
     s.add_argument("--date", default=None, help="ex-dividend date YYYY-MM-DD (default: today UTC)")
     s.add_argument("--now", default=None, help="override wall clock, YYYY-MM-DDTHH:MM:SSZ (tests / replay)")
-    s.add_argument("--refuse-after-decision", action="store_true",
-                   help="exit 3 instead of writing when the run starts after the decision instant "
-                        "(inputs are bounded there either way; this makes a late cron loud)")
+    s.add_argument("--allow-after-decision", action="store_true",
+                   help="write even when the run starts after the decision instant. Default is to "
+                        "exit 3: the runtime's grace window would otherwise let a late file open "
+                        "the position at or after the open, past the step being captured. For "
+                        "offline regeneration only, never for the cron")
     s.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
+    s.add_argument("--trading-calendar", default=DEFAULT_TRADING_CALENDAR,
+                   help="frozen XNYS session table; every instant is derived from it")
     s.add_argument("--gross", type=float, default=GROSS_USD)
     s.add_argument("--max-net-usd", type=float, default=MAX_NET_USD,
                    help="sizing.max_net_usd of the deployed config; the day's legs are scaled "

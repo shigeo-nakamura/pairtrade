@@ -478,8 +478,9 @@ implemented here so that decision is not blocked on the runtime.
 
 Same shape as Engine B, on a calendar instead of a session table: one
 entry per declared ex-dividend date (decision one minute before the US
-cash open, flatten six minutes after it, generated in `America/New_York`
-so the UTC instants follow daylight saving), weights `{SPY: -w, US500: +w}` (ETF hedged with the
+cash open, flatten six minutes after it, both read from the frozen XNYS
+session table so they follow daylight saving, holidays and half days),
+weights `{SPY: -w, US500: +w}` (ETF hedged with the
 futures-derived index perp) or `{IBM: -w}` (single stock, unhedged), an
 empty map when the producer's skip gates fire. Skip gates and the
 slippage-budget size rule live in `scripts/exdiv_signal_producer.py`;

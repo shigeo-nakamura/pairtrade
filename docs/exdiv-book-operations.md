@@ -15,13 +15,30 @@ QQQ 09-21) decides whether the DRY_RUN instance is switched on at all.
 
 Lighter's stock/ETF perp index is the raw equity price with no dividend
 adjustment, so on an ex-dividend date it steps down by the dividend at the
-US cash open (13:30–13:31) with no T-1 pre-discount (bot-strategy#681,
-verified live on ORCL 2026-07-10 and the August round). The bot shorts the
-event symbol at **13:29:00**, hedged with the same notional long in
-`US500` (S&P 500 ETFs) or `US100` (QQQ) — futures-derived indexes that do
-not step — and covers both at **13:36:00**. Single stocks run unhedged.
-Entry and exit are **time-only**; there is no price-based take-profit or
-stop. Everything that decides *whether* and *how much* is in the producer.
+US cash open (the first minute or two of the session) with no T-1
+pre-discount (bot-strategy#681, verified live on ORCL 2026-07-10 and the
+August round). The bot shorts the event symbol **one minute before the
+cash open**, hedged with the same notional long in `US500` (S&P 500 ETFs)
+or `US100` (QQQ) — futures-derived indexes that do not step — and covers
+both **six minutes after it**. Single stocks run unhedged. Entry and exit
+are **time-only**; there is no price-based take-profit or stop. Everything
+that decides *whether* and *how much* is in the producer.
+
+Every instant is derived from the frozen XNYS session table
+(`configs/engine-b/trading_calendar.json`, already diff-checked in CI
+against its own generator by the Engine B A-7 freeze), never from
+wall-clock UTC or weekday arithmetic. That covers all three ways a fixed
+schedule goes wrong:
+
+| | why a fixed schedule breaks | example |
+|---|---|---|
+| daylight saving | the open is 13:30 UTC only in summer | 2026-12-16 opens 14:30 UTC, so it decides at 14:29:00Z |
+| market holidays | T-1 must be the previous *session* | 2026-09-07 is Labor Day, so T-1 for an 09-08 event is 09-04 |
+| half days | the close moves, so the T-1 close lookup moves | 2026-11-27 closes 18:00 UTC, not 21:00 |
+
+A declared event on a date the US market is closed, or outside the frozen
+calendar's 2026-01-01..2027-12-31 range, is refused rather than scheduled.
+Extending past 2027 means regenerating that calendar first.
 
 ## Files
 
@@ -30,7 +47,7 @@ stop. Everything that decides *whether* and *how much* is in the producer.
 | `configs/book/exdiv-events.json` | human-maintained calendar: one row per (symbol, ex_date) with `dividend_usd`, `hedge`, `status` (`declared` / `estimated`), `source`. Only `declared` rows are used |
 | `configs/book/exdiv-lighter.calendar.json` | runtime calendar, **generated** from the events file (`decision_at 13:29:00Z`, `flatten_at 13:36:00Z`, one entry per date). CI fails if it is stale |
 | `configs/book/exdiv-lighter.yaml` | runtime config (`fp=6ba59389b7ce` at 2026-09-07): universe = event symbols + `US500`/`US100`, gross $8,000 (weights are fractions of it, one leg ≤ 0.25 = $2,000), grace 120 s, `max_age_secs 300`, `require_dollar_neutral: false` (single stocks are unhedged by design), `max_net_usd 2200` |
-| `scripts/exdiv_signal_producer.py` | `calendar` (events → runtime calendar, `--check` for CI) and `signal` (13:27 cron: gates + sizing → `signal.json`, optional S3 upload) |
+| `scripts/exdiv_signal_producer.py` | `calendar` (events → runtime calendar, `--check` for CI) and `signal` (pre-open cron: gates + sizing → `signal.json`, optional S3 upload). Both derive every instant from `configs/engine-b/trading_calendar.json` (`--trading-calendar` overrides) |
 | `scripts/test_exdiv_signal_producer.py` | unit tests (synthetic logger rows) |
 | `deploy/book-runtime-exdiv-lighter.service` | runtime unit, PROM `127.0.0.1:9475`, status → `s3://debot-dashboard/debot/status/book-exdiv-lighter/` |
 | `deploy/book-signal-fetch-exdiv-lighter.{service,timer}` | S3 → local signal fetch, `Mon..Fri 09:27:00–09:31:40 America/New_York every 20 s` (`AccuracySec=1s`, so it follows US daylight saving); nothing polls outside that span |
@@ -46,10 +63,11 @@ Hyperliquid `hl_exdiv_poller.py`. The producer reads the Lighter logger's
 
 ## Producer rules (the signal side of the frozen design)
 
-Run at 09:27 New York time on the ex-dividend date (13:27 UTC in summer,
-14:27 in winter — the cron below fires on both and exits immediately on
-non-event days). For every declared event that day, using the fresh rows
-(`ob_age_secs ≤ 90`) from 09:23 NY up to the decision instant:
+Run about two minutes before the open on the ex-dividend date (13:27 UTC
+in summer, 14:27 in winter — the cron below fires on both and exits
+immediately on non-event days). For every declared event that day, using
+the fresh rows (`ob_age_secs ≤ 90`) from seven minutes before the open up
+to the decision instant:
 
 1. **Skip gates** (issue design): median spread > 30 bps; median L1 (min of
    bid/ask notional) < $200; the step already landed before the open
@@ -74,14 +92,16 @@ non-event days). For every declared event that day, using the fresh rows
    nothing is written.
 
 Inputs are always bounded at the decision instant, never at wall-clock
-"now": a delayed cron or an operator retry inside the runtime's grace
-window reads exactly the rows an on-time run would have read, so it
-reproduces the on-time file instead of sizing from post-open prices. The
-run warns on stderr when it starts late, and `--refuse-after-decision`
-turns that into exit 3 for an unattended cron. `as_of` = the last row
+"now": a delayed run reads exactly the rows an on-time run would have
+read, so it cannot size from post-open prices. On top of that, **a run
+that starts after the decision refuses outright (exit 3)** — the runtime's
+120 s grace window would otherwise let a late file open the position at or
+after the open, past the very step the strategy exists to capture.
+`--allow-after-decision` overrides that for offline regeneration (replay,
+backfill) and must never appear in the cron. `as_of` = the last row
 actually used (never after the decision, so never look-ahead);
-`decision_key` = the date, matching the calendar entry; `meta.decision_at`
-and `meta.input_cutoff` record both instants.
+`decision_key` = the date, matching the calendar entry; `meta` records
+`decision_at`, `input_cutoff`, `session_open` and `prev_session`.
 
 ## Workstation cron (operator adds; agents do not edit crontab)
 
@@ -92,9 +112,11 @@ whichever one is not the market's 09:27 simply finds no event window:
 27 13,14 * * 1-5 python3 $HOME/bot/.worktrees/pairtrade-master/scripts/exdiv_signal_producer.py signal --events $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-events.json --config $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-lighter.yaml --out $HOME/bot/logs/exdiv_948/signal.json --s3-uri s3://debot-dashboard/debot/book/exdiv-lighter/signal.json >> $HOME/bot/logs/exdiv_948/producer.log 2>&1
 ```
 
-(The off-hour run is harmless: it writes the same file from the same
-bounded window before the decision, or warns that it is late and still
-bounds its inputs. If you prefer a single line, set `CRON_TZ=America/New_York`
+(The off-hour run is harmless: on a non-event day it exits 0 having
+written nothing, and on an event day the wrong-hour line is after the
+decision and exits 3 without writing. Exit 3 in the log therefore means
+"that was the off-season line", or "the on-time line was delayed" — check
+the timestamp. If you prefer a single line, set `CRON_TZ=America/New_York`
 on the crontab and use `27 9 * * 1-5`.)
 
 It exits 0 with "no declared ex-dividend event" on every other day. The
