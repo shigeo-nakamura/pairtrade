@@ -26,6 +26,7 @@ UNIT_SOURCE_DIR=${BOOK_UNIT_SOURCE_DIR:-/opt/debot/deploy}
 # one is caught by the runtime at startup, not here, since --validate does
 # not load it.
 CALENDAR_SOURCE=${BOOK_CALENDAR_SOURCE:-}
+CALENDAR_VALIDATOR=${BOOK_CALENDAR_VALIDATOR:-$(dirname "$0")/validate_book_calendar.py}
 if [ -z "$CALENDAR_SOURCE" ] && [ -f "/opt/debot/configs/book/${INSTANCE}.calendar.json" ]; then
   CALENDAR_SOURCE=/opt/debot/configs/book/${INSTANCE}.calendar.json
 fi
@@ -84,19 +85,18 @@ if [ -n "$CALENDAR_SOURCE" ]; then
     echo "book runtime calendar source is missing: $CALENDAR_SOURCE" >&2
     exit 1
   fi
-  # Same object shape the runtime's deny_unknown_fields parser expects; a
-  # bare list or a misspelled key must not reach the host as "installed".
-  if ! python3 - "$CALENDAR_SOURCE" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-if not isinstance(d, dict) or not isinstance(d.get("entries"), list):
-    raise SystemExit("calendar must be an object with an 'entries' list")
-for e in d["entries"]:
-    extra = set(e) - {"decision_key", "decision_at", "flatten_at"}
-    if extra or "decision_key" not in e or "decision_at" not in e:
-        raise SystemExit(f"bad calendar entry {e!r}")
-PY
-  then
+  # Mirror what src/book/schedule.rs will accept, because
+  # `book_runtime --validate` does NOT load the calendar: without this an
+  # unparsable or self-inconsistent calendar installs cleanly and only
+  # fails when the service next starts. The checks (object shape and
+  # deny_unknown_fields at both levels, RFC 3339 timestamps, unique
+  # decision keys, flatten after decision, no overlap) live in
+  # validate_book_calendar.py so CI can run them on the committed file too.
+  if [ ! -f "$CALENDAR_VALIDATOR" ]; then
+    echo "calendar validator is missing: $CALENDAR_VALIDATOR" >&2
+    exit 1
+  fi
+  if ! python3 "$CALENDAR_VALIDATOR" "$CALENDAR_SOURCE" >/dev/null; then
     echo "book runtime calendar failed validation ($CALENDAR_SOURCE); installed bundle left untouched" >&2
     exit 1
   fi

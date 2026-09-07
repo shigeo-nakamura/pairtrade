@@ -107,6 +107,38 @@ class CalendarTests(unittest.TestCase):
             xp.load_events(write([good, dict(good, dividend_usd=2.0)]))
 
 
+class UniverseScopeTests(unittest.TestCase):
+    """Only today's events may block today's publish."""
+
+    def _run(self, events, day, out, cfg):
+        script = os.path.join(HERE, "exdiv_signal_producer.py")
+        return subprocess.run([sys.executable, script, "signal", "--events", events,
+                               "--out", out, "--config", cfg, "--date", day,
+                               "--now", f"{day}T13:27:00Z", "--log-dir", "/nonexistent"],
+                              capture_output=True, text=True)
+
+    def test_a_future_off_universe_event_warns_but_does_not_block_today(self):
+        cfg = os.path.join(os.path.dirname(HERE), "configs", "book", "exdiv-lighter.yaml")
+        with tempfile.TemporaryDirectory() as td:
+            ev = os.path.join(td, "e.json")
+            with open(ev, "w") as f:
+                json.dump({"schema_version": 1, "events": [
+                    {"symbol": "IWM", "ex_date": "2026-09-15", "dividend_usd": 0.68,
+                     "hedge": "US500", "status": "declared", "source": "t"},
+                    {"symbol": "NOTLISTED", "ex_date": "2026-10-20", "dividend_usd": 1.0,
+                     "hedge": None, "status": "declared", "source": "t"}]}, f)
+            out = os.path.join(td, "s.json")
+            r = self._run(ev, "2026-09-15", out, cfg)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)   # today still publishes
+            self.assertIn("NOTLISTED", r.stderr)                      # but it is flagged
+            self.assertIn("WARNING", r.stderr)
+            self.assertTrue(os.path.exists(out))
+            # the same symbol ON today's date does block
+            r = self._run(ev, "2026-10-20", os.path.join(td, "s2.json"), cfg)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("today's events", r.stderr)
+
+
 class TradingCalendarTests(unittest.TestCase):
     """Every instant comes from the frozen XNYS session table: daylight
     saving, market holidays and half days (Codex P2, rounds 1 and 2)."""
@@ -305,8 +337,14 @@ class SignalTests(unittest.TestCase):
         evals = [{"symbol": "IBM", "hedge": None, "skip": None, "notional_usd": 2000.0},
                  {"symbol": "TSM", "hedge": None, "skip": None, "notional_usd": 2000.0}]
         w, agg = xp.weights_from_evals(evals, 8000.0, 2200.0)
-        self.assertLessEqual(abs(agg["net_usd"]), 2200.0 + 1e-6)
-        self.assertAlmostEqual(agg["net_usd"], -2200.0, places=4)
+        target = 2200.0 * (1.0 - xp.NET_CAP_HEADROOM)
+        self.assertLessEqual(abs(agg["net_usd"]), target + 1e-6)
+        self.assertAlmostEqual(agg["net_usd"], -target, places=1)
+        # headroom exists so the runtime's per-leg lot rounding cannot push
+        # the rounded book over the hard cap and reject the whole plan
+        self.assertLess(abs(agg["net_usd"]), 2200.0)
+        self.assertEqual(evals[0]["applied_notional_usd"],
+                         round(evals[0]["notional_usd"] * agg["scale"], 2))
         self.assertAlmostEqual(w["IBM"], w["TSM"], places=9)      # scaled together
         self.assertLess(agg["scale"], 1.0)
         # A hedged pair has no net exposure, so the cap never shrinks it.
@@ -346,7 +384,8 @@ class SignalTests(unittest.TestCase):
             self.assertLessEqual(sum(abs(v) for v in w.values()), 1.0 + 1e-9)
             self.assertLessEqual(max((abs(v) for v in w.values()), default=0.0),
                                  xp.MAX_SYMBOL_WEIGHT + 1e-9)
-            self.assertLessEqual(abs(sum(w.values())) * 8000.0, 2200.0 + 1e-6)
+            self.assertLessEqual(abs(sum(w.values())) * 8000.0,
+                                 2200.0 * (1.0 - xp.NET_CAP_HEADROOM) + 1e-6)
             for v in w.values():             # quantised, never a long float
                 self.assertEqual(v, round(v, xp.WEIGHT_PLACES))
 
@@ -354,19 +393,42 @@ class SignalTests(unittest.TestCase):
         """A regenerated calendar reaches /opt/debot but not the running
         process until it is reinstalled and restarted (Codex P1, round 3)."""
         dec = xp.decision_at(D)
-        ok = {"book": {"next_decision_key": "2026-09-18",
-                       "next_decision_at": "2026-09-18T13:29:00Z"}}
-        self.assertIsNone(xp.host_schedule_drift(ok, "2026-09-18", dec))
-        stale = {"book": {"next_decision_key": "2026-09-21",
-                          "next_decision_at": "2026-09-21T13:29:00Z"}}
-        self.assertIn("not today's 2026-09-18", xp.host_schedule_drift(stale, "2026-09-18", dec))
-        empty = {"book": {"next_decision_key": None, "next_decision_at": None}}
-        self.assertIn("no next decision", xp.host_schedule_drift(empty, "2026-09-18", dec))
-        wrong_time = {"book": {"next_decision_key": "2026-09-18",
-                               "next_decision_at": "2026-09-18T14:29:00Z"}}
-        self.assertIn("different session table",
-                      xp.host_schedule_drift(wrong_time, "2026-09-18", dec))
-        self.assertIn("no `book` block", xp.host_schedule_drift({}, "2026-09-18", dec))
+        fresh_ts = NOW.timestamp() - 30
+
+        def st(**book):
+            return {"ts": fresh_ts, "updated_at": "2026-09-18T13:26:30Z", "book": book}
+
+        self.assertIsNone(xp.host_schedule_drift(
+            st(next_decision_key="2026-09-18", next_decision_at="2026-09-18T13:29:00Z"),
+            "2026-09-18", dec, NOW))
+        self.assertIn("not today's 2026-09-18", xp.host_schedule_drift(
+            st(next_decision_key="2026-09-21", next_decision_at="2026-09-21T13:29:00Z"),
+            "2026-09-18", dec, NOW))
+        self.assertIn("no next decision", xp.host_schedule_drift(
+            st(next_decision_key=None, next_decision_at=None), "2026-09-18", dec, NOW))
+        self.assertIn("different session table", xp.host_schedule_drift(
+            st(next_decision_key="2026-09-18", next_decision_at="2026-09-18T14:29:00Z"),
+            "2026-09-18", dec, NOW))
+        self.assertIn("no `book` block", xp.host_schedule_drift({}, "2026-09-18", dec, NOW))
+
+    def test_a_dead_runtime_is_caught_even_with_the_right_next_decision(self):
+        """A process that died days ago leaves a status whose
+        next_decision_key may still be today's -- reading the key alone
+        would pass exactly the silent-skip case the guard exists to catch."""
+        dec = xp.decision_at(D)
+        dead = {"ts": NOW.timestamp() - 4 * 86400, "updated_at": "2026-09-14T13:26:30Z",
+                "book": {"next_decision_key": "2026-09-18",
+                         "next_decision_at": "2026-09-18T13:29:00Z"}}
+        msg = xp.host_schedule_drift(dead, "2026-09-18", dec, NOW)
+        self.assertIsNotNone(msg)
+        self.assertIn("not running", msg)
+        # a status with no usable timestamp is also refused, not trusted
+        self.assertIn("no numeric `ts`", xp.host_schedule_drift(
+            {"book": {"next_decision_key": "2026-09-18",
+                      "next_decision_at": "2026-09-18T13:29:00Z"}}, "2026-09-18", dec, NOW))
+        # just inside the bound still passes
+        ok = dict(dead, ts=NOW.timestamp() - xp.HOST_STATUS_MAX_AGE_SECS + 60)
+        self.assertIsNone(xp.host_schedule_drift(ok, "2026-09-18", dec, NOW))
 
     def test_host_status_read_failures_do_not_block(self):
         self.assertIsNone(xp.read_host_status("/nonexistent/status.json"))
@@ -375,6 +437,42 @@ class SignalTests(unittest.TestCase):
             with open(bad, "w") as f:
                 f.write("{not json")
             self.assertIsNone(xp.read_host_status(bad))
+
+    def test_landed_gate_uses_mids_and_fails_closed_when_unevaluable(self):
+        """Pre-open, Lighter's index for an equity perp is an internal
+        book price while the futures-derived hedge quotes continuously, so
+        the gate is measured mid-vs-mid; and an unevaluable safety gate
+        skips rather than trading with it silently disabled."""
+        sig = xp.build_signal(EVENTS[:1], D, base_rows(), prev_rows(), NOW)
+        e = sig["meta"]["events"][0]
+        self.assertIsNone(e["skip"])
+        self.assertEqual(e["premarket_basis"], "mid_vs_t-1_close_mid")
+        # no T-1 rows at all -> the gate cannot be evaluated -> skip
+        sig = xp.build_signal(EVENTS[:1], D, base_rows(), [], NOW)
+        e = sig["meta"]["events"][0]
+        self.assertEqual(e["skip"], "landed_gate_unavailable")
+        self.assertIsNone(e["premarket_adj_move_bps"])
+        self.assertFalse(e["landed_gate_inputs"]["event_t1_mid"])
+        self.assertEqual(sig["weights"], {})
+        # T-1 rows for the event but not the control -> still unevaluable
+        only_event = [r for r in prev_rows() if r["symbol"] == "SPY"]
+        e = xp.build_signal(EVENTS[:1], D, base_rows(), only_event, NOW)["meta"]["events"][0]
+        self.assertEqual(e["skip"], "landed_gate_unavailable")
+        self.assertFalse(e["landed_gate_inputs"]["control_t1_mid"])
+        # a market-wide pre-open drop is NOT the dividend: control moves too
+        both_down = ([r for r in base_rows() if r["symbol"] not in ("SPY", "US500")]
+                     + series("SPY", NOW.replace(minute=23, second=0), 5, bid=657.33, ask=657.39)
+                     + series("US500", NOW.replace(minute=23, second=0), 5, bid=6573.5, ask=6573.7,
+                              bid_sz=20, ask_sz=20))
+        self.assertIsNone(xp.build_signal(EVENTS[:1], D, both_down, prev_rows(), NOW)["meta"]["events"][0]["skip"])
+
+    def test_the_landed_gate_still_fires_on_a_real_pre_open_step(self):
+        # SPY mid down 40 bps vs its T-1 close mid while US500 is flat
+        rows = ([r for r in base_rows() if r["symbol"] != "SPY"]
+                + series("SPY", NOW.replace(minute=23, second=0), 5, bid=657.33, ask=657.39))
+        e = xp.build_signal(EVENTS[:1], D, rows, prev_rows(), NOW)["meta"]["events"][0]
+        self.assertEqual(e["skip"], "gap_already_landed")
+        self.assertLess(e["premarket_adj_move_bps"], 0)
 
     def test_producer_constants_match_the_deployed_config(self):
         """The producer mirrors the runtime caps; drift would produce files
@@ -469,9 +567,10 @@ class SignalTests(unittest.TestCase):
             self.assertTrue(os.path.exists(out_late))
             # stale host schedule -> exit 4, nothing written
             st = os.path.join(td, "status.json")
+            fresh_ts = datetime(2026, 9, 18, 13, 27, tzinfo=timezone.utc).timestamp()
             with open(st, "w") as f:
-                json.dump({"book": {"next_decision_key": "2026-09-21",
-                                    "next_decision_at": "2026-09-21T13:29:00Z"}}, f)
+                json.dump({"ts": fresh_ts, "book": {"next_decision_key": "2026-09-21",
+                                                    "next_decision_at": "2026-09-21T13:29:00Z"}}, f)
             out_v = os.path.join(td, "verified.json")
             base = [sys.executable, script, "signal", "--events", ev, "--out", out_v,
                     "--date", "2026-09-18", "--now", "2026-09-18T13:27:30Z", "--log-dir", logdir]
@@ -480,8 +579,8 @@ class SignalTests(unittest.TestCase):
             self.assertFalse(os.path.exists(out_v))
             # matching host schedule -> publishes
             with open(st, "w") as f:
-                json.dump({"book": {"next_decision_key": "2026-09-18",
-                                    "next_decision_at": "2026-09-18T13:29:00Z"}}, f)
+                json.dump({"ts": fresh_ts, "book": {"next_decision_key": "2026-09-18",
+                                                    "next_decision_at": "2026-09-18T13:29:00Z"}}, f)
             r = subprocess.run(base + ["--verify-host-status", st], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertTrue(os.path.exists(out_v))
@@ -492,6 +591,16 @@ class SignalTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("WARNING", r.stderr)
             self.assertTrue(os.path.exists(out_v))
+            # a run before the input window opens must not publish an
+            # empty-window "go flat" signal (the UTC cron's off-hour line
+            # on a winter event)
+            out_e = os.path.join(td, "early.json")
+            r = subprocess.run([sys.executable, script, "signal", "--events", ev, "--out", out_e,
+                                "--date", "2026-09-18", "--now", "2026-09-18T12:27:00Z",
+                                "--log-dir", logdir], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 5, r.stdout + r.stderr)
+            self.assertIn("before the", r.stderr)
+            self.assertFalse(os.path.exists(out_e))
             # symbol outside the deployed universe -> refuse (exit 2)
             with open(ev, "w") as f:
                 json.dump({"schema_version": 1, "events": [

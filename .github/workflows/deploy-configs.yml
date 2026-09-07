@@ -47,15 +47,21 @@ jobs:
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
           python3 -m py_compile debot/scripts/book_signal_file.py debot/scripts/test_book_signal_file.py
           python3 -m py_compile debot/scripts/exdiv_signal_producer.py debot/scripts/test_exdiv_signal_producer.py
+          python3 -m py_compile debot/scripts/validate_book_calendar.py debot/scripts/test_validate_book_calendar.py
           python3 debot/scripts/test_book_signal_file.py
           python3 debot/scripts/test_xsmom_signal_producer.py
           python3 debot/scripts/test_exdiv_signal_producer.py
+          python3 debot/scripts/test_validate_book_calendar.py
           # The exdiv-lighter runtime calendar is generated from the human
           # events file; a stale committed copy would schedule the wrong
           # dates (bot-strategy#948).
           python3 debot/scripts/exdiv_signal_producer.py calendar \
             --events debot/configs/book/exdiv-events.json \
             --out debot/configs/book/exdiv-lighter.calendar.json --check
+          # `book_runtime --validate` does not load the calendar, so check
+          # it the way install_book_runtime.sh will.
+          python3 debot/scripts/validate_book_calendar.py \
+            debot/configs/book/exdiv-lighter.calendar.json
           bash debot/scripts/test_book_signal_fetch.sh
           bash debot/scripts/test_s3_object_present.sh
           bash debot/scripts/test_fetch_book_bundle.sh

@@ -84,7 +84,11 @@ DEFAULT_TRADING_CALENDAR = os.path.join(
 ENTRY_OFFSET_SECS = -60                 # one minute before the cash open
 FLATTEN_OFFSET_SECS = 360               # six minutes after it
 LOOKBACK_OFFSET_SECS = -420             # gates read the seven minutes before the open
-PREV_CLOSE_OFFSETS_SECS = (-60, -300)   # T-1 close index, in preference order
+# T-1 close reference, in preference order. Several candidates so a single
+# missing logger row does not make the landed gate unevaluable (which now
+# skips the event).
+PREV_CLOSE_OFFSETS_SECS = (-60, -120, -180, -300, -600)
+HOST_STATUS_MAX_AGE_SECS = 900          # a status older than this is a dead runtime
 MIN_FRESH_ROWS = 3
 FRESH_OB_SECS = 90.0
 
@@ -93,6 +97,12 @@ MAX_LEG_USD = 2000.0
 MIN_LEG_USD = 50.0
 MAX_SYMBOL_WEIGHT = 0.5                 # sizing.max_symbol_weight
 MAX_NET_USD = 2200.0                    # sizing.max_net_usd
+# The runtime re-checks max_net_usd on the ROUNDED target notionals, and
+# it rounds each leg's quantity down independently, so a mixed-sign day
+# can land a few dollars above a cap the weights satisfied exactly -- and
+# a net breach rejects the whole plan (`cap_net`), losing every event of
+# the day. Aim below the cap by this fraction so lot rounding has room.
+NET_CAP_HEADROOM = 0.05
 SKIP_SPREAD_BPS = 30.0
 MIN_L1_USD = 200.0
 SLIPPAGE_BUDGET_FRAC = 0.20
@@ -335,6 +345,28 @@ def latest_index(win):
     return xs[-1] if xs else None
 
 
+def latest_mid(win):
+    xs = [mid(r) for r in win]
+    xs = [x for x in xs if x]
+    return xs[-1] if xs else None
+
+
+def close_mid(rows_prev, sym: str, prev_day: date,
+              cal_path: str = DEFAULT_TRADING_CALENDAR):
+    """The perp mid at the last minute of the previous session, from the
+    same rows `close_index` uses."""
+    close = session_close(prev_day, cal_path)
+    for off in PREV_CLOSE_OFFSETS_SECS:
+        target = close + timedelta(seconds=off)
+        xs = [mid(r) for r in rows_prev
+              if r.get("symbol") == sym and r["_t"].hour == target.hour
+              and r["_t"].minute == target.minute]
+        xs = [x for x in xs if x]
+        if xs:
+            return xs[-1]
+    return None
+
+
 def band_for_budget(budget_bps: float):
     fit = [b for b in DEPTH_BANDS if b <= budget_bps]
     return max(fit) if fit else None
@@ -379,20 +411,42 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     if l1 < MIN_L1_USD:
         out["skip"] = "l1_lt_200usd"
         return out
-    # Landed-before-open gate: event index move since T-1 close, minus the
-    # hedge's (or US500's) move over the same span. Needs a real T-1 close.
+    # Landed-before-open gate: has the step already arrived while we were
+    # waiting? Measured on the perp MID, not on index_price: before the
+    # cash open Lighter's index for a single-name/ETF perp is an internal
+    # book-derived price (see close_index), while the futures-derived
+    # hedge legs quote continuously -- comparing one against the other
+    # mixes two different price definitions, and a few bps of thin
+    # pre-open book noise on the event leg would false-fire the gate and
+    # throw away the event (QQQ's threshold is only about -6 bps). The mid
+    # is also the honest measure of "can we still capture it": it is what
+    # we would transact at.
     ctl = hedge or "US500"
     ctl_win = window_rows(rows_t, ctl, cutoff, start)
-    ctl_ref = close_index(rows_prev, ctl, prev_day, cal_path)
-    ev_now, ctl_now = latest_index(win), latest_index(ctl_win)
-    if out["ref_index_source"] == "t-1_close" and ev_now and ctl_ref and ctl_now:
-        adj = ((ev_now / ref - 1) - (ctl_now / ctl_ref - 1)) * 1e4
+    ev_ref_mid, ctl_ref_mid = close_mid(rows_prev, sym, prev_day, cal_path), \
+        close_mid(rows_prev, ctl, prev_day, cal_path)
+    ev_now, ctl_now = latest_mid(win), latest_mid(ctl_win)
+    if ev_ref_mid and ctl_ref_mid and ev_now and ctl_now:
+        adj = ((ev_now / ev_ref_mid - 1) - (ctl_now / ctl_ref_mid - 1)) * 1e4
         out["premarket_adj_move_bps"] = round(adj, 2)
+        out["premarket_basis"] = "mid_vs_t-1_close_mid"
         if adj <= -LANDED_FRAC * div_bps:
             out["skip"] = "gap_already_landed"
             return out
     else:
+        # The gate cannot be evaluated (a logger gap over the T-1 close, or
+        # no fresh control rows). Fail CLOSED: proceeding would take the
+        # trade with its main safety check silently disabled, and a fill
+        # after the step has landed is both a loss and a corrupted capture
+        # measurement. Missing one event costs only that observation.
         out["premarket_adj_move_bps"] = None
+        out["premarket_basis"] = None
+        out["landed_gate_inputs"] = {
+            "event_t1_mid": ev_ref_mid is not None, "control_t1_mid": ctl_ref_mid is not None,
+            "event_now_mid": ev_now is not None, "control_now_mid": ctl_now is not None,
+            "control": ctl}
+        out["skip"] = "landed_gate_unavailable"
+        return out
     if hedge:
         if len(ctl_win) < MIN_FRESH_ROWS:
             out["skip"] = "hedge_no_fresh_book"
@@ -459,8 +513,9 @@ def _cap_excess(w: dict, gross: float, max_net_usd: float):
     if big > MAX_SYMBOL_WEIGHT:
         factors.append(MAX_SYMBOL_WEIGHT / big)
     net_usd = abs(sum(w.values())) * gross
-    if max_net_usd > 0 and net_usd > max_net_usd:
-        factors.append(max_net_usd / net_usd)
+    net_target = max_net_usd * (1.0 - NET_CAP_HEADROOM)
+    if max_net_usd > 0 and net_usd > net_target:
+        factors.append(net_target / net_usd)
     if not factors:
         return None
     # A hair under the exact ratio so the next quantisation cannot land
@@ -484,6 +539,7 @@ def weights_from_evals(evals: list[dict], gross: float,
             w[e["hedge"]] = w.get(e["hedge"], 0.0) + e["notional_usd"] / gross
     w = {k: v for k, v in w.items() if abs(v) > 1e-12}
     scale = 1.0
+    sized = [e for e in evals if not e["skip"] and e["notional_usd"] > 0]
     tot = sum(abs(v) for v in w.values())
     if tot > 1.0:
         scale = min(scale, 1.0 / tot)
@@ -517,6 +573,11 @@ def weights_from_evals(evals: list[dict], gross: float,
         raise SystemExit(
             f"could not fit the day's book inside the caps (gross {sum(abs(v) for v in w.values()):.6f}, "
             f"net ${abs(sum(w.values())) * gross:.2f} vs ${max_net_usd:.2f}); refusing to publish")
+    # A common scale-down changes what is actually traded, so record it on
+    # each event rather than leaving the readout to report the pre-scale
+    # size it never sent.
+    for e in sized:
+        e["applied_notional_usd"] = round(e["notional_usd"] * scale, 2)
     return w, {"scale": scale, "gross_usd": round(sum(abs(v) for v in w.values()) * gross, 2),
                "net_usd": round(sum(w.values()) * gross, 2)}
 
@@ -575,7 +636,9 @@ def read_host_status(uri_or_path: str) -> dict | None:
         return None
 
 
-def host_schedule_drift(status: dict, key: str, dec: datetime) -> str | None:
+def host_schedule_drift(status: dict, key: str, dec: datetime,
+                        now: datetime | None = None,
+                        max_age_secs: int = HOST_STATUS_MAX_AGE_SECS) -> str | None:
     """A message when the running instance has not scheduled `key`, else None.
 
     The runtime loads its calendar file once at startup from
@@ -583,10 +646,24 @@ def host_schedule_drift(status: dict, key: str, dec: datetime) -> str | None:
     regenerated calendar (a new event, or EWY going from estimated to
     declared) reaches the host but not the process until the instance is
     reinstalled and restarted, and the decision is silently never
-    scheduled."""
+    scheduled.
+
+    Staleness is checked first: a runtime that died days ago leaves a
+    status whose `next_decision_key` may well be today's, so reading the
+    key alone would pass exactly the case this guard exists to catch -- a
+    decision nobody is going to consume."""
     book = status.get("book")
     if not isinstance(book, dict):
         return "status.json has no `book` block"
+    now = now or datetime.now(timezone.utc)
+    ts = status.get("ts")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return "status.json has no numeric `ts`; cannot tell whether the runtime is alive"
+    age = (now - datetime.fromtimestamp(ts, tz=timezone.utc)).total_seconds()
+    if age > max_age_secs:
+        return (f"the instance's status is {age / 60:.0f} min old (updated "
+                f"{status.get('updated_at', '?')}); the runtime is not running, so nothing "
+                f"would consume this decision")
     got_key, got_at = book.get("next_decision_key"), book.get("next_decision_at")
     if got_key is None:
         return "the running instance reports no next decision (its calendar may be empty or exhausted)"
@@ -630,15 +707,39 @@ def cmd_signal(a) -> int:
     now = bsf.parse_ts(a.now) if a.now else datetime.now(timezone.utc).replace(microsecond=0)
     d = date.fromisoformat(a.date) if a.date else now.date()
     events = load_events(a.events)
+    todays = declared_on(events, d)
     if a.config:
-        outside = sorted({x for e in events for x in (e["symbol"], e["hedge"]) if x} - universe_from_config(a.config))
-        if outside:
-            print(f"refusing: events name symbols outside the deployed universe ({a.config}): {', '.join(outside)}", file=sys.stderr)
+        # Only today's events can block today's publish. A symbol missing
+        # from the universe on some future row is worth warning about --
+        # it must be added before that date -- but refusing here would let
+        # a row for next month silently cancel this morning's event.
+        universe = universe_from_config(a.config)
+        def _missing(rows):
+            return sorted({x for e in rows for x in (e["symbol"], e["hedge"]) if x} - universe)
+        blocking = _missing(todays)
+        if blocking:
+            print(f"refusing: today's events name symbols outside the deployed universe "
+                  f"({a.config}): {', '.join(blocking)}", file=sys.stderr)
             return 2
-    if not declared_on(events, d):
+        later = _missing([e for e in events if e["status"] == "declared" and e not in todays])
+        if later:
+            print(f"WARNING: later declared events name symbols outside the deployed universe "
+                  f"({a.config}): {', '.join(later)}. Add them to universe.symbols and redeploy "
+                  f"before those dates.", file=sys.stderr)
+    if not todays:
         print(f"no declared ex-dividend event on {d}; nothing written")
         return 0
     dec = decision_at(d, a.trading_calendar)
+    start = lookback_start(d, a.trading_calendar)
+    if now < start:
+        # The UTC cron carries one line per possible open hour, so on a
+        # winter event the summer line fires an hour early. Without this it
+        # would "succeed" with an empty input window -- every event
+        # no_fresh_book -- and upload a go-flat signal for the day, which
+        # the runtime may consume before the real run publishes.
+        print(f"refusing: run started at {_ts(now)}, before the {_ts(start)} input window opens "
+              f"(the decision is {_ts(dec)})", file=sys.stderr)
+        return 5
     if now > dec:
         # Inputs are bounded at the decision either way, but the runtime
         # would still ACT on a file that lands inside its grace window --
@@ -659,7 +760,7 @@ def cmd_signal(a) -> int:
             print(f"WARNING: could not read {a.verify_host_status}; publishing without the "
                   f"host-schedule check", file=sys.stderr)
         else:
-            drift = host_schedule_drift(status, d.isoformat(), dec)
+            drift = host_schedule_drift(status, d.isoformat(), dec, now)
             if drift:
                 print(f"refusing: {drift}. Reinstall the instance (install_book_runtime.sh) and "
                       f"restart it so it loads the current calendar -- see "
@@ -670,7 +771,9 @@ def cmd_signal(a) -> int:
     sig = build_signal(events, d, rows_t, rows_prev, now, a.gross, a.producer_id, a.max_net_usd,
                        a.trading_calendar)
     bsf.write_signal(a.out, sig)
-    ev_summary = ", ".join(f"{e['symbol']}:{e['skip'] or '$' + str(e['notional_usd'])}" for e in sig["meta"]["events"])
+    ev_summary = ", ".join(
+        f"{e['symbol']}:{e['skip'] or '$' + str(e.get('applied_notional_usd', e['notional_usd']))}"
+        for e in sig["meta"]["events"])
     print(f"wrote {a.out} key={sig['decision_key']} legs={len(sig['weights'])} gross=${sig['meta']['gross_usd']} "
           f"net=${sig['meta']['net_usd']} sha={sig['payload_sha256'][:12]} [{ev_summary}]")
     if a.s3_uri:

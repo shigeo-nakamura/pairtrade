@@ -48,6 +48,7 @@ Extending past 2027 means regenerating that calendar first.
 | `configs/book/exdiv-lighter.calendar.json` | runtime calendar, **generated** from the events file (`decision_at 13:29:00Z`, `flatten_at 13:36:00Z`, one entry per date). CI fails if it is stale |
 | `configs/book/exdiv-lighter.yaml` | runtime config (`fp=08a901c93832` at 2026-09-07): universe = event symbols + `US500`/`US100`, gross $8,000 (weights are fractions of it, one leg ≤ 0.25 = $2,000), grace 45 s so the acceptance window closes 15 s before the open, `max_age_secs 300`, `require_dollar_neutral: false` (single stocks are unhedged by design), `max_net_usd 2200` |
 | `scripts/exdiv_signal_producer.py` | `calendar` (events → runtime calendar, `--check` for CI) and `signal` (pre-open cron: gates + sizing → `signal.json`, optional S3 upload). Both derive every instant from `configs/engine-b/trading_calendar.json` (`--trading-calendar` overrides) |
+| `scripts/validate_book_calendar.py` | what `install_book_runtime.sh` runs before installing a calendar, and CI runs on the committed one: `book_runtime --validate` does **not** load the calendar, so shape, RFC 3339 timestamps, unique keys, flatten-after-decision and non-overlap are checked here |
 | `scripts/test_exdiv_signal_producer.py` | unit tests (synthetic logger rows) |
 | `deploy/book-runtime-exdiv-lighter.service` | runtime unit, PROM `127.0.0.1:9475`, status → `s3://debot-dashboard/debot/status/book-exdiv-lighter/` |
 | `deploy/book-signal-fetch-exdiv-lighter.{service,timer}` | S3 → local signal fetch, `Mon..Fri 09:27:00–09:29:40 America/New_York every 20 s` (`AccuracySec=1s`, so it follows US daylight saving); it stops before the open, and nothing polls outside that span |
@@ -70,10 +71,18 @@ the fresh rows (`ob_age_secs ≤ 90`) from seven minutes before the open up
 to the decision instant:
 
 1. **Skip gates** (issue design): median spread > 30 bps; median L1 (min of
-   bid/ask notional) < $200; the step already landed before the open
-   (event `index_price` move since the T-1 19:59 close, minus the hedge's —
-   or `US500`'s — move, ≤ −0.5 × dividend bps); no fresh book; hedge leg
-   spread > 30 bps.
+   bid/ask notional) < $200; no fresh book; hedge leg spread > 30 bps; and
+   the landed-before-open gate — the event's **mid** move since its T-1
+   close mid, minus the hedge's (or `US500`'s) move over the same span,
+   ≤ −0.5 × dividend bps. The gate is measured on mids, not on
+   `index_price`: before the open Lighter's index for an equity perp is an
+   internal book price while the futures-derived hedge legs quote
+   continuously, so an index-vs-index comparison mixes two price
+   definitions and a few bps of thin pre-open noise would false-fire it
+   (QQQ's threshold is only about −6 bps). If the gate cannot be evaluated
+   at all — a logger gap over the T-1 close, say — the event is **skipped**
+   (`landed_gate_unavailable`) rather than traded with its main safety
+   check silently disabled.
 2. **Size** (2026-09-07 comment, replaces the bare `25 % × L1`): slippage
    budget = 20 % of the dividend in bps; take the widest logged depth band
    inside the budget and use **half the median cumulative bid depth** in
@@ -81,8 +90,13 @@ to the decision instant:
    band holds no depth (half-spread wider than the band, or rows without
    the field), the frozen `25 % × L1` rule applies instead.
 3. Hedge = same notional, opposite sign. Several events on one day are
-   summed; if the day would breach `sum |w| ≤ 1` or a symbol cap every leg
-   is scaled down together so the hedge ratios survive.
+   summed; if the day would breach `sum |w| ≤ 1`, a symbol cap, or the
+   net-dollar cap, every leg is scaled down together so the hedge ratios
+   survive, and `meta.events[].applied_notional_usd` records what was
+   actually sent. Weights are quantised toward zero and the caps
+   re-checked, and the net target keeps 5 % headroom under `max_net_usd`
+   because the runtime re-checks that cap on lot-rounded quantities — a
+   net breach rejects the whole plan, losing every event of the day.
 4. Write `signal.json` (schema v1, `payload_sha256`) **even if every event
    was skipped** — an empty map is the runtime's valid "go flat", so the
    ledger keeps a `decision` row with the per-event diagnostics in `meta`
@@ -124,18 +138,29 @@ whichever one is not the market's 09:27 simply finds no event window:
 ```
 
 `--verify-host-status` reads the running instance's published status and
-refuses (exit 4) when it has not scheduled today's decision — see
-"Calendar updates" below. An unreadable status only warns, so a transient
-S3 error cannot block a legitimate publish.
+refuses (exit 4) when it has not scheduled today's decision, **or when
+that status is more than 15 minutes old** — a runtime that died days ago
+leaves a status whose `next_decision_key` may well be today's, so checking
+the key alone would pass exactly the silent-skip case this guard exists to
+catch. See "Calendar updates" below. An unreadable status only warns, so a
+transient S3 error cannot block a legitimate publish.
 
-(The off-hour run is harmless: on a non-event day it exits 0 having
-written nothing, and on an event day the wrong-hour line is after the
-decision and exits 3 without writing. If you prefer a single line, set
+(The off-hour line writes nothing on either side of the year: in summer it
+runs after the 13:29Z decision and exits 3, in winter it runs before the
+14:23Z input window opens and exits 5. Both are refusals, so neither can
+publish the empty-window "go flat" signal that an unguarded early run
+would have produced. If you prefer a single line, set
 `CRON_TZ=America/New_York` on the crontab and use `27 9 * * 1-5`.)
 
-Exit codes: 0 wrote (or nothing to do), 2 config/universe refusal, 3 the
-run started after the decision, 4 the running instance has not scheduled
-this decision.
+Exit codes: 0 wrote (or nothing to do), 2 today's events name a symbol
+outside the deployed universe, 3 the run started after the decision, 4 the
+running instance has not scheduled this decision (or its status is stale,
+i.e. the runtime is not running), 5 the run started before the input
+window opens.
+
+A symbol missing from the universe on a **later** event only warns: it has
+to be added before that date, but it must not cancel this morning's
+unrelated event.
 
 It exits 0 with "no declared ex-dividend event" on every other day. The
 fetch timer on the host polls S3 from 09:27:00 NY, so the upload has ~90 s
@@ -214,6 +239,18 @@ entry, no `[ADOPT]` rows.
 - Producer log: the per-event line
   `[SPY:$1500.0, QQQ:l1_lt_200usd, …]` says what was sized or why it was
   skipped.
+
+## Expected operational noise
+
+`book-signal-fetch-exdiv-lighter.service` is a oneshot that runs 9 times
+every weekday but only has something to fetch on the handful of
+ex-dividend dates. On every other day `book_signal_fetch.sh` finds no
+usable object and exits non-zero, so the unit sits in `failed`. That is
+expected and is **not** a signal to act on; the checks that mean something
+are `status.json`'s `next_decision_key` and the ledger row after an event.
+(The same is true of `xsmom-695`'s 5-minute fetch timer between
+rebalances.) Do not add `SuccessExitStatus=1` to hide it — that would also
+hide a genuine fetch failure on an event morning.
 
 ## Not done here (by decision)
 
