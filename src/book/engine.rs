@@ -1738,9 +1738,15 @@ impl BookEngine {
         if current.is_empty() {
             return;
         }
-        let symbols: Vec<String> = current.keys().cloned().collect();
-        let lots = self.lots_for(&symbols).await;
-        let plan = match rebalance::plan_flatten(&current, prices, &lots, &self.cfg.sizing) {
+        // No lot fetch: `plan_flatten` targets every leg to zero, and
+        // `plan`'s tq == 0.0 branch closes at the exact current venue
+        // quantity without ever consulting `lots` (dust included,
+        // deadband/minimum don't apply to a close) -- by design, so a
+        // protective flatten can submit during a ticker-metadata outage.
+        // Fetching lots here first would only add REST latency (blocking
+        // the select! loop tick() runs inside) for metadata this plan
+        // never reads.
+        let plan = match rebalance::plan_flatten(&current, prices, &HashMap::new(), &self.cfg.sizing) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("[FLATTEN] cannot plan ({reason}): {e}");

@@ -245,16 +245,31 @@ async fn main() -> Result<()> {
             .collect();
         p.seed_positions(seed).await;
     }
+    // Concurrent, not sequential: this runs before the select! loop even
+    // starts, so a restarted process with persisted exposure and a slow or
+    // timing-out venue would otherwise be unable to reconcile positions,
+    // evaluate risk, process an overdue flatten, or handle SIGTERM for the
+    // sum of every symbol's request latency. Same strategy as the retry
+    // path below.
+    let mut lot_fetches = tokio::task::JoinSet::new();
+    for s in symbols.clone() {
+        let connector = connector.clone();
+        lot_fetches.spawn(async move {
+            let lot = fetch_lot(&connector, &s).await;
+            (s, lot)
+        });
+    }
     let mut missing_lots: Vec<String> = Vec::new();
-    for s in &symbols {
-        match fetch_lot(&connector, s).await {
-            Some(lot) => {
-                engine.set_lot(s, lot);
+    while let Some(res) = lot_fetches.join_next().await {
+        match res {
+            Ok((s, Some(lot))) => {
+                engine.set_lot(&s, lot);
                 if let Some(p) = &paper {
-                    p.set_lot(s, lot).await;
+                    p.set_lot(&s, lot).await;
                 }
             }
-            None => missing_lots.push(s.clone()),
+            Ok((s, None)) => missing_lots.push(s),
+            Err(e) => log::error!("[LOT] startup fetch task panicked: {e}"),
         }
     }
     if !missing_lots.is_empty() {
