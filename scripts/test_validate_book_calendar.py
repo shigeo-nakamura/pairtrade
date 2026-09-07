@@ -61,25 +61,55 @@ class ValidatorTests(unittest.TestCase):
                 flatten_at="2026-09-15T13:20:00Z"),
             "flatten equals decision": lambda d: d["entries"][0].update(
                 flatten_at="2026-09-15T13:29:00Z"),
+            # schedule.rs rejects a flatten inside the signal window, not
+            # merely one at or before the decision.
+            "flatten inside the signal window": lambda d: d["entries"][0].update(
+                flatten_at="2026-09-15T13:29:30Z"),
             "overlap": lambda d: d["entries"][1].update(
                 decision_at="2026-09-15T13:30:00Z", flatten_at="2026-09-15T13:40:00Z"),
-            "out of order": lambda d: d["entries"].reverse(),
+            "overlap via grace, no flatten": lambda d: d["entries"].__setitem__(1, {
+                "decision_key": "b", "decision_at": "2026-09-15T13:29:20Z"}),
             "entry not an object": lambda d: d["entries"].__setitem__(0, "2026-09-15"),
         }
         for name, fn in entry_cases.items():
             with self.assertRaises(SystemExit, msg=name):
                 vbc.validate(write(mutate(fn)))
 
+    def test_entry_order_is_not_a_rule(self):
+        """Scheduler::build sorts by decision_at before checking, so a
+        merely unsorted calendar must not block an install."""
+        import copy
+        d = copy.deepcopy(GOOD)
+        d["entries"].reverse()
+        self.assertEqual(len(vbc.validate(write(d))["entries"]), 2)
+
+    def test_grace_is_honoured(self):
+        import copy
+        d = copy.deepcopy(GOOD)
+        d["entries"][0]["flatten_at"] = "2026-09-15T13:29:30Z"    # 30 s after decision
+        vbc.validate(write(d), grace_secs=10)                      # fine with a 10 s window
+        with self.assertRaises(SystemExit):                        # not with 45 s
+            vbc.validate(write(d), grace_secs=45)
+        with self.assertRaises(SystemExit):
+            vbc.validate(write(GOOD), grace_secs=-1)
+
     def test_the_committed_calendar_is_loadable(self):
         cal = os.path.join(os.path.dirname(HERE), "configs", "book",
                            "exdiv-lighter.calendar.json")
-        d = vbc.validate(cal)
+        # the grace the deployed config actually uses
+        import re
+        cfg = open(os.path.join(os.path.dirname(HERE), "configs", "book",
+                                "exdiv-lighter.yaml")).read()
+        grace = int(re.search(r"^\s+signal_grace_secs:\s*(\d+)", cfg, re.M).group(1))
+        d = vbc.validate(cal, grace)
         self.assertGreater(len(d["entries"]), 0)
 
     def test_cli(self):
-        r = subprocess.run([sys.executable, SCRIPT, write(GOOD)], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, SCRIPT, write(GOOD), "--grace-secs", "45"],
+                           capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("2 entries", r.stdout)
+        self.assertIn("grace 45s", r.stdout)
         r = subprocess.run([sys.executable, SCRIPT, write({"entries": []})],
                            capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0)

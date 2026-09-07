@@ -351,20 +351,46 @@ def latest_mid(win):
     return xs[-1] if xs else None
 
 
+def _mid_at(rows_prev, sym: str, target: datetime):
+    xs = [mid(r) for r in rows_prev
+          if r.get("symbol") == sym and r["_t"].hour == target.hour
+          and r["_t"].minute == target.minute]
+    xs = [x for x in xs if x]
+    return xs[-1] if xs else None
+
+
 def close_mid(rows_prev, sym: str, prev_day: date,
               cal_path: str = DEFAULT_TRADING_CALENDAR):
-    """The perp mid at the last minute of the previous session, from the
-    same rows `close_index` uses."""
+    """The perp mid at the last minute of the previous session."""
     close = session_close(prev_day, cal_path)
     for off in PREV_CLOSE_OFFSETS_SECS:
-        target = close + timedelta(seconds=off)
-        xs = [mid(r) for r in rows_prev
-              if r.get("symbol") == sym and r["_t"].hour == target.hour
-              and r["_t"].minute == target.minute]
-        xs = [x for x in xs if x]
-        if xs:
-            return xs[-1]
+        m = _mid_at(rows_prev, sym, close + timedelta(seconds=off))
+        if m is not None:
+            return m
     return None
+
+
+def close_mid_pair(rows_prev, sym: str, ctl: str, prev_day: date,
+                   cal_path: str = DEFAULT_TRADING_CALENDAR):
+    """T-1 close mids for the event and its control, resolved on the SAME
+    minute. Resolving them independently would let a logger gap on one leg
+    pull its reference minutes earlier, so the differential would then
+    include that leg's own drift over the gap -- up to 9 minutes with the
+    widened offset list, against a gate threshold of only a few bps.
+    Returns (event_mid, control_mid); the control is None only when no
+    offset has both."""
+    close = session_close(prev_day, cal_path)
+    ev_only = None
+    for off in PREV_CLOSE_OFFSETS_SECS:
+        target = close + timedelta(seconds=off)
+        ev, cm = _mid_at(rows_prev, sym, target), _mid_at(rows_prev, ctl, target)
+        if ev is not None and cm is not None:
+            return ev, cm
+        if ev_only is None and ev is not None:
+            ev_only = ev
+    # No common minute: fall back to the event alone (the caller then uses
+    # the unadjusted gate, which can only skip more often).
+    return ev_only, None
 
 
 def band_for_budget(budget_bps: float):
@@ -411,6 +437,18 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     if l1 < MIN_L1_USD:
         out["skip"] = "l1_lt_200usd"
         return out
+    ctl = hedge or "US500"
+    ctl_win = window_rows(rows_t, ctl, cutoff, start)
+    if hedge:
+        if len(ctl_win) < MIN_FRESH_ROWS:
+            out["skip"] = "hedge_no_fresh_book"
+            return out
+        hsp = st.median([spread_bps(r) for r in ctl_win])
+        out["hedge_spread_bps"] = round(hsp, 2)
+        if hsp > SKIP_SPREAD_BPS:
+            out["skip"] = "hedge_spread_gt_30bps"
+            return out
+
     # Landed-before-open gate: has the step already arrived while we were
     # waiting? Measured on the perp MID, not on index_price: before the
     # cash open Lighter's index for a single-name/ETF perp is an internal
@@ -421,10 +459,7 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     # throw away the event (QQQ's threshold is only about -6 bps). The mid
     # is also the honest measure of "can we still capture it": it is what
     # we would transact at.
-    ctl = hedge or "US500"
-    ctl_win = window_rows(rows_t, ctl, cutoff, start)
-    ev_ref_mid, ctl_ref_mid = close_mid(rows_prev, sym, prev_day, cal_path), \
-        close_mid(rows_prev, ctl, prev_day, cal_path)
+    ev_ref_mid, ctl_ref_mid = close_mid_pair(rows_prev, sym, ctl, prev_day, cal_path)
     ev_now, ctl_now = latest_mid(win), latest_mid(ctl_win)
     if ev_ref_mid and ev_now:
         ev_move = (ev_now / ev_ref_mid - 1) * 1e4
@@ -456,15 +491,6 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
             "control": ctl}
         out["skip"] = "landed_gate_unavailable"
         return out
-    if hedge:
-        if len(ctl_win) < MIN_FRESH_ROWS:
-            out["skip"] = "hedge_no_fresh_book"
-            return out
-        hsp = st.median([spread_bps(r) for r in ctl_win])
-        out["hedge_spread_bps"] = round(hsp, 2)
-        if hsp > SKIP_SPREAD_BPS:
-            out["skip"] = "hedge_spread_gt_30bps"
-            return out
     budget = SLIPPAGE_BUDGET_FRAC * div_bps
     band = band_for_budget(budget)
     out["slippage_budget_bps"] = round(budget, 2)
@@ -508,6 +534,11 @@ def _quantize(v: float, places: int = WEIGHT_PLACES) -> float:
     return math.floor(abs(v) * q) / q * (1.0 if v >= 0 else -1.0)
 
 
+def net_cap_target(max_net_usd: float) -> float:
+    """What the producer aims for under the runtime's hard net cap."""
+    return max_net_usd * (1.0 - NET_CAP_HEADROOM)
+
+
 def _cap_excess(w: dict, gross: float, max_net_usd: float):
     """The factor every weight must be multiplied by to fit every cap, or
     None when the book already fits. Mirrors src/book/signal.rs and the
@@ -522,9 +553,8 @@ def _cap_excess(w: dict, gross: float, max_net_usd: float):
     if big > MAX_SYMBOL_WEIGHT:
         factors.append(MAX_SYMBOL_WEIGHT / big)
     net_usd = abs(sum(w.values())) * gross
-    net_target = max_net_usd * (1.0 - NET_CAP_HEADROOM)
-    if max_net_usd > 0 and net_usd > net_target:
-        factors.append(net_target / net_usd)
+    if max_net_usd > 0 and net_usd > net_cap_target(max_net_usd):
+        factors.append(net_cap_target(max_net_usd) / net_usd)
     if not factors:
         return None
     # A hair under the exact ratio so the next quantisation cannot land
@@ -559,9 +589,11 @@ def weights_from_evals(evals: list[dict], gross: float,
     # are only 0.5 gross and 0.25 per symbol, both inside their caps, yet
     # $4,000 net against a $2,200 cap -> the runtime would reject the plan
     # (cap_net) and neither event would trade.
+    # The same target `_cap_excess` uses, so the first pass does not leave
+    # work for the verification loop and under-report the scale.
     net_usd = abs(sum(w.values())) * gross
-    if max_net_usd > 0 and net_usd > max_net_usd:
-        scale = min(scale, max_net_usd / net_usd)
+    if max_net_usd > 0 and net_usd > net_cap_target(max_net_usd):
+        scale = min(scale, net_cap_target(max_net_usd) / net_usd)
     if scale < 1.0:
         w = {k: v * scale for k, v in w.items()}
     # Quantise toward zero, never to nearest: the runtime's caps are hard
@@ -577,6 +609,10 @@ def weights_from_evals(evals: list[dict], gross: float,
         excess = _cap_excess(w, gross, max_net_usd)
         if excess is None:
             break
+        # Fold every shrink into the reported scale: `applied_notional_usd`
+        # exists to say what was actually sent, so it must not be computed
+        # from a factor that a later pass has already tightened.
+        scale *= excess
         w = {k: _quantize(v * excess) for k, v in w.items()}
     else:
         raise SystemExit(
@@ -730,7 +766,8 @@ def cmd_signal(a) -> int:
             print(f"refusing: today's events name symbols outside the deployed universe "
                   f"({a.config}): {', '.join(blocking)}", file=sys.stderr)
             return 2
-        later = _missing([e for e in events if e["status"] == "declared" and e not in todays])
+        later = _missing([e for e in events
+                          if e["status"] == "declared" and e["ex_date"] > d])
         if later:
             print(f"WARNING: later declared events name symbols outside the deployed universe "
                   f"({a.config}): {', '.join(later)}. Add them to universe.symbols and redeploy "

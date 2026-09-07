@@ -59,9 +59,11 @@ jobs:
             --events debot/configs/book/exdiv-events.json \
             --out debot/configs/book/exdiv-lighter.calendar.json --check
           # `book_runtime --validate` does not load the calendar, so check
-          # it the way install_book_runtime.sh will.
+          # it the way install_book_runtime.sh will, with the grace value
+          # the deployed config actually uses.
+          EXDIV_GRACE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*signal_grace_secs:/{print $2; exit}' debot/configs/book/exdiv-lighter.yaml)
           python3 debot/scripts/validate_book_calendar.py \
-            debot/configs/book/exdiv-lighter.calendar.json
+            debot/configs/book/exdiv-lighter.calendar.json --grace-secs "$EXDIV_GRACE"
           bash debot/scripts/test_book_signal_fetch.sh
           bash debot/scripts/test_s3_object_present.sh
           bash debot/scripts/test_fetch_book_bundle.sh

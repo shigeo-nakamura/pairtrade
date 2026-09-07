@@ -96,7 +96,17 @@ if [ -n "$CALENDAR_SOURCE" ]; then
     echo "calendar validator is missing: $CALENDAR_VALIDATOR" >&2
     exit 1
   fi
-  if ! python3 "$CALENDAR_VALIDATOR" "$CALENDAR_SOURCE" >/dev/null; then
+  # Both the flatten and overlap rules depend on signal_grace_secs, so
+  # take it from the config being installed rather than the validator's
+  # default -- a wrong value would accept a calendar the runtime bails on.
+  GRACE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*signal_grace_secs:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+  case "$GRACE" in
+    ''|*[!0-9]*)
+      echo "could not read schedule.signal_grace_secs from $CONFIG_SOURCE (got '${GRACE}')" >&2
+      exit 1
+      ;;
+  esac
+  if ! python3 "$CALENDAR_VALIDATOR" "$CALENDAR_SOURCE" --grace-secs "$GRACE" >/dev/null; then
     echo "book runtime calendar failed validation ($CALENDAR_SOURCE); installed bundle left untouched" >&2
     exit 1
   fi

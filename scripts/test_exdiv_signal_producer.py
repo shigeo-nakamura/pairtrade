@@ -343,8 +343,14 @@ class SignalTests(unittest.TestCase):
         # headroom exists so the runtime's per-leg lot rounding cannot push
         # the rounded book over the hard cap and reject the whole plan
         self.assertLess(abs(agg["net_usd"]), 2200.0)
+        # `applied_notional_usd` must match what the WEIGHTS say, not a
+        # scale from before the post-quantisation shrink (which
+        # over-reported by ~5 %).
         self.assertEqual(evals[0]["applied_notional_usd"],
                          round(evals[0]["notional_usd"] * agg["scale"], 2))
+        for e in evals:
+            from_weights = abs(w[e["symbol"]]) * 8000.0
+            self.assertAlmostEqual(e["applied_notional_usd"], from_weights, delta=0.05)
         self.assertAlmostEqual(w["IBM"], w["TSM"], places=9)      # scaled together
         self.assertLess(agg["scale"], 1.0)
         # A hedged pair has no net exposure, so the cap never shrinks it.
@@ -483,6 +489,33 @@ class SignalTests(unittest.TestCase):
         e = xp.build_signal(EVENTS[:1], D, rows, prev_rows(), NOW)["meta"]["events"][0]
         self.assertEqual(e["skip"], "gap_already_landed")
         self.assertLess(e["premarket_adj_move_bps"], 0)
+
+    def test_t1_close_mids_come_from_a_common_minute(self):
+        """Resolving the event and control references independently would
+        let a gap on one leg pull its reference minutes earlier, so the
+        differential would include that leg's own drift over the gap."""
+        close = xp.session_close(date(2026, 9, 17))
+        rows = []
+        # control has every candidate minute; the event only the older one
+        for off in xp.PREV_CLOSE_OFFSETS_SECS:
+            t = close + timedelta(seconds=off)
+            rows.append(row("US500", t, 6599.9, 6600.1))
+        older = close + timedelta(seconds=xp.PREV_CLOSE_OFFSETS_SECS[-1])
+        rows.append(row("SPY", older, 649.97, 650.03))
+        ev, ctl = xp.close_mid_pair(rows, "SPY", "US500", date(2026, 9, 17))
+        self.assertAlmostEqual(ev, 650.0, places=6)
+        self.assertIsNotNone(ctl)
+        self.assertAlmostEqual(ctl, xp._mid_at(rows, "US500", older), places=6)
+        # no common minute at all -> event alone, control None
+        ev, ctl = xp.close_mid_pair([row("SPY", older, 649.97, 650.03)],
+                                    "SPY", "US500", date(2026, 9, 17))
+        self.assertAlmostEqual(ev, 650.0, places=6)
+        self.assertIsNone(ctl)
+
+    def test_a_hedge_with_no_book_keeps_its_specific_reason(self):
+        rows = [r for r in base_rows() if r["symbol"] != "US500"]
+        e = xp.build_signal(EVENTS[:1], D, rows, prev_rows(), NOW)["meta"]["events"][0]
+        self.assertEqual(e["skip"], "hedge_no_fresh_book")
 
     def test_producer_constants_match_the_deployed_config(self):
         """The producer mirrors the runtime caps; drift would produce files
