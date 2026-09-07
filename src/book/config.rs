@@ -323,6 +323,34 @@ impl BookConfig {
         if ex.paper_slippage_bps < 0.0 || ex.paper_fee_bps < 0.0 {
             bail!("execution.paper_* bps must be >= 0");
         }
+        // The paper fill is `mid * (1 -/+ slip)`: at 100% a sell fills at
+        // zero and beyond it the price and the fee go negative, which
+        // would corrupt the basis, realized PnL and equity of the whole
+        // replay instead of failing here.
+        if ex.paper_slippage_bps >= 10_000.0 {
+            bail!("execution.paper_slippage_bps must be < 10000 (100%)");
+        }
+        // Every runtime file must be its own. Sharing one would have each
+        // ledger append leave the state unparsable and the end-of-tick
+        // persist overwrite the ledger; a path that collided with a flag
+        // file would be worse still, since the kill switch and RISK_ACK
+        // are read as "this file exists".
+        let named: [(&str, &Path); 6] = [
+            ("paths.state", &self.paths.state),
+            ("paths.ledger", &self.paths.ledger),
+            ("paths.pnl", &self.paths.pnl),
+            ("paths.status", &self.paths.status),
+            ("risk.kill_switch_path", &self.risk.kill_switch_path),
+            ("risk.risk_ack_path", &self.risk.risk_ack_path),
+        ];
+        let mut seen: Vec<(&str, PathBuf)> = Vec::new();
+        for (name, path) in named {
+            let key = resolved_path(path);
+            if let Some((other, _)) = seen.iter().find(|(_, k)| *k == key) {
+                bail!("{name} and {other} are the same file ({})", path.display());
+            }
+            seen.push((name, key));
+        }
         let r = &self.risk;
         if r.equity_reference_usd <= 0.0 {
             bail!("risk.equity_reference_usd must be > 0");
@@ -366,6 +394,22 @@ impl BookConfig {
             self.signal.producer_id,
             self.fingerprint()
         )
+    }
+}
+
+/// A path in a form two configured paths can be compared by: the
+/// directory resolved through symlinks and `..` when it exists (so
+/// `a/b.json` and `a/../a/b.json` are recognised as one file), with the
+/// file name appended. Falls back to the path as written when the
+/// directory is not there yet, which is the normal case before the first
+/// run creates it.
+fn resolved_path(p: &Path) -> PathBuf {
+    match (p.parent(), p.file_name()) {
+        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => match dir.canonicalize() {
+            Ok(d) => d.join(name),
+            Err(_) => p.to_path_buf(),
+        },
+        _ => p.to_path_buf(),
     }
 }
 
@@ -434,6 +478,36 @@ mod tests {
         let mut b = a.clone();
         b.sizing.max_net_usd += 1.0;
         assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn rejects_two_runtime_paths_that_are_the_same_file() {
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.paths.ledger = c.paths.state.clone();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("paths.ledger and paths.state"), "{e}");
+        // A runtime file that doubles as a flag file is worse: the kill
+        // switch is read as "this file exists".
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.risk.kill_switch_path = c.paths.status.clone();
+        assert!(c.validate().is_err());
+        // Different spellings of one path are still one file.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.paths.state = dir.path().join("state.json");
+        c.paths.pnl = dir.path().join("sub").join("..").join("state.json");
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_paper_slippage_of_a_hundred_percent_or_more() {
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.execution.paper_slippage_bps = 9_999.0;
+        assert!(c.validate().is_ok());
+        c.execution.paper_slippage_bps = 10_000.0;
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("paper_slippage_bps"), "{e}");
     }
 
     #[test]

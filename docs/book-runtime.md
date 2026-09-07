@@ -85,6 +85,14 @@ paths:
   status: /var/lib/book-xsmom/status.json
 ```
 
+Validation rejects a config whose numbers cannot produce a sane run
+(`paper_slippage_bps` must stay under 10000, i.e. 100%, or a paper sell
+would fill at or below zero) and one where any two of the six runtime
+files — the four `paths` plus `kill_switch_path` and `risk_ack_path` —
+are the same file, since sharing one would have each ledger append leave
+the state unparsable, and a runtime file that doubled as a flag file
+would read as a permanent kill switch.
+
 The effective config is fingerprinted (`[CONFIG] instance=… fp=<sha256-12>`)
 at startup and exported as `book_config_info{instance,fp}` so a
 deployed-but-not-loaded config is visible on `/metrics` (same discipline as
@@ -398,7 +406,8 @@ scripts/book_signal_file.py --out replay/signals/2026-07-03.json \
 for the replay clock to accept it. Up to 60 s past the decision instant
 the clock-skew allowance accepts it at the decision tick itself; later
 than that it is applied at the arrival tick described above, never
-before it.
+before it. A window that crosses midnight puts that arrival on the next
+bar date, and it is ticked there, with that date's closes.
 
 ## 10. Live gate and hosts
 

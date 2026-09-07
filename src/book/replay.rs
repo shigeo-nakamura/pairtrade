@@ -200,24 +200,30 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         let mut ticks: Vec<i64> = Vec::new();
         for d in scheduler.decisions_between(day_start, day_end - 1) {
             ticks.push(d.decision_at);
-            // A producer may publish after the decision instant, anywhere
-            // inside the grace window. Live, the fetch timer delivers the
-            // file and the next 5 s tick applies it. Here the following
-            // tick would otherwise be the end of the day, so anything
-            // generated more than the clock-skew allowance after the
-            // decision would be rejected once as future-generated and
-            // never retried. Tick at its stated arrival instead.
+            if let Some(f) = d.flatten_at {
+                if (day_start..day_end).contains(&f) {
+                    ticks.push(f);
+                }
+            }
+        }
+        // A producer may publish after the decision instant, anywhere
+        // inside the grace window. Live, the fetch timer delivers the file
+        // and the next 5 s tick applies it. Here the following tick would
+        // otherwise be the end of the day, so anything generated more than
+        // the clock-skew allowance after the decision would be rejected
+        // once as future-generated and never retried. Tick at its stated
+        // arrival instead. A window that crosses midnight puts that
+        // arrival on the *next* bar date, so decisions reaching back a
+        // whole grace period are scanned, not just this date's.
+        for d in
+            scheduler.decisions_between(day_start - cfg.schedule.signal_grace_secs, day_end - 1)
+        {
             if let Some(arrival) = signal_generated_at(replay_dir, &d.key) {
                 if arrival > d.decision_at
                     && arrival <= d.window_end
                     && (day_start..day_end).contains(&arrival)
                 {
                     ticks.push(arrival);
-                }
-            }
-            if let Some(f) = d.flatten_at {
-                if (day_start..day_end).contains(&f) {
-                    ticks.push(f);
                 }
             }
         }
@@ -293,6 +299,7 @@ pub async fn run_from_paths(
 mod tests {
     use super::*;
     use crate::book::config::test_config_yaml;
+    use crate::book::config::ScheduleKind;
     use crate::book::signal::testutil::signal_json;
     use chrono::{DateTime, Duration};
 
@@ -623,6 +630,45 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(out.join("state.json")).unwrap())
                 .unwrap();
         assert!(state["positions"]["BTC"]["qty"].as_f64().unwrap() < 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_late_arrival_after_midnight_is_ticked_on_the_next_bar_date() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        // Decide at 23:30 with an hour of grace: the window runs into the
+        // next bar date, and so may the producer's publish.
+        let mut c = cfg();
+        c.schedule.kind = ScheduleKind::Daily;
+        c.schedule.decision_time_utc = Some("23:30".into());
+        let decision_at = ts("2026-07-05T23:30:00Z");
+        let arrival = ts("2026-07-06T00:10:00Z");
+        let body = signal_json(
+            "test_producer",
+            arrival,
+            decision_at - Duration::minutes(30),
+            "2026-07-05",
+            &[("BTC", 0.5), ("DOT", -0.5)],
+        );
+        std::fs::create_dir_all(dir.path().join("signals")).unwrap();
+        std::fs::write(dir.path().join("signals").join("2026-07-05.json"), body).unwrap();
+        let out = dir.path().join("out");
+        run(c, dir.path(), &out).await.unwrap();
+        let ledger = read_rows(&out.join("ledger.jsonl"));
+        let rows: Vec<_> = ledger
+            .iter()
+            .filter(|r| r["event"] == "decision" && r["decision_key"] == "2026-07-05")
+            .collect();
+        let outcomes: Vec<_> = rows
+            .iter()
+            .map(|r| r["outcome"].as_str().unwrap())
+            .collect();
+        // Refused at the decision and again at the end of that bar date
+        // (still future-generated at both), then applied on the next date
+        // at the stated arrival, which is what live would do.
+        assert_eq!(outcomes, vec!["rejected", "rejected", "applied"]);
+        assert!(rows[..2].iter().all(|r| r["reason"] == "future_generated"));
+        assert_eq!(rows[2]["ts_ms"], arrival.timestamp_millis());
     }
 
     #[tokio::test]
