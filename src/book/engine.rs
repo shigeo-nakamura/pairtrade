@@ -1942,19 +1942,42 @@ impl BookEngine {
         let date = utc_date(now);
         let mut funding_detail = serde_json::Map::new();
         let symbols: Vec<String> = self.state.positions.keys().cloned().collect();
-        for sym in symbols {
-            let has_price = prices.contains_key(&sym);
+        // Fetch every held leg's rate concurrently first (LiveExecutor's
+        // funding_rate_hourly is a REST get_ticker per symbol), then apply
+        // them below sequentially -- that part mutates `self.state` and
+        // can't run concurrently. `tick` awaits the whole of this inside
+        // book_runtime.rs's select!, so a sequential fetch per leg would
+        // hold that arm for the sum of every symbol's request latency,
+        // blocking WS handling, decisions, risk processing and SIGTERM on
+        // the first tick of each UTC date, same as the paper-funding, lot
+        // and price-fallback fetches already made concurrent.
+        let mut rate_fetches = tokio::task::JoinSet::new();
+        for sym in &symbols {
             // A held leg with no fresh mark must not consume its funding
             // interval at the entry-price fallback below: forcing `rate`
             // to `None` here routes it through the same
             // pending_funding_qty_hours carry a missing *rate* already
             // uses, instead of permanently misstating
             // cum_funding_est_usd from a price the venue never quoted.
-            let rate = if has_price {
-                self.exec.funding_rate_hourly(&sym).await
-            } else {
-                None
-            };
+            if !prices.contains_key(sym) {
+                continue;
+            }
+            let exec = self.exec.clone();
+            let sym = sym.clone();
+            rate_fetches.spawn(async move {
+                let rate = exec.funding_rate_hourly(&sym).await;
+                (sym, rate)
+            });
+        }
+        let mut rates: HashMap<String, Option<f64>> = HashMap::new();
+        while let Some(res) = rate_fetches.join_next().await {
+            if let Ok((sym, rate)) = res {
+                rates.insert(sym, rate);
+            }
+        }
+        for sym in symbols {
+            let has_price = prices.contains_key(&sym);
+            let rate = rates.get(&sym).copied().flatten();
             let Some(p) = self.state.positions.get(&sym) else {
                 continue;
             };

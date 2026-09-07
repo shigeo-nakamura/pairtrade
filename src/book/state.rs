@@ -297,7 +297,18 @@ impl BookState {
             let dir = if pos.qty > 0.0 { 1.0 } else { -1.0 };
             realized = (price - pos.avg_price) * closing * dir;
             pos.realized_pnl += realized;
+            // Snapped to zero here, before classifying: a venue-reported
+            // fill that exactly closes a position accumulated through
+            // several fills (e.g. 0.1 + 0.2, closed by 0.3) leaves a
+            // same-sign residual of a few ULPs, not exactly 0.0. Left
+            // unsnapped, that residual takes the *reducing* branch below
+            // instead of *closed*, so trades_closed/trades_won never
+            // increment and book_fill's `leg_closed` (which compares
+            // trades_closed before/after) reports this as a partial
+            // reduction even though the tail cleanup a few lines down
+            // removes the leg from `positions` moments later.
             let remaining = pos.qty + signed_qty;
+            let remaining = if remaining.abs() < 1e-12 { 0.0 } else { remaining };
             if remaining == 0.0 || (remaining > 0.0) != (pos.qty > 0.0) {
                 // Closed, maybe flipped. One trade = one leg's lifetime,
                 // so classify on everything it realized, not this fill.
@@ -409,6 +420,22 @@ mod tests {
         assert_eq!(s.positions["SOL"].realized_pnl, 0.0);
         s.apply_fill("SOL", 1.0, 70.0, 3); // short closed +$10
         assert_eq!((s.trades_closed, s.trades_won), (2, 1));
+    }
+
+    #[test]
+    fn a_venue_fill_that_closes_a_float_noisy_accumulation_still_counts_as_closed() {
+        // 0.1 + 0.2 != 0.3 exactly in f64; a venue-reported fill of the
+        // "same" quantity leaves a same-sign residual of a few ULPs, which
+        // must not take the reducing (not closed) branch just because it
+        // isn't exactly 0.0.
+        let mut s = BookState::new("t");
+        s.apply_fill("SOL", 0.1, 100.0, 1);
+        s.apply_fill("SOL", 0.2, 100.0, 2);
+        let qty_before = s.positions["SOL"].qty;
+        assert_ne!(qty_before, 0.3, "fixture assumption: float noise present");
+        s.apply_fill("SOL", -0.3, 110.0, 3);
+        assert_eq!((s.trades_closed, s.trades_won), (1, 1));
+        assert!(!s.positions.contains_key("SOL"));
     }
 
     #[test]
