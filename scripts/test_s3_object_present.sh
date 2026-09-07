@@ -23,4 +23,11 @@ rc=0; FAKE_AWS_MODE=missing bash "$HERE/s3_object_present.sh" b k || rc=$?
 [ "$rc" = "10" ] || { echo "FAIL: missing object should exit 10, got $rc" >&2; exit 1; }
 rc=0; FAKE_AWS_MODE=denied bash "$HERE/s3_object_present.sh" b k 2>/dev/null || rc=$?
 [ "$rc" = "1" ] || { echo "FAIL: an ambiguous failure must exit 1, not 10; got $rc" >&2; exit 1; }
+# The callers run under `set -e`, where a bare `probe; rc=$?` would exit
+# before the bootstrap-skip branch is ever reached. Pin the form they use.
+FAKE_AWS_MODE=missing bash -c "set -e; rc=0; bash '$HERE/s3_object_present.sh' b k 2>/dev/null || rc=\$?; [ \$rc = 10 ] || exit 1; echo reached" >/dev/null \
+  || { echo "FAIL: the || rc=\$? form must survive a missing object under set -e" >&2; exit 1; }
+if FAKE_AWS_MODE=missing bash -c "set -e; bash '$HERE/s3_object_present.sh' b k 2>/dev/null; rc=\$?; echo reached" >/dev/null 2>&1; then
+  echo "FAIL: the bare form was expected to abort under set -e" >&2; exit 1
+fi
 echo "s3_object_present tests OK"
