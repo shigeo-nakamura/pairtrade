@@ -159,6 +159,7 @@ pub struct BookBlock {
     pub signal_status: String,
     pub pending_residual: bool,
     pub positions_source: &'static str,
+    pub equity_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

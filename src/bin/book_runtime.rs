@@ -166,6 +166,8 @@ async fn main() -> Result<()> {
         let l = Arc::new(LiveExecutor::new(
             connector.clone(),
             cfg.execution.fill_confirm_timeout_secs,
+            cfg.execution.slippage_bps,
+            cfg.execution.allow_venue_protection_fallback,
         ));
         paper = None;
         live = Some(l.clone());

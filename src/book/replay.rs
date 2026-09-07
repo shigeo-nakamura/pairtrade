@@ -83,8 +83,28 @@ pub fn sandbox_config(mut cfg: BookConfig, out_dir: &Path) -> BookConfig {
     cfg
 }
 
+/// Files a replay writes into `--out`; removed before every run so a
+/// rerun never resumes from a previous run's state or appends to its
+/// ledgers (the byte-identical guarantee depends on this).
+pub const OUTPUT_FILES: &[&str] = &[
+    "state.json",
+    "ledger.jsonl",
+    "pnl.jsonl",
+    "status.json",
+    "KILL_SWITCH",
+    "RISK_ACK",
+];
+
 pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<ReplaySummary> {
     std::fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+    for f in OUTPUT_FILES {
+        let p = out_dir.join(f);
+        match std::fs::remove_file(&p) {
+            Ok(()) => log::info!("[REPLAY] removed previous {}", p.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove {}", p.display())),
+        }
+    }
     let cfg = sandbox_config(cfg, out_dir);
     let bars = load_bars(&replay_dir.join("bars.jsonl"))?;
     let lots: HashMap<String, LotMeta> = match std::fs::read_to_string(replay_dir.join("lots.json"))
@@ -317,14 +337,28 @@ mod tests {
         assert_eq!(status["book"]["signal_status"], "skipped:window_missed");
         assert_eq!(status["book"]["next_decision_key"], "2026-07-18");
 
-        // Byte-exact reproducibility.
+        // Byte-exact reproducibility, both into a fresh directory and when
+        // rerunning into the same one (previous outputs are removed first).
         let out2 = dir.path().join("out2");
         run(cfg(), dir.path(), &out2).await.unwrap();
-        for f in ["ledger.jsonl", "pnl.jsonl", "state.json"] {
+        let files = ["ledger.jsonl", "pnl.jsonl", "state.json"];
+        let first: Vec<Vec<u8>> = files
+            .iter()
+            .map(|f| std::fs::read(out1.join(f)).unwrap())
+            .collect();
+        for (i, f) in files.iter().enumerate() {
             assert_eq!(
-                std::fs::read(out1.join(f)).unwrap(),
+                first[i],
                 std::fs::read(out2.join(f)).unwrap(),
                 "{f} differs between runs"
+            );
+        }
+        run(cfg(), dir.path(), &out1).await.unwrap();
+        for (i, f) in files.iter().enumerate() {
+            assert_eq!(
+                first[i],
+                std::fs::read(out1.join(f)).unwrap(),
+                "{f} differs on rerun into the same dir"
             );
         }
     }

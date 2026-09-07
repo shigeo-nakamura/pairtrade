@@ -201,17 +201,90 @@ pub struct LiveExecutor {
     connector: Arc<dyn DexConnector + Send + Sync>,
     prices: RwLock<HashMap<String, f64>>,
     fill_confirm_timeout_secs: i64,
+    slippage_bps: u32,
+    allow_venue_protection_fallback: bool,
+}
+
+/// Whether `mid` is still within `slippage_bps` of the price the intent
+/// was sized at, in the adverse direction for `side` (a favourable move
+/// never blocks).
+pub fn within_slippage(reference: f64, mid: f64, side: Side, slippage_bps: u32) -> bool {
+    if !(reference > 0.0 && mid > 0.0) {
+        return false;
+    }
+    let adverse_bps = match side {
+        Side::Buy => (mid - reference) / reference * 10_000.0,
+        Side::Sell => (reference - mid) / reference * 10_000.0,
+    };
+    adverse_bps <= slippage_bps as f64
 }
 
 impl LiveExecutor {
     pub fn new(
         connector: Arc<dyn DexConnector + Send + Sync>,
         fill_confirm_timeout_secs: i64,
+        slippage_bps: u32,
+        allow_venue_protection_fallback: bool,
     ) -> Self {
         Self {
             connector,
             prices: RwLock::new(HashMap::new()),
             fill_confirm_timeout_secs,
+            slippage_bps,
+            allow_venue_protection_fallback,
+        }
+    }
+
+    /// Send the order with the configured slippage cap: the venue's
+    /// price-capped IOC when it has one, otherwise (only if the operator
+    /// opted in) the venue-native market/IOC with its own protection price.
+    async fn send_capped(
+        &self,
+        intent: &OrderIntent,
+        size: Decimal,
+        side: OrderSide,
+    ) -> Result<dex_connector::CreateOrderResponse, String> {
+        match self
+            .connector
+            .create_order_taker_ioc(
+                &intent.symbol,
+                size,
+                side,
+                self.slippage_bps,
+                intent.reduce_only,
+            )
+            .await
+        {
+            Ok(r) => Ok(r),
+            Err(dex_connector::DexError::Permanent(msg))
+                if msg.to_ascii_lowercase().contains("not implemented")
+                    || msg.to_ascii_lowercase().contains("not supported")
+                    || msg.to_ascii_lowercase().contains("no native") =>
+            {
+                if !self.allow_venue_protection_fallback {
+                    return Err(format!(
+                        "venue has no price-capped IOC ({msg}) and execution.allow_venue_protection_fallback is false; order not sent"
+                    ));
+                }
+                log::warn!(
+                    "[EXEC] {} {}: no price-capped IOC on this venue ({msg}); falling back to create_order(price=None) with the venue protection price (bot-strategy#918)",
+                    intent.side,
+                    intent.symbol
+                );
+                self.connector
+                    .create_order(
+                        &intent.symbol,
+                        size,
+                        side,
+                        None,
+                        None,
+                        intent.reduce_only,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| format!("{e:?}"))
+            }
+            Err(e) => Err(format!("{e:?}")),
         }
     }
 
@@ -312,6 +385,24 @@ impl Executor for LiveExecutor {
 
     async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
         let started = Instant::now();
+        // Drift guard: the plan was sized at `reference_price`; if the book
+        // has already moved past the slippage budget the order is not sent
+        // (the engine re-plans on the next tick with fresh prices).
+        let mid = self
+            .prices
+            .read()
+            .await
+            .get(&intent.symbol)
+            .copied()
+            .ok_or_else(|| anyhow!("live: no price for {}", intent.symbol))?;
+        if !within_slippage(intent.reference_price, mid, intent.side, self.slippage_bps) {
+            return Err(anyhow!(
+                "price moved beyond slippage_bps={} before send (reference={} mid={})",
+                self.slippage_bps,
+                intent.reference_price,
+                mid
+            ));
+        }
         let before = self
             .venue_position(&intent.symbol)
             .await?
@@ -322,21 +413,9 @@ impl Executor for LiveExecutor {
             Side::Sell => OrderSide::Short,
         };
         let size = decimal(intent.qty)?;
-        let sent = self
-            .connector
-            .create_order(
-                &intent.symbol,
-                size,
-                side,
-                None,
-                None,
-                intent.reduce_only,
-                None,
-            )
-            .await;
-        let (order_id, venue_error) = match sent {
+        let (order_id, venue_error) = match self.send_capped(intent, size, side).await {
             Ok(r) => (Some(r.order_id), None),
-            Err(e) => (None, Some(format!("{e:?}"))),
+            Err(e) => (None, Some(e)),
         };
         // Confirm against the venue position regardless of the ack: a send
         // error can still have executed (REST/WS limits are coupled).
@@ -488,6 +567,17 @@ mod tests {
             .execute(&intent("DOT", Side::Buy, 1.0, false))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn slippage_guard_blocks_adverse_moves_only() {
+        assert!(within_slippage(100.0, 100.4, Side::Buy, 50));
+        assert!(!within_slippage(100.0, 100.6, Side::Buy, 50));
+        assert!(within_slippage(100.0, 99.0, Side::Buy, 50)); // favourable
+        assert!(within_slippage(100.0, 99.6, Side::Sell, 50));
+        assert!(!within_slippage(100.0, 99.4, Side::Sell, 50));
+        assert!(within_slippage(100.0, 101.0, Side::Sell, 50)); // favourable
+        assert!(!within_slippage(0.0, 100.0, Side::Buy, 50));
     }
 
     #[test]

@@ -64,9 +64,10 @@ sizing:
   rebalance_deadband_usd: 5       # diffs below this are not traded at all
 
 execution:
-  slippage_bps: 50                # IOC price cap passed to the venue
+  slippage_bps: 50                # IOC price cap; also a pre-send drift guard vs the sizing mid
   max_attempts: 3                 # per intent, on partial fill
   fill_confirm_timeout_secs: 15   # venue position must reflect the fill within this
+  allow_venue_protection_fallback: false  # Lighter has no capped IOC (#918): true = send with the venue's ±20% protection instead
   paper_slippage_bps: 5           # dry_run fill = mid +/- this
   paper_fee_bps: 0
 
@@ -185,8 +186,15 @@ reduce_only }`.
 
 ## 6. Execution and fill confirmation
 
-- Live: `create_order_taker_ioc(symbol, qty, side, slippage_bps,
-  reduce_only)`. The HTTP 200 is **not** a fill (Lighter: accepted, not
+- Live: before sending, the current mid must still be within
+  `slippage_bps` of the intent's sizing price in the adverse direction,
+  otherwise the intent errors out unsent and the residual is re-planned
+  next tick. The order goes out as `create_order_taker_ioc(symbol, qty,
+  side, slippage_bps, reduce_only)`; on a venue without a price-capped IOC
+  (Lighter in dex-connector v4.7.20, bot-strategy#918) it is sent as
+  `create_order(price=None)` with the venue's ±20 % protection price
+  **only if** `execution.allow_venue_protection_fallback` is true, else
+  it is not sent. The HTTP 200 is **not** a fill (Lighter: accepted, not
   executed — bot-strategy#875 G-2). The runtime polls `get_positions()`
   for up to `fill_confirm_timeout_secs`; the filled quantity is the change
   in the venue position. Partial fills re-plan the residual up to
@@ -211,6 +219,11 @@ reduce_only }`.
 
 - **Kill switch** (`risk.kill_switch_path` exists): no opening intents;
   reducing intents and flattens still run.
+- **Venue equity unavailable** (live `get_balance` fails or returns a
+  non-positive number): the tick evaluates the rails against the last
+  observation but blocks every opening intent (`order_blocked
+  reason=equity_unavailable`, `book.equity_ready=false` in `status.json`)
+  until a fresh value is read; reductions and flattens still run.
 - **Session drawdown halt**: `session_start_equity - equity >
   max_session_loss_bps/1e4 * session_start_equity` (equity = venue equity
   live, `equity_reference + cum realized + unrealized` paper) engages a
@@ -257,7 +270,8 @@ reduce_only }`.
 
 `book-runtime --config <yaml> --replay <dir> --out <dir>` runs the same
 engine against `bars.jsonl` (`{"date","symbol","close"[,"funding_rate_hourly"]}`
-rows), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
+rows; previous `state.json` / ledgers / status in `--out` are removed
+first so a rerun never resumes or appends), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
 default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
 for every bar date `D` the closes of `D` become the prices, each decision /
 flatten scheduled inside `D` is ticked at its exact time (paper fills at

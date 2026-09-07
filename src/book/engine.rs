@@ -88,6 +88,10 @@ pub struct BookEngine {
     /// Whether the last venue reconcile succeeded (live) — trading is
     /// suppressed while it is false.
     positions_ready: bool,
+    /// Live only: the last venue equity read succeeded. Opening intents are
+    /// blocked while false (risk limits cannot be evaluated against a
+    /// stale number); reductions and flattens still run.
+    equity_ready: bool,
     config_fp: String,
 }
 
@@ -137,6 +141,7 @@ impl BookEngine {
             status_interval_secs: 30,
             last_flatten_attempt: 0,
             positions_ready: true,
+            equity_ready: true,
             config_fp,
         })
     }
@@ -194,7 +199,8 @@ impl BookEngine {
             self.positions_ready = self.reconcile_with_venue(now, &prices).await;
         }
 
-        let equity = self.compute_equity(&prices).await;
+        let (equity, equity_ready) = self.compute_equity(&prices).await;
+        self.equity_ready = equity_ready;
 
         if let Some(ev) = self.risk.maybe_clear_halt(&mut self.state, now, equity) {
             log::warn!("[RISK] session halt cleared by RISK_ACK: {ev:?}");
@@ -241,7 +247,7 @@ impl BookEngine {
 
         self.maybe_daily_mark(now, &prices).await;
 
-        let equity = self.compute_equity(&prices).await;
+        let (equity, _) = self.compute_equity(&prices).await;
         self.write_status(now, &prices, equity);
         self.state
             .persist(&self.cfg.paths.state)
@@ -321,22 +327,44 @@ impl BookEngine {
         true
     }
 
-    async fn compute_equity(&self, prices: &HashMap<String, f64>) -> f64 {
+    /// Current equity and whether it is a fresh venue value (paper equity
+    /// is always fresh).
+    async fn compute_equity(&self, prices: &HashMap<String, f64>) -> (f64, bool) {
         if self.exec.is_paper() {
-            return self.cfg.risk.equity_reference_usd + self.state.cum_realized_usd
-                - self.state.cum_fees_usd
-                + self.state.cum_funding_est_usd
-                + self.state.unrealized_usd(prices);
+            return (
+                self.cfg.risk.equity_reference_usd + self.state.cum_realized_usd
+                    - self.state.cum_fees_usd
+                    + self.state.cum_funding_est_usd
+                    + self.state.unrealized_usd(prices),
+                true,
+            );
         }
         match self.exec.equity().await {
-            Ok(Some(e)) if e.is_finite() && e > 0.0 => e,
+            Ok(Some(e)) if e.is_finite() && e > 0.0 => (e, true),
             other => {
-                log::warn!("[EQUITY] venue equity unavailable ({other:?}); using last observation");
-                self.state
-                    .last_equity
-                    .map(|(_, e)| e)
-                    .unwrap_or(self.cfg.risk.equity_reference_usd)
+                log::warn!(
+                    "[EQUITY] venue equity unavailable ({other:?}); using last observation, opens blocked"
+                );
+                (
+                    self.state
+                        .last_equity
+                        .map(|(_, e)| e)
+                        .unwrap_or(self.cfg.risk.equity_reference_usd),
+                    false,
+                )
             }
+        }
+    }
+
+    fn opens_allowed(&self) -> bool {
+        self.equity_ready && self.risk.opens_allowed(&self.state)
+    }
+
+    fn block_reason(&self) -> &'static str {
+        if !self.equity_ready {
+            "equity_unavailable"
+        } else {
+            self.risk.block_reason(&self.state).unwrap_or("blocked")
         }
     }
 
@@ -735,8 +763,8 @@ impl BookEngine {
             residual: BTreeMap::new(),
         };
         for intent in &plan.intents {
-            if !intent.reduce_only && !self.risk.opens_allowed(&self.state) {
-                let reason = self.risk.block_reason(&self.state).unwrap_or("blocked");
+            if !intent.reduce_only && !self.opens_allowed() {
+                let reason = self.block_reason();
                 log::warn!(
                     "[ORDER] blocked {} {} {} qty={} reason={reason}",
                     intent.kind_label(),
@@ -1013,7 +1041,7 @@ impl BookEngine {
                 json!({ "rate_hourly": rate, "hours": hours, "est_usd": est }),
             );
         }
-        let equity = self.compute_equity(prices).await;
+        let (equity, _) = self.compute_equity(prices).await;
         let marks: BTreeMap<String, serde_json::Value> = self
             .state
             .positions
@@ -1145,6 +1173,7 @@ impl BookEngine {
                 } else {
                     "venue"
                 },
+                equity_ready: self.equity_ready,
             },
         };
         self.status.write(&doc);
@@ -1352,6 +1381,7 @@ mod tests {
     struct MockVenue {
         prices: HashMap<String, f64>,
         positions: Mutex<BTreeMap<String, VenuePosition>>,
+        equity_ok: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -1375,7 +1405,11 @@ mod tests {
             Ok(self.positions.lock().unwrap().clone())
         }
         async fn equity(&self) -> Result<Option<f64>> {
-            Ok(Some(1000.0))
+            if self.equity_ok.load(std::sync::atomic::Ordering::Relaxed) {
+                Ok(Some(1000.0))
+            } else {
+                Err(anyhow::anyhow!("get_balance: timeout"))
+            }
         }
         async fn funding_rate_hourly(&self, _symbol: &str) -> Option<f64> {
             None
@@ -1431,6 +1465,7 @@ mod tests {
                 )]
                 .into(),
             ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1452,5 +1487,49 @@ mod tests {
         venue.positions.lock().unwrap().clear();
         engine.tick(secs("2026-09-06T00:00:05Z")).await.unwrap();
         assert!(engine.state.is_flat());
+    }
+
+    #[tokio::test]
+    async fn live_opens_are_blocked_while_venue_equity_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        let d = ts("2026-09-06T00:30:00Z");
+        // SOL/DOT: MockVenue reports 2 size decimals for every symbol, which
+        // would round a $500 BTC leg to zero.
+        write_signal(dir.path(), "2026-09-06", d, &[("SOL", 0.5), ("DOT", -0.5)]);
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 200.0), ("DOT".to_string(), 4.0)].into(),
+            positions: Mutex::new(BTreeMap::new()),
+            equity_ok: std::sync::atomic::AtomicBool::new(false),
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine =
+            BookEngine::new(cfg.clone(), scheduler, venue.clone(), signals, status).unwrap();
+        engine.tick(d.timestamp()).await.unwrap();
+        assert!(engine.state.is_flat());
+        let blocked: Vec<Value> = rows(&cfg.paths.ledger)
+            .into_iter()
+            .filter(|r| r["event"] == "order_blocked")
+            .collect();
+        assert_eq!(blocked.len(), 2);
+        assert_eq!(blocked[0]["reason"], "equity_unavailable");
+        assert_eq!(
+            engine.state.last_decision.as_ref().unwrap().outcome,
+            DecisionOutcome::Partial
+        );
+        // Equity back → the retry from the persisted target fills.
+        venue
+            .equity_ok
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        assert_eq!(
+            engine.state.last_decision.as_ref().unwrap().outcome,
+            DecisionOutcome::Applied
+        );
+        assert!(!engine.state.is_flat());
     }
 }

@@ -88,6 +88,13 @@ pub struct ExecutionConfig {
     pub slippage_bps: u32,
     pub max_attempts: u32,
     pub fill_confirm_timeout_secs: i64,
+    /// Lighter has no price-capped IOC in dex-connector v4.7.20
+    /// (`create_order_taker_ioc` is `Permanent`; bot-strategy#918): when
+    /// true, a live order falls back to `create_order(price=None)`, i.e.
+    /// the venue's own ±20 % protection price instead of `slippage_bps`.
+    /// Default false = fail closed (the order is not sent).
+    #[serde(default)]
+    pub allow_venue_protection_fallback: bool,
     pub paper_slippage_bps: f64,
     #[serde(default)]
     pub paper_fee_bps: f64,
