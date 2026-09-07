@@ -628,7 +628,12 @@ impl Executor for LiveExecutor {
                 if saw_record && all_fees_known && covers_confirmed {
                     fee_usd = Some(fee_acc);
                 }
-                if size > 0.0 {
+                // Same coverage rule as the fee: a partial, eventually
+                // consistent slice's VWAP is not the price of the whole
+                // confirmed fill if the missing part traded elsewhere, so
+                // only trust it once the matched size covers what the
+                // position delta confirmed.
+                if size > 0.0 && covers_confirmed {
                     fill_price = value / size;
                     source = "venue_fills";
                 }

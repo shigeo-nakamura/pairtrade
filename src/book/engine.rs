@@ -99,6 +99,14 @@ pub struct BookEngine {
     config_fp: String,
 }
 
+/// The budget key for a flip's reduce-only close: kept separate from the
+/// plain symbol key (which tracks the paired opening) so a close that
+/// keeps erroring or landing unfilled cannot resubmit forever just
+/// because the opening it is blocking never spends its own budget.
+fn flip_close_budget_key(symbol: &str) -> String {
+    format!("{symbol}#close")
+}
+
 /// How one decision's execution ended.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecSummary {
@@ -107,11 +115,13 @@ pub struct ExecSummary {
     /// because every opening was administratively blocked must not spend
     /// an execution attempt).
     pub sent: usize,
-    /// Symbols among those the venue actually saw, excluding a flip's
-    /// reduce-only close: that close must not consume the budget of its
-    /// paired opening, whether that opening aborted before it was sent or
-    /// was blocked outright. A standalone reduction (no opening leg for the
-    /// same symbol in this plan) still counts.
+    /// Symbols (or, for a flip's reduce-only close, its own
+    /// [`flip_close_budget_key`]) among those the venue actually saw. A
+    /// flip's close spends its own separate budget rather than its paired
+    /// opening's, so a close that keeps failing cannot resubmit
+    /// unboundedly just because the opening it blocks never sends. A
+    /// standalone reduction (no opening leg for the same symbol in this
+    /// plan) still counts against the plain symbol key.
     pub sent_symbols: BTreeSet<String>,
     pub filled: usize,
     pub partial: usize,
@@ -686,17 +696,45 @@ impl BookEngine {
         };
         // A leg that has used its own budget is dropped from the retry;
         // the others still go out. Nothing left to send means nothing to
-        // record either -- the record already says `partial`.
+        // record either -- the record already says `partial`. A flip's
+        // close spends a separate budget key from its paired opening (see
+        // `flip_close_budget_key`): if the close alone has exhausted its
+        // budget, both legs for that symbol are dropped together, since
+        // sending the opening without a confirmed close would double the
+        // venue exposure rather than complete the flip.
         let mut plan = plan;
         let max = self.cfg.execution.max_attempts;
+        // A symbol only has a live flip in *this* plan when both its
+        // reduce-only close and its opening leg are still present -- once
+        // the close has already filled (or there is no old position left
+        // to close), a fresh opening for the symbol is a plain open, and a
+        // leftover "#close" budget entry from an earlier tick's flip must
+        // not block it.
+        let opening_symbols: std::collections::HashSet<&str> = plan
+            .intents
+            .iter()
+            .filter(|i| !i.reduce_only)
+            .map(|i| i.symbol.as_str())
+            .collect();
+        let true_flip_symbols: std::collections::HashSet<String> = plan
+            .intents
+            .iter()
+            .filter(|i| i.reduce_only && opening_symbols.contains(i.symbol.as_str()))
+            .map(|i| i.symbol.clone())
+            .collect();
+        let symbol_exhausted = |symbol: &str| -> bool {
+            rec.attempts_for(symbol) >= max
+                || (true_flip_symbols.contains(symbol)
+                    && rec.attempts_for(&flip_close_budget_key(symbol)) >= max)
+        };
         let dropped: Vec<String> = plan
             .intents
             .iter()
-            .filter(|i| rec.attempts_for(&i.symbol) >= max)
+            .filter(|i| symbol_exhausted(&i.symbol))
             .map(|i| i.symbol.clone())
             .collect();
         if !dropped.is_empty() {
-            plan.intents.retain(|i| rec.attempts_for(&i.symbol) < max);
+            plan.intents.retain(|i| !symbol_exhausted(&i.symbol));
             log::warn!(
                 "[REBALANCE] key={} legs out of attempts, not retried: {dropped:?}",
                 d.key
@@ -1160,11 +1198,13 @@ impl BookEngine {
             match self.exec.execute(intent).await {
                 Ok(fill) => {
                     s.sent += 1;
-                    // A flip's close does not spend the budget its paired
-                    // opening still needs; a standalone reduction (no
-                    // opening leg for this symbol in the plan) still counts,
-                    // unchanged from before.
-                    if !intent.reduce_only || !flip_symbols.contains(intent.symbol.as_str()) {
+                    // A flip's close spends its own budget key, not the
+                    // paired opening's; a standalone reduction (no opening
+                    // leg for this symbol in the plan) counts against the
+                    // plain symbol key as before.
+                    if intent.reduce_only && flip_symbols.contains(intent.symbol.as_str()) {
+                        s.sent_symbols.insert(flip_close_budget_key(&intent.symbol));
+                    } else {
                         s.sent_symbols.insert(intent.symbol.clone());
                     }
                     if fill.filled_qty > 0.0 {
@@ -1188,7 +1228,9 @@ impl BookEngine {
                     if !pre_send {
                         s.sent += 1;
                         // Same flip-stage rule as the success path.
-                        if !intent.reduce_only || !flip_symbols.contains(intent.symbol.as_str()) {
+                        if intent.reduce_only && flip_symbols.contains(intent.symbol.as_str()) {
+                            s.sent_symbols.insert(flip_close_budget_key(&intent.symbol));
+                        } else {
                             s.sent_symbols.insert(intent.symbol.clone());
                         }
                         // The order was submitted and its outcome is
@@ -1531,6 +1573,27 @@ impl BookEngine {
         let symbols = self.tracked_symbols();
         let prices = self.exec.prices(&symbols).await;
         self.write_daily_mark(now, &prices).await;
+        // The mark's funding accrual can move equity down; re-check the
+        // rails against it immediately, same date. Without this, the only
+        // remaining evaluation is the next date's first tick, which rolls
+        // the daily anchor to this already funding-reduced equity before
+        // ever comparing it against today's start_equity -- a funding loss
+        // above the daily threshold but below the session one would then
+        // never be observed as a halt, unlike a live tick, where the mark
+        // runs on the new date's first tick and the funding hit is instead
+        // caught by evaluate() on that same date's *next* tick.
+        let (equity, equity_ready) = self.compute_equity(&prices).await;
+        if equity_ready {
+            for ev in self.risk.evaluate(&mut self.state, now, equity) {
+                if let RiskEvent::DailyHalt { .. } = ev {
+                    log::warn!(
+                        "[RISK] daily loss halt {ev:?} (post-mark funding accrual); opens blocked until next UTC day"
+                    );
+                    self.ledger
+                        .write(now, "halt", None, json!({ "risk": ev, "equity": equity }));
+                }
+            }
+        }
         if let Err(e) = self.state.persist(&self.cfg.paths.state) {
             log::error!("[MARK] persist failed: {e}");
         }

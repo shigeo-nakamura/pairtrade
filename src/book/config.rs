@@ -335,13 +335,14 @@ impl BookConfig {
         // persist overwrite the ledger; a path that collided with a flag
         // file would be worse still, since the kill switch and RISK_ACK
         // are read as "this file exists".
-        let named: [(&str, &Path); 6] = [
+        let named: [(&str, &Path); 7] = [
             ("paths.state", &self.paths.state),
             ("paths.ledger", &self.paths.ledger),
             ("paths.pnl", &self.paths.pnl),
             ("paths.status", &self.paths.status),
             ("risk.kill_switch_path", &self.risk.kill_switch_path),
             ("risk.risk_ack_path", &self.risk.risk_ack_path),
+            ("signal.path", &self.signal.path),
         ];
         let mut seen: Vec<(&str, PathBuf)> = Vec::new();
         for (name, path) in named {
@@ -574,6 +575,14 @@ mod tests {
             c.paths.ledger = dir.path().join("ledger.jsonl");
             assert!(c.validate().is_err());
         }
+        // signal.path aliasing another runtime path is just as unsafe: the
+        // engine reads it directly, so an alias to the ledger makes the
+        // signal unparsable, and an alias to the kill switch blocks every
+        // opening.
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.signal.path = c.paths.ledger.clone();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("signal.path"), "{e}");
     }
 
     #[test]
