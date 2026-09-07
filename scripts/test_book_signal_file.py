@@ -24,6 +24,19 @@ class SignalFileTests(unittest.TestCase):
             '{"as_of":"2026-09-06T00:00:00Z","decision_key":"2026-09-06","producer_id":"p","weights":{"BTC":0.1,"ETH":1.0,"SOL":-0.1}}',
         )
 
+    def test_hash_vector_with_non_ascii_producer_id_matches_rust(self):
+        # ensure_ascii=False must be set on the Python side: serde_json
+        # never \u-escapes non-ASCII text, so a naive json.dumps() here
+        # would hash different bytes than the Rust validator for the same
+        # logical payload and reject every signal from a non-ASCII
+        # producer_id/decision_key/symbol with hash_mismatch.
+        sha = bsf.payload_sha256("prîd_日本語", "2026-09-06T00:00:00Z", "2026-09-06", {"BTC": 0.1})
+        self.assertEqual(sha, "739a42e64055240a8c9be1dd93422d58a4e8e326574464bee1ed4fd9cfc4acfc")
+        self.assertEqual(
+            bsf.canonical_payload("prîd_日本語", "2026-09-06T00:00:00Z", "2026-09-06", {"BTC": 0.1}),
+            '{"as_of":"2026-09-06T00:00:00Z","decision_key":"2026-09-06","producer_id":"prîd_日本語","weights":{"BTC":0.1}}',
+        )
+
     def test_build_and_write_roundtrip(self):
         gen = datetime(2026, 9, 6, 0, 20, 36, tzinfo=timezone.utc)
         as_of = datetime(2026, 9, 6, 0, 0, 0, tzinfo=timezone.utc)

@@ -395,6 +395,28 @@ mod tests {
     }
 
     #[test]
+    fn canonical_payload_matches_python_for_a_non_ascii_producer_id() {
+        // Shared vector with
+        // scripts/test_book_signal_file.py::test_hash_vector_with_non_ascii_producer_id_matches_rust
+        // (produced there with ensure_ascii=False, since serde_json never
+        // \u-escapes non-ASCII text -- a naive json.dumps() would hash
+        // different bytes than this for the same logical payload).
+        let w: BTreeMap<String, f64> = [("BTC", 0.1)]
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let s = canonical_payload("prîd_日本語", &ts("2026-09-06T00:00:00Z"), "2026-09-06", &w);
+        assert_eq!(
+            s,
+            "{\"as_of\":\"2026-09-06T00:00:00Z\",\"decision_key\":\"2026-09-06\",\"producer_id\":\"prîd_日本語\",\"weights\":{\"BTC\":0.1}}"
+        );
+        assert_eq!(
+            sha256_hex(&s),
+            "739a42e64055240a8c9be1dd93422d58a4e8e326574464bee1ed4fd9cfc4acfc"
+        );
+    }
+
+    #[test]
     fn accepts_a_well_formed_signal() {
         let c = cfg();
         let v = validate(

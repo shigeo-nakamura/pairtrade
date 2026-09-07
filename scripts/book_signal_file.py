@@ -6,7 +6,7 @@ validator. Producers (XSMOM, Engine B) import `write_signal` so the payload
 hash is computed exactly the way the runtime recomputes it:
 
     sha256(json.dumps({"as_of", "decision_key", "producer_id", "weights"},
-                      sort_keys=True, separators=(",", ":")))
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
 Timestamps are rendered as `YYYY-MM-DDTHH:MM:SSZ` (UTC, second precision).
 Weights are plain floats; `repr(float)` formatting on both sides agrees for
@@ -48,7 +48,12 @@ def canonical_payload(producer_id: str, as_of: str, decision_key: str, weights: 
         "producer_id": producer_id,
         "weights": {k: float(v) for k, v in weights.items()},
     }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    # ensure_ascii=False: the Rust side (serde_json) never \u-escapes
+    # non-ASCII characters, only quotes/backslashes/control chars, so a
+    # non-ASCII producer_id/decision_key/symbol must be encoded the same
+    # way here or the two sides hash different bytes for an otherwise
+    # identical payload.
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def payload_sha256(producer_id: str, as_of: str, decision_key: str, weights: dict) -> str:

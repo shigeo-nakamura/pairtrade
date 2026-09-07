@@ -25,8 +25,14 @@ pub struct Decision {
     pub flatten_at: Option<i64>,
 }
 
-/// One entry of a `kind: calendar` file.
+/// One entry of a `kind: calendar` file. `deny_unknown_fields` matters
+/// more here than elsewhere: a misspelled `flatten_at` (e.g.
+/// `flatten_after`) would otherwise be silently dropped and defaulted to
+/// `None`, and the runtime would accept the calendar but never close that
+/// entry's position -- potentially leaving live exposure open
+/// indefinitely instead of failing to load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CalendarEntry {
     pub decision_key: String,
     pub decision_at: DateTime<Utc>,
@@ -35,6 +41,7 @@ pub struct CalendarEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CalendarFile {
     #[serde(default)]
     pub calendar_version: String,
@@ -247,6 +254,22 @@ mod tests {
 
     fn ts(s: &str) -> i64 {
         DateTime::parse_from_rfc3339(s).unwrap().timestamp()
+    }
+
+    #[test]
+    fn load_calendar_rejects_a_misspelled_flatten_field_instead_of_dropping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calendar.json");
+        // `flatten_after` is not a field: without deny_unknown_fields this
+        // would silently deserialize as an entry with no flatten_at at
+        // all, accepting the calendar but never closing the position.
+        std::fs::write(
+            &path,
+            r#"{"entries":[{"decision_key":"2026-09-08","decision_at":"2026-09-08T06:30:00Z","flatten_after":"2026-09-08T13:30:00Z"}]}"#,
+        )
+        .unwrap();
+        let e = format!("{:#}", load_calendar(&path).unwrap_err());
+        assert!(e.to_lowercase().contains("flatten_after"), "{e}");
     }
 
     fn interval() -> Scheduler {

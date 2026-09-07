@@ -350,6 +350,14 @@ impl BookConfig {
         if ex.paper_slippage_bps >= 10_000.0 {
             bail!("execution.paper_slippage_bps must be < 10000 (100%)");
         }
+        // The live budget guards the same adverse-price direction as the
+        // paper one (LiveExecutor's within_slippage / send_capped price
+        // cap): at 100% or more it stops meaningfully bounding a sell
+        // (any positive mid passes), so a live order could clear far
+        // outside its sizing reference instead of being rejected.
+        if ex.slippage_bps >= 10_000 {
+            bail!("execution.slippage_bps must be < 10000 (100%)");
+        }
         // Every runtime file must be its own. Sharing one would have each
         // ledger append leave the state unparsable and the end-of-tick
         // persist overwrite the ledger; a path that collided with a flag
@@ -819,6 +827,16 @@ mod tests {
         c.execution.paper_slippage_bps = 10_000.0;
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("paper_slippage_bps"), "{e}");
+    }
+
+    #[test]
+    fn rejects_live_slippage_of_a_hundred_percent_or_more() {
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.execution.slippage_bps = 9_999;
+        assert!(c.validate().is_ok());
+        c.execution.slippage_bps = 10_000;
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("execution.slippage_bps"), "{e}");
     }
 
     #[test]
