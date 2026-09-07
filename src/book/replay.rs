@@ -327,7 +327,7 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         // The mark belongs to the last instant of the bar date, after every
         // decision/flatten of the date, so funding intervals line up with
         // the dates whose rates they use.
-        engine.daily_mark_now(day_end - 1).await;
+        engine.daily_mark_now(day_end - 1).await?;
         summary.days += 1;
     }
     let prices = exec.prices(&cfg.universe.symbols).await;
@@ -342,7 +342,8 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
     Ok(summary)
 }
 
-/// `generated_at` of the signal file for `key`, as unix seconds. `None`
+/// `generated_at` of the signal file for `key`, as unix seconds, rounded up
+/// to the next whole second when it carries a fractional remainder. `None`
 /// when there is no file, or it cannot be read or parsed: this only picks
 /// tick times, every check stays with the engine.
 fn signal_generated_at(replay_dir: &Path, key: &str) -> Option<i64> {
@@ -356,12 +357,20 @@ fn signal_generated_at(replay_dir: &Path, key: &str) -> Option<i64> {
     // offset that normal signal validation accepts, hiding it from the
     // arrival-tick schedule and letting its grace window close (recorded
     // as skipped) even though the engine would have accepted it.
-    Some(
-        DateTime::parse_from_rfc3339(raw)
-            .ok()?
-            .with_timezone(&Utc)
-            .timestamp(),
-    )
+    let dt = DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc);
+    // The engine's own acceptance check compares whole-second tick times
+    // against `window_end` (`now <= d.window_end`); a live poll can only
+    // ever observe this file at or after its real arrival instant. Ceiling
+    // instead of `.timestamp()`'s floor, so a file generated at, say,
+    // `window_end + 0.5s` schedules its arrival tick at `window_end + 1`
+    // (correctly outside the window) rather than at `window_end` itself
+    // (which would let replay accept a signal live would have rejected).
+    let secs = dt.timestamp();
+    Some(if dt.timestamp_subsec_nanos() > 0 {
+        secs + 1
+    } else {
+        secs
+    })
 }
 
 /// Convenience for callers that hold a config path.
@@ -822,7 +831,14 @@ mod tests {
             "an unparseable arrival timestamp would leave this window never ticked before it \
              closes, recording it skipped instead"
         );
-        assert_eq!(rows[0]["ts_ms"], arrival.timestamp_millis());
+        // The arrival tick is scheduled at the ceiling of the file's real
+        // (fractional) generated_at, not its floor: a live poll could not
+        // have observed this file any earlier than 00:10:00.250, so the
+        // synthetic tick lands at 00:10:01, one second after `arrival`.
+        assert_eq!(
+            rows[0]["ts_ms"],
+            (arrival + Duration::seconds(1)).timestamp_millis()
+        );
     }
 
     #[tokio::test]

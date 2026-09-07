@@ -1826,7 +1826,11 @@ impl BookEngine {
 
     /// Write the daily mark for `now` unconditionally (replay: at the last
     /// tick of a bar date, after every decision/flatten of that date).
-    pub async fn daily_mark_now(&mut self, now: i64) {
+    /// Propagates a pnl.jsonl append failure instead of only logging it:
+    /// unlike the live loop, replay has no later tick on the same date to
+    /// retry the mark, so a swallowed failure here would let `run` return
+    /// success with that date's mark silently missing.
+    pub async fn daily_mark_now(&mut self, now: i64) -> Result<()> {
         let symbols = self.tracked_symbols();
         let prices = self.exec.prices(&symbols).await;
         let (date, funding_detail) = self.accrue_daily_funding(now, &prices).await;
@@ -1882,9 +1886,11 @@ impl BookEngine {
         // Write the mark only now, after any halt/flatten above, so it
         // reflects the post-flatten book instead of the state from before
         // the day-end risk check: on the final replay day nothing later
-        // corrects a mark taken before the flatten.
+        // corrects a mark taken before the flatten. Propagated (`?`):
+        // replay must fail the whole run here rather than proceed to the
+        // next bar date with this date's mark missing.
         self.write_daily_mark_row(now, &prices, &date, funding_detail)
-            .await;
+            .await?;
         // The halt/flatten above can change positions and flags after the
         // last tick already wrote status.json for this date; re-write it so
         // a replay ending on this date doesn't leave status.json reporting
@@ -1894,11 +1900,15 @@ impl BookEngine {
         if let Err(e) = self.state.persist(&self.cfg.paths.state) {
             log::error!("[MARK] persist failed: {e}");
         }
+        Ok(())
     }
 
     async fn write_daily_mark(&mut self, now: i64, prices: &HashMap<String, f64>) {
         let (date, funding_detail) = self.accrue_daily_funding(now, prices).await;
-        self.write_daily_mark_row(now, prices, &date, funding_detail)
+        // Error already logged inside; leaving `last_mark_date` unset gets
+        // the live 5s loop to retry this same date on its next tick.
+        let _ = self
+            .write_daily_mark_row(now, prices, &date, funding_detail)
             .await;
     }
 
@@ -1977,14 +1987,20 @@ impl BookEngine {
     /// Write the mark row for `date` and advance `last_mark_date`. Split
     /// out of `write_daily_mark` so `daily_mark_now` can run its risk
     /// evaluation and any halt/flatten between accrual and this call (see
-    /// `accrue_daily_funding`).
+    /// `accrue_daily_funding`). Returns the append error (after logging
+    /// it) rather than only logging: `write_daily_mark`'s live caller
+    /// intentionally ignores it, since leaving `last_mark_date` unset
+    /// already gets the live 5s loop to retry the mark next tick, but
+    /// `daily_mark_now`'s replay caller has no such next tick for the
+    /// same date -- it must fail the run instead of silently reporting
+    /// success with that date's mark missing from pnl.jsonl.
     async fn write_daily_mark_row(
         &mut self,
         now: i64,
         prices: &HashMap<String, f64>,
         date: &str,
         funding_detail: serde_json::Map<String, serde_json::Value>,
-    ) {
+    ) -> Result<()> {
         let (equity, _) = self.compute_equity(prices).await;
         let marks: BTreeMap<String, serde_json::Value> = self
             .state
@@ -2029,7 +2045,7 @@ impl BookEngine {
         );
         if let Err(e) = wrote {
             log::warn!("[MARK] {date} pnl append failed, will retry next tick: {e}");
-            return;
+            return Err(e);
         }
         log::info!(
             "[MARK] {date} equity=${equity:.2} realized=${:.2} unreal=${:.2} funding_est=${:.2} n_pos={}",
@@ -2039,6 +2055,7 @@ impl BookEngine {
             self.state.positions.len()
         );
         self.state.last_mark_date = Some(date.to_string());
+        Ok(())
     }
 
     fn write_status(&mut self, now: i64, prices: &HashMap<String, f64>, equity: f64) {
@@ -2799,7 +2816,7 @@ mod tests {
         // The next daily mark runs with the rate feed recovered
         // (`paper_engine`'s default 0.0001/hr): the orphaned carry must be
         // settled here, not left stranded until a reopen that never comes.
-        engine.daily_mark_now(after_one_hour + 3600).await;
+        engine.daily_mark_now(after_one_hour + 3600).await.unwrap();
         assert!(
             !engine.state.pending_funding_qty_hours.contains_key("BTC"),
             "orphaned pending funding must be settled once the rate recovers"
@@ -2832,7 +2849,7 @@ mod tests {
             .insert("XRP".to_string(), 100.0);
         assert!(!engine.state.positions.contains_key("XRP"));
 
-        engine.daily_mark_now(secs("2026-09-06T00:00:00Z")).await;
+        engine.daily_mark_now(secs("2026-09-06T00:00:00Z")).await.unwrap();
         assert!(
             engine.state.pending_funding_qty_hours.get("XRP").is_none(),
             "an out-of-universe orphaned carry must still be priced and settled"
@@ -3706,7 +3723,7 @@ mod tests {
         // state.json, leaving status.json reporting the pre-halt book).
         exec.set_funding_rate_hourly("SOL", 0.001).await;
         let t1 = t0 + 100 * 3600;
-        engine.daily_mark_now(t1).await;
+        engine.daily_mark_now(t1).await.unwrap();
         assert!(engine.state.session.halted, "session should be halted");
         assert!(engine.state.is_flat(), "session halt flattens the book");
         let after: Value =
@@ -3756,7 +3773,7 @@ mod tests {
         // day of a replay nothing later corrects that mark.
         exec.set_funding_rate_hourly("SOL", 0.001).await;
         let t1 = t0 + 100 * 3600;
-        engine.daily_mark_now(t1).await;
+        engine.daily_mark_now(t1).await.unwrap();
         assert!(engine.state.session.halted);
         assert!(engine.state.is_flat());
 
