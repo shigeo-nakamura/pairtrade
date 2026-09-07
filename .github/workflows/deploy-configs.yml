@@ -148,7 +148,11 @@ jobs:
           aws s3 cp debot/deploy/engine-b-phase0.service "s3://${S3_BUCKET}/deploy/engine-b-phase0.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.service "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.timer "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.timer"
-          for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do
+          # exdiv-lighter units are published and delivered to the host but
+          # never installed or started by CI (bot-strategy#948): the manual
+          # install after gate G1 reads them from /opt/debot/deploy.
+          for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer \
+                   book-runtime-exdiv-lighter.service book-signal-fetch-exdiv-lighter.service book-signal-fetch-exdiv-lighter.timer; do
             aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
           done
           ENGINE_B_PREFIX="debot/engine-b-phase0/releases/${GITHUB_SHA}"
@@ -239,12 +243,14 @@ jobs:
           {
             "commands": [
               "set -e",
-              "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
+              "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs __INSTALL_DIR__/deploy",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exclude '*.env'",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
               "install -d -m 0755 /tmp/book-units-__GITHUB_SHA__",
               "for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u /tmp/book-units-__GITHUB_SHA__/$u; done",
+              "# exdiv-lighter (bot-strategy#948): delivered to the persistent deploy dir that install_book_runtime.sh reads by default, so the post-G1 manual install has its units. NOT installed and NOT started here -- only xsmom-695 is installed below.",
+              "for u in book-runtime-exdiv-lighter.service book-signal-fetch-exdiv-lighter.service book-signal-fetch-exdiv-lighter.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u __INSTALL_DIR__/deploy/$u; done",
               "# Both install paths stage everything from S3 into a per-run dir, so neither depends on the other having run first: ci.yml owns the binary object, this job owns the config and unit objects, and whichever installs last promotes the newest of both under install_book_runtime.sh's flock.",
               "install -d -m 0755 /tmp/engine-b-phase0-__GITHUB_SHA__",
               "aws s3 sync s3://__S3_BUCKET__/debot/engine-b-phase0/releases/__GITHUB_SHA__/ /tmp/engine-b-phase0-__GITHUB_SHA__/ --exact-timestamps",

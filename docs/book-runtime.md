@@ -477,8 +477,9 @@ implemented here so that decision is not blocked on the runtime.
 ## 12. Ex-dividend gap bot on this runtime — decision (bot-strategy#948)
 
 Same shape as Engine B, on a calendar instead of a session table: one
-entry per declared ex-dividend date (`decision_at 13:29:00Z`, `flatten_at
-13:36:00Z`), weights `{SPY: -w, US500: +w}` (ETF hedged with the
+entry per declared ex-dividend date (decision one minute before the US
+cash open, flatten six minutes after it, generated in `America/New_York`
+so the UTC instants follow daylight saving), weights `{SPY: -w, US500: +w}` (ETF hedged with the
 futures-derived index perp) or `{IBM: -w}` (single stock, unhedged), an
 empty map when the producer's skip gates fire. Skip gates and the
 slippage-budget size rule live in `scripts/exdiv_signal_producer.py`;

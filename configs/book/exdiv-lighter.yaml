@@ -4,10 +4,13 @@
 #
 # This is a `schedule.kind: calendar` instance of the book runtime (#937):
 # every declared ex-dividend date in configs/book/exdiv-events.json becomes
-# one calendar entry {decision_at 13:29:00Z, flatten_at 13:36:00Z}.
-# scripts/exdiv_signal_producer.py writes the signal at ~13:27 UTC from the
-# local Lighter WS logger (skip gates + slippage-budget sizing live there,
-# the runtime only executes); an empty weights map is the valid "skip".
+# one calendar entry, one minute before the US cash open to six minutes
+# after it. Those instants are generated in America/New_York and converted
+# per date, so a summer event is 13:29:00Z/13:36:00Z and a winter one
+# 14:29:00Z/14:36:00Z. scripts/exdiv_signal_producer.py writes the signal
+# two minutes before the decision from the local Lighter WS logger (skip
+# gates + slippage-budget sizing live there, the runtime only executes);
+# an empty weights map is the valid "skip".
 # The Hyperliquid leg (exdiv-hl) is a separate instance, added only after
 # the 2026-09-16 TSM readout confirms the same index step on HL.
 schema_version: 1
@@ -39,8 +42,9 @@ schedule:
   # subcommand; installed next to this file by install_book_runtime.sh
   # (BOOK_CALENDAR_SOURCE). The runtime loads it at startup.
   calendar_path: /opt/book-runtime/exdiv-lighter.calendar.json
-  # Entry is time-only (13:29:00): a signal that is not valid by 13:31 is
-  # useless because the step lands 13:30-13:31, so the window is short.
+  # Entry is time-only (one minute before the cash open): a signal that is
+  # not valid two minutes later is useless, because the step lands in the
+  # first minute of the session, so the window is deliberately short.
   signal_grace_secs: 120
 
 signal:

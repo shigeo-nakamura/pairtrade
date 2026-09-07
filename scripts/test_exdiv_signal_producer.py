@@ -2,6 +2,7 @@
 """Tests for exdiv_signal_producer.py (synthetic logger rows, no network)."""
 import json
 import os
+import statistics as st
 import subprocess
 import sys
 import tempfile
@@ -106,6 +107,39 @@ class CalendarTests(unittest.TestCase):
             xp.load_events(write([good, dict(good, dividend_usd=2.0)]))
 
 
+class MarketTimezoneTests(unittest.TestCase):
+    """The open is 13:30 UTC only under daylight saving (Codex P2 on #288)."""
+
+    def test_calendar_entries_follow_the_new_york_open(self):
+        summer = [dict(EVENTS[0], ex_date=date(2026, 9, 18))]
+        winter = [dict(EVENTS[0], symbol="EWY", ex_date=date(2026, 12, 16))]
+        e_s = xp.calendar_from_events(summer)["entries"][0]
+        e_w = xp.calendar_from_events(winter)["entries"][0]
+        self.assertEqual((e_s["decision_at"], e_s["flatten_at"]),
+                         ("2026-09-18T13:29:00Z", "2026-09-18T13:36:00Z"))
+        self.assertEqual((e_w["decision_at"], e_w["flatten_at"]),
+                         ("2026-12-16T14:29:00Z", "2026-12-16T14:36:00Z"))
+
+    def test_prev_close_lookup_follows_the_new_york_close(self):
+        # NY 15:59 is 19:59 UTC in September and 20:59 UTC in December; a
+        # fixed 19:59 would silently disable the landed-step gate in winter.
+        sept = datetime(2026, 9, 17, 19, 59, tzinfo=timezone.utc)
+        dec = datetime(2026, 12, 15, 20, 59, tzinfo=timezone.utc)
+        self.assertEqual(xp.close_index([row("SPY", sept, 659.0, 661.0, index=660.0)],
+                                        "SPY", date(2026, 9, 17)), 660.0)
+        self.assertEqual(xp.close_index([row("EWY", dec, 59.0, 61.0, index=60.0)],
+                                        "EWY", date(2026, 12, 15)), 60.0)
+        # the summer-shaped row is NOT accepted for a winter date
+        self.assertIsNone(xp.close_index([row("EWY", datetime(2026, 12, 15, 19, 59, tzinfo=timezone.utc),
+                                              59.0, 61.0, index=60.0)], "EWY", date(2026, 12, 15)))
+
+    def test_window_start_follows_the_new_york_lookback(self):
+        winter_d = date(2026, 12, 16)
+        start = xp.market_instant(winter_d, xp.LOOKBACK_START_NY)
+        self.assertEqual(start.strftime("%H:%M"), "14:23")
+        self.assertEqual(xp.decision_at(winter_d).strftime("%H:%M"), "14:29")
+
+
 class SignalTests(unittest.TestCase):
     def test_hedged_and_unhedged_legs_sized_from_depth(self):
         sig = xp.build_signal(EVENTS, D, base_rows(), prev_rows(), NOW)
@@ -192,6 +226,89 @@ class SignalTests(unittest.TestCase):
         self.assertNotIn("TSM", w)
         self.assertLess(agg["scale"], 1.0)
 
+    def test_late_run_is_bounded_at_the_decision_instant(self):
+        """A delayed cron or a retry inside the grace window must not size
+        from post-decision prices, nor relabel as_of to hide it (Codex P1)."""
+        on_time = xp.build_signal(EVENTS[:1], D, base_rows(), prev_rows(), NOW)
+        # Same day, but the book collapses right after the decision: rows at
+        # 13:30-13:34 carry a fraction of the depth and a much wider spread.
+        after = []
+        for i in range(5):
+            t = datetime(2026, 9, 18, 13, 30 + i, tzinfo=timezone.utc)
+            after.append(row("SPY", t, 655.0, 665.0, bid_sz=0.05, ask_sz=0.05,
+                             depth={"2": {"bid": 10.0, "ask": 10.0}, "3": {"bid": 10.0, "ask": 10.0},
+                                    "5": {"bid": 10.0, "ask": 10.0}, "10": {"bid": 10.0, "ask": 10.0},
+                                    "20": {"bid": 10.0, "ask": 10.0}, "50": {"bid": 10.0, "ask": 10.0}}))
+            after.append(row("US500", t, 6599.9, 6600.1, bid_sz=20, ask_sz=20))
+        late_now = datetime(2026, 9, 18, 13, 35, tzinfo=timezone.utc)
+        late = xp.build_signal(EVENTS[:1], D, base_rows() + after, prev_rows(), late_now)
+        # The post-decision rows are invisible: same weights as the on-time run.
+        self.assertEqual(late["weights"], on_time["weights"])
+        self.assertEqual(late["meta"]["events"][0]["spread_bps"], on_time["meta"]["events"][0]["spread_bps"])
+        # as_of is a real observation time, never after the decision.
+        self.assertLessEqual(late["as_of"], "2026-09-18T13:29:00Z")
+        self.assertEqual(late["meta"]["input_cutoff"], "2026-09-18T13:29:00Z")
+        self.assertEqual(late["meta"]["decision_at"], "2026-09-18T13:29:00Z")
+        self.assertEqual(late["generated_at"], "2026-09-18T13:35:00Z")
+        # Mutation check: the assertions above are only meaningful if those
+        # post-decision rows would otherwise have changed the outcome. With
+        # the cutoff moved back to "now" (the pre-fix behaviour) they are
+        # visible, and they do change it -- 30 bps median spread trips the
+        # skip gate that the bounded run passes.
+        rows = base_rows() + after
+        dec = xp.decision_at(D)
+        bounded_win = xp.window_rows(rows, "SPY", dec)
+        unbounded_win = xp.window_rows(rows, "SPY", late_now)
+        self.assertEqual(len(bounded_win), 5)          # the whole 09:23-09:29 window
+        self.assertGreater(len(unbounded_win), len(bounded_win))
+        self.assertTrue(any(r["_t"] > dec for r in unbounded_win))
+        self.assertTrue(all(r["_t"] <= dec for r in bounded_win))
+        self.assertGreater(
+            st.median([xp.spread_bps(r) for r in unbounded_win]),
+            xp.SKIP_SPREAD_BPS,
+        )
+        self.assertLess(
+            st.median([xp.spread_bps(r) for r in bounded_win]),
+            xp.SKIP_SPREAD_BPS,
+        )
+        # A run with only post-decision rows has nothing admissible at all.
+        wide_only = xp.build_signal(EVENTS[:1], D, after, prev_rows(), late_now)
+        self.assertEqual(wide_only["meta"]["events"][0]["skip"], "no_fresh_book")
+
+    def test_aggregate_net_cap_scales_unhedged_events_together(self):
+        """Two $2,000 unhedged shorts are inside the gross and symbol caps
+        but breach max_net_usd, which would make the runtime reject the
+        whole plan and trade neither event (Codex P2)."""
+        evals = [{"symbol": "IBM", "hedge": None, "skip": None, "notional_usd": 2000.0},
+                 {"symbol": "TSM", "hedge": None, "skip": None, "notional_usd": 2000.0}]
+        w, agg = xp.weights_from_evals(evals, 8000.0, 2200.0)
+        self.assertLessEqual(abs(agg["net_usd"]), 2200.0 + 1e-6)
+        self.assertAlmostEqual(agg["net_usd"], -2200.0, places=4)
+        self.assertAlmostEqual(w["IBM"], w["TSM"], places=9)      # scaled together
+        self.assertLess(agg["scale"], 1.0)
+        # A hedged pair has no net exposure, so the cap never shrinks it.
+        hedged = [{"symbol": "SPY", "hedge": "US500", "skip": None, "notional_usd": 2000.0}]
+        w2, agg2 = xp.weights_from_evals(hedged, 8000.0, 2200.0)
+        self.assertEqual(agg2["scale"], 1.0)
+        self.assertAlmostEqual(agg2["net_usd"], 0.0, places=6)
+
+    def test_producer_constants_match_the_deployed_config(self):
+        """The producer mirrors the runtime caps; drift would produce files
+        the runtime rejects."""
+        import re
+        cfg = open(os.path.join(os.path.dirname(HERE), "configs", "book", "exdiv-lighter.yaml")).read()
+
+        def num(section, key):
+            block = re.search(rf"^{section}:\s*$(.*?)^[a-z_]+:", cfg, re.M | re.S).group(1)
+            return float(re.search(rf"^\s+{key}:\s*([0-9.]+)", block, re.M).group(1))
+
+        self.assertEqual(xp.GROSS_USD, num("sizing", "gross_notional_usd"))
+        self.assertEqual(xp.MAX_SYMBOL_WEIGHT, num("sizing", "max_symbol_weight"))
+        self.assertEqual(xp.MAX_NET_USD, num("sizing", "max_net_usd"))
+        self.assertEqual(xp.PRODUCER_ID, re.search(r"^\s+producer_id:\s*(\S+)", cfg, re.M).group(1))
+        # one leg at the cap must stay inside the per-symbol weight cap
+        self.assertLessEqual(xp.MAX_LEG_USD / xp.GROSS_USD, xp.MAX_SYMBOL_WEIGHT + 1e-12)
+
     def test_no_event_or_no_rows(self):
         self.assertIsNone(xp.build_signal(EVENTS, date(2026, 9, 17), [], [], NOW))
         sig = xp.build_signal(EVENTS, D, [], [], NOW)      # event day, logger dead
@@ -236,6 +353,16 @@ class SignalTests(unittest.TestCase):
                                 "--date", "2026-09-17", "--log-dir", logdir], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertFalse(os.path.exists(out + ".2"))
+            # late run: writes with a warning by default, exit 3 with the flag
+            r = subprocess.run([sys.executable, script, "signal", "--events", ev, "--out", out,
+                                "--date", "2026-09-18", "--now", "2026-09-18T13:35:00Z", "--log-dir", logdir],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("WARNING", r.stderr)
+            r = subprocess.run([sys.executable, script, "signal", "--events", ev, "--out", out,
+                                "--date", "2026-09-18", "--now", "2026-09-18T13:35:00Z", "--log-dir", logdir,
+                                "--refuse-after-decision"], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
             # symbol outside the deployed universe -> refuse (exit 2)
             with open(ev, "w") as f:
                 json.dump({"schema_version": 1, "events": [

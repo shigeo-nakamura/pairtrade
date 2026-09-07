@@ -6,15 +6,26 @@ WS logger (`~/bot/scripts/lighter_exdiv_logger.py`, bot-strategy#681):
 
   calendar  configs/book/exdiv-events.json  ->  <instance>.calendar.json
             One runtime calendar entry per ex-dividend date that has at
-            least one `status: declared` row: decision 13:29:00 UTC,
-            flatten 13:36:00 UTC (the frozen open-window design). CI checks
-            the committed calendar equals this output (`--check`).
+            least one `status: declared` row: decision one minute before
+            the US cash open, flatten six minutes after it (the frozen
+            open-window design). Every time here is anchored to
+            `America/New_York` and converted to UTC per date, so a winter
+            (EST) event gets 14:29Z/14:36Z where a summer (EDT) one gets
+            13:29Z/13:36Z. CI checks the committed calendar equals this
+            output (`--check`).
 
-  signal    at ~13:27 UTC on an ex-dividend date: read the logger rows of
-            the last few minutes, apply the skip gates, size each leg from
-            the slippage budget, and write schema-v1 signal.json (empty
-            weights = valid "skip", so the runtime still records the
-            decision). Optionally upload to S3 for book_signal_fetch.sh.
+  signal    a couple of minutes before the open on an ex-dividend date:
+            read the logger rows of the last few minutes, apply the skip
+            gates, size each leg from the slippage budget, and write
+            schema-v1 signal.json (empty weights = valid "skip", so the
+            runtime still records the decision). Optionally upload to S3
+            for book_signal_fetch.sh.
+
+            Input rows are always bounded at the decision instant, never
+            at "now": a delayed cron or an operator retry inside the
+            runtime's grace window must not size the book from prices
+            observed after the decision (and possibly after the dividend
+            step). `as_of` is then genuinely the last row used.
 
 The runtime never computes a signal (docs/book-runtime.md §1); everything
 that decides *whether* and *how much* lives here so the runtime stays a
@@ -51,16 +62,23 @@ import re
 import statistics as st
 import subprocess
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import book_signal_file as bsf  # noqa: E402
 
 PRODUCER_ID = "exdiv_948_open_window_v1"
 CALENDAR_SCHEMA = 1
-ENTRY_HHMMSS = (13, 29, 0)
-FLATTEN_HHMMSS = (13, 36, 0)
-LOOKBACK_START_HHMM = (13, 23)          # rows [13:23, now] feed the gates
+# Every schedule instant is defined in US market local time and converted
+# per date: the US cash open is 13:30 UTC only under daylight saving, and
+# 14:30 UTC in winter (a December EWY event, say). Hard-coded UTC would
+# enter an hour early and disable the T-1 close lookup for those dates.
+MARKET_TZ = ZoneInfo("America/New_York")
+ENTRY_NY = (9, 29, 0)                   # one minute before the cash open
+FLATTEN_NY = (9, 36, 0)
+LOOKBACK_START_NY = (9, 23)             # rows [09:23 NY, decision] feed the gates
+PREV_CLOSE_NY = ((15, 59), (15, 55))    # T-1 close index, in preference order
 MIN_FRESH_ROWS = 3
 FRESH_OB_SECS = 90.0
 
@@ -68,6 +86,7 @@ GROSS_USD = 8000.0                      # sizing.gross_notional_usd
 MAX_LEG_USD = 2000.0
 MIN_LEG_USD = 50.0
 MAX_SYMBOL_WEIGHT = 0.5                 # sizing.max_symbol_weight
+MAX_NET_USD = 2200.0                    # sizing.max_net_usd
 SKIP_SPREAD_BPS = 30.0
 MIN_L1_USD = 200.0
 SLIPPAGE_BUDGET_FRAC = 0.20
@@ -125,8 +144,22 @@ def declared_on(events: list[dict], d: date) -> list[dict]:
     return [e for e in events if e["status"] == "declared" and e["ex_date"] == d]
 
 
-def _ts(d: date, hhmmss) -> str:
-    return f"{d.isoformat()}T{hhmmss[0]:02d}:{hhmmss[1]:02d}:{hhmmss[2]:02d}Z"
+def market_instant(d: date, hms) -> datetime:
+    """A market-local wall time on date `d`, as an aware UTC datetime.
+
+    `d` is the trading date, so the NY calendar date is the same one; the
+    conversion is what moves with daylight saving."""
+    h, m = hms[0], hms[1]
+    sec = hms[2] if len(hms) > 2 else 0
+    return datetime.combine(d, dtime(h, m, sec), tzinfo=MARKET_TZ).astimezone(timezone.utc)
+
+
+def _ts(d: date, hms) -> str:
+    return market_instant(d, hms).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def decision_at(d: date) -> datetime:
+    return market_instant(d, ENTRY_NY)
 
 
 def calendar_from_events(events: list[dict]) -> dict:
@@ -135,8 +168,8 @@ def calendar_from_events(events: list[dict]) -> dict:
     share a decision and never overlap."""
     dates = sorted({e["ex_date"] for e in events if e["status"] == "declared"})
     entries = [{"decision_key": d.isoformat(),
-                "decision_at": _ts(d, ENTRY_HHMMSS),
-                "flatten_at": _ts(d, FLATTEN_HHMMSS)} for d in dates]
+                "decision_at": _ts(d, ENTRY_NY),
+                "flatten_at": _ts(d, FLATTEN_NY)} for d in dates]
     canon = json.dumps(entries, sort_keys=True, separators=(",", ":"))
     version = "exdiv-948-v1-" + hashlib.sha256(canon.encode()).hexdigest()[:12]
     return {"calendar_version": version, "entries": entries}
@@ -190,14 +223,24 @@ def l1_usd(r):
     return min(bs, as_) * m
 
 
-def fresh(r, now: datetime) -> bool:
+def fresh(r, cutoff: datetime) -> bool:
+    """`ob_age_secs` is intrinsic to the row (how stale the book was when it
+    was logged); the second bound is the row's own age, measured against the
+    decision cutoff rather than wall-clock now, so a late run reads exactly
+    the rows an on-time run would have read."""
     age = _f(r.get("ob_age_secs"))
-    return age is not None and age <= FRESH_OB_SECS and (now - r["_t"]).total_seconds() <= 600
+    return age is not None and age <= FRESH_OB_SECS and (cutoff - r["_t"]).total_seconds() <= 600
 
 
-def window_rows(rows, sym: str, now: datetime) -> list[dict]:
-    start = now.replace(hour=LOOKBACK_START_HHMM[0], minute=LOOKBACK_START_HHMM[1], second=0, microsecond=0)
-    return [r for r in rows if r.get("symbol") == sym and start <= r["_t"] <= now and fresh(r, now) and mid(r)]
+def window_rows(rows, sym: str, cutoff: datetime) -> list[dict]:
+    """Fresh rows in [09:23 NY, cutoff]. `cutoff` is min(now, decision_at):
+    a run that starts late (or is retried inside the runtime's grace
+    window) must not see prices published after the decision instant, and
+    must not see a *smaller* window either -- everything is measured
+    against the cutoff, so a retry reproduces the on-time file."""
+    start = market_instant(cutoff.date(), LOOKBACK_START_NY)
+    return [r for r in rows if r.get("symbol") == sym and start <= r["_t"] <= cutoff
+            and fresh(r, cutoff) and mid(r)]
 
 
 def prev_trading_day(d: date) -> date:
@@ -207,12 +250,16 @@ def prev_trading_day(d: date) -> date:
     return p
 
 
-def close_index(rows_prev, sym: str):
-    """T-1 index at the last RTH minute (19:59 UTC, fallback 19:55). Outside
-    RTH Lighter's index is an internal price, so only these rows count."""
-    for hh, mm in ((19, 59), (19, 55)):
+def close_index(rows_prev, sym: str, prev_day: date):
+    """T-1 index at the last regular-session minute (NY 15:59, fallback
+    15:55). Outside regular hours Lighter's index is an internal book price,
+    so only these rows count; the UTC minute they land on moves with
+    daylight saving, hence the per-date conversion."""
+    for hms in PREV_CLOSE_NY:
+        target = market_instant(prev_day, hms)
         xs = [_f(r.get("index_price")) for r in rows_prev
-              if r.get("symbol") == sym and r["_t"].hour == hh and r["_t"].minute == mm]
+              if r.get("symbol") == sym and r["_t"].hour == target.hour
+              and r["_t"].minute == target.minute]
         xs = [x for x in xs if x]
         if xs:
             return xs[-1]
@@ -243,12 +290,12 @@ def depth_median(win, band: int, side: str):
 
 # ---------------------------------------------------------------- decision
 
-def evaluate_event(ev: dict, rows_t, rows_prev, now: datetime) -> dict:
+def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date) -> dict:
     """One event -> {"notional_usd", "skip": reason|None, diagnostics}."""
     sym, hedge = ev["symbol"], ev["hedge"]
     out = {"symbol": sym, "hedge": hedge, "ex_date": ev["ex_date"].isoformat(),
            "dividend_usd": ev["dividend_usd"], "skip": None, "notional_usd": 0.0}
-    win = window_rows(rows_t, sym, now)
+    win = window_rows(rows_t, sym, cutoff)
     out["n_rows"] = len(win)
     if len(win) < MIN_FRESH_ROWS:
         out["skip"] = "no_fresh_book"
@@ -256,7 +303,7 @@ def evaluate_event(ev: dict, rows_t, rows_prev, now: datetime) -> dict:
     sp = st.median([spread_bps(r) for r in win])
     l1 = st.median([v for v in (l1_usd(r) for r in win) if v is not None] or [0.0])
     m = st.median([mid(r) for r in win])
-    ref = close_index(rows_prev, sym)
+    ref = close_index(rows_prev, sym, prev_day)
     out["ref_index_source"] = "t-1_close" if ref else "current_mid"
     ref = ref or m
     div_bps = ev["dividend_usd"] / ref * 1e4
@@ -271,8 +318,8 @@ def evaluate_event(ev: dict, rows_t, rows_prev, now: datetime) -> dict:
     # Landed-before-open gate: event index move since T-1 close, minus the
     # hedge's (or US500's) move over the same span. Needs a real T-1 close.
     ctl = hedge or "US500"
-    ctl_win = window_rows(rows_t, ctl, now)
-    ctl_ref = close_index(rows_prev, ctl)
+    ctl_win = window_rows(rows_t, ctl, cutoff)
+    ctl_ref = close_index(rows_prev, ctl, prev_day)
     ev_now, ctl_now = latest_index(win), latest_index(ctl_win)
     if out["ref_index_source"] == "t-1_close" and ev_now and ctl_ref and ctl_now:
         adj = ((ev_now / ref - 1) - (ctl_now / ctl_ref - 1)) * 1e4
@@ -325,10 +372,13 @@ def evaluate_event(ev: dict, rows_t, rows_prev, now: datetime) -> dict:
     return out
 
 
-def weights_from_evals(evals: list[dict], gross: float) -> tuple[dict, dict]:
+def weights_from_evals(evals: list[dict], gross: float,
+                       max_net_usd: float = MAX_NET_USD) -> tuple[dict, dict]:
     """Sum legs into weights (fractions of gross). If the day's book would
-    breach sum|w| <= 1 or a symbol cap, scale every leg down together so
-    the hedge ratios survive; the runtime would otherwise reject the file."""
+    breach sum|w| <= 1, a symbol cap, or the instance's net-dollar cap,
+    scale every leg down together so the hedge ratios survive; the runtime
+    rejects a whole plan that breaches any cap, which would lose every
+    event of the day rather than shrink them."""
     w: dict[str, float] = {}
     for e in evals:
         if e["skip"] or e["notional_usd"] <= 0:
@@ -344,6 +394,13 @@ def weights_from_evals(evals: list[dict], gross: float) -> tuple[dict, dict]:
     big = max((abs(v) for v in w.values()), default=0.0)
     if big > MAX_SYMBOL_WEIGHT:
         scale = min(scale, MAX_SYMBOL_WEIGHT / big)
+    # Unhedged single-stock events add up on one side: two $2,000 shorts
+    # are only 0.5 gross and 0.25 per symbol, both inside their caps, yet
+    # $4,000 net against a $2,200 cap -> the runtime would reject the plan
+    # (cap_net) and neither event would trade.
+    net_usd = abs(sum(w.values())) * gross
+    if max_net_usd > 0 and net_usd > max_net_usd:
+        scale = min(scale, max_net_usd / net_usd)
     if scale < 1.0:
         w = {k: v * scale for k, v in w.items()}
     w = {k: round(v, 6) for k, v in w.items()}
@@ -352,21 +409,25 @@ def weights_from_evals(evals: list[dict], gross: float) -> tuple[dict, dict]:
 
 
 def build_signal(events, d: date, rows_t, rows_prev, now: datetime, gross: float = GROSS_USD,
-                 producer_id: str = PRODUCER_ID) -> dict | None:
+                 producer_id: str = PRODUCER_ID, max_net_usd: float = MAX_NET_USD) -> dict | None:
     todays = declared_on(events, d)
     if not todays:
         return None
-    evals = [evaluate_event(e, rows_t, rows_prev, now) for e in todays]
-    weights, agg = weights_from_evals(evals, gross)
-    used = [r["_t"] for e in todays for r in window_rows(rows_t, e["symbol"], now)]
-    as_of = max(used) if used else now
-    decision_at = datetime(d.year, d.month, d.day, *ENTRY_HHMMSS, tzinfo=timezone.utc)
-    if as_of > decision_at:
-        # Rows after 13:29 would make the file look-ahead for its own key;
-        # the runtime rejects that. Never happens on the 13:27 cron.
-        as_of = decision_at
+    # Everything the gates and sizing see is bounded at the decision
+    # instant. A late run therefore produces the same file it would have
+    # produced on time (minus rows that never arrived), instead of one
+    # sized from post-decision prices and labelled as if it were not.
+    dec = decision_at(d)
+    cutoff = min(now, dec)
+    prev_day = prev_trading_day(d)
+    evals = [evaluate_event(e, rows_t, rows_prev, cutoff, prev_day) for e in todays]
+    weights, agg = weights_from_evals(evals, gross, max_net_usd)
+    used = [r["_t"] for e in todays for r in window_rows(rows_t, e["symbol"], cutoff)]
+    as_of = max(used) if used else cutoff
     meta = {"source": "lighter_exdiv_logger rows + configs/book/exdiv-events.json",
-            "date": d.isoformat(), "events": evals, "gross_reference_usd": gross, **agg}
+            "date": d.isoformat(), "events": evals, "gross_reference_usd": gross,
+            "decision_at": dec.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "input_cutoff": cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"), **agg}
     return bsf.build_signal(producer_id, now, as_of, d.isoformat(), weights, meta)
 
 
@@ -420,8 +481,17 @@ def cmd_signal(a) -> int:
     if not declared_on(events, d):
         print(f"no declared ex-dividend event on {d}; nothing written")
         return 0
+    dec = decision_at(d)
+    if now > dec:
+        late = (now - dec).total_seconds()
+        msg = (f"run started {late:.0f}s after the {dec:%Y-%m-%dT%H:%M:%SZ} decision; "
+               f"inputs are bounded at the decision instant")
+        if a.refuse_after_decision:
+            print(f"refusing: {msg}", file=sys.stderr)
+            return 3
+        print(f"WARNING: {msg}", file=sys.stderr)
     rows_t, rows_prev = load_rows(a.log_dir, d), load_rows(a.log_dir, prev_trading_day(d))
-    sig = build_signal(events, d, rows_t, rows_prev, now, a.gross, a.producer_id)
+    sig = build_signal(events, d, rows_t, rows_prev, now, a.gross, a.producer_id, a.max_net_usd)
     bsf.write_signal(a.out, sig)
     ev_summary = ", ".join(f"{e['symbol']}:{e['skip'] or '$' + str(e['notional_usd'])}" for e in sig["meta"]["events"])
     print(f"wrote {a.out} key={sig['decision_key']} legs={len(sig['weights'])} gross=${sig['meta']['gross_usd']} "
@@ -445,8 +515,14 @@ def main() -> int:
     s.add_argument("--config", default=None, help="deployed runtime config; refuse symbols outside its universe")
     s.add_argument("--date", default=None, help="ex-dividend date YYYY-MM-DD (default: today UTC)")
     s.add_argument("--now", default=None, help="override wall clock, YYYY-MM-DDTHH:MM:SSZ (tests / replay)")
+    s.add_argument("--refuse-after-decision", action="store_true",
+                   help="exit 3 instead of writing when the run starts after the decision instant "
+                        "(inputs are bounded there either way; this makes a late cron loud)")
     s.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     s.add_argument("--gross", type=float, default=GROSS_USD)
+    s.add_argument("--max-net-usd", type=float, default=MAX_NET_USD,
+                   help="sizing.max_net_usd of the deployed config; the day's legs are scaled "
+                        "together to stay inside it (the runtime rejects the whole plan otherwise)")
     s.add_argument("--producer-id", default=PRODUCER_ID)
     s.add_argument("--s3-uri", default=None)
     a = ap.parse_args()
@@ -454,6 +530,9 @@ def main() -> int:
         return cmd_calendar(a)
     if not (math.isfinite(a.gross) and a.gross > 0):
         print(f"--gross must be a finite positive number, got {a.gross}", file=sys.stderr)
+        return 2
+    if not (math.isfinite(a.max_net_usd) and a.max_net_usd > 0):
+        print(f"--max-net-usd must be a finite positive number, got {a.max_net_usd}", file=sys.stderr)
         return 2
     return cmd_signal(a)
 

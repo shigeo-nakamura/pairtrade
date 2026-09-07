@@ -33,7 +33,7 @@ stop. Everything that decides *whether* and *how much* is in the producer.
 | `scripts/exdiv_signal_producer.py` | `calendar` (events → runtime calendar, `--check` for CI) and `signal` (13:27 cron: gates + sizing → `signal.json`, optional S3 upload) |
 | `scripts/test_exdiv_signal_producer.py` | unit tests (synthetic logger rows) |
 | `deploy/book-runtime-exdiv-lighter.service` | runtime unit, PROM `127.0.0.1:9475`, status → `s3://debot-dashboard/debot/status/book-exdiv-lighter/` |
-| `deploy/book-signal-fetch-exdiv-lighter.{service,timer}` | S3 → local signal fetch, `Mon..Fri 13:27:00–13:31:40 UTC every 20 s` (`AccuracySec=1s`); nothing polls outside that span |
+| `deploy/book-signal-fetch-exdiv-lighter.{service,timer}` | S3 → local signal fetch, `Mon..Fri 09:27:00–09:31:40 America/New_York every 20 s` (`AccuracySec=1s`, so it follows US daylight saving); nothing polls outside that span |
 | `scripts/install_book_runtime.sh` | now also installs `BOOK_CALENDAR_SOURCE` (default `/opt/debot/configs/book/<instance>.calendar.json`) as `/opt/book-runtime/<instance>.calendar.json` — the service cannot read `/opt/debot` (`InaccessiblePaths`) |
 
 Observation side (bot-strategy repo, `scripts/strategy_probes/exdiv_948/`,
@@ -46,8 +46,10 @@ Hyperliquid `hl_exdiv_poller.py`. The producer reads the Lighter logger's
 
 ## Producer rules (the signal side of the frozen design)
 
-Run at 13:27 on the ex-dividend date. For every declared event that day,
-using the fresh rows (`ob_age_secs ≤ 90`) since 13:23:
+Run at 09:27 New York time on the ex-dividend date (13:27 UTC in summer,
+14:27 in winter — the cron below fires on both and exits immediately on
+non-event days). For every declared event that day, using the fresh rows
+(`ob_age_secs ≤ 90`) from 09:23 NY up to the decision instant:
 
 1. **Skip gates** (issue design): median spread > 30 bps; median L1 (min of
    bid/ask notional) < $200; the step already landed before the open
@@ -71,20 +73,35 @@ using the fresh rows (`ob_age_secs ≤ 90`) since 13:23:
    `premarket_adj_move_bps`, `expected_net_bps`). No event on the date →
    nothing is written.
 
-`as_of` = the last row used (≤ 13:29:00, so never look-ahead for the key);
-`decision_key` = the date, matching the calendar entry.
+Inputs are always bounded at the decision instant, never at wall-clock
+"now": a delayed cron or an operator retry inside the runtime's grace
+window reads exactly the rows an on-time run would have read, so it
+reproduces the on-time file instead of sizing from post-open prices. The
+run warns on stderr when it starts late, and `--refuse-after-decision`
+turns that into exit 3 for an unattended cron. `as_of` = the last row
+actually used (never after the decision, so never look-ahead);
+`decision_key` = the date, matching the calendar entry; `meta.decision_at`
+and `meta.input_cutoff` record both instants.
 
 ## Workstation cron (operator adds; agents do not edit crontab)
 
+The workstation runs on UTC, so both possible open times get a line and
+whichever one is not the market's 09:27 simply finds no event window:
+
 ```
-27 13 * * 1-5 python3 $HOME/bot/.worktrees/pairtrade-master/scripts/exdiv_signal_producer.py signal --events $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-events.json --config $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-lighter.yaml --out $HOME/bot/logs/exdiv_948/signal.json --s3-uri s3://debot-dashboard/debot/book/exdiv-lighter/signal.json >> $HOME/bot/logs/exdiv_948/producer.log 2>&1
+27 13,14 * * 1-5 python3 $HOME/bot/.worktrees/pairtrade-master/scripts/exdiv_signal_producer.py signal --events $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-events.json --config $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-lighter.yaml --out $HOME/bot/logs/exdiv_948/signal.json --s3-uri s3://debot-dashboard/debot/book/exdiv-lighter/signal.json >> $HOME/bot/logs/exdiv_948/producer.log 2>&1
 ```
 
+(The off-hour run is harmless: it writes the same file from the same
+bounded window before the decision, or warns that it is late and still
+bounds its inputs. If you prefer a single line, set `CRON_TZ=America/New_York`
+on the crontab and use `27 9 * * 1-5`.)
+
 It exits 0 with "no declared ex-dividend event" on every other day. The
-fetch timer on the host polls S3 from 13:27:00, so the upload has ~90 s of
-slack before the 13:29:00 decision; the 120 s grace closes the window at
-13:31:00 (entering after the step has landed is pointless, so a late
-signal is `skipped`, not applied).
+fetch timer on the host polls S3 from 09:27:00 NY, so the upload has ~90 s
+of slack before the 09:29:00 decision; the 120 s grace closes the window
+two minutes later (entering after the step has landed is pointless, so a
+late signal is `skipped`, not applied).
 
 ## Host install (only after G1 passes)
 
@@ -133,3 +150,11 @@ entry, no `[ADOPT]` rows.
 - **Live**: needs G1 (September ETF events) and G2 (ETF L1 median 13:00–
   14:00 ≥ $2,000), the `BOOK_CONFIRM_LIVE` flow in
   `docs/book-runtime-operations.md`, and its own explicit approval.
+
+## Unit delivery
+
+`deploy-configs.yml` uploads the three `exdiv-lighter` units to S3 and
+copies them to `/opt/debot/deploy/` on the Robinhood host, which is what
+`install_book_runtime.sh` reads by default. They are **delivered only** —
+CI never installs or starts this instance, so the manual install above has
+its units without the runtime appearing on the host before G1.
