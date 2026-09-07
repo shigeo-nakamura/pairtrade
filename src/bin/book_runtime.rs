@@ -104,11 +104,10 @@ struct InstanceLock {
     _file: std::fs::File,
 }
 
-fn acquire_instance_lock(state_path: &Path) -> Result<InstanceLock> {
-    if let Some(parent) = state_path.parent() {
+fn acquire_instance_lock(lock_path: &Path) -> Result<InstanceLock> {
+    if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let lock_path = state_path.with_extension("lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -159,7 +158,7 @@ async fn main() -> Result<()> {
 
     // Held for the rest of `main`: refuses a second process against the
     // same state before it can ever load it or reach the venue.
-    let _instance_lock = acquire_instance_lock(&cfg.paths.state)?;
+    let _instance_lock = acquire_instance_lock(&cfg.instance_lock_path())?;
 
     prom::maybe_start_exporter();
     let process_started_at = now_secs();

@@ -143,6 +143,21 @@ pub fn parse_hhmm(s: &str) -> Result<i64> {
 }
 
 impl BookConfig {
+    /// The exclusive per-instance lock `book_runtime` acquires before
+    /// loading state or connecting to the venue (bot-strategy#937), derived
+    /// from `paths.state` so it needs no config field of its own. Exposed
+    /// here (not computed separately in the binary) so `validate_impl`
+    /// below can reserve it: a config whose `risk_ack_path` (or any other
+    /// runtime path) happened to equal it would let the engine's normal
+    /// stray-ack cleanup unlink the lock file's directory entry out from
+    /// under the running process's held flock (which stays valid only on
+    /// the now-unlinked inode), letting a second instance recreate the
+    /// pathname and lock a different inode -- defeating the exclusion the
+    /// lock exists for.
+    pub fn instance_lock_path(&self) -> PathBuf {
+        self.paths.state.with_extension("lock")
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read book config {}", path.display()))?;
@@ -340,6 +355,7 @@ impl BookConfig {
         // persist overwrite the ledger; a path that collided with a flag
         // file would be worse still, since the kill switch and RISK_ACK
         // are read as "this file exists".
+        let lock_path = self.instance_lock_path();
         let mut named: Vec<(&str, &Path)> = vec![
             ("paths.state", &self.paths.state),
             ("paths.ledger", &self.paths.ledger),
@@ -348,6 +364,7 @@ impl BookConfig {
             ("risk.kill_switch_path", &self.risk.kill_switch_path),
             ("risk.risk_ack_path", &self.risk.risk_ack_path),
             ("signal.path", &self.signal.path),
+            ("<instance-lock>", &lock_path),
         ];
         if let Some(calendar_path) = &self.schedule.calendar_path {
             named.push(("schedule.calendar_path", calendar_path));
@@ -625,6 +642,18 @@ mod tests {
         let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
         c.risk.kill_switch_path = c.paths.status.clone();
         assert!(c.validate().is_err());
+        // The derived instance-lock path (bot-strategy#937) must be
+        // reserved too: RISK_ACK aliasing it would let the engine's normal
+        // stray-ack cleanup unlink the lock file's directory entry out
+        // from under the running process's held flock, letting a second
+        // instance relock a fresh inode at the same pathname.
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.risk.risk_ack_path = c.instance_lock_path();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(
+            e.contains("risk.risk_ack_path") && e.contains("<instance-lock>"),
+            "{e}"
+        );
         // Different spellings of one path are still one file.
         let dir = tempfile::tempdir().unwrap();
         let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
