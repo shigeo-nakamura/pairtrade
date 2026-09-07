@@ -168,13 +168,27 @@ impl BookConfig {
         if self.instance_id.trim().is_empty() {
             bail!("instance_id must not be empty");
         }
-        if !matches!(
-            self.venue.as_str(),
-            "lighter" | "hyperliquid" | "hyperliquid-account"
-        ) {
+        // Validate against what this binary can actually reach:
+        // `DexConnectorBox`'s arms are feature-gated, so accepting a venue
+        // the release build has no connector for would pass validation and
+        // then fail at startup with `Unsupported dex`.
+        let supported: &[&str] = &[
+            #[cfg(feature = "lighter-sdk")]
+            "lighter",
+            #[cfg(feature = "hyperliquid-sdk")]
+            "hyperliquid",
+            #[cfg(feature = "hyperliquid-sdk")]
+            "hyperliquid-account",
+        ];
+        if !supported.contains(&self.venue.as_str()) {
             bail!(
-                "venue must be lighter | hyperliquid | hyperliquid-account, got {:?}",
-                self.venue
+                "venue {:?} is not available in this build (compiled connectors: {}); rebuild with the matching dex-connector feature or pick another venue",
+                self.venue,
+                if supported.is_empty() {
+                    "none".to_string()
+                } else {
+                    supported.join(", ")
+                }
             );
         }
         if self.universe.symbols.is_empty() {
@@ -441,6 +455,25 @@ mod tests {
             "signal_grace_secs: 3600\n  flatten_after_secs: 60",
         );
         assert!(BookConfig::from_yaml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn rejects_a_venue_this_build_has_no_connector_for() {
+        let bad = test_config_yaml().replace("venue: lighter", "venue: bitmex");
+        let err = BookConfig::from_yaml_str(&bad).unwrap_err().to_string();
+        assert!(err.contains("not available in this build"), "{err}");
+        // Hyperliquid is only accepted when the binary carries its SDK,
+        // which the released book-runtime does not.
+        let hl = test_config_yaml().replace("venue: lighter", "venue: hyperliquid");
+        let parsed = BookConfig::from_yaml_str(&hl);
+        if cfg!(feature = "hyperliquid-sdk") {
+            assert!(parsed.is_ok());
+        } else {
+            assert!(parsed
+                .unwrap_err()
+                .to_string()
+                .contains("not available in this build"));
+        }
     }
 
     #[test]

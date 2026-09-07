@@ -287,12 +287,15 @@ impl LiveExecutor {
     /// Send the order with the configured slippage cap: the venue's
     /// price-capped IOC when it has one, otherwise (only if the operator
     /// opted in) the venue-native market/IOC with its own protection price.
+    /// `Err((message, submitted))`: `submitted` is false only when the
+    /// order provably never reached the venue, which lets the caller
+    /// report a `PreSendAbort` instead of confirming a phantom fill.
     async fn send_capped(
         &self,
         intent: &OrderIntent,
         size: Decimal,
         side: OrderSide,
-    ) -> Result<dex_connector::CreateOrderResponse, String> {
+    ) -> Result<dex_connector::CreateOrderResponse, (String, bool)> {
         match self
             .connector
             .create_order_taker_ioc(
@@ -311,8 +314,11 @@ impl LiveExecutor {
                     || msg.to_ascii_lowercase().contains("no native") =>
             {
                 if !self.allow_venue_protection_fallback {
-                    return Err(format!(
-                        "venue has no price-capped IOC ({msg}) and execution.allow_venue_protection_fallback is false; order not sent"
+                    return Err((
+                        format!(
+                            "venue has no price-capped IOC ({msg}) and execution.allow_venue_protection_fallback is false; order not sent"
+                        ),
+                        false,
                     ));
                 }
                 log::warn!(
@@ -331,9 +337,9 @@ impl LiveExecutor {
                         None,
                     )
                     .await
-                    .map_err(|e| format!("{e:?}"))
+                    .map_err(|e| (format!("{e:?}"), true))
             }
-            Err(e) => Err(format!("{e:?}")),
+            Err(e) => Err((format!("{e:?}"), true)),
         }
     }
 
@@ -505,7 +511,11 @@ impl Executor for LiveExecutor {
         let size = decimal(intent.qty)?;
         let (order_id, venue_error) = match self.send_capped(intent, size, side).await {
             Ok(r) => (Some(r.order_id), None),
-            Err(e) => (None, Some(e)),
+            // Provably never submitted: report it as a pre-send abort so
+            // the engine does not spend an attempt confirming a fill that
+            // cannot exist.
+            Err((msg, false)) => return Err(anyhow!(PreSendAbort(msg))),
+            Err((msg, true)) => (None, Some(msg)),
         };
         // Confirm against the venue position regardless of the ack: a send
         // error can still have executed (REST/WS limits are coupled).

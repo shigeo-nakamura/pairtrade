@@ -33,7 +33,7 @@ this repo was sunset on 2026-09-06 and removed (same issue).
 ```yaml
 schema_version: 1
 instance_id: xsmom-695            # status/ledger tag, dashboard card id
-venue: lighter                    # lighter | hyperliquid
+venue: lighter                    # must be a connector this binary was built with
 dry_run: true                     # paper fills; live requires BOOK_CONFIRM_LIVE=yes-i-mean-it too
 
 universe:
@@ -225,7 +225,9 @@ reduce_only }`.
   (Lighter in dex-connector v4.7.20, bot-strategy#918) it is sent as
   `create_order(price=None)` with the venue's ±20 % protection price
   **only if** `execution.allow_venue_protection_fallback` is true, else
-  it is not sent. The HTTP 200 is **not** a fill (Lighter: accepted, not
+  it is not sent — and that refusal is reported as a pre-send abort, so
+  it costs no attempt and the target is still retried once the flag is
+  enabled. The HTTP 200 is **not** a fill (Lighter: accepted, not
   executed — bot-strategy#875 G-2). The runtime polls `get_positions()`
   for up to `fill_confirm_timeout_secs`; the filled quantity is the change
   in the venue position. Partial fills re-plan the residual up to
@@ -305,9 +307,11 @@ reduce_only }`.
   halt without an operator ever seeing it (bot-strategy#932
   semantics: the flatten fills are booked as exit fills from venue fills,
   not from the mid). Consuming the ack re-anchors both the session and the
-  daily window at the current equity, and therefore only happens while the
-  venue equity is fresh (live) — with `equity_ready=false` the ack file is
-  left in place and the halt stays. A stray ack found while not halted
+  daily window at the current equity. It therefore only happens while the
+  venue equity is fresh (live) **and the halted book is already flat**:
+  clearing the halt over an open position would stop the flatten retry
+  while the exposure remains. In either case the ack file is left in
+  place and the halt stays, with the reason logged. A stray ack found while not halted
   is deleted without effect, so it can never clear a *future* halt.
 - **Daily loss halt**: realized + unrealized loss since 00:00 UTC beyond
   `max_daily_loss_bps` blocks opening intents until the next UTC day; no
@@ -383,6 +387,11 @@ scripts/book_signal_file.py --out replay/signals/2026-07-03.json \
 
 - `dry_run: false` refuses to start unless `BOOK_CONFIRM_LIVE=yes-i-mean-it`
   is also set (two-variable rule, same as `engine_b_live`).
+- The released `book-runtime` is built with `lighter-sdk` only, and the
+  config validator rejects any venue this binary has no connector for
+  rather than letting it fail at startup with `Unsupported dex`. A
+  Hyperliquid instance (even DRY_RUN) needs a build with
+  `hyperliquid-sdk`.
 - Live execution is **Lighter-only** for now: orders go out as
   `create_order(price=None)` (venue-native market/IOC with Lighter's 20 %
   protection price — bot-strategy#918 tracks a price-constrained IOC).

@@ -214,14 +214,26 @@ impl BookEngine {
         // An ack re-anchors both loss windows at `equity`, so it is only
         // consumed while that number is a fresh venue value; a stale one
         // would hand the session an unintended cushion once reads recover.
-        if equity_ready {
+        // The ack is only consumed once the halt's own flatten has
+        // finished. Clearing it over an exposed book would stop the
+        // flatten retry while the position is still open, and the halted
+        // decision is not eligible for a residual retry either.
+        let halted_but_exposed = self.state.session.halted && !self.state.is_flat();
+        if equity_ready && !halted_but_exposed {
             if let Some(ev) = self.risk.maybe_clear_halt(&mut self.state, now, equity) {
                 log::warn!("[RISK] session halt cleared by RISK_ACK: {ev:?}");
                 self.ledger
                     .write(now, "halt_cleared", None, json!({ "risk": ev }));
             }
         } else if self.state.session.halted && self.cfg.risk.risk_ack_path.exists() {
-            log::warn!("[RISK] RISK_ACK present but venue equity is unavailable; ack deferred");
+            let why = if halted_but_exposed {
+                "the halted book is not flat yet"
+            } else {
+                "venue equity is unavailable"
+            };
+            log::warn!(
+                "[RISK] RISK_ACK present but {why}; ack deferred (the file is left in place)"
+            );
         }
         // Anchors, rollovers, and the loss limits are only ever evaluated
         // against a fresh venue equity (paper equity is always fresh): a
