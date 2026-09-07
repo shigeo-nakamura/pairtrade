@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 
@@ -339,16 +339,28 @@ impl BookEngine {
         // persisted below with the rest of `state` so a restart between a
         // failed append and the next retry does not lose it) so the
         // eventual successful row still reports the full breakdown.
-        let date = utc_date(now);
-        let pending_mark =
-            if self.mark_on_date_change && self.state.last_mark_date.as_deref() != Some(&date) {
-                let (date, funding_detail) = self.accrue_daily_funding(now, &prices).await;
-                let mut merged = std::mem::take(&mut self.state.pending_mark_funding_detail);
-                merge_funding_detail(&mut merged, funding_detail);
-                Some((date, merged))
-            } else {
-                None
-            };
+        let today = utc_date(now);
+        let pending_mark = if self.mark_on_date_change
+            && self.state.last_mark_date.as_deref() != Some(&today)
+        {
+            let (accrual_date, funding_detail) = self.accrue_daily_funding(now, &prices).await;
+            let mut merged = std::mem::take(&mut self.state.pending_mark_funding_detail);
+            merge_funding_detail(&mut merged, funding_detail);
+            // The date this cycle was *first* attempted for, not
+            // whatever `accrue_daily_funding` just computed from `now`:
+            // a retry that doesn't succeed until after a UTC rollover
+            // must still write (and keep retrying) the date whose append
+            // actually failed, not silently relabel it as `today`'s row
+            // and permanently omit the stuck date. Funding accrual
+            // itself is unaffected either way -- it is always just hours
+            // elapsed since `funding_accrued_at`, independent of which
+            // date label this row ends up under.
+            let label = self.state.pending_mark_date.clone().unwrap_or(accrual_date);
+            self.state.pending_mark_date = Some(label.clone());
+            Some((label, merged))
+        } else {
+            None
+        };
 
         let (equity, equity_ready) = self.compute_equity(&prices).await;
         self.equity_ready = equity_ready;
@@ -435,7 +447,10 @@ impl BookEngine {
                 .write_daily_mark_row(now, &prices, &date, funding_detail.clone())
                 .await
             {
-                Ok(()) => self.state.pending_mark_funding_detail.clear(),
+                Ok(()) => {
+                    self.state.pending_mark_funding_detail.clear();
+                    self.state.pending_mark_date = None;
+                }
                 Err(_) => self.state.pending_mark_funding_detail = funding_detail,
             }
         }
@@ -2120,7 +2135,21 @@ impl BookEngine {
         date: &str,
         funding_detail: serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
-        let (equity, _) = self.compute_equity(prices).await;
+        let (equity, equity_ready) = self.compute_equity(prices).await;
+        if !equity_ready {
+            log::warn!("[MARK] {date} deferred: a held leg has no fresh price yet, will retry next tick");
+            bail!("{date} mark deferred: a held leg has no fresh price yet");
+        }
+        // A held leg missing a fresh price (WS not connected yet on the
+        // day's first tick, or mid-outage) makes `compute_equity` fall
+        // back to the last observation and report not-ready. Writing the
+        // mark anyway would durably record that stale fallback and
+        // advance `last_mark_date`, so the date is considered complete
+        // and this corrupted row is never retried once prices recover.
+        // Treat it exactly like an append failure: bail before writing
+        // anything, so the caller's existing retry path (unset
+        // last_mark_date, retained funding_detail) picks it up next tick.
+
         let marks: BTreeMap<String, serde_json::Value> = self
             .state
             .positions
@@ -2521,6 +2550,87 @@ mod tests {
             !engine.equity_ready,
             "a held leg with no fresh mark must not report equity as fresh"
         );
+    }
+
+    #[tokio::test]
+    async fn a_daily_mark_is_deferred_not_corrupted_when_a_held_leg_has_no_fresh_price() {
+        // Writing the mark despite equity_ready == false would durably
+        // record stale fallback equity and advance last_mark_date, so
+        // the date is considered complete and this corrupted row is
+        // never retried once prices recover.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("DOT", -0.5)]);
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        // Isolate daily_mark_now's own behavior: tick() would otherwise
+        // also write today's mark while prices are still fresh.
+        engine.mark_on_date_change = false;
+        engine.tick(d.timestamp()).await.unwrap();
+        assert_eq!(
+            engine.state.last_decision.as_ref().unwrap().outcome,
+            DecisionOutcome::Applied
+        );
+        assert!(engine.state.last_mark_date.is_none());
+
+        // Feed outage at the moment the daily mark would run.
+        exec.clear_observations().await;
+        let mark_time = d.timestamp() + 3600;
+        assert!(engine.daily_mark_now(mark_time).await.is_err());
+        assert!(
+            engine.state.last_mark_date.is_none(),
+            "a mark based on stale fallback equity must not be considered done"
+        );
+
+        // Prices recover: the deferred mark now succeeds.
+        exec.set_price("BTC", 100_000.0).await;
+        exec.set_price("DOT", 4.0).await;
+        engine.daily_mark_now(mark_time + 5).await.unwrap();
+        assert!(engine.state.last_mark_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_mark_retains_its_date_across_a_utc_rollover() {
+        // If a stuck append doesn't succeed until after midnight, the
+        // eventual row must still be labeled (and its funding attributed
+        // to) the date whose append actually failed -- not silently
+        // relabeled as the newer date, permanently omitting the stuck one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("DOT", -0.5)]);
+        // A directory at pnl's path makes every append fail.
+        std::fs::create_dir_all(&cfg.paths.pnl).unwrap();
+        let (mut engine, _exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.tick(d.timestamp()).await.unwrap();
+        assert_eq!(
+            engine.state.pending_mark_date.as_deref(),
+            Some("2026-09-06")
+        );
+        assert!(engine.state.last_mark_date.is_none());
+
+        // Still stuck, now on the next UTC day.
+        let day2 = ts("2026-09-07T00:10:00Z").timestamp();
+        engine.tick(day2).await.unwrap();
+        assert_eq!(
+            engine.state.pending_mark_date.as_deref(),
+            Some("2026-09-06"),
+            "must not relabel the stuck mark as the newer date"
+        );
+        assert!(engine.state.last_mark_date.is_none());
+
+        // The outage clears.
+        std::fs::remove_dir(&cfg.paths.pnl).unwrap();
+        engine.tick(day2 + 5).await.unwrap();
+        assert_eq!(
+            engine.state.last_mark_date.as_deref(),
+            Some("2026-09-06"),
+            "the stuck date's own row must land, not one for today"
+        );
+        assert!(engine.state.pending_mark_date.is_none());
+        assert!(engine.state.pending_mark_funding_detail.is_empty());
     }
 
     #[tokio::test]

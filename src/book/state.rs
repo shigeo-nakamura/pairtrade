@@ -169,6 +169,16 @@ pub struct BookState {
     /// includes it regardless; this is only the per-symbol row detail.
     #[serde(default)]
     pub pending_mark_funding_detail: serde_json::Map<String, serde_json::Value>,
+    /// The date `pending_mark_funding_detail` belongs to. Without this, a
+    /// retry that doesn't succeed until after a UTC rollover would
+    /// recompute the label from the new `now` and merge both days'
+    /// accrual into one row for the newer date, permanently omitting the
+    /// date whose append actually failed. Set on the first accrual
+    /// attempt for a date, cleared only once that date's row is
+    /// successfully written -- a later tick's own accrual is held off
+    /// until this drains, so at most one date is ever pending.
+    #[serde(default)]
+    pub pending_mark_date: Option<String>,
     /// Last equity observation (unix secs, usd).
     #[serde(default)]
     pub last_equity: Option<(i64, f64)>,
@@ -197,6 +207,7 @@ impl BookState {
             pending_funding_qty_hours: BTreeMap::new(),
             last_mark_date: None,
             pending_mark_funding_detail: serde_json::Map::new(),
+            pending_mark_date: None,
             last_equity: None,
             trades_closed: 0,
             trades_won: 0,
