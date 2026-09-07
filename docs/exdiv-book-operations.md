@@ -79,15 +79,20 @@ to the decision instant:
    internal book price while the futures-derived hedge legs quote
    continuously, so an index-vs-index comparison mixes two price
    definitions and a few bps of thin pre-open noise would false-fire it
-   (QQQ's threshold is only about −6 bps). If only the **control** series
-   is missing (a logger gap, or a symbol added to the watchlist recently)
-   the gate falls back to the event's own unadjusted move
-   (`premarket_basis: mid_unadjusted_no_control`), which fires on
-   market-wide drops too and so can only skip more often, never trade
-   where the adjusted gate would have skipped. If the **event's own** mids
-   are missing the gate cannot be evaluated at all and the event is
-   **skipped** (`landed_gate_unavailable`) rather than traded with its
-   main safety check silently disabled.
+   (QQQ's threshold is only about −6 bps). Both T-1 mids are resolved on
+   the **same** minute, so a logger gap on one leg cannot make the
+   differential include that leg's own drift.
+
+   If any of the four inputs is missing — including the control — the
+   event is **skipped** (`landed_gate_unavailable`) rather than traded
+   with its main safety check disabled. There is deliberately no
+   unadjusted fallback: the control adjustment *is* the gate, not a
+   refinement of it (single-stock idio noise over this window runs 3–5×
+   the dividend), and an unadjusted move is not a conservative substitute.
+   An event down 3 bps while its control is up 5 bps is −8 bps adjusted
+   (skip at a −6 bps threshold) but −3 bps unadjusted (trade). This is why
+   `US500` and `US100` must stay in the logger watchlist even though they
+   are never traded on a single-stock event.
 2. **Size** (2026-09-07 comment, replaces the bare `25 % × L1`): slippage
    budget = 20 % of the dividend in bps; take the widest logged depth band
    inside the budget and use **half the median cumulative bid depth** in

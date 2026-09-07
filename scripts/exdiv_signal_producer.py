@@ -377,8 +377,8 @@ def close_mid_pair(rows_prev, sym: str, ctl: str, prev_day: date,
     pull its reference minutes earlier, so the differential would then
     include that leg's own drift over the gap -- up to 9 minutes with the
     widened offset list, against a gate threshold of only a few bps.
-    Returns (event_mid, control_mid); the control is None only when no
-    offset has both."""
+    Returns (event_mid, control_mid); the control is None when no offset
+    has both, which makes the gate unevaluable and skips the event."""
     close = session_close(prev_day, cal_path)
     ev_only = None
     for off in PREV_CLOSE_OFFSETS_SECS:
@@ -461,28 +461,25 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     # we would transact at.
     ev_ref_mid, ctl_ref_mid = close_mid_pair(rows_prev, sym, ctl, prev_day, cal_path)
     ev_now, ctl_now = latest_mid(win), latest_mid(ctl_win)
-    if ev_ref_mid and ev_now:
-        ev_move = (ev_now / ev_ref_mid - 1) * 1e4
-        if ctl_ref_mid and ctl_now:
-            adj = ev_move - (ctl_now / ctl_ref_mid - 1) * 1e4
-            out["premarket_basis"] = "mid_vs_t-1_close_mid"
-        else:
-            # No control series (a logger gap, or a symbol only added to
-            # the watchlist recently). Use the event's own move: it fires
-            # on market-wide drops too, so it can only skip more often,
-            # never trade when the adjusted gate would have skipped.
-            adj = ev_move
-            out["premarket_basis"] = "mid_unadjusted_no_control"
+    if ev_ref_mid and ev_now and ctl_ref_mid and ctl_now:
+        adj = (ev_now / ev_ref_mid - 1) * 1e4 - (ctl_now / ctl_ref_mid - 1) * 1e4
         out["premarket_adj_move_bps"] = round(adj, 2)
+        out["premarket_basis"] = "mid_vs_t-1_close_mid"
         if adj <= -LANDED_FRAC * div_bps:
             out["skip"] = "gap_already_landed"
             return out
     else:
-        # The event's own mids are missing, so there is nothing to measure.
-        # Fail CLOSED: proceeding would take the trade with its main safety
-        # check silently disabled, and a fill after the step has landed is
-        # both a loss and a corrupted capture measurement. Missing one
-        # event costs only that observation.
+        # Fail CLOSED whenever any of the four inputs is missing, the
+        # control included. An earlier revision fell back to the event's
+        # own unadjusted move on the claim that it "can only skip more
+        # often" -- that is false: an event down 3 bps while its control is
+        # up 5 bps has an adjusted move of -8 bps and would skip at a -6
+        # bps threshold, while the unadjusted -3 bps would trade. The
+        # control adjustment is the gate, not a refinement of it (single
+        # stock idio noise over this window runs 3-5x the dividend), so
+        # without it there is no gate. Missing one event costs one
+        # observation; trading with the check silently disabled costs a
+        # loss and a corrupted capture measurement.
         out["premarket_adj_move_bps"] = None
         out["premarket_basis"] = None
         out["landed_gate_inputs"] = {

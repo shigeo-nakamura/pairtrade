@@ -460,21 +460,27 @@ class SignalTests(unittest.TestCase):
         self.assertIsNone(e["premarket_adj_move_bps"])
         self.assertFalse(e["landed_gate_inputs"]["event_t1_mid"])
         self.assertEqual(sig["weights"], {})
-        # Only the CONTROL is missing (a logger gap, or a symbol added to
-        # the watchlist recently): fall back to the event's own move rather
-        # than throwing the event away. Unadjusted can only skip MORE often
-        # -- it fires on market-wide drops too -- so it stays fail-safe.
+        # Only the CONTROL is missing: still unevaluable. An unadjusted
+        # fallback is NOT a conservative version of this gate -- an event
+        # down 3 bps while its control is up 5 bps is -8 bps adjusted
+        # (skip at a -6 bps threshold) but -3 bps unadjusted (trade).
         only_event = [r for r in prev_rows() if r["symbol"] == "SPY"]
         e = xp.build_signal(EVENTS[:1], D, base_rows(), only_event, NOW)["meta"]["events"][0]
-        self.assertIsNone(e["skip"])
-        self.assertEqual(e["premarket_basis"], "mid_unadjusted_no_control")
-        self.assertIsNotNone(e["premarket_adj_move_bps"])
-        # ... and it still catches a real drop without a control
-        dropped = ([r for r in base_rows() if r["symbol"] != "SPY"]
-                   + series("SPY", NOW.replace(minute=23, second=0), 5, bid=657.33, ask=657.39))
-        e = xp.build_signal(EVENTS[:1], D, dropped, only_event, NOW)["meta"]["events"][0]
+        self.assertEqual(e["skip"], "landed_gate_unavailable")
+        self.assertFalse(e["landed_gate_inputs"]["control_t1_mid"])
+        self.assertIsNone(e["premarket_adj_move_bps"])
+
+    def test_the_control_adjustment_can_make_the_gate_stricter(self):
+        """The counterexample that rules out an unadjusted fallback."""
+        t0 = NOW.replace(minute=23, second=0)
+        # SPY -3 bps overnight, US500 +5 bps -> adjusted -8 bps
+        rows = ([r for r in base_rows() if r["symbol"] not in ("SPY", "US500")]
+                + series("SPY", t0, 5, bid=659.7719, ask=659.8319)
+                + series("US500", t0, 5, bid=6603.2, ask=6603.4, bid_sz=20, ask_sz=20))
+        small_div = [dict(EVENTS[0], dividend_usd=0.76)]     # ~11.5 bps, threshold ~-5.8
+        e = xp.build_signal(small_div, D, rows, prev_rows(), NOW)["meta"]["events"][0]
+        self.assertLess(e["premarket_adj_move_bps"], -5.8)
         self.assertEqual(e["skip"], "gap_already_landed")
-        self.assertEqual(e["premarket_basis"], "mid_unadjusted_no_control")
         # a market-wide pre-open drop is NOT the dividend: control moves too
         both_down = ([r for r in base_rows() if r["symbol"] not in ("SPY", "US500")]
                      + series("SPY", NOW.replace(minute=23, second=0), 5, bid=657.33, ask=657.39)
