@@ -379,11 +379,11 @@ fn signal_generated_at(replay_dir: &Path, key: &str) -> Option<i64> {
     // arrival-tick schedule and letting its grace window close (recorded
     // as skipped) even though the engine would have accepted it.
     let dt = DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc);
-    // Rounded up (`signal::arrival_secs`), the same visibility rule
+    // Rounded up (`signal::ceil_secs`), the same visibility rule
     // `DirSignalSource` applies: a file generated at `window_end + 0.5s`
     // schedules its arrival tick at `window_end + 1` (correctly outside
     // the window) rather than at `window_end` itself.
-    Some(super::signal::arrival_secs(dt))
+    Some(super::signal::ceil_secs(dt))
 }
 
 /// Convenience for callers that hold a config path.

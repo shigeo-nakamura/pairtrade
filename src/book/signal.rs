@@ -13,14 +13,17 @@ use sha2::{Digest, Sha256};
 
 use super::config::{SignalConfig, SizingConfig, UniverseConfig};
 
-/// The first whole second at which a file generated at `t` can be
-/// observed: `t` rounded *up* when it carries a fractional remainder. The
-/// engine's tick times, window ends and arrival checks are all whole
-/// seconds, and a poll can only ever see a file at or after its real
-/// generation instant -- flooring (`timestamp()`) would instead expose a
-/// file generated at `T + 0.5s` to the tick at `T`, letting replay accept
-/// a signal (or fill it on the previous bar date) that live never could.
-pub fn arrival_secs(t: DateTime<Utc>) -> i64 {
+/// `t` rounded *up* to the next whole second when it carries a fractional
+/// remainder, otherwise unchanged. Every engine tick time, window end,
+/// arrival check and schedule boundary is a whole second, and flooring
+/// (`timestamp()`) would silently move an instant *earlier* than
+/// configured or observed: a signal file generated at `T + 0.5s` would
+/// appear to a tick at `T` as already arrived (letting replay accept it,
+/// or fill it, a bar date early), and a calendar `decision_at` or
+/// `flatten_at` of `T + 0.5s` would let the tick at `T` select or flatten
+/// it half a second before the configured instant, submitting a
+/// prepublished signal or closing early. Used for both.
+pub fn ceil_secs(t: DateTime<Utc>) -> i64 {
     let secs = t.timestamp();
     if t.timestamp_subsec_nanos() > 0 {
         secs + 1
@@ -132,18 +135,22 @@ impl SignalReject {
 /// Canonical JSON of the hashed payload: `{"as_of","decision_key",
 /// "producer_id","weights"}` with sorted keys and no whitespace, matching
 /// Python's `json.dumps(obj, sort_keys=True, separators=(",", ":"))`.
-/// Timestamps are rendered exactly as the producer wrote them
-/// (`YYYY-MM-DDTHH:MM:SSZ`), weights with Rust/Python shortest round-trip
-/// float formatting.
+/// `as_of` is hashed as the exact string the producer wrote (whatever
+/// valid RFC 3339 spelling that was), never re-derived from the parsed
+/// `DateTime<Utc>`: `book_signal_file.py` hashes the string it itself
+/// wrote into the file, so re-formatting it here (fractional seconds
+/// dropped, a numeric offset forced to `Z`) before hashing would report
+/// `hash_mismatch` on a payload nothing had actually altered. Weights use
+/// Rust/Python shortest round-trip float formatting.
 pub fn canonical_payload(
     producer_id: &str,
-    as_of: &DateTime<Utc>,
+    as_of: &str,
     decision_key: &str,
     weights: &BTreeMap<String, f64>,
 ) -> String {
     let mut out = String::new();
     out.push_str("{\"as_of\":");
-    out.push_str(&serde_json::to_string(&as_of.format("%Y-%m-%dT%H:%M:%SZ").to_string()).unwrap());
+    out.push_str(&serde_json::to_string(as_of).unwrap());
     out.push_str(",\"decision_key\":");
     out.push_str(&serde_json::to_string(decision_key).unwrap());
     out.push_str(",\"producer_id\":");
@@ -216,7 +223,7 @@ pub fn sha256_hex(s: &str) -> String {
 
 pub fn payload_sha256(
     producer_id: &str,
-    as_of: &DateTime<Utc>,
+    as_of: &str,
     decision_key: &str,
     weights: &BTreeMap<String, f64>,
 ) -> String {
@@ -256,9 +263,17 @@ pub fn validate(
     if file.producer_id != signal_cfg.producer_id {
         return Err(SignalReject::ProducerMismatch(file.producer_id));
     }
+    // The exact string the producer wrote, not `file.as_of` re-formatted
+    // from the parsed DateTime<Utc> (see `canonical_payload`'s doc): both
+    // parses read the same already-validated body, so this one failing
+    // when the first succeeded is not reachable in practice.
+    let as_of_raw: String = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("as_of")?.as_str().map(str::to_string))
+        .ok_or_else(|| SignalReject::Unparseable("as_of is not a string".into()))?;
     let expected = payload_sha256(
         &file.producer_id,
-        &file.as_of,
+        &as_of_raw,
         &file.decision_key,
         &file.weights,
     );
@@ -345,12 +360,13 @@ pub(crate) mod testutil {
         weights: &[(&str, f64)],
     ) -> String {
         let w: BTreeMap<String, f64> = weights.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-        let sha = payload_sha256(producer_id, &as_of, decision_key, &w);
+        let as_of_s = as_of.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let sha = payload_sha256(producer_id, &as_of_s, decision_key, &w);
         serde_json::json!({
             "schema_version": 1,
             "producer_id": producer_id,
             "generated_at": generated_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            "as_of": as_of.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "as_of": as_of_s,
             "decision_key": decision_key,
             "weights": w,
             "meta": {"test": true},
@@ -399,7 +415,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
-        let s = canonical_payload("p", &ts("2026-09-06T00:00:00Z"), "2026-09-06", &w);
+        let s = canonical_payload("p", "2026-09-06T00:00:00Z", "2026-09-06", &w);
         assert_eq!(
             s,
             r#"{"as_of":"2026-09-06T00:00:00Z","decision_key":"2026-09-06","producer_id":"p","weights":{"BTC":0.1,"ETH":1.0,"SOL":-0.1}}"#
@@ -421,7 +437,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
-        let s = canonical_payload("prîd_日本語", &ts("2026-09-06T00:00:00Z"), "2026-09-06", &w);
+        let s = canonical_payload("prîd_日本語", "2026-09-06T00:00:00Z", "2026-09-06", &w);
         assert_eq!(
             s,
             "{\"as_of\":\"2026-09-06T00:00:00Z\",\"decision_key\":\"2026-09-06\",\"producer_id\":\"prîd_日本語\",\"weights\":{\"BTC\":0.1}}"
@@ -446,6 +462,34 @@ mod tests {
         assert_eq!(v.decision_key, "2026-09-06");
         assert_eq!(v.weights.len(), 4);
         assert_eq!(v.payload_sha256.len(), 64);
+    }
+
+    #[test]
+    fn accepts_a_hash_computed_from_the_producers_own_as_of_spelling() {
+        // A numeric UTC offset instead of "Z": a different, equally valid
+        // RFC 3339 spelling of the exact same instant. The producer
+        // hashed this string as written -- re-deriving a canonical
+        // "...Z" form from the parsed DateTime<Utc> before hashing (the
+        // bug) would report hash_mismatch on this untampered payload.
+        let c = cfg();
+        let w: BTreeMap<String, f64> = [("BTC", 0.25), ("ETH", 0.25), ("SOL", -0.25), ("DOT", -0.25)]
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let as_of_raw = "2026-09-06T00:00:00+00:00";
+        let sha = payload_sha256("test_producer", as_of_raw, "2026-09-06", &w);
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "producer_id": "test_producer",
+            "generated_at": "2026-09-06T00:20:00Z",
+            "as_of": as_of_raw,
+            "decision_key": "2026-09-06",
+            "weights": w,
+            "payload_sha256": sha,
+        })
+        .to_string();
+        let v = validate(&body, &c.signal, &c.sizing, &c.universe, &ctx("2026-09-06")).unwrap();
+        assert_eq!(v.decision_key, "2026-09-06");
     }
 
     #[test]
@@ -666,7 +710,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
-        let s = canonical_payload("p", &ts("2026-09-06T00:00:00Z"), "k", &w);
+        let s = canonical_payload("p", "2026-09-06T00:00:00Z", "k", &w);
         assert_eq!(
             s,
             r#"{"as_of":"2026-09-06T00:00:00Z","decision_key":"k","producer_id":"p","weights":{"A":1e-07,"B":-4.5e-05}}"#

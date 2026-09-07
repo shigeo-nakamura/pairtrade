@@ -13,6 +13,7 @@ use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::config::{parse_hhmm, ScheduleConfig, ScheduleKind};
+use super::signal::ceil_secs;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
@@ -162,11 +163,17 @@ impl Scheduler {
     }
 
     fn calendar_decision(&self, e: &CalendarEntry) -> Decision {
+        // Rounded up (`signal::ceil_secs`), not floored: a configured
+        // instant with a fractional remainder (e.g. `T + 0.5s`) must not
+        // let a whole-second tick at `T` select or flatten it half a
+        // second early, submitting a prepublished signal or closing
+        // before the operator's own configured decision_at/flatten_at.
+        let decision_at = ceil_secs(e.decision_at);
         Decision {
             key: e.decision_key.clone(),
-            decision_at: e.decision_at.timestamp(),
-            window_end: e.decision_at.timestamp() + self.grace_secs,
-            flatten_at: e.flatten_at.map(|t| t.timestamp()),
+            decision_at,
+            window_end: decision_at + self.grace_secs,
+            flatten_at: e.flatten_at.map(ceil_secs),
         }
     }
 
@@ -177,7 +184,7 @@ impl Scheduler {
                 .calendar
                 .iter()
                 .rev()
-                .find(|e| e.decision_at.timestamp() <= now)
+                .find(|e| ceil_secs(e.decision_at) <= now)
                 .map(|e| self.calendar_decision(e)),
             ScheduleKind::Daily | ScheduleKind::IntervalDays => {
                 let today = Utc.timestamp_opt(now, 0).single()?.date_naive();
@@ -196,7 +203,7 @@ impl Scheduler {
             ScheduleKind::Calendar => self
                 .calendar
                 .iter()
-                .find(|e| e.decision_at.timestamp() > now)
+                .find(|e| ceil_secs(e.decision_at) > now)
                 .map(|e| self.calendar_decision(e)),
             ScheduleKind::Daily | ScheduleKind::IntervalDays => {
                 let today = Utc.timestamp_opt(now, 0).single()?.date_naive();
@@ -434,5 +441,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("overlap") && e.contains("inclusive"), "{e}");
+    }
+
+    #[test]
+    fn a_fractional_calendar_boundary_is_rounded_up_not_down() {
+        // decision_at/flatten_at floored via .timestamp() would let a
+        // whole-second tick at the floor select the decision, or flatten,
+        // half a second before the operator's configured instant --
+        // submitting a prepublished signal, or closing, early.
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        cfg.schedule.kind = ScheduleKind::Calendar;
+        cfg.schedule.flatten_after_secs = None;
+        let entries = vec![CalendarEntry {
+            decision_key: "2026-09-08".into(),
+            decision_at: DateTime::parse_from_rfc3339("2026-09-08T06:30:00.5Z")
+                .unwrap()
+                .into(),
+            flatten_at: Some(
+                DateTime::parse_from_rfc3339("2026-09-08T13:30:00.5Z")
+                    .unwrap()
+                    .into(),
+            ),
+        }];
+        let s = Scheduler::build(&cfg.schedule, entries).unwrap();
+        // Not yet current at the floor of decision_at.
+        assert!(s.current(ts("2026-09-08T06:30:00Z")).is_none());
+        let d = s.current(ts("2026-09-08T06:30:01Z")).unwrap();
+        assert_eq!(d.decision_at, ts("2026-09-08T06:30:01Z"));
+        assert_eq!(d.flatten_at, Some(ts("2026-09-08T13:30:01Z")));
     }
 }

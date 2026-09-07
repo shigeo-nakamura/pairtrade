@@ -77,12 +77,12 @@ impl SignalSource for DirSignalSource {
         // timeline must not be visible to an earlier tick just because the
         // file is already on disk; a parse failure here is left to
         // `signal::validate` to reject uniformly.
-        // Rounded up, not floored (`signal::arrival_secs`): a fixture
+        // Rounded up, not floored (`signal::ceil_secs`): a fixture
         // generated at 23:59:59.250 must not be visible to the 23:59:59
         // final tick of the previous bar date and filled at that date's
         // close, since it could only ever have arrived on the next date.
         if let Ok(file) = serde_json::from_str::<super::signal::SignalFile>(&text) {
-            if signal::arrival_secs(file.generated_at) > now {
+            if signal::ceil_secs(file.generated_at) > now {
                 return Ok(None);
             }
         }
