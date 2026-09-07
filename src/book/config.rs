@@ -1,6 +1,7 @@
 //! Book runtime configuration (`configs/book/<instance>.yaml`), see
 //! `docs/book-runtime.md` §2.
 
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -456,11 +457,38 @@ fn resolved_path(p: &Path) -> PathBuf {
     }
     match (p.parent(), p.file_name()) {
         (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => match dir.canonicalize() {
-            Ok(d) => d.join(name),
+            Ok(d) => resolve_leaf(&d, name),
             Err(_) => anchored_path(p),
         },
         _ => anchored_path(p),
     }
+}
+
+/// `dir` is already canonical; `name` is the leaf under it, and the whole
+/// path failed to canonicalize (so the leaf itself does not exist, or is a
+/// symlink whose target does not exist yet). If it is such a dangling
+/// symlink, follow it once so an alias like `ledger.jsonl -> state.json`
+/// still resolves to the same path as `state.json` before either file is
+/// created, instead of comparing the two unresolved leaf names as distinct.
+fn resolve_leaf(dir: &Path, name: &OsStr) -> PathBuf {
+    let candidate = dir.join(name);
+    let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+        return candidate;
+    };
+    if !meta.file_type().is_symlink() {
+        return candidate;
+    }
+    let Ok(target) = std::fs::read_link(&candidate) else {
+        return candidate;
+    };
+    let joined = if target.is_absolute() {
+        target
+    } else {
+        dir.join(target)
+    };
+    joined
+        .canonicalize()
+        .unwrap_or_else(|_| anchored_path(&joined))
 }
 
 #[cfg(test)]
@@ -568,6 +596,24 @@ mod tests {
         {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("state.json"), "{}").unwrap();
+            std::os::unix::fs::symlink(
+                dir.path().join("state.json"),
+                dir.path().join("ledger.jsonl"),
+            )
+            .unwrap();
+            let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+            c.paths.state = dir.path().join("state.json");
+            c.paths.ledger = dir.path().join("ledger.jsonl");
+            assert!(c.validate().is_err());
+        }
+        // A leaf symlink whose target does not exist yet (created before
+        // the file it points at, as on a fresh run) still aliases the two
+        // paths -- whole-path canonicalization fails on both, but the
+        // dangling link itself must still be followed rather than compared
+        // by its raw, unresolved leaf name.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
             std::os::unix::fs::symlink(
                 dir.path().join("state.json"),
                 dir.path().join("ledger.jsonl"),

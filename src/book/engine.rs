@@ -1761,6 +1761,37 @@ impl BookEngine {
                 json!({ "rate_hourly": rate, "hours": hours, "est_usd": est }),
             );
         }
+        // A leg that fully closed while its funding rate was unavailable
+        // leaves its carry in `pending_funding_qty_hours` with no position
+        // left for the loop above to revisit. Settle it here once a rate
+        // is available again, instead of only on a later reopen of the
+        // same symbol.
+        let orphaned: Vec<String> = self
+            .state
+            .pending_funding_qty_hours
+            .keys()
+            .filter(|s| !self.state.positions.contains_key(*s))
+            .cloned()
+            .collect();
+        for sym in orphaned {
+            let Some(rate) = self.exec.funding_rate_hourly(&sym).await else {
+                continue;
+            };
+            let Some(price) = prices.get(&sym).copied() else {
+                continue;
+            };
+            let qty_hours = self
+                .state
+                .pending_funding_qty_hours
+                .remove(&sym)
+                .unwrap_or(0.0);
+            let est = -qty_hours * price * rate;
+            self.state.cum_funding_est_usd += est;
+            funding_detail.insert(
+                sym.clone(),
+                json!({ "rate_hourly": rate, "hours": 0.0, "est_usd": est, "settled_pending_only": true }),
+            );
+        }
         let (equity, _) = self.compute_equity(prices).await;
         let marks: BTreeMap<String, serde_json::Value> = self
             .state
@@ -2302,6 +2333,44 @@ mod tests {
         assert!((est - (-2.0 * 100_000.0 * 0.0001)).abs() < 1e-9);
         assert!(engine.state.pending_funding_qty_hours.get("BTC").is_none());
         assert!((engine.state.cum_funding_est_usd - est).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn funding_pending_after_a_full_close_settles_without_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let (mut engine, _exec) = paper_engine(cfg, dir.path(), vec![]).await;
+
+        let opened_at = secs("2026-09-06T00:00:00Z");
+        engine.state.apply_fill("BTC", 2.0, 100_000.0, opened_at);
+        let after_one_hour = opened_at + 3600;
+        assert!(engine
+            .accrue_funding("BTC", after_one_hour, 100_000.0, None)
+            .is_none());
+        assert_eq!(
+            engine.state.pending_funding_qty_hours.get("BTC").copied(),
+            Some(2.0)
+        );
+
+        // The leg closes for good this time -- there is no reopen for
+        // `write_daily_mark`'s position-keyed loop to revisit.
+        engine.state.positions.remove("BTC");
+
+        // The next daily mark runs with the rate feed recovered
+        // (`paper_engine`'s default 0.0001/hr): the orphaned carry must be
+        // settled here, not left stranded until a reopen that never comes.
+        engine.daily_mark_now(after_one_hour + 3600).await;
+        assert!(
+            !engine.state.pending_funding_qty_hours.contains_key("BTC"),
+            "orphaned pending funding must be settled once the rate recovers"
+        );
+        let expected = -2.0 * 100_000.0 * 0.0001;
+        assert!(
+            (engine.state.cum_funding_est_usd - expected).abs() < 1e-9,
+            "cum_funding_est_usd={}, expected={expected}",
+            engine.state.cum_funding_est_usd
+        );
     }
 
     #[tokio::test]
