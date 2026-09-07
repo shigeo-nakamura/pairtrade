@@ -118,14 +118,6 @@ pub struct BookEngine {
     /// stale number); reductions and flattens still run.
     equity_ready: bool,
     config_fp: String,
-    /// Funding breakdown accrued but not yet durably written to
-    /// pnl.jsonl, from a live daily mark whose append failed: merged into
-    /// the next attempt's own accrual (see `tick`) so the eventual
-    /// successful row still reports the whole day's funding, not just
-    /// the sliver accrued since the last failed attempt.
-    /// `cum_funding_est_usd` itself is already correct regardless --
-    /// accrual and the row describing it are applied independently.
-    pending_funding_detail: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Fold `from` (a later accrual attempt's per-symbol breakdown) onto
@@ -262,7 +254,6 @@ impl BookEngine {
             positions_ready: true,
             equity_ready: true,
             config_fp,
-            pending_funding_detail: serde_json::Map::new(),
         })
     }
 
@@ -344,13 +335,15 @@ impl BookEngine {
         // seconds since this accrual, never double-charging. That also
         // means each retry's own `funding_detail` only describes its own
         // sliver, not the whole day -- merged onto whatever a prior
-        // failed attempt already accrued (`pending_funding_detail`) so
-        // the eventual successful row still reports the full breakdown.
+        // failed attempt already accrued (`state.pending_mark_funding_detail`,
+        // persisted below with the rest of `state` so a restart between a
+        // failed append and the next retry does not lose it) so the
+        // eventual successful row still reports the full breakdown.
         let date = utc_date(now);
         let pending_mark =
             if self.mark_on_date_change && self.state.last_mark_date.as_deref() != Some(&date) {
                 let (date, funding_detail) = self.accrue_daily_funding(now, &prices).await;
-                let mut merged = std::mem::take(&mut self.pending_funding_detail);
+                let mut merged = std::mem::take(&mut self.state.pending_mark_funding_detail);
                 merge_funding_detail(&mut merged, funding_detail);
                 Some((date, merged))
             } else {
@@ -442,8 +435,8 @@ impl BookEngine {
                 .write_daily_mark_row(now, &prices, &date, funding_detail.clone())
                 .await
             {
-                Ok(()) => self.pending_funding_detail.clear(),
-                Err(_) => self.pending_funding_detail = funding_detail,
+                Ok(()) => self.state.pending_mark_funding_detail.clear(),
+                Err(_) => self.state.pending_mark_funding_detail = funding_detail,
             }
         }
 

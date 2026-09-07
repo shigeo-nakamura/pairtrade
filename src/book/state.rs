@@ -159,6 +159,16 @@ pub struct BookState {
     pub pending_funding_qty_hours: BTreeMap<String, f64>,
     #[serde(default)]
     pub last_mark_date: Option<String>,
+    /// Per-symbol funding breakdown accrued but not yet durably written to
+    /// pnl.jsonl for the live daily mark still pending (`last_mark_date`
+    /// unset for today): merged onto the next retry's own accrual so the
+    /// eventual successful row still reports the whole day's funding, not
+    /// just the sliver accrued since the last attempt. Persisted (not
+    /// engine-local) so a restart between a failed append and the next
+    /// retry does not lose it -- `cum_funding_est_usd` above already
+    /// includes it regardless; this is only the per-symbol row detail.
+    #[serde(default)]
+    pub pending_mark_funding_detail: serde_json::Map<String, serde_json::Value>,
     /// Last equity observation (unix secs, usd).
     #[serde(default)]
     pub last_equity: Option<(i64, f64)>,
@@ -186,6 +196,7 @@ impl BookState {
             cum_funding_est_usd: 0.0,
             pending_funding_qty_hours: BTreeMap::new(),
             last_mark_date: None,
+            pending_mark_funding_detail: serde_json::Map::new(),
             last_equity: None,
             trades_closed: 0,
             trades_won: 0,

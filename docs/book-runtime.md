@@ -46,7 +46,7 @@ schedule:
   decision_time_utc: "00:30"      # interval_days / daily
   signal_grace_secs: 5400         # window after decision_time in which a valid signal is accepted
   flatten_after_secs: null        # fixed-window strategies: flatten at decision + N seconds
-  calendar_path: null             # kind=calendar: JSON list of {decision_key, decision_at, flatten_at}
+  calendar_path: null             # kind=calendar: JSON object `{"calendar_version": "...", "entries": [{decision_key, decision_at, flatten_at}, ...]}` (a bare top-level list is rejected)
 
 signal:
   path: /var/lib/book-xsmom/signal.json
