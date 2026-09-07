@@ -15,9 +15,14 @@ cp "$src" "$dst"
 FAKE
 chmod +x "$T/bin/aws"
 export PATH="$T/bin:$PATH"
+export BOOK_SIGNAL_MAX_AGE_SECS=7200
 
-python3 "$HERE/book_signal_file.py" --out "$T/good.json" --producer p --decision-key 2026-09-06 \
-  --as-of 2026-09-06T00:00:00Z --generated-at 2026-09-06T00:20:00Z BTC=0.1 ETH=-0.1 >/dev/null
+# Generated now: the fetcher enforces BOOK_SIGNAL_MAX_AGE_SECS, so a
+# fixed past timestamp would make the "good" fixture stale over time.
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+KEY=$(date -u +%Y-%m-%d)
+python3 "$HERE/book_signal_file.py" --out "$T/good.json" --producer p --decision-key "$KEY" \
+  --as-of "$NOW" --generated-at "$NOW" BTC=0.1 ETH=-0.1 >/dev/null
 python3 - "$T" <<'PY'
 import json, sys
 t = sys.argv[1]
@@ -26,10 +31,24 @@ m = dict(d); del m["decision_key"]; json.dump(m, open(f"{t}/bad_missing.json", "
 h = json.loads(json.dumps(d)); h["weights"]["BTC"] = 0.2; json.dump(h, open(f"{t}/bad_hash.json", "w"))
 g = dict(d); g["generated_at"] = 123; json.dump(g, open(f"{t}/bad_ts_type.json", "w"))
 w = json.loads(json.dumps(d)); w["weights"]["BTC"] = "0.1"; json.dump(w, open(f"{t}/bad_weight_type.json", "w"))
-a = dict(d); a["as_of"] = "2026-09-06T00:30:00Z"; a["payload_sha256"] = __import__("hashlib").sha256(json.dumps({"as_of": a["as_of"], "decision_key": a["decision_key"], "producer_id": a["producer_id"], "weights": a["weights"]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest(); json.dump(a, open(f"{t}/bad_lookahead.json", "w"))
+import datetime, hashlib
+def rehash(o):
+    o["payload_sha256"] = hashlib.sha256(json.dumps(
+        {"as_of": o["as_of"], "decision_key": o["decision_key"],
+         "producer_id": o["producer_id"], "weights": o["weights"]},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return o
+gen = datetime.datetime.strptime(d["generated_at"], "%Y-%m-%dT%H:%M:%SZ")
+a = json.loads(json.dumps(d))
+a["as_of"] = (gen + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(rehash(a), open(f"{t}/bad_lookahead.json", "w"))
 v = dict(d); v["schema_version"] = True; json.dump(v, open(f"{t}/bad_schema_bool.json", "w"))
 f = dict(d); f["schema_version"] = 1.0; json.dump(f, open(f"{t}/bad_schema_float.json", "w"))
 n = json.loads(json.dumps(d)); n["meta"] = {"k": float("nan")}; open(f"{t}/bad_nan_meta.json", "w").write(json.dumps(n))
+stale = json.loads(json.dumps(d))
+stale["generated_at"] = "2020-01-01T00:00:00Z"
+stale["as_of"] = "2020-01-01T00:00:00Z"
+json.dump(rehash(stale), open(f"{t}/bad_stale.json", "w"))
 fut = json.loads(json.dumps(d))
 fut["generated_at"] = "2099-01-01T00:00:00Z"
 json.dump(fut, open(f"{t}/bad_future.json", "w"))
@@ -38,10 +57,10 @@ open(f"{t}/bad_dup_key.json", "w").write(raw.replace("{", '{"producer_id":"other
 open(f"{t}/bad_json.json", "w").write("{")
 PY
 
-bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .*(2026-09-06 "
+bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .*($KEY "
 cmp -s "$T/good.json" "$T/dst/signal.json"
 
-for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_json; do
+for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_stale bad_json; do
   if bash "$HERE/book_signal_fetch.sh" "$T/$bad.json" "$T/dst/signal.json" 2>/dev/null; then
     echo "FAIL: $bad was promoted" >&2; exit 1
   fi

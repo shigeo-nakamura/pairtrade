@@ -72,10 +72,26 @@ if ! LD_LIBRARY_PATH="$STAGE/lib" "$STAGE/bin/book_runtime" --config "$STAGE/${I
   echo "book runtime bundle failed validation ($CONFIG_SOURCE with $BINARY_SOURCE); installed bundle left untouched" >&2
   exit 1
 fi
+# The fetcher pre-filters downloads with the same freshness bound the
+# runtime enforces, so a stale S3 object cannot displace a usable local
+# signal. Derive it from the validated config rather than duplicating the
+# number in the unit file.
+MAX_AGE=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*max_age_secs:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+case "$MAX_AGE" in
+  ''|*[!0-9]*)
+    echo "could not read signal.max_age_secs from $CONFIG_SOURCE (got '${MAX_AGE}')" >&2
+    exit 1
+    ;;
+esac
+printf 'BOOK_SIGNAL_MAX_AGE_SECS=%s\n' "$MAX_AGE" > "$STAGE/${INSTANCE}.fetch.env"
+chown root:"$SERVICE_GROUP" "$STAGE/${INSTANCE}.fetch.env"
+chmod 0440 "$STAGE/${INSTANCE}.fetch.env"
+
 mv -f "$STAGE/bin/book_runtime" "$INSTALL_DIR/bin/book_runtime"
 mv -f "$STAGE/lib/libsigner.so" "$INSTALL_DIR/lib/libsigner.so"
 mv -f "$STAGE/bin/book_signal_fetch.sh" "$INSTALL_DIR/bin/book_signal_fetch.sh"
 mv -f "$STAGE/${INSTANCE}.yaml" "$INSTALL_DIR/${INSTANCE}.yaml"
+mv -f "$STAGE/${INSTANCE}.fetch.env" "$INSTALL_DIR/${INSTANCE}.fetch.env"
 
 install -d -o root -g "$SERVICE_GROUP" -m 0750 "$SECRETS_DIR"
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_ROOT" "$STATE_ROOT/${INSTANCE}"
