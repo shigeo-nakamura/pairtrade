@@ -445,6 +445,45 @@ fn stop_distance_pct(mark: f64, stop_level: f64) -> f64 {
     ((mark - stop_level) / mark * 100.0).max(0.0)
 }
 
+/// Per-symbol perp size backing the collateral calculation: the LARGER of the
+/// recorded book and the venue's actual position. A venue position bigger than
+/// the book is exactly the case `reconcile` halts on, and valuing collateral
+/// off the smaller recorded size there would understate the notional and hide
+/// a real shortfall. Venue symbols that are not configured cannot be priced by
+/// this bot and are returned separately so the caller can fail closed rather
+/// than silently ignore collateral they consume.
+fn merge_perp_sizes(
+    configured: &[String],
+    recorded: &BTreeMap<String, f64>,
+    venue: &[(String, f64)],
+) -> (BTreeMap<String, f64>, Vec<String>) {
+    let mut sizes: BTreeMap<String, f64> = configured
+        .iter()
+        .map(|s| (s.clone(), recorded.get(s).copied().unwrap_or(0.0).max(0.0)))
+        .collect();
+    let mut unpriced = Vec::new();
+    for (sym, size) in venue {
+        let size = size.abs();
+        if size <= 0.0 {
+            continue;
+        }
+        match sizes.get_mut(&sym.to_ascii_uppercase()) {
+            Some(v) => *v = v.max(size),
+            None => unpriced.push(sym.clone()),
+        }
+    }
+    sizes.retain(|_, v| *v > 0.0);
+    (sizes, unpriced)
+}
+
+/// Perp notional (USD) for the given sizes at the given marks.
+fn perp_notional_usd(sizes: &BTreeMap<String, f64>, marks: &BTreeMap<String, f64>) -> f64 {
+    sizes
+        .iter()
+        .map(|(sym, size)| size * marks.get(sym).copied().unwrap_or(0.0))
+        .sum()
+}
+
 /// Runtime guard: liquidation must stay at least `clearance_pct` of drawdown
 /// beyond the furthest resting stop, or a drawdown liquidates the account
 /// before that stop can fire.
@@ -979,22 +1018,40 @@ impl Engine {
         Ok(e)
     }
 
-    /// Current Lighter price per configured symbol (read-only).
-    async fn lighter_marks(&self) -> Result<BTreeMap<String, f64>> {
+    /// Current Lighter price for exactly the given symbols (read-only). Only
+    /// symbols that actually carry perp size are priced: a quote failure on an
+    /// unrelated configured symbol must not abort the collateral evaluation
+    /// for the legs that are open.
+    async fn lighter_marks_for(
+        &self,
+        symbols: &BTreeMap<String, f64>,
+    ) -> Result<BTreeMap<String, f64>> {
         let mut marks = BTreeMap::new();
-        for sym in &self.cfg.symbols {
+        for sym in symbols.keys() {
             marks.insert(sym.clone(), self.quote(&self.lt, sym).await?.price);
         }
         Ok(marks)
     }
 
-    /// Perp notional currently held, at the given Lighter marks.
-    fn held_perp_notional_usd(&self, marks: &BTreeMap<String, f64>) -> f64 {
-        self.state
+    /// Perp sizes the collateral guard must value: recorded book merged with
+    /// the venue's actual open positions (see `merge_perp_sizes`).
+    async fn perp_sizes(&self) -> Result<(BTreeMap<String, f64>, Vec<String>)> {
+        let positions = self
+            .lt
+            .get_positions()
+            .await
+            .map_err(|e| anyhow!("Lighter get_positions: {e:?}"))?;
+        let venue: Vec<(String, f64)> = positions
+            .iter()
+            .map(|p| (p.symbol.clone(), p.size.to_f64().unwrap_or(0.0)))
+            .collect();
+        let recorded: BTreeMap<String, f64> = self
+            .state
             .legs
             .iter()
-            .map(|(sym, leg)| leg.perp_size.max(0.0) * marks.get(sym).copied().unwrap_or(0.0))
-            .sum()
+            .map(|(sym, leg)| (sym.clone(), leg.perp_size))
+            .collect();
+        Ok(merge_perp_sizes(&self.cfg.symbols, &recorded, &venue))
     }
 
     /// Pre-order collateral check (bot-strategy#909): the perp book may only
@@ -1011,8 +1068,24 @@ impl Engine {
         if adding_perp_usd <= 0.0 && !holds_perp {
             return Ok(None);
         }
-        let marks = self.lighter_marks().await?;
-        let after = self.held_perp_notional_usd(&marks) + adding_perp_usd.max(0.0);
+        let (sizes, unpriced) = match self.perp_sizes().await {
+            Ok(v) => v,
+            Err(e) if self.cfg.dry_run => {
+                log::warn!(
+                    "[MARGIN] DRY_RUN: Lighter positions unavailable, precheck skipped: {e:?}"
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e.context("collateral precheck: cannot verify Lighter positions")),
+        };
+        if !unpriced.is_empty() && !self.cfg.dry_run {
+            return Ok(Some(format!(
+                "Lighter holds position(s) in {} which this bot does not price; they consume the same cross collateral, so the shortfall cannot be computed — close them or add them to BULL_HOLDER_SYMBOLS",
+                unpriced.join(", ")
+            )));
+        }
+        let marks = self.lighter_marks_for(&sizes).await?;
+        let after = perp_notional_usd(&sizes, &marks) + adding_perp_usd.max(0.0);
         if after <= 0.0 {
             return Ok(None);
         }
@@ -1051,10 +1124,36 @@ impl Engine {
     async fn margin_monitor(&mut self) {
         let now = now_secs();
         self.last_margin_check = now;
-        // Spot-only book (`PERP_FRACTION=0`): decide that from state before
-        // any venue read, so a Lighter outage cannot publish `ok: false` for
-        // a book that carries no Lighter collateral risk at all.
-        if !self.state.legs.values().any(|l| l.perp_size > 0.0) {
+        // What actually backs the collateral: the venue's own positions
+        // merged with the recorded book (never the smaller of the two).
+        let (sizes, unpriced) = match self.perp_sizes().await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "[MARGIN] Lighter positions unavailable, guard skipped this cycle: {e:?}"
+                );
+                self.last_margin = Some(MarginSnapshot {
+                    ts: now,
+                    equity_usd: None,
+                    perp_notional_usd: 0.0,
+                    margin_pct: None,
+                    liq_distance_pct: None,
+                    worst_stop_distance_pct: None,
+                    ok: false,
+                    detail: format!("Lighter positions unavailable, guard not evaluated: {e}"),
+                });
+                return;
+            }
+        };
+        if !unpriced.is_empty() {
+            log::error!(
+                "[MARGIN] Lighter holds unpriced position(s) in {} on the same cross collateral; the guard cannot be trusted until they are closed or configured",
+                unpriced.join(", ")
+            );
+        }
+        // Spot-only book (`PERP_FRACTION=0`) or nothing open: no Lighter
+        // collateral risk, and no reason to read marks at all.
+        if sizes.is_empty() && unpriced.is_empty() {
             self.last_margin = Some(MarginSnapshot {
                 ts: now,
                 equity_usd: None,
@@ -1067,7 +1166,7 @@ impl Engine {
             });
             return;
         }
-        let marks = match self.lighter_marks().await {
+        let marks = match self.lighter_marks_for(&sizes).await {
             Ok(m) => m,
             Err(e) => {
                 log::warn!("[MARGIN] Lighter marks unavailable, guard skipped this cycle: {e:?}");
@@ -1086,7 +1185,7 @@ impl Engine {
                 return;
             }
         };
-        let notional = self.held_perp_notional_usd(&marks);
+        let notional = perp_notional_usd(&sizes, &marks);
         if notional <= 0.0 {
             self.last_margin = Some(MarginSnapshot {
                 ts: now,
@@ -1123,7 +1222,7 @@ impl Engine {
             .state
             .legs
             .iter()
-            .filter(|(_, l)| l.perp_size > 0.0)
+            .filter(|(sym, _)| sizes.contains_key(*sym))
             .map(|(sym, l)| match (l.stop_level, marks.get(sym)) {
                 (Some(level), Some(&mark)) if l.stop_order_id.is_some() => {
                     if mark < level {
@@ -1142,7 +1241,8 @@ impl Engine {
         let liq = liquidation_distance_pct(equity, notional, self.cfg.lighter_mmr_pct)
             .unwrap_or(f64::INFINITY);
         let margin_pct = equity / notional * 100.0;
-        let breached = margin_breached(liq, worst_stop, STOP_LIQ_CLEARANCE_PCT);
+        let breached =
+            margin_breached(liq, worst_stop, STOP_LIQ_CLEARANCE_PCT) || !unpriced.is_empty();
         let detail = if breached {
             let need = equity_for_distance_usd(
                 notional,
@@ -2294,6 +2394,36 @@ mod tests {
         let stop = stop_distance_pct(70.0, 65.0);
         assert!(liq3 > stop + STOP_LIQ_CLEARANCE_PCT, "{liq3} vs {stop}");
         assert_eq!(stop_distance_pct(0.0, 65.0), 0.0);
+    }
+
+    #[test]
+    fn perp_sizes_take_the_larger_of_book_and_venue() {
+        let configured = vec!["BTC".to_string(), "ETH".to_string()];
+        let recorded: BTreeMap<String, f64> = [("BTC".to_string(), 0.01), ("ETH".to_string(), 0.0)]
+            .into_iter()
+            .collect();
+        // The venue holds twice the recorded BTC (the case reconcile halts
+        // on) and a short ETH leg; both must be valued, ETH by magnitude.
+        let venue = vec![
+            ("BTC".to_string(), 0.02),
+            ("ETH".to_string(), -0.5),
+            ("SOL".to_string(), 3.0),
+        ];
+        let (sizes, unpriced) = merge_perp_sizes(&configured, &recorded, &venue);
+        assert_eq!(sizes.get("BTC"), Some(&0.02));
+        assert_eq!(sizes.get("ETH"), Some(&0.5));
+        assert_eq!(unpriced, vec!["SOL".to_string()]);
+        // Nothing anywhere → nothing to price (no venue read needed).
+        let (empty, none) = merge_perp_sizes(&configured, &BTreeMap::new(), &[]);
+        assert!(empty.is_empty() && none.is_empty());
+        // Notional uses only the symbols that carry size.
+        let marks: BTreeMap<String, f64> =
+            [("BTC".to_string(), 80_000.0), ("ETH".to_string(), 2_500.0)]
+                .into_iter()
+                .collect();
+        assert!(
+            (perp_notional_usd(&sizes, &marks) - (0.02 * 80_000.0 + 0.5 * 2_500.0)).abs() < 1e-9
+        );
     }
 
     #[test]
