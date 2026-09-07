@@ -80,12 +80,11 @@ impl Scheduler {
     /// Construct with an explicit calendar (tests / replay).
     pub fn build(cfg: &ScheduleConfig, mut calendar: Vec<CalendarEntry>) -> Result<Self> {
         calendar.sort_by_key(|e| e.decision_at);
-        for w in calendar.windows(2) {
-            if w[0].decision_key == w[1].decision_key {
-                bail!("calendar has duplicate decision_key {}", w[0].decision_key);
-            }
-        }
+        let mut keys = std::collections::HashSet::new();
         for e in &calendar {
+            if !keys.insert(e.decision_key.as_str()) {
+                bail!("calendar has duplicate decision_key {}", e.decision_key);
+            }
             if let Some(f) = e.flatten_at {
                 if f <= e.decision_at {
                     bail!(
@@ -93,6 +92,23 @@ impl Scheduler {
                         e.decision_key
                     );
                 }
+            }
+        }
+        // No overlap: an entry's signal window and exit must be over before
+        // the next decision starts (the runtime keeps a single decision
+        // record).
+        for w in calendar.windows(2) {
+            let grace = Duration::seconds(cfg.signal_grace_secs.max(0));
+            let first_end =
+                (w[0].decision_at + grace).max(w[0].flatten_at.unwrap_or(w[0].decision_at));
+            if first_end > w[1].decision_at {
+                bail!(
+                    "calendar entries {} and {} overlap: the first ends at {} but the second starts at {}",
+                    w[0].decision_key,
+                    w[1].decision_key,
+                    first_end,
+                    w[1].decision_at
+                );
             }
         }
         Ok(Self {
@@ -328,10 +344,30 @@ mod tests {
             "2026-09-09"
         );
         assert!(s.next_after(ts("2026-09-09T07:00:00Z")).is_none());
-        // duplicate key rejected
+        // duplicate key rejected, also when another entry sits in between (A, B, A)
         let mut dup = entries.clone();
-        dup.push(entries[0].clone());
-        assert!(Scheduler::build(&cfg.schedule, dup).is_err());
+        dup.push(CalendarEntry {
+            decision_key: "2026-09-08".into(),
+            decision_at: DateTime::parse_from_rfc3339("2026-09-10T06:30:00Z")
+                .unwrap()
+                .into(),
+            flatten_at: None,
+        });
+        assert!(Scheduler::build(&cfg.schedule, dup)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+        // overlapping flatten rejected
+        let mut over = entries.clone();
+        over[0].flatten_at = Some(
+            DateTime::parse_from_rfc3339("2026-09-09T07:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(Scheduler::build(&cfg.schedule, over)
+            .unwrap_err()
+            .to_string()
+            .contains("overlap"));
         // flatten before decision rejected
         let mut bad = entries.clone();
         bad[0].flatten_at = Some(bad[0].decision_at);

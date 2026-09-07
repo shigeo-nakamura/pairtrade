@@ -99,6 +99,13 @@ impl PaperExecutor {
         self.funding.write().await.insert(symbol.to_string(), rate);
     }
 
+    /// Drop every price and funding observation (replay: before each bar
+    /// date, so a symbol missing from a date is missing, not stale).
+    pub async fn clear_observations(&self) {
+        self.prices.write().await.clear();
+        self.funding.write().await.clear();
+    }
+
     /// Seed the paper book (restart: from `state.json`).
     pub async fn seed_positions(&self, positions: BTreeMap<String, VenuePosition>) {
         *self.positions.lock().await = positions;

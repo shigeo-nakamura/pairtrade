@@ -228,6 +228,54 @@ impl BookConfig {
             if f <= sc.signal_grace_secs {
                 bail!("schedule.flatten_after_secs must exceed signal_grace_secs");
             }
+            // A flatten that falls after the next decision would overlap two
+            // decisions' obligations; the runtime keeps one decision record.
+            let cadence_secs = match sc.kind {
+                ScheduleKind::Daily => 86_400,
+                ScheduleKind::IntervalDays => sc.every_days.unwrap_or(1) as i64 * 86_400,
+                ScheduleKind::Calendar => i64::MAX,
+            };
+            if f >= cadence_secs {
+                bail!(
+                    "schedule.flatten_after_secs ({f}) must be shorter than the decision cadence ({cadence_secs}s)"
+                );
+            }
+        }
+        if sc.signal_grace_secs
+            >= match sc.kind {
+                ScheduleKind::Daily => 86_400,
+                ScheduleKind::IntervalDays => sc.every_days.unwrap_or(1) as i64 * 86_400,
+                ScheduleKind::Calendar => i64::MAX,
+            }
+        {
+            bail!("schedule.signal_grace_secs must be shorter than the decision cadence");
+        }
+        // YAML accepts `.nan` / `.inf`; a NaN limit compares false against
+        // everything and would silently disable a rail. Every numeric field
+        // must be finite before the range checks below mean anything.
+        for (name, v) in [
+            ("signal.net_tolerance", self.signal.net_tolerance),
+            ("sizing.gross_notional_usd", self.sizing.gross_notional_usd),
+            ("sizing.max_symbol_weight", self.sizing.max_symbol_weight),
+            ("sizing.max_gross_usd", self.sizing.max_gross_usd),
+            ("sizing.max_net_usd", self.sizing.max_net_usd),
+            ("sizing.min_order_usd", self.sizing.min_order_usd),
+            (
+                "sizing.rebalance_deadband_usd",
+                self.sizing.rebalance_deadband_usd,
+            ),
+            (
+                "execution.paper_slippage_bps",
+                self.execution.paper_slippage_bps,
+            ),
+            ("execution.paper_fee_bps", self.execution.paper_fee_bps),
+            ("risk.equity_reference_usd", self.risk.equity_reference_usd),
+            ("risk.max_session_loss_bps", self.risk.max_session_loss_bps),
+            ("risk.max_daily_loss_bps", self.risk.max_daily_loss_bps),
+        ] {
+            if !v.is_finite() {
+                bail!("{name} must be a finite number, got {v}");
+            }
         }
         if self.signal.producer_id.trim().is_empty() {
             bail!("signal.producer_id must not be empty");
@@ -392,6 +440,38 @@ mod tests {
             "signal_grace_secs: 3600",
             "signal_grace_secs: 3600\n  flatten_after_secs: 60",
         );
+        assert!(BookConfig::from_yaml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn rejects_nan_limits_and_overlapping_flattens() {
+        let bad =
+            test_config_yaml().replace("max_session_loss_bps: 500", "max_session_loss_bps: .nan");
+        assert!(BookConfig::from_yaml_str(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("finite"));
+        let bad =
+            test_config_yaml().replace("equity_reference_usd: 1000", "equity_reference_usd: .inf");
+        assert!(BookConfig::from_yaml_str(&bad).is_err());
+        let bad = test_config_yaml().replace("max_net_usd: 150", "max_net_usd: .nan");
+        assert!(BookConfig::from_yaml_str(&bad).is_err());
+        // 5-day cadence: a 6-day flatten overlaps the next decision.
+        let bad = test_config_yaml().replace(
+            "signal_grace_secs: 3600",
+            "signal_grace_secs: 3600\n  flatten_after_secs: 518400",
+        );
+        assert!(BookConfig::from_yaml_str(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("cadence"));
+        let ok = test_config_yaml().replace(
+            "signal_grace_secs: 3600",
+            "signal_grace_secs: 3600\n  flatten_after_secs: 86400",
+        );
+        assert!(BookConfig::from_yaml_str(&ok).is_ok());
+        let bad =
+            test_config_yaml().replace("signal_grace_secs: 3600", "signal_grace_secs: 432000");
         assert!(BookConfig::from_yaml_str(&bad).is_err());
     }
 

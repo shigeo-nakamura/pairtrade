@@ -279,15 +279,34 @@ impl BookEngine {
                 .get(&sym)
                 .map(|l| 10f64.powi(-(l.size_decimals as i32)) * 0.5)
                 .unwrap_or(1e-9);
-            if (venue_qty - book_qty).abs() <= tol {
+            let book_basis_ok = self
+                .state
+                .positions
+                .get(&sym)
+                .map_or(true, |p| p.avg_price > 0.0);
+            if (venue_qty - book_qty).abs() <= tol && book_basis_ok {
                 continue;
             }
             let entry = venue
                 .get(&sym)
                 .and_then(|p| p.entry_price)
-                .or_else(|| prices.get(&sym).copied())
-                .or_else(|| self.state.positions.get(&sym).map(|p| p.avg_price))
+                .filter(|e| *e > 0.0)
+                .or_else(|| prices.get(&sym).copied().filter(|p| *p > 0.0))
+                .or_else(|| {
+                    self.state
+                        .positions
+                        .get(&sym)
+                        .map(|p| p.avg_price)
+                        .filter(|a| *a > 0.0)
+                })
                 .unwrap_or(0.0);
+            if venue_qty != 0.0 && entry <= 0.0 {
+                // No basis yet (venue reports no entry price and no WS mid
+                // has arrived): adopting now would book PnL from zero.
+                // Wait for a price; trading stays suppressed meanwhile.
+                log::warn!("[ADOPT] {sym}: venue qty {venue_qty} but no entry basis available yet; deferring");
+                return false;
+            }
             log::warn!(
                 "[ADOPT] {sym}: venue qty {venue_qty} != book qty {book_qty}; adopting venue (entry={entry})"
             );
@@ -383,17 +402,25 @@ impl BookEngine {
             self.signal_status = "no_decision_yet".to_string();
             return;
         };
-        if let Some((key, f)) = self.overdue_flatten(now) {
-            if key != d.key && !self.state.is_flat() {
-                // Never advance the schedule over an unfinished exit.
-                log::warn!(
-                    "[DECISION] key={} deferred: flatten of {} (due {}) still pending",
-                    d.key,
-                    key,
-                    f
-                );
-                self.signal_status = format!("waiting_flatten:{key}");
-                return;
+        // A previous key's flatten obligation (overdue or, if schedules
+        // somehow overlap despite the config checks, still in the future)
+        // must be settled before its record can be replaced.
+        if let Some(prev) = self.state.last_decision.clone() {
+            if prev.key != d.key && prev.flatten_at.is_some() && !prev.flatten_done {
+                if self.state.is_flat() {
+                    if let Some(r) = self.state.last_decision.as_mut() {
+                        r.flatten_done = true;
+                    }
+                } else {
+                    log::warn!(
+                        "[DECISION] key={} deferred: flatten of {} (due {:?}) still pending",
+                        d.key,
+                        prev.key,
+                        prev.flatten_at
+                    );
+                    self.signal_status = format!("waiting_flatten:{}", prev.key);
+                    return;
+                }
             }
         }
         let rec = self.state.last_decision.clone().filter(|r| r.key == d.key);
@@ -1531,5 +1558,53 @@ mod tests {
             DecisionOutcome::Applied
         );
         assert!(!engine.state.is_flat());
+    }
+
+    #[tokio::test]
+    async fn adoption_waits_for_a_price_basis_and_never_books_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // Venue holds 2 SOL, reports no entry price, and no mid has arrived.
+        let venue = Arc::new(MockVenue {
+            prices: HashMap::new(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 2.0,
+                        entry_price: None,
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine =
+            BookEngine::new(cfg.clone(), scheduler, venue.clone(), signals, status).unwrap();
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        assert!(
+            engine.state.positions.is_empty(),
+            "no adoption without a basis"
+        );
+        assert!(!engine.positions_ready);
+        // A mid arrives → adopted at the mid.
+        let venue2 = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 210.0)].into(),
+            positions: Mutex::new(venue.positions.lock().unwrap().clone()),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue2, signals, status).unwrap();
+        engine.tick(secs("2026-09-06T00:00:05Z")).await.unwrap();
+        assert!(engine.positions_ready);
+        assert_eq!(engine.state.positions["SOL"].qty, 2.0);
+        assert_eq!(engine.state.positions["SOL"].avg_price, 210.0);
     }
 }
