@@ -1330,6 +1330,37 @@ impl BookEngine {
             .collect();
         let mut flip_close_filled: std::collections::HashSet<&str> =
             std::collections::HashSet::new();
+        // Funding rates for every intent's symbol, fetched concurrently up
+        // front rather than one REST get_ticker (live) per intent inline
+        // in the loop below: a session-halt or overdue flatten with
+        // several legs must not be delayed by the sum of per-leg ticker
+        // timeouts when usable WS prices are already available to close
+        // with. A rate missed here (fetch failed, or the position closed
+        // before this plan was built) still falls through to
+        // accrue_funding's `None` path (pending_funding_qty_hours),
+        // exactly like a live rate lookup failing ever did.
+        let mut funding_fetches = tokio::task::JoinSet::new();
+        for sym in plan
+            .intents
+            .iter()
+            .map(|i| i.symbol.clone())
+            .collect::<std::collections::HashSet<_>>()
+        {
+            if !self.state.positions.contains_key(&sym) {
+                continue;
+            }
+            let exec = self.exec.clone();
+            funding_fetches.spawn(async move {
+                let rate = exec.funding_rate_hourly(&sym).await;
+                (sym, rate)
+            });
+        }
+        let mut funding_rates: HashMap<String, Option<f64>> = HashMap::new();
+        while let Some(res) = funding_fetches.join_next().await {
+            if let Ok((sym, rate)) = res {
+                funding_rates.insert(sym, rate);
+            }
+        }
         for (idx, intent) in plan.intents.iter().enumerate() {
             // Re-check the caps against the book that actually exists (see
             // `opening_cap_breach`): reductions ahead of this intent may
@@ -1418,11 +1449,7 @@ impl BookEngine {
                 s.blocked += 1;
                 continue;
             }
-            let rate = if self.state.positions.contains_key(&intent.symbol) {
-                self.exec.funding_rate_hourly(&intent.symbol).await
-            } else {
-                None
-            };
+            let rate = funding_rates.get(&intent.symbol).copied().flatten();
             match self.exec.execute(intent).await {
                 Ok(fill) => {
                     s.sent += 1;

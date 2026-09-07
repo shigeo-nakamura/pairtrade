@@ -367,7 +367,13 @@ pub fn plan_targets(
     })
 }
 
-/// Plan that closes every leg (halt flatten / fixed-window exit).
+/// Plan that closes every leg (halt flatten / fixed-window exit). A leg
+/// with no fresh price is left out of the plan entirely rather than
+/// failing the whole thing with `MissingPrice`: a protective flatten must
+/// still submit closes for every other, priceable leg now, and the caller
+/// already retries every 30s (`last_flatten_attempt`), so the unpriceable
+/// leg is picked up as soon as its price returns instead of blocking
+/// every other leg's close in the meantime.
 pub fn plan_flatten(
     current: &BTreeMap<String, f64>,
     prices: &HashMap<String, f64>,
@@ -377,7 +383,12 @@ pub fn plan_flatten(
     let empty = BTreeMap::new();
     let mut relaxed = sizing.clone();
     relaxed.rebalance_deadband_usd = 0.0;
-    plan(&empty, current, prices, lots, &relaxed)
+    let priceable: BTreeMap<String, f64> = current
+        .iter()
+        .filter(|(sym, _)| matches!(prices.get(*sym), Some(p) if p.is_finite() && *p > 0.0))
+        .map(|(sym, qty)| (sym.clone(), *qty))
+        .collect();
+    plan(&empty, &priceable, prices, lots, &relaxed)
 }
 
 #[cfg(test)]
@@ -635,6 +646,23 @@ mod tests {
             .intents
             .iter()
             .all(|i| i.reduce_only && i.kind == IntentKind::Close));
+    }
+
+    #[test]
+    fn flatten_closes_priceable_legs_even_when_one_leg_has_no_price() {
+        // A protective flatten (session halt, overdue fixed-window
+        // flatten) with several legs must still submit closes for every
+        // priceable one now: an all-or-nothing MissingPrice would leave
+        // every other leg open too, and the 30s flatten retry would repeat
+        // the same failure on every attempt instead of making progress.
+        let cur = w(&[("BTC", 0.1), ("DOT", -10.0)]);
+        let mut px = prices();
+        px.remove("DOT");
+        let p = plan_flatten(&cur, &px, &lots(), &sizing()).unwrap();
+        assert_eq!(p.intents.len(), 1);
+        assert_eq!(p.intents[0].symbol, "BTC");
+        assert!(p.intents[0].reduce_only);
+        assert_eq!(p.intents[0].kind, IntentKind::Close);
     }
 
     #[test]

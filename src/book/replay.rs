@@ -337,6 +337,20 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         engine.daily_mark_now(day_end - 1).await?;
         summary.days += 1;
     }
+    // A closed leg's funding carry that never found a rate to settle
+    // against stays in `pending_funding_qty_hours` forever, silently
+    // absent from cum_funding_est_usd, equity and every risk comparison
+    // that used it for the rest of the replay (bars.jsonl requiring a row
+    // for these symbols catches a *missing* row, not one whose rate is
+    // present-but-null throughout). Reporting success with that carry
+    // still open would understate funding without any error.
+    if !engine.state.pending_funding_qty_hours.is_empty() {
+        bail!(
+            "replay finished with unresolved funding carry for {:?} -- \
+             their bars.jsonl rows never had a funding_rate_hourly to settle against",
+            engine.state.pending_funding_qty_hours.keys().collect::<Vec<_>>()
+        );
+    }
     let prices = exec.prices(&cfg.universe.symbols).await;
     summary.final_equity = cfg.risk.equity_reference_usd + engine.state.cum_realized_usd
         - engine.state.cum_fees_usd
@@ -556,6 +570,41 @@ mod tests {
                 "{f} differs on rerun into the same dir"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_never_resolved_funding_carry_fails_the_replay() {
+        // BTC's rate is present on the decision day it opens, then absent
+        // for the only other day in this short window: the day-2 accrual
+        // freezes into pending_funding_qty_hours and, with no later day
+        // to settle it against, must not let `run` report success while
+        // that carry stays silently out of cum_funding_est_usd and equity.
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = Vec::new();
+        for (day, btc_rate) in [("2026-07-03", Some(0.00001)), ("2026-07-04", None)] {
+            for (sym, px) in [("BTC", 100_000.0), ("ETH", 4_000.0), ("SOL", 200.0), ("DOT", 4.0)] {
+                let rate = if sym == "BTC" { btc_rate } else { Some(0.00001) };
+                lines.push(
+                    serde_json::json!({
+                        "date": day, "symbol": sym, "close": px,
+                        "funding_rate_hourly": rate,
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        std::fs::write(dir.path().join("bars.jsonl"), lines.join("\n") + "\n").unwrap();
+        std::fs::write(
+            dir.path().join("lots.json"),
+            r#"{"BTC":{"size_decimals":5,"min_order_qty":null},"ETH":{"size_decimals":4,"min_order_qty":null},"SOL":{"size_decimals":2,"min_order_qty":null},"DOT":{"size_decimals":1,"min_order_qty":null}}"#,
+        )
+        .unwrap();
+        write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("DOT", -0.5)]);
+        let err = run(cfg(), dir.path(), &dir.path().join("out"))
+            .await
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("BTC") && err.contains("funding"), "{err}");
     }
 
     #[tokio::test]
