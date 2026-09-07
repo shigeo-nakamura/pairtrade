@@ -483,7 +483,9 @@ impl BookEngine {
                 // Guaranteed present: the deferral above returned without
                 // touching the book when there was no mark.
                 if let Some(mark) = close_mark {
+                    let trades_closed_before = self.state.trades_closed;
                     let realized = self.state.apply_fill(&sym, closed_qty, mark, now);
+                    let leg_closed = self.state.trades_closed != trades_closed_before;
                     log::warn!(
                         "[ADOPT] {sym}: booking an unrecorded close of {closed_qty} at the {mark} mark (realized ${realized:.4}, estimated price)"
                     );
@@ -497,7 +499,13 @@ impl BookEngine {
                         "paper": self.exec.is_paper(),
                     });
                     self.ledger.write(now, "recovered_close", None, row.clone());
-                    self.pnl.write(now, "exit", None, row);
+                    // A recovered fill only fully closes the leg when
+                    // `apply_fill` advances `trades_closed`; a recovered
+                    // partial reduction (venue still holds a smaller
+                    // same-side position) is a distinct event, matching the
+                    // ordinary-fill path in `book_fill`.
+                    let event = if leg_closed { "exit" } else { "partial_reduce" };
+                    self.pnl.write(now, event, None, row);
                 }
             }
             if venue_qty == 0.0 {
@@ -1601,10 +1609,12 @@ impl BookEngine {
     ) -> Option<f64> {
         let p = self.state.positions.get_mut(symbol)?;
         let since = p.funding_accrued_at.unwrap_or(p.opened_at);
+        // Leave `funding_accrued_at` unadvanced when the rate is unavailable
+        // so the whole interval (not just the part after this failed lookup)
+        // is booked once a rate reappears, instead of silently discarding it.
+        let rate = rate_hourly?;
         let hours = ((now - since).max(0)) as f64 / 3600.0;
-        let est = rate_hourly
-            .map(|r| -p.qty * price * r * hours)
-            .unwrap_or(0.0);
+        let est = -p.qty * price * rate * hours;
         p.funding_accrued_at = Some(now);
         self.state.cum_funding_est_usd += est;
         Some(est)
@@ -2146,6 +2156,59 @@ mod tests {
         assert!(rows(&cfg.paths.pnl)
             .iter()
             .any(|r| r["event"] == "exit" && r["recovered"] == true));
+    }
+
+    #[tokio::test]
+    async fn a_recovered_partial_reduction_is_not_labeled_an_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // Persisted book: long 3 SOL @ 100. The venue shows only 1 SOL left
+        // on the same side -- a reduce-only fill landed without this
+        // process booking it, but the leg is still open.
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 3.0, 100.0, secs("2026-09-05T23:00:00Z"));
+        state.persist(&cfg.paths.state).unwrap();
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 130.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 1.0,
+                        entry_price: Some(100.0),
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: None,
+            half_fill_symbol: None,
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        // The leg is still open, so this must not count as a completed
+        // trade even though the recovered reduction realized PnL.
+        assert_eq!(engine.state.positions["SOL"].qty, 1.0);
+        assert_eq!(engine.state.trades_closed, 0);
+        let recovered = rows(&cfg.paths.ledger)
+            .into_iter()
+            .find(|r| r["event"] == "recovered_close")
+            .expect("recovered_close row");
+        assert_eq!(recovered["closed_qty"], -2.0);
+        let pnl_rows = rows(&cfg.paths.pnl);
+        assert!(
+            !pnl_rows.iter().any(|r| r["event"] == "exit"),
+            "a recovered partial reduction must not be logged as a completed exit: {pnl_rows:?}"
+        );
+        assert!(pnl_rows
+            .iter()
+            .any(|r| r["event"] == "partial_reduce" && r["recovered"] == true));
     }
 
     #[tokio::test]
