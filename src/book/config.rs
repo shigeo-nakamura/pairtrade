@@ -1,7 +1,7 @@
 //! Book runtime configuration (`configs/book/<instance>.yaml`), see
 //! `docs/book-runtime.md` §2.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
@@ -397,19 +397,44 @@ impl BookConfig {
     }
 }
 
+/// `.` and `..` folded away textually. Used when the real directory is
+/// not on disk yet, so `run/state.json` and `run/../run/state.json` are
+/// still recognised as one file. A leading `..` that cannot be folded is
+/// kept, and no symlink is followed -- there is nothing to follow.
+fn lexical_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    None | Some(Component::ParentDir) | Some(Component::RootDir)
+                ) {
+                    out.pop();
+                } else if out.components().next_back() != Some(Component::RootDir) {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// A path in a form two configured paths can be compared by: the
 /// directory resolved through symlinks and `..` when it exists (so
 /// `a/b.json` and `a/../a/b.json` are recognised as one file), with the
-/// file name appended. Falls back to the path as written when the
-/// directory is not there yet, which is the normal case before the first
-/// run creates it.
+/// file name appended. Before the first run creates that directory the
+/// path is folded lexically instead, which catches the same aliasing for
+/// everything but a symlink that does not exist yet either.
 fn resolved_path(p: &Path) -> PathBuf {
     match (p.parent(), p.file_name()) {
         (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => match dir.canonicalize() {
             Ok(d) => d.join(name),
-            Err(_) => p.to_path_buf(),
+            Err(_) => lexical_path(p),
         },
-        _ => p.to_path_buf(),
+        _ => lexical_path(p),
     }
 }
 
@@ -497,6 +522,13 @@ mod tests {
         c.paths.state = dir.path().join("state.json");
         c.paths.pnl = dir.path().join("sub").join("..").join("state.json");
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        assert!(c.validate().is_err());
+        // And before the first run has created the directory, where there
+        // is nothing to canonicalize against.
+        let run = dir.path().join("not-created-yet");
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.paths.state = run.join("state.json");
+        c.paths.pnl = run.join("sub").join("..").join("state.json");
         assert!(c.validate().is_err());
     }
 

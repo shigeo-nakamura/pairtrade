@@ -153,7 +153,6 @@ impl Executor for PaperExecutor {
     }
 
     async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
-        let started = Instant::now();
         let mid = self
             .prices
             .read()
@@ -206,7 +205,12 @@ impl Executor for PaperExecutor {
             fee_usd: Some(filled * price * self.fee_bps / 10_000.0),
             order_id: None,
             venue_error: None,
-            latency_ms: started.elapsed().as_millis() as i64,
+            // Paper fills report a fixed latency, never the wall clock:
+            // a replay writes every FillReport into `ledger.jsonl`, so an
+            // OS scheduling pause would otherwise turn a 0 ms fill into a
+            // 1 ms one and break the byte-identical guarantee for inputs
+            // that never changed.
+            latency_ms: 0,
             position_after,
         })
     }
@@ -674,6 +678,9 @@ mod tests {
         assert!((f.fill_price - 100.1).abs() < 1e-9);
         assert!((f.fee_usd.unwrap() - 2.0 * 100.1 * 0.0002).abs() < 1e-9);
         assert_eq!(f.position_after, Some(2.0));
+        // A replay writes the whole report to the ledger, so the paper
+        // latency must not be the wall clock.
+        assert_eq!(f.latency_ms, 0);
         // reduce-only sell of 5 on a 2 long fills 2
         let f = ex
             .execute(&intent("SOL", Side::Sell, 5.0, true))

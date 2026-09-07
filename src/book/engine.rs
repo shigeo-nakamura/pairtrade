@@ -2,7 +2,7 @@
 //! daily mark → status. Driven by the wall clock in `book_runtime` and by
 //! a synthetic clock in [`super::replay`]. See `docs/book-runtime.md`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -107,12 +107,30 @@ pub struct ExecSummary {
     /// because every opening was administratively blocked must not spend
     /// an execution attempt).
     pub sent: usize,
+    /// Symbols among those. An attempt is only spent on what the venue
+    /// actually saw: a filled reduction must not consume the budget of an
+    /// opening that aborted before it was sent.
+    pub sent_symbols: BTreeSet<String>,
     pub filled: usize,
     pub partial: usize,
     pub unfilled: usize,
     pub blocked: usize,
     pub errors: usize,
     pub residual: BTreeMap<String, f64>,
+}
+
+impl ExecSummary {
+    /// Did this execution use up one of the decision's attempts? Only if
+    /// the venue saw an order for something that is *still* outstanding.
+    /// A plan whose reduction filled while its opening aborted before the
+    /// send has not tried that opening at all, and with `max_attempts: 1`
+    /// counting it would strand the book one-sided for the whole window.
+    pub fn spent_an_attempt(&self) -> bool {
+        if self.sent == 0 {
+            return false;
+        }
+        self.residual.is_empty() || self.residual.keys().any(|s| self.sent_symbols.contains(s))
+    }
 }
 
 impl BookEngine {
@@ -693,11 +711,12 @@ impl BookEngine {
         };
         // A retry that sent nothing (every remaining intent was blocked by
         // the risk rails or a cap) has not used the venue at all: keep the
-        // attempt budget for when the block clears inside the window.
-        let attempts = if summary.sent == 0 {
-            rec.attempts
-        } else {
+        // attempt budget for when the block clears inside the window. The
+        // same holds when nothing that is still outstanding was sent.
+        let attempts = if summary.spent_an_attempt() {
             attempts
+        } else {
+            rec.attempts
         };
         if let Some(r) = self.state.last_decision.as_mut() {
             r.outcome = outcome;
@@ -926,11 +945,12 @@ impl BookEngine {
             DecisionOutcome::Partial
         };
         // Same rule as the retry path: a first application whose intents
-        // were all blocked has not spent an execution attempt.
-        let attempts = if summary.sent == 0 {
-            prior_attempts
-        } else {
+        // were all blocked has not spent an execution attempt, and neither
+        // has one whose residual never reached the venue.
+        let attempts = if summary.spent_an_attempt() {
             attempts
+        } else {
+            prior_attempts
         };
         self.last_signal_generated_at = Some(sig.generated_at.timestamp());
         self.signal_status = format!(
@@ -1007,6 +1027,7 @@ impl BookEngine {
         let mut s = ExecSummary {
             intents: plan.intents.len(),
             sent: 0,
+            sent_symbols: BTreeSet::new(),
             filled: 0,
             partial: 0,
             unfilled: 0,
@@ -1087,6 +1108,7 @@ impl BookEngine {
             match self.exec.execute(intent).await {
                 Ok(fill) => {
                     s.sent += 1;
+                    s.sent_symbols.insert(intent.symbol.clone());
                     if fill.filled_qty > 0.0 {
                         self.accrue_funding(&intent.symbol, now, intent.reference_price, rate);
                         fills_since_check = true;
@@ -1107,6 +1129,7 @@ impl BookEngine {
                     let pre_send = e.downcast_ref::<PreSendAbort>().is_some();
                     if !pre_send {
                         s.sent += 1;
+                        s.sent_symbols.insert(intent.symbol.clone());
                         // The order was submitted and its outcome is
                         // unknown: it may have filled and moved both the
                         // book and the rails without us seeing it. Stop
@@ -2387,6 +2410,67 @@ mod tests {
         assert!(!rows(&cfg.paths.ledger)[before..]
             .iter()
             .any(|r| r["event"] == "rebalance_summary"));
+    }
+
+    #[tokio::test]
+    async fn a_filled_reduction_does_not_spend_the_attempt_of_an_unsent_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        cfg.execution.max_attempts = 1;
+        let d = ts("2026-09-06T00:30:00Z");
+        // Book is long $500 of SOL; the target halves it and opens a DOT
+        // short. The reduction reaches the venue, the opening aborts before
+        // it is sent -- so the venue never saw the leg that is left over.
+        write_signal(
+            dir.path(),
+            "2026-09-06",
+            d,
+            &[("SOL", 0.25), ("DOT", -0.25)],
+        );
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 2.5, 200.0, d.timestamp() - 3600);
+        state.persist(&cfg.paths.state).unwrap();
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 200.0), ("DOT".to_string(), 4.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 2.5,
+                        entry_price: Some(200.0),
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: Some("DOT".to_string()),
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Partial);
+        assert!(rec.target_qty.contains_key("DOT"));
+        assert_eq!(engine.state.positions["SOL"].qty, 1.25, "the reduce filled");
+        assert_eq!(
+            rec.attempts, 0,
+            "the DOT opening never reached the venue, so no attempt was spent"
+        );
+        // With max_attempts: 1 the budget has to be intact for the residual
+        // to be retried at all inside the window.
+        let before = rows(&cfg.paths.ledger).len();
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        assert!(
+            rows(&cfg.paths.ledger)[before..]
+                .iter()
+                .any(|r| r["event"] == "order_intent" && r["intent"]["symbol"] == "DOT"),
+            "the unsent opening is retried"
+        );
     }
 
     #[tokio::test]

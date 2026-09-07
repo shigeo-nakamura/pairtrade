@@ -91,7 +91,10 @@ would fill at or below zero) and one where any two of the six runtime
 files — the four `paths` plus `kill_switch_path` and `risk_ack_path` —
 are the same file, since sharing one would have each ledger append leave
 the state unparsable, and a runtime file that doubled as a flag file
-would read as a permanent kill switch.
+would read as a permanent kill switch. Paths are compared with their
+directory canonicalized when it exists and folded lexically when it does
+not, so aliases like `run/../run/state.json` are caught before the first
+run as well as after it.
 
 The effective config is fingerprinted (`[CONFIG] instance=… fp=<sha256-12>`)
 at startup and exported as `book_config_info{instance,fp}` so a
@@ -177,7 +180,11 @@ bot-strategy#580).
   planned at all (a transient missing price or lot-metadata response) and
   when an intent aborts *before* reaching the venue (no send-time price,
   or the book moved past the slippage budget) -- those rows carry
-  `pre_send: true` in the ledger.
+  `pre_send: true` in the ledger. "Something reached the venue" is judged
+  per residual leg, not per plan: an attempt is spent only when an order
+  went out for a symbol that is *still* outstanding, so a reduction that
+  filled cannot consume the budget of an opening that aborted before its
+  send and leave the book one-sided for the window.
 - An overdue flatten (`flatten_at` passed, book not flat) is processed
   before any decision — including after a restart that lands past the
   *next* decision time. The schedule does not advance onto a new key while
@@ -291,7 +298,8 @@ reduce_only }`.
   rounded the same way as live, so paper and live share every code path
   except the venue call.
 - Every attempt writes a `fill` ledger row (intent, requested, filled,
-  price, venue/paper, latency, attempt) and a `rebalance_summary` row
+  price, venue/paper, latency -- always 0 for paper fills, so a replay
+  stays byte-identical -- and attempt) and a `rebalance_summary` row
   closes the decision. When a fill is confirmed from the position delta
   but no matching fill record can be read (a lost acknowledgement, or an
   eventually-consistent fills endpoint, or a matched record whose own fee
