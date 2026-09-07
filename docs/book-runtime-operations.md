@@ -105,8 +105,10 @@ expected maintenance step.
 ## Host install (CI, no start)
 
 Two workflows can install, and neither depends on the other having run
-first: `ci.yml` owns the binary object in S3, `deploy-configs.yml` owns
-the config and unit objects, and each stages **everything** it needs from
+first: `ci.yml` publishes the runtime as an **immutable per-commit bundle**
+(`debot/book-runtime/releases/<sha>/{book_runtime,libsigner.so,manifest.json}`)
+plus a `current.json` pointer written last, `deploy-configs.yml` owns the
+config and unit objects, and each stages **everything** it needs from
 S3 into a per-run directory before calling
 `scripts/install_book_runtime.sh` with `BOOK_INSTANCE=xsmom-695`. A run
 whose counterpart object is not published yet logs and skips, so the
@@ -121,6 +123,11 @@ The installer holds an exclusive lock, so the two never interleave:
 - `/etc/book-runtime/` created; **`xsmom-695-secrets.env` is never written
   by CI**
 - units installed + `daemon-reload`; nothing started.
+
+`scripts/fetch_book_bundle.sh` is what reads that pointer: it downloads
+the binary and the signer from one release prefix and verifies both
+against that release's own manifest, so a deploy racing a CI upload can
+never pair a new binary with the previous signer.
 
 The installer stages the whole bundle (binary, signer library, config,
 fetch script), runs `book_runtime --validate` on the staged config with the

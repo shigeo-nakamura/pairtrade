@@ -40,6 +40,8 @@ jobs:
         run: bash scripts/test_book_signal_fetch.sh
       - name: Run S3 object presence probe tests
         run: bash scripts/test_s3_object_present.sh
+      - name: Run book bundle fetch tests
+        run: bash scripts/test_fetch_book_bundle.sh
       - name: Run Arcus live signal replay unit tests
         run: python3 scripts/test_arcus_live_tick_signal_replay.py -v
       - name: Run Arcus durable event stream unit tests
