@@ -58,6 +58,17 @@ class ProducerTests(unittest.TestCase):
         bad = dict(ROW, book={"LIT": {"side": 2, "notional": 10.0}})
         with self.assertRaises(SystemExit):
             xp.build(bad, 1000.0, datetime.now(timezone.utc))
+        bad = dict(ROW, book={"LIT": {"side": 1.5, "notional": 10.0}})
+        with self.assertRaises(SystemExit):  # not truncated to 1
+            xp.build(bad, 1000.0, datetime.now(timezone.utc))
+        missing = {k: v for k, v in ROW.items() if k != "book"}
+        with self.assertRaises(SystemExit):  # no book key is not a flat book
+            xp.build(missing, 1000.0, datetime.now(timezone.utc))
+        bad = dict(ROW, book=[])
+        with self.assertRaises(SystemExit):
+            xp.build(bad, 1000.0, datetime.now(timezone.utc))
+        flat = dict(ROW, book={})
+        self.assertEqual(xp.build(flat, 1000.0, datetime.now(timezone.utc))["weights"], {})
 
     def test_cli_writes_only_on_a_rebalance_date(self):
         with tempfile.TemporaryDirectory() as d:

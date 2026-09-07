@@ -66,13 +66,18 @@ def load_rebalance_rows(path: str) -> list[dict]:
     return rows
 
 
-def weights_from_book(book: dict, gross: float) -> dict:
+def weights_from_book(book, gross: float) -> dict:
+    # `book` must be present as a mapping: an explicit `{}` is a deliberate
+    # go-flat, a missing/invalid key is a schema regression, never flat.
+    if not isinstance(book, dict):
+        raise SystemExit(f"rebalance row 'book' must be a mapping, got {type(book).__name__}")
     out = {}
     for sym, leg in book.items():
-        side = int(leg["side"])
+        raw_side = leg["side"]
+        if isinstance(raw_side, bool) or raw_side not in (1, -1):
+            raise SystemExit(f"{sym}: side must be exactly +1/-1, got {raw_side!r}")
+        side = int(raw_side)
         notional = float(leg["notional"])
-        if side not in (1, -1):
-            raise SystemExit(f"{sym}: side must be +1/-1, got {side}")
         if notional < 0:
             raise SystemExit(f"{sym}: negative notional {notional}")
         if notional == 0:
@@ -95,7 +100,9 @@ def check_caps(weights: dict, max_symbol_weight: float, net_tolerance: float) ->
 
 def build(row: dict, gross: float, generated_at: datetime, producer_id: str = PRODUCER_ID) -> dict:
     d = date.fromisoformat(row["date"])
-    weights = weights_from_book(row.get("book", {}), gross)
+    if "book" not in row:
+        raise SystemExit(f"rebalance row for {row.get('date')} has no 'book' key; refusing (a flat book is an explicit {{}})")
+    weights = weights_from_book(row["book"], gross)
     check_caps(weights, MAX_SYMBOL_WEIGHT, NET_TOLERANCE)
     as_of = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
     meta = {
