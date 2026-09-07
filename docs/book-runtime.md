@@ -362,7 +362,12 @@ held, and no `(date, symbol)` may repeat), an optional `lots.json` (`{"SYM": {"s
 default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
 for every bar date `D` the closes of `D` become the prices, each decision /
 flatten scheduled inside `D` (a midnight decision belongs to the date it
-starts) is ticked at its exact time (paper fills at the close of `D`), and
+starts) is ticked at its exact time (paper fills at the close of `D`), a
+decision whose fixture states a `generated_at` after the decision instant
+but still inside its window is ticked again at that stated arrival (live,
+the fetch timer would deliver the file and the next 5 s tick would apply
+it; without the extra tick the fixture would be refused once as
+future-generated and the day lost), and
 after the final tick at `D 23:59:59` the daily mark labelled `D` is written
 (replay never marks at a decision tick, so funding intervals line up with
 the dates whose rates they use). The config's paths are redirected into `--out` and `dry_run` is
@@ -380,8 +385,11 @@ scripts/book_signal_file.py --out replay/signals/2026-07-03.json \
   BTC=0.0625 ETH=-0.0625 ...
 ```
 
-`generated_at` must fall inside `[decision_at - max_age_secs, decision_at
-+ 60 s]` for the replay clock to accept it.
+`generated_at` must fall inside `[decision_at - max_age_secs, window_end]`
+for the replay clock to accept it. Up to 60 s past the decision instant
+the clock-skew allowance accepts it at the decision tick itself; later
+than that it is applied at the arrival tick described above, never
+before it.
 
 ## 10. Live gate and hosts
 

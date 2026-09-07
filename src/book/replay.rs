@@ -200,6 +200,21 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         let mut ticks: Vec<i64> = Vec::new();
         for d in scheduler.decisions_between(day_start, day_end - 1) {
             ticks.push(d.decision_at);
+            // A producer may publish after the decision instant, anywhere
+            // inside the grace window. Live, the fetch timer delivers the
+            // file and the next 5 s tick applies it. Here the following
+            // tick would otherwise be the end of the day, so anything
+            // generated more than the clock-skew allowance after the
+            // decision would be rejected once as future-generated and
+            // never retried. Tick at its stated arrival instead.
+            if let Some(arrival) = signal_generated_at(replay_dir, &d.key) {
+                if arrival > d.decision_at
+                    && arrival <= d.window_end
+                    && (day_start..day_end).contains(&arrival)
+                {
+                    ticks.push(arrival);
+                }
+            }
             if let Some(f) = d.flatten_at {
                 if (day_start..day_end).contains(&f) {
                     ticks.push(f);
@@ -246,6 +261,22 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
     summary.cum_funding_est_usd = engine.state.cum_funding_est_usd;
     summary.trades_closed = engine.state.trades_closed;
     Ok(summary)
+}
+
+/// `generated_at` of the signal file for `key`, as unix seconds. `None`
+/// when there is no file, or it cannot be read or parsed: this only picks
+/// tick times, every check stays with the engine.
+fn signal_generated_at(replay_dir: &Path, key: &str) -> Option<i64> {
+    let text =
+        std::fs::read_to_string(replay_dir.join("signals").join(format!("{key}.json"))).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let raw = v.get("generated_at")?.as_str()?;
+    Some(
+        chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%SZ")
+            .ok()?
+            .and_utc()
+            .timestamp(),
+    )
 }
 
 /// Convenience for callers that hold a config path.
@@ -552,6 +583,46 @@ mod tests {
         // The 07-03 book is still on.
         assert!(state["positions"]["BTC"]["qty"].as_f64().unwrap() > 0.0);
         assert_eq!(state["last_decision"]["outcome"], "skipped");
+    }
+
+    #[tokio::test]
+    async fn a_signal_published_late_in_the_window_is_still_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("DOT", -0.5)]);
+        // 07-08 is published 30 minutes after the decision instant: late
+        // enough that the decision tick must refuse it as future-generated,
+        // but well inside the 3600 s grace window, so live trading would
+        // pick it up on the next tick. The replay has to do the same.
+        let decision_at = ts("2026-07-08T00:30:00Z");
+        let arrival = decision_at + Duration::minutes(30);
+        let body = signal_json(
+            "test_producer",
+            arrival,
+            decision_at - Duration::minutes(30),
+            "2026-07-08",
+            &[("BTC", -0.5), ("DOT", 0.5)],
+        );
+        std::fs::write(dir.path().join("signals").join("2026-07-08.json"), body).unwrap();
+        let out = dir.path().join("out");
+        run(cfg(), dir.path(), &out).await.unwrap();
+        let ledger = read_rows(&out.join("ledger.jsonl"));
+        let rows: Vec<_> = ledger
+            .iter()
+            .filter(|r| r["event"] == "decision" && r["decision_key"] == "2026-07-08")
+            .collect();
+        let outcomes: Vec<_> = rows
+            .iter()
+            .map(|r| r["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(outcomes, vec!["rejected", "applied"]);
+        assert_eq!(rows[0]["reason"], "future_generated");
+        // Applied at its stated arrival, never before it.
+        assert_eq!(rows[1]["ts_ms"], arrival.timestamp_millis());
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("state.json")).unwrap())
+                .unwrap();
+        assert!(state["positions"]["BTC"]["qty"].as_f64().unwrap() < 0.0);
     }
 
     #[tokio::test]
