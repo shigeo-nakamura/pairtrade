@@ -1040,6 +1040,18 @@ impl Engine {
             Ok(m) => m,
             Err(e) => {
                 log::warn!("[MARGIN] Lighter marks unavailable, guard skipped this cycle: {e:?}");
+                // Never leave a stale `ok: true` in status.json when the
+                // guard could not run.
+                self.last_margin = Some(MarginSnapshot {
+                    ts: now,
+                    equity_usd: None,
+                    perp_notional_usd: 0.0,
+                    margin_pct: None,
+                    liq_distance_pct: None,
+                    worst_stop_distance_pct: None,
+                    ok: false,
+                    detail: format!("Lighter marks unavailable, guard not evaluated: {e}"),
+                });
                 return;
             }
         };
@@ -1160,10 +1172,13 @@ impl Engine {
         self.state.last_tranche_date = None;
         self.state.tranche_progress.clear();
         self.persist();
-        // Collateral precheck on the first tranche (read-only, before any
-        // order). Short → the ARM fails and the caller halts: deposit, then
-        // RISK_ACK and ARM again.
-        if let Some(short) = self.margin_precheck(perp_tr * n as f64).await? {
+        // Collateral precheck against the WHOLE planned book (all tranches,
+        // all symbols), read-only and before any order: the deposit contract
+        // is for EQUITY_USD × PERP_FRACTION, not for one tranche — a ladder
+        // must not be allowed to start on a fifth of the collateral. Short →
+        // the ARM fails and the caller halts: deposit, RISK_ACK, ARM again.
+        // Scheduled tranches re-check incrementally as the book grows.
+        if let Some(short) = self.margin_precheck(perp_notional * n as f64).await? {
             bail!("{short}");
         }
         self.buy_tranche("ARM").await
