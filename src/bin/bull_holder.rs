@@ -53,7 +53,8 @@
 //! - **Pre-order**: ARM and every scheduled tranche require equity ≥
 //!   `BULL_HOLDER_PERP_MARGIN_MIN_PCT` of the total perp notional AFTER the
 //!   order (default 47.55% = ride to the 35% stop + worst 30-day funding +
-//!   execution buffer). A short ARM fails (halt, deposit, RISK_ACK, re-ARM);
+//!   execution buffer + liquidation fee; see `perp_margin_min_pct`). A short
+//!   ARM fails (halt, deposit, RISK_ACK, re-ARM);
 //!   a short scheduled tranche is deferred to the next UTC day.
 //! - **Runtime**: every reconcile the symmetric-drawdown liquidation point is
 //!   compared with the resting stops; if funding erosion or a drawdown puts
@@ -181,10 +182,14 @@ struct Config {
     lighter_mmr_pct: f64,
     /// Minimum Lighter account equity as a percentage of the TOTAL perp
     /// notional (all symbols, after the order being considered). Default
-    /// 47.55% = the 35% stop (35 + 1.2 × 0.65 maintenance on the remainder),
-    /// plus worst observed 30-day funding (9.77%, ETH), plus 1% execution
-    /// buffer — bot-strategy#909 "30-day buffer" allocation. Validated to
-    /// exceed the bare liquidation floor for `stop_dd_pct`.
+    /// 47.55% is the sum of four terms (matches
+    /// `bot-strategy scripts/strategy_probes/bull_holder_909_910/collateral_model.py`):
+    /// 35.78 to ride the 35% stop out (35 loss + 1.2 × 0.65 maintenance on
+    /// what is left) + 9.77 worst observed 30-day funding (ETH, Binance
+    /// proxy) + 1.00 execution buffer (stop-fill slippage) + 1.00 Lighter
+    /// `liquidation_fee` — bot-strategy#909 "30-day buffer" allocation.
+    /// Recomputing it after a funding or MMR change must keep all four.
+    /// Validated to exceed the bare liquidation floor for `stop_dd_pct`.
     perp_margin_min_pct: f64,
     /// Main loop cadence.
     tick_secs: u64,
