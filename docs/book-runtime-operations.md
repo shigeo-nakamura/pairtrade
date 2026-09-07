@@ -56,8 +56,13 @@ that already exists on this machine.)
   by CI**
 - units installed + `daemon-reload`; nothing started.
 
-The installer runs `book_runtime --validate` on the config before it is
-allowed on the host; a config that does not parse fails the deploy.
+The installer stages the whole bundle (binary, signer library, config,
+fetch script), runs `book_runtime --validate` on the staged config with the
+staged binary, and only then promotes all four files; a bundle that does
+not validate fails the deploy and leaves the previous one intact. It holds
+an exclusive `flock` on `/var/lock/book-runtime-install.lock` for that
+sequence, so the binary deploy (`ci.yml`) and the config deploy
+(`deploy-configs.yml`) can never interleave when a push fires both.
 
 ## Credentials (one-time, operator)
 

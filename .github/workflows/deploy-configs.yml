@@ -192,11 +192,6 @@ jobs:
     name: Deploy configs to Robinhood Lighter host
     needs: deploy-configs
     runs-on: ubuntu-latest
-    # Same group as ci.yml's deploy-robinhood-lighter job (both run the
-    # book runtime installer on this host); serialised, never cancelled.
-    concurrency:
-      group: robinhood-host-install
-      cancel-in-progress: false
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     environment: debot
     env:

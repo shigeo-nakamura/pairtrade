@@ -20,6 +20,22 @@ FETCH_SCRIPT_SOURCE=${BOOK_FETCH_SCRIPT_SOURCE:-/opt/debot/scripts/book_signal_f
 UNIT_SOURCE_DIR=${BOOK_UNIT_SOURCE_DIR:-/opt/debot/deploy}
 SERVICE_USER=book-runtime
 SERVICE_GROUP=book-runtime
+LOCK_FILE=${BOOK_INSTALL_LOCK:-/var/lock/book-runtime-install.lock}
+
+# ci.yml (binary) and deploy-configs.yml (config/units) both run this
+# script on the same host, and a push touching src/** and configs/** fires
+# both workflows at once. A shared GitHub concurrency group is the wrong
+# tool -- queuing a third job there cancels the pending one, which would
+# silently drop a binary deploy -- so the mutual exclusion lives here: each
+# run holds an exclusive lock for the whole stage-validate-promote
+# sequence, and both contenders install a complete, self-consistent bundle
+# from whatever is currently staged under /opt/debot.
+install -d -m 0755 "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+if ! flock -w 600 9; then
+  echo "another book runtime install is holding $LOCK_FILE; giving up after 600s" >&2
+  exit 1
+fi
 
 for source in "$BINARY_SOURCE" "$LIBSIGNER_SOURCE" "$CONFIG_SOURCE" "$FETCH_SCRIPT_SOURCE" \
               "$UNIT_SOURCE_DIR/book-runtime-${INSTANCE}.service" \

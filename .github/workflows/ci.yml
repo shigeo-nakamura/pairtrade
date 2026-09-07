@@ -444,13 +444,6 @@ jobs:
     name: Deploy Engine B live + book runtime binaries to Robinhood Lighter host
     needs: deploy
     runs-on: ubuntu-latest
-    # Shared with deploy-configs.yml's Robinhood job: both run
-    # install_book_runtime.sh on the same host, and a push touching src/**
-    # and configs/** fires both workflows at once. One group, no cancel,
-    # so the installs are serialised instead of interleaving their mv's.
-    concurrency:
-      group: robinhood-host-install
-      cancel-in-progress: false
     if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
     environment: debot
     env:
