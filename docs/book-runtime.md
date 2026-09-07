@@ -234,7 +234,12 @@ reduce_only }`.
   `max_attempts`; an unfilled residual after the last attempt is logged
   `[REBALANCE] residual …` and carried in `state.json` as
   `pending_residual` so the next tick within the window retries, and the
-  dashboard shows it.
+  dashboard shows it. Only a difference the planner could actually send
+  counts as residual: a close, a flip or a reduction always can, but an
+  opening or increase whose quantity is under the venue's minimum order
+  size is skipped as `below_venue_min_qty` on every retry, so it is
+  dropped from the residual instead of re-running the decision each tick
+  and leaving it `partial` for the whole window.
 - Live position adoption: every tick the venue position is the source of
   truth; any leg whose venue quantity differs from the book (opened or
   changed elsewhere, or by a crashed previous run) is adopted at the
@@ -262,7 +267,11 @@ reduce_only }`.
   realized PnL and the trade counters are recovered: a `recovered_close`
   ledger row and a `pnl.jsonl` exit row both carry
   `fill_price_source=reconcile_mark` and `recovered=true`, so the estimated
-  price is never mistaken for a venue fill. A leg the venue no longer holds is dropped. The
+  price is never mistaken for a venue fill. That booking needs a *current*
+  mark: with no price available the whole adoption is deferred (the leg
+  stays on the book, trading stays suppressed) rather than closing against
+  the stored basis, which would realize exactly zero and then drop the
+  leg, destroying the evidence of what it actually made. A leg the venue no longer holds is dropped once it has been booked. The
   runtime subscribes prices for the universe plus every persisted leg, and
   a leg adopted outside that set is priced from the venue ticker (60 s
   cache) so a reduce-only close can always be planned *and* sent on the
