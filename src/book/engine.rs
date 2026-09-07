@@ -1424,9 +1424,11 @@ impl BookEngine {
             Side::Buy => fill.filled_qty,
             Side::Sell => -fill.filled_qty,
         };
+        let trades_closed_before = self.state.trades_closed;
         let realized = self
             .state
             .apply_fill(&intent.symbol, signed, fill.fill_price, now);
+        let leg_closed = self.state.trades_closed != trades_closed_before;
         // An unknown fee is left out of the total rather than counted as
         // zero; the ledger row carries `fee_known: false` so it can be
         // reconciled against the venue later.
@@ -1480,10 +1482,12 @@ impl BookEngine {
         );
         // An unfilled reduce-only IOC is routine; writing an exit row for
         // it would put a phantom close in the PnL log while the leg is
-        // still open.
-        if fill.filled_qty > 0.0
-            && (realized != 0.0 || matches!(intent.kind, IntentKind::Close | IntentKind::Reduce))
-        {
+        // still open. A Close/Reduce fill that only trims the leg (leaves
+        // it open, possibly still realizing PnL) is a distinct event from
+        // one that actually closes it: `trades_closed` (and any consumer
+        // treating "exit" rows as completed legs) must only advance on the
+        // latter.
+        if fill.filled_qty > 0.0 && leg_closed {
             self.pnl.write(
                 now,
                 "exit",
@@ -1491,6 +1495,24 @@ impl BookEngine {
                 json!({
                     "symbol": intent.symbol,
                     "closed_qty": fill.filled_qty,
+                    "fill_price": fill.fill_price,
+                    "realized_usd": realized,
+                    "fee_usd": fill.fee_usd,
+                    "fee_known": fill.fee_usd.is_some(),
+                    "paper": self.exec.is_paper(),
+                }),
+            );
+        } else if fill.filled_qty > 0.0
+            && !leg_closed
+            && (realized != 0.0 || matches!(intent.kind, IntentKind::Close | IntentKind::Reduce))
+        {
+            self.pnl.write(
+                now,
+                "partial_reduce",
+                Some(key),
+                json!({
+                    "symbol": intent.symbol,
+                    "reduced_qty": fill.filled_qty,
                     "fill_price": fill.fill_price,
                     "realized_usd": realized,
                     "fee_usd": fill.fee_usd,
@@ -1651,6 +1673,12 @@ impl BookEngine {
                 }
             }
         }
+        // The halt/flatten above can change positions and flags after the
+        // last tick already wrote status.json for this date; re-write it so
+        // a replay ending on this date doesn't leave status.json reporting
+        // the pre-halt book.
+        let (equity, _) = self.compute_equity(&prices).await;
+        self.write_status(now, &prices, equity);
         if let Err(e) = self.state.persist(&self.cfg.paths.state) {
             log::error!("[MARK] persist failed: {e}");
         }
@@ -2674,6 +2702,20 @@ mod tests {
         assert!(rec.target_qty.contains_key("DOT"));
         // Half of the 1.25 reduction filled.
         assert_eq!(engine.state.positions["SOL"].qty, 1.875);
+        // The leg is still open (1.875 > 0): the partial fill must not be
+        // logged as a completed exit, only as a partial reduction.
+        assert!(
+            !rows(&cfg.paths.pnl)
+                .iter()
+                .any(|r| r["event"] == "exit" && r["symbol"] == "SOL"),
+            "a partial reduce that leaves the leg open is not an exit"
+        );
+        assert!(
+            rows(&cfg.paths.pnl)
+                .iter()
+                .any(|r| r["event"] == "partial_reduce" && r["symbol"] == "SOL"),
+            "the partial reduction is still logged, under its own label"
+        );
         assert_eq!(rec.attempts_for("SOL"), 1, "the venue saw the reduction");
         assert_eq!(
             rec.attempts_for("DOT"),
@@ -2827,6 +2869,67 @@ mod tests {
             blocked,
             "the opening leg is explicitly blocked, not silently dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn a_post_mark_session_halt_refreshes_status_not_just_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        // Isolate the session rail: the daily one must not fire first and
+        // muddy which halt this test is about.
+        cfg.risk.max_daily_loss_bps = 1_000_000.0;
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.status_interval_secs = 0;
+        let t0 = secs("2026-09-06T00:00:00Z");
+        // A long SOL position, anchored as the whole session/day: $1000 of
+        // notional against the $1000 paper base. The paper venue keeps its
+        // own mirrored book, so the reduce-only flatten fills against that.
+        engine.state.apply_fill("SOL", 5.0, 200.0, t0);
+        exec.seed_positions(
+            [(
+                "SOL".to_string(),
+                VenuePosition {
+                    qty: 5.0,
+                    entry_price: Some(200.0),
+                },
+            )]
+            .into(),
+        )
+        .await;
+        engine.state.session.start_equity = 1000.0;
+        engine.state.session.start_at = t0;
+        engine.state.daily.date = crate::book::risk::utc_date(t0);
+        engine.state.daily.start_equity = 1000.0;
+        engine.state.peak_equity = 1000.0;
+        // A live tick "yesterday" writes status.json while the book is
+        // still open and unhalted -- the baseline this bug leaves stale.
+        engine.write_status(t0, &[("SOL".to_string(), 200.0)].into(), 1000.0);
+        let before: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg.paths.status).unwrap()).unwrap();
+        assert_eq!(before["has_position"], true);
+        assert_eq!(before["position_count"], 1);
+        // A punishing funding rate over 100h drives session equity down
+        // more than the 5% session limit ($50 of $1000) -- enough to
+        // session-halt and flatten, entirely inside `daily_mark_now`'s own
+        // post-mark risk re-check (finding: this path only persisted
+        // state.json, leaving status.json reporting the pre-halt book).
+        exec.set_funding_rate_hourly("SOL", 0.001).await;
+        let t1 = t0 + 100 * 3600;
+        engine.daily_mark_now(t1).await;
+        assert!(engine.state.session.halted, "session should be halted");
+        assert!(engine.state.is_flat(), "session halt flattens the book");
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg.paths.status).unwrap()).unwrap();
+        assert_eq!(
+            after["book"]["session_halted"], true,
+            "status.json must reflect the halt, not the pre-halt tick: {after}"
+        );
+        assert_eq!(
+            after["has_position"], false,
+            "status.json must reflect the flatten, not the pre-halt position: {after}"
+        );
+        assert_eq!(after["position_count"], 0);
     }
 
     #[tokio::test]
