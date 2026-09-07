@@ -246,7 +246,12 @@ reduce_only }`.
   stored one is adopted even at an unchanged quantity (a fill booked at
   `mid_estimate` after a lost acknowledgement, or an external
   close-and-reopen of the same net size), since leaving it would corrupt
-  unrealized and later realized PnL for the life of the leg. When the venue shows *less* exposure than the book
+  unrealized and later realized PnL for the life of the leg. In that
+  close-and-reopen case the old leg's realized PnL cannot be recovered
+  from position data alone -- inventing a close price would fabricate a
+  trade -- so a `basis_correction` ledger row records the old and new
+  basis with `realized_pnl_recoverable: false`, and the operator
+  reconciles it against the venue's own trade history. When the venue shows *less* exposure than the book
   (a close that filled after the last persist, or a crash between the send
   and the booking), the missing reduction is booked at the current mark so
   realized PnL and the trade counters are recovered: a `recovered_close`
@@ -265,7 +270,16 @@ reduce_only }`.
   except the venue call.
 - Every attempt writes a `fill` ledger row (intent, requested, filled,
   price, venue/paper, latency, attempt) and a `rebalance_summary` row
-  closes the decision.
+  closes the decision. When a fill is confirmed from the position delta
+  but no matching fill record can be read (a lost acknowledgement, or an
+  eventually-consistent fills endpoint), its fee is recorded as **unknown**
+  rather than zero: `fee_known: false` on the row, and the amount is left
+  out of `cum_fees_usd` instead of understating it. Those rows are what a
+  later reconciliation against the venue's own fee history would use.
+- A submitted order whose outcome could not be confirmed blocks every
+  remaining opening in the plan (`unconfirmed_fill`): it may have filled
+  and moved both the book and the rails unseen, so the next tick
+  reconciles against the venue before anything else is sent.
 
 ## 7. Portfolio risk
 

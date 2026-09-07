@@ -407,6 +407,30 @@ impl BookEngine {
             } else {
                 0.0
             };
+            // Same signed quantity, different venue basis: the leg was
+            // closed and reopened outside this process. Position data
+            // alone cannot say at what price it closed -- inventing one
+            // would fabricate a trade, and staying silent would lose it --
+            // so the correction is recorded explicitly for reconciliation
+            // against the venue's own trade history.
+            if closed_qty == 0.0 && venue_qty != 0.0 && venue_basis_stale {
+                let old_basis = book_basis.unwrap_or(0.0);
+                log::warn!(
+                    "[ADOPT] {sym}: same quantity {venue_qty} but the venue basis moved {old_basis} -> {entry};                      any realized PnL from that external close/reopen is NOT in this book's accounting"
+                );
+                self.ledger.write(
+                    now,
+                    "basis_correction",
+                    None,
+                    json!({
+                        "symbol": sym,
+                        "qty": venue_qty,
+                        "book_basis": old_basis,
+                        "venue_basis": entry,
+                        "realized_pnl_recoverable": false,
+                    }),
+                );
+            }
             if closed_qty != 0.0 {
                 let mark = prices
                     .get(&sym)
@@ -1048,6 +1072,12 @@ impl BookEngine {
                     let pre_send = e.downcast_ref::<PreSendAbort>().is_some();
                     if !pre_send {
                         s.sent += 1;
+                        // The order was submitted and its outcome is
+                        // unknown: it may have filled and moved both the
+                        // book and the rails without us seeing it. Stop
+                        // the remaining openings until the next tick has
+                        // reconciled against the venue.
+                        rail_blocked = Some("unconfirmed_fill".to_string());
                     }
                     log::error!(
                         "[ORDER] {} {} {} failed{}: {e}",
@@ -1188,7 +1218,12 @@ impl BookEngine {
         let realized = self
             .state
             .apply_fill(&intent.symbol, signed, fill.fill_price, now);
-        self.state.cum_fees_usd += fill.fee_usd;
+        // An unknown fee is left out of the total rather than counted as
+        // zero; the ledger row carries `fee_known: false` so it can be
+        // reconciled against the venue later.
+        if let Some(fee) = fill.fee_usd {
+            self.state.cum_fees_usd += fee;
+        }
         let result = if fill.filled_qty <= 0.0 {
             "unfilled"
         } else if fill.filled_qty < intent.qty * (1.0 - 1e-6) {
@@ -1218,7 +1253,7 @@ impl BookEngine {
             fill.fill_price_source,
             slippage_bps,
             realized,
-            fill.fee_usd
+            fill.fee_usd.unwrap_or(f64::NAN)
         );
         self.ledger.write(
             now,
@@ -1229,6 +1264,7 @@ impl BookEngine {
                 "fill": fill,
                 "result": result,
                 "slippage_bps_vs_reference": slippage_bps,
+                "fee_known": fill.fee_usd.is_some(),
                 "realized_usd": realized,
                 "paper": self.exec.is_paper(),
             }),
@@ -1249,6 +1285,7 @@ impl BookEngine {
                     "fill_price": fill.fill_price,
                     "realized_usd": realized,
                     "fee_usd": fill.fee_usd,
+                    "fee_known": fill.fee_usd.is_some(),
                     "paper": self.exec.is_paper(),
                 }),
             );
@@ -2094,7 +2131,7 @@ mod tests {
                 filled_qty: intent.qty,
                 fill_price: intent.reference_price,
                 fill_price_source: "mid_estimate",
-                fee_usd: 0.0,
+                fee_usd: Some(0.0),
                 order_id: Some("o".into()),
                 venue_error: None,
                 latency_ms: 0,

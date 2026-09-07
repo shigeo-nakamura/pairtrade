@@ -39,7 +39,12 @@ pub struct FillReport {
     pub fill_price: f64,
     /// `paper` | `venue_fills` | `mid_estimate`
     pub fill_price_source: &'static str,
-    pub fee_usd: f64,
+    /// Venue fee for this fill. `None` when the fill was confirmed from
+    /// the position delta but no matching fill record could be read (a
+    /// lost acknowledgement, or an eventually-consistent fills endpoint):
+    /// the cost is real but unknown, and booking zero would silently
+    /// understate cumulative fees and PnL.
+    pub fee_usd: Option<f64>,
     pub order_id: Option<String>,
     pub venue_error: Option<String>,
     pub latency_ms: i64,
@@ -198,7 +203,7 @@ impl Executor for PaperExecutor {
             filled_qty: filled,
             fill_price: price,
             fill_price_source: "paper",
-            fee_usd: filled * price * self.fee_bps / 10_000.0,
+            fee_usd: Some(filled * price * self.fee_bps / 10_000.0),
             order_id: None,
             venue_error: None,
             latency_ms: started.elapsed().as_millis() as i64,
@@ -568,29 +573,46 @@ impl Executor for LiveExecutor {
         // reflected too), not the older planning reference.
         let mut fill_price = mid;
         let mut source = "mid_estimate";
-        let mut fee_usd = 0.0;
+        // `None` until a fill record is actually read: a lost ack or an
+        // eventually-consistent fills endpoint leaves the real cost
+        // unknown, and booking zero would understate cumulative fees.
+        let mut fee_usd: Option<f64> = None;
         if let Some(oid) = order_id.as_deref() {
             if let Ok(f) = self.connector.get_filled_orders(&intent.symbol).await {
                 let mut value = 0.0;
                 let mut size = 0.0;
+                let mut fee_acc = 0.0;
+                let mut saw_record = false;
                 for o in f
                     .orders
                     .iter()
                     .filter(|o| o.order_id == oid && !o.is_rejected)
                 {
+                    saw_record = true;
                     let s = o.filled_size.and_then(|d| d.to_f64()).unwrap_or(0.0);
                     let v = o.filled_value.and_then(|d| d.to_f64()).unwrap_or(0.0);
-                    fee_usd += o.filled_fee.and_then(|d| d.to_f64()).unwrap_or(0.0);
+                    fee_acc += o.filled_fee.and_then(|d| d.to_f64()).unwrap_or(0.0);
                     if s > 0.0 && v > 0.0 {
                         size += s;
                         value += v;
                     }
+                }
+                if saw_record {
+                    fee_usd = Some(fee_acc);
                 }
                 if size > 0.0 {
                     fill_price = value / size;
                     source = "venue_fills";
                 }
             }
+        }
+        if filled > 0.0 && fee_usd.is_none() {
+            log::warn!(
+                "[EXEC] {} filled {} but no fill record was readable (order_id={:?}); its fee is unknown, not zero",
+                intent.symbol,
+                filled,
+                order_id
+            );
         }
         Ok(FillReport {
             requested_qty: intent.qty,
@@ -633,7 +655,7 @@ mod tests {
             .unwrap();
         assert_eq!(f.filled_qty, 2.0);
         assert!((f.fill_price - 100.1).abs() < 1e-9);
-        assert!((f.fee_usd - 2.0 * 100.1 * 0.0002).abs() < 1e-9);
+        assert!((f.fee_usd.unwrap() - 2.0 * 100.1 * 0.0002).abs() < 1e-9);
         assert_eq!(f.position_after, Some(2.0));
         // reduce-only sell of 5 on a 2 long fills 2
         let f = ex
