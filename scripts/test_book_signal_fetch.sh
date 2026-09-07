@@ -97,5 +97,27 @@ done
 
 out=$(bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json")
 [ -z "$out" ] || { echo "FAIL: unchanged re-download should be silent, got: $out" >&2; exit 1; }
+
+# Key regression: with a daily grid at 23:59 the previous day's key is
+# still "current" for most of the day, so it passes the grid check -- but
+# it must not replace the newer signal already on disk.
+python3 - "$T" <<'PY'
+import datetime, hashlib, json, sys
+t = sys.argv[1]
+d = json.load(open(f"{t}/good.json"))
+prev = json.loads(json.dumps(d))
+prev["decision_key"] = (
+    datetime.datetime.strptime(d["decision_key"], "%Y-%m-%d") - datetime.timedelta(days=1)
+).strftime("%Y-%m-%d")
+prev["payload_sha256"] = hashlib.sha256(json.dumps(
+    {"as_of": prev["as_of"], "decision_key": prev["decision_key"],
+     "producer_id": prev["producer_id"], "weights": prev["weights"]},
+    sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+json.dump(prev, open(f"{t}/prev_key.json", "w"))
+PY
+if bash "$HERE/book_signal_fetch.sh" "$T/prev_key.json" "$T/dst/signal.json" 2>/dev/null; then
+  echo "FAIL: an older decision key replaced a newer signal" >&2; exit 1
+fi
+cmp -s "$T/good.json" "$T/dst/signal.json" || { echo "FAIL: the newer signal was displaced" >&2; exit 1; }
 ls -A "$T/dst" | grep -q '^\.signal\.' && { echo "FAIL: temp file left behind" >&2; exit 1; }
 echo "book_signal_fetch tests OK"

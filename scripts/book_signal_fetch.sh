@@ -47,7 +47,7 @@ if ! SUMMARY=$(BOOK_SIGNAL_MAX_AGE_SECS="${BOOK_SIGNAL_MAX_AGE_SECS:-}" \
   BOOK_SCHEDULE_KIND="${BOOK_SCHEDULE_KIND:-}" \
   BOOK_ANCHOR_DATE="${BOOK_ANCHOR_DATE:-}" \
   BOOK_EVERY_DAYS="${BOOK_EVERY_DAYS:-}" \
-  python3 - "$TMP" <<'PY'
+  python3 - "$TMP" "$DST" <<'PY'
 import hashlib, json, math, os, sys
 from datetime import datetime, timedelta, timezone
 def _reject_constant(token):
@@ -128,6 +128,20 @@ if decision_time and kind in ("interval_days", "daily"):
         raise SystemExit(
             f"decision_key {d['decision_key']} is not the current or next decision ({', '.join(sorted(allowed))})"
         )
+    # Both cur and nxt are allowed so a signal published a few minutes
+    # early still lands. That window also lets a regenerated prior-grid
+    # object back in, though, so never accept a key older than the one
+    # already on disk.
+    if len(sys.argv) > 2 and os.path.exists(sys.argv[2]):
+        try:
+            have = json.load(open(sys.argv[2])).get("decision_key")
+            datetime.strptime(str(have), "%Y-%m-%d")
+        except (ValueError, TypeError, json.JSONDecodeError, OSError):
+            have = None
+        if have and d["decision_key"] < have:
+            raise SystemExit(
+                f"decision_key {d['decision_key']} is older than the {have} signal already in place"
+            )
 if decision_time:
     # Date-keyed schedules: decision_key IS the decision date, so the
     # decision instant is derivable here and as_of must not be after it.
