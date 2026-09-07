@@ -362,6 +362,28 @@ impl BookConfig {
         if ex.slippage_bps >= 10_000 {
             bail!("execution.slippage_bps must be < 10000 (100%)");
         }
+        // paths.state itself must not be a symlink: its atomic persist
+        // (rename a temp file onto this exact pathname) replaces whatever
+        // is there rather than writing through it, so a leaf symlink is
+        // destroyed -- and diverges from its former target -- on the very
+        // first persist. instance_lock_path derives from this path
+        // resolved through symlinks precisely so two configs naming the
+        // same state via an alias share one lock; that guarantee would
+        // silently stop holding after the first restart following that
+        // first persist, once the alias and target have become two
+        // separate files. An ancestor *directory* symlink is fine (the
+        // kernel resolves it transparently on every read/write/rename, so
+        // it is never replaced), only the final path component is unsafe.
+        if let Ok(meta) = std::fs::symlink_metadata(&self.paths.state) {
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "paths.state ({}) must not itself be a symlink -- its first atomic persist \
+                     would replace the link (not its target), silently diverging from whatever \
+                     it used to alias; point every config directly at the real file instead",
+                    self.paths.state.display()
+                );
+            }
+        }
         // Every runtime file must be its own. Sharing one would have each
         // ledger append leave the state unparsable and the end-of-tick
         // persist overwrite the ledger; a path that collided with a flag
@@ -776,6 +798,38 @@ mod tests {
         c.signal.path = c.paths.ledger.clone();
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("signal.path"), "{e}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rejects_paths_state_that_is_itself_a_symlink() {
+        // instance_lock_path derives from paths.state resolved through
+        // symlinks, but the first atomic persist (rename onto the exact
+        // paths.state pathname) replaces a leaf symlink rather than
+        // writing through it -- so an alias that looked safe at startup
+        // would silently stop being one after the first persist. Refusing
+        // to start at all is simpler and more robust than trying to keep
+        // every downstream consumer (locking, loading, persisting) in
+        // sync with an alias that cannot itself survive a single write.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.json"), dir.path().join("state.json"))
+            .unwrap();
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.paths.state = dir.path().join("state.json");
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("paths.state") && e.contains("symlink"), "{e}");
+        // A symlinked *ancestor directory* is unaffected: the kernel
+        // resolves it transparently on every read/write/rename, so it is
+        // never replaced the way a leaf symlink is.
+        let real_dir = tempfile::tempdir().unwrap();
+        std::fs::write(real_dir.path().join("state.json"), "{}").unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        std::fs::remove_dir(link_dir.path()).unwrap();
+        std::os::unix::fs::symlink(real_dir.path(), link_dir.path()).unwrap();
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.paths.state = link_dir.path().join("state.json");
+        c.validate().unwrap();
     }
 
     #[test]

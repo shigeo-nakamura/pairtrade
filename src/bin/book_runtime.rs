@@ -322,15 +322,29 @@ async fn main() -> Result<()> {
                     // closes at a number the venue no longer reports,
                     // instead of taking the unavailable-rate path that
                     // preserves a pending funding obligation.
-                    for s in &symbols {
-                        match connector.get_ticker(s, None).await {
-                            Ok(t) => match t.funding_rate.and_then(|r| r.to_f64()) {
-                                Some(r) => p.set_funding_rate_hourly(s, r).await,
-                                None => p.clear_funding_rate_hourly(s).await,
-                            },
-                            Err(_) => p.clear_funding_rate_hourly(s).await,
-                        }
+                    //
+                    // Fetched concurrently, not one symbol after another:
+                    // this arm runs inside the outer `select!`, so a
+                    // sequential loop would hold it for the *sum* of every
+                    // symbol's request latency, during which the runtime
+                    // cannot receive WS prices, run its 5s engine tick, or
+                    // handle SIGTERM. Concurrent requests bound the stall
+                    // to the slowest single one instead.
+                    let mut refreshes = tokio::task::JoinSet::new();
+                    for s in symbols.clone() {
+                        let connector = connector.clone();
+                        let p = p.clone();
+                        refreshes.spawn(async move {
+                            match connector.get_ticker(&s, None).await {
+                                Ok(t) => match t.funding_rate.and_then(|r| r.to_f64()) {
+                                    Some(r) => p.set_funding_rate_hourly(&s, r).await,
+                                    None => p.clear_funding_rate_hourly(&s).await,
+                                },
+                                Err(_) => p.clear_funding_rate_hourly(&s).await,
+                            }
+                        });
                     }
+                    while refreshes.join_next().await.is_some() {}
                 }
             }
             _ = sigterm.recv() => {
