@@ -43,8 +43,9 @@ will accept; see "Universe drift" below. The fetcher on the host applies
 every check `signal.rs` does before it replaces the current file (hash,
 schema, producer, freshness, look-ahead, decision key, universe, caps,
 neutrality), all from values the installer derives from the deployed
-config, so a bad upload can never displace a signal the runtime could
-still have used. The local `aws` CLI uses the admin
+config, and additionally refuses a decision key older than the signal
+already in place, so a bad upload can never displace one the runtime
+could still have used. The local `aws` CLI uses the admin
 profile already on this machine.
 
 (Point the script path at the checkout that tracks `master` once
