@@ -1,0 +1,92 @@
+# Book runtime config for the ex-dividend gap bot on Lighter (bot-strategy#948),
+# DRY_RUN. Copy to the host as /opt/book-runtime/exdiv-lighter.yaml.
+# Credentials never live in this file.
+#
+# This is a `schedule.kind: calendar` instance of the book runtime (#937):
+# every declared ex-dividend date in configs/book/exdiv-events.json becomes
+# one calendar entry {decision_at 13:29:00Z, flatten_at 13:36:00Z}.
+# scripts/exdiv_signal_producer.py writes the signal at ~13:27 UTC from the
+# local Lighter WS logger (skip gates + slippage-budget sizing live there,
+# the runtime only executes); an empty weights map is the valid "skip".
+# The Hyperliquid leg (exdiv-hl) is a separate instance, added only after
+# the 2026-09-16 TSM readout confirms the same index step on HL.
+schema_version: 1
+instance_id: exdiv-lighter
+venue: lighter
+dry_run: true
+
+universe:
+  # Event symbols (dividend payers with a Lighter perp) plus the two hedge
+  # legs. The producer refuses a signal naming anything else (--config).
+  symbols:
+    - SPY
+    - QQQ
+    - IWM
+    - EWY
+    - IBM
+    - ORCL
+    - TSM
+    - MSFT
+    - AAPL
+    - NVDA
+    - QCOM
+    - US500
+    - US100
+
+schedule:
+  kind: calendar
+  # Generated from exdiv-events.json by the producer's `calendar`
+  # subcommand; installed next to this file by install_book_runtime.sh
+  # (BOOK_CALENDAR_SOURCE). The runtime loads it at startup.
+  calendar_path: /opt/book-runtime/exdiv-lighter.calendar.json
+  # Entry is time-only (13:29:00): a signal that is not valid by 13:31 is
+  # useless because the step lands 13:30-13:31, so the window is short.
+  signal_grace_secs: 120
+
+signal:
+  path: /var/lib/book-runtime/exdiv-lighter/signal.json
+  producer_id: exdiv_948_open_window_v1
+  max_age_secs: 300
+  # ETF events are hedged (SPY -w / US500 +w) but single-stock events are
+  # deliberately unhedged (issue design), so neutrality is not required;
+  # net exposure is capped by sizing.max_net_usd instead.
+  require_dollar_neutral: false
+  net_tolerance: 1.0
+
+sizing:
+  # weights are fractions of this; the producer caps every leg at $2,000
+  # (0.25) and sizes it from the slippage budget (20 % of the dividend)
+  # against the logger's cumulative depth. Two hedged ETF events on one
+  # day can share a hedge symbol, hence max_symbol_weight 0.5.
+  gross_notional_usd: 8000
+  max_symbol_weight: 0.5
+  max_gross_usd: 8800
+  # One unhedged single-stock leg at most ($2,000 + one lot of rounding).
+  max_net_usd: 2200
+  min_order_usd: 10
+  rebalance_deadband_usd: 5
+
+execution:
+  # Pre-send drift guard; the producer already skipped anything wider than
+  # 30 bps. Lighter has no price-capped IOC (bot-strategy#918): stays
+  # false while DRY_RUN, see docs/book-runtime-operations.md.
+  slippage_bps: 30
+  max_attempts: 3
+  fill_confirm_timeout_secs: 10
+  # Paper fill = mid +/- 5 bps: pessimistic for SPY (1-2 bps spread), about
+  # right for MSFT/EWY, optimistic only for names the skip gate rejects.
+  paper_slippage_bps: 5
+  paper_fee_bps: 0
+
+risk:
+  equity_reference_usd: 8000
+  max_session_loss_bps: 250       # $200 sticky halt on the paper base
+  max_daily_loss_bps: 150         # $120
+  kill_switch_path: /var/lib/book-runtime/exdiv-lighter/KILL_SWITCH
+  risk_ack_path: /var/lib/book-runtime/exdiv-lighter/RISK_ACK
+
+paths:
+  state: /var/lib/book-runtime/exdiv-lighter/state.json
+  ledger: /var/lib/book-runtime/exdiv-lighter/ledger.jsonl
+  pnl: /var/lib/book-runtime/exdiv-lighter/pnl.jsonl
+  status: /var/lib/book-runtime/exdiv-lighter/status.json

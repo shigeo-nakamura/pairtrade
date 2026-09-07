@@ -1,0 +1,16 @@
+[Unit]
+Description=Fetch the exdiv-lighter signal file from S3 around the US cash open (bot-strategy#948 / #937)
+
+[Timer]
+# The producer publishes at ~13:27 UTC on ex-dividend days and the decision
+# is 13:29:00 with a 120 s window, so poll every 20 s from 13:27:00 to
+# 13:31:40 on weekdays only. Outside that span there is nothing to fetch
+# (a stale object is refused by book_signal_fetch.sh anyway), so no
+# background polling: an ex-div date that is not a weekday does not exist.
+OnCalendar=Mon..Fri *-*-* 13:27..31:0/20 UTC
+AccuracySec=1s
+Persistent=false
+Unit=book-signal-fetch-exdiv-lighter.service
+
+[Install]
+WantedBy=timers.target

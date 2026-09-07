@@ -46,8 +46,16 @@ jobs:
           python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
           python3 -m py_compile debot/scripts/book_signal_file.py debot/scripts/test_book_signal_file.py
+          python3 -m py_compile debot/scripts/exdiv_signal_producer.py debot/scripts/test_exdiv_signal_producer.py
           python3 debot/scripts/test_book_signal_file.py
           python3 debot/scripts/test_xsmom_signal_producer.py
+          python3 debot/scripts/test_exdiv_signal_producer.py
+          # The exdiv-lighter runtime calendar is generated from the human
+          # events file; a stale committed copy would schedule the wrong
+          # dates (bot-strategy#948).
+          python3 debot/scripts/exdiv_signal_producer.py calendar \
+            --events debot/configs/book/exdiv-events.json \
+            --out debot/configs/book/exdiv-lighter.calendar.json --check
           bash debot/scripts/test_book_signal_fetch.sh
           bash debot/scripts/test_s3_object_present.sh
           bash debot/scripts/test_fetch_book_bundle.sh
@@ -77,6 +85,7 @@ jobs:
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.timer
           systemd-analyze verify debot/deploy/book-signal-fetch-xsmom-695.timer
+          systemd-analyze verify debot/deploy/book-signal-fetch-exdiv-lighter.timer
 
   deploy-configs:
     needs: validate-config-artifacts

@@ -18,6 +18,17 @@ LIBSIGNER_SOURCE=${BOOK_LIBSIGNER_SOURCE:-/opt/debot/lib/libsigner.so}
 CONFIG_SOURCE=${BOOK_CONFIG_SOURCE:-/opt/debot/configs/book/${INSTANCE}.yaml}
 FETCH_SCRIPT_SOURCE=${BOOK_FETCH_SCRIPT_SOURCE:-/opt/debot/scripts/book_signal_fetch.sh}
 UNIT_SOURCE_DIR=${BOOK_UNIT_SOURCE_DIR:-/opt/debot/deploy}
+# Optional: a `schedule.kind: calendar` instance's calendar file, installed
+# next to the config as <INSTALL_DIR>/<instance>.calendar.json (the unit's
+# InaccessiblePaths hides /opt/debot from the service, so the runtime
+# cannot read it from the synced configs tree). Empty = the instance has no
+# calendar (interval_days / daily); a missing file when the config names
+# one is caught by the runtime at startup, not here, since --validate does
+# not load it.
+CALENDAR_SOURCE=${BOOK_CALENDAR_SOURCE:-}
+if [ -z "$CALENDAR_SOURCE" ] && [ -f "/opt/debot/configs/book/${INSTANCE}.calendar.json" ]; then
+  CALENDAR_SOURCE=/opt/debot/configs/book/${INSTANCE}.calendar.json
+fi
 SERVICE_USER=book-runtime
 SERVICE_GROUP=book-runtime
 LOCK_FILE=${BOOK_INSTALL_LOCK:-/var/lock/book-runtime-install.lock}
@@ -68,6 +79,29 @@ install -o root -g "$SERVICE_GROUP" -m 0550 "$BINARY_SOURCE" "$STAGE/bin/book_ru
 install -o root -g "$SERVICE_GROUP" -m 0440 "$LIBSIGNER_SOURCE" "$STAGE/lib/libsigner.so"
 install -o root -g "$SERVICE_GROUP" -m 0440 "$CONFIG_SOURCE" "$STAGE/${INSTANCE}.yaml"
 install -o root -g "$SERVICE_GROUP" -m 0550 "$FETCH_SCRIPT_SOURCE" "$STAGE/bin/book_signal_fetch.sh"
+if [ -n "$CALENDAR_SOURCE" ]; then
+  if [ ! -f "$CALENDAR_SOURCE" ]; then
+    echo "book runtime calendar source is missing: $CALENDAR_SOURCE" >&2
+    exit 1
+  fi
+  # Same object shape the runtime's deny_unknown_fields parser expects; a
+  # bare list or a misspelled key must not reach the host as "installed".
+  if ! python3 - "$CALENDAR_SOURCE" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+if not isinstance(d, dict) or not isinstance(d.get("entries"), list):
+    raise SystemExit("calendar must be an object with an 'entries' list")
+for e in d["entries"]:
+    extra = set(e) - {"decision_key", "decision_at", "flatten_at"}
+    if extra or "decision_key" not in e or "decision_at" not in e:
+        raise SystemExit(f"bad calendar entry {e!r}")
+PY
+  then
+    echo "book runtime calendar failed validation ($CALENDAR_SOURCE); installed bundle left untouched" >&2
+    exit 1
+  fi
+  install -o root -g "$SERVICE_GROUP" -m 0440 "$CALENDAR_SOURCE" "$STAGE/${INSTANCE}.calendar.json"
+fi
 if ! LD_LIBRARY_PATH="$STAGE/lib" "$STAGE/bin/book_runtime" --config "$STAGE/${INSTANCE}.yaml" --validate >/dev/null; then
   echo "book runtime bundle failed validation ($CONFIG_SOURCE with $BINARY_SOURCE); installed bundle left untouched" >&2
   exit 1
@@ -132,6 +166,9 @@ mv -f "$STAGE/lib/libsigner.so" "$INSTALL_DIR/lib/libsigner.so"
 mv -f "$STAGE/bin/book_signal_fetch.sh" "$INSTALL_DIR/bin/book_signal_fetch.sh"
 mv -f "$STAGE/${INSTANCE}.yaml" "$INSTALL_DIR/${INSTANCE}.yaml"
 mv -f "$STAGE/${INSTANCE}.fetch.env" "$INSTALL_DIR/${INSTANCE}.fetch.env"
+if [ -n "$CALENDAR_SOURCE" ]; then
+  mv -f "$STAGE/${INSTANCE}.calendar.json" "$INSTALL_DIR/${INSTANCE}.calendar.json"
+fi
 
 install -d -o root -g "$SERVICE_GROUP" -m 0750 "$SECRETS_DIR"
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_ROOT" "$STATE_ROOT/${INSTANCE}"
