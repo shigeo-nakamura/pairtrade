@@ -110,6 +110,10 @@ pub const OUTPUT_FILES: &[&str] = &[
     "RISK_ACK",
 ];
 
+/// The most decimals a venue lot size can plausibly carry; anything above
+/// this in a fixture is a typo, and above `i32::MAX` it would wrap.
+const MAX_SIZE_DECIMALS: u32 = 12;
+
 pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<ReplaySummary> {
     std::fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
     for f in OUTPUT_FILES {
@@ -128,6 +132,22 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(e) => return Err(e).context("read lots.json"),
     };
+    // Rounding casts `size_decimals` to i32, so an out-of-range fixture
+    // value would wrap to a negative one and quietly round every quantity
+    // to tens instead of failing. No venue quotes more than 12 decimals.
+    for (sym, l) in &lots {
+        if l.size_decimals > MAX_SIZE_DECIMALS {
+            bail!(
+                "lots.json {sym}: size_decimals {} is out of range (0..={MAX_SIZE_DECIMALS})",
+                l.size_decimals
+            );
+        }
+        if let Some(m) = l.min_order_qty {
+            if !m.is_finite() || m < 0.0 {
+                bail!("lots.json {sym}: min_order_qty {m} must be finite and >= 0");
+            }
+        }
+    }
     let exec = Arc::new(PaperExecutor::new(
         cfg.execution.paper_slippage_bps,
         cfg.execution.paper_fee_bps,
@@ -488,6 +508,32 @@ mod tests {
                 .to_string();
             assert!(err.contains(missing), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_lot_precision_fails_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("DOT", -0.5)]);
+        // u32::MAX would cast to -1 and round every quantity to tens.
+        std::fs::write(
+            dir.path().join("lots.json"),
+            r#"{"BTC":{"size_decimals":4294967295,"min_order_qty":null}}"#,
+        )
+        .unwrap();
+        let e = run(cfg(), dir.path(), &dir.path().join("out"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("size_decimals"), "{e}");
+        std::fs::write(
+            dir.path().join("lots.json"),
+            r#"{"BTC":{"size_decimals":4,"min_order_qty":-1.0}}"#,
+        )
+        .unwrap();
+        assert!(run(cfg(), dir.path(), &dir.path().join("out2"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

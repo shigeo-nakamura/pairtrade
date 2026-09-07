@@ -422,6 +422,22 @@ fn lexical_path(p: &Path) -> PathBuf {
     out
 }
 
+/// An absolute form of a path whose directory does not exist yet: folded
+/// lexically and, when still relative, anchored to the working directory
+/// the process will actually write from. Without the anchor
+/// `run/state.json` and `$PWD/run/state.json` would compare as two files
+/// and both could be handed to state and ledger.
+fn anchored_path(p: &Path) -> PathBuf {
+    let lex = lexical_path(p);
+    if lex.is_absolute() {
+        return lex;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => lexical_path(&cwd.join(lex)),
+        Err(_) => lex,
+    }
+}
+
 /// A path in a form two configured paths can be compared by: the
 /// directory resolved through symlinks and `..` when it exists (so
 /// `a/b.json` and `a/../a/b.json` are recognised as one file), with the
@@ -432,9 +448,9 @@ fn resolved_path(p: &Path) -> PathBuf {
     match (p.parent(), p.file_name()) {
         (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => match dir.canonicalize() {
             Ok(d) => d.join(name),
-            Err(_) => lexical_path(p),
+            Err(_) => anchored_path(p),
         },
-        _ => lexical_path(p),
+        _ => anchored_path(p),
     }
 }
 
@@ -529,6 +545,13 @@ mod tests {
         let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
         c.paths.state = run.join("state.json");
         c.paths.pnl = run.join("sub").join("..").join("state.json");
+        assert!(c.validate().is_err());
+        // A relative spelling of a path is the same file as its absolute
+        // one, whatever the working directory writes resolve against.
+        let cwd = std::env::current_dir().unwrap();
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.paths.state = PathBuf::from("not-created-yet/shared.json");
+        c.paths.ledger = cwd.join("not-created-yet").join("shared.json");
         assert!(c.validate().is_err());
     }
 

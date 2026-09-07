@@ -119,20 +119,6 @@ pub struct ExecSummary {
     pub residual: BTreeMap<String, f64>,
 }
 
-impl ExecSummary {
-    /// Did this execution use up one of the decision's attempts? Only if
-    /// the venue saw an order for something that is *still* outstanding.
-    /// A plan whose reduction filled while its opening aborted before the
-    /// send has not tried that opening at all, and with `max_attempts: 1`
-    /// counting it would strand the book one-sided for the whole window.
-    pub fn spent_an_attempt(&self) -> bool {
-        if self.sent == 0 {
-            return false;
-        }
-        self.residual.is_empty() || self.residual.keys().any(|s| self.sent_symbols.contains(s))
-    }
-}
-
 impl BookEngine {
     pub fn new(
         cfg: BookConfig,
@@ -637,7 +623,8 @@ impl BookEngine {
                     self.finish_skipped(now, &d, "window_closed_after_reject");
                 }
                 DecisionOutcome::Partial
-                    if now <= d.window_end && r.attempts < self.cfg.execution.max_attempts =>
+                    if now <= d.window_end
+                        && r.any_symbol_under_budget(self.cfg.execution.max_attempts) =>
                 {
                     self.retry_residual(now, &d, &r, prices).await;
                 }
@@ -664,7 +651,6 @@ impl BookEngine {
         }
         let lots = self.lots_for(&symbols).await;
         let current = self.state.signed_qty();
-        let attempts = rec.attempts + 1;
         let plan = match rebalance::plan_targets(
             &rec.target_qty,
             &current,
@@ -696,6 +682,29 @@ impl BookEngine {
                 return;
             }
         };
+        // A leg that has used its own budget is dropped from the retry;
+        // the others still go out. Nothing left to send means nothing to
+        // record either -- the record already says `partial`.
+        let mut plan = plan;
+        let max = self.cfg.execution.max_attempts;
+        let dropped: Vec<String> = plan
+            .intents
+            .iter()
+            .filter(|i| rec.attempts_for(&i.symbol) >= max)
+            .map(|i| i.symbol.clone())
+            .collect();
+        if !dropped.is_empty() {
+            plan.intents.retain(|i| rec.attempts_for(&i.symbol) < max);
+            log::warn!(
+                "[REBALANCE] key={} legs out of attempts, not retried: {dropped:?}",
+                d.key
+            );
+        }
+        if plan.intents.is_empty() {
+            log::debug!("[REBALANCE] key={} nothing left to retry this tick", d.key);
+            return;
+        }
+        let attempts = rec.attempts + 1;
         log::info!(
             "[DECISION] key={} retry attempt={} intents={} residual_targets={}",
             d.key,
@@ -709,18 +718,23 @@ impl BookEngine {
         } else {
             DecisionOutcome::Partial
         };
-        // A retry that sent nothing (every remaining intent was blocked by
-        // the risk rails or a cap) has not used the venue at all: keep the
-        // attempt budget for when the block clears inside the window. The
-        // same holds when nothing that is still outstanding was sent.
-        let attempts = if summary.spent_an_attempt() {
-            attempts
-        } else {
-            rec.attempts
-        };
+        // Per-leg again: a retry whose intents were all blocked by the
+        // rails or a cap has not used the venue, and a leg that aborted
+        // before its send keeps its budget for later in the window.
+        let mut by_symbol = rec.attempts_by_symbol.clone();
+        for sym in &summary.sent_symbols {
+            *by_symbol.entry(sym.clone()).or_insert(0) += 1;
+        }
+        let attempts = by_symbol
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(rec.attempts)
+            .max(rec.attempts);
         if let Some(r) = self.state.last_decision.as_mut() {
             r.outcome = outcome;
             r.attempts = attempts;
+            r.attempts_by_symbol = by_symbol;
             r.at = now;
             r.reject_reason = None;
         }
@@ -767,6 +781,10 @@ impl BookEngine {
             signal_sha256: None,
             reject_reason: Some(reason.to_string()),
             attempts: prev.as_ref().map(|r| r.attempts).unwrap_or(0),
+            attempts_by_symbol: prev
+                .as_ref()
+                .map(|r| r.attempts_by_symbol.clone())
+                .unwrap_or_default(),
             flatten_at: d.flatten_at,
             flatten_done: prev.map(|r| r.flatten_done).unwrap_or(false),
             target_qty: BTreeMap::new(),
@@ -805,6 +823,10 @@ impl BookEngine {
             signal_sha256: None,
             reject_reason: Some(detail.clone()),
             attempts,
+            attempts_by_symbol: prev
+                .as_ref()
+                .map(|r| r.attempts_by_symbol.clone())
+                .unwrap_or_default(),
             flatten_at: d.flatten_at,
             flatten_done: prev.map(|r| r.flatten_done).unwrap_or(false),
             target_qty: BTreeMap::new(),
@@ -901,6 +923,15 @@ impl BookEngine {
             }
         };
         let prior_attempts = attempts;
+        // Per-leg budgets carried over from an earlier tick on this key
+        // (a rejected read, or a crash between the persist and the send).
+        let prior_by_symbol = self
+            .state
+            .last_decision
+            .as_ref()
+            .filter(|r| r.key == d.key)
+            .map(|r| r.attempts_by_symbol.clone())
+            .unwrap_or_default();
         let attempts = attempts + 1;
         log::info!(
             "[DECISION] key={} sha={} attempt={} intents={} gross_target=${:.2} net_target=${:.2} skipped={}",
@@ -926,6 +957,7 @@ impl BookEngine {
             signal_sha256: Some(sig.payload_sha256.clone()),
             reject_reason: None,
             attempts: prior_attempts,
+            attempts_by_symbol: prior_by_symbol.clone(),
             flatten_at: d.flatten_at,
             flatten_done: false,
             target_qty: plan.target_qty.clone(),
@@ -944,14 +976,20 @@ impl BookEngine {
         } else {
             DecisionOutcome::Partial
         };
-        // Same rule as the retry path: a first application whose intents
-        // were all blocked has not spent an execution attempt, and neither
-        // has one whose residual never reached the venue.
-        let attempts = if summary.spent_an_attempt() {
-            attempts
-        } else {
-            prior_attempts
-        };
+        // The budget is per leg: only the symbols the venue actually saw
+        // spend an attempt, so a filled reduction cannot exhaust the
+        // opening it was planned with. The scalar is the worst of them,
+        // for the ledger and the logs.
+        let mut by_symbol = prior_by_symbol;
+        for sym in &summary.sent_symbols {
+            *by_symbol.entry(sym.clone()).or_insert(0) += 1;
+        }
+        let attempts = by_symbol
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(prior_attempts)
+            .max(prior_attempts);
         self.last_signal_generated_at = Some(sig.generated_at.timestamp());
         self.signal_status = format!(
             "{}:{}",
@@ -968,6 +1006,7 @@ impl BookEngine {
             signal_sha256: Some(sig.payload_sha256.clone()),
             reject_reason: None,
             attempts,
+            attempts_by_symbol: by_symbol,
             flatten_at: d.flatten_at,
             flatten_done: false,
             target_qty: plan.target_qty.clone(),
@@ -1575,7 +1614,18 @@ impl BookEngine {
                     .count() as i32,
                 positions_ready: self.positions_ready,
                 positions: status::dashboard_positions(&self.state, prices),
-                pnl_total: equity - self.cfg.risk.equity_reference_usd,
+                // `equity_reference_usd` is the *paper* base. Live equity
+                // is the venue's, so subtracting it would publish the
+                // whole account size as PnL before a single trade; anchor
+                // to the session start the risk rails already use.
+                pnl_total: equity
+                    - if self.exec.is_paper() {
+                        self.cfg.risk.equity_reference_usd
+                    } else if self.state.session.start_equity > 0.0 {
+                        self.state.session.start_equity
+                    } else {
+                        equity
+                    },
                 pnl_today: if today_start > 0.0 {
                     equity - today_start
                 } else {
@@ -1904,6 +1954,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: None,
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1943,6 +1994,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: Some("DOT".to_string()),
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1988,6 +2040,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: Some("SOL".to_string()),
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2026,6 +2079,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: None,
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2067,6 +2121,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: None,
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2116,6 +2171,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: None,
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2156,6 +2212,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: None,
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2191,6 +2248,9 @@ mod tests {
         /// Symbol whose orders abort before reaching the venue (the shape
         /// of a missing send-time price or a drift-guard rejection).
         abort_symbol: Option<String>,
+        /// Symbol whose orders fill only half, so the leg stays residual
+        /// after the venue has seen it.
+        half_fill_symbol: Option<String>,
     }
 
     #[async_trait]
@@ -2238,9 +2298,14 @@ mod tests {
                 assert!(rec.signal_sha256.is_some());
                 assert!(rec.target_qty.contains_key(&intent.symbol));
             }
+            let qty = if self.half_fill_symbol.as_deref() == Some(intent.symbol.as_str()) {
+                intent.qty / 2.0
+            } else {
+                intent.qty
+            };
             let signed = match intent.side {
-                Side::Buy => intent.qty,
-                Side::Sell => -intent.qty,
+                Side::Buy => qty,
+                Side::Sell => -qty,
             };
             let mut p = self.positions.lock().unwrap();
             let e = p.entry(intent.symbol.clone()).or_default();
@@ -2254,7 +2319,7 @@ mod tests {
             }
             Ok(FillReport {
                 requested_qty: intent.qty,
-                filled_qty: intent.qty,
+                filled_qty: qty,
                 fill_price: intent.reference_price,
                 fill_price_source: "mid_estimate",
                 fee_usd: Some(0.0),
@@ -2292,6 +2357,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: None,
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2341,6 +2407,7 @@ mod tests {
                 equity_ok: std::sync::atomic::AtomicBool::new(true),
                 state_path: None,
                 abort_symbol: None,
+                half_fill_symbol: None,
             });
             let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
             let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2421,8 +2488,11 @@ mod tests {
         cfg.execution.max_attempts = 1;
         let d = ts("2026-09-06T00:30:00Z");
         // Book is long $500 of SOL; the target halves it and opens a DOT
-        // short. The reduction reaches the venue, the opening aborts before
-        // it is sent -- so the venue never saw the leg that is left over.
+        // short. The reduction reaches the venue and only half fills, so it
+        // stays residual too; the opening aborts before it is sent, so the
+        // venue never saw that leg at all. The shared counter would call
+        // the whole decision one attempt and, at max_attempts: 1, never
+        // retry DOT.
         write_signal(
             dir.path(),
             "2026-09-06",
@@ -2447,6 +2517,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: Some("DOT".to_string()),
+            half_fill_symbol: Some("SOL".to_string()),
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2456,20 +2527,63 @@ mod tests {
         let rec = engine.state.last_decision.clone().unwrap();
         assert_eq!(rec.outcome, DecisionOutcome::Partial);
         assert!(rec.target_qty.contains_key("DOT"));
-        assert_eq!(engine.state.positions["SOL"].qty, 1.25, "the reduce filled");
+        // Half of the 1.25 reduction filled.
+        assert_eq!(engine.state.positions["SOL"].qty, 1.875);
+        assert_eq!(rec.attempts_for("SOL"), 1, "the venue saw the reduction");
         assert_eq!(
-            rec.attempts, 0,
-            "the DOT opening never reached the venue, so no attempt was spent"
+            rec.attempts_for("DOT"),
+            0,
+            "the opening never reached the venue, so it spent no attempt"
         );
-        // With max_attempts: 1 the budget has to be intact for the residual
-        // to be retried at all inside the window.
+        // With max_attempts: 1 the DOT budget has to be intact for the
+        // residual to be retried at all, while SOL is done.
         let before = rows(&cfg.paths.ledger).len();
         engine.tick(d.timestamp() + 5).await.unwrap();
+        let new_rows = &rows(&cfg.paths.ledger)[before..];
         assert!(
-            rows(&cfg.paths.ledger)[before..]
+            new_rows
                 .iter()
                 .any(|r| r["event"] == "order_intent" && r["intent"]["symbol"] == "DOT"),
             "the unsent opening is retried"
+        );
+        assert!(
+            !new_rows
+                .iter()
+                .any(|r| r["event"] == "order_intent" && r["intent"]["symbol"] == "SOL"),
+            "the leg that used its attempt is not retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_pnl_total_is_measured_against_the_session_not_the_paper_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // The paper base is $100 while the live account holds $1000: the
+        // difference is the account, not profit.
+        cfg.risk.equity_reference_usd = 100.0;
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 200.0)].into(),
+            positions: Mutex::new(BTreeMap::new()),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: None,
+            half_fill_symbol: None,
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.status_interval_secs = 0;
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg.paths.status).unwrap()).unwrap();
+        assert_eq!(doc["pnl_source"], "venue_equity");
+        assert!(
+            doc["pnl_total"].as_f64().unwrap().abs() < 1e-9,
+            "nothing has been traded: {}",
+            doc["pnl_total"]
         );
     }
 
@@ -2489,6 +2603,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(false),
             state_path: Some(cfg.paths.state.clone()),
             abort_symbol: None,
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2548,6 +2663,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: None,
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2567,6 +2683,7 @@ mod tests {
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
             abort_symbol: None,
+            half_fill_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);

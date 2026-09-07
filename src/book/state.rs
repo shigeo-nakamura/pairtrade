@@ -55,9 +55,18 @@ pub struct DecisionRecord {
     pub signal_sha256: Option<String>,
     #[serde(default)]
     pub reject_reason: Option<String>,
-    /// Rebalance attempts spent on this key (plan → execute rounds).
+    /// Highest per-symbol attempt count on this key; reported in the
+    /// ledger and the logs. The budget itself is per symbol, below.
     #[serde(default)]
     pub attempts: u32,
+    /// Attempts spent per symbol: an order for that symbol reached the
+    /// venue that many times. A leg that never got sent -- blocked by a
+    /// rail, or aborted before the send -- keeps its budget even when
+    /// another leg of the same plan was submitted, so with
+    /// `max_attempts: 1` one filled reduction cannot strand the opening
+    /// it was paired with.
+    #[serde(default)]
+    pub attempts_by_symbol: BTreeMap<String, u32>,
     /// Unix seconds at which this decision's book must be flat again
     /// (fixed-window strategies); persisted so an overdue flatten survives
     /// a restart that lands after the next decision time.
@@ -70,6 +79,19 @@ pub struct DecisionRecord {
     /// re-plan a residual after a partial fill or a restart.
     #[serde(default)]
     pub target_qty: BTreeMap<String, f64>,
+}
+
+impl DecisionRecord {
+    pub fn attempts_for(&self, symbol: &str) -> u32 {
+        self.attempts_by_symbol.get(symbol).copied().unwrap_or(0)
+    }
+
+    /// Is any leg of this decision still allowed to reach the venue?
+    pub fn any_symbol_under_budget(&self, max_attempts: u32) -> bool {
+        self.target_qty
+            .keys()
+            .any(|s| self.attempts_for(s) < max_attempts)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

@@ -94,7 +94,8 @@ the state unparsable, and a runtime file that doubled as a flag file
 would read as a permanent kill switch. Paths are compared with their
 directory canonicalized when it exists and folded lexically when it does
 not, so aliases like `run/../run/state.json` are caught before the first
-run as well as after it.
+run as well as after it, and a relative path is anchored to the working
+directory before that comparison.
 
 The effective config is fingerprinted (`[CONFIG] instance=… fp=<sha256-12>`)
 at startup and exported as `book_config_info{instance,fp}` so a
@@ -180,11 +181,14 @@ bot-strategy#580).
   planned at all (a transient missing price or lot-metadata response) and
   when an intent aborts *before* reaching the venue (no send-time price,
   or the book moved past the slippage budget) -- those rows carry
-  `pre_send: true` in the ledger. "Something reached the venue" is judged
-  per residual leg, not per plan: an attempt is spent only when an order
-  went out for a symbol that is *still* outstanding, so a reduction that
-  filled cannot consume the budget of an opening that aborted before its
-  send and leave the book one-sided for the window.
+  `pre_send: true` in the ledger. The budget is **per leg**, not per
+  plan: `attempts_by_symbol` counts how often each symbol reached the
+  venue, a retry drops only the legs that have used their own budget, and
+  the decision keeps retrying while any of its symbols still has one. So
+  a reduction that filled (or was sent and came back unfilled) cannot
+  consume the budget of an opening that aborted before its send and leave
+  the book one-sided for the window. The scalar `attempts` in the ledger
+  and the logs is the worst leg's count.
 - An overdue flatten (`flatten_at` passed, book not flat) is processed
   before any decision — including after a restart that lands past the
   *next* decision time. The schedule does not advance onto a new key while
@@ -367,7 +371,10 @@ reduce_only }`.
   `has_position`, `positions`, `pnl_total`, `pnl_today`,
   `kill_switch_active`, `trade_stats`) plus a nested `book` block
   (`next_decision_at`, `last_decision`, `signal_status`, `gross_usd`,
-  `net_usd`, `session_halted`, `pending_residual`). Mirrored to S3 when
+  `net_usd`, `session_halted`, `pending_residual`). `pnl_total` is
+  measured against `equity_reference_usd` in DRY_RUN and against the
+  session's own start equity live, since the paper base says nothing
+  about the size of a real account. Mirrored to S3 when
   `STATUS_S3_BUCKET` / `STATUS_S3_KEY_PREFIX` are set.
 - Prometheus (`PROM_LISTEN`): `book_gross_usd`, `book_net_usd`,
   `book_position_count`, `book_equity_usd`, `book_session_halted`,
@@ -384,7 +391,8 @@ first so a rerun never resumes or appends; bar dates must be continuous,
 since a missing day loses its decisions, flattens, mark and funding
 accrual, and every leg the book holds must have a row on every date it is
 held, and no `(date, symbol)` may repeat), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
-default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
+default 4 decimals, `size_decimals` above 12 or a negative
+`min_order_qty` rejects the fixture rather than wrapping the rounding) and `signals/<key>.json` files with a synthetic clock:
 for every bar date `D` the closes of `D` become the prices, each decision /
 flatten scheduled inside `D` (a midnight decision belongs to the date it
 starts) is ticked at its exact time (paper fills at the close of `D`), a
