@@ -191,7 +191,7 @@ impl BookEngine {
                     }
                     DecisionOutcome::Halted => "halted".to_string(),
                 };
-                (Some(r.at), status)
+                (r.signal_generated_at, status)
             }
             None => (None, "none".to_string()),
         };
@@ -889,6 +889,7 @@ impl BookEngine {
             outcome: DecisionOutcome::Skipped,
             at: now,
             signal_sha256: None,
+            signal_generated_at: None,
             reject_reason: Some(reason.to_string()),
             attempts: prev.as_ref().map(|r| r.attempts).unwrap_or(0),
             attempts_by_symbol: prev
@@ -931,6 +932,7 @@ impl BookEngine {
             outcome: DecisionOutcome::Rejected,
             at: now,
             signal_sha256: None,
+            signal_generated_at: None,
             reject_reason: Some(detail.clone()),
             attempts,
             attempts_by_symbol: prev
@@ -1065,6 +1067,7 @@ impl BookEngine {
             outcome: DecisionOutcome::Partial,
             at: now,
             signal_sha256: Some(sig.payload_sha256.clone()),
+            signal_generated_at: Some(sig.generated_at.timestamp()),
             reject_reason: None,
             attempts: prior_attempts,
             attempts_by_symbol: prior_by_symbol.clone(),
@@ -1114,6 +1117,7 @@ impl BookEngine {
             outcome,
             at: now,
             signal_sha256: Some(sig.payload_sha256.clone()),
+            signal_generated_at: Some(sig.generated_at.timestamp()),
             reject_reason: None,
             attempts,
             attempts_by_symbol: by_symbol,
@@ -2130,7 +2134,34 @@ mod tests {
             "{}",
             restarted.signal_status
         );
-        assert_eq!(restarted.last_signal_generated_at, Some(rec.at));
+        assert_eq!(restarted.last_signal_generated_at, rec.signal_generated_at);
+        assert_eq!(
+            restarted.last_signal_generated_at,
+            Some(d.timestamp() - 600)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_a_rejected_or_skipped_decision_reports_no_signal_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        // No signal file on disk at all, and the tick lands after the
+        // signal window has already closed (default grace 3600s): this
+        // must land as Skipped ("window_missed"), never as an accepted
+        // decision.
+        let (mut engine, _) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.tick(d.timestamp() + 3601).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Skipped);
+        assert_eq!(rec.signal_generated_at, None);
+        drop(engine);
+
+        // A restart much later must not fabricate a signal age from the
+        // skip's own timestamp -- there was no accepted signal.
+        let (restarted, _) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        assert_eq!(restarted.last_signal_generated_at, None);
     }
 
     #[tokio::test]

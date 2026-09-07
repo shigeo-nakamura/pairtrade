@@ -133,11 +133,17 @@ async fn main() -> Result<()> {
     // Subscribe the universe plus every symbol the persisted book still
     // holds (a leg removed from the universe must stay priceable so it can
     // be closed); legs adopted from the venue at runtime fall back to the
-    // ticker price inside LiveExecutor.
+    // ticker price inside LiveExecutor. A symbol can also carry a
+    // `pending_funding_qty_hours` balance with no open position (the leg
+    // closed before its funding settled) -- without a price/rate feed for
+    // it, that carry can never resolve, so it needs the same subscription.
+    let persisted_state =
+        debot::book::state::BookState::load_or_new(&cfg.paths.state, &cfg.instance_id)?;
     let mut symbols = cfg.universe.symbols.clone();
-    for s in debot::book::state::BookState::load_or_new(&cfg.paths.state, &cfg.instance_id)?
+    for s in persisted_state
         .positions
         .keys()
+        .chain(persisted_state.pending_funding_qty_hours.keys())
     {
         if !symbols.contains(s) {
             symbols.push(s.clone());

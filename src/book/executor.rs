@@ -70,7 +70,14 @@ pub trait Executor: Send + Sync {
 // ---------------------------------------------------------------- paper
 
 pub struct PaperExecutor {
-    prices: RwLock<HashMap<String, f64>>,
+    /// Mids with the instant each arrived; an entry older than
+    /// `WS_PRICE_MAX_AGE_SECS` is treated as absent rather than served
+    /// stale, matching `LiveExecutor::price_for`. Paper has no ticker
+    /// fallback, so a quiet feed simply drops the price instead of
+    /// serving one indefinitely -- a long-running DRY_RUN process would
+    /// otherwise keep marking (and filling) a symbol at a price from
+    /// hours or days ago during a partial feed outage.
+    prices: RwLock<HashMap<String, (f64, Instant)>>,
     lots: RwLock<HashMap<String, LotMeta>>,
     funding: RwLock<HashMap<String, f64>>,
     positions: Mutex<BTreeMap<String, VenuePosition>>,
@@ -92,7 +99,24 @@ impl PaperExecutor {
 
     pub async fn set_price(&self, symbol: &str, mid: f64) {
         if mid.is_finite() && mid > 0.0 {
-            self.prices.write().await.insert(symbol.to_string(), mid);
+            self.prices
+                .write()
+                .await
+                .insert(symbol.to_string(), (mid, Instant::now()));
+        }
+    }
+
+    /// Current mid for `symbol` if a fresh-enough observation exists.
+    async fn fresh_price(&self, symbol: &str) -> Option<f64> {
+        let (px, at) = *self.prices.read().await.get(symbol)?;
+        if at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
+            Some(px)
+        } else {
+            log::warn!(
+                "[PRICE] paper mid for {symbol} is {}s old; treating as absent",
+                at.elapsed().as_secs()
+            );
+            None
         }
     }
 
@@ -124,11 +148,13 @@ impl Executor for PaperExecutor {
     }
 
     async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
-        let p = self.prices.read().await;
-        symbols
-            .iter()
-            .filter_map(|s| p.get(s).map(|v| (s.clone(), *v)))
-            .collect()
+        let mut out = HashMap::with_capacity(symbols.len());
+        for s in symbols {
+            if let Some(px) = self.fresh_price(s).await {
+                out.insert(s.clone(), px);
+            }
+        }
+        out
     }
 
     async fn lot_meta(&self, symbol: &str) -> Result<LotMeta> {
@@ -153,18 +179,12 @@ impl Executor for PaperExecutor {
     }
 
     async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
-        let mid = self
-            .prices
-            .read()
-            .await
-            .get(&intent.symbol)
-            .copied()
-            .ok_or_else(|| {
-                anyhow!(PreSendAbort(format!(
-                    "paper: no price for {}",
-                    intent.symbol
-                )))
-            })?;
+        let mid = self.fresh_price(&intent.symbol).await.ok_or_else(|| {
+            anyhow!(PreSendAbort(format!(
+                "paper: no price for {}",
+                intent.symbol
+            )))
+        })?;
         let slip = self.slippage_bps / 10_000.0;
         let price = match intent.side {
             Side::Buy => mid * (1.0 + slip),
@@ -711,6 +731,35 @@ mod tests {
         // no price → error
         assert!(ex
             .execute(&intent("DOT", Side::Buy, 1.0, false))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stale_paper_mid_is_treated_as_absent_not_served_forever() {
+        let ex = PaperExecutor::new(10.0, 2.0);
+        ex.set_price("SOL", 100.0).await;
+        assert_eq!(
+            ex.prices(&["SOL".to_string()]).await.get("SOL").copied(),
+            Some(100.0)
+        );
+        assert!(ex
+            .execute(&intent("SOL", Side::Buy, 1.0, false))
+            .await
+            .is_ok());
+
+        // Back-date the observation past WS_PRICE_MAX_AGE_SECS without a
+        // real sleep: a quiet feed during a long-running DRY_RUN process
+        // must not keep marking/filling at an arbitrarily old price.
+        let stale_at = Instant::now() - std::time::Duration::from_secs(WS_PRICE_MAX_AGE_SECS + 1);
+        ex.prices
+            .write()
+            .await
+            .insert("SOL".to_string(), (100.0, stale_at));
+
+        assert!(ex.prices(&["SOL".to_string()]).await.get("SOL").is_none());
+        assert!(ex
+            .execute(&intent("SOL", Side::Buy, 1.0, false))
             .await
             .is_err());
     }

@@ -492,29 +492,38 @@ fn resolved_path(p: &Path) -> PathBuf {
 
 /// `dir` is already canonical; `name` is the leaf under it, and the whole
 /// path failed to canonicalize (so the leaf itself does not exist, or is a
-/// symlink whose target does not exist yet). If it is such a dangling
-/// symlink, follow it once so an alias like `ledger.jsonl -> state.json`
-/// still resolves to the same path as `state.json` before either file is
-/// created, instead of comparing the two unresolved leaf names as distinct.
+/// symlink whose target does not exist yet). Follow the symlink chain --
+/// possibly several hops, e.g. `ledger.jsonl -> alias -> state.json` while
+/// `state.json` does not exist yet -- so it still resolves to the same
+/// path as `state.json` before any file in the chain is created, instead
+/// of comparing an intermediate link name as if it were distinct. A hop
+/// that revisits an already-seen path (a symlink cycle) stops following
+/// and falls back to the lexical form of where it landed.
 fn resolve_leaf(dir: &Path, name: &OsStr) -> PathBuf {
-    let candidate = dir.join(name);
-    let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
-        return candidate;
-    };
-    if !meta.file_type().is_symlink() {
-        return candidate;
+    let mut current = dir.join(name);
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if let Ok(full) = current.canonicalize() {
+            return full;
+        }
+        if !seen.insert(current.clone()) {
+            return anchored_path(&current);
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&current) else {
+            return current;
+        };
+        if !meta.file_type().is_symlink() {
+            return current;
+        }
+        let Ok(target) = std::fs::read_link(&current) else {
+            return current;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current.parent().map(|p| p.join(&target)).unwrap_or(target)
+        };
     }
-    let Ok(target) = std::fs::read_link(&candidate) else {
-        return candidate;
-    };
-    let joined = if target.is_absolute() {
-        target
-    } else {
-        dir.join(target)
-    };
-    joined
-        .canonicalize()
-        .unwrap_or_else(|_| anchored_path(&joined))
 }
 
 #[cfg(test)]
@@ -668,6 +677,22 @@ mod tests {
             c.paths.ledger = dir.path().join("ledger.jsonl");
             assert!(c.validate().is_err());
         }
+        // A chained dangling symlink (ledger.jsonl -> alias -> state.json,
+        // none of the three existing yet) must still resolve through both
+        // hops to the same path as state.json, not stop at the
+        // intermediate `alias` name.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(dir.path().join("alias"), dir.path().join("ledger.jsonl"))
+                .unwrap();
+            std::os::unix::fs::symlink(dir.path().join("state.json"), dir.path().join("alias"))
+                .unwrap();
+            let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+            c.paths.state = dir.path().join("state.json");
+            c.paths.ledger = dir.path().join("ledger.jsonl");
+            assert!(c.validate().is_err());
+        }
         // signal.path aliasing another runtime path is just as unsafe: the
         // engine reads it directly, so an alias to the ledger makes the
         // signal unparsable, and an alias to the kill switch blocks every
@@ -676,6 +701,21 @@ mod tests {
         c.signal.path = c.paths.ledger.clone();
         let e = c.validate().unwrap_err().to_string();
         assert!(e.contains("signal.path"), "{e}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_leaf_gives_up_on_a_symlink_cycle_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("b"), dir.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("b")).unwrap();
+        // Must terminate (the test itself is the timeout) and return some
+        // deterministic path rather than looping forever.
+        let resolved = resolved_path(&dir.path().join("a"));
+        assert!(
+            resolved.ends_with("a") || resolved.ends_with("b"),
+            "{resolved:?}"
+        );
     }
 
     #[test]

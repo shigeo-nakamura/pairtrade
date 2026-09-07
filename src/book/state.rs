@@ -53,6 +53,14 @@ pub struct DecisionRecord {
     pub at: i64,
     #[serde(default)]
     pub signal_sha256: Option<String>,
+    /// Unix seconds of the signal file's own `generated_at`, set only when
+    /// this decision actually accepted a signal (Applied/Partial). `at`
+    /// above is when this record was last written -- the apply time, a
+    /// retry, or a halt -- and can be much later than the signal's true
+    /// generation time, so `book_signal_age_seconds` must restore from
+    /// this field rather than from `at`.
+    #[serde(default)]
+    pub signal_generated_at: Option<i64>,
     #[serde(default)]
     pub reject_reason: Option<String>,
     /// Highest per-symbol attempt count on this key; reported in the
