@@ -43,7 +43,7 @@ def rehash(o):
     o["payload_sha256"] = hashlib.sha256(json.dumps(
         {"as_of": o["as_of"], "decision_key": o["decision_key"],
          "producer_id": o["producer_id"], "weights": o["weights"]},
-        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
     return o
 gen = datetime.datetime.strptime(d["generated_at"], "%Y-%m-%dT%H:%M:%SZ")
 a = json.loads(json.dumps(d))
@@ -122,7 +122,7 @@ prev["decision_key"] = (
 prev["payload_sha256"] = hashlib.sha256(json.dumps(
     {"as_of": prev["as_of"], "decision_key": prev["decision_key"],
      "producer_id": prev["producer_id"], "weights": prev["weights"]},
-    sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 json.dump(prev, open(f"{t}/prev_key.json", "w"))
 PY
 if bash "$HERE/book_signal_fetch.sh" "$T/prev_key.json" "$T/dst/signal.json" 2>/dev/null; then
@@ -130,4 +130,14 @@ if bash "$HERE/book_signal_fetch.sh" "$T/prev_key.json" "$T/dst/signal.json" 2>/
 fi
 cmp -s "$T/good.json" "$T/dst/signal.json" || { echo "FAIL: the newer signal was displaced" >&2; exit 1; }
 ls -A "$T/dst" | grep -q '^\.signal\.' && { echo "FAIL: temp file left behind" >&2; exit 1; }
+
+# Non-ASCII regression: the producer hashes UTF-8 (ensure_ascii=False, matching
+# the Rust side); the fetcher's own recomputation must not hash "\u..." escapes
+# instead and refuse a correctly hashed file the runtime would accept.
+mkdir -p "$T/dst2"
+python3 "$HERE/book_signal_file.py" --out "$T/utf8.json" --producer 'prîd_日本語' --decision-key "$KEY" \
+  --as-of "$NOW" --generated-at "$NOW" BTC=0.1 ETH=-0.1 >/dev/null
+BOOK_SIGNAL_PRODUCER_ID='prîd_日本語' bash "$HERE/book_signal_fetch.sh" "$T/utf8.json" "$T/dst2/signal.json" \
+  | grep -q "updated " || { echo "FAIL: non-ASCII producer id was refused (ensure_ascii mismatch)" >&2; exit 1; }
+cmp -s "$T/utf8.json" "$T/dst2/signal.json" || { echo "FAIL: non-ASCII fixture not promoted" >&2; exit 1; }
 echo "book_signal_fetch tests OK"

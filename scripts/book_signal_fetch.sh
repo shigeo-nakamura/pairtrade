@@ -190,7 +190,12 @@ for sym, v in d["weights"].items():
         raise SystemExit(f"weight for {sym} must be a finite number, got {v!r}")
 payload = {"as_of": d["as_of"], "decision_key": d["decision_key"], "producer_id": d["producer_id"],
            "weights": {k: float(v) for k, v in d["weights"].items()}}
-sha = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+# ensure_ascii=False, same as book_signal_file.py::canonical_payload and the
+# Rust side (serde_json never \u-escapes): with the default True, a valid
+# non-ASCII producer_id / decision_key / symbol would be hashed as "\u..."
+# escapes here, and the fetcher would refuse a correctly hashed file the
+# runtime accepts -- silently losing that decision.
+sha = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 if sha != str(d["payload_sha256"]).lower():
     raise SystemExit(f"payload_sha256 mismatch: file {d['payload_sha256']} computed {sha}")
 # The weight constraints signal.rs enforces. Each is skipped when its
