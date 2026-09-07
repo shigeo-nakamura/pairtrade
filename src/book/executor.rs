@@ -583,6 +583,10 @@ impl Executor for LiveExecutor {
                 let mut size = 0.0;
                 let mut fee_acc = 0.0;
                 let mut saw_record = false;
+                // One matched fill without a usable fee makes the total
+                // unknown: adding it as zero would report `fee_known:
+                // true` on a number that is short by that fill's cost.
+                let mut all_fees_known = true;
                 for o in f
                     .orders
                     .iter()
@@ -591,13 +595,16 @@ impl Executor for LiveExecutor {
                     saw_record = true;
                     let s = o.filled_size.and_then(|d| d.to_f64()).unwrap_or(0.0);
                     let v = o.filled_value.and_then(|d| d.to_f64()).unwrap_or(0.0);
-                    fee_acc += o.filled_fee.and_then(|d| d.to_f64()).unwrap_or(0.0);
+                    match o.filled_fee.and_then(|d| d.to_f64()) {
+                        Some(f) => fee_acc += f,
+                        None => all_fees_known = false,
+                    }
                     if s > 0.0 && v > 0.0 {
                         size += s;
                         value += v;
                     }
                 }
-                if saw_record {
+                if saw_record && all_fees_known {
                     fee_usd = Some(fee_acc);
                 }
                 if size > 0.0 {

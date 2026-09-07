@@ -246,8 +246,11 @@ reduce_only }`.
   stored one is adopted even at an unchanged quantity (a fill booked at
   `mid_estimate` after a lost acknowledgement, or an external
   close-and-reopen of the same net size), since leaving it would corrupt
-  unrealized and later realized PnL for the life of the leg. In that
-  close-and-reopen case the old leg's realized PnL cannot be recovered
+  unrealized and later realized PnL for the life of the leg. A recovered
+  *increase* whose venue basis is unavailable folds the added quantity in
+  at the mark, exactly as a fill would have; only a reduction keeps its
+  basis untouched. In the close-and-reopen case (an unchanged quantity
+  with a different basis) the old leg's realized PnL cannot be recovered
   from position data alone -- inventing a close price would fabricate a
   trade -- so a `basis_correction` ledger row records the old and new
   basis with `realized_pnl_recoverable: false`, and the operator
@@ -272,8 +275,8 @@ reduce_only }`.
   price, venue/paper, latency, attempt) and a `rebalance_summary` row
   closes the decision. When a fill is confirmed from the position delta
   but no matching fill record can be read (a lost acknowledgement, or an
-  eventually-consistent fills endpoint), its fee is recorded as **unknown**
-  rather than zero: `fee_known: false` on the row, and the amount is left
+  eventually-consistent fills endpoint, or a matched record whose own fee
+  field is absent), its fee is recorded as **unknown** rather than zero: `fee_known: false` on the row, and the amount is left
   out of `cum_fees_usd` instead of understating it. Those rows are what a
   later reconciliation against the venue's own fee history would use.
 - A submitted order whose outcome could not be confirmed blocks every

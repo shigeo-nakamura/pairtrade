@@ -413,7 +413,11 @@ impl BookEngine {
             // would fabricate a trade, and staying silent would lose it --
             // so the correction is recorded explicitly for reconciliation
             // against the venue's own trade history.
-            if closed_qty == 0.0 && venue_qty != 0.0 && venue_basis_stale {
+            if closed_qty == 0.0
+                && venue_qty != 0.0
+                && venue_basis_stale
+                && (venue_qty - book_qty).abs() <= tol
+            {
                 let old_basis = book_basis.unwrap_or(0.0);
                 log::warn!(
                     "[ADOPT] {sym}: same quantity {venue_qty} but the venue basis moved {old_basis} -> {entry};                      any realized PnL from that external close/reopen is NOT in this book's accounting"
@@ -480,8 +484,16 @@ impl BookEngine {
                 // realized its part against it); only a leg with no valid
                 // basis, or one that flipped or appeared from nowhere,
                 // falls back to the mark.
+                let added = venue_qty.abs() - book_qty.abs();
                 if let Some(v) = venue_entry {
                     p.avg_price = v;
+                } else if kept_same_side && added > 0.0 && entry > 0.0 && p.avg_price > 0.0 {
+                    // A recovered increase with no venue basis: fold the
+                    // added quantity in at the mark, as `apply_fill` would
+                    // have. Keeping the old basis unchanged would price
+                    // the added units as if they were bought at the old
+                    // level and overstate the unrealized PnL.
+                    p.avg_price = (p.avg_price * book_qty.abs() + entry * added) / venue_qty.abs();
                 } else if entry > 0.0 && (!kept_same_side || p.avg_price <= 0.0) {
                     p.avg_price = entry;
                 }
@@ -1963,6 +1975,55 @@ mod tests {
         assert!(rows(&cfg.paths.ledger)
             .iter()
             .any(|r| r["event"] == "adopt" && r["symbol"] == "SOL"));
+    }
+
+    #[tokio::test]
+    async fn a_recovered_increase_folds_the_added_quantity_in_at_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // Book: long 1 SOL @ 100. Venue: long 2, no entry price, mark 130.
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 1.0, 100.0, secs("2026-09-05T23:00:00Z"));
+        state.persist(&cfg.paths.state).unwrap();
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 130.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 2.0,
+                        entry_price: None,
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: None,
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        let p = &engine.state.positions["SOL"];
+        assert_eq!(p.qty, 2.0);
+        // (100 * 1 + 130 * 1) / 2 -- not the old 100, which would claim a
+        // $60 unrealized gain instead of the real $30.
+        assert!(
+            (p.avg_price - 115.0).abs() < 1e-9,
+            "avg_price = {}",
+            p.avg_price
+        );
+        let px: HashMap<String, f64> = [("SOL".to_string(), 130.0)].into();
+        assert!((engine.state.unrealized_usd(&px) - 30.0).abs() < 1e-9);
+        assert_eq!(engine.state.cum_realized_usd, 0.0);
+        // An increase is not an external close-and-reopen.
+        assert!(!rows(&cfg.paths.ledger)
+            .iter()
+            .any(|r| r["event"] == "basis_correction"));
     }
 
     #[tokio::test]
