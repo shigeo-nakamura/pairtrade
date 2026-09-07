@@ -2002,7 +2002,12 @@ impl BookEngine {
                 )
             })
             .collect();
-        self.pnl.write(
+        // Advance `last_mark_date` only once the row is durably written: a
+        // transient permissions or filesystem error must not permanently
+        // remove this date's mark from the ledger, since every later tick
+        // treats `last_mark_date` as proof the mark already happened and
+        // will never retry it (see `maybe_daily_mark`).
+        let wrote = self.pnl.try_write(
             now,
             "mark",
             self.state.last_decision.as_ref().map(|r| r.key.as_str()),
@@ -2022,6 +2027,10 @@ impl BookEngine {
                 "paper": self.exec.is_paper(),
             }),
         );
+        if let Err(e) = wrote {
+            log::warn!("[MARK] {date} pnl append failed, will retry next tick: {e}");
+            return;
+        }
         log::info!(
             "[MARK] {date} equity=${equity:.2} realized=${:.2} unreal=${:.2} funding_est=${:.2} n_pos={}",
             self.state.cum_realized_usd,

@@ -86,6 +86,27 @@ pub fn load_bars(path: &Path) -> Result<BTreeMap<NaiveDate, HashMap<String, BarR
     Ok(out)
 }
 
+/// Acquire (and hold, via the returned `File`) an exclusive `flock` on
+/// `<out_dir>/.replay.lock`, refusing a second concurrent replay against
+/// the same output directory instead of letting both silently interleave
+/// writes to it.
+fn acquire_output_lock(out_dir: &Path) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    let lock_path = out_dir.join(".replay.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open replay lock {}", lock_path.display()))?;
+    file.try_lock_exclusive().with_context(|| {
+        format!(
+            "{} is already locked -- another replay is running against this --out directory",
+            lock_path.display()
+        )
+    })?;
+    Ok(file)
+}
+
 /// Rewrite every on-disk path of `cfg` into `out_dir` and force paper mode.
 pub fn sandbox_config(mut cfg: BookConfig, out_dir: &Path) -> BookConfig {
     cfg.dry_run = true;
@@ -116,6 +137,13 @@ const MAX_SIZE_DECIMALS: u32 = 12;
 
 pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<ReplaySummary> {
     std::fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+    // Exclusive per-`--out` lock, held for the rest of `run`: two replay
+    // jobs pointed at the same output directory would otherwise
+    // concurrently delete, append to and atomically replace each other's
+    // ledgers and final state below, breaking the documented byte-exact
+    // replay guarantee. Not one of `OUTPUT_FILES`, so the cleanup loop
+    // below never removes it out from under this process's held flock.
+    let _out_lock = acquire_output_lock(out_dir)?;
     for f in OUTPUT_FILES {
         let p = out_dir.join(f);
         match std::fs::remove_file(&p) {
