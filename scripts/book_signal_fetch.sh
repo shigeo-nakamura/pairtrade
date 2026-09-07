@@ -35,13 +35,16 @@ if d["schema_version"] != 1:
 for k in ("producer_id", "decision_key", "payload_sha256"):
     if not isinstance(d[k], str) or not d[k].strip():
         raise SystemExit(f"{k} must be a non-empty string")
+ts = {}
 for k in ("generated_at", "as_of"):
     if not isinstance(d[k], str):
         raise SystemExit(f"{k} must be a string timestamp")
     try:
-        datetime.strptime(d[k], "%Y-%m-%dT%H:%M:%SZ")
+        ts[k] = datetime.strptime(d[k], "%Y-%m-%dT%H:%M:%SZ")
     except ValueError as e:
         raise SystemExit(f"{k} is not a YYYY-MM-DDTHH:MM:SSZ timestamp: {e}")
+if ts["as_of"] > ts["generated_at"]:
+    raise SystemExit("as_of is after generated_at (look-ahead); the runtime would reject this file")
 if not isinstance(d["weights"], dict):
     raise SystemExit("weights must be a symbol -> number mapping")
 for sym, v in d["weights"].items():

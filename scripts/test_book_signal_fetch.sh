@@ -26,13 +26,14 @@ m = dict(d); del m["decision_key"]; json.dump(m, open(f"{t}/bad_missing.json", "
 h = json.loads(json.dumps(d)); h["weights"]["BTC"] = 0.2; json.dump(h, open(f"{t}/bad_hash.json", "w"))
 g = dict(d); g["generated_at"] = 123; json.dump(g, open(f"{t}/bad_ts_type.json", "w"))
 w = json.loads(json.dumps(d)); w["weights"]["BTC"] = "0.1"; json.dump(w, open(f"{t}/bad_weight_type.json", "w"))
+a = dict(d); a["as_of"] = "2026-09-06T00:30:00Z"; a["payload_sha256"] = __import__("hashlib").sha256(json.dumps({"as_of": a["as_of"], "decision_key": a["decision_key"], "producer_id": a["producer_id"], "weights": a["weights"]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest(); json.dump(a, open(f"{t}/bad_lookahead.json", "w"))
 open(f"{t}/bad_json.json", "w").write("{")
 PY
 
 bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .*(2026-09-06 "
 cmp -s "$T/good.json" "$T/dst/signal.json"
 
-for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_json; do
+for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_json; do
   if bash "$HERE/book_signal_fetch.sh" "$T/$bad.json" "$T/dst/signal.json" 2>/dev/null; then
     echo "FAIL: $bad was promoted" >&2; exit 1
   fi
