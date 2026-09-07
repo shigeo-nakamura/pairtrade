@@ -98,9 +98,14 @@ expected maintenance step.
 
 ## Host install (CI, no start)
 
-`ci.yml`'s `deploy-robinhood-lighter` job downloads `bin/book_runtime`
-(sha-checked), the three units, and runs
-`scripts/install_book_runtime.sh` with `BOOK_INSTANCE=xsmom-695`:
+Two workflows can install, and neither depends on the other having run
+first: `ci.yml` owns the binary object in S3, `deploy-configs.yml` owns
+the config and unit objects, and each stages **everything** it needs from
+S3 into a per-run directory before calling
+`scripts/install_book_runtime.sh` with `BOOK_INSTANCE=xsmom-695`. A run
+whose counterpart object is not published yet logs and skips, so the
+first rollout completes whichever way the two happen to interleave.
+The installer holds an exclusive lock, so the two never interleave:
 
 - identity `book-runtime:book-runtime` (system user, no home, nologin)
 - `/opt/book-runtime/{bin/book_runtime, bin/book_signal_fetch.sh,

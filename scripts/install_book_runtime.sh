@@ -102,10 +102,22 @@ case "$KIND" in
     fi
     ;;
 esac
+MAX_SYMBOL_WEIGHT=$(awk '/^sizing:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*max_symbol_weight:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+NET_TOLERANCE=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*net_tolerance:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+REQUIRE_NEUTRAL=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*require_dollar_neutral:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+UNIVERSE=$(awk '/^universe:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*- /{printf "%s%s", sep, $2; sep=","}' "$STAGE/${INSTANCE}.yaml")
+if [ -z "$UNIVERSE" ]; then
+  echo "could not read universe.symbols from $CONFIG_SOURCE" >&2
+  exit 1
+fi
 {
   printf 'BOOK_SIGNAL_MAX_AGE_SECS=%s\n' "$MAX_AGE"
   printf 'BOOK_SIGNAL_PRODUCER_ID=%s\n' "$PRODUCER"
   printf 'BOOK_DECISION_TIME_UTC=%s\n' "$DECISION_TIME"
+  printf 'BOOK_MAX_SYMBOL_WEIGHT=%s\n' "${MAX_SYMBOL_WEIGHT:-}"
+  printf 'BOOK_NET_TOLERANCE=%s\n' "${NET_TOLERANCE:-0.05}"
+  printf 'BOOK_REQUIRE_DOLLAR_NEUTRAL=%s\n' "${REQUIRE_NEUTRAL:-true}"
+  printf 'BOOK_UNIVERSE=%s\n' "$UNIVERSE"
 } > "$STAGE/${INSTANCE}.fetch.env"
 chown root:"$SERVICE_GROUP" "$STAGE/${INSTANCE}.fetch.env"
 chmod 0440 "$STAGE/${INSTANCE}.fetch.env"

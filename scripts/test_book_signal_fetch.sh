@@ -18,6 +18,10 @@ export PATH="$T/bin:$PATH"
 export BOOK_SIGNAL_MAX_AGE_SECS=7200
 export BOOK_SIGNAL_PRODUCER_ID=p
 export BOOK_DECISION_TIME_UTC=23:59
+export BOOK_UNIVERSE=BTC,ETH
+export BOOK_MAX_SYMBOL_WEIGHT=0.5
+export BOOK_NET_TOLERANCE=0.05
+export BOOK_REQUIRE_DOLLAR_NEUTRAL=true
 
 # Generated now: the fetcher enforces BOOK_SIGNAL_MAX_AGE_SECS, so a
 # fixed past timestamp would make the "good" fixture stale over time.
@@ -55,6 +59,15 @@ late = json.loads(json.dumps(d))
 late["as_of"] = late["generated_at"]
 late["generated_at"] = (gen + datetime.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
 json.dump(rehash(late), open(f"{t}/bad_after_decision.json", "w"))
+outside = json.loads(json.dumps(d))
+outside["weights"] = {"BTC": 0.1, "XYZ": -0.1}
+json.dump(rehash(outside), open(f"{t}/bad_universe.json", "w"))
+big = json.loads(json.dumps(d))
+big["weights"] = {"BTC": 0.9, "ETH": -0.9}
+json.dump(rehash(big), open(f"{t}/bad_symbol_cap.json", "w"))
+skew = json.loads(json.dumps(d))
+skew["weights"] = {"BTC": 0.4, "ETH": -0.1}
+json.dump(rehash(skew), open(f"{t}/bad_net.json", "w"))
 stale = json.loads(json.dumps(d))
 stale["generated_at"] = "2020-01-01T00:00:00Z"
 stale["as_of"] = "2020-01-01T00:00:00Z"
@@ -70,7 +83,7 @@ PY
 bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .*($KEY "
 cmp -s "$T/good.json" "$T/dst/signal.json"
 
-for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_stale bad_producer bad_after_decision bad_json; do
+for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_stale bad_producer bad_after_decision bad_universe bad_symbol_cap bad_net bad_json; do
   if bash "$HERE/book_signal_fetch.sh" "$T/$bad.json" "$T/dst/signal.json" 2>/dev/null; then
     echo "FAIL: $bad was promoted" >&2; exit 1
   fi

@@ -11,7 +11,9 @@
 # checks signal.rs will: BOOK_SIGNAL_MAX_AGE_SECS (freshness),
 # BOOK_SIGNAL_PRODUCER_ID (producer identity) and BOOK_DECISION_TIME_UTC
 # (the decision time a date-keyed schedule derives from decision_key, for
-# the as_of look-ahead bound; empty for calendar schedules). Any of them
+# the as_of look-ahead bound; empty for calendar schedules), plus the
+# weight constraints BOOK_UNIVERSE / BOOK_MAX_SYMBOL_WEIGHT /
+# BOOK_NET_TOLERANCE / BOOK_REQUIRE_DOLLAR_NEUTRAL. Any of them
 # unset skips only its own check -- the runtime remains authoritative, the
 # point here is to not displace a usable local file with one it will
 # reject.
@@ -36,6 +38,10 @@ fi
 if ! SUMMARY=$(BOOK_SIGNAL_MAX_AGE_SECS="${BOOK_SIGNAL_MAX_AGE_SECS:-}" \
   BOOK_SIGNAL_PRODUCER_ID="${BOOK_SIGNAL_PRODUCER_ID:-}" \
   BOOK_DECISION_TIME_UTC="${BOOK_DECISION_TIME_UTC:-}" \
+  BOOK_MAX_SYMBOL_WEIGHT="${BOOK_MAX_SYMBOL_WEIGHT:-}" \
+  BOOK_NET_TOLERANCE="${BOOK_NET_TOLERANCE:-}" \
+  BOOK_REQUIRE_DOLLAR_NEUTRAL="${BOOK_REQUIRE_DOLLAR_NEUTRAL:-}" \
+  BOOK_UNIVERSE="${BOOK_UNIVERSE:-}" \
   python3 - "$TMP" <<'PY'
 import hashlib, json, math, os, sys
 from datetime import datetime, timezone
@@ -117,6 +123,28 @@ payload = {"as_of": d["as_of"], "decision_key": d["decision_key"], "producer_id"
 sha = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 if sha != str(d["payload_sha256"]).lower():
     raise SystemExit(f"payload_sha256 mismatch: file {d['payload_sha256']} computed {sha}")
+# The weight constraints signal.rs enforces. Each is skipped when its
+# value is absent, but the installer always writes them.
+universe = {s for s in os.environ.get("BOOK_UNIVERSE", "").split(",") if s}
+if universe:
+    outside = sorted(set(d["weights"]) - universe)
+    if outside:
+        raise SystemExit(f"weights name {len(outside)} symbol(s) outside the universe: {', '.join(outside)}")
+max_w = os.environ.get("BOOK_MAX_SYMBOL_WEIGHT", "").strip()
+if max_w:
+    cap = float(max_w)
+    over = sorted(s for s, w in d["weights"].items() if abs(float(w)) > cap + 1e-12)
+    if over:
+        raise SystemExit(f"weights over the {cap} per-symbol cap: {', '.join(over)}")
+gross = sum(abs(float(w)) for w in d["weights"].values())
+if gross > 1.0 + 1e-9:
+    raise SystemExit(f"sum |w| = {gross:.6f} > 1")
+neutral = os.environ.get("BOOK_REQUIRE_DOLLAR_NEUTRAL", "").strip().lower() == "true"
+tol = os.environ.get("BOOK_NET_TOLERANCE", "").strip()
+if neutral and tol:
+    net = sum(float(w) for w in d["weights"].values())
+    if abs(net) > float(tol) + 1e-12:
+        raise SystemExit(f"|net| = {abs(net):.6f} > net_tolerance {tol}")
 print(f"{d['decision_key']} {sha[:12]} n={len(d['weights'])}")
 PY
 ); then
