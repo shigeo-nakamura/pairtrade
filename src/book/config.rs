@@ -153,9 +153,13 @@ impl BookConfig {
     /// under the running process's held flock (which stays valid only on
     /// the now-unlinked inode), letting a second instance recreate the
     /// pathname and lock a different inode -- defeating the exclusion the
-    /// lock exists for.
+    /// lock exists for. Derived from `resolved_path`, not the raw
+    /// `paths.state` spelling, so two configs that name the same state
+    /// through different existing leaf aliases (a symlink or hard link)
+    /// still land on the same lock path instead of each locking a
+    /// different file while loading the same state.
     pub fn instance_lock_path(&self) -> PathBuf {
-        self.paths.state.with_extension("lock")
+        resolved_path(&self.paths.state).with_extension("lock")
     }
 
     pub fn load(path: &Path) -> Result<Self> {

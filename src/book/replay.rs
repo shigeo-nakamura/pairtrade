@@ -196,8 +196,19 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         // Every leg the book still holds must be marked on this date:
         // without a price the mark, funding and equity would silently fall
         // back to the entry basis, reporting zero movement and possibly
-        // suppressing a drawdown halt.
-        for sym in engine.state.positions.keys() {
+        // suppressing a drawdown halt. A symbol can also carry a
+        // `pending_funding_qty_hours` balance with no open position (the
+        // leg closed before its funding settled); a later date is free to
+        // omit that now-closed symbol's row, so without the same
+        // requirement here the orphan-settlement pass never gets a
+        // price/rate for it and the carry is silently dropped from
+        // cumulative funding, equity and risk for the rest of the replay.
+        for sym in engine
+            .state
+            .positions
+            .keys()
+            .chain(engine.state.pending_funding_qty_hours.keys())
+        {
             if !rows.contains_key(sym) {
                 bail!("bars.jsonl has no {sym} row for {date}, but the book still holds that leg");
             }
