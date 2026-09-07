@@ -107,10 +107,15 @@ impl Sentinels {
             return false;
         }
         if let Err(e) = std::fs::remove_file(&self.risk_ack) {
-            log::warn!(
-                "[RISK_ACK] failed to remove {} after ack: {e:?}",
+            // Fail closed: reporting the ack as taken while the file is
+            // still on disk would clear this halt *and* leave the file to
+            // clear the next one automatically, skipping the operator
+            // acknowledgement the halt exists to require.
+            log::error!(
+                "[RISK_ACK] {} could not be removed ({e:?}); the halt stays engaged until it is gone",
                 self.risk_ack.display()
             );
+            return false;
         }
         true
     }
@@ -167,6 +172,25 @@ mod tests {
             .filter(|n| n.starts_with('.'))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn take_risk_ack_fails_closed_when_the_file_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ack = dir.path().join("RISK_ACK");
+        let s = Sentinels::new(dir.path().join("KILL_SWITCH"), ack.clone());
+        assert!(!s.take_risk_ack(), "no ack file");
+        std::fs::write(&ack, "").unwrap();
+        assert!(s.take_risk_ack(), "ack taken and removed");
+        assert!(!ack.exists());
+        // A directory at the ack path cannot be unlinked by remove_file:
+        // the ack must not be reported as taken while it is still there.
+        std::fs::create_dir(&ack).unwrap();
+        assert!(
+            !s.take_risk_ack(),
+            "removal failed, so the ack is not taken"
+        );
+        assert!(ack.exists());
     }
 
     #[test]

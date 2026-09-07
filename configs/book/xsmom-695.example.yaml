@@ -1,0 +1,98 @@
+# Book runtime config for the XSMOM shadow → DRY_RUN track (bot-strategy#695 /
+# #937). Copy to the host as /opt/book-runtime/xsmom-695.yaml. Everything
+# here is reviewable in a PR diff; credentials never live in this file.
+#
+# The producer (scripts/xsmom_signal_producer.py, follow-up PR) writes
+# signal.path on every rebalance day right after the 00:20 UTC shadow run;
+# the runtime reads it inside the 00:30 + 90 min window.
+schema_version: 1
+instance_id: xsmom-695
+venue: lighter
+dry_run: true
+
+universe:
+  # L38 (bot-strategy#695 universe screen, 2026-07-03 snapshot). The
+  # producer re-screens point-in-time; anything outside this list is
+  # rejected by the runtime, so widen it here when the producer's screen
+  # admits a new symbol.
+  symbols:
+    - BTC
+    - ETH
+    - SOL
+    - HYPE
+    - LIT
+    - TRX
+    - GRAM
+    - ZEC
+    - PAXG
+    - FARTCOIN
+    - ENA
+    - BNB
+    - XRP
+    - WLD
+    - UNI
+    - AAVE
+    - NEAR
+    - XPL
+    - ADA
+    - XMR
+    - AVAX
+    - TAO
+    - TIA
+    - PENDLE
+    - XLM
+    - SUI
+    - TRUMP
+    - BB
+    - DOGE
+    - DOT
+    - LINK
+    - 1000PEPE
+    - ZRO
+    - ASTER
+    - BCH
+    - APT
+    - WLFI
+    - SKR
+
+schedule:
+  kind: interval_days
+  anchor_date: 2026-07-03          # first shadow book (#695)
+  every_days: 5                    # hold 5 days (L28_H5_q20_riskadj)
+  decision_time_utc: "00:30"
+  signal_grace_secs: 5400
+
+signal:
+  path: /var/lib/book-runtime/xsmom-695/signal.json
+  producer_id: xsmom_695_L28_H5_q20_riskadj
+  max_age_secs: 7200
+  require_dollar_neutral: true
+  net_tolerance: 0.05
+
+sizing:
+  gross_notional_usd: 1000         # same $1000 gross as the shadow book
+  max_symbol_weight: 0.15          # q20 on ~38 names → ~8 per side, ~0.0625 each
+  max_gross_usd: 1100
+  max_net_usd: 150
+  min_order_usd: 10
+  rebalance_deadband_usd: 5
+
+execution:
+  slippage_bps: 50
+  max_attempts: 3
+  fill_confirm_timeout_secs: 15
+  paper_slippage_bps: 5            # shadow used opposite-touch fills; 5 bps ≈ L38 median half-spread
+  paper_fee_bps: 0
+
+risk:
+  equity_reference_usd: 1000
+  max_session_loss_bps: 1500       # S2 gate on #695 is max DD ≤ $150
+  max_daily_loss_bps: 500
+  kill_switch_path: /var/lib/book-runtime/xsmom-695/KILL_SWITCH
+  risk_ack_path: /var/lib/book-runtime/xsmom-695/RISK_ACK
+
+paths:
+  state: /var/lib/book-runtime/xsmom-695/state.json
+  ledger: /var/lib/book-runtime/xsmom-695/ledger.jsonl
+  pnl: /var/lib/book-runtime/xsmom-695/pnl.jsonl
+  status: /var/lib/book-runtime/xsmom-695/status.json
