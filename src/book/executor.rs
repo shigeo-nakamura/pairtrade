@@ -206,7 +206,12 @@ impl Executor for PaperExecutor {
 
 pub struct LiveExecutor {
     connector: Arc<dyn DexConnector + Send + Sync>,
-    prices: RwLock<HashMap<String, f64>>,
+    /// WS mids with the instant each arrived. A symbol whose feed goes
+    /// quiet while the socket stays open would otherwise keep serving the
+    /// same number to both sizing and the send-time drift guard, so an
+    /// entry older than `WS_PRICE_MAX_AGE_SECS` is ignored and the
+    /// timestamped ticker fallback is used instead.
+    prices: RwLock<HashMap<String, (f64, Instant)>>,
     /// Ticker-sourced prices for symbols the WS feed does not carry (a leg
     /// adopted from the venue outside the configured universe), with the
     /// instant they were fetched; refreshed at most every
@@ -219,6 +224,9 @@ pub struct LiveExecutor {
 }
 
 const FALLBACK_PRICE_TTL_SECS: u64 = 60;
+/// A WS mid older than this is treated as absent (the engine ticks every
+/// 5 s, and a live perp feed updates far faster than this bound).
+const WS_PRICE_MAX_AGE_SECS: u64 = 30;
 
 /// Whether `mid` is still within `slippage_bps` of the price the intent
 /// was sized at, in the adverse direction for `side` (a favourable move
@@ -306,7 +314,10 @@ impl LiveExecutor {
 
     pub async fn set_price(&self, symbol: &str, mid: f64) {
         if mid.is_finite() && mid > 0.0 {
-            self.prices.write().await.insert(symbol.to_string(), mid);
+            self.prices
+                .write()
+                .await
+                .insert(symbol.to_string(), (mid, Instant::now()));
         }
     }
 
@@ -315,8 +326,14 @@ impl LiveExecutor {
     /// Used both by the planner (`prices`) and at send time (`execute`) so
     /// an adopted out-of-universe leg can be planned *and* sent.
     async fn price_for(&self, symbol: &str) -> Option<f64> {
-        if let Some(px) = self.prices.read().await.get(symbol).copied() {
-            return Some(px);
+        if let Some((px, at)) = self.prices.read().await.get(symbol).copied() {
+            if at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
+                return Some(px);
+            }
+            log::warn!(
+                "[PRICE] WS mid for {symbol} is {}s old; falling back to the ticker",
+                at.elapsed().as_secs()
+            );
         }
         let cached = self.fallback_prices.read().await.get(symbol).copied();
         if let Some((px, at)) = cached {
@@ -615,6 +632,13 @@ mod tests {
             .execute(&intent("DOT", Side::Buy, 1.0, false))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn ws_price_age_bound_is_shorter_than_the_fallback_ttl() {
+        // A WS mid must expire before the ticker cache it falls back to,
+        // otherwise a quiet feed would keep serving the same number.
+        assert!(WS_PRICE_MAX_AGE_SECS < FALLBACK_PRICE_TTL_SECS);
     }
 
     #[test]

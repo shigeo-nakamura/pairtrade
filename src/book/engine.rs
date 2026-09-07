@@ -202,10 +202,10 @@ impl BookEngine {
     /// One engine step at `now` (unix seconds).
     pub async fn tick(&mut self, now: i64) -> Result<()> {
         let symbols = self.tracked_symbols();
-        let prices = self.exec.prices(&symbols).await;
+        let mut prices = self.exec.prices(&symbols).await;
 
         if !self.exec.is_paper() {
-            self.positions_ready = self.reconcile_with_venue(now, &prices).await;
+            self.positions_ready = self.reconcile_with_venue(now, &mut prices).await;
         }
 
         let (equity, equity_ready) = self.compute_equity(&prices).await;
@@ -282,7 +282,7 @@ impl BookEngine {
 
     /// Live only: the venue position is the truth. Returns false when it
     /// could not be read (trading is suppressed for this tick).
-    async fn reconcile_with_venue(&mut self, now: i64, prices: &HashMap<String, f64>) -> bool {
+    async fn reconcile_with_venue(&mut self, now: i64, prices: &mut HashMap<String, f64>) -> bool {
         let venue = match self.exec.positions().await {
             Ok(v) => v,
             Err(e) => {
@@ -298,17 +298,18 @@ impl BookEngine {
         }
         // A venue-discovered leg outside the tracked set has no price in
         // `prices`; ask the executor (WS mid or ticker fallback) for it so
-        // adoption is not deferred forever.
+        // adoption is not deferred forever. The result is merged into the
+        // caller's map, not a clone: the same tick's risk flatten and
+        // decision must be able to price the leg they just adopted.
         let extra: Vec<String> = symbols
             .iter()
             .filter(|s| !prices.contains_key(*s))
             .cloned()
             .collect();
-        let mut prices = prices.clone();
         if !extra.is_empty() {
-            prices.extend(self.exec.prices(&extra).await);
+            let fetched = self.exec.prices(&extra).await;
+            prices.extend(fetched);
         }
-        let prices = &prices;
         for sym in symbols {
             let venue_qty = venue.get(&sym).map(|p| p.qty).unwrap_or(0.0);
             let book_qty = self.state.positions.get(&sym).map(|p| p.qty).unwrap_or(0.0);
@@ -528,13 +529,16 @@ impl BookEngine {
         ) {
             Ok(p) => p,
             Err(e) => {
+                // Nothing was sent, so this costs no attempt either (same
+                // rule as a fully blocked tick): a transient missing price
+                // or lot-metadata response must not exhaust the budget
+                // while the residual is still inside its window.
                 log::warn!(
-                    "[REBALANCE] key={} retry {} cannot plan: {e}",
+                    "[REBALANCE] key={} cannot plan the residual: {e} (attempt budget untouched at {})",
                     d.key,
-                    attempts
+                    rec.attempts
                 );
                 if let Some(r) = self.state.last_decision.as_mut() {
-                    r.attempts = attempts;
                     r.at = now;
                     r.reject_reason = Some(e.to_string());
                 }
@@ -542,7 +546,7 @@ impl BookEngine {
                     now,
                     "decision",
                     Some(&d.key),
-                    json!({ "outcome": "partial", "retry": attempts, "reason": e.label(), "detail": e.to_string() }),
+                    json!({ "outcome": "partial", "retry": rec.attempts, "reason": e.label(), "detail": e.to_string() }),
                 );
                 return;
             }
@@ -1647,6 +1651,53 @@ mod tests {
         );
         assert!(engine2.state.positions.get("BTC").is_none());
         assert!(engine2.state.positions.get("ETH").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_adopted_out_of_universe_leg_is_priced_for_the_same_tick_flatten() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // XRP is not in the config universe, so the tick's price request
+        // (built from universe + persisted book) does not include it; only
+        // the reconcile-time lookup can price it.
+        let venue = Arc::new(MockVenue {
+            prices: [("XRP".to_string(), 2.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "XRP".to_string(),
+                    VenuePosition {
+                        qty: 100.0,
+                        entry_price: Some(2.0),
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine =
+            BookEngine::new(cfg.clone(), scheduler, venue.clone(), signals, status).unwrap();
+        // Already halted: the tick must adopt XRP *and* flatten it now.
+        engine.state.session.halted = true;
+        engine.state.session.start_equity = 1000.0;
+        engine.state.session.start_at = 1;
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        let ledger = rows(&cfg.paths.ledger);
+        assert!(ledger
+            .iter()
+            .any(|r| r["event"] == "adopt" && r["symbol"] == "XRP"));
+        let flatten = ledger
+            .iter()
+            .find(|r| r["event"] == "flatten")
+            .expect("flatten row");
+        assert_eq!(flatten["flat"], true, "{flatten:?}");
+        assert!(engine.state.is_flat());
+        assert!(venue.positions.lock().unwrap().is_empty());
     }
 
     /// Minimal non-paper venue: canned positions and prices, full fills.

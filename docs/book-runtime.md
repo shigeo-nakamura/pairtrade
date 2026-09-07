@@ -160,7 +160,8 @@ bot-strategy#580).
   only spent when something actually reached the venue: a tick whose
   intents were all blocked (kill switch, halt, stale equity, cap) leaves
   the budget untouched, so a block that clears later in the window can
-  still apply the target.
+  still apply the target; the same holds when the residual cannot be
+  planned at all (a transient missing price or lot-metadata response).
 - An overdue flatten (`flatten_at` passed, book not flat) is processed
   before any decision — including after a restart that lands past the
   *next* decision time. The schedule does not advance onto a new key while
@@ -223,7 +224,10 @@ reduce_only }`.
   that instant first. A leg the venue no longer holds is dropped. The
   runtime subscribes prices for the universe plus every persisted leg, and
   a leg adopted outside that set is priced from the venue ticker (60 s
-  cache) so a reduce-only close can always be planned.
+  cache) so a reduce-only close can always be planned *and* sent on the
+  same tick, including a halt flatten. A WS mid older than 30 s is treated
+  as absent and refreshed from the ticker, so a feed that goes quiet with
+  the socket still open cannot size an order off a stale number.
 - DRY_RUN: the paper book lives in `state.json`; fills are at
   `mid * (1 +/- paper_slippage_bps)` with `paper_fee_bps`; quantities are
   rounded the same way as live, so paper and live share every code path
