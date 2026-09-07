@@ -472,10 +472,66 @@ impl Executor for LiveExecutor {
     }
 
     async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
+        // Serve everything the WS feed and the fallback cache can answer
+        // without I/O first, then fetch the remainder concurrently. This
+        // runs inside `engine.tick`, which book_runtime.rs awaits inside
+        // its `select!`: one `get_ticker` per stale symbol *in sequence*
+        // would hold that arm for the sum of every request's latency,
+        // blocking WS price updates, scheduled decisions, risk processing
+        // and SIGTERM. Concurrent requests bound it to the slowest one.
         let mut out = HashMap::new();
-        for s in symbols {
-            if let Some(px) = self.price_for(s).await {
-                out.insert(s.clone(), px);
+        let mut needs_ticker: Vec<String> = Vec::new();
+        {
+            let ws = self.prices.read().await;
+            let fallback = self.fallback_prices.read().await;
+            for s in symbols {
+                if let Some((px, at)) = ws.get(s) {
+                    if at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
+                        out.insert(s.clone(), *px);
+                        continue;
+                    }
+                    log::warn!(
+                        "[PRICE] WS mid for {s} is {}s old; falling back to the ticker",
+                        at.elapsed().as_secs()
+                    );
+                }
+                if let Some((px, at)) = fallback.get(s) {
+                    if at.elapsed().as_secs() < FALLBACK_PRICE_TTL_SECS {
+                        out.insert(s.clone(), *px);
+                        continue;
+                    }
+                }
+                needs_ticker.push(s.clone());
+            }
+        }
+        if needs_ticker.is_empty() {
+            return out;
+        }
+        let mut fetches = tokio::task::JoinSet::new();
+        for s in needs_ticker {
+            let connector = self.connector.clone();
+            fetches.spawn(async move {
+                let px = match connector.get_ticker(&s, None).await {
+                    Ok(t) => t.price.to_f64().filter(|p| *p > 0.0),
+                    Err(e) => {
+                        log::warn!("[PRICE] no WS mid for {s} and ticker fallback failed: {e:?}");
+                        None
+                    }
+                };
+                (s, px)
+            });
+        }
+        let mut fetched: Vec<(String, f64)> = Vec::new();
+        while let Some(res) = fetches.join_next().await {
+            if let Ok((s, Some(px))) = res {
+                fetched.push((s, px));
+            }
+        }
+        if !fetched.is_empty() {
+            let mut fallback = self.fallback_prices.write().await;
+            for (s, px) in fetched {
+                fallback.insert(s.clone(), (px, Instant::now()));
+                out.insert(s, px);
             }
         }
         out

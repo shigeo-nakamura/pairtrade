@@ -31,7 +31,14 @@ use super::rebalance::LotMeta;
 use super::schedule::Scheduler;
 use super::status::StatusWriter;
 
+/// `deny_unknown_fields`: a misspelled optional `funding_rate_hourly`
+/// (e.g. `funding_rate_hourly_` or `funding_rate`) would otherwise be
+/// silently dropped and default to `None`, deferring a held leg's funding
+/// for that day and later settling it at a different day's rate and price
+/// -- corrupting replay PnL without any error. Same rule as the calendar
+/// file and the config.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BarRow {
     pub date: NaiveDate,
     pub symbol: String,
@@ -549,6 +556,30 @@ mod tests {
                 "{f} differs on rerun into the same dir"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_misspelled_bar_field_fails_the_replay_instead_of_dropping_the_rate() {
+        // `funding_rate_hourly_` would otherwise be ignored and the rate
+        // default to None: the held leg's funding for that day is deferred
+        // and later settled at a different day's rate and price, silently
+        // corrupting replay PnL. It must fail at load instead.
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        let bars = std::fs::read_to_string(dir.path().join("bars.jsonl")).unwrap();
+        let broken = bars.replacen("\"funding_rate_hourly\"", "\"funding_rate_hourly_\"", 1);
+        assert_ne!(bars, broken);
+        std::fs::write(dir.path().join("bars.jsonl"), broken).unwrap();
+        write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("DOT", -0.5)]);
+        let err = run(cfg(), dir.path(), &dir.path().join("out"))
+            .await
+            .unwrap_err();
+        // `{:#}`: the serde message sits below the `path:line` context.
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("unknown field") && err.contains("funding_rate_hourly_"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
