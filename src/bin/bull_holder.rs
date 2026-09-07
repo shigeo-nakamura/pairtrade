@@ -432,12 +432,17 @@ fn required_collateral_usd(perp_notional_usd: f64, min_pct: f64) -> f64 {
     perp_notional_usd * min_pct / 100.0
 }
 
-/// Distance (%) from `mark` down to a resting stop trigger.
+/// Distance (%) from `mark` down to a resting stop trigger, never negative.
+/// A mark already below a still-resting stop (trigger canceled, rejected,
+/// delayed or unfilled) means the stop offers no protection on any further
+/// decline: at best it fires here and now, so clamp to 0 rather than let a
+/// negative distance make `margin_breached` accept a liquidation point that
+/// no stop can pre-empt.
 fn stop_distance_pct(mark: f64, stop_level: f64) -> f64 {
     if mark <= 0.0 {
         return 0.0;
     }
-    (mark - stop_level) / mark * 100.0
+    ((mark - stop_level) / mark * 100.0).max(0.0)
 }
 
 /// Runtime guard: liquidation must stay at least `clearance_pct` of drawdown
@@ -1046,6 +1051,22 @@ impl Engine {
     async fn margin_monitor(&mut self) {
         let now = now_secs();
         self.last_margin_check = now;
+        // Spot-only book (`PERP_FRACTION=0`): decide that from state before
+        // any venue read, so a Lighter outage cannot publish `ok: false` for
+        // a book that carries no Lighter collateral risk at all.
+        if !self.state.legs.values().any(|l| l.perp_size > 0.0) {
+            self.last_margin = Some(MarginSnapshot {
+                ts: now,
+                equity_usd: None,
+                perp_notional_usd: 0.0,
+                margin_pct: None,
+                liq_distance_pct: None,
+                worst_stop_distance_pct: None,
+                ok: true,
+                detail: "no perp exposure".into(),
+            });
+            return;
+        }
         let marks = match self.lighter_marks().await {
             Ok(m) => m,
             Err(e) => {
@@ -1105,6 +1126,14 @@ impl Engine {
             .filter(|(_, l)| l.perp_size > 0.0)
             .map(|(sym, l)| match (l.stop_level, marks.get(sym)) {
                 (Some(level), Some(&mark)) if l.stop_order_id.is_some() => {
+                    if mark < level {
+                        // Separate from collateral: the stop should have
+                        // fired. Surface it — the guard treats it as zero
+                        // protection via the clamp in stop_distance_pct.
+                        log::error!(
+                            "[STOP] {sym}: mark {mark:.2} is below the resting stop {level:.2} but the perp leg is still open — verify the trigger order on Lighter"
+                        );
+                    }
                     stop_distance_pct(mark, level)
                 }
                 _ => self.cfg.stop_dd_pct,
@@ -2265,6 +2294,22 @@ mod tests {
         let stop = stop_distance_pct(70.0, 65.0);
         assert!(liq3 > stop + STOP_LIQ_CLEARANCE_PCT, "{liq3} vs {stop}");
         assert_eq!(stop_distance_pct(0.0, 65.0), 0.0);
+    }
+
+    #[test]
+    fn crossed_stop_offers_no_protection() {
+        // Mark already below a still-resting stop: distance clamps to 0, so
+        // the guard demands the liquidation point stay clear of the mark
+        // itself instead of accepting it as "beyond" a negative distance.
+        assert_eq!(stop_distance_pct(60.0, 65.0), 0.0);
+        assert!(margin_breached(0.5, 0.0, STOP_LIQ_CLEARANCE_PCT));
+        assert!(!margin_breached(2.0, 0.0, STOP_LIQ_CLEARANCE_PCT));
+        // Without the clamp a −8.3% distance would have accepted this.
+        assert!(margin_breached(
+            0.5,
+            stop_distance_pct(60.0, 65.0),
+            STOP_LIQ_CLEARANCE_PCT
+        ));
     }
 
     #[test]
