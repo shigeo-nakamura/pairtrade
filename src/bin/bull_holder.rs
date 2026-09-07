@@ -45,6 +45,27 @@
 //!   ADDs / no stop re-placement (protective exits, including DISARM, still run)
 //! - `bull_holder/RISK_ACK`   touch → clear a reconcile/data halt (consumed)
 //!
+//! Lighter collateral guard (bot-strategy#909): the HL spot base never backs
+//! the Lighter perp margin, so an under-funded Lighter sub-account is
+//! liquidated by a drawdown smaller than the exit/stop levels (the #893
+//! example — $1,000 behind $4,500 of perp — went at ~21%). Two checks, both
+//! against Lighter's own account equity (collateral + unrealised PnL):
+//! - **Pre-order**: ARM and every scheduled tranche require equity ≥
+//!   `BULL_HOLDER_PERP_MARGIN_MIN_PCT` of the total perp notional AFTER the
+//!   order (default 47.55% = ride to the 35% stop + worst 30-day funding +
+//!   execution buffer + liquidation fee; see `perp_margin_min_pct`). A short
+//!   ARM fails (halt, deposit, RISK_ACK, re-ARM);
+//!   a short scheduled tranche is deferred to the next UTC day.
+//! - **Runtime**: every reconcile the symmetric-drawdown liquidation point is
+//!   compared with the resting stops; if funding erosion or a drawdown puts
+//!   liquidation inside the stop (+1% clearance) the bot logs `[MARGIN]
+//!   BREACH` with the top-up amount and reports it in status.json. It does
+//!   NOT halt (the daily exit rule and the exchange stop keep running) and
+//!   never de-risks on its own — the remedy is an operator deposit.
+//!
+//! DRY_RUN evaluates both checks but never blocks on them (the DRY_RUN
+//! account holds no real collateral).
+//!
 //! KNOWN GAPS before any live use (bot-strategy#895 rollout gates):
 //! - `BULL_HOLDER_DRY_RUN=false` is refused at startup (code change to lift).
 //! - Lighter trigger orders have not been exercised live by pairtrade.
@@ -68,6 +89,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BOT: &str = "bull_holder";
+/// Runtime collateral guard: the liquidation point must sit at least this
+/// many percentage points of drawdown beyond the furthest resting stop
+/// (stop-fill slippage; bot-strategy#909 execution buffer).
+const STOP_LIQ_CLEARANCE_PCT: f64 = 1.0;
 
 fn init_logger() {
     let offset_seconds = std::env::var("TIMEZONE_OFFSET")
@@ -150,6 +175,22 @@ struct Config {
     exit_dd_pct: f64,
     /// Lighter exchange stop (insurance) level: peak × (1 − stop_dd_pct/100).
     stop_dd_pct: f64,
+    /// Lighter maintenance-margin fraction (%) of the perp markets, used to
+    /// locate the cross-margin liquidation point. 1.20% for BTC/ETH per
+    /// `orderBookDetails` on 2026-09-05 (bot-strategy#909); re-check if
+    /// Lighter changes its risk parameters.
+    lighter_mmr_pct: f64,
+    /// Minimum Lighter account equity as a percentage of the TOTAL perp
+    /// notional (all symbols, after the order being considered). Default
+    /// 47.55% is the sum of four terms (matches
+    /// `bot-strategy scripts/strategy_probes/bull_holder_909_910/collateral_model.py`):
+    /// 35.78 to ride the 35% stop out (35 loss + 1.2 × 0.65 maintenance on
+    /// what is left) + 9.77 worst observed 30-day funding (ETH, Binance
+    /// proxy) + 1.00 execution buffer (stop-fill slippage) + 1.00 Lighter
+    /// `liquidation_fee` — bot-strategy#909 "30-day buffer" allocation.
+    /// Recomputing it after a funding or MMR change must keep all four.
+    /// Validated to exceed the bare liquidation floor for `stop_dd_pct`.
+    perp_margin_min_pct: f64,
     /// Main loop cadence.
     tick_secs: u64,
     /// Daily evaluation runs once the UTC day is at least this old (seconds
@@ -212,6 +253,8 @@ impl Config {
             entry_tranches: env_u32("BULL_HOLDER_ENTRY_TRANCHES", 1),
             exit_dd_pct: env_f64("BULL_HOLDER_EXIT_DD_PCT", 30.0),
             stop_dd_pct: env_f64("BULL_HOLDER_STOP_DD_PCT", 35.0),
+            lighter_mmr_pct: env_f64("BULL_HOLDER_LIGHTER_MMR_PCT", 1.2),
+            perp_margin_min_pct: env_f64("BULL_HOLDER_PERP_MARGIN_MIN_PCT", 47.55),
             tick_secs: env_u64("BULL_HOLDER_TICK_SECS", 60),
             daily_eval_after_utc_secs: env_u32("BULL_HOLDER_DAILY_EVAL_AFTER_UTC_SECS", 300),
             max_close_fetch_failures: env_u32("BULL_HOLDER_MAX_CLOSE_FETCH_FAILURES", 3),
@@ -269,6 +312,25 @@ impl Config {
         if self.equity_usd <= 0.0 {
             bail!("BULL_HOLDER_EQUITY_USD must be > 0");
         }
+        // Collateral settings only bind a book that actually opens perp legs.
+        // A spot-only book (`PERP_FRACTION=0`) never places a Lighter order
+        // and never runs the collateral check, so coupling these to
+        // `stop_dd_pct` there would let an irrelevant stop value refuse
+        // startup (e.g. STOP_DD_PCT=50 makes the floor 50.6 > the 47.55
+        // default).
+        if self.perp_fraction > 0.0 {
+            if !(0.0 < self.lighter_mmr_pct && self.lighter_mmr_pct < 10.0) {
+                bail!("BULL_HOLDER_LIGHTER_MMR_PCT must be in (0,10) (Lighter BTC/ETH maintenance margin is 1.2%)");
+            }
+            let floor = liquidation_floor_pct(self.stop_dd_pct, self.lighter_mmr_pct);
+            if !(self.perp_margin_min_pct > floor && self.perp_margin_min_pct <= 100.0) {
+                bail!(
+                    "BULL_HOLDER_PERP_MARGIN_MIN_PCT={} must be > {floor:.2} and <= 100: below {floor:.2}% collateral a {}% drawdown liquidates the Lighter account before the exchange stop can fire (bot-strategy#909)",
+                    self.perp_margin_min_pct,
+                    self.stop_dd_pct
+                );
+            }
+        }
         if !(0.0 < self.spot_fraction && self.spot_fraction <= 1.0) {
             bail!("BULL_HOLDER_SPOT_FRACTION must be in (0,1]");
         }
@@ -299,6 +361,11 @@ impl Config {
             ("entry_tranches", self.entry_tranches.to_string()),
             ("exit_dd_pct", format!("{:.2}", self.exit_dd_pct)),
             ("stop_dd_pct", format!("{:.2}", self.stop_dd_pct)),
+            ("lighter_mmr_pct", format!("{:.2}", self.lighter_mmr_pct)),
+            (
+                "perp_margin_min_pct",
+                format!("{:.2}", self.perp_margin_min_pct),
+            ),
             (
                 "hl_taker_slippage_bps",
                 self.hl_taker_slippage_bps.to_string(),
@@ -342,6 +409,135 @@ fn size_from_notional(notional_usd: f64, price: f64, size_decimals: u32) -> Deci
     }
     let raw = Decimal::from_f64(notional_usd / price).unwrap_or(Decimal::ZERO);
     raw.round_dp_with_strategy(size_decimals, RoundingStrategy::ToZero)
+}
+
+// ---- Lighter collateral guard (bot-strategy#909) --------------------------
+
+/// Collateral (% of perp notional) at which a symmetric drawdown of
+/// `stop_dd_pct` liquidates a Lighter cross-margin account: the loss on the
+/// notional plus the maintenance requirement on what is left. Any minimum
+/// below this lets liquidation reach the account before the exchange stop.
+fn liquidation_floor_pct(stop_dd_pct: f64, mmr_pct: f64) -> f64 {
+    stop_dd_pct + mmr_pct * (1.0 - stop_dd_pct / 100.0)
+}
+
+/// Symmetric drawdown (%) from the current marks at which `equity_usd` of
+/// cross collateral stops covering `perp_notional_usd`: solves
+/// `E − N·d = N·(1 − d)·m` for `d`. `None` with no perp exposure. Negative
+/// means the account is already below maintenance.
+fn liquidation_distance_pct(equity_usd: f64, perp_notional_usd: f64, mmr_pct: f64) -> Option<f64> {
+    if perp_notional_usd <= 0.0 {
+        return None;
+    }
+    let m = mmr_pct / 100.0;
+    Some((equity_usd / perp_notional_usd - m) / (1.0 - m) * 100.0)
+}
+
+/// Inverse of `liquidation_distance_pct`: equity that puts the liquidation
+/// point `target_distance_pct` below the marks.
+fn equity_for_distance_usd(perp_notional_usd: f64, target_distance_pct: f64, mmr_pct: f64) -> f64 {
+    let m = mmr_pct / 100.0;
+    perp_notional_usd * (target_distance_pct / 100.0 * (1.0 - m) + m)
+}
+
+/// Lighter equity required to hold `perp_notional_usd` at `min_pct`.
+fn required_collateral_usd(perp_notional_usd: f64, min_pct: f64) -> f64 {
+    perp_notional_usd * min_pct / 100.0
+}
+
+/// Distance (%) from `mark` down to a resting stop trigger, never negative.
+/// A mark already below a still-resting stop (trigger canceled, rejected,
+/// delayed or unfilled) means the stop offers no protection on any further
+/// decline: at best it fires here and now, so clamp to 0 rather than let a
+/// negative distance make `margin_breached` accept a liquidation point that
+/// no stop can pre-empt.
+fn stop_distance_pct(mark: f64, stop_level: f64) -> f64 {
+    if mark <= 0.0 {
+        return 0.0;
+    }
+    ((mark - stop_level) / mark * 100.0).max(0.0)
+}
+
+/// Per-symbol perp size backing the collateral calculation: the LARGER of the
+/// recorded book and the venue's actual position. A venue position bigger than
+/// the book is exactly the case `reconcile` halts on, and valuing collateral
+/// off the smaller recorded size there would understate the notional and hide
+/// a real shortfall.
+///
+/// The second return lists exposure this guard cannot model and must fail
+/// closed on: venue symbols that are not configured (no price here, yet they
+/// consume the same cross collateral) and SHORT venue positions (this bot is
+/// long-only; a short loses on the way up, where the long's sell stop offers
+/// no protection at all). A short still contributes its magnitude to the
+/// margin requirement, so it is counted in `sizes` as well as flagged.
+fn merge_perp_sizes(
+    configured: &[String],
+    recorded: &BTreeMap<String, f64>,
+    venue: &[(String, f64, i32)],
+) -> (BTreeMap<String, f64>, Vec<String>) {
+    let mut sizes: BTreeMap<String, f64> = configured
+        .iter()
+        .map(|s| (s.clone(), recorded.get(s).copied().unwrap_or(0.0).max(0.0)))
+        .collect();
+    let mut unsupported = Vec::new();
+    for (sym, size, sign) in venue {
+        let size = size.abs();
+        if size <= 0.0 {
+            continue;
+        }
+        let key = sym.to_ascii_uppercase();
+        match sizes.get_mut(&key) {
+            Some(v) => {
+                *v = v.max(size);
+                if *sign < 0 {
+                    unsupported.push(format!("{key} (short)"));
+                }
+            }
+            None => unsupported.push(format!("{key} (not configured)")),
+        }
+    }
+    sizes.retain(|_, v| *v > 0.0);
+    (sizes, unsupported)
+}
+
+/// Perp notional (USD) for the given sizes at the given marks.
+fn perp_notional_usd(sizes: &BTreeMap<String, f64>, marks: &BTreeMap<String, f64>) -> f64 {
+    sizes
+        .iter()
+        .map(|(sym, size)| size * marks.get(sym).copied().unwrap_or(0.0))
+        .sum()
+}
+
+/// Does a leg's resting stop actually cover `size`? A tracked order is not
+/// enough: a stop placed for less than the position now open (a failed
+/// re-placement after a tranche, or a venue position larger than the book)
+/// leaves the remainder with no exchange-side protection.
+///
+/// KNOWN LIMIT (bot-strategy#950): this trusts `stop_order_id` to still be
+/// resting on Lighter. A stop canceled at the venue, or a cancel whose
+/// response was lost, keeps the id in state and reads here as covered.
+/// Cross-checking `get_open_orders` was deliberately NOT added yet: that
+/// connector path returns WS-tracked orders only (no REST fallback), and
+/// whether Lighter publishes resting TRIGGER orders on that channel is
+/// unverified — pairtrade has never exercised Lighter trigger orders live
+/// (see this file's KNOWN GAPS and bot-strategy#895). Wiring the check
+/// against a channel that omits them would report every stop as missing,
+/// which is worse than the gap it closes. Settle it with the #895 live
+/// stop-order check, then add the cross-check.
+fn stop_covers(has_order: bool, stop_size: Option<f64>, size: f64) -> bool {
+    // 1e-9 absorbs f64 round-trips through state.json.
+    has_order && stop_size.map(|ss| ss + 1e-9 >= size).unwrap_or(false)
+}
+
+/// Runtime guard: liquidation must stay at least `clearance_pct` of drawdown
+/// beyond the furthest resting stop, or a drawdown liquidates the account
+/// before that stop can fire.
+fn margin_breached(
+    liq_distance_pct: f64,
+    worst_stop_distance_pct: f64,
+    clearance_pct: f64,
+) -> bool {
+    liq_distance_pct < worst_stop_distance_pct + clearance_pct
 }
 
 /// Relative mismatch check used by reconcile.
@@ -628,6 +824,28 @@ struct Engine {
     state: State,
     last_status_write: u64,
     last_reconcile: u64,
+    /// When `margin_monitor` last ran (it also runs while halted).
+    last_margin_check: u64,
+    /// Last runtime collateral-guard evaluation (status.json `margin`).
+    last_margin: Option<MarginSnapshot>,
+}
+
+/// Result of one runtime collateral-guard evaluation (bot-strategy#909).
+#[derive(Serialize, Debug, Clone)]
+struct MarginSnapshot {
+    ts: u64,
+    /// Lighter account equity (collateral + unrealised PnL), USD.
+    equity_usd: Option<f64>,
+    /// Perp notional held, at Lighter marks, USD.
+    perp_notional_usd: f64,
+    /// equity / notional, %.
+    margin_pct: Option<f64>,
+    /// Symmetric drawdown that liquidates the account, %.
+    liq_distance_pct: Option<f64>,
+    /// Drawdown to the furthest resting stop, %.
+    worst_stop_distance_pct: Option<f64>,
+    ok: bool,
+    detail: String,
 }
 
 struct Quote {
@@ -825,6 +1043,337 @@ impl Engine {
         }
     }
 
+    // ------------------------------------------------- collateral guard
+
+    /// Lighter account equity (collateral + unrealised PnL, USD): the cross-
+    /// margin figure the venue liquidates against. Fails closed.
+    async fn lighter_equity_usd(&self) -> Result<f64> {
+        let b = self
+            .lt
+            .get_balance(None)
+            .await
+            .map_err(|e| anyhow!("Lighter get_balance: {e:?}"))?;
+        let e = b
+            .equity
+            .to_f64()
+            .ok_or_else(|| anyhow!("Lighter equity {} not representable", b.equity))?;
+        if !e.is_finite() {
+            bail!("Lighter equity {e} is not finite");
+        }
+        Ok(e)
+    }
+
+    /// Current Lighter price for exactly the given symbols (read-only). Only
+    /// symbols that actually carry perp size are priced: a quote failure on an
+    /// unrelated configured symbol must not abort the collateral evaluation
+    /// for the legs that are open.
+    async fn lighter_marks_for(
+        &self,
+        symbols: &BTreeMap<String, f64>,
+    ) -> Result<BTreeMap<String, f64>> {
+        let mut marks = BTreeMap::new();
+        for sym in symbols.keys() {
+            marks.insert(sym.clone(), self.quote(&self.lt, sym).await?.price);
+        }
+        Ok(marks)
+    }
+
+    /// Perp sizes the collateral guard must value: recorded book merged with
+    /// the venue's actual open positions (see `merge_perp_sizes`).
+    async fn perp_sizes(&self) -> Result<(BTreeMap<String, f64>, Vec<String>)> {
+        let positions = self
+            .lt
+            .get_positions()
+            .await
+            .map_err(|e| anyhow!("Lighter get_positions: {e:?}"))?;
+        let venue: Vec<(String, f64, i32)> = positions
+            .iter()
+            .map(|p| (p.symbol.clone(), p.size.to_f64().unwrap_or(0.0), p.sign))
+            .collect();
+        let recorded: BTreeMap<String, f64> = self
+            .state
+            .legs
+            .iter()
+            .map(|(sym, leg)| (sym.clone(), leg.perp_size))
+            .collect();
+        Ok(merge_perp_sizes(&self.cfg.symbols, &recorded, &venue))
+    }
+
+    /// Pre-order collateral check (bot-strategy#909): the perp book may only
+    /// grow while Lighter equity covers the notional AFTER the order at
+    /// `perp_margin_min_pct`. `Ok(None)` = covered; `Ok(Some(msg))` = short
+    /// (msg names the deposit needed); `Err` = could not verify (callers
+    /// fail closed). DRY_RUN evaluates and logs but never blocks — the
+    /// DRY_RUN account holds no real collateral, so it would always be short.
+    async fn margin_precheck(&self, adding_perp_usd: f64) -> Result<Option<String>> {
+        // `PERP_FRACTION=0` is a valid spot-only book. Decide that from state
+        // alone, BEFORE any venue read, so a Lighter outage cannot halt an
+        // ARM (or postpone a tranche) that needs no Lighter collateral.
+        let holds_perp = self.state.legs.values().any(|l| l.perp_size > 0.0);
+        if adding_perp_usd <= 0.0 && !holds_perp {
+            return Ok(None);
+        }
+        let (sizes, unpriced) = match self.perp_sizes().await {
+            Ok(v) => v,
+            Err(e) if self.cfg.dry_run => {
+                log::warn!(
+                    "[MARGIN] DRY_RUN: Lighter positions unavailable, precheck skipped: {e:?}"
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e.context("collateral precheck: cannot verify Lighter positions")),
+        };
+        if !unpriced.is_empty() && !self.cfg.dry_run {
+            return Ok(Some(format!(
+                "Lighter holds exposure the collateral guard cannot model ({}); it consumes the same cross collateral and the long-only stop cannot cover a short, so the shortfall cannot be computed — close it (or add the symbol to BULL_HOLDER_SYMBOLS) before arming",
+                unpriced.join(", ")
+            )));
+        }
+        let marks = self.lighter_marks_for(&sizes).await?;
+        let after = perp_notional_usd(&sizes, &marks) + adding_perp_usd.max(0.0);
+        if after <= 0.0 {
+            return Ok(None);
+        }
+        let equity = match self.lighter_equity_usd().await {
+            Ok(e) => e,
+            Err(e) if self.cfg.dry_run => {
+                log::warn!("[MARGIN] DRY_RUN: Lighter equity unavailable, precheck skipped: {e:?}");
+                return Ok(None);
+            }
+            Err(e) => return Err(e.context("collateral precheck: cannot verify Lighter equity")),
+        };
+        let required = required_collateral_usd(after, self.cfg.perp_margin_min_pct);
+        if equity >= required {
+            log::info!(
+                "[MARGIN] precheck ok: Lighter equity ${equity:.2} >= ${required:.2} for perp ${after:.0} after this order ({}%)",
+                self.cfg.perp_margin_min_pct
+            );
+            return Ok(None);
+        }
+        let msg = format!(
+            "Lighter equity ${equity:.2} < ${required:.2} required to hold perp ${after:.0} at {}% (BULL_HOLDER_PERP_MARGIN_MIN_PCT): deposit at least ${:.2} more USDC to the Lighter sub-account first",
+            self.cfg.perp_margin_min_pct,
+            required - equity
+        );
+        if self.cfg.dry_run {
+            log::warn!("[MARGIN] DRY_RUN (not enforced): {msg}");
+            return Ok(None);
+        }
+        Ok(Some(msg))
+    }
+
+    /// Runtime collateral guard, run with every reconcile while On: compares
+    /// the symmetric-drawdown liquidation point with the resting stops.
+    /// Alert + status only — never halts (the exit rule and the exchange stop
+    /// must keep running) and never de-risks; the remedy is a deposit.
+    async fn margin_monitor(&mut self) {
+        let now = now_secs();
+        self.last_margin_check = now;
+        // What actually backs the collateral: the venue's own positions
+        // merged with the recorded book (never the smaller of the two).
+        let (sizes, unpriced) = match self.perp_sizes().await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "[MARGIN] Lighter positions unavailable, guard skipped this cycle: {e:?}"
+                );
+                self.last_margin = Some(MarginSnapshot {
+                    ts: now,
+                    equity_usd: None,
+                    perp_notional_usd: 0.0,
+                    margin_pct: None,
+                    liq_distance_pct: None,
+                    worst_stop_distance_pct: None,
+                    ok: false,
+                    detail: format!("Lighter positions unavailable, guard not evaluated: {e}"),
+                });
+                return;
+            }
+        };
+        if !unpriced.is_empty() {
+            log::error!(
+                "[MARGIN] Lighter holds exposure the guard cannot model ({}) on the same cross collateral; the guard cannot be trusted until it is closed or configured",
+                unpriced.join(", ")
+            );
+        }
+        // Spot-only book (`PERP_FRACTION=0`) or nothing open: no Lighter
+        // collateral risk, and no reason to read marks at all.
+        if sizes.is_empty() && unpriced.is_empty() {
+            self.last_margin = Some(MarginSnapshot {
+                ts: now,
+                equity_usd: None,
+                perp_notional_usd: 0.0,
+                margin_pct: None,
+                liq_distance_pct: None,
+                worst_stop_distance_pct: None,
+                ok: true,
+                detail: "no perp exposure".into(),
+            });
+            return;
+        }
+        let marks = match self.lighter_marks_for(&sizes).await {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("[MARGIN] Lighter marks unavailable, guard skipped this cycle: {e:?}");
+                // Never leave a stale `ok: true` in status.json when the
+                // guard could not run.
+                self.last_margin = Some(MarginSnapshot {
+                    ts: now,
+                    equity_usd: None,
+                    perp_notional_usd: 0.0,
+                    margin_pct: None,
+                    liq_distance_pct: None,
+                    worst_stop_distance_pct: None,
+                    ok: false,
+                    detail: format!("Lighter marks unavailable, guard not evaluated: {e}"),
+                });
+                return;
+            }
+        };
+        let notional = perp_notional_usd(&sizes, &marks);
+        if notional <= 0.0 {
+            // Zero priced notional is only good news when there is nothing
+            // the guard failed to model: an unconfigured or short venue
+            // position prices to nothing here yet still consumes collateral.
+            let ok = unpriced.is_empty();
+            self.last_margin = Some(MarginSnapshot {
+                ts: now,
+                equity_usd: None,
+                perp_notional_usd: 0.0,
+                margin_pct: None,
+                liq_distance_pct: None,
+                worst_stop_distance_pct: None,
+                ok,
+                detail: if ok {
+                    "no perp exposure".into()
+                } else {
+                    format!(
+                        "Lighter exposure the guard cannot model: {}",
+                        unpriced.join(", ")
+                    )
+                },
+            });
+            return;
+        }
+        let equity = match self.lighter_equity_usd().await {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("[MARGIN] Lighter equity unavailable, guard skipped this cycle: {e:?}");
+                self.last_margin = Some(MarginSnapshot {
+                    ts: now,
+                    equity_usd: None,
+                    perp_notional_usd: notional,
+                    margin_pct: None,
+                    liq_distance_pct: None,
+                    worst_stop_distance_pct: None,
+                    ok: false,
+                    detail: format!("Lighter equity unavailable: {e}"),
+                });
+                return;
+            }
+        };
+        // Furthest protection level, plus the legs that have none. A stop
+        // only counts when it is tracked AND was placed for at least the size
+        // now open: a failed (re)placement, or a venue position larger than
+        // the stop we rest, leaves exposure the exchange cannot close. Such a
+        // leg keeps the configured distance for the numeric bar (the
+        // conservative choice — a larger distance demands more collateral)
+        // but is reported separately, because "collateral is sufficient" and
+        // "the position is protected" are different claims.
+        let mut worst_stop = f64::NEG_INFINITY;
+        let mut unprotected: Vec<String> = Vec::new();
+        for (sym, size) in &sizes {
+            let leg = self.state.legs.get(sym);
+            let covered = leg
+                .map(|l| stop_covers(l.stop_order_id.is_some(), l.stop_size, *size))
+                .unwrap_or(false);
+            match (leg.and_then(|l| l.stop_level), marks.get(sym), covered) {
+                (Some(level), Some(&mark), true) => {
+                    if mark < level {
+                        // Separate from collateral: the stop should have
+                        // fired. Surface it — the guard treats it as zero
+                        // protection via the clamp in stop_distance_pct.
+                        log::error!(
+                            "[STOP] {sym}: mark {mark:.2} is below the resting stop {level:.2} but the perp leg is still open — verify the trigger order on Lighter"
+                        );
+                    }
+                    worst_stop = worst_stop.max(stop_distance_pct(mark, level));
+                }
+                _ => {
+                    unprotected.push(sym.clone());
+                    worst_stop = worst_stop.max(self.cfg.stop_dd_pct);
+                }
+            }
+        }
+        let liq = liquidation_distance_pct(equity, notional, self.cfg.lighter_mmr_pct)
+            .unwrap_or(f64::INFINITY);
+        let margin_pct = equity / notional * 100.0;
+        let short_of_collateral = margin_breached(liq, worst_stop, STOP_LIQ_CLEARANCE_PCT);
+        let breached = short_of_collateral || !unpriced.is_empty() || !unprotected.is_empty();
+        // A top-up figure is only meaningful when the shortfall is purely a
+        // collateral one. With exposure the guard cannot model, or with legs
+        // the exchange cannot close, the notional and the stop used for that
+        // arithmetic are both wrong — say what has to be fixed instead of
+        // quoting a number that could be short or even negative.
+        let detail = if !unpriced.is_empty() {
+            format!(
+                "Lighter exposure the guard cannot model ({}); no top-up can be computed while it is open — close it or add the symbol to BULL_HOLDER_SYMBOLS. Modelled legs alone: liquidation at {liq:.1}% drawdown",
+                unpriced.join(", ")
+            )
+        } else if !unprotected.is_empty() {
+            format!(
+                "perp exposure with no covering exchange stop ({}) — re-place the stop; liquidation at {liq:.1}% drawdown{}",
+                unprotected.join(", "),
+                if short_of_collateral {
+                    format!(
+                        ", and collateral is short by ${:.2}",
+                        equity_for_distance_usd(
+                            notional,
+                            worst_stop + STOP_LIQ_CLEARANCE_PCT,
+                            self.cfg.lighter_mmr_pct,
+                        ) - equity
+                    )
+                } else {
+                    String::new()
+                }
+            )
+        } else if short_of_collateral {
+            let need = equity_for_distance_usd(
+                notional,
+                worst_stop + STOP_LIQ_CLEARANCE_PCT,
+                self.cfg.lighter_mmr_pct,
+            ) - equity;
+            format!(
+                "liquidation at {liq:.1}% drawdown is inside the exchange stop at {worst_stop:.1}% (+{STOP_LIQ_CLEARANCE_PCT}% clearance): deposit at least ${need:.2} more USDC to Lighter"
+            )
+        } else {
+            format!("liquidation at {liq:.1}% drawdown, furthest stop at {worst_stop:.1}%")
+        };
+        if breached && !self.cfg.dry_run {
+            log::error!(
+                "[MARGIN] BREACH: Lighter equity ${equity:.2} vs perp ${notional:.0} ({margin_pct:.1}%): {detail} — new tranches/ADDs are refused by the precheck; the daily exit rule and the exchange stop keep running"
+            );
+        } else if breached {
+            log::info!(
+                "[MARGIN] DRY_RUN (no real collateral, not enforced): equity ${equity:.2} vs perp ${notional:.0}: {detail}"
+            );
+        } else {
+            log::info!(
+                "[MARGIN] ok: Lighter equity ${equity:.2} vs perp ${notional:.0} ({margin_pct:.1}%): {detail}"
+            );
+        }
+        self.last_margin = Some(MarginSnapshot {
+            ts: now,
+            equity_usd: Some(equity),
+            perp_notional_usd: notional,
+            margin_pct: Some(margin_pct),
+            liq_distance_pct: Some(liq),
+            worst_stop_distance_pct: Some(worst_stop),
+            ok: !breached,
+            detail,
+        });
+    }
+
     // ------------------------------------------------------------ lifecycle
 
     async fn arm(&mut self) -> Result<()> {
@@ -856,6 +1405,15 @@ impl Engine {
         self.state.last_tranche_date = None;
         self.state.tranche_progress.clear();
         self.persist();
+        // Collateral precheck against the WHOLE planned book (all tranches,
+        // all symbols), read-only and before any order: the deposit contract
+        // is for EQUITY_USD × PERP_FRACTION, not for one tranche — a ladder
+        // must not be allowed to start on a fifth of the collateral. Short →
+        // the ARM fails and the caller halts: deposit, RISK_ACK, ARM again.
+        // Scheduled tranches re-check incrementally as the book grows.
+        if let Some(short) = self.margin_precheck(perp_notional * n as f64).await? {
+            bail!("{short}");
+        }
         self.buy_tranche("ARM").await
     }
 
@@ -1261,6 +1819,7 @@ impl Engine {
     // ----------------------------------------------------------- reconcile
 
     async fn reconcile(&mut self) {
+        self.margin_monitor().await;
         if self.cfg.dry_run {
             return; // nothing real to compare against
         }
@@ -1429,6 +1988,15 @@ impl Engine {
 
         if self.state.halted {
             log::error!("[HALT] active: {:?}", self.state.halt_reason);
+            // A halt blocks orders, not observation: perp collateral keeps
+            // eroding while the operator investigates, so keep the read-only
+            // collateral guard running on the reconcile cadence. Without this
+            // the last [MARGIN] snapshot would freeze until RISK_ACK.
+            if self.state.mode == Mode::On
+                && now.saturating_sub(self.last_margin_check) >= self.cfg.reconcile_every_secs
+            {
+                self.margin_monitor().await;
+            }
         } else if self.state.mode == Mode::On && intent != OperatorIntent::DisarmNow {
             self.daily_eval().await;
             // Next entry tranche, only if still On after the daily exit check
@@ -1442,9 +2010,33 @@ impl Engine {
                     self.cfg.daily_eval_after_utc_secs,
                 )
             {
-                if let Err(e) = self.buy_tranche("scheduled").await {
-                    log::error!("[ENTRY] tranche failed: {e:?}");
-                    self.halt(format!("tranche failed: {e}"));
+                // Precheck against the whole tranche even when resuming a
+                // partial one (slightly over-requires; never under).
+                let adding = self.state.tranche_perp_usd * self.cfg.symbols.len() as f64;
+                match self.margin_precheck(adding).await {
+                    Ok(None) => {
+                        if let Err(e) = self.buy_tranche("scheduled").await {
+                            log::error!("[ENTRY] tranche failed: {e:?}");
+                            self.halt(format!("tranche failed: {e}"));
+                        }
+                    }
+                    Ok(Some(short)) => {
+                        // Not a halt: the exit rule must keep running. The
+                        // ladder is pushed out a day, like a day the bot is
+                        // down; it retries at the next daily slot.
+                        log::error!(
+                            "[MARGIN] scheduled tranche deferred to the next UTC day: {short}"
+                        );
+                        self.state.last_tranche_date = Some(utc_date(now));
+                        self.persist();
+                    }
+                    Err(e) => {
+                        // Transient read failure: retry next tick, do not
+                        // burn the day.
+                        log::warn!(
+                            "[MARGIN] tranche postponed, cannot verify Lighter collateral: {e:?}"
+                        );
+                    }
                 }
             }
             if self.state.mode == Mode::On
@@ -1488,6 +2080,7 @@ impl Engine {
             "tranche_perp_usd": self.state.tranche_perp_usd,
             "last_tranche_date": self.state.last_tranche_date,
             "config_fp": self.cfg.fingerprint(),
+            "margin": self.last_margin,
             "legs": legs,
         });
         if let Err(e) = persist_json(&self.cfg.status_path, &status) {
@@ -1501,9 +2094,10 @@ async fn main() -> Result<()> {
     init_logger();
     let cfg = Config::from_env()?;
     log::info!(
-        "[CONFIG] bot={BOT} instance={} dry_run={} symbols={} equity=${:.0} spot_frac={} perp_frac={} tranches={} exit_dd={}% stop_dd={}% hl_slip={}bps fp={}",
+        "[CONFIG] bot={BOT} instance={} dry_run={} symbols={} equity=${:.0} spot_frac={} perp_frac={} tranches={} exit_dd={}% stop_dd={}% mmr={}% margin_min={}% hl_slip={}bps fp={}",
         cfg.instance_id, cfg.dry_run, cfg.symbols.join(","), cfg.equity_usd, cfg.spot_fraction, cfg.perp_fraction,
-        cfg.entry_tranches, cfg.exit_dd_pct, cfg.stop_dd_pct, cfg.hl_taker_slippage_bps, cfg.fingerprint()
+        cfg.entry_tranches, cfg.exit_dd_pct, cfg.stop_dd_pct, cfg.lighter_mmr_pct, cfg.perp_margin_min_pct,
+        cfg.hl_taker_slippage_bps, cfg.fingerprint()
     );
     refuse_live(
         cfg.dry_run,
@@ -1551,6 +2145,8 @@ async fn main() -> Result<()> {
         state,
         last_status_write: 0,
         last_reconcile: 0,
+        last_margin_check: 0,
+        last_margin: None,
         cfg,
     };
     // A restart while On must re-verify the book before doing anything else.
@@ -1855,6 +2451,168 @@ mod tests {
     }
 
     #[test]
+    fn liquidation_point_matches_909_worked_example() {
+        // #893's approved example: $1,000 behind $4,500 of perp at 1.2% MMR
+        // liquidates at ~21.28% — before the 30% exit and the 35% stop.
+        let d = liquidation_distance_pct(1_000.0, 4_500.0, 1.2).unwrap();
+        assert!((d - 21.28).abs() < 0.02, "{d}");
+        // Inverse round-trips.
+        let e = equity_for_distance_usd(4_500.0, d, 1.2);
+        assert!((e - 1_000.0).abs() < 1e-6, "{e}");
+        // No exposure → no liquidation point; already-underwater → negative.
+        assert!(liquidation_distance_pct(1_000.0, 0.0, 1.2).is_none());
+        assert!(liquidation_distance_pct(10.0, 4_500.0, 1.2).unwrap() < 0.0);
+        // Floor for the 35% stop, and the #909 30-day-buffer deposit.
+        assert!((liquidation_floor_pct(35.0, 1.2) - 35.78).abs() < 1e-9);
+        assert!((required_collateral_usd(4_500.0, 47.55) - 2_139.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn runtime_guard_breach_and_clearance() {
+        // Freshly armed at the #909 allocation: liquidation 46.9% out, stop
+        // 35% out → fine.
+        let liq = liquidation_distance_pct(2_139.75, 4_500.0, 1.2).unwrap();
+        assert!((liq - 46.9).abs() < 0.1, "{liq}");
+        assert!(!margin_breached(liq, 35.0, STOP_LIQ_CLEARANCE_PCT));
+        // Funding erodes equity to the floor: liquidation lands inside the
+        // stop (+ clearance) → breach.
+        let eroded = equity_for_distance_usd(4_500.0, 35.5, 1.2);
+        let liq2 = liquidation_distance_pct(eroded, 4_500.0, 1.2).unwrap();
+        assert!(margin_breached(liq2, 35.0, STOP_LIQ_CLEARANCE_PCT));
+        assert!(!margin_breached(liq2, 35.0, 0.0));
+        // A drawdown to the 30% exit day at the #909 allocation still keeps
+        // liquidation beyond the (now much closer) stop.
+        let equity = 2_139.75 - 0.30 * 4_500.0;
+        let notional = 0.70 * 4_500.0;
+        let liq3 = liquidation_distance_pct(equity, notional, 1.2).unwrap();
+        let stop = stop_distance_pct(70.0, 65.0);
+        assert!(liq3 > stop + STOP_LIQ_CLEARANCE_PCT, "{liq3} vs {stop}");
+        assert_eq!(stop_distance_pct(0.0, 65.0), 0.0);
+    }
+
+    #[test]
+    fn perp_sizes_take_the_larger_of_book_and_venue() {
+        let configured = vec!["BTC".to_string(), "ETH".to_string()];
+        let recorded: BTreeMap<String, f64> = [("BTC".to_string(), 0.01), ("ETH".to_string(), 0.0)]
+            .into_iter()
+            .collect();
+        // The venue holds twice the recorded BTC (the case reconcile halts
+        // on) and a short ETH leg; both must be valued, ETH by magnitude.
+        let venue = vec![
+            ("BTC".to_string(), 0.02, 1),
+            ("ETH".to_string(), 0.5, -1),
+            ("SOL".to_string(), 3.0, 1),
+        ];
+        let (sizes, unsupported) = merge_perp_sizes(&configured, &recorded, &venue);
+        assert_eq!(sizes.get("BTC"), Some(&0.02));
+        // A short still consumes margin: counted, and flagged as unmodellable
+        // because the long-only sell stop cannot cover an upward move.
+        assert_eq!(sizes.get("ETH"), Some(&0.5));
+        assert_eq!(
+            unsupported,
+            vec![
+                "ETH (short)".to_string(),
+                "SOL (not configured)".to_string()
+            ]
+        );
+        // Recorded larger than the venue reports (a stale or partial venue
+        // read): keep the recorded size, never undercount the notional.
+        let (stale, none) = merge_perp_sizes(
+            &configured,
+            &[("BTC".to_string(), 0.03)].into_iter().collect(),
+            &[("BTC".to_string(), 0.02, 1)],
+        );
+        assert_eq!(stale.get("BTC"), Some(&0.03));
+        assert!(none.is_empty());
+        // Nothing anywhere → nothing to price (no venue read needed).
+        let (empty, clean) = merge_perp_sizes(&configured, &BTreeMap::new(), &[]);
+        assert!(empty.is_empty() && clean.is_empty());
+        // Only an unconfigured position open: nothing priceable, but the
+        // caller must NOT read that as "no exposure".
+        let (no_sizes, flagged) = merge_perp_sizes(
+            &configured,
+            &BTreeMap::new(),
+            &[("SOL".to_string(), 3.0, 1)],
+        );
+        assert!(no_sizes.is_empty());
+        assert_eq!(flagged, vec!["SOL (not configured)".to_string()]);
+        // Notional uses only the symbols that carry size.
+        let marks: BTreeMap<String, f64> =
+            [("BTC".to_string(), 80_000.0), ("ETH".to_string(), 2_500.0)]
+                .into_iter()
+                .collect();
+        assert!(
+            (perp_notional_usd(&sizes, &marks) - (0.02 * 80_000.0 + 0.5 * 2_500.0)).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn stop_only_counts_when_it_covers_the_open_size() {
+        // Exact and over-sized stops cover the position.
+        assert!(stop_covers(true, Some(0.02), 0.02));
+        assert!(stop_covers(true, Some(0.03), 0.02));
+        // A stop resting for LESS than what is open leaves the remainder
+        // unprotected — the venue-position-larger-than-book case.
+        assert!(!stop_covers(true, Some(0.01), 0.02));
+        // No resting order, or none recorded: no protection either way.
+        assert!(!stop_covers(false, Some(0.02), 0.02));
+        assert!(!stop_covers(true, None, 0.02));
+        // A state.json round-trip must not read as under-covered.
+        let round_tripped: f64 =
+            serde_json::from_str(&serde_json::to_string(&0.02).unwrap()).unwrap();
+        assert!(stop_covers(true, Some(round_tripped), 0.02));
+    }
+
+    #[test]
+    fn crossed_stop_offers_no_protection() {
+        // Mark already below a still-resting stop: distance clamps to 0, so
+        // the guard demands the liquidation point stay clear of the mark
+        // itself instead of accepting it as "beyond" a negative distance.
+        assert_eq!(stop_distance_pct(60.0, 65.0), 0.0);
+        assert!(margin_breached(0.5, 0.0, STOP_LIQ_CLEARANCE_PCT));
+        assert!(!margin_breached(2.0, 0.0, STOP_LIQ_CLEARANCE_PCT));
+        // Without the clamp a −8.3% distance would have accepted this.
+        assert!(margin_breached(
+            0.5,
+            stop_distance_pct(60.0, 65.0),
+            STOP_LIQ_CLEARANCE_PCT
+        ));
+    }
+
+    #[test]
+    fn config_validation_rejects_margin_min_below_liquidation_floor() {
+        let mut cfg = test_config();
+        cfg.perp_margin_min_pct = 35.0; // below the 35.78% floor for a 35% stop
+        assert!(cfg.validate().is_err());
+        cfg.perp_margin_min_pct = 35.79;
+        assert!(cfg.validate().is_ok());
+        cfg.perp_margin_min_pct = 100.01;
+        assert!(cfg.validate().is_err());
+        cfg.perp_margin_min_pct = 47.55;
+        cfg.lighter_mmr_pct = 0.0;
+        assert!(cfg.validate().is_err());
+        // Spot-only: no Lighter order and no collateral check ever runs, so
+        // a stop value that would otherwise raise the floor above the
+        // default minimum must not refuse startup.
+        let mut spot_only = test_config();
+        spot_only.perp_fraction = 0.0;
+        spot_only.stop_dd_pct = 50.0;
+        assert!(spot_only.validate().is_ok());
+        // The same values with perp exposure are still rejected.
+        let mut with_perp = spot_only.clone();
+        with_perp.perp_fraction = 0.45;
+        assert!(with_perp.validate().is_err());
+    }
+
+    #[test]
+    fn fingerprint_changes_with_margin_min() {
+        let a = test_config();
+        let mut b = test_config();
+        b.perp_margin_min_pct = 60.0;
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
     fn fingerprint_changes_with_exit_level() {
         let a = test_config();
         let mut b = test_config();
@@ -1881,6 +2639,8 @@ mod tests {
             entry_tranches: 5,
             exit_dd_pct: 30.0,
             stop_dd_pct: 35.0,
+            lighter_mmr_pct: 1.2,
+            perp_margin_min_pct: 47.55,
             tick_secs: 60,
             daily_eval_after_utc_secs: 300,
             max_close_fetch_failures: 3,
