@@ -11,7 +11,7 @@ use chrono::{TimeZone, Utc};
 use serde_json::json;
 
 use super::config::BookConfig;
-use super::executor::{Executor, FillReport};
+use super::executor::{Executor, FillReport, PreSendAbort};
 use super::ledger::Ledger;
 use super::rebalance::{self, IntentKind, LotMeta, OrderIntent, Plan, Side};
 use super::risk::{utc_date, RiskEvent, RiskRails};
@@ -318,12 +318,25 @@ impl BookEngine {
                 .get(&sym)
                 .map(|l| 10f64.powi(-(l.size_decimals as i32)) * 0.5)
                 .unwrap_or(1e-9);
-            let book_basis_ok = self
-                .state
-                .positions
-                .get(&sym)
-                .map_or(true, |p| p.avg_price > 0.0);
-            if (venue_qty - book_qty).abs() <= tol && book_basis_ok {
+            let book_basis = self.state.positions.get(&sym).map(|p| p.avg_price);
+            let book_basis_ok = book_basis.map_or(true, |a| a > 0.0);
+            // The venue's own average entry is authoritative. It can differ
+            // from the stored one at an unchanged quantity: a fill booked
+            // at `mid_estimate` after a lost acknowledgement, or an
+            // external close-and-reopen of the same net size between ticks.
+            // Leaving it would corrupt unrealized and later realized PnL
+            // for as long as the leg lives.
+            let venue_basis_stale = match (
+                venue
+                    .get(&sym)
+                    .and_then(|p| p.entry_price)
+                    .filter(|e| *e > 0.0),
+                book_basis.filter(|a| *a > 0.0),
+            ) {
+                (Some(v), Some(b)) => ((v - b) / b).abs() > 1e-6,
+                _ => false,
+            };
+            if (venue_qty - book_qty).abs() <= tol && book_basis_ok && !venue_basis_stale {
                 continue;
             }
             // The venue's own average entry, when it reports one. Only
@@ -432,6 +445,7 @@ impl BookEngine {
                         avg_price: entry,
                         opened_at: now,
                         funding_accrued_at: Some(now),
+                        realized_pnl: 0.0,
                     });
                 let kept_same_side = book_qty != 0.0 && (venue_qty > 0.0) == (book_qty > 0.0);
                 p.qty = venue_qty;
@@ -959,6 +973,12 @@ impl BookEngine {
                     if let Some(rail) = self.risk.loss_rail_breached(&self.state, equity) {
                         cap_breach = Some(rail.to_string());
                     }
+                } else {
+                    // The rails cannot be checked against current venue
+                    // equity, and a fill has already moved the book: block
+                    // the rest of the openings rather than send them blind.
+                    self.equity_ready = false;
+                    cap_breach = Some("equity_unavailable".to_string());
                 }
             }
             if !intent.reduce_only && (cap_breach.is_some() || !self.opens_allowed()) {
@@ -982,7 +1002,7 @@ impl BookEngine {
                 s.blocked += 1;
                 continue;
             }
-            s.sent += 1;
+
             self.ledger
                 .write(now, "order_intent", Some(key), json!({ "intent": intent }));
             let rate = if self.state.positions.contains_key(&intent.symbol) {
@@ -992,6 +1012,7 @@ impl BookEngine {
             };
             match self.exec.execute(intent).await {
                 Ok(fill) => {
+                    s.sent += 1;
                     if fill.filled_qty > 0.0 {
                         self.accrue_funding(&intent.symbol, now, intent.reference_price, rate);
                         fills_since_check = true;
@@ -1004,17 +1025,27 @@ impl BookEngine {
                     }
                 }
                 Err(e) => {
+                    // A pre-send abort (no usable price, or the book moved
+                    // past the slippage budget) never reached the venue, so
+                    // it must not spend the decision's attempt budget: the
+                    // condition is transient and the residual should still
+                    // be retried inside the window.
+                    let pre_send = e.downcast_ref::<PreSendAbort>().is_some();
+                    if !pre_send {
+                        s.sent += 1;
+                    }
                     log::error!(
-                        "[ORDER] {} {} {} failed: {e}",
+                        "[ORDER] {} {} {} failed{}: {e}",
                         intent.side,
                         intent.symbol,
-                        intent.qty
+                        intent.qty,
+                        if pre_send { " before sending" } else { "" }
                     );
                     self.ledger.write(
                         now,
                         "order_error",
                         Some(key),
-                        json!({ "intent": intent, "error": e.to_string() }),
+                        json!({ "intent": intent, "error": e.to_string(), "pre_send": pre_send }),
                     );
                     status::ORDER_TOTAL
                         .with_label_values(&[&self.cfg.instance_id, "error"])
@@ -1738,6 +1769,7 @@ mod tests {
             positions: Mutex::new(BTreeMap::new()),
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
+            abort_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1759,6 +1791,121 @@ mod tests {
         assert!(rows(&cfg.paths.pnl)
             .iter()
             .any(|r| r["event"] == "exit" && r["recovered"] == true));
+    }
+
+    #[tokio::test]
+    async fn a_pre_send_abort_costs_no_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("SOL", 0.5), ("DOT", -0.5)]);
+        // DOT's order never reaches the venue (no send-time price, or the
+        // drift guard); SOL fills.
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 200.0), ("DOT".to_string(), 4.0)].into(),
+            positions: Mutex::new(BTreeMap::new()),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: Some("DOT".to_string()),
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Partial);
+        // Nothing reached the venue, so no attempt was spent: DOT aborted
+        // before sending, and opening SOL alone would have left a $500
+        // one-sided book, past the $150 net cap -- so the cap re-check
+        // blocked it rather than compounding the half-applied plan.
+        assert_eq!(rec.attempts, 0);
+        assert!(engine.state.is_flat());
+        let ledger = rows(&cfg.paths.ledger);
+        let err = ledger
+            .iter()
+            .find(|r| r["event"] == "order_error")
+            .expect("order_error row");
+        assert_eq!(err["intent"]["symbol"], "DOT");
+        assert_eq!(err["pre_send"], true);
+        let blocked = ledger
+            .iter()
+            .find(|r| r["event"] == "order_blocked")
+            .expect("order_blocked row");
+        assert_eq!(blocked["intent"]["symbol"], "SOL");
+        assert!(blocked["reason"].as_str().unwrap().starts_with("cap_net"));
+    }
+
+    #[tokio::test]
+    async fn a_decision_whose_every_intent_aborts_pre_send_spends_no_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        cfg.signal.require_dollar_neutral = false;
+        cfg.sizing.max_net_usd = 1_000.0;
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("SOL", 0.5)]);
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 200.0)].into(),
+            positions: Mutex::new(BTreeMap::new()),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: Some("SOL".to_string()),
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Partial);
+        assert_eq!(rec.attempts, 0, "nothing reached the venue");
+        assert!(engine.state.is_flat());
+    }
+
+    #[tokio::test]
+    async fn a_venue_basis_correction_is_adopted_even_at_an_unchanged_quantity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // The book booked its fill at an estimated mid of 100; the venue's
+        // own average entry is 112 for the same quantity.
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 2.0, 100.0, secs("2026-09-05T23:00:00Z"));
+        state.persist(&cfg.paths.state).unwrap();
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 130.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 2.0,
+                        entry_price: Some(112.0),
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: None,
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        let p = &engine.state.positions["SOL"];
+        assert_eq!(p.qty, 2.0);
+        assert_eq!(p.avg_price, 112.0, "the venue basis is authoritative");
+        // Nothing closed, so nothing was realized by the correction.
+        assert_eq!(engine.state.cum_realized_usd, 0.0);
+        assert!(rows(&cfg.paths.ledger)
+            .iter()
+            .any(|r| r["event"] == "adopt" && r["symbol"] == "SOL"));
     }
 
     #[tokio::test]
@@ -1785,6 +1932,7 @@ mod tests {
             ),
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
+            abort_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1824,6 +1972,7 @@ mod tests {
             ),
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
+            abort_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1856,6 +2005,9 @@ mod tests {
         /// When set, `execute` asserts that `state.json` at this path already
         /// carries the decision record (hash + targets) for the order.
         state_path: Option<std::path::PathBuf>,
+        /// Symbol whose orders abort before reaching the venue (the shape
+        /// of a missing send-time price or a drift-guard rejection).
+        abort_symbol: Option<String>,
     }
 
     #[async_trait]
@@ -1889,6 +2041,12 @@ mod tests {
             Some(0.001)
         }
         async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
+            if self.abort_symbol.as_deref() == Some(intent.symbol.as_str()) {
+                return Err(anyhow::anyhow!(PreSendAbort(format!(
+                    "live: no price for {}",
+                    intent.symbol
+                ))));
+            }
             if let Some(p) = &self.state_path {
                 let persisted = BookState::load_or_new(p, "test-book").unwrap();
                 let rec = persisted
@@ -1950,6 +2108,7 @@ mod tests {
             ),
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
+            abort_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1992,6 +2151,7 @@ mod tests {
             positions: Mutex::new(BTreeMap::new()),
             equity_ok: std::sync::atomic::AtomicBool::new(false),
             state_path: Some(cfg.paths.state.clone()),
+            abort_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2050,6 +2210,7 @@ mod tests {
             ),
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
+            abort_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -2068,6 +2229,7 @@ mod tests {
             positions: Mutex::new(venue.positions.lock().unwrap().clone()),
             equity_ok: std::sync::atomic::AtomicBool::new(true),
             state_path: None,
+            abort_symbol: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);

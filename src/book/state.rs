@@ -21,6 +21,13 @@ pub struct Position {
     /// Last funding accrual timestamp (unix seconds).
     #[serde(default)]
     pub funding_accrued_at: Option<i64>,
+    /// Realized PnL booked against *this* leg so far. A leg reduced over
+    /// several fills is one trade, so the win/loss classification at its
+    /// final close must use the total, not the last fill: +$50 then -$10
+    /// is a $40 winner, and the reverse order is a loser either way.
+    /// Reset when a new leg opens (including a flip).
+    #[serde(default)]
+    pub realized_pnl: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +227,7 @@ impl BookState {
                 avg_price: price,
                 opened_at: now,
                 funding_accrued_at: Some(now),
+                realized_pnl: 0.0,
             });
         let mut realized = 0.0;
         let same_side = pos.qty == 0.0 || (pos.qty > 0.0) == (signed_qty > 0.0);
@@ -229,6 +237,7 @@ impl BookState {
                 pos.avg_price = price;
                 pos.opened_at = now;
                 pos.funding_accrued_at = Some(now);
+                pos.realized_pnl = 0.0;
             } else {
                 pos.avg_price =
                     (pos.avg_price * pos.qty.abs() + price * signed_qty.abs()) / new_qty.abs();
@@ -239,11 +248,13 @@ impl BookState {
             let closing = signed_qty.abs().min(pos.qty.abs());
             let dir = if pos.qty > 0.0 { 1.0 } else { -1.0 };
             realized = (price - pos.avg_price) * closing * dir;
+            pos.realized_pnl += realized;
             let remaining = pos.qty + signed_qty;
             if remaining == 0.0 || (remaining > 0.0) != (pos.qty > 0.0) {
-                // Closed, maybe flipped.
+                // Closed, maybe flipped. One trade = one leg's lifetime,
+                // so classify on everything it realized, not this fill.
                 self.trades_closed += 1;
-                if realized > 0.0 {
+                if pos.realized_pnl > 0.0 {
                     self.trades_won += 1;
                 }
                 if remaining != 0.0 {
@@ -251,6 +262,7 @@ impl BookState {
                     pos.opened_at = now;
                     pos.funding_accrued_at = Some(now);
                 }
+                pos.realized_pnl = 0.0;
                 pos.qty = remaining;
             } else {
                 pos.qty = remaining;
@@ -310,6 +322,45 @@ mod tests {
         assert!(!s.positions.contains_key("BTC"));
         assert_eq!(s.trades_won, 1);
         assert!(s.is_flat());
+    }
+
+    #[test]
+    fn a_leg_reduced_over_several_fills_is_one_trade_classified_on_its_total() {
+        let mut s = BookState::new("t");
+        s.apply_fill("SOL", 2.0, 100.0, 1);
+        // Half out at +$50, remainder out at -$10: one $40 winner.
+        assert_eq!(s.apply_fill("SOL", -1.0, 150.0, 2), 50.0);
+        assert_eq!(s.trades_closed, 0);
+        assert_eq!(s.apply_fill("SOL", -1.0, 90.0, 3), -10.0);
+        assert_eq!(s.trades_closed, 1);
+        assert_eq!(
+            s.trades_won, 1,
+            "the last fill lost, but the trade made $40"
+        );
+        assert!((s.cum_realized_usd - 40.0).abs() < 1e-9);
+
+        // Reverse order: -$10 then +$50 is the same $40 winner.
+        let mut s = BookState::new("t");
+        s.apply_fill("SOL", 2.0, 100.0, 1);
+        s.apply_fill("SOL", -1.0, 90.0, 2);
+        s.apply_fill("SOL", -1.0, 150.0, 3);
+        assert_eq!((s.trades_closed, s.trades_won), (1, 1));
+
+        // A genuinely losing leg still counts as a loss.
+        let mut s = BookState::new("t");
+        s.apply_fill("SOL", 2.0, 100.0, 1);
+        s.apply_fill("SOL", -1.0, 95.0, 2);
+        s.apply_fill("SOL", -1.0, 90.0, 3);
+        assert_eq!((s.trades_closed, s.trades_won), (1, 0));
+
+        // A flip starts a fresh leg: the next close is judged on its own.
+        let mut s = BookState::new("t");
+        s.apply_fill("SOL", 1.0, 100.0, 1);
+        s.apply_fill("SOL", -2.0, 80.0, 2); // close -$20, open short 1 @ 80
+        assert_eq!((s.trades_closed, s.trades_won), (1, 0));
+        assert_eq!(s.positions["SOL"].realized_pnl, 0.0);
+        s.apply_fill("SOL", 1.0, 70.0, 3); // short closed +$10
+        assert_eq!((s.trades_closed, s.trades_won), (2, 1));
     }
 
     #[test]

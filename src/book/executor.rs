@@ -155,7 +155,12 @@ impl Executor for PaperExecutor {
             .await
             .get(&intent.symbol)
             .copied()
-            .ok_or_else(|| anyhow!("paper: no price for {}", intent.symbol))?;
+            .ok_or_else(|| {
+                anyhow!(PreSendAbort(format!(
+                    "paper: no price for {}",
+                    intent.symbol
+                )))
+            })?;
         let slip = self.slippage_bps / 10_000.0;
         let price = match intent.side {
             Side::Buy => mid * (1.0 + slip),
@@ -227,6 +232,21 @@ const FALLBACK_PRICE_TTL_SECS: u64 = 60;
 /// A WS mid older than this is treated as absent (the engine ticks every
 /// 5 s, and a live perp feed updates far faster than this bound).
 const WS_PRICE_MAX_AGE_SECS: u64 = 30;
+
+/// An intent that never reached the venue: no usable price, or the book
+/// moved past the slippage budget between planning and sending. The
+/// engine does not count these against a decision's attempt budget, since
+/// nothing was submitted and the condition is typically transient.
+#[derive(Debug)]
+pub struct PreSendAbort(pub String);
+
+impl std::fmt::Display for PreSendAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for PreSendAbort {}
 
 /// Whether `mid` is still within `slippage_bps` of the price the intent
 /// was sized at, in the adverse direction for `side` (a favourable move
@@ -453,17 +473,17 @@ impl Executor for LiveExecutor {
         // Drift guard: the plan was sized at `reference_price`; if the book
         // has already moved past the slippage budget the order is not sent
         // (the engine re-plans on the next tick with fresh prices).
-        let mid = self
-            .price_for(&intent.symbol)
-            .await
-            .ok_or_else(|| anyhow!("live: no price for {}", intent.symbol))?;
+        let mid = self.price_for(&intent.symbol).await.ok_or_else(|| {
+            anyhow!(PreSendAbort(format!(
+                "live: no price for {}",
+                intent.symbol
+            )))
+        })?;
         if !within_slippage(intent.reference_price, mid, intent.side, self.slippage_bps) {
-            return Err(anyhow!(
+            return Err(anyhow!(PreSendAbort(format!(
                 "price moved beyond slippage_bps={} before send (reference={} mid={})",
-                self.slippage_bps,
-                intent.reference_price,
-                mid
-            ));
+                self.slippage_bps, intent.reference_price, mid
+            ))));
         }
         let before = self
             .venue_position(&intent.symbol)

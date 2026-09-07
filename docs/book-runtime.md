@@ -162,7 +162,10 @@ bot-strategy#580).
   intents were all blocked (kill switch, halt, stale equity, cap) leaves
   the budget untouched, so a block that clears later in the window can
   still apply the target; the same holds when the residual cannot be
-  planned at all (a transient missing price or lot-metadata response).
+  planned at all (a transient missing price or lot-metadata response) and
+  when an intent aborts *before* reaching the venue (no send-time price,
+  or the book moved past the slippage budget) -- those rows carry
+  `pre_send: true` in the ledger.
 - An overdue flatten (`flatten_at` passed, book not flat) is processed
   before any decision — including after a restart that lands past the
   *next* decision time. The schedule does not advance onto a new key while
@@ -203,7 +206,9 @@ reduce_only }`.
    that fills adversely, or its fees, can cross a session or daily limit
    part-way through a plan whose rails were evaluated before the first
    order. The tick's own evaluation still owns the actual halt and the
-   flatten that follows.
+   flatten that follows. If that refresh cannot read the venue equity at
+   all, the remaining openings are blocked as `equity_unavailable` rather
+   than sent unchecked.
 
 ## 6. Execution and fill confirmation
 
@@ -232,7 +237,11 @@ reduce_only }`.
   reports its own average entry, or when the leg has no valid basis,
   flipped, or appeared from nowhere: a same-side reduction keeps its
   basis, so the remaining leg's unrealized PnL is not erased by the mark
-  used to book the recovered part. When the venue shows *less* exposure than the book
+  used to book the recovered part. A venue basis that differs from the
+  stored one is adopted even at an unchanged quantity (a fill booked at
+  `mid_estimate` after a lost acknowledgement, or an external
+  close-and-reopen of the same net size), since leaving it would corrupt
+  unrealized and later realized PnL for the life of the leg. When the venue shows *less* exposure than the book
   (a close that filled after the last persist, or a crash between the send
   and the booking), the missing reduction is booked at the current mark so
   realized PnL and the trade counters are recovered: a `recovered_close`
@@ -295,6 +304,9 @@ reduce_only }`.
   `ts_ms`, and the decision key it belongs to.
 - `pnl.jsonl`: one `mark` row per UTC day (equity, realized, unrealized,
   funding estimate, per-symbol marks) plus one `exit` row per closed leg.
+  A leg reduced over several fills is **one** trade: its win/loss
+  classification uses everything the leg realized over its lifetime, not
+  the last fill, so +$50 then -$10 counts as one winner.
 - `status.json`: the flat `debot-dashboard` schema (`id`, `dry_run`,
   `has_position`, `positions`, `pnl_total`, `pnl_today`,
   `kill_switch_active`, `trade_stats`) plus a nested `book` block
