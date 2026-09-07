@@ -436,6 +436,38 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     return out
 
 
+WEIGHT_PLACES = 6
+
+
+def _quantize(v: float, places: int = WEIGHT_PLACES) -> float:
+    """Round a weight toward zero, so |w| never grows in the last place."""
+    q = 10 ** places
+    return math.floor(abs(v) * q) / q * (1.0 if v >= 0 else -1.0)
+
+
+def _cap_excess(w: dict, gross: float, max_net_usd: float):
+    """The factor every weight must be multiplied by to fit every cap, or
+    None when the book already fits. Mirrors src/book/signal.rs and the
+    runtime's post-rounding planner caps."""
+    if not w:
+        return None
+    factors = []
+    tot = sum(abs(v) for v in w.values())
+    if tot > 1.0:
+        factors.append(1.0 / tot)
+    big = max(abs(v) for v in w.values())
+    if big > MAX_SYMBOL_WEIGHT:
+        factors.append(MAX_SYMBOL_WEIGHT / big)
+    net_usd = abs(sum(w.values())) * gross
+    if max_net_usd > 0 and net_usd > max_net_usd:
+        factors.append(max_net_usd / net_usd)
+    if not factors:
+        return None
+    # A hair under the exact ratio so the next quantisation cannot land
+    # back exactly on the boundary.
+    return min(factors) * (1.0 - 1e-9)
+
+
 def weights_from_evals(evals: list[dict], gross: float,
                        max_net_usd: float = MAX_NET_USD) -> tuple[dict, dict]:
     """Sum legs into weights (fractions of gross). If the day's book would
@@ -467,7 +499,24 @@ def weights_from_evals(evals: list[dict], gross: float,
         scale = min(scale, max_net_usd / net_usd)
     if scale < 1.0:
         w = {k: v * scale for k, v in w.items()}
-    w = {k: round(v, 6) for k, v in w.items()}
+    # Quantise toward zero, never to nearest: the runtime's caps are hard
+    # limits (`sum |w| <= 1 + 1e-9`), and rounding many legs independently
+    # can push the aggregate back over one after scaling put it inside --
+    # three hedged legs of $1588.57/$1649.26/$1685.08 land on 1.000002 and
+    # the whole signal is rejected. Truncation can only shrink |w|.
+    w = {k: _quantize(v) for k, v in w.items()}
+    # Truncation moves every weight toward zero, so gross and per-symbol
+    # can only improve, but the *net* of opposite-signed legs can drift by
+    # up to one tick per leg. Verify and shrink again if it still breaches.
+    for _ in range(4):
+        excess = _cap_excess(w, gross, max_net_usd)
+        if excess is None:
+            break
+        w = {k: _quantize(v * excess) for k, v in w.items()}
+    else:
+        raise SystemExit(
+            f"could not fit the day's book inside the caps (gross {sum(abs(v) for v in w.values()):.6f}, "
+            f"net ${abs(sum(w.values())) * gross:.2f} vs ${max_net_usd:.2f}); refusing to publish")
     return w, {"scale": scale, "gross_usd": round(sum(abs(v) for v in w.values()) * gross, 2),
                "net_usd": round(sum(w.values()) * gross, 2)}
 
@@ -508,6 +557,46 @@ def universe_from_config(path: str) -> set:
     if not syms:
         raise SystemExit(f"{path}: universe.symbols is empty")
     return syms
+
+
+def read_host_status(uri_or_path: str) -> dict | None:
+    """The runtime's published status.json (local path or s3:// URI), or
+    None when it cannot be read. Unreadable is not the same as stale: a
+    transient S3 error must not block a legitimate publish."""
+    try:
+        if uri_or_path.startswith("s3://"):
+            out = subprocess.run(["aws", "s3", "cp", "--only-show-errors", uri_or_path, "-"],
+                                 check=True, capture_output=True, text=True).stdout
+        else:
+            with open(uri_or_path) as f:
+                out = f.read()
+        return json.loads(out)
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        return None
+
+
+def host_schedule_drift(status: dict, key: str, dec: datetime) -> str | None:
+    """A message when the running instance has not scheduled `key`, else None.
+
+    The runtime loads its calendar file once at startup from
+    /opt/book-runtime/, which the /opt/debot config sync cannot write. So a
+    regenerated calendar (a new event, or EWY going from estimated to
+    declared) reaches the host but not the process until the instance is
+    reinstalled and restarted, and the decision is silently never
+    scheduled."""
+    book = status.get("book")
+    if not isinstance(book, dict):
+        return "status.json has no `book` block"
+    got_key, got_at = book.get("next_decision_key"), book.get("next_decision_at")
+    if got_key is None:
+        return "the running instance reports no next decision (its calendar may be empty or exhausted)"
+    if got_key != key:
+        return (f"the running instance's next decision is {got_key} ({got_at}), not today's {key}: "
+                f"its calendar predates this events file")
+    if got_at and got_at != _ts(dec):
+        return (f"the running instance schedules {key} at {got_at}, not {_ts(dec)}: "
+                f"its calendar was generated from a different session table")
+    return None
 
 
 def upload(path: str, s3_uri: str) -> None:
@@ -564,6 +653,18 @@ def cmd_signal(a) -> int:
             print(f"refusing: {msg} (pass --allow-after-decision to write anyway)", file=sys.stderr)
             return 3
         print(f"WARNING: {msg}; writing anyway (--allow-after-decision)", file=sys.stderr)
+    if a.verify_host_status:
+        status = read_host_status(a.verify_host_status)
+        if status is None:
+            print(f"WARNING: could not read {a.verify_host_status}; publishing without the "
+                  f"host-schedule check", file=sys.stderr)
+        else:
+            drift = host_schedule_drift(status, d.isoformat(), dec)
+            if drift:
+                print(f"refusing: {drift}. Reinstall the instance (install_book_runtime.sh) and "
+                      f"restart it so it loads the current calendar -- see "
+                      f"docs/exdiv-book-operations.md 'Calendar updates'.", file=sys.stderr)
+                return 4
     prev_day = prev_trading_day(d, a.trading_calendar)
     rows_t, rows_prev = load_rows(a.log_dir, d), load_rows(a.log_dir, prev_day)
     sig = build_signal(events, d, rows_t, rows_prev, now, a.gross, a.producer_id, a.max_net_usd,
@@ -607,6 +708,11 @@ def main() -> int:
                         "together to stay inside it (the runtime rejects the whole plan otherwise)")
     s.add_argument("--producer-id", default=PRODUCER_ID)
     s.add_argument("--s3-uri", default=None)
+    s.add_argument("--verify-host-status", default=None,
+                   help="the running instance's status.json (path or s3:// URI). Refuse to publish "
+                        "(exit 4) when it has not scheduled today's decision, which means its "
+                        "calendar file predates this events file and the decision would be "
+                        "silently skipped. An unreadable status only warns")
     a = ap.parse_args()
     if a.cmd == "calendar":
         return cmd_calendar(a)

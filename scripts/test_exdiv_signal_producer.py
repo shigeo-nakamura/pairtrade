@@ -244,7 +244,7 @@ class SignalTests(unittest.TestCase):
         w, agg = xp.weights_from_evals(evals, 8000.0)
         self.assertLessEqual(sum(abs(v) for v in w.values()), 1.0 + 1e-9)
         self.assertLessEqual(max(abs(v) for v in w.values()), xp.MAX_SYMBOL_WEIGHT + 1e-9)
-        self.assertAlmostEqual(w["US500"], -(w["SPY"] + w["IWM"]), places=9)
+        self.assertAlmostEqual(w["US500"], -(w["SPY"] + w["IWM"]), places=5)
         self.assertNotIn("TSM", w)
         self.assertLess(agg["scale"], 1.0)
 
@@ -314,6 +314,67 @@ class SignalTests(unittest.TestCase):
         w2, agg2 = xp.weights_from_evals(hedged, 8000.0, 2200.0)
         self.assertEqual(agg2["scale"], 1.0)
         self.assertAlmostEqual(agg2["net_usd"], 0.0, places=6)
+
+    def test_rounding_never_pushes_the_book_back_over_a_cap(self):
+        """Scaling put the book inside the caps, but rounding six weights
+        to nearest put it back over `sum |w| <= 1 + 1e-9` and the runtime
+        rejected the whole signal (Codex P2, round 3)."""
+        evals = [{"symbol": "SPY", "hedge": "US500", "skip": None, "notional_usd": 1588.57},
+                 {"symbol": "QQQ", "hedge": "US100", "skip": None, "notional_usd": 1649.26},
+                 {"symbol": "IWM", "hedge": "EWY", "skip": None, "notional_usd": 1685.08}]
+        w, agg = xp.weights_from_evals(evals, 8000.0, 2200.0)
+        self.assertLessEqual(sum(abs(v) for v in w.values()), 1.0 + 1e-9)
+        self.assertLess(agg["scale"], 1.0)
+        # Mutation control: rounding to nearest on the same scaled vector
+        # does breach the cap, so the assertion above is not vacuous.
+        naive = {k: round(v, 6) for k, v in
+                 {"SPY": -0.161373, "US500": 0.161373, "QQQ": -0.167538,
+                  "US100": 0.167538, "IWM": -0.171147, "EWY": 0.171147}.items()}
+        self.assertGreater(sum(abs(v) for v in naive.values()), 1.0 + 1e-9)
+
+    def test_caps_hold_for_many_random_same_day_books(self):
+        import random
+        rnd = random.Random(948)
+        for _ in range(400):
+            n = rnd.randint(1, 5)
+            evals = []
+            for i in range(n):
+                evals.append({"symbol": f"E{i}", "skip": None,
+                              "hedge": (f"H{i}" if rnd.random() < 0.6 else None),
+                              "notional_usd": round(rnd.uniform(50, 2000), 2)})
+            w, agg = xp.weights_from_evals(evals, 8000.0, 2200.0)
+            self.assertLessEqual(sum(abs(v) for v in w.values()), 1.0 + 1e-9)
+            self.assertLessEqual(max((abs(v) for v in w.values()), default=0.0),
+                                 xp.MAX_SYMBOL_WEIGHT + 1e-9)
+            self.assertLessEqual(abs(sum(w.values())) * 8000.0, 2200.0 + 1e-6)
+            for v in w.values():             # quantised, never a long float
+                self.assertEqual(v, round(v, xp.WEIGHT_PLACES))
+
+    def test_host_schedule_drift_detection(self):
+        """A regenerated calendar reaches /opt/debot but not the running
+        process until it is reinstalled and restarted (Codex P1, round 3)."""
+        dec = xp.decision_at(D)
+        ok = {"book": {"next_decision_key": "2026-09-18",
+                       "next_decision_at": "2026-09-18T13:29:00Z"}}
+        self.assertIsNone(xp.host_schedule_drift(ok, "2026-09-18", dec))
+        stale = {"book": {"next_decision_key": "2026-09-21",
+                          "next_decision_at": "2026-09-21T13:29:00Z"}}
+        self.assertIn("not today's 2026-09-18", xp.host_schedule_drift(stale, "2026-09-18", dec))
+        empty = {"book": {"next_decision_key": None, "next_decision_at": None}}
+        self.assertIn("no next decision", xp.host_schedule_drift(empty, "2026-09-18", dec))
+        wrong_time = {"book": {"next_decision_key": "2026-09-18",
+                               "next_decision_at": "2026-09-18T14:29:00Z"}}
+        self.assertIn("different session table",
+                      xp.host_schedule_drift(wrong_time, "2026-09-18", dec))
+        self.assertIn("no `book` block", xp.host_schedule_drift({}, "2026-09-18", dec))
+
+    def test_host_status_read_failures_do_not_block(self):
+        self.assertIsNone(xp.read_host_status("/nonexistent/status.json"))
+        with tempfile.TemporaryDirectory() as td:
+            bad = os.path.join(td, "s.json")
+            with open(bad, "w") as f:
+                f.write("{not json")
+            self.assertIsNone(xp.read_host_status(bad))
 
     def test_producer_constants_match_the_deployed_config(self):
         """The producer mirrors the runtime caps; drift would produce files
@@ -389,6 +450,31 @@ class SignalTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("WARNING", r.stderr)
             self.assertTrue(os.path.exists(out_late))
+            # stale host schedule -> exit 4, nothing written
+            st = os.path.join(td, "status.json")
+            with open(st, "w") as f:
+                json.dump({"book": {"next_decision_key": "2026-09-21",
+                                    "next_decision_at": "2026-09-21T13:29:00Z"}}, f)
+            out_v = os.path.join(td, "verified.json")
+            base = [sys.executable, script, "signal", "--events", ev, "--out", out_v,
+                    "--date", "2026-09-18", "--now", "2026-09-18T13:27:30Z", "--log-dir", logdir]
+            r = subprocess.run(base + ["--verify-host-status", st], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertFalse(os.path.exists(out_v))
+            # matching host schedule -> publishes
+            with open(st, "w") as f:
+                json.dump({"book": {"next_decision_key": "2026-09-18",
+                                    "next_decision_at": "2026-09-18T13:29:00Z"}}, f)
+            r = subprocess.run(base + ["--verify-host-status", st], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue(os.path.exists(out_v))
+            # unreadable status -> warns, still publishes
+            os.remove(out_v)
+            r = subprocess.run(base + ["--verify-host-status", os.path.join(td, "missing.json")],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("WARNING", r.stderr)
+            self.assertTrue(os.path.exists(out_v))
             # symbol outside the deployed universe -> refuse (exit 2)
             with open(ev, "w") as f:
                 json.dump({"schema_version": 1, "events": [

@@ -109,21 +109,63 @@ The workstation runs on UTC, so both possible open times get a line and
 whichever one is not the market's 09:27 simply finds no event window:
 
 ```
-27 13,14 * * 1-5 python3 $HOME/bot/.worktrees/pairtrade-master/scripts/exdiv_signal_producer.py signal --events $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-events.json --config $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-lighter.yaml --out $HOME/bot/logs/exdiv_948/signal.json --s3-uri s3://debot-dashboard/debot/book/exdiv-lighter/signal.json >> $HOME/bot/logs/exdiv_948/producer.log 2>&1
+27 13,14 * * 1-5 python3 $HOME/bot/.worktrees/pairtrade-master/scripts/exdiv_signal_producer.py signal --events $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-events.json --config $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-lighter.yaml --verify-host-status s3://debot-dashboard/debot/status/book-exdiv-lighter/status.json --out $HOME/bot/logs/exdiv_948/signal.json --s3-uri s3://debot-dashboard/debot/book/exdiv-lighter/signal.json >> $HOME/bot/logs/exdiv_948/producer.log 2>&1
 ```
+
+`--verify-host-status` reads the running instance's published status and
+refuses (exit 4) when it has not scheduled today's decision — see
+"Calendar updates" below. An unreadable status only warns, so a transient
+S3 error cannot block a legitimate publish.
 
 (The off-hour run is harmless: on a non-event day it exits 0 having
 written nothing, and on an event day the wrong-hour line is after the
-decision and exits 3 without writing. Exit 3 in the log therefore means
-"that was the off-season line", or "the on-time line was delayed" — check
-the timestamp. If you prefer a single line, set `CRON_TZ=America/New_York`
-on the crontab and use `27 9 * * 1-5`.)
+decision and exits 3 without writing. If you prefer a single line, set
+`CRON_TZ=America/New_York` on the crontab and use `27 9 * * 1-5`.)
+
+Exit codes: 0 wrote (or nothing to do), 2 config/universe refusal, 3 the
+run started after the decision, 4 the running instance has not scheduled
+this decision.
 
 It exits 0 with "no declared ex-dividend event" on every other day. The
 fetch timer on the host polls S3 from 09:27:00 NY, so the upload has ~90 s
 of slack before the 09:29:00 decision; the 120 s grace closes the window
 two minutes later (entering after the step has landed is pointless, so a
 late signal is `skipped`, not applied).
+
+## Calendar updates (after the instance is installed)
+
+**A regenerated calendar does not reach the running process on its own.**
+`deploy-configs.yml` syncs it to `/opt/debot/configs/book/`, but the
+service reads `/opt/book-runtime/exdiv-lighter.calendar.json` and cannot
+see `/opt/debot` (`InaccessiblePaths`), and it loads that file once at
+startup. So whenever `configs/book/exdiv-events.json` changes — a new
+event, or EWY going from `estimated` to `declared` — the new decision date
+is scheduled only after the instance is reinstalled **and restarted**.
+This is the same deploy-is-not-restart rule as bot-strategy#580.
+
+After the config deploy lands:
+
+```
+# 1. promote the new calendar into the runtime's own directory
+sudo env BOOK_INSTANCE=exdiv-lighter \
+     BOOK_BINARY_SOURCE=/opt/book-runtime/bin/book_runtime \
+     BOOK_LIBSIGNER_SOURCE=/opt/book-runtime/lib/libsigner.so \
+     bash /opt/debot/scripts/install_book_runtime.sh
+
+# 2. restart so it loads (safe only while flat -- outside 09:29-09:36 NY
+#    on an event day the book is always flat by design)
+sudo systemctl restart book-runtime-exdiv-lighter
+
+# 3. verify the new date is actually scheduled
+sudo journalctl -u book-runtime-exdiv-lighter --since '-5min' --no-pager | grep '\[CONFIG\]'
+jq '.book.next_decision_key, .book.next_decision_at' /var/lib/book-runtime/exdiv-lighter/status.json
+```
+
+Step 3 is the check that matters: `next_decision_key` must be the next
+declared ex-dividend date. The producer performs the same check remotely
+before every publish (`--verify-host-status`, in the cron above) and
+refuses with exit 4 rather than uploading a signal for a decision the
+runtime will never open a window for.
 
 ## Host install (only after G1 passes)
 
