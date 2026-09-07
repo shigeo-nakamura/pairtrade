@@ -40,6 +40,7 @@ jobs:
           bash -n debot/scripts/install_engine_b_live.sh
           bash -n debot/scripts/install_book_runtime.sh
           bash -n debot/scripts/book_signal_fetch.sh
+          bash -n debot/scripts/s3_object_present.sh
           python3 -m py_compile debot/scripts/xsmom_signal_producer.py debot/scripts/test_xsmom_signal_producer.py
           python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
@@ -47,6 +48,7 @@ jobs:
           python3 debot/scripts/test_book_signal_file.py
           python3 debot/scripts/test_xsmom_signal_producer.py
           bash debot/scripts/test_book_signal_fetch.sh
+          bash debot/scripts/test_s3_object_present.sh
 
       - name: Test Engine B Phase 0 observer
         run: |
@@ -235,7 +237,7 @@ jobs:
               "# Both install paths stage everything from S3 into a per-run dir, so neither depends on the other having run first: ci.yml owns the binary object, this job owns the config and unit objects, and whichever installs last promotes the newest of both under install_book_runtime.sh's flock.",
               "install -d -m 0755 /tmp/engine-b-phase0-__GITHUB_SHA__",
               "aws s3 sync s3://__S3_BUCKET__/debot/engine-b-phase0/releases/__GITHUB_SHA__/ /tmp/engine-b-phase0-__GITHUB_SHA__/ --exact-timestamps",
-              "/bin/bash -lc 'set -e; if ! aws s3api head-object --bucket __S3_BUCKET__ --key debot/book_runtime >/dev/null 2>&1; then echo \"book runtime binary not published to S3 yet (ci.yml uploads it); skipping\"; else aws s3 cp s3://__S3_BUCKET__/debot/book_runtime /tmp/book-units-__GITHUB_SHA__/book_runtime; aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so /tmp/book-units-__GITHUB_SHA__/libsigner.so; sudo env BOOK_INSTANCE=xsmom-695 BOOK_BINARY_SOURCE=/tmp/book-units-__GITHUB_SHA__/book_runtime BOOK_LIBSIGNER_SOURCE=/tmp/book-units-__GITHUB_SHA__/libsigner.so BOOK_UNIT_SOURCE_DIR=/tmp/book-units-__GITHUB_SHA__ bash __INSTALL_DIR__/scripts/install_book_runtime.sh; fi'",
+              "/bin/bash -lc 'set -e; bash __INSTALL_DIR__/scripts/s3_object_present.sh __S3_BUCKET__ debot/book_runtime; rc=$?; if [ $rc -eq 10 ]; then echo \"book runtime binary not published to S3 yet (ci.yml uploads it); skipping\"; elif [ $rc -ne 0 ]; then exit $rc; else aws s3 cp s3://__S3_BUCKET__/debot/book_runtime /tmp/book-units-__GITHUB_SHA__/book_runtime; aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so /tmp/book-units-__GITHUB_SHA__/libsigner.so; sudo env BOOK_INSTANCE=xsmom-695 BOOK_BINARY_SOURCE=/tmp/book-units-__GITHUB_SHA__/book_runtime BOOK_LIBSIGNER_SOURCE=/tmp/book-units-__GITHUB_SHA__/libsigner.so BOOK_UNIT_SOURCE_DIR=/tmp/book-units-__GITHUB_SHA__ bash __INSTALL_DIR__/scripts/install_book_runtime.sh; fi'",
               "sudo env ENGINE_B_PHASE0_CODE_COMMIT=__GITHUB_SHA__ ENGINE_B_PHASE0_REQUIREMENTS=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_requirements.txt ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0.py ENGINE_B_PHASE0_ARCHIVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_archive.sh ENGINE_B_PHASE0_CONFIG_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/phase0.json ENGINE_B_PHASE0_CALENDAR_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/trading_calendar.json ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/tmp/engine-b-phase0-__GITHUB_SHA__/deploy bash /tmp/engine-b-phase0-__GITHUB_SHA__/scripts/install_engine_b_phase0.sh"
             ]
           }
