@@ -426,19 +426,28 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     ev_ref_mid, ctl_ref_mid = close_mid(rows_prev, sym, prev_day, cal_path), \
         close_mid(rows_prev, ctl, prev_day, cal_path)
     ev_now, ctl_now = latest_mid(win), latest_mid(ctl_win)
-    if ev_ref_mid and ctl_ref_mid and ev_now and ctl_now:
-        adj = ((ev_now / ev_ref_mid - 1) - (ctl_now / ctl_ref_mid - 1)) * 1e4
+    if ev_ref_mid and ev_now:
+        ev_move = (ev_now / ev_ref_mid - 1) * 1e4
+        if ctl_ref_mid and ctl_now:
+            adj = ev_move - (ctl_now / ctl_ref_mid - 1) * 1e4
+            out["premarket_basis"] = "mid_vs_t-1_close_mid"
+        else:
+            # No control series (a logger gap, or a symbol only added to
+            # the watchlist recently). Use the event's own move: it fires
+            # on market-wide drops too, so it can only skip more often,
+            # never trade when the adjusted gate would have skipped.
+            adj = ev_move
+            out["premarket_basis"] = "mid_unadjusted_no_control"
         out["premarket_adj_move_bps"] = round(adj, 2)
-        out["premarket_basis"] = "mid_vs_t-1_close_mid"
         if adj <= -LANDED_FRAC * div_bps:
             out["skip"] = "gap_already_landed"
             return out
     else:
-        # The gate cannot be evaluated (a logger gap over the T-1 close, or
-        # no fresh control rows). Fail CLOSED: proceeding would take the
-        # trade with its main safety check silently disabled, and a fill
-        # after the step has landed is both a loss and a corrupted capture
-        # measurement. Missing one event costs only that observation.
+        # The event's own mids are missing, so there is nothing to measure.
+        # Fail CLOSED: proceeding would take the trade with its main safety
+        # check silently disabled, and a fill after the step has landed is
+        # both a loss and a corrupted capture measurement. Missing one
+        # event costs only that observation.
         out["premarket_adj_move_bps"] = None
         out["premarket_basis"] = None
         out["landed_gate_inputs"] = {

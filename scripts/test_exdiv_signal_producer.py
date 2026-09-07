@@ -447,18 +447,28 @@ class SignalTests(unittest.TestCase):
         e = sig["meta"]["events"][0]
         self.assertIsNone(e["skip"])
         self.assertEqual(e["premarket_basis"], "mid_vs_t-1_close_mid")
-        # no T-1 rows at all -> the gate cannot be evaluated -> skip
+        # no T-1 rows at all -> the event's own mids are missing -> skip
         sig = xp.build_signal(EVENTS[:1], D, base_rows(), [], NOW)
         e = sig["meta"]["events"][0]
         self.assertEqual(e["skip"], "landed_gate_unavailable")
         self.assertIsNone(e["premarket_adj_move_bps"])
         self.assertFalse(e["landed_gate_inputs"]["event_t1_mid"])
         self.assertEqual(sig["weights"], {})
-        # T-1 rows for the event but not the control -> still unevaluable
+        # Only the CONTROL is missing (a logger gap, or a symbol added to
+        # the watchlist recently): fall back to the event's own move rather
+        # than throwing the event away. Unadjusted can only skip MORE often
+        # -- it fires on market-wide drops too -- so it stays fail-safe.
         only_event = [r for r in prev_rows() if r["symbol"] == "SPY"]
         e = xp.build_signal(EVENTS[:1], D, base_rows(), only_event, NOW)["meta"]["events"][0]
-        self.assertEqual(e["skip"], "landed_gate_unavailable")
-        self.assertFalse(e["landed_gate_inputs"]["control_t1_mid"])
+        self.assertIsNone(e["skip"])
+        self.assertEqual(e["premarket_basis"], "mid_unadjusted_no_control")
+        self.assertIsNotNone(e["premarket_adj_move_bps"])
+        # ... and it still catches a real drop without a control
+        dropped = ([r for r in base_rows() if r["symbol"] != "SPY"]
+                   + series("SPY", NOW.replace(minute=23, second=0), 5, bid=657.33, ask=657.39))
+        e = xp.build_signal(EVENTS[:1], D, dropped, only_event, NOW)["meta"]["events"][0]
+        self.assertEqual(e["skip"], "gap_already_landed")
+        self.assertEqual(e["premarket_basis"], "mid_unadjusted_no_control")
         # a market-wide pre-open drop is NOT the dividend: control moves too
         both_down = ([r for r in base_rows() if r["symbol"] not in ("SPY", "US500")]
                      + series("SPY", NOW.replace(minute=23, second=0), 5, bid=657.33, ask=657.39)

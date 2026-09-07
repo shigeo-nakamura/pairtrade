@@ -79,10 +79,15 @@ to the decision instant:
    internal book price while the futures-derived hedge legs quote
    continuously, so an index-vs-index comparison mixes two price
    definitions and a few bps of thin pre-open noise would false-fire it
-   (QQQ's threshold is only about −6 bps). If the gate cannot be evaluated
-   at all — a logger gap over the T-1 close, say — the event is **skipped**
-   (`landed_gate_unavailable`) rather than traded with its main safety
-   check silently disabled.
+   (QQQ's threshold is only about −6 bps). If only the **control** series
+   is missing (a logger gap, or a symbol added to the watchlist recently)
+   the gate falls back to the event's own unadjusted move
+   (`premarket_basis: mid_unadjusted_no_control`), which fires on
+   market-wide drops too and so can only skip more often, never trade
+   where the adjusted gate would have skipped. If the **event's own** mids
+   are missing the gate cannot be evaluated at all and the event is
+   **skipped** (`landed_gate_unavailable`) rather than traded with its
+   main safety check silently disabled.
 2. **Size** (2026-09-07 comment, replaces the bare `25 % × L1`): slippage
    budget = 20 % of the dividend in bps; take the widest logged depth band
    inside the budget and use **half the median cumulative bid depth** in
