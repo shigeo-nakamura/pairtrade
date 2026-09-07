@@ -195,11 +195,23 @@ Not a checklist to execute now; recorded so the path is explicit:
 2. Set `dry_run: false` in `configs/book/xsmom-695.yaml` **and**
    `Environment=BOOK_CONFIRM_LIVE=yes-i-mean-it` in a unit drop-in; either
    alone refuses to start.
-3. Restart before a decision window with the book flat (the paper book
+3. In the same reviewed config change, set
+   `execution.allow_venue_protection_fallback: true`. **Without it no
+   Lighter order can be sent at all**: dex-connector v4.7.20 has no
+   price-capped IOC for Lighter, so `send_capped` refuses rather than
+   silently widening the cap, and the default is false precisely so that
+   choice is made deliberately. Accepting it means orders go out with
+   Lighter's own ±20 % protection price instead of the configured
+   `slippage_bps`, so the pre-send drift guard (which still uses
+   `slippage_bps` against the sizing mid) and the per-symbol/gross/net
+   caps are what actually bound a bad fill. Revisit when
+   bot-strategy#918 lands a price-constrained IOC; at that point this
+   flag should go back to false.
+4. Restart before a decision window with the book flat (the paper book
    does not carry over: delete `state.json` positions or let the venue
    reconcile adopt whatever is there — it starts flat on a new account).
-4. First live decision: watch `[FILL]` lines for `venue_fills` fill-price
+5. First live decision: watch `[FILL]` lines for `venue_fills` fill-price
    source and `book_order_total{result="filled"}`; residuals show as
    `partial` with `residual_qty` in the ledger.
-5. Live is Lighter-only until dex-connector has a perp IOC path for
+6. Live is Lighter-only until dex-connector has a perp IOC path for
    Hyperliquid (`docs/book-runtime.md` §10).

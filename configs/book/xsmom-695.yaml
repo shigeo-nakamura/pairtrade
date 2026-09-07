@@ -109,6 +109,11 @@ sizing:
   rebalance_deadband_usd: 5
 
 execution:
+  # Going live additionally requires allow_venue_protection_fallback: true
+  # (see docs/book-runtime-operations.md "Live transition"): dex-connector
+  # v4.7.20 has no price-capped IOC for Lighter, so with the default false
+  # a live order is refused rather than sent under a wider cap than asked
+  # for. It stays false here because this instance is DRY_RUN.
   slippage_bps: 50
   max_attempts: 3
   fill_confirm_timeout_secs: 15
