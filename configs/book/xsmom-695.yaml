@@ -11,49 +11,80 @@ venue: lighter
 dry_run: true
 
 universe:
-  # L38 (bot-strategy#695 universe screen, 2026-07-03 snapshot). The
-  # producer re-screens point-in-time; anything outside this list is
-  # rejected by the runtime, so widen it here when the producer's screen
-  # admits a new symbol.
+  # The runtime rejects any signal naming a symbol outside this list, so it
+  # must cover everything the producer's point-in-time screen can admit.
+  # That screen is deliberately dynamic (it re-screens every rebalance to
+  # keep survivorship out of the shadow track, bot-strategy#695), so this
+  # is NOT the frozen 2026-07-03 L38 snapshot: it is the union of that
+  # snapshot and every symbol the shadow book has actually held through
+  # 2026-09-06.
+  #
+  # New names still appear at a rate of roughly 2-6 per rebalance, and one
+  # outside this list makes the runtime reject the whole signal
+  # (`rejected:unknown_symbol` in status.json) and hold the previous book.
+  # `xsmom_signal_producer.py --config` cross-checks against this file and
+  # refuses to publish such a signal, so the failure surfaces at the
+  # producer with the missing symbols named. Add them here and redeploy.
   symbols:
-    - BTC
-    - ETH
-    - SOL
-    - HYPE
-    - LIT
-    - TRX
-    - GRAM
-    - ZEC
-    - PAXG
-    - FARTCOIN
-    - ENA
-    - BNB
-    - XRP
-    - WLD
-    - UNI
+    - 1000BONK
+    - 1000PEPE
+    - 1000SHIB
     - AAVE
-    - NEAR
-    - XPL
     - ADA
-    - XMR
+    - APT
+    - ASTER
     - AVAX
-    - TAO
-    - TIA
-    - PENDLE
-    - XLM
-    - SUI
-    - TRUMP
+    - AXS
     - BB
+    - BCH
+    - BNB
+    - BTC
+    - CC
+    - CRV
+    - DASH
     - DOGE
     - DOT
+    - ENA
+    - ETH
+    - FARTCOIN
+    - FIL
+    - GRAM
+    - GRASS
+    - HYPE
+    - ICP
+    - JTO
+    - JUP
+    - KAITO
+    - LDO
     - LINK
-    - 1000PEPE
-    - ZRO
-    - ASTER
-    - BCH
-    - APT
-    - WLFI
+    - LIT
+    - LTC
+    - NEAR
+    - ONDO
+    - PAXG
+    - PENDLE
+    - PUMP
+    - ROBO
+    - SEI
     - SKR
+    - SOL
+    - SPX
+    - SUI
+    - TAO
+    - TIA
+    - TRUMP
+    - TRX
+    - UNI
+    - VVV
+    - WIF
+    - WLD
+    - WLFI
+    - XLM
+    - XMR
+    - XPL
+    - XRP
+    - ZEC
+    - ZRO
 
 schedule:
   kind: interval_days

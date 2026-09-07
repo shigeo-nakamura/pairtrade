@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import math
 import os
 import subprocess
@@ -135,6 +136,23 @@ def build(row: dict, gross: float, generated_at: datetime, producer_id: str = PR
     return bsf.build_signal(producer_id, generated_at, as_of, d.isoformat(), weights, meta)
 
 
+def universe_from_config(path: str) -> set:
+    """Symbols the deployed runtime will accept.
+
+    Read with a regex rather than a YAML parser: the host may not have
+    PyYAML, and the file is generated from this repo so its shape is
+    known. A parse that finds no symbols is an error, not an empty set.
+    """
+    text = open(path).read()
+    block = re.search(r"^universe:\s*$(.*?)^[a-z_]+:", text, re.M | re.S)
+    if not block:
+        raise SystemExit(f"{path}: no universe: block")
+    syms = set(re.findall(r"^\s+- ([A-Za-z0-9_]+)\s*$", block.group(1), re.M))
+    if not syms:
+        raise SystemExit(f"{path}: universe.symbols is empty")
+    return syms
+
+
 def upload(path: str, s3_uri: str) -> None:
     subprocess.run(
         ["aws", "s3", "cp", "--only-show-errors", "--content-type", "application/json",
@@ -148,6 +166,9 @@ def main() -> int:
     ap.add_argument("--ledger", default=DEFAULT_LEDGER)
     ap.add_argument("--out", required=True, help="local signal.json path (written atomically)")
     ap.add_argument("--s3-uri", default=None, help="optional s3://bucket/key to upload the file to")
+    ap.add_argument("--config", default=None,
+                    help="deployed runtime config; refuse to publish a signal naming a symbol "
+                         "outside its universe (the runtime would reject the whole file)")
     ap.add_argument("--date", default=None, help="decision date YYYY-MM-DD (default: today UTC)")
     ap.add_argument("--gross", type=float, default=GROSS_USD)
     ap.add_argument("--producer-id", default=PRODUCER_ID)
@@ -169,6 +190,19 @@ def main() -> int:
         print(f"refusing: {today} is not on the {ANCHOR}+{EVERY_DAYS}d grid", file=sys.stderr)
         return 2
     sig = build(row, a.gross, datetime.now(timezone.utc), a.producer_id)
+    if a.config:
+        # A symbol the deployed config does not list makes the runtime
+        # reject the entire signal and hold the previous book. Surface it
+        # here, named, instead of leaving it to be found in status.json.
+        outside = sorted(set(sig["weights"]) - universe_from_config(a.config))
+        if outside:
+            print(
+                f"refusing: {today} book has {len(outside)} symbol(s) outside the deployed "
+                f"universe ({a.config}): {', '.join(outside)}. Add them to universe.symbols "
+                "and redeploy the config, then re-run.",
+                file=sys.stderr,
+            )
+            return 2
     bsf.write_signal(a.out, sig)
     print(f"wrote {a.out} key={sig['decision_key']} n={len(sig['weights'])} "
           f"gross=${sig['meta']['gross_usd']} net=${sig['meta']['net_usd']} sha={sig['payload_sha256'][:12]}")

@@ -25,7 +25,8 @@ this workstation (cron)                     S3                          Tokyo ho
   1000`). It refuses to emit off-grid dates or books that violate the
   runtime caps (exit 2), and writes nothing on non-rebalance days.
 - Decision grid: anchor 2026-07-03, every 5 days, decision 00:30, grace
-  90 min (`signal_grace_secs: 5400`). The watcher's first successful run
+  90 min (`signal_grace_secs: 5400`). Next decisions: 2026-09-11,
+  2026-09-16, 2026-09-21. The watcher's first successful run
   of a rebalance day is normally 00:20; if it only succeeds later the
   producer still emits within the hour, and the runtime accepts anything
   inside the window. A rebalance day with no valid file by 02:00 is
@@ -34,12 +35,49 @@ this workstation (cron)                     S3                          Tokyo ho
 ## Workstation cron (operator adds; agents do not edit crontab)
 
 ```
-25 * * * * $HOME/bot/scripts/.venv-lighter-collector/bin/python $HOME/bot/.worktrees/i937/pairtrade/scripts/xsmom_signal_producer.py --out $HOME/bot/logs/xsmom_shadow/signal.json --s3-uri s3://debot-dashboard/debot/book/xsmom-695/signal.json >> $HOME/bot/logs/xsmom_shadow/producer.log 2>&1
+25 * * * * $HOME/bot/scripts/.venv-lighter-collector/bin/python $HOME/bot/pairtrade/scripts/xsmom_signal_producer.py --out $HOME/bot/logs/xsmom_shadow/signal.json --config $HOME/bot/pairtrade/configs/book/xsmom-695.yaml --s3-uri s3://debot-dashboard/debot/book/xsmom-695/signal.json >> $HOME/bot/logs/xsmom_shadow/producer.log 2>&1
 ```
+
+`--config` cross-checks the book against the universe the deployed runtime
+will accept; see "Universe drift" below. The local `aws` CLI uses the admin
+profile already on this machine.
 
 (Point the script path at the checkout that tracks `master` once
 pairtrade#285/#286 are merged. The local `aws` CLI uses the admin profile
 that already exists on this machine.)
+
+## Universe drift (expect this, roughly every few rebalances)
+
+The shadow watcher re-screens its universe point-in-time at every
+rebalance, on purpose: pinning it would put survivorship back into the
+track (bot-strategy#695). So the book's membership genuinely moves. Over
+2026-07-03 .. 2026-09-06 it introduced **2 to 6 new symbols per
+rebalance**, and 21 of the 55 symbols it has held were never in the frozen
+L38 snapshot.
+
+`configs/book/xsmom-695.yaml` therefore lists the **union** of that
+snapshot and everything the shadow book has actually held (59 symbols as
+of 2026-09-06), not L38.
+
+A symbol outside that list makes the runtime reject the whole signal
+(`rejected:unknown_symbol` in `status.json`, previous book held). The
+producer's `--config` check turns that into a producer-side refusal
+naming the missing symbols:
+
+```
+refusing: 2026-09-11 book has 3 symbol(s) outside the deployed universe
+(...xsmom-695.yaml): FOO, BAR, BAZ. Add them to universe.symbols and
+redeploy the config, then re-run.
+```
+
+When that fires: add the symbols to `universe.symbols`, open a PR, let
+`Deploy Configs` install it, and re-run the producer. The window stays
+open for 90 minutes after 00:30 UTC, so a same-morning fix still lands.
+
+Making the bound dynamic (accept any symbol the venue lists, keeping the
+per-symbol and gross/net caps as the real guard) is the proper fix and is
+tracked separately; until then this is a recurring, expected maintenance
+step.
 
 ## Host install (CI, no start)
 

@@ -84,6 +84,36 @@ class ProducerTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 xp.load_rebalance_rows(ledger)
 
+    def test_universe_cross_check_refuses_symbols_the_runtime_would_reject(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = os.path.join(d, "cfg.yaml")
+            with open(cfg, "w") as f:
+                f.write("universe:\n  symbols:\n    - LIT\n    - GRAM\n    - APT\nschedule:\n  kind: daily\n")
+            self.assertEqual(xp.universe_from_config(cfg), {"LIT", "GRAM", "APT"})
+            ledger = os.path.join(d, "ledger.jsonl")
+            write_ledger(ledger, [ROW])
+            out = os.path.join(d, "signal.json")
+            cmd = [sys.executable, os.path.join(HERE, "xsmom_signal_producer.py"),
+                   "--ledger", ledger, "--out", out, "--date", "2026-09-06", "--config", cfg]
+            # ROW also holds ENA, which the config does not list.
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertIn("ENA", r.stderr)
+            self.assertFalse(os.path.exists(out))
+            with open(cfg, "a") as f:
+                f.write("")
+            with open(cfg, "w") as f:
+                f.write("universe:\n  symbols:\n    - LIT\n    - GRAM\n    - APT\n    - ENA\nschedule:\n  kind: daily\n")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.exists(out))
+            # A config with no universe block is an error, not an empty set.
+            bad = os.path.join(d, "bad.yaml")
+            with open(bad, "w") as f:
+                f.write("schedule:\n  kind: daily\n")
+            with self.assertRaises(SystemExit):
+                xp.universe_from_config(bad)
+
     def test_cli_writes_only_on_a_rebalance_date(self):
         with tempfile.TemporaryDirectory() as d:
             ledger = os.path.join(d, "ledger.jsonl")
