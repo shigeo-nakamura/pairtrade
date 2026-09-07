@@ -24,13 +24,15 @@ t = sys.argv[1]
 d = json.load(open(f"{t}/good.json"))
 m = dict(d); del m["decision_key"]; json.dump(m, open(f"{t}/bad_missing.json", "w"))
 h = json.loads(json.dumps(d)); h["weights"]["BTC"] = 0.2; json.dump(h, open(f"{t}/bad_hash.json", "w"))
+g = dict(d); g["generated_at"] = 123; json.dump(g, open(f"{t}/bad_ts_type.json", "w"))
+w = json.loads(json.dumps(d)); w["weights"]["BTC"] = "0.1"; json.dump(w, open(f"{t}/bad_weight_type.json", "w"))
 open(f"{t}/bad_json.json", "w").write("{")
 PY
 
-bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .* 2026-09-06"
+bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .*(2026-09-06 "
 cmp -s "$T/good.json" "$T/dst/signal.json"
 
-for bad in bad_missing bad_hash bad_json; do
+for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_json; do
   if bash "$HERE/book_signal_fetch.sh" "$T/$bad.json" "$T/dst/signal.json" 2>/dev/null; then
     echo "FAIL: $bad was promoted" >&2; exit 1
   fi

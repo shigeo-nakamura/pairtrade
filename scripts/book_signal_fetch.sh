@@ -24,15 +24,31 @@ fi
 # displace the last valid local file; a file the runtime would reject must
 # never replace one it accepted.
 if ! SUMMARY=$(python3 - "$TMP" <<'PY'
-import hashlib, json, sys
+import hashlib, json, math, sys
+from datetime import datetime
 d = json.load(open(sys.argv[1]))
 for k in ("schema_version", "producer_id", "generated_at", "as_of", "decision_key", "weights", "payload_sha256"):
     if k not in d:
         raise SystemExit(f"missing field {k}")
 if d["schema_version"] != 1:
     raise SystemExit(f"schema_version {d['schema_version']} != 1")
-if not isinstance(d["weights"], dict) or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in d["weights"].values()):
+for k in ("producer_id", "decision_key", "payload_sha256"):
+    if not isinstance(d[k], str) or not d[k].strip():
+        raise SystemExit(f"{k} must be a non-empty string")
+for k in ("generated_at", "as_of"):
+    if not isinstance(d[k], str):
+        raise SystemExit(f"{k} must be a string timestamp")
+    try:
+        datetime.strptime(d[k], "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as e:
+        raise SystemExit(f"{k} is not a YYYY-MM-DDTHH:MM:SSZ timestamp: {e}")
+if not isinstance(d["weights"], dict):
     raise SystemExit("weights must be a symbol -> number mapping")
+for sym, v in d["weights"].items():
+    if not isinstance(sym, str) or not sym.strip():
+        raise SystemExit(f"bad symbol key {sym!r}")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+        raise SystemExit(f"weight for {sym} must be a finite number, got {v!r}")
 payload = {"as_of": d["as_of"], "decision_key": d["decision_key"], "producer_id": d["producer_id"],
            "weights": {k: float(v) for k, v in d["weights"].items()}}
 sha = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
