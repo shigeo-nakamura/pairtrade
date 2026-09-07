@@ -517,22 +517,25 @@ impl BookEngine {
                     .unwrap_or(0.0);
                 self.accrue_funding(&sym, now, px, rate);
             }
-            // Same signed quantity, different venue basis: the leg was
-            // closed and reopened outside this process. Position data
-            // alone cannot say at what price it closed -- inventing one
-            // would fabricate a trade, and staying silent would lose it --
-            // so the correction is recorded explicitly for reconciliation
-            // against the venue's own trade history.
-            let mut basis_corrected_same_qty = false;
+            // Same signed quantity, different venue basis: either the leg
+            // was closed and reopened outside this process, or an earlier
+            // increase was booked at a mid-price estimate (a lost
+            // acknowledgement, or an eventually-consistent fills endpoint)
+            // that the venue's own average entry now supersedes. Position
+            // data alone cannot tell the two apart -- inventing a close
+            // price for the former would fabricate a trade, so leg
+            // history (opened_at, realized_pnl) is left untouched here
+            // and only avg_price is corrected below; the correction is
+            // still recorded for reconciliation against the venue's own
+            // trade history.
             if closed_qty == 0.0
                 && venue_qty != 0.0
                 && venue_basis_stale
                 && (venue_qty - book_qty).abs() <= tol
             {
-                basis_corrected_same_qty = true;
                 let old_basis = book_basis.unwrap_or(0.0);
                 log::warn!(
-                    "[ADOPT] {sym}: same quantity {venue_qty} but the venue basis moved {old_basis} -> {entry};                      any realized PnL from that external close/reopen is NOT in this book's accounting"
+                    "[ADOPT] {sym}: same quantity {venue_qty} but the venue basis moved {old_basis} -> {entry}; could be an external close/reopen or a mid-estimate fill now corrected -- leg history preserved either way"
                 );
                 self.ledger.write(
                     now,
@@ -590,17 +593,6 @@ impl BookEngine {
                         funding_accrued_at: Some(now),
                         realized_pnl: 0.0,
                     });
-                if basis_corrected_same_qty {
-                    // This is the same-quantity external close/reopen
-                    // logged above, not a continuation of the old leg:
-                    // its history must start fresh, or a realized_pnl
-                    // left over from a partial reduction against the OLD
-                    // leg gets combined with the NEW leg's eventual close
-                    // when apply_fill decides win/loss, corrupting the
-                    // trade count and win rate.
-                    p.opened_at = now;
-                    p.realized_pnl = 0.0;
-                }
                 let kept_same_side = book_qty != 0.0 && (venue_qty > 0.0) == (book_qty > 0.0);
                 p.qty = venue_qty;
                 p.funding_accrued_at = Some(now);
@@ -2993,14 +2985,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_venue_basis_correction_starts_a_fresh_leg_history() {
+    async fn a_venue_basis_correction_preserves_the_legs_realized_history() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
         sandbox(&mut cfg, dir.path());
         cfg.dry_run = false;
         // Book: opened long 4 @ 100, then reduced by 2 @ 120 -- a real
         // partial reduction that already realized $40 onto this leg's
-        // history, leaving qty 2 with that $40 still carried on it.
+        // history, leaving qty 2 with that $40 still carried on it. Same
+        // quantity + a different venue basis is ambiguous by itself (an
+        // external close/reopen, OR an earlier increase that was booked
+        // at a mid-price estimate and is only now being corrected to the
+        // venue's authoritative entry -- the latter is the SAME leg, not
+        // a new one), so this correction must not reset opened_at or
+        // realized_pnl: doing so would erase real history whenever it is
+        // actually the latter case.
         let t0 = secs("2026-09-05T20:00:00Z");
         let t1 = secs("2026-09-05T23:00:00Z");
         let mut state = BookState::new(&cfg.instance_id);
@@ -3009,9 +3008,6 @@ mod tests {
         assert_eq!(state.positions["SOL"].realized_pnl, 40.0);
         assert_eq!(state.positions["SOL"].opened_at, t0);
         state.persist(&cfg.paths.state).unwrap();
-        // The venue reports the *same* quantity but a different basis:
-        // classified as an external close/reopen (basis_correction), not
-        // a continuation of the leg above.
         let venue = Arc::new(MockVenue {
             prices: [("SOL".to_string(), 130.0)].into(),
             positions: Mutex::new(
@@ -3037,14 +3033,14 @@ mod tests {
         engine.tick(now).await.unwrap();
         let p = &engine.state.positions["SOL"];
         assert_eq!(p.qty, 2.0);
-        assert_eq!(p.avg_price, 112.0);
+        assert_eq!(p.avg_price, 112.0, "the venue basis is authoritative");
         assert_eq!(
-            p.realized_pnl, 0.0,
-            "the old leg's realized PnL must not carry into the new leg"
+            p.realized_pnl, 40.0,
+            "a genuine earlier realization must survive a basis correction"
         );
         assert_eq!(
-            p.opened_at, now,
-            "a basis-corrected leg is a fresh leg, not a continuation"
+            p.opened_at, t0,
+            "leg history is preserved, not reset, on this ambiguous signal"
         );
         assert!(rows(&cfg.paths.ledger)
             .iter()
