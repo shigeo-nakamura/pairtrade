@@ -348,13 +348,17 @@ impl BookConfig {
         if let Some(calendar_path) = &self.schedule.calendar_path {
             named.push(("schedule.calendar_path", calendar_path));
         }
-        let mut seen: Vec<(&str, PathBuf)> = Vec::new();
+        let mut seen: Vec<(&str, PathBuf, Option<(u64, u64)>)> = Vec::new();
         for (name, path) in named {
             let key = resolved_path(path);
-            if let Some((other, _)) = seen.iter().find(|(_, k)| *k == key) {
+            let identity = file_identity(path);
+            if let Some((other, _, _)) = seen
+                .iter()
+                .find(|(_, k, id)| *k == key || (identity.is_some() && *id == identity))
+            {
                 bail!("{name} and {other} are the same file ({})", path.display());
             }
-            seen.push((name, key));
+            seen.push((name, key, identity));
         }
         let r = &self.risk;
         if r.equity_reference_usd <= 0.0 {
@@ -441,6 +445,21 @@ fn anchored_path(p: &Path) -> PathBuf {
         Ok(cwd) => lexical_path(&cwd.join(lex)),
         Err(_) => lex,
     }
+}
+
+/// `(device, inode)` of an existing path, so two hard links to one file --
+/// distinct directory entries that canonicalize to distinct path strings --
+/// are still caught. `None` when the path does not exist yet or the
+/// platform has no such identity (hard links are unix-only).
+#[cfg(unix)]
+fn file_identity(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_p: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// A path in a form two configured paths can be compared by: the whole
@@ -597,6 +616,24 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("state.json"), "{}").unwrap();
             std::os::unix::fs::symlink(
+                dir.path().join("state.json"),
+                dir.path().join("ledger.jsonl"),
+            )
+            .unwrap();
+            let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+            c.paths.state = dir.path().join("state.json");
+            c.paths.ledger = dir.path().join("ledger.jsonl");
+            assert!(c.validate().is_err());
+        }
+        // Two hard links to one inode canonicalize to two distinct path
+        // strings -- unlike a symlink, neither is "the real path" -- so the
+        // check must also compare device+inode identity, not just resolved
+        // path names.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("state.json"), "{}").unwrap();
+            std::fs::hard_link(
                 dir.path().join("state.json"),
                 dir.path().join("ledger.jsonl"),
             )

@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::directional::append_jsonl;
@@ -26,10 +27,7 @@ impl Ledger {
         &self.path
     }
 
-    /// Append one row. `now` is unix seconds (rendered as `ts_ms`);
-    /// `payload` must be a JSON object and is merged after the envelope so
-    /// callers cannot accidentally override `event` / `instance_id`.
-    pub fn write(&self, now: i64, event: &str, decision_key: Option<&str>, payload: Value) {
+    fn envelope(&self, now: i64, event: &str, decision_key: Option<&str>, payload: Value) -> Value {
         let mut row = json!({
             "event": event,
             "ts_ms": now * 1000,
@@ -41,9 +39,39 @@ impl Ledger {
                 dst.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
+        row
+    }
+
+    /// Append one row, logging (not propagating) a failed write. `now` is
+    /// unix seconds (rendered as `ts_ms`); `payload` must be a JSON object
+    /// and is merged after the envelope so callers cannot accidentally
+    /// override `event` / `instance_id`. Use this for rows that are
+    /// informational only; a row whose absence must block what follows
+    /// (an `order_intent` audit record ahead of a live send) should use
+    /// [`Ledger::try_write`] instead.
+    pub fn write(&self, now: i64, event: &str, decision_key: Option<&str>, payload: Value) {
+        let row = self.envelope(now, event, decision_key, payload);
         if let Err(e) = append_jsonl(&self.path, &row) {
             log::warn!("[LEDGER] append to {} failed: {e}", self.path.display());
         }
+    }
+
+    /// Like [`Ledger::write`], but returns the append failure instead of
+    /// only logging it, so a caller whose durable audit record is a
+    /// precondition -- not just an observation -- can fail closed. A full
+    /// disk or an unwritable ledger path here means the exchange write
+    /// this row is meant to precede must not happen with zero durable
+    /// intent/fill record behind it.
+    pub fn try_write(
+        &self,
+        now: i64,
+        event: &str,
+        decision_key: Option<&str>,
+        payload: Value,
+    ) -> Result<()> {
+        let row = self.envelope(now, event, decision_key, payload);
+        append_jsonl(&self.path, &row)
+            .with_context(|| format!("append {event} to {}", self.path.display()))
     }
 }
 

@@ -203,6 +203,17 @@ impl BookEngine {
                 v.push(s.clone());
             }
         }
+        // A symbol can carry a `pending_funding_qty_hours` balance with no
+        // open position and outside the configured universe -- adopted,
+        // then fully closed while its funding rate was unavailable. Keep
+        // fetching its price so the orphan-settlement pass in
+        // `write_daily_mark` can eventually clear the carry once a rate
+        // recovers, instead of skipping it forever at `prices.get(&sym)`.
+        for s in self.state.pending_funding_qty_hours.keys() {
+            if !v.contains(s) {
+                v.push(s.clone());
+            }
+        }
         v
     }
 
@@ -1240,8 +1251,34 @@ impl BookEngine {
                 continue;
             }
 
-            self.ledger
-                .write(now, "order_intent", Some(key), json!({ "intent": intent }));
+            if let Err(e) =
+                self.ledger
+                    .try_write(now, "order_intent", Some(key), json!({ "intent": intent }))
+            {
+                // The durable intent/fill record this row establishes is a
+                // precondition for the send that follows, not just an
+                // observation of it: without it, a fill would leave zero
+                // audit trail for later fee/PnL reconciliation. Block the
+                // send rather than risk that.
+                log::error!(
+                    "[ORDER] blocked {} {} {} qty={} reason=ledger_append_failed: {e}",
+                    intent.kind_label(),
+                    intent.side,
+                    intent.symbol,
+                    intent.qty
+                );
+                self.ledger.write(
+                    now,
+                    "order_blocked",
+                    Some(key),
+                    json!({ "intent": intent, "reason": "ledger_append_failed" }),
+                );
+                status::ORDER_TOTAL
+                    .with_label_values(&[&self.cfg.instance_id, "blocked"])
+                    .inc();
+                s.blocked += 1;
+                continue;
+            }
             let rate = if self.state.positions.contains_key(&intent.symbol) {
                 self.exec.funding_rate_hourly(&intent.symbol).await
             } else {
@@ -2197,6 +2234,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_ledger_append_blocks_the_send_instead_of_only_logging_it() {
+        let d = ts("2026-09-06T00:30:00Z");
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        // The ledger's parent is actually a plain file, so `append_jsonl`'s
+        // `create_dir_all` -- and therefore every `Ledger::write`/
+        // `try_write` -- fails on every call, the shape of a full disk or
+        // an unwritable ledger path in production.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        cfg.paths.ledger = blocker.join("ledger.jsonl");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("ETH", -0.5)]);
+        let (mut engine, _exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.tick(d.timestamp()).await.unwrap();
+
+        // The `order_intent` audit row is a precondition for the send, not
+        // just an observation of it: with it failing, neither opening must
+        // reach the venue, whatever the ledger itself can still report.
+        assert!(
+            !engine.state.positions.contains_key("BTC"),
+            "{:?}",
+            engine.state.positions.get("BTC")
+        );
+        assert!(
+            !engine.state.positions.contains_key("ETH"),
+            "{:?}",
+            engine.state.positions.get("ETH")
+        );
+    }
+
+    #[tokio::test]
     async fn a_close_that_happened_off_book_is_recovered_into_the_accounting() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
@@ -2366,6 +2435,39 @@ mod tests {
             "orphaned pending funding must be settled once the rate recovers"
         );
         let expected = -2.0 * 100_000.0 * 0.0001;
+        assert!(
+            (engine.state.cum_funding_est_usd - expected).abs() < 1e-9,
+            "cum_funding_est_usd={}, expected={expected}",
+            engine.state.cum_funding_est_usd
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_funding_carry_outside_the_universe_is_still_priced_and_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let (mut engine, exec) = paper_engine(cfg, dir.path(), vec![]).await;
+
+        // XRP is outside the configured universe (BTC/ETH/SOL/DOT) and has
+        // no open position: an adopted leg that accrued an unrateable
+        // funding carry and then fully closed. Neither of `tracked_symbols`'
+        // other two sources -- the universe list or `state.positions` --
+        // would include it, so its price must come from the carry itself.
+        exec.set_price("XRP", 2.0).await;
+        exec.set_funding_rate_hourly("XRP", 0.0001).await;
+        engine
+            .state
+            .pending_funding_qty_hours
+            .insert("XRP".to_string(), 100.0);
+        assert!(!engine.state.positions.contains_key("XRP"));
+
+        engine.daily_mark_now(secs("2026-09-06T00:00:00Z")).await;
+        assert!(
+            engine.state.pending_funding_qty_hours.get("XRP").is_none(),
+            "an out-of-universe orphaned carry must still be priced and settled"
+        );
+        let expected = -100.0 * 2.0 * 0.0001;
         assert!(
             (engine.state.cum_funding_est_usd - expected).abs() < 1e-9,
             "cum_funding_est_usd={}, expected={expected}",
