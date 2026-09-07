@@ -28,7 +28,20 @@ import hashlib, json, math, sys
 from datetime import datetime
 def _reject_constant(token):
     raise SystemExit(f"non-standard JSON constant {token} (the runtime's parser rejects it)")
-d = json.load(open(sys.argv[1]), parse_constant=_reject_constant)
+def _no_duplicate_keys(pairs):
+    seen = set()
+    for k, _ in pairs:
+        if k in seen:
+            # serde rejects a repeated struct field; Python would silently
+            # keep the last one and promote a file the runtime cannot parse.
+            raise SystemExit(f"duplicate JSON key {k!r}")
+        seen.add(k)
+    return dict(pairs)
+d = json.load(
+    open(sys.argv[1]),
+    parse_constant=_reject_constant,
+    object_pairs_hook=_no_duplicate_keys,
+)
 for k in ("schema_version", "producer_id", "generated_at", "as_of", "decision_key", "weights", "payload_sha256"):
     if k not in d:
         raise SystemExit(f"missing field {k}")

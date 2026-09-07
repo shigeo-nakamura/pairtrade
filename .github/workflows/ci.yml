@@ -362,7 +362,7 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          mkdir -p dist/bin dist/lib dist/scripts dist/configs
+          mkdir -p dist/bin dist/lib
           file debot/target/release/engine_b_live | grep -q aarch64
           file debot/target/release/book-runtime | grep -q aarch64
           file lighter-go/build/libsigner.so | grep -q aarch64
@@ -402,13 +402,6 @@ jobs:
           echo "libsigner_sha256=${LIBSIGNER_SHA256}" >> "${GITHUB_OUTPUT}"
           (cd dist && sha256sum -c checksums.sha256)
           jq . dist/manifest.json
-          rsync -a \
-            --exclude "venv/" \
-            --exclude "__pycache__/" \
-            --exclude "*.log" \
-            --exclude "*.pyc" \
-            debot/scripts/ dist/scripts/
-          rsync -a debot/configs/ dist/configs/
 
       - name: Configure AWS credentials
         if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
@@ -427,18 +420,11 @@ jobs:
           aws s3 cp dist/lib/libsigner.so "s3://${S3_BUCKET}/debot/libsigner.so"
           aws s3 cp dist/checksums.sha256 "s3://${S3_BUCKET}/debot/checksums.sha256"
           aws s3 cp dist/manifest.json "s3://${S3_BUCKET}/debot/manifest.json"
-          aws s3 sync dist/scripts/ "s3://${S3_BUCKET}/debot/scripts/" \
-            --exclude "venv/*" \
-            --exclude "venv/**" \
-            --exclude "__pycache__/*" \
-            --exclude "__pycache__/**" \
-            --exclude "*.log" \
-            --exclude "*.pyc"
-          aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/"
-          aws s3 cp debot/deploy/engine-b-live.service "s3://${S3_BUCKET}/deploy/engine-b-live.service"
-          for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do
-            aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
-          done
+          # scripts/, configs/ and deploy/ units are NOT uploaded here:
+          # deploy-configs.yml is their single owner. This build may finish
+          # after a later config-only push has already deployed, and an
+          # unversioned re-upload of this commit's copies would roll the
+          # host back to older configuration (bot-strategy#937 review).
 
   deploy-robinhood-lighter:
     name: Deploy Engine B live + book runtime binaries to Robinhood Lighter host
