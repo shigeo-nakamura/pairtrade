@@ -1135,6 +1135,22 @@ impl BookEngine {
             .filter(|i| !i.reduce_only)
             .map(|i| i.symbol.as_str())
             .collect();
+        // The subset of `flip_symbols` with an actual paired close in this
+        // plan (a plain open or increase has no reduce-only sibling and
+        // must not be gated on one). The opening leg of a real flip must
+        // not reach the venue until its close has fully filled: a zero or
+        // partial close leaves the old position live, so the paired
+        // "open" would merely net against it on the venue rather than
+        // establish the new side, stranding the target once both legs'
+        // budgets are spent.
+        let true_flip_symbols: std::collections::HashSet<&str> = plan
+            .intents
+            .iter()
+            .filter(|i| i.reduce_only && flip_symbols.contains(i.symbol.as_str()))
+            .map(|i| i.symbol.as_str())
+            .collect();
+        let mut flip_close_filled: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
         for (idx, intent) in plan.intents.iter().enumerate() {
             // Re-check the caps against the book that actually exists (see
             // `opening_cap_breach`): reductions ahead of this intent may
@@ -1145,6 +1161,13 @@ impl BookEngine {
             } else {
                 self.opening_cap_breach(&plan.intents[idx..], prices)
             };
+            if !intent.reduce_only
+                && cap_breach.is_none()
+                && true_flip_symbols.contains(intent.symbol.as_str())
+                && !flip_close_filled.contains(intent.symbol.as_str())
+            {
+                cap_breach = Some("flip_close_incomplete".to_string());
+            }
             if !intent.reduce_only && cap_breach.is_none() {
                 if let Some(rail) = &rail_blocked {
                     cap_breach = Some(rail.clone());
@@ -1216,6 +1239,12 @@ impl BookEngine {
                         "filled" => s.filled += 1,
                         "partial" => s.partial += 1,
                         _ => s.unfilled += 1,
+                    }
+                    if intent.reduce_only
+                        && result == "filled"
+                        && true_flip_symbols.contains(intent.symbol.as_str())
+                    {
+                        flip_close_filled.insert(intent.symbol.as_str());
                     }
                 }
                 Err(e) => {
@@ -1590,15 +1619,23 @@ impl BookEngine {
                         log::warn!(
                             "[RISK] daily loss halt {ev:?} (post-mark funding accrual); opens blocked until next UTC day"
                         );
-                        self.ledger
-                            .write(now, "halt", None, json!({ "risk": ev, "equity": equity }));
+                        self.ledger.write(
+                            now,
+                            "halt",
+                            None,
+                            json!({ "risk": ev, "equity": equity }),
+                        );
                     }
                     RiskEvent::SessionHalt { .. } => {
                         log::error!(
                             "[RISK] SESSION HALT {ev:?} (post-mark funding accrual); flattening"
                         );
-                        self.ledger
-                            .write(now, "halt", None, json!({ "risk": ev, "equity": equity }));
+                        self.ledger.write(
+                            now,
+                            "halt",
+                            None,
+                            json!({ "risk": ev, "equity": equity }),
+                        );
                         status::DECISION_TOTAL
                             .with_label_values(&[&self.cfg.instance_id, "halted"])
                             .inc();
@@ -2721,6 +2758,74 @@ mod tests {
                 && r["intent"]["symbol"] == "SOL"
                 && r["intent"]["reduce_only"] == false),
             "the flip's opening is retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flip_open_is_blocked_until_its_close_confirms_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        cfg.execution.max_attempts = 1;
+        cfg.signal.require_dollar_neutral = false;
+        let d = ts("2026-09-06T00:30:00Z");
+        // Book is long 2.5 SOL; the signal flips it to a 0.1 short. The
+        // venue only ever half-fills SOL orders, so the reduce-only close
+        // leaves 1.25 SOL still long instead of reaching flat. Without
+        // gating the paired opening on the close's own confirmed-full
+        // result, the opening would still be sent and merely net against
+        // the still-long position on the venue instead of establishing
+        // the short target.
+        write_signal(dir.path(), "2026-09-06", d, &[("SOL", -0.1)]);
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 2.5, 200.0, d.timestamp() - 3600);
+        state.persist(&cfg.paths.state).unwrap();
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 200.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 2.5,
+                        entry_price: Some(200.0),
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: None,
+            half_fill_symbol: Some("SOL".to_string()),
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Partial);
+        assert!(
+            engine.state.signed_qty().get("SOL").copied().unwrap_or(0.0) > 0.0,
+            "the half-filled close leaves the book still long, never netted short by an unconfirmed open"
+        );
+        let sent_open = rows(&cfg.paths.ledger).into_iter().any(|r| {
+            r["event"] == "order_intent"
+                && r["intent"]["symbol"] == "SOL"
+                && r["intent"]["reduce_only"] == false
+        });
+        assert!(
+            !sent_open,
+            "the opening leg must not be sent while its close is still incomplete"
+        );
+        let blocked = rows(&cfg.paths.ledger).into_iter().any(|r| {
+            r["event"] == "order_blocked"
+                && r["intent"]["symbol"] == "SOL"
+                && r["reason"] == "flip_close_incomplete"
+        });
+        assert!(
+            blocked,
+            "the opening leg is explicitly blocked, not silently dropped"
         );
     }
 
