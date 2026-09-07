@@ -59,8 +59,12 @@ impl OrderIntent {
     }
 }
 
-/// Venue lot metadata per symbol.
+/// Venue lot metadata per symbol. `deny_unknown_fields`: a replay
+/// `lots.json` that misspells the optional `min_order_qty` would otherwise
+/// silently get `None`, skipping the venue-minimum check and filling
+/// orders the intended fixture would have rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LotMeta {
     pub size_decimals: u32,
     /// Venue minimum base quantity per order, when known.

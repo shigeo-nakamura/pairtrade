@@ -602,6 +602,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_misspelled_lot_field_fails_the_replay_instead_of_dropping_the_minimum() {
+        // `min_order_qty_` would otherwise be ignored and the minimum
+        // default to None, so the planner skips the venue-minimum check
+        // and paper fills orders the fixture meant to reject.
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("DOT", -0.5)]);
+        std::fs::write(
+            dir.path().join("lots.json"),
+            r#"{"BTC":{"size_decimals":4,"min_order_qty_":1.0}}"#,
+        )
+        .unwrap();
+        let err = run(cfg(), dir.path(), &dir.path().join("out"))
+            .await
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("unknown field") && err.contains("min_order_qty_"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_out_of_range_lot_precision_fails_the_replay() {
         let dir = tempfile::tempdir().unwrap();
         write_bars(dir.path(), None);

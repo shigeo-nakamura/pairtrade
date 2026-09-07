@@ -290,6 +290,26 @@ impl BookEngine {
             self.positions_ready = self.reconcile_with_venue(now, &mut prices).await;
         }
 
+        // On the first tick of a new UTC date, accrue funding since the
+        // prior mark *before* equity is computed and the rails evaluated,
+        // and hold the mark row back until after any resulting halt or
+        // flatten and this tick's decision (written at the bottom of this
+        // method). Accruing afterwards, as the old `maybe_daily_mark` did,
+        // let a midnight decision open the new target one tick before a
+        // funding-triggered loss breach was noticed, and finalized that
+        // date's sole mark before the halt/flatten it should reflect --
+        // the same ordering replay's `daily_mark_now` already enforces.
+        // A failed row write leaves `last_mark_date` unset so the next
+        // tick retries; per-leg `funding_accrued_at` then only covers the
+        // seconds since this accrual, never double-charging.
+        let date = utc_date(now);
+        let pending_mark =
+            if self.mark_on_date_change && self.state.last_mark_date.as_deref() != Some(&date) {
+                Some(self.accrue_daily_funding(now, &prices).await)
+            } else {
+                None
+            };
+
         let (equity, equity_ready) = self.compute_equity(&prices).await;
         self.equity_ready = equity_ready;
 
@@ -366,8 +386,12 @@ impl BookEngine {
             self.process_decision(now, &prices).await;
         }
 
-        if self.mark_on_date_change {
-            self.maybe_daily_mark(now, &prices).await;
+        if let Some((date, funding_detail)) = pending_mark {
+            // Error already logged inside; `last_mark_date` stays unset so
+            // the next tick retries the row (see the accrual above).
+            let _ = self
+                .write_daily_mark_row(now, &prices, &date, funding_detail)
+                .await;
         }
 
         let (equity, _) = self.compute_equity(&prices).await;
@@ -1820,14 +1844,6 @@ impl BookEngine {
         Some(est)
     }
 
-    async fn maybe_daily_mark(&mut self, now: i64, prices: &HashMap<String, f64>) {
-        let date = utc_date(now);
-        if self.state.last_mark_date.as_deref() == Some(date.as_str()) {
-            return;
-        }
-        self.write_daily_mark(now, prices).await;
-    }
-
     /// Write the daily mark for `now` unconditionally (replay: at the last
     /// tick of a bar date, after every decision/flatten of that date).
     /// Propagates a pnl.jsonl append failure instead of only logging it:
@@ -1913,15 +1929,6 @@ impl BookEngine {
         Ok(())
     }
 
-    async fn write_daily_mark(&mut self, now: i64, prices: &HashMap<String, f64>) {
-        let (date, funding_detail) = self.accrue_daily_funding(now, prices).await;
-        // Error already logged inside; leaving `last_mark_date` unset gets
-        // the live 5s loop to retry this same date on its next tick.
-        let _ = self
-            .write_daily_mark_row(now, prices, &date, funding_detail)
-            .await;
-    }
-
     /// Funding accrual per held/orphaned leg for `now`'s date, without
     /// writing the mark row yet: `daily_mark_now` runs its own risk
     /// evaluation (which the accrual above can move) and any resulting
@@ -1994,16 +2001,16 @@ impl BookEngine {
         (date, funding_detail)
     }
 
-    /// Write the mark row for `date` and advance `last_mark_date`. Split
-    /// out of `write_daily_mark` so `daily_mark_now` can run its risk
-    /// evaluation and any halt/flatten between accrual and this call (see
-    /// `accrue_daily_funding`). Returns the append error (after logging
-    /// it) rather than only logging: `write_daily_mark`'s live caller
-    /// intentionally ignores it, since leaving `last_mark_date` unset
-    /// already gets the live 5s loop to retry the mark next tick, but
-    /// `daily_mark_now`'s replay caller has no such next tick for the
-    /// same date -- it must fail the run instead of silently reporting
-    /// success with that date's mark missing from pnl.jsonl.
+    /// Write the mark row for `date` and advance `last_mark_date`. Kept
+    /// separate from `accrue_daily_funding` so both callers -- `tick` (live,
+    /// on a date change) and `daily_mark_now` (replay) -- can run the risk
+    /// evaluation and any halt/flatten between accrual and this call.
+    /// Returns the append error (after logging it) rather than only
+    /// logging: `tick` intentionally ignores it, since leaving
+    /// `last_mark_date` unset already gets the live 5s loop to retry the
+    /// mark next tick, but `daily_mark_now`'s replay caller has no such
+    /// next tick for the same date -- it must fail the run instead of
+    /// silently reporting success with that date's mark missing.
     async fn write_daily_mark_row(
         &mut self,
         now: i64,
