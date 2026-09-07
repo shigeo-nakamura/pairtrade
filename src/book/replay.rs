@@ -11,8 +11,9 @@
 //!
 //! For each bar date `D` (ascending): closes of `D` become the prices, every
 //! decision / flatten scheduled inside `D` is ticked at its exact time, and
-//! a final tick at `D+1 00:00:00` writes the daily mark. Fills are paper
-//! fills at the close of `D`.
+//! a final tick at `D 23:59:59` writes the daily mark (labelled `D`). Fills
+//! are paper fills at the close of `D`. A decision at the next midnight is
+//! ticked in the next iteration, after that date's closes are loaded.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -170,7 +171,10 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
                 _ => break,
             }
         }
-        ticks.push(day_end);
+        // Daily mark at the last second of the bar date, so a decision
+        // scheduled at the next midnight is ticked in the next iteration
+        // with that date's own closes loaded.
+        ticks.push(day_end - 1);
         ticks.sort_unstable();
         ticks.dedup();
         for t in ticks {
@@ -309,12 +313,13 @@ mod tests {
 
         let pnl = read_rows(&out1.join("pnl.jsonl"));
         let marks: Vec<_> = pnl.iter().filter(|r| r["event"] == "mark").collect();
-        // One startup mark on the first tick (07-03) plus one per day roll.
-        assert_eq!(marks.len(), 13);
+        // One mark per bar date (the 07-03 one is the startup tick; the
+        // 23:59:59 tick of the same date does not mark twice).
+        assert_eq!(marks.len(), 12);
         assert_eq!(marks[0]["date"], "2026-07-03");
         assert_eq!(marks[1]["date"], "2026-07-04");
         assert_eq!(marks[1]["n_positions"], 2);
-        assert_eq!(marks[12]["date"], "2026-07-15");
+        assert_eq!(marks[11]["date"], "2026-07-14");
         // Funding estimate accrues on both legs (rate 1e-5/h, ~24h): the long
         // pays, the short receives; net is non-zero because notionals differ
         // after rounding.
@@ -391,6 +396,35 @@ mod tests {
             .unwrap();
         assert_eq!(d0708["outcome"], "rejected");
         assert_eq!(d0708["reason"], "missing_price");
+    }
+
+    #[tokio::test]
+    async fn a_midnight_decision_uses_its_own_dates_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        let mut c = cfg();
+        c.schedule.decision_time_utc = Some("00:00".into());
+        // Decision at 2026-07-08T00:00Z: must fill at the 07-08 close
+        // (BTC 100000 + 500*5 = 102500), not the 07-07 close (102000).
+        let decision_at = ts("2026-07-08T00:00:00Z");
+        let body = signal_json(
+            "test_producer",
+            decision_at - Duration::minutes(10),
+            decision_at - Duration::minutes(30),
+            "2026-07-08",
+            &[("BTC", 0.5), ("DOT", -0.5)],
+        );
+        std::fs::create_dir_all(dir.path().join("signals")).unwrap();
+        std::fs::write(dir.path().join("signals").join("2026-07-08.json"), body).unwrap();
+        let out = dir.path().join("out");
+        run(c, dir.path(), &out).await.unwrap();
+        let ledger = read_rows(&out.join("ledger.jsonl"));
+        let btc = ledger
+            .iter()
+            .find(|r| r["event"] == "fill" && r["intent"]["symbol"] == "BTC")
+            .unwrap();
+        assert_eq!(btc["decision_key"], "2026-07-08");
+        assert!((btc["intent"]["reference_price"].as_f64().unwrap() - 102_500.0).abs() < 1e-6);
     }
 
     #[tokio::test]

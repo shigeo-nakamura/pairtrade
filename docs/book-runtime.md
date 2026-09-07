@@ -150,8 +150,9 @@ bot-strategy#580).
   orders. This is an internal decision (`outcome=flatten`), no file
   required.
 - Restart safety: `state.json` carries `last_decision` (key + outcome +
-  applied hash + rounded target quantities + `flatten_at`) so a restart
-  inside a window neither re-applies nor double-trades. A `partial`
+  applied hash + rounded target quantities + `flatten_at`), written and
+  persisted **before the first order of a decision is sent**, so a restart
+  inside a window (or mid-execution) neither re-applies nor double-trades. A `partial`
   decision is retried from the **persisted target quantities**, never by
   re-reading the producer file: one decision key stays tied to one
   accepted vector even if the file is rewritten or removed, and the
@@ -232,7 +233,9 @@ reduce_only }`.
   restarts until the `risk_ack_path` file is consumed (bot-strategy#932
   semantics: the flatten fills are booked as exit fills from venue fills,
   not from the mid). Consuming the ack re-anchors both the session and the
-  daily window at the current equity. A stray ack found while not halted
+  daily window at the current equity, and therefore only happens while the
+  venue equity is fresh (live) — with `equity_ready=false` the ack file is
+  left in place and the halt stays. A stray ack found while not halted
   is deleted without effect, so it can never clear a *future* halt.
 - **Daily loss halt**: realized + unrealized loss since 00:00 UTC beyond
   `max_daily_loss_bps` blocks opening intents until the next UTC day; no
@@ -274,9 +277,9 @@ rows; previous `state.json` / ledgers / status in `--out` are removed
 first so a rerun never resumes or appends), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
 default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
 for every bar date `D` the closes of `D` become the prices, each decision /
-flatten scheduled inside `D` is ticked at its exact time (paper fills at
-the close of `D`), and a final tick at `D+1 00:00:00` writes the daily
-mark. The config's paths are redirected into `--out` and `dry_run` is
+flatten scheduled inside `D` (a midnight decision belongs to the date it
+starts) is ticked at its exact time (paper fills at the close of `D`), and
+a final tick at `D 23:59:59` writes the daily mark labelled `D`. The config's paths are redirected into `--out` and `dry_run` is
 forced on. Given identical inputs `ledger.jsonl`, `pnl.jsonl` and
 `state.json` are byte-identical run to run (covered by a test), which is
 what the shadow → live comparison for XSMOM relies on.

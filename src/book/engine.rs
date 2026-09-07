@@ -202,10 +202,17 @@ impl BookEngine {
         let (equity, equity_ready) = self.compute_equity(&prices).await;
         self.equity_ready = equity_ready;
 
-        if let Some(ev) = self.risk.maybe_clear_halt(&mut self.state, now, equity) {
-            log::warn!("[RISK] session halt cleared by RISK_ACK: {ev:?}");
-            self.ledger
-                .write(now, "halt_cleared", None, json!({ "risk": ev }));
+        // An ack re-anchors both loss windows at `equity`, so it is only
+        // consumed while that number is a fresh venue value; a stale one
+        // would hand the session an unintended cushion once reads recover.
+        if equity_ready {
+            if let Some(ev) = self.risk.maybe_clear_halt(&mut self.state, now, equity) {
+                log::warn!("[RISK] session halt cleared by RISK_ACK: {ev:?}");
+                self.ledger
+                    .write(now, "halt_cleared", None, json!({ "risk": ev }));
+            }
+        } else if self.state.session.halted && self.cfg.risk.risk_ack_path.exists() {
+            log::warn!("[RISK] RISK_ACK present but venue equity is unavailable; ack deferred");
         }
         let events = self.risk.evaluate(&mut self.state, now, equity);
         for ev in &events {
@@ -702,6 +709,29 @@ impl BookEngine {
             plan.net_target_usd,
             plan.skipped.len()
         );
+        // Durably record the accepted vector BEFORE the first order goes
+        // out: a crash mid-execution then restarts with the hash and the
+        // rounded targets on disk, so the residual is retried from them
+        // (never from a rewritten or missing producer file).
+        self.state.last_decision = Some(DecisionRecord {
+            key: d.key.clone(),
+            outcome: DecisionOutcome::Partial,
+            at: now,
+            signal_sha256: Some(sig.payload_sha256.clone()),
+            reject_reason: None,
+            attempts,
+            flatten_at: d.flatten_at,
+            flatten_done: false,
+            target_qty: plan.target_qty.clone(),
+        });
+        if let Err(e) = self.state.persist(&self.cfg.paths.state) {
+            log::error!(
+                "[DECISION] key={} cannot persist the accepted target ({e}); no orders sent this tick",
+                d.key
+            );
+            self.state.last_decision = None;
+            return;
+        }
         let summary = self.execute_plan(now, &d.key, &plan, prices).await;
         let outcome = if summary.residual.is_empty() {
             DecisionOutcome::Applied
@@ -1409,6 +1439,9 @@ mod tests {
         prices: HashMap<String, f64>,
         positions: Mutex<BTreeMap<String, VenuePosition>>,
         equity_ok: std::sync::atomic::AtomicBool,
+        /// When set, `execute` asserts that `state.json` at this path already
+        /// carries the decision record (hash + targets) for the order.
+        state_path: Option<std::path::PathBuf>,
     }
 
     #[async_trait]
@@ -1442,6 +1475,14 @@ mod tests {
             None
         }
         async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
+            if let Some(p) = &self.state_path {
+                let persisted = BookState::load_or_new(p, "test-book").unwrap();
+                let rec = persisted
+                    .last_decision
+                    .expect("decision record persisted before the first order");
+                assert!(rec.signal_sha256.is_some());
+                assert!(rec.target_qty.contains_key(&intent.symbol));
+            }
             let signed = match intent.side {
                 Side::Buy => intent.qty,
                 Side::Sell => -intent.qty,
@@ -1493,6 +1534,7 @@ mod tests {
                 .into(),
             ),
             equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1530,6 +1572,7 @@ mod tests {
             prices: [("SOL".to_string(), 200.0), ("DOT".to_string(), 4.0)].into(),
             positions: Mutex::new(BTreeMap::new()),
             equity_ok: std::sync::atomic::AtomicBool::new(false),
+            state_path: Some(cfg.paths.state.clone()),
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1580,6 +1623,7 @@ mod tests {
                 .into(),
             ),
             equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);
@@ -1597,6 +1641,7 @@ mod tests {
             prices: [("SOL".to_string(), 210.0)].into(),
             positions: Mutex::new(venue.positions.lock().unwrap().clone()),
             equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
         });
         let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
         let status = StatusWriter::new(cfg.paths.status.clone(), None);

@@ -485,7 +485,10 @@ impl Executor for LiveExecutor {
             );
         }
         // Fill price: venue fill records when they can be matched, else mid.
-        let mut fill_price = intent.reference_price;
+        // Fallback price: the mid read right before the send (bounded by
+        // the drift guard in the adverse direction; favourable moves are
+        // reflected too), not the older planning reference.
+        let mut fill_price = mid;
         let mut source = "mid_estimate";
         let mut fee_usd = 0.0;
         if let Some(oid) = order_id.as_deref() {
