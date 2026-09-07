@@ -156,7 +156,11 @@ bot-strategy#580).
   decision is retried from the **persisted target quantities**, never by
   re-reading the producer file: one decision key stays tied to one
   accepted vector even if the file is rewritten or removed, and the
-  retries are bounded by `max_attempts` inside the window.
+  retries are bounded by `max_attempts` inside the window. An attempt is
+  only spent when something actually reached the venue: a tick whose
+  intents were all blocked (kill switch, halt, stale equity, cap) leaves
+  the budget untouched, so a block that clears later in the window can
+  still apply the target.
 - An overdue flatten (`flatten_at` passed, book not flat) is processed
   before any decision — including after a restart that lands past the
   *next* decision time. The schedule does not advance onto a new key while
@@ -184,6 +188,14 @@ reduce_only }`.
    then open the new one.
 5. Ordering: all reducing intents first (largest notional first), then
    opening intents (largest first) — margin is freed before it is used.
+6. At send time each opening intent is re-checked against the book that
+   actually exists: the caps are re-evaluated on the current positions plus
+   this intent and the intents still to be sent. The planner's caps assume
+   every reduction ahead filled; when one did not (or a leg was adopted
+   from the venue in between), the plan's end state is no longer the
+   validated target, and the opening is blocked
+   (`order_blocked reason=cap_gross(...)`) rather than compounding the
+   breach. Reductions and flattens are never blocked this way.
 
 ## 6. Execution and fill confirmation
 
@@ -279,7 +291,9 @@ reduce_only }`.
 `book-runtime --config <yaml> --replay <dir> --out <dir>` runs the same
 engine against `bars.jsonl` (`{"date","symbol","close"[,"funding_rate_hourly"]}`
 rows; previous `state.json` / ledgers / status in `--out` are removed
-first so a rerun never resumes or appends), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
+first so a rerun never resumes or appends; a date missing from the file
+that contains a scheduled decision or flatten fails the run instead of
+silently skipping it), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
 default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
 for every bar date `D` the closes of `D` become the prices, each decision /
 flatten scheduled inside `D` (a midnight decision belongs to the date it

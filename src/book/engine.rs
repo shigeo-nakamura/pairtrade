@@ -103,6 +103,10 @@ pub struct BookEngine {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecSummary {
     pub intents: usize,
+    /// Intents actually handed to the executor (a retry that sent nothing
+    /// because every opening was administratively blocked must not spend
+    /// an execution attempt).
+    pub sent: usize,
     pub filled: usize,
     pub partial: usize,
     pub unfilled: usize,
@@ -556,6 +560,14 @@ impl BookEngine {
         } else {
             DecisionOutcome::Partial
         };
+        // A retry that sent nothing (every remaining intent was blocked by
+        // the risk rails or a cap) has not used the venue at all: keep the
+        // attempt budget for when the block clears inside the window.
+        let attempts = if summary.sent == 0 {
+            rec.attempts
+        } else {
+            attempts
+        };
         if let Some(r) = self.state.last_decision.as_mut() {
             r.outcome = outcome;
             r.attempts = attempts;
@@ -778,6 +790,13 @@ impl BookEngine {
         } else {
             DecisionOutcome::Partial
         };
+        // Same rule as the retry path: a first application whose intents
+        // were all blocked has not spent an execution attempt.
+        let attempts = if summary.sent == 0 {
+            attempts.saturating_sub(1)
+        } else {
+            attempts
+        };
         self.last_signal_generated_at = Some(sig.generated_at.timestamp());
         self.signal_status = format!(
             "{}:{}",
@@ -852,6 +871,7 @@ impl BookEngine {
     ) -> ExecSummary {
         let mut s = ExecSummary {
             intents: plan.intents.len(),
+            sent: 0,
             filled: 0,
             partial: 0,
             unfilled: 0,
@@ -859,9 +879,18 @@ impl BookEngine {
             errors: 0,
             residual: BTreeMap::new(),
         };
-        for intent in &plan.intents {
-            if !intent.reduce_only && !self.opens_allowed() {
-                let reason = self.block_reason();
+        for (idx, intent) in plan.intents.iter().enumerate() {
+            // Re-check the caps against the book that actually exists (see
+            // `opening_cap_breach`): reductions ahead of this intent may
+            // have failed, in which case the plan's end state is no longer
+            // the target the planner validated.
+            let cap_breach = if intent.reduce_only {
+                None
+            } else {
+                self.opening_cap_breach(&plan.intents[idx..], prices)
+            };
+            if !intent.reduce_only && (cap_breach.is_some() || !self.opens_allowed()) {
+                let reason = cap_breach.unwrap_or_else(|| self.block_reason().to_string());
                 log::warn!(
                     "[ORDER] blocked {} {} {} qty={} reason={reason}",
                     intent.kind_label(),
@@ -881,6 +910,7 @@ impl BookEngine {
                 s.blocked += 1;
                 continue;
             }
+            s.sent += 1;
             self.ledger
                 .write(now, "order_intent", Some(key), json!({ "intent": intent }));
             let rate = if self.state.positions.contains_key(&intent.symbol) {
@@ -949,6 +979,78 @@ impl BookEngine {
             }),
         );
         s
+    }
+
+    /// Would executing `remaining` (this intent and every intent after it,
+    /// assuming full fills) leave the *actual* book past a configured cap?
+    ///
+    /// The planner validated the caps for the final target, which assumes
+    /// every reduction ahead of this point filled. When one did not, the
+    /// end state of the plan is no longer that target — e.g. rotating A
+    /// into B with A's close unfilled would hold both legs. Projecting the
+    /// rest of the plan onto the live book catches exactly that, while a
+    /// normal dollar-neutral rotation (whose end state is the validated
+    /// target) still passes even though its intermediate states are
+    /// one-sided.
+    fn opening_cap_breach(
+        &self,
+        remaining: &[OrderIntent],
+        prices: &HashMap<String, f64>,
+    ) -> Option<String> {
+        let sz = &self.cfg.sizing;
+        let mut projected = self.state.signed_qty();
+        for i in remaining {
+            let signed = match i.side {
+                Side::Buy => i.qty,
+                Side::Sell => -i.qty,
+            };
+            *projected.entry(i.symbol.clone()).or_insert(0.0) += signed;
+        }
+        let px_of = |sym: &String| -> f64 {
+            prices
+                .get(sym)
+                .copied()
+                .filter(|p| p.is_finite() && *p > 0.0)
+                .or_else(|| self.state.positions.get(sym).map(|p| p.avg_price))
+                .or_else(|| {
+                    remaining
+                        .iter()
+                        .find(|i| &i.symbol == sym)
+                        .map(|i| i.reference_price)
+                })
+                .unwrap_or(0.0)
+        };
+        let mut gross = 0.0;
+        let mut net = 0.0;
+        for (sym, qty) in &projected {
+            let px = px_of(sym);
+            gross += qty.abs() * px;
+            net += qty * px;
+        }
+        // Per-symbol cap only for the symbol being opened: another leg over
+        // its own cap is not this intent's doing, and the gross/net checks
+        // below already stop it from being compounded.
+        let sym = &remaining[0].symbol;
+        let px = px_of(sym);
+        let one_lot_usd = self
+            .lots
+            .get(sym)
+            .map(|l| 10f64.powi(-(l.size_decimals as i32)) * px)
+            .unwrap_or(0.0);
+        let sym_cap = sz.max_symbol_weight * sz.gross_notional_usd + one_lot_usd;
+        let sym_notional = projected.get(sym).copied().unwrap_or(0.0).abs() * px;
+        if sym_notional > sym_cap + 1e-9 {
+            return Some(format!(
+                "cap_symbol({sym} ${sym_notional:.2} > ${sym_cap:.2})"
+            ));
+        }
+        if gross > sz.max_gross_usd + 1e-9 {
+            return Some(format!("cap_gross(${gross:.2} > ${:.2})", sz.max_gross_usd));
+        }
+        if net.abs() > sz.max_net_usd + 1e-9 {
+            return Some(format!("cap_net(${net:.2} > ${:.2})", sz.max_net_usd));
+        }
+        None
     }
 
     /// Book a fill into the state, write the ledger row, return the result
@@ -1467,9 +1569,15 @@ mod tests {
         engine.tick(d.timestamp()).await.unwrap();
         let rec = engine.state.last_decision.clone().unwrap();
         assert_eq!(rec.outcome, DecisionOutcome::Partial);
-        assert_eq!(rec.attempts, 1);
+        // Nothing reached the venue, so no execution attempt was spent: a
+        // kill switch held for a few ticks must not burn the retry budget.
+        assert_eq!(rec.attempts, 0);
         assert_eq!(rec.target_qty.len(), 2);
         assert!(engine.state.is_flat());
+        // Ticks while still blocked keep the budget at zero.
+        engine.tick(d.timestamp() + 1).await.unwrap();
+        engine.tick(d.timestamp() + 2).await.unwrap();
+        assert_eq!(engine.state.last_decision.as_ref().unwrap().attempts, 0);
         // Kill switch lifted, producer file gone (and even a different vector
         // for the same key would be ignored): retry uses the persisted target.
         std::fs::remove_file(&cfg.risk.kill_switch_path).unwrap();
@@ -1477,17 +1585,68 @@ mod tests {
         engine.tick(d.timestamp() + 5).await.unwrap();
         let rec = engine.state.last_decision.clone().unwrap();
         assert_eq!(rec.outcome, DecisionOutcome::Applied);
-        assert_eq!(rec.attempts, 2);
+        assert_eq!(rec.attempts, 1);
         assert!(engine.state.positions["BTC"].qty > 0.0);
         assert!(engine.state.positions["DOT"].qty < 0.0);
         assert!(!engine.state.positions.contains_key("ETH"));
         let ledger = rows(&cfg.paths.ledger);
         let retry = ledger
             .iter()
-            .find(|r| r["event"] == "decision" && r["retry"] == 2)
-            .expect("retry row");
-        assert_eq!(retry["outcome"], "applied");
+            .find(|r| r["event"] == "decision" && r["outcome"] == "applied")
+            .expect("applied retry row");
+        assert_eq!(retry["retry"], 1);
         assert_eq!(retry["signal_sha256"], rec.signal_sha256.clone().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_opening_is_blocked_when_the_projected_book_would_breach_a_cap() {
+        let d = ts("2026-09-06T00:30:00Z");
+
+        // Baseline: a flat book takes the $1000 target without complaint.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.sizing.max_gross_usd = 1_100.0;
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("ETH", -0.5)]);
+        let (mut ok_engine, _ok_exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        ok_engine.tick(d.timestamp()).await.unwrap();
+        assert!(ok_engine.state.positions["BTC"].qty > 0.0);
+        assert!(ok_engine.state.positions["ETH"].qty < 0.0);
+        assert!(rows(&cfg.paths.ledger)
+            .iter()
+            .all(|r| r["event"] != "order_blocked"));
+
+        // Now a $900 SOL leg that no intent closes (a reduction that failed
+        // on an earlier tick, or a leg adopted from the venue): the plan's
+        // projected end state is $1900 gross, past the $1100 cap, so both
+        // openings are refused instead of compounding the breach. Each
+        // opening is judged against the intents still to be sent, so one
+        // that would leave the book inside every cap is still allowed --
+        // the caps are the contract, not the plan's shape.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut cfg2 = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg2, dir2.path());
+        cfg2.sizing.max_gross_usd = 1_100.0;
+        write_signal(dir2.path(), "2026-09-06", d, &[("BTC", 0.5), ("ETH", -0.5)]);
+        let (mut engine2, _exec2) = paper_engine(cfg2.clone(), dir2.path(), vec![]).await;
+        engine2
+            .state
+            .apply_fill("SOL", 4.5, 200.0, d.timestamp() - 60);
+        engine2.tick(d.timestamp()).await.unwrap();
+        let blocked: Vec<Value> = rows(&cfg2.paths.ledger)
+            .into_iter()
+            .filter(|r| r["event"] == "order_blocked")
+            .collect();
+        assert_eq!(blocked.len(), 2, "{blocked:?}");
+        assert!(
+            blocked[0]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("cap_gross"),
+            "{blocked:?}"
+        );
+        assert!(engine2.state.positions.get("BTC").is_none());
+        assert!(engine2.state.positions.get("ETH").is_none());
     }
 
     /// Minimal non-paper venue: canned positions and prices, full fills.

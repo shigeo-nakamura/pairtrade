@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{Duration, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 
 use super::config::BookConfig;
@@ -138,6 +138,40 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
     )?;
     engine.status_interval_secs = 0;
     engine.mark_on_date_change = false;
+
+    // A date missing from bars.jsonl gets no ticks at all: a decision or a
+    // flatten scheduled inside it would silently vanish (or leave a leg
+    // exposed until the next supplied bar). Refuse such a gap rather than
+    // produce a quietly wrong replay.
+    if let (Some(first), Some(last)) = (bars.keys().next(), bars.keys().next_back()) {
+        let mut d = *first;
+        while d < *last {
+            d += Duration::days(1);
+            if bars.contains_key(&d) {
+                continue;
+            }
+            let day_start = Utc
+                .from_utc_datetime(&d.and_hms_opt(0, 0, 0).unwrap())
+                .timestamp();
+            let day_end = day_start + 86_400;
+            if let Some(dd) = scheduler.decisions_between(day_start, day_end - 1).first() {
+                bail!(
+                    "bars.jsonl has no rows for {d}, but decision {} is scheduled that day",
+                    dd.key
+                );
+            }
+            if let Some(prev) = scheduler.current(day_start) {
+                if let Some(f) = prev.flatten_at {
+                    if (day_start..day_end).contains(&f) {
+                        bail!(
+                            "bars.jsonl has no rows for {d}, but decision {}'s flatten is scheduled that day",
+                            prev.key
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     let mut summary = ReplaySummary::default();
     for (date, rows) in &bars {
@@ -390,6 +424,23 @@ mod tests {
                 "{f} differs on rerun into the same dir"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_bar_date_gap_containing_a_scheduled_event_fails_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        // Drop every row for 2026-07-08, an interval-schedule decision day.
+        let bars = std::fs::read_to_string(dir.path().join("bars.jsonl")).unwrap();
+        let kept: Vec<&str> = bars.lines().filter(|l| !l.contains("2026-07-08")).collect();
+        std::fs::write(dir.path().join("bars.jsonl"), kept.join("\n") + "\n").unwrap();
+        write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("DOT", -0.5)]);
+        let err = run(cfg(), dir.path(), &dir.path().join("out"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2026-07-08"), "{err}");
+        assert!(err.contains("decision"), "{err}");
     }
 
     #[tokio::test]
