@@ -139,7 +139,8 @@ bot-strategy#580).
 - `daily`: every calendar date at `decision_time_utc`.
 - `calendar`: explicit list; `flatten_at` per entry (Engine B: KRX close
   and US cash open from the frozen `configs/engine-b/trading_calendar.json`,
-  converted by the producer).
+  converted by the producer). An entry's `flatten_at` must fall after its
+  whole signal window, and consecutive entries may not overlap.
 - The decision **window** is `[decision_at, decision_at + signal_grace_secs]`.
   Inside the window the runtime re-reads the signal file every tick until
   it validates; if the window closes without a valid file the key is marked
@@ -221,7 +222,13 @@ reduce_only }`.
   changed elsewhere, or by a crashed previous run) is adopted at the
   venue's quantity **and** average entry price (mid when the venue reports
   none) and logged `[ADOPT]`; the stored leg's funding is settled up to
-  that instant first. A leg the venue no longer holds is dropped. The
+  that instant first. When the venue shows *less* exposure than the book
+  (a close that filled after the last persist, or a crash between the send
+  and the booking), the missing reduction is booked at the current mark so
+  realized PnL and the trade counters are recovered: a `recovered_close`
+  ledger row and a `pnl.jsonl` exit row both carry
+  `fill_price_source=reconcile_mark` and `recovered=true`, so the estimated
+  price is never mistaken for a venue fill. A leg the venue no longer holds is dropped. The
   runtime subscribes prices for the universe plus every persisted leg, and
   a leg adopted outside that set is priced from the venue ticker (60 s
   cache) so a reduce-only close can always be planned *and* sent on the
@@ -295,9 +302,9 @@ reduce_only }`.
 `book-runtime --config <yaml> --replay <dir> --out <dir>` runs the same
 engine against `bars.jsonl` (`{"date","symbol","close"[,"funding_rate_hourly"]}`
 rows; previous `state.json` / ledgers / status in `--out` are removed
-first so a rerun never resumes or appends; a date missing from the file
-that contains a scheduled decision or flatten fails the run instead of
-silently skipping it), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
+first so a rerun never resumes or appends; bar dates must be continuous,
+since a missing day loses its decisions, flattens, mark and funding
+accrual), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
 default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
 for every bar date `D` the closes of `D` become the prices, each decision /
 flatten scheduled inside `D` (a midnight decision belongs to the date it

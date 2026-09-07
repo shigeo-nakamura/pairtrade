@@ -372,6 +372,48 @@ impl BookEngine {
                     .unwrap_or(0.0);
                 self.accrue_funding(&sym, now, px, rate);
             }
+            // A leg the venue shows as smaller (or gone) closed without
+            // this process booking it -- a fill that landed after the last
+            // persist, or a crash between the send and `book_fill`. Book
+            // the reduction at the current mark so realized PnL and the
+            // trade counters are recovered instead of silently dropped;
+            // the price is an estimate and both rows say so.
+            let same_side = venue_qty != 0.0 && (venue_qty > 0.0) == (book_qty > 0.0);
+            let closed_qty = if book_qty == 0.0 {
+                0.0
+            } else if venue_qty == 0.0 || !same_side {
+                -book_qty
+            } else if venue_qty.abs() < book_qty.abs() {
+                venue_qty - book_qty
+            } else {
+                0.0
+            };
+            if closed_qty != 0.0 {
+                let mark = prices
+                    .get(&sym)
+                    .copied()
+                    .filter(|p| p.is_finite() && *p > 0.0)
+                    .or(if entry > 0.0 { Some(entry) } else { None })
+                    .or_else(|| self.state.positions.get(&sym).map(|p| p.avg_price))
+                    .unwrap_or(0.0);
+                if mark > 0.0 {
+                    let realized = self.state.apply_fill(&sym, closed_qty, mark, now);
+                    log::warn!(
+                        "[ADOPT] {sym}: booking an unrecorded close of {closed_qty} at the {mark} mark (realized ${realized:.4}, estimated price)"
+                    );
+                    let row = json!({
+                        "symbol": sym,
+                        "closed_qty": closed_qty,
+                        "fill_price": mark,
+                        "fill_price_source": "reconcile_mark",
+                        "realized_usd": realized,
+                        "recovered": true,
+                        "paper": self.exec.is_paper(),
+                    });
+                    self.ledger.write(now, "recovered_close", None, row.clone());
+                    self.pnl.write(now, "exit", None, row);
+                }
+            }
             if venue_qty == 0.0 {
                 self.state.positions.remove(&sym);
             } else {
@@ -1651,6 +1693,45 @@ mod tests {
         );
         assert!(engine2.state.positions.get("BTC").is_none());
         assert!(engine2.state.positions.get("ETH").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_close_that_happened_off_book_is_recovered_into_the_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        // Persisted book: long 2 SOL @ 100. The venue is flat -- the close
+        // filled but the process died before booking it.
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 2.0, 100.0, secs("2026-09-05T23:00:00Z"));
+        state.persist(&cfg.paths.state).unwrap();
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 130.0)].into(),
+            positions: Mutex::new(BTreeMap::new()),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        assert!(engine.state.is_flat());
+        // (130 - 100) * 2 booked, and the trade counted as a win.
+        assert!((engine.state.cum_realized_usd - 60.0).abs() < 1e-9);
+        assert_eq!(engine.state.trades_closed, 1);
+        assert_eq!(engine.state.trades_won, 1);
+        let recovered = rows(&cfg.paths.ledger)
+            .into_iter()
+            .find(|r| r["event"] == "recovered_close")
+            .expect("recovered_close row");
+        assert_eq!(recovered["symbol"], "SOL");
+        assert_eq!(recovered["closed_qty"], -2.0);
+        assert_eq!(recovered["fill_price_source"], "reconcile_mark");
+        assert!(rows(&cfg.paths.pnl)
+            .iter()
+            .any(|r| r["event"] == "exit" && r["recovered"] == true));
     }
 
     #[tokio::test]

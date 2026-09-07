@@ -86,10 +86,18 @@ impl Scheduler {
                 bail!("calendar has duplicate decision_key {}", e.decision_key);
             }
             if let Some(f) = e.flatten_at {
-                if f <= e.decision_at {
+                // The flatten must clear the whole signal window: a
+                // decision accepted late in the window would otherwise open
+                // legs after their own mandated exit (the tick processes
+                // flattens before decisions). Same invariant the config
+                // enforces for `flatten_after_secs`.
+                let window_end = e.decision_at + Duration::seconds(cfg.signal_grace_secs.max(0));
+                if f <= window_end {
                     bail!(
-                        "calendar entry {} has flatten_at <= decision_at",
-                        e.decision_key
+                        "calendar entry {} has flatten_at {} inside its signal window (ends {})",
+                        e.decision_key,
+                        f,
+                        window_end
                     );
                 }
             }
@@ -344,6 +352,17 @@ mod tests {
             "2026-09-09"
         );
         assert!(s.next_after(ts("2026-09-09T07:00:00Z")).is_none());
+        // a flatten inside the signal window is rejected
+        let mut inside = entries.clone();
+        inside[0].flatten_at = Some(
+            DateTime::parse_from_rfc3339("2026-09-08T06:35:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(Scheduler::build(&cfg.schedule, inside)
+            .unwrap_err()
+            .to_string()
+            .contains("signal window"));
         // duplicate key rejected, also when another entry sits in between (A, B, A)
         let mut dup = entries.clone();
         dup.push(CalendarEntry {
