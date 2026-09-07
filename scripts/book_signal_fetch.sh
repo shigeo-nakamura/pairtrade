@@ -103,10 +103,12 @@ if decision_time and kind in ("interval_days", "daily"):
     # other date-shaped key -- a regenerated previous grid date, say --
     # would be refused by the runtime and must not displace a usable file.
     hh, mm = (int(x) for x in decision_time.split(":"))
+    decision_time_today = datetime(2000, 1, 1, hh, mm).time()
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     today = now_utc.date()
+    before_decision = now_utc.time() < decision_time_today
     if kind == "daily":
-        cur = today if now_utc.time() >= datetime(2000, 1, 1, hh, mm).time() else today - timedelta(days=1)
+        cur = today if not before_decision else today - timedelta(days=1)
         nxt = cur + timedelta(days=1)
     else:
         anchor_s = os.environ.get("BOOK_ANCHOR_DATE", "").strip()
@@ -119,11 +121,20 @@ if decision_time and kind in ("interval_days", "daily"):
             cur, nxt = None, anchor
         else:
             aligned = anchor + timedelta(days=(delta // every) * every)
-            if aligned == today and now_utc.time() < datetime(2000, 1, 1, hh, mm).time():
+            if aligned == today and before_decision:
                 aligned = aligned - timedelta(days=every)
             cur = aligned if aligned >= anchor else None
             nxt = (cur + timedelta(days=every)) if cur else anchor
-    allowed = {k.isoformat() for k in (cur, nxt) if k}
+    # `nxt` is only genuinely imminent -- published "a few minutes before
+    # the decision instant" as the comment above promises -- when its date
+    # is today and that instant has not passed yet. Once today's own
+    # decision has started, `cur` stays today for the rest of the day while
+    # a naive `nxt` would already point at tomorrow (or a full grid interval
+    # out); accepting that key here would let a same-day re-fetch clobber
+    # today's not-yet-consumed signal with one the runtime won't accept
+    # until its own decision instant, silently losing today's decision.
+    imminent_nxt = nxt if (nxt is not None and nxt == today and before_decision) else None
+    allowed = {k.isoformat() for k in (cur, imminent_nxt) if k}
     if d["decision_key"] not in allowed:
         raise SystemExit(
             f"decision_key {d['decision_key']} is not the current or next decision ({', '.join(sorted(allowed))})"
