@@ -2,8 +2,8 @@
 # #937). Copy to the host as /opt/book-runtime/xsmom-695.yaml. Everything
 # here is reviewable in a PR diff; credentials never live in this file.
 #
-# The producer (scripts/xsmom_signal_producer.py, follow-up PR) writes
-# signal.path on every rebalance day right after the 00:20 UTC shadow run;
+# scripts/xsmom_signal_producer.py writes the signal on every rebalance day
+# right after the 00:20 UTC shadow run (via S3 + book-signal-fetch timer);
 # the runtime reads it inside the 00:30 + 90 min window.
 schema_version: 1
 instance_id: xsmom-695
