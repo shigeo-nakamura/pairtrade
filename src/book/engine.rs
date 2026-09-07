@@ -1824,8 +1824,8 @@ impl BookEngine {
     pub async fn daily_mark_now(&mut self, now: i64) {
         let symbols = self.tracked_symbols();
         let prices = self.exec.prices(&symbols).await;
-        self.write_daily_mark(now, &prices).await;
-        // The mark's funding accrual can move equity down; re-check the
+        let (date, funding_detail) = self.accrue_daily_funding(now, &prices).await;
+        // The funding accrual above can move equity down; re-check the
         // rails against it immediately, same date. Without this, the only
         // remaining evaluation is the next date's first tick, which rolls
         // the daily anchor to this already funding-reduced equity before
@@ -1874,6 +1874,12 @@ impl BookEngine {
                 }
             }
         }
+        // Write the mark only now, after any halt/flatten above, so it
+        // reflects the post-flatten book instead of the state from before
+        // the day-end risk check: on the final replay day nothing later
+        // corrects a mark taken before the flatten.
+        self.write_daily_mark_row(now, &prices, &date, funding_detail)
+            .await;
         // The halt/flatten above can change positions and flags after the
         // last tick already wrote status.json for this date; re-write it so
         // a replay ending on this date doesn't leave status.json reporting
@@ -1886,12 +1892,37 @@ impl BookEngine {
     }
 
     async fn write_daily_mark(&mut self, now: i64, prices: &HashMap<String, f64>) {
+        let (date, funding_detail) = self.accrue_daily_funding(now, prices).await;
+        self.write_daily_mark_row(now, prices, &date, funding_detail)
+            .await;
+    }
+
+    /// Funding accrual per held/orphaned leg for `now`'s date, without
+    /// writing the mark row yet: `daily_mark_now` runs its own risk
+    /// evaluation (which the accrual above can move) and any resulting
+    /// halt/flatten between this and `write_daily_mark_row`, so the row
+    /// itself reflects the post-flatten book instead of the pre-halt one.
+    async fn accrue_daily_funding(
+        &mut self,
+        now: i64,
+        prices: &HashMap<String, f64>,
+    ) -> (String, serde_json::Map<String, serde_json::Value>) {
         let date = utc_date(now);
-        // Funding accrual per leg (estimate from the current rate).
         let mut funding_detail = serde_json::Map::new();
         let symbols: Vec<String> = self.state.positions.keys().cloned().collect();
         for sym in symbols {
-            let rate = self.exec.funding_rate_hourly(&sym).await;
+            let has_price = prices.contains_key(&sym);
+            // A held leg with no fresh mark must not consume its funding
+            // interval at the entry-price fallback below: forcing `rate`
+            // to `None` here routes it through the same
+            // pending_funding_qty_hours carry a missing *rate* already
+            // uses, instead of permanently misstating
+            // cum_funding_est_usd from a price the venue never quoted.
+            let rate = if has_price {
+                self.exec.funding_rate_hourly(&sym).await
+            } else {
+                None
+            };
             let Some(p) = self.state.positions.get(&sym) else {
                 continue;
             };
@@ -1901,7 +1932,7 @@ impl BookEngine {
             let est = self.accrue_funding(&sym, now, price, rate).unwrap_or(0.0);
             funding_detail.insert(
                 sym.clone(),
-                json!({ "rate_hourly": rate, "hours": hours, "est_usd": est }),
+                json!({ "rate_hourly": rate, "hours": hours, "est_usd": est, "price_available": has_price }),
             );
         }
         // A leg that fully closed while its funding rate was unavailable
@@ -1935,6 +1966,20 @@ impl BookEngine {
                 json!({ "rate_hourly": rate, "hours": 0.0, "est_usd": est, "settled_pending_only": true }),
             );
         }
+        (date, funding_detail)
+    }
+
+    /// Write the mark row for `date` and advance `last_mark_date`. Split
+    /// out of `write_daily_mark` so `daily_mark_now` can run its risk
+    /// evaluation and any halt/flatten between accrual and this call (see
+    /// `accrue_daily_funding`).
+    async fn write_daily_mark_row(
+        &mut self,
+        now: i64,
+        prices: &HashMap<String, f64>,
+        date: &str,
+        funding_detail: serde_json::Map<String, serde_json::Value>,
+    ) {
         let (equity, _) = self.compute_equity(prices).await;
         let marks: BTreeMap<String, serde_json::Value> = self
             .state
@@ -1979,7 +2024,7 @@ impl BookEngine {
             self.state.cum_funding_est_usd,
             self.state.positions.len()
         );
-        self.state.last_mark_date = Some(date);
+        self.state.last_mark_date = Some(date.to_string());
     }
 
     fn write_status(&mut self, now: i64, prices: &HashMap<String, f64>, equity: f64) {
@@ -2682,6 +2727,37 @@ mod tests {
         assert!((est - (-2.0 * 100_000.0 * 0.0001)).abs() < 1e-9);
         assert!(engine.state.pending_funding_qty_hours.get("BTC").is_none());
         assert!((engine.state.cum_funding_est_usd - est).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_missing_price_defers_funding_like_a_missing_rate_instead_of_using_entry_price() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let (mut engine, exec) = paper_engine(cfg, dir.path(), vec![]).await;
+        let opened_at = secs("2026-09-06T00:00:00Z");
+        engine.state.apply_fill("BTC", 2.0, 100_000.0, opened_at);
+
+        // BTC has a funding rate but no fresh price (feed outage): the 2
+        // BTC * 1h exposure must be frozen the same way a missing *rate*
+        // already is, not consumed at the stale entry price.
+        exec.clear_observations().await;
+        exec.set_funding_rate_hourly("BTC", 0.0001).await;
+        let after_one_hour = opened_at + 3600;
+        let prices = exec.prices(&["BTC".to_string()]).await;
+        assert!(prices.get("BTC").is_none());
+        let (_, funding_detail) = engine.accrue_daily_funding(after_one_hour, &prices).await;
+
+        assert_eq!(
+            engine.state.pending_funding_qty_hours.get("BTC").copied(),
+            Some(2.0)
+        );
+        assert_eq!(engine.state.cum_funding_est_usd, 0.0);
+        assert_eq!(
+            funding_detail["BTC"]["rate_hourly"],
+            serde_json::Value::Null
+        );
+        assert_eq!(funding_detail["BTC"]["price_available"], false);
     }
 
     #[tokio::test]
@@ -3567,6 +3643,58 @@ mod tests {
             "status.json must reflect the flatten, not the pre-halt position: {after}"
         );
         assert_eq!(after["position_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_post_mark_session_halt_mark_row_reflects_the_flattened_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.risk.max_daily_loss_bps = 1_000_000.0;
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.status_interval_secs = 0;
+        let t0 = secs("2026-09-06T00:00:00Z");
+        engine.state.apply_fill("SOL", 5.0, 200.0, t0);
+        exec.seed_positions(
+            [(
+                "SOL".to_string(),
+                VenuePosition {
+                    qty: 5.0,
+                    entry_price: Some(200.0),
+                },
+            )]
+            .into(),
+        )
+        .await;
+        engine.state.session.start_equity = 1000.0;
+        engine.state.session.start_at = t0;
+        engine.state.daily.date = crate::book::risk::utc_date(t0);
+        engine.state.daily.start_equity = 1000.0;
+        engine.state.peak_equity = 1000.0;
+
+        // Same punishing-funding session-halt setup as the status.json
+        // test above, but this checks the *mark row itself*
+        // (pnl.jsonl), which `daily_mark_now` used to write BEFORE its
+        // own post-mark risk check could flatten the book: on the final
+        // day of a replay nothing later corrects that mark.
+        exec.set_funding_rate_hourly("SOL", 0.001).await;
+        let t1 = t0 + 100 * 3600;
+        engine.daily_mark_now(t1).await;
+        assert!(engine.state.session.halted);
+        assert!(engine.state.is_flat());
+
+        let mark = rows(&cfg.paths.pnl)
+            .into_iter()
+            .find(|r| r["event"] == "mark")
+            .expect("mark row");
+        assert_eq!(
+            mark["session_halted"], true,
+            "the mark must reflect the halt, not the pre-halt tick: {mark}"
+        );
+        assert_eq!(
+            mark["n_positions"], 0,
+            "the mark must reflect the flatten, not the pre-halt position: {mark}"
+        );
     }
 
     #[tokio::test]

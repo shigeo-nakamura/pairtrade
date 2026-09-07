@@ -14,7 +14,7 @@
 //! spot-only as of v4.7.20).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +31,7 @@ use debot::infra::prom;
 use debot::infra::s3_mirror::S3Mirror;
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
 use dex_connector::{DexConnector, PriceUpdate};
+use fs2::FileExt;
 use rust_decimal::prelude::ToPrimitive;
 
 fn now_secs() -> i64 {
@@ -92,6 +93,36 @@ async fn fetch_lot(
     }
 }
 
+/// Process-wide ownership of one instance's state: held for the lifetime
+/// of `main` (dropping the file releases the OS-level `flock`, including
+/// on a crash). Two `book-runtime` processes accidentally started against
+/// the same config would otherwise both load the same state, reconcile
+/// the same pre-trade venue snapshot, and submit the same decision
+/// concurrently -- each recording it Applied, so the resulting doubled
+/// exposure would only ever be adopted on a later tick, not prevented.
+struct InstanceLock {
+    _file: std::fs::File,
+}
+
+fn acquire_instance_lock(state_path: &Path) -> Result<InstanceLock> {
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let lock_path = state_path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open instance lock {}", lock_path.display()))?;
+    file.try_lock_exclusive().with_context(|| {
+        format!(
+            "{} is already locked -- another book-runtime process is running against this state; refusing to start a second instance",
+            lock_path.display()
+        )
+    })?;
+    Ok(InstanceLock { _file: file })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logger();
@@ -125,6 +156,10 @@ async fn main() -> Result<()> {
             );
         }
     }
+
+    // Held for the rest of `main`: refuses a second process against the
+    // same state before it can ever load it or reach the venue.
+    let _instance_lock = acquire_instance_lock(&cfg.paths.state)?;
 
     prom::maybe_start_exporter();
     let process_started_at = now_secs();
@@ -307,4 +342,32 @@ async fn main() -> Result<()> {
     }
     engine.state.persist(engine.state_path())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_instance_lock_on_the_same_state_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let first = acquire_instance_lock(&state_path).unwrap();
+        assert!(
+            acquire_instance_lock(&state_path).is_err(),
+            "a second process against the same state must be refused"
+        );
+        drop(first);
+        // Releasing the first must let a fresh process start.
+        assert!(acquire_instance_lock(&state_path).is_ok());
+    }
+
+    #[test]
+    fn instance_locks_for_different_state_paths_do_not_interfere() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = acquire_instance_lock(&dir.path().join("a").join("state.json")).unwrap();
+        let b = acquire_instance_lock(&dir.path().join("b").join("state.json")).unwrap();
+        drop(a);
+        drop(b);
+    }
 }
