@@ -25,7 +25,7 @@ fi
 # never replace one it accepted.
 if ! SUMMARY=$(python3 - "$TMP" <<'PY'
 import hashlib, json, math, sys
-from datetime import datetime
+from datetime import datetime, timezone
 def _reject_constant(token):
     raise SystemExit(f"non-standard JSON constant {token} (the runtime's parser rejects it)")
 def _no_duplicate_keys(pairs):
@@ -60,6 +60,12 @@ for k in ("generated_at", "as_of"):
         raise SystemExit(f"{k} is not a YYYY-MM-DDTHH:MM:SSZ timestamp: {e}")
 if ts["as_of"] > ts["generated_at"]:
     raise SystemExit("as_of is after generated_at (look-ahead); the runtime would reject this file")
+# The runtime refuses a file generated more than 60s in the future (a
+# producer clock error); promoting it here would displace a usable signal
+# and lose the window. Same bound, applied before the mv.
+ahead = (ts["generated_at"] - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
+if ahead > 60:
+    raise SystemExit(f"generated_at is {ahead:.0f}s in the future; the runtime would reject this file")
 if not isinstance(d["weights"], dict):
     raise SystemExit("weights must be a symbol -> number mapping")
 for sym, v in d["weights"].items():

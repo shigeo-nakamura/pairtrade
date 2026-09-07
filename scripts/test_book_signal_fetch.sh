@@ -30,6 +30,9 @@ a = dict(d); a["as_of"] = "2026-09-06T00:30:00Z"; a["payload_sha256"] = __import
 v = dict(d); v["schema_version"] = True; json.dump(v, open(f"{t}/bad_schema_bool.json", "w"))
 f = dict(d); f["schema_version"] = 1.0; json.dump(f, open(f"{t}/bad_schema_float.json", "w"))
 n = json.loads(json.dumps(d)); n["meta"] = {"k": float("nan")}; open(f"{t}/bad_nan_meta.json", "w").write(json.dumps(n))
+fut = json.loads(json.dumps(d))
+fut["generated_at"] = "2099-01-01T00:00:00Z"
+json.dump(fut, open(f"{t}/bad_future.json", "w"))
 raw = open(f"{t}/good.json").read()
 open(f"{t}/bad_dup_key.json", "w").write(raw.replace("{", '{"producer_id":"other",', 1))
 open(f"{t}/bad_json.json", "w").write("{")
@@ -38,7 +41,7 @@ PY
 bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .*(2026-09-06 "
 cmp -s "$T/good.json" "$T/dst/signal.json"
 
-for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_json; do
+for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_json; do
   if bash "$HERE/book_signal_fetch.sh" "$T/$bad.json" "$T/dst/signal.json" 2>/dev/null; then
     echo "FAIL: $bad was promoted" >&2; exit 1
   fi
