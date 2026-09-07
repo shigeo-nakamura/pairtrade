@@ -444,8 +444,9 @@ bar date, and it is ticked there, with that date's closes.
   the state is persisted and the next start resumes from it (live: from
   the venue position, which is adopted if it differs).
 - Binary: `ci.yml` builds and uploads `bin/book_runtime` to S3 next to
-  `engine_b_live`; host installation (unit, identity, secrets) is the
-  follow-up PR together with the XSMOM producer.
+  `engine_b_live` and installs it on the Tokyo host without starting it;
+  the per-instance units, identity, secrets, and daily checks are in
+  `docs/book-runtime-operations.md`.
 - Building this runtime is **not** capital approval. XSMOM goes live only
   if the pre-registered 2026-10-02 readout on bot-strategy#695 passes;
   Engine B only after #876's Phase 1 gate.
