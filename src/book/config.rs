@@ -335,7 +335,7 @@ impl BookConfig {
         // persist overwrite the ledger; a path that collided with a flag
         // file would be worse still, since the kill switch and RISK_ACK
         // are read as "this file exists".
-        let named: [(&str, &Path); 7] = [
+        let mut named: Vec<(&str, &Path)> = vec![
             ("paths.state", &self.paths.state),
             ("paths.ledger", &self.paths.ledger),
             ("paths.pnl", &self.paths.pnl),
@@ -344,6 +344,9 @@ impl BookConfig {
             ("risk.risk_ack_path", &self.risk.risk_ack_path),
             ("signal.path", &self.signal.path),
         ];
+        if let Some(calendar_path) = &self.schedule.calendar_path {
+            named.push(("schedule.calendar_path", calendar_path));
+        }
         let mut seen: Vec<(&str, PathBuf)> = Vec::new();
         for (name, path) in named {
             let key = resolved_path(path);

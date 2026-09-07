@@ -1585,12 +1585,32 @@ impl BookEngine {
         let (equity, equity_ready) = self.compute_equity(&prices).await;
         if equity_ready {
             for ev in self.risk.evaluate(&mut self.state, now, equity) {
-                if let RiskEvent::DailyHalt { .. } = ev {
-                    log::warn!(
-                        "[RISK] daily loss halt {ev:?} (post-mark funding accrual); opens blocked until next UTC day"
-                    );
-                    self.ledger
-                        .write(now, "halt", None, json!({ "risk": ev, "equity": equity }));
+                match ev {
+                    RiskEvent::DailyHalt { .. } => {
+                        log::warn!(
+                            "[RISK] daily loss halt {ev:?} (post-mark funding accrual); opens blocked until next UTC day"
+                        );
+                        self.ledger
+                            .write(now, "halt", None, json!({ "risk": ev, "equity": equity }));
+                    }
+                    RiskEvent::SessionHalt { .. } => {
+                        log::error!(
+                            "[RISK] SESSION HALT {ev:?} (post-mark funding accrual); flattening"
+                        );
+                        self.ledger
+                            .write(now, "halt", None, json!({ "risk": ev, "equity": equity }));
+                        status::DECISION_TOTAL
+                            .with_label_values(&[&self.cfg.instance_id, "halted"])
+                            .inc();
+                        if let Some(r) = self.state.last_decision.as_mut() {
+                            r.outcome = DecisionOutcome::Halted;
+                            r.at = now;
+                        }
+                        self.flatten_now(now, &prices, "session_halt").await;
+                    }
+                    RiskEvent::DailyRollover { .. } | RiskEvent::SessionHaltCleared { .. } => {
+                        log::info!("[RISK] {ev:?} (post-mark funding accrual)");
+                    }
                 }
             }
         }
