@@ -16,6 +16,8 @@ FAKE
 chmod +x "$T/bin/aws"
 export PATH="$T/bin:$PATH"
 export BOOK_SIGNAL_MAX_AGE_SECS=7200
+export BOOK_SIGNAL_PRODUCER_ID=p
+export BOOK_DECISION_TIME_UTC=23:59
 
 # Generated now: the fetcher enforces BOOK_SIGNAL_MAX_AGE_SECS, so a
 # fixed past timestamp would make the "good" fixture stale over time.
@@ -45,6 +47,14 @@ json.dump(rehash(a), open(f"{t}/bad_lookahead.json", "w"))
 v = dict(d); v["schema_version"] = True; json.dump(v, open(f"{t}/bad_schema_bool.json", "w"))
 f = dict(d); f["schema_version"] = 1.0; json.dump(f, open(f"{t}/bad_schema_float.json", "w"))
 n = json.loads(json.dumps(d)); n["meta"] = {"k": float("nan")}; open(f"{t}/bad_nan_meta.json", "w").write(json.dumps(n))
+wrong = json.loads(json.dumps(d))
+wrong["producer_id"] = "someone_else"
+json.dump(rehash(wrong), open(f"{t}/bad_producer.json", "w"))
+# as_of after the day's decision time (23:59 in the test env).
+late = json.loads(json.dumps(d))
+late["as_of"] = late["generated_at"]
+late["generated_at"] = (gen + datetime.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(rehash(late), open(f"{t}/bad_after_decision.json", "w"))
 stale = json.loads(json.dumps(d))
 stale["generated_at"] = "2020-01-01T00:00:00Z"
 stale["as_of"] = "2020-01-01T00:00:00Z"
@@ -60,7 +70,7 @@ PY
 bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .*($KEY "
 cmp -s "$T/good.json" "$T/dst/signal.json"
 
-for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_stale bad_json; do
+for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_stale bad_producer bad_after_decision bad_json; do
   if bash "$HERE/book_signal_fetch.sh" "$T/$bad.json" "$T/dst/signal.json" 2>/dev/null; then
     echo "FAIL: $bad was promoted" >&2; exit 1
   fi

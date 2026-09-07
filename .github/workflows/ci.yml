@@ -462,6 +462,12 @@ jobs:
           # (`debot-pair-robinhood-lighter`, points farming) is deliberately
           # NOT touched by this job any more: its binary, config, and units
           # stay exactly as last deployed (bot-strategy#937 sunset decision).
+          #
+          # The book runtime's sources are staged in a per-run /tmp dir, not
+          # in the shared /opt/debot tree: deploy-configs.yml can be inside
+          # install_book_runtime.sh at the same time, and writing the shared
+          # paths outside that script's flock could let it stage a mixed
+          # binary/signer pair.
           cat > /tmp/ssm-robinhood-deploy-params.json <<'JSON'
           {
             "commands": [
@@ -477,15 +483,17 @@ jobs:
               "aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so __INSTALL_DIR__/deploy/engine-b-live-libsigner.so",
               "echo '__LIBSIGNER_SHA256__  __INSTALL_DIR__/deploy/engine-b-live-libsigner.so' | sha256sum -c -",
               "sudo env ENGINE_B_LIVE_LIBSIGNER_SOURCE=__INSTALL_DIR__/deploy/engine-b-live-libsigner.so bash __INSTALL_DIR__/scripts/install_engine_b_live.sh",
-              "aws s3 cp s3://__S3_BUCKET__/debot/book_runtime __INSTALL_DIR__/bin/book_runtime",
-              "echo '__BOOK_RUNTIME_SHA256__  __INSTALL_DIR__/bin/book_runtime' | sha256sum -c -",
-              "sudo chmod 755 __INSTALL_DIR__/bin/book_runtime",
-              "for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u __INSTALL_DIR__/deploy/$u; done",
-              "sudo env BOOK_INSTANCE=xsmom-695 BOOK_LIBSIGNER_SOURCE=__INSTALL_DIR__/deploy/engine-b-live-libsigner.so bash __INSTALL_DIR__/scripts/install_book_runtime.sh"
+              "install -d -m 0755 /tmp/book-runtime-__GITHUB_SHA__",
+              "aws s3 cp s3://__S3_BUCKET__/debot/book_runtime /tmp/book-runtime-__GITHUB_SHA__/book_runtime",
+              "echo '__BOOK_RUNTIME_SHA256__  /tmp/book-runtime-__GITHUB_SHA__/book_runtime' | sha256sum -c -",
+              "aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so /tmp/book-runtime-__GITHUB_SHA__/libsigner.so",
+              "echo '__LIBSIGNER_SHA256__  /tmp/book-runtime-__GITHUB_SHA__/libsigner.so' | sha256sum -c -",
+              "for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u /tmp/book-runtime-__GITHUB_SHA__/$u; done",
+              "sudo env BOOK_INSTANCE=xsmom-695 BOOK_BINARY_SOURCE=/tmp/book-runtime-__GITHUB_SHA__/book_runtime BOOK_LIBSIGNER_SOURCE=/tmp/book-runtime-__GITHUB_SHA__/libsigner.so BOOK_UNIT_SOURCE_DIR=/tmp/book-runtime-__GITHUB_SHA__ bash __INSTALL_DIR__/scripts/install_book_runtime.sh"
             ]
           }
           JSON
-          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g; s|__ENGINE_B_LIVE_SHA256__|${ENGINE_B_LIVE_SHA256}|g; s|__BOOK_RUNTIME_SHA256__|${BOOK_RUNTIME_SHA256}|g" /tmp/ssm-robinhood-deploy-params.json
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g; s|__ENGINE_B_LIVE_SHA256__|${ENGINE_B_LIVE_SHA256}|g; s|__BOOK_RUNTIME_SHA256__|${BOOK_RUNTIME_SHA256}|g; s|__GITHUB_SHA__|${GITHUB_SHA}|g" /tmp/ssm-robinhood-deploy-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \

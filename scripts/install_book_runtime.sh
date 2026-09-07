@@ -83,7 +83,30 @@ case "$MAX_AGE" in
     exit 1
     ;;
 esac
-printf 'BOOK_SIGNAL_MAX_AGE_SECS=%s\n' "$MAX_AGE" > "$STAGE/${INSTANCE}.fetch.env"
+PRODUCER=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*producer_id:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+if [ -z "$PRODUCER" ]; then
+  echo "could not read signal.producer_id from $CONFIG_SOURCE" >&2
+  exit 1
+fi
+# Only date-keyed schedules (interval_days / daily) let the fetcher derive
+# a decision time from the file's own decision_key; a calendar schedule
+# leaves this empty and the fetcher skips that one check.
+KIND=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*kind:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+DECISION_TIME=""
+case "$KIND" in
+  interval_days|daily)
+    DECISION_TIME=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*decision_time_utc:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
+    if [ -z "$DECISION_TIME" ]; then
+      echo "could not read schedule.decision_time_utc from $CONFIG_SOURCE (kind=$KIND)" >&2
+      exit 1
+    fi
+    ;;
+esac
+{
+  printf 'BOOK_SIGNAL_MAX_AGE_SECS=%s\n' "$MAX_AGE"
+  printf 'BOOK_SIGNAL_PRODUCER_ID=%s\n' "$PRODUCER"
+  printf 'BOOK_DECISION_TIME_UTC=%s\n' "$DECISION_TIME"
+} > "$STAGE/${INSTANCE}.fetch.env"
 chown root:"$SERVICE_GROUP" "$STAGE/${INSTANCE}.fetch.env"
 chmod 0440 "$STAGE/${INSTANCE}.fetch.env"
 

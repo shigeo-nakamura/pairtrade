@@ -70,9 +70,26 @@ refusing: 2026-09-11 book has 3 symbol(s) outside the deployed universe
 redeploy the config, then re-run.
 ```
 
-When that fires: add the symbols to `universe.symbols`, open a PR, let
-`Deploy Configs` install it, and re-run the producer. The window stays
-open for 90 minutes after 00:30 UTC, so a same-morning fix still lands.
+When that fires:
+
+1. Add the symbols to `universe.symbols`, open a PR, merge it, and let
+   `Deploy Configs` install the new config.
+2. **Restart the service**: `book_runtime` reads its config once at
+   startup, and both deploy paths install without restarting on purpose
+   (bot-strategy#269). Until the restart the running process still
+   enforces the old universe and will keep rejecting the signal.
+   ```bash
+   sudo systemctl restart book-runtime-xsmom-695
+   sudo journalctl -u book-runtime-xsmom-695 -n 20 --no-pager | grep '\[CONFIG\]'
+   ```
+   Check the `fp=` in that line against `book_runtime --config … --validate`
+   on the merged config. The runtime does not force-close on restart (it
+   is not pairtrade), so a DRY_RUN book simply resumes from `state.json`;
+   for a live book, restart outside a decision window.
+3. Re-run the producer.
+
+The window stays open for 90 minutes after 00:30 UTC, so a same-morning
+fix still lands, but only if the restart happens too.
 
 Making the bound dynamic (accept any symbol the venue lists, keeping the
 per-symbol and gross/net caps as the real guard) is the proper fix,
