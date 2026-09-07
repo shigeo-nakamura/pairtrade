@@ -1897,9 +1897,15 @@ impl BookEngine {
         // the pre-halt book.
         let (equity, _) = self.compute_equity(&prices).await;
         self.write_status(now, &prices, equity);
-        if let Err(e) = self.state.persist(&self.cfg.paths.state) {
-            log::error!("[MARK] persist failed: {e}");
-        }
+        // Propagated for the same reason as the mark append above: on the
+        // final replay day nothing later persists, so a swallowed failure
+        // here would let `run` report a summary computed from the
+        // post-mark in-memory state while state.json still reflects the
+        // pre-mark tick (no final funding accrual, no funding-triggered
+        // halt/flatten).
+        self.state
+            .persist(&self.cfg.paths.state)
+            .with_context(|| format!("[MARK] {date} persist failed"))?;
         Ok(())
     }
 
