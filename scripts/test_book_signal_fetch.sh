@@ -77,6 +77,16 @@ stale = json.loads(json.dumps(d))
 stale["generated_at"] = "2020-01-01T00:00:00Z"
 stale["as_of"] = "2020-01-01T00:00:00Z"
 json.dump(rehash(stale), open(f"{t}/bad_stale.json", "w"))
+# strptime accepts a non-zero-padded field despite the %Y-%m-%dT%H:%M:%SZ
+# format string; the runtime's strict RFC 3339 parser does not. Forced
+# non-padded seconds on both fields, kept equal, so this is rejected for
+# its width alone -- not for being stale or an as_of/generated_at
+# look-ahead, which a mismatched second would otherwise also trip.
+width = json.loads(json.dumps(d))
+narrow_ts = gen.replace(second=5).strftime("%Y-%m-%dT%H:%M:") + "5Z"
+width["generated_at"] = narrow_ts
+width["as_of"] = narrow_ts
+json.dump(rehash(width), open(f"{t}/bad_ts_width.json", "w"))
 fut = json.loads(json.dumps(d))
 fut["generated_at"] = "2099-01-01T00:00:00Z"
 json.dump(fut, open(f"{t}/bad_future.json", "w"))
@@ -88,7 +98,7 @@ PY
 bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .*($KEY "
 cmp -s "$T/good.json" "$T/dst/signal.json"
 
-for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_stale bad_producer bad_after_decision bad_universe bad_symbol_cap bad_net bad_old_key bad_json; do
+for bad in bad_missing bad_hash bad_ts_type bad_ts_width bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_stale bad_producer bad_after_decision bad_universe bad_symbol_cap bad_net bad_old_key bad_json; do
   if bash "$HERE/book_signal_fetch.sh" "$T/$bad.json" "$T/dst/signal.json" 2>/dev/null; then
     echo "FAIL: $bad was promoted" >&2; exit 1
   fi

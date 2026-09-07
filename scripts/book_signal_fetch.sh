@@ -82,6 +82,13 @@ for k in ("generated_at", "as_of"):
         ts[k] = datetime.strptime(d[k], "%Y-%m-%dT%H:%M:%SZ")
     except ValueError as e:
         raise SystemExit(f"{k} is not a YYYY-MM-DDTHH:MM:SSZ timestamp: {e}")
+    # strptime accepts a non-zero-padded field (e.g. "2026-9-7T0:25:0Z")
+    # despite the format string above, but Rust's RFC 3339 deserializer
+    # for SignalFile.generated_at does not -- promoting such a file would
+    # displace the last usable signal with one the runtime cannot parse.
+    # Require an exact round-trip through the canonical width instead.
+    if ts[k].strftime("%Y-%m-%dT%H:%M:%SZ") != d[k]:
+        raise SystemExit(f"{k} is not exactly YYYY-MM-DDTHH:MM:SSZ (zero-padded): {d[k]!r}")
 if ts["as_of"] > ts["generated_at"]:
     raise SystemExit("as_of is after generated_at (look-ahead); the runtime would reject this file")
 # The runtime refuses a file generated more than 60s in the future (a
