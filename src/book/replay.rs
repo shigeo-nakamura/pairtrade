@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use chrono::{Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 
 use super::config::BookConfig;
@@ -311,10 +311,16 @@ fn signal_generated_at(replay_dir: &Path, key: &str) -> Option<i64> {
         std::fs::read_to_string(replay_dir.join("signals").join(format!("{key}.json"))).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let raw = v.get("generated_at")?.as_str()?;
+    // RFC 3339, matching how `SignalFile::generated_at: DateTime<Utc>`
+    // itself deserializes: a strict `%Y-%m-%dT%H:%M:%SZ`-only parser
+    // would reject a value with fractional seconds or a numeric `+00:00`
+    // offset that normal signal validation accepts, hiding it from the
+    // arrival-tick schedule and letting its grace window close (recorded
+    // as skipped) even though the engine would have accepted it.
     Some(
-        chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%SZ")
+        DateTime::parse_from_rfc3339(raw)
             .ok()?
-            .and_utc()
+            .with_timezone(&Utc)
             .timestamp(),
     )
 }
@@ -727,6 +733,56 @@ mod tests {
         // so neither tick even sees the file (no early reject); applied on
         // the next date at the stated arrival, which is what live would do.
         assert_eq!(outcomes, vec!["applied"]);
+        assert_eq!(rows[0]["ts_ms"], arrival.timestamp_millis());
+    }
+
+    #[tokio::test]
+    async fn an_arrival_with_fractional_seconds_or_a_numeric_offset_is_still_ticked() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        let mut c = cfg();
+        c.schedule.kind = ScheduleKind::Daily;
+        c.schedule.decision_time_utc = Some("23:30".into());
+        let decision_at = ts("2026-07-05T23:30:00Z");
+        let arrival = ts("2026-07-06T00:10:00Z");
+        let body = signal_json(
+            "test_producer",
+            arrival,
+            decision_at - Duration::minutes(30),
+            "2026-07-05",
+            &[("BTC", 0.5), ("DOT", -0.5)],
+        );
+        // generated_at is not part of the hashed payload, so rewriting
+        // just this field to a form SignalFile's DateTime<Utc> field
+        // still deserializes (fractional seconds, numeric offset) --
+        // which the engine's own signal validation accepts -- but the
+        // replay's own arrival-tick parser previously rejected with its
+        // stricter, hand-rolled format string.
+        let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["generated_at"] = serde_json::Value::String("2026-07-06T00:10:00.250+00:00".into());
+        std::fs::create_dir_all(dir.path().join("signals")).unwrap();
+        std::fs::write(
+            dir.path().join("signals").join("2026-07-05.json"),
+            v.to_string(),
+        )
+        .unwrap();
+        let out = dir.path().join("out");
+        run(c, dir.path(), &out).await.unwrap();
+        let ledger = read_rows(&out.join("ledger.jsonl"));
+        let rows: Vec<_> = ledger
+            .iter()
+            .filter(|r| r["event"] == "decision" && r["decision_key"] == "2026-07-05")
+            .collect();
+        let outcomes: Vec<_> = rows
+            .iter()
+            .map(|r| r["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec!["applied"],
+            "an unparseable arrival timestamp would leave this window never ticked before it \
+             closes, recording it skipped instead"
+        );
         assert_eq!(rows[0]["ts_ms"], arrival.timestamp_millis());
     }
 

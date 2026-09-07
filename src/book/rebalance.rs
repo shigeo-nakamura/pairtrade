@@ -225,12 +225,39 @@ pub fn plan_targets(
             Some(p) if p.is_finite() && p > 0.0 => p,
             _ => return Err(PlanReject::MissingPrice(sym.clone())),
         };
+        target_qty.insert(sym.clone(), tq);
+        let mk = |side: Side, qty: f64, reduce_only: bool, kind: IntentKind| OrderIntent {
+            symbol: sym.clone(),
+            side,
+            qty,
+            reference_price: price,
+            notional_usd: qty * price,
+            reduce_only,
+            kind,
+        };
+        let side_for = |delta: f64| if delta > 0.0 { Side::Buy } else { Side::Sell };
+
+        if tq == 0.0 {
+            // Go flat: close the whole leg at its exact current venue
+            // quantity, dust included (deadband and minimum do not apply
+            // to a close). Rounding to a lot's precision or checking its
+            // minimum-order size is meaningless here -- nothing is being
+            // rounded, the close quantity is just the venue's own number
+            // -- so this must not require `LotMeta`: a protective
+            // flatten (session halt, overdue fixed-window flatten) needs
+            // to submit the close during a ticker-metadata outage, e.g.
+            // for a symbol just adopted from the venue that this process
+            // has never fetched a ticker for.
+            // cur != 0.0 here: the tq == 0.0 && cur == 0.0 case already
+            // continued above.
+            reducing.push(mk(side_for(-cur), cur.abs(), true, IntentKind::Close));
+            continue;
+        }
         let lot = lots
             .get(sym)
             .copied()
             .ok_or_else(|| PlanReject::MissingLotMeta(sym.clone()))?;
         let tq_abs = tq.abs();
-        target_qty.insert(sym.clone(), tq);
         let t_notional = tq_abs * price;
         gross += t_notional;
         net += tq * price;
@@ -246,24 +273,8 @@ pub fn plan_targets(
 
         let diff = tq - cur;
         let diff_usd = diff.abs() * price;
-        let mk = |side: Side, qty: f64, reduce_only: bool, kind: IntentKind| OrderIntent {
-            symbol: sym.clone(),
-            side,
-            qty,
-            reference_price: price,
-            notional_usd: qty * price,
-            reduce_only,
-            kind,
-        };
-        let side_for = |delta: f64| if delta > 0.0 { Side::Buy } else { Side::Sell };
 
         if diff == 0.0 {
-            continue;
-        }
-        if tq == 0.0 {
-            // Go flat: close the whole leg, dust included (deadband and
-            // minimum do not apply to a close).
-            reducing.push(mk(side_for(-cur), cur.abs(), true, IntentKind::Close));
             continue;
         }
         if diff_usd < sizing.rebalance_deadband_usd {
@@ -591,6 +602,24 @@ mod tests {
             .label(),
             "missing_lot_meta"
         );
+    }
+
+    #[test]
+    fn flatten_needs_no_lot_metadata_for_the_symbol_being_closed() {
+        // A protective flatten (session halt, overdue fixed-window
+        // flatten) must still be able to close a held leg during a
+        // ticker-metadata outage: closing to the exact current venue
+        // quantity rounds nothing and has no minimum-order floor, so it
+        // must not require LotMeta the way opening or resizing does.
+        let cur = w(&[("DOT", 10.0)]);
+        let mut l = lots();
+        l.remove("DOT");
+        let p = plan_flatten(&cur, &prices(), &l, &sizing()).unwrap();
+        assert_eq!(p.intents.len(), 1);
+        assert_eq!(p.intents[0].symbol, "DOT");
+        assert_eq!(p.intents[0].qty, 10.0);
+        assert!(p.intents[0].reduce_only);
+        assert_eq!(p.intents[0].kind, IntentKind::Close);
     }
 
     #[test]
