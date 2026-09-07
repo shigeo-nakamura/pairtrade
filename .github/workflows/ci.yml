@@ -70,7 +70,7 @@ jobs:
         # guard was written for were sunset on 2026-09-06 (bot-strategy#937);
         # the guard now covers every trading unit this repo still deploys.
         run: |
-          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+(debot-pair-[a-z-]+|engine-b-live|debot-bull-holder)([[:space:]]|$)' .github/workflows/*.yml; then
+          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+(debot-pair-[a-z-]+|engine-b-live|debot-bull-holder|book-runtime-[a-z0-9-]+)([[:space:]]|$)' .github/workflows/*.yml; then
             echo "::error::CI workflow contains a forbidden 'systemctl restart/start <trading unit>' — trading services must be restarted manually only (bot-strategy#269)."
             exit 1
           fi

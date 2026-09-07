@@ -42,11 +42,19 @@ fi
 install -d -o root -g "$SERVICE_GROUP" -m 0750 "$INSTALL_DIR" "$INSTALL_DIR/bin" "$INSTALL_DIR/lib"
 install -o root -g "$SERVICE_GROUP" -m 0550 "$BINARY_SOURCE" "$INSTALL_DIR/bin/book_runtime"
 install -o root -g "$SERVICE_GROUP" -m 0440 "$LIBSIGNER_SOURCE" "$INSTALL_DIR/lib/libsigner.so"
-install -o root -g "$SERVICE_GROUP" -m 0440 "$CONFIG_SOURCE" "$INSTALL_DIR/${INSTANCE}.yaml"
 install -o root -g "$SERVICE_GROUP" -m 0550 "$FETCH_SCRIPT_SOURCE" "$INSTALL_DIR/bin/book_signal_fetch.sh"
 
-# The config must parse and fingerprint before it is allowed on the host.
-LD_LIBRARY_PATH="$INSTALL_DIR/lib" "$INSTALL_DIR/bin/book_runtime" --config "$INSTALL_DIR/${INSTANCE}.yaml" --validate >/dev/null
+# The config must parse and fingerprint before it replaces the installed
+# copy: validate a staged file first, then swap atomically, so a bad config
+# never displaces the last-known-good one the next restart would load.
+STAGED="$INSTALL_DIR/.${INSTANCE}.yaml.staged"
+trap 'rm -f "$STAGED"' EXIT
+install -o root -g "$SERVICE_GROUP" -m 0440 "$CONFIG_SOURCE" "$STAGED"
+if ! LD_LIBRARY_PATH="$INSTALL_DIR/lib" "$INSTALL_DIR/bin/book_runtime" --config "$STAGED" --validate >/dev/null; then
+  echo "book runtime config $CONFIG_SOURCE failed validation; installed config left untouched" >&2
+  exit 1
+fi
+mv -f "$STAGED" "$INSTALL_DIR/${INSTANCE}.yaml"
 
 install -d -o root -g "$SERVICE_GROUP" -m 0750 "$SECRETS_DIR"
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_ROOT" "$STATE_ROOT/${INSTANCE}"

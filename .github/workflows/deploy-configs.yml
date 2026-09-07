@@ -88,7 +88,7 @@ jobs:
         # bot-strategy#269: trading services are restarted manually only.
         # Keep this regex aligned with the matching guard in `ci.yml`.
         run: |
-          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+(debot-pair-[a-z-]+|engine-b-live|debot-bull-holder)([[:space:]]|$)' debot/.github/workflows/*.yml; then
+          if grep -nE 'systemctl[[:space:]]+(restart|start)[[:space:]]+(debot-pair-[a-z-]+|engine-b-live|debot-bull-holder|book-runtime-[a-z0-9-]+)([[:space:]]|$)' debot/.github/workflows/*.yml; then
             echo "::error::CI workflow contains a forbidden 'systemctl restart/start <trading unit>' — trading services must be restarted manually only (bot-strategy#269)."
             exit 1
           fi
@@ -229,8 +229,11 @@ jobs:
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exclude '*.env'",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
+              "install -d -m 0755 /tmp/book-units-__GITHUB_SHA__",
+              "for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u /tmp/book-units-__GITHUB_SHA__/$u; done",
               "install -d -m 0755 /tmp/engine-b-phase0-__GITHUB_SHA__",
               "aws s3 sync s3://__S3_BUCKET__/debot/engine-b-phase0/releases/__GITHUB_SHA__/ /tmp/engine-b-phase0-__GITHUB_SHA__/ --exact-timestamps",
+              "if [ -f __INSTALL_DIR__/bin/book_runtime ]; then sudo env BOOK_INSTANCE=xsmom-695 BOOK_LIBSIGNER_SOURCE=__INSTALL_DIR__/deploy/engine-b-live-libsigner.so BOOK_UNIT_SOURCE_DIR=/tmp/book-units-__GITHUB_SHA__ bash __INSTALL_DIR__/scripts/install_book_runtime.sh; else echo 'book_runtime binary not deployed yet (ci.yml); skipping book runtime install'; fi",
               "sudo env ENGINE_B_PHASE0_CODE_COMMIT=__GITHUB_SHA__ ENGINE_B_PHASE0_REQUIREMENTS=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_requirements.txt ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0.py ENGINE_B_PHASE0_ARCHIVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_archive.sh ENGINE_B_PHASE0_CONFIG_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/phase0.json ENGINE_B_PHASE0_CALENDAR_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/trading_calendar.json ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/tmp/engine-b-phase0-__GITHUB_SHA__/deploy bash /tmp/engine-b-phase0-__GITHUB_SHA__/scripts/install_engine_b_phase0.sh"
             ]
           }
