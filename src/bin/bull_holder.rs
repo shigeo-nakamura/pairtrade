@@ -495,6 +495,15 @@ fn perp_notional_usd(sizes: &BTreeMap<String, f64>, marks: &BTreeMap<String, f64
         .sum()
 }
 
+/// Does a leg's resting stop actually cover `size`? A tracked order is not
+/// enough: a stop placed for less than the position now open (a failed
+/// re-placement after a tranche, or a venue position larger than the book)
+/// leaves the remainder with no exchange-side protection.
+fn stop_covers(has_order: bool, stop_size: Option<f64>, size: f64) -> bool {
+    // 1e-9 absorbs f64 round-trips through state.json.
+    has_order && stop_size.map(|ss| ss + 1e-9 >= size).unwrap_or(false)
+}
+
 /// Runtime guard: liquidation must stay at least `clearance_pct` of drawdown
 /// beyond the furthest resting stop, or a drawdown liquidates the account
 /// before that stop can fire.
@@ -1238,15 +1247,23 @@ impl Engine {
                 return;
             }
         };
-        // Furthest resting stop; a perp leg without a resting stop counts at
-        // the configured stop distance (the level it would rest at).
-        let worst_stop = self
-            .state
-            .legs
-            .iter()
-            .filter(|(sym, _)| sizes.contains_key(*sym))
-            .map(|(sym, l)| match (l.stop_level, marks.get(sym)) {
-                (Some(level), Some(&mark)) if l.stop_order_id.is_some() => {
+        // Furthest protection level, plus the legs that have none. A stop
+        // only counts when it is tracked AND was placed for at least the size
+        // now open: a failed (re)placement, or a venue position larger than
+        // the stop we rest, leaves exposure the exchange cannot close. Such a
+        // leg keeps the configured distance for the numeric bar (the
+        // conservative choice — a larger distance demands more collateral)
+        // but is reported separately, because "collateral is sufficient" and
+        // "the position is protected" are different claims.
+        let mut worst_stop = f64::NEG_INFINITY;
+        let mut unprotected: Vec<String> = Vec::new();
+        for (sym, size) in &sizes {
+            let leg = self.state.legs.get(sym);
+            let covered = leg
+                .map(|l| stop_covers(l.stop_order_id.is_some(), l.stop_size, *size))
+                .unwrap_or(false);
+            match (leg.and_then(|l| l.stop_level), marks.get(sym), covered) {
+                (Some(level), Some(&mark), true) => {
                     if mark < level {
                         // Separate from collateral: the stop should have
                         // fired. Surface it — the guard treats it as zero
@@ -1255,17 +1272,47 @@ impl Engine {
                             "[STOP] {sym}: mark {mark:.2} is below the resting stop {level:.2} but the perp leg is still open — verify the trigger order on Lighter"
                         );
                     }
-                    stop_distance_pct(mark, level)
+                    worst_stop = worst_stop.max(stop_distance_pct(mark, level));
                 }
-                _ => self.cfg.stop_dd_pct,
-            })
-            .fold(f64::NEG_INFINITY, f64::max);
+                _ => {
+                    unprotected.push(sym.clone());
+                    worst_stop = worst_stop.max(self.cfg.stop_dd_pct);
+                }
+            }
+        }
         let liq = liquidation_distance_pct(equity, notional, self.cfg.lighter_mmr_pct)
             .unwrap_or(f64::INFINITY);
         let margin_pct = equity / notional * 100.0;
-        let breached =
-            margin_breached(liq, worst_stop, STOP_LIQ_CLEARANCE_PCT) || !unpriced.is_empty();
-        let detail = if breached {
+        let short_of_collateral = margin_breached(liq, worst_stop, STOP_LIQ_CLEARANCE_PCT);
+        let breached = short_of_collateral || !unpriced.is_empty() || !unprotected.is_empty();
+        // A top-up figure is only meaningful when the shortfall is purely a
+        // collateral one. With exposure the guard cannot model, or with legs
+        // the exchange cannot close, the notional and the stop used for that
+        // arithmetic are both wrong — say what has to be fixed instead of
+        // quoting a number that could be short or even negative.
+        let detail = if !unpriced.is_empty() {
+            format!(
+                "Lighter exposure the guard cannot model ({}); no top-up can be computed while it is open — close it or add the symbol to BULL_HOLDER_SYMBOLS. Modelled legs alone: liquidation at {liq:.1}% drawdown",
+                unpriced.join(", ")
+            )
+        } else if !unprotected.is_empty() {
+            format!(
+                "perp exposure with no covering exchange stop ({}) — re-place the stop; liquidation at {liq:.1}% drawdown{}",
+                unprotected.join(", "),
+                if short_of_collateral {
+                    format!(
+                        ", and collateral is short by ${:.2}",
+                        equity_for_distance_usd(
+                            notional,
+                            worst_stop + STOP_LIQ_CLEARANCE_PCT,
+                            self.cfg.lighter_mmr_pct,
+                        ) - equity
+                    )
+                } else {
+                    String::new()
+                }
+            )
+        } else if short_of_collateral {
             let need = equity_for_distance_usd(
                 notional,
                 worst_stop + STOP_LIQ_CLEARANCE_PCT,
@@ -2472,6 +2519,23 @@ mod tests {
         assert!(
             (perp_notional_usd(&sizes, &marks) - (0.02 * 80_000.0 + 0.5 * 2_500.0)).abs() < 1e-9
         );
+    }
+
+    #[test]
+    fn stop_only_counts_when_it_covers_the_open_size() {
+        // Exact and over-sized stops cover the position.
+        assert!(stop_covers(true, Some(0.02), 0.02));
+        assert!(stop_covers(true, Some(0.03), 0.02));
+        // A stop resting for LESS than what is open leaves the remainder
+        // unprotected — the venue-position-larger-than-book case.
+        assert!(!stop_covers(true, Some(0.01), 0.02));
+        // No resting order, or none recorded: no protection either way.
+        assert!(!stop_covers(false, Some(0.02), 0.02));
+        assert!(!stop_covers(true, None, 0.02));
+        // A state.json round-trip must not read as under-covered.
+        let round_tripped: f64 =
+            serde_json::from_str(&serde_json::to_string(&0.02).unwrap()).unwrap();
+        assert!(stop_covers(true, Some(round_tripped), 0.02));
     }
 
     #[test]
