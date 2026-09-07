@@ -18,6 +18,7 @@ export PATH="$T/bin:$PATH"
 export BOOK_SIGNAL_MAX_AGE_SECS=7200
 export BOOK_SIGNAL_PRODUCER_ID=p
 export BOOK_DECISION_TIME_UTC=23:59
+export BOOK_SCHEDULE_KIND=daily
 export BOOK_UNIVERSE=BTC,ETH
 export BOOK_MAX_SYMBOL_WEIGHT=0.5
 export BOOK_NET_TOLERANCE=0.05
@@ -68,6 +69,10 @@ json.dump(rehash(big), open(f"{t}/bad_symbol_cap.json", "w"))
 skew = json.loads(json.dumps(d))
 skew["weights"] = {"BTC": 0.4, "ETH": -0.1}
 json.dump(rehash(skew), open(f"{t}/bad_net.json", "w"))
+# A date-shaped key that is neither the current nor the next decision.
+oldkey = json.loads(json.dumps(d))
+oldkey["decision_key"] = (datetime.datetime.strptime(d["decision_key"], "%Y-%m-%d") - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+json.dump(rehash(oldkey), open(f"{t}/bad_old_key.json", "w"))
 stale = json.loads(json.dumps(d))
 stale["generated_at"] = "2020-01-01T00:00:00Z"
 stale["as_of"] = "2020-01-01T00:00:00Z"
@@ -83,7 +88,7 @@ PY
 bash "$HERE/book_signal_fetch.sh" "$T/good.json" "$T/dst/signal.json" | grep -q "updated .*($KEY "
 cmp -s "$T/good.json" "$T/dst/signal.json"
 
-for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_stale bad_producer bad_after_decision bad_universe bad_symbol_cap bad_net bad_json; do
+for bad in bad_missing bad_hash bad_ts_type bad_weight_type bad_lookahead bad_schema_bool bad_schema_float bad_nan_meta bad_dup_key bad_future bad_stale bad_producer bad_after_decision bad_universe bad_symbol_cap bad_net bad_old_key bad_json; do
   if bash "$HERE/book_signal_fetch.sh" "$T/$bad.json" "$T/dst/signal.json" 2>/dev/null; then
     echo "FAIL: $bad was promoted" >&2; exit 1
   fi

@@ -93,6 +93,8 @@ fi
 # leaves this empty and the fetcher skips that one check.
 KIND=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*kind:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
 DECISION_TIME=""
+ANCHOR_DATE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*anchor_date:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
+EVERY_DAYS=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*every_days:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
 case "$KIND" in
   interval_days|daily)
     DECISION_TIME=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*decision_time_utc:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
@@ -114,6 +116,9 @@ fi
   printf 'BOOK_SIGNAL_MAX_AGE_SECS=%s\n' "$MAX_AGE"
   printf 'BOOK_SIGNAL_PRODUCER_ID=%s\n' "$PRODUCER"
   printf 'BOOK_DECISION_TIME_UTC=%s\n' "$DECISION_TIME"
+  printf 'BOOK_SCHEDULE_KIND=%s\n' "$KIND"
+  printf 'BOOK_ANCHOR_DATE=%s\n' "$ANCHOR_DATE"
+  printf 'BOOK_EVERY_DAYS=%s\n' "$EVERY_DAYS"
   printf 'BOOK_MAX_SYMBOL_WEIGHT=%s\n' "${MAX_SYMBOL_WEIGHT:-}"
   printf 'BOOK_NET_TOLERANCE=%s\n' "${NET_TOLERANCE:-0.05}"
   printf 'BOOK_REQUIRE_DOLLAR_NEUTRAL=%s\n' "${REQUIRE_NEUTRAL:-true}"

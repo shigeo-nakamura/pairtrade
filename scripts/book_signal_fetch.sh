@@ -13,7 +13,9 @@
 # (the decision time a date-keyed schedule derives from decision_key, for
 # the as_of look-ahead bound; empty for calendar schedules), plus the
 # weight constraints BOOK_UNIVERSE / BOOK_MAX_SYMBOL_WEIGHT /
-# BOOK_NET_TOLERANCE / BOOK_REQUIRE_DOLLAR_NEUTRAL. Any of them
+# BOOK_NET_TOLERANCE / BOOK_REQUIRE_DOLLAR_NEUTRAL, and the grid
+# (BOOK_SCHEDULE_KIND / BOOK_ANCHOR_DATE / BOOK_EVERY_DAYS) that says
+# which decision key is current. Any of them
 # unset skips only its own check -- the runtime remains authoritative, the
 # point here is to not displace a usable local file with one it will
 # reject.
@@ -42,9 +44,12 @@ if ! SUMMARY=$(BOOK_SIGNAL_MAX_AGE_SECS="${BOOK_SIGNAL_MAX_AGE_SECS:-}" \
   BOOK_NET_TOLERANCE="${BOOK_NET_TOLERANCE:-}" \
   BOOK_REQUIRE_DOLLAR_NEUTRAL="${BOOK_REQUIRE_DOLLAR_NEUTRAL:-}" \
   BOOK_UNIVERSE="${BOOK_UNIVERSE:-}" \
+  BOOK_SCHEDULE_KIND="${BOOK_SCHEDULE_KIND:-}" \
+  BOOK_ANCHOR_DATE="${BOOK_ANCHOR_DATE:-}" \
+  BOOK_EVERY_DAYS="${BOOK_EVERY_DAYS:-}" \
   python3 - "$TMP" <<'PY'
 import hashlib, json, math, os, sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 def _reject_constant(token):
     raise SystemExit(f"non-standard JSON constant {token} (the runtime's parser rejects it)")
 def _no_duplicate_keys(pairs):
@@ -89,7 +94,40 @@ want_producer = os.environ.get("BOOK_SIGNAL_PRODUCER_ID", "").strip()
 if want_producer and d["producer_id"] != want_producer:
     # A routing mistake upstream must not displace this instance's signal.
     raise SystemExit(f"producer_id {d['producer_id']!r} != configured {want_producer!r}")
+kind = os.environ.get("BOOK_SCHEDULE_KIND", "").strip()
 decision_time = os.environ.get("BOOK_DECISION_TIME_UTC", "").strip()
+if decision_time and kind in ("interval_days", "daily"):
+    # The runtime only accepts the key of the decision that is current at
+    # the time it reads the file. Accept that key or the next one (the
+    # producer publishes a few minutes before the decision instant); any
+    # other date-shaped key -- a regenerated previous grid date, say --
+    # would be refused by the runtime and must not displace a usable file.
+    hh, mm = (int(x) for x in decision_time.split(":"))
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    today = now_utc.date()
+    if kind == "daily":
+        cur = today if now_utc.time() >= datetime(2000, 1, 1, hh, mm).time() else today - timedelta(days=1)
+        nxt = cur + timedelta(days=1)
+    else:
+        anchor_s = os.environ.get("BOOK_ANCHOR_DATE", "").strip()
+        every = int(os.environ.get("BOOK_EVERY_DAYS", "0") or 0)
+        if not anchor_s or every <= 0:
+            raise SystemExit("interval_days schedule without BOOK_ANCHOR_DATE/BOOK_EVERY_DAYS")
+        anchor = datetime.strptime(anchor_s, "%Y-%m-%d").date()
+        delta = (today - anchor).days
+        if delta < 0:
+            cur, nxt = None, anchor
+        else:
+            aligned = anchor + timedelta(days=(delta // every) * every)
+            if aligned == today and now_utc.time() < datetime(2000, 1, 1, hh, mm).time():
+                aligned = aligned - timedelta(days=every)
+            cur = aligned if aligned >= anchor else None
+            nxt = (cur + timedelta(days=every)) if cur else anchor
+    allowed = {k.isoformat() for k in (cur, nxt) if k}
+    if d["decision_key"] not in allowed:
+        raise SystemExit(
+            f"decision_key {d['decision_key']} is not the current or next decision ({', '.join(sorted(allowed))})"
+        )
 if decision_time:
     # Date-keyed schedules: decision_key IS the decision date, so the
     # decision instant is derivable here and as_of must not be after it.
