@@ -67,6 +67,10 @@ class ProducerTests(unittest.TestCase):
         bad = dict(ROW, book=[])
         with self.assertRaises(SystemExit):
             xp.build(bad, 1000.0, datetime.now(timezone.utc))
+        for bad_notional in [True, "45.45", float("nan")]:
+            bad = dict(ROW, book={"LIT": {"side": 1, "notional": bad_notional}})
+            with self.assertRaises(SystemExit):
+                xp.build(bad, 1000.0, datetime.now(timezone.utc))
         flat = dict(ROW, book={})
         self.assertEqual(xp.build(flat, 1000.0, datetime.now(timezone.utc))["weights"], {})
 

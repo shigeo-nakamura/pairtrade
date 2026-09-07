@@ -46,6 +46,7 @@ jobs:
           python3 -m py_compile debot/scripts/book_signal_file.py debot/scripts/test_book_signal_file.py
           python3 debot/scripts/test_book_signal_file.py
           python3 debot/scripts/test_xsmom_signal_producer.py
+          bash debot/scripts/test_book_signal_fetch.sh
 
       - name: Test Engine B Phase 0 observer
         run: |

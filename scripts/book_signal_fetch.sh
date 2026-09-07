@@ -30,8 +30,8 @@ d = json.load(open(sys.argv[1]))
 for k in ("schema_version", "producer_id", "generated_at", "as_of", "decision_key", "weights", "payload_sha256"):
     if k not in d:
         raise SystemExit(f"missing field {k}")
-if d["schema_version"] != 1:
-    raise SystemExit(f"schema_version {d['schema_version']} != 1")
+if isinstance(d["schema_version"], bool) or not isinstance(d["schema_version"], int) or d["schema_version"] != 1:
+    raise SystemExit(f"schema_version must be the integer 1, got {d['schema_version']!r}")
 for k in ("producer_id", "decision_key", "payload_sha256"):
     if not isinstance(d[k], str) or not d[k].strip():
         raise SystemExit(f"{k} must be a non-empty string")

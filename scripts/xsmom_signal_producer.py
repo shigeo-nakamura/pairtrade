@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -77,7 +78,10 @@ def weights_from_book(book, gross: float) -> dict:
         if isinstance(raw_side, bool) or raw_side not in (1, -1):
             raise SystemExit(f"{sym}: side must be exactly +1/-1, got {raw_side!r}")
         side = int(raw_side)
-        notional = float(leg["notional"])
+        raw_notional = leg["notional"]
+        if isinstance(raw_notional, bool) or not isinstance(raw_notional, (int, float)) or not math.isfinite(float(raw_notional)):
+            raise SystemExit(f"{sym}: notional must be a finite number, got {raw_notional!r}")
+        notional = float(raw_notional)
         if notional < 0:
             raise SystemExit(f"{sym}: negative notional {notional}")
         if notional == 0:
