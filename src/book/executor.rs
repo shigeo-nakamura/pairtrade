@@ -618,7 +618,14 @@ impl Executor for LiveExecutor {
                         value += v;
                     }
                 }
-                if saw_record && all_fees_known {
+                // The fills endpoint is eventually consistent: a matched
+                // slice that is missing some already-landed fills still
+                // reports its own fees as fully known. Only trust the total
+                // once the matched size covers what the position delta
+                // confirmed was actually filled; otherwise leave it unknown
+                // rather than freeze it short.
+                let covers_confirmed = size + intent.qty.abs() * 1e-6 >= filled;
+                if saw_record && all_fees_known && covers_confirmed {
                     fee_usd = Some(fee_acc);
                 }
                 if size > 0.0 {

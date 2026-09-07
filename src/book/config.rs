@@ -438,13 +438,18 @@ fn anchored_path(p: &Path) -> PathBuf {
     }
 }
 
-/// A path in a form two configured paths can be compared by: the
-/// directory resolved through symlinks and `..` when it exists (so
-/// `a/b.json` and `a/../a/b.json` are recognised as one file), with the
-/// file name appended. Before the first run creates that directory the
-/// path is folded lexically instead, which catches the same aliasing for
-/// everything but a symlink that does not exist yet either.
+/// A path in a form two configured paths can be compared by: the whole
+/// path resolved through symlinks and `..` when it exists, so a leaf alias
+/// (`ledger.jsonl -> state.json`) and not just a `..` in the directory
+/// (`a/../a/b.json`) is caught. Before that file exists -- the common case
+/// on first run -- only its parent directory can be canonicalized, and the
+/// leaf name is appended lexically; that still catches directory-level
+/// aliasing for everything but a leaf symlink that does not exist yet
+/// either. Before even the directory exists, the path is folded lexically.
 fn resolved_path(p: &Path) -> PathBuf {
+    if let Ok(full) = p.canonicalize() {
+        return full;
+    }
     match (p.parent(), p.file_name()) {
         (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => match dir.canonicalize() {
             Ok(d) => d.join(name),
@@ -553,6 +558,22 @@ mod tests {
         c.paths.state = PathBuf::from("not-created-yet/shared.json");
         c.paths.ledger = cwd.join("not-created-yet").join("shared.json");
         assert!(c.validate().is_err());
+        // An existing leaf symlink aliases two paths that look distinct
+        // right down to the file name.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("state.json"), "{}").unwrap();
+            std::os::unix::fs::symlink(
+                dir.path().join("state.json"),
+                dir.path().join("ledger.jsonl"),
+            )
+            .unwrap();
+            let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+            c.paths.state = dir.path().join("state.json");
+            c.paths.ledger = dir.path().join("ledger.jsonl");
+            assert!(c.validate().is_err());
+        }
     }
 
     #[test]

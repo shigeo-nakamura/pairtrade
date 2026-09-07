@@ -107,9 +107,11 @@ pub struct ExecSummary {
     /// because every opening was administratively blocked must not spend
     /// an execution attempt).
     pub sent: usize,
-    /// Symbols among those. An attempt is only spent on what the venue
-    /// actually saw: a filled reduction must not consume the budget of an
-    /// opening that aborted before it was sent.
+    /// Symbols among those the venue actually saw, excluding a flip's
+    /// reduce-only close: that close must not consume the budget of its
+    /// paired opening, whether that opening aborted before it was sent or
+    /// was blocked outright. A standalone reduction (no opening leg for the
+    /// same symbol in this plan) still counts.
     pub sent_symbols: BTreeSet<String>,
     pub filled: usize,
     pub partial: usize,
@@ -1084,6 +1086,17 @@ impl BookEngine {
         // without latching only the first opening after the breach would
         // be stopped and the next would go out against the same rail.
         let mut rail_blocked: Option<String> = None;
+        // Symbols with a paired opening leg in this plan: a sign flip is
+        // split into a reduce-only close followed by an opening intent for
+        // the same symbol (see `rebalance::plan_targets`). The close must
+        // not spend that symbol's attempt budget itself, or a blocked or
+        // aborted opening right after it would never get to retry.
+        let flip_symbols: std::collections::HashSet<&str> = plan
+            .intents
+            .iter()
+            .filter(|i| !i.reduce_only)
+            .map(|i| i.symbol.as_str())
+            .collect();
         for (idx, intent) in plan.intents.iter().enumerate() {
             // Re-check the caps against the book that actually exists (see
             // `opening_cap_breach`): reductions ahead of this intent may
@@ -1147,7 +1160,13 @@ impl BookEngine {
             match self.exec.execute(intent).await {
                 Ok(fill) => {
                     s.sent += 1;
-                    s.sent_symbols.insert(intent.symbol.clone());
+                    // A flip's close does not spend the budget its paired
+                    // opening still needs; a standalone reduction (no
+                    // opening leg for this symbol in the plan) still counts,
+                    // unchanged from before.
+                    if !intent.reduce_only || !flip_symbols.contains(intent.symbol.as_str()) {
+                        s.sent_symbols.insert(intent.symbol.clone());
+                    }
                     if fill.filled_qty > 0.0 {
                         self.accrue_funding(&intent.symbol, now, intent.reference_price, rate);
                         fills_since_check = true;
@@ -1168,7 +1187,10 @@ impl BookEngine {
                     let pre_send = e.downcast_ref::<PreSendAbort>().is_some();
                     if !pre_send {
                         s.sent += 1;
-                        s.sent_symbols.insert(intent.symbol.clone());
+                        // Same flip-stage rule as the success path.
+                        if !intent.reduce_only || !flip_symbols.contains(intent.symbol.as_str()) {
+                            s.sent_symbols.insert(intent.symbol.clone());
+                        }
                         // The order was submitted and its outcome is
                         // unknown: it may have filled and moved both the
                         // book and the rails without us seeing it. Stop
@@ -2245,8 +2267,11 @@ mod tests {
         /// When set, `execute` asserts that `state.json` at this path already
         /// carries the decision record (hash + targets) for the order.
         state_path: Option<std::path::PathBuf>,
-        /// Symbol whose orders abort before reaching the venue (the shape
-        /// of a missing send-time price or a drift-guard rejection).
+        /// Symbol whose *opening* orders abort before reaching the venue
+        /// (the shape of a missing send-time price or a drift-guard
+        /// rejection). Reduce-only orders for the same symbol still go
+        /// through, so a flip's close can be made to succeed while its
+        /// paired opening aborts.
         abort_symbol: Option<String>,
         /// Symbol whose orders fill only half, so the leg stays residual
         /// after the venue has seen it.
@@ -2284,7 +2309,7 @@ mod tests {
             Some(0.001)
         }
         async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
-            if self.abort_symbol.as_deref() == Some(intent.symbol.as_str()) {
+            if !intent.reduce_only && self.abort_symbol.as_deref() == Some(intent.symbol.as_str()) {
                 return Err(anyhow::anyhow!(PreSendAbort(format!(
                     "live: no price for {}",
                     intent.symbol
@@ -2551,6 +2576,68 @@ mod tests {
                 .iter()
                 .any(|r| r["event"] == "order_intent" && r["intent"]["symbol"] == "SOL"),
             "the leg that used its attempt is not retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flip_close_does_not_spend_the_attempt_of_its_own_aborted_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.dry_run = false;
+        cfg.execution.max_attempts = 1;
+        cfg.signal.require_dollar_neutral = false;
+        let d = ts("2026-09-06T00:30:00Z");
+        // Book is long $500 of SOL; the signal flips it to a $100 short.
+        // The close (reduce-only, full $500) reaches the venue and fills,
+        // but the opening leg of the same flip aborts before it is sent (no
+        // send-time price). A per-symbol counter that does not distinguish
+        // the flip's two stages would treat the close's send as spending
+        // SOL's sole attempt and never retry the still-unsent short.
+        write_signal(dir.path(), "2026-09-06", d, &[("SOL", -0.1)]);
+        let mut state = BookState::new(&cfg.instance_id);
+        state.apply_fill("SOL", 2.5, 200.0, d.timestamp() - 3600);
+        state.persist(&cfg.paths.state).unwrap();
+        let venue = Arc::new(MockVenue {
+            prices: [("SOL".to_string(), 200.0)].into(),
+            positions: Mutex::new(
+                [(
+                    "SOL".to_string(),
+                    VenuePosition {
+                        qty: 2.5,
+                        entry_price: Some(200.0),
+                    },
+                )]
+                .into(),
+            ),
+            equity_ok: std::sync::atomic::AtomicBool::new(true),
+            state_path: None,
+            abort_symbol: Some("SOL".to_string()),
+            half_fill_symbol: None,
+        });
+        let scheduler = Scheduler::build(&cfg.schedule, vec![]).unwrap();
+        let status = StatusWriter::new(cfg.paths.status.clone(), None);
+        let signals = Box::new(DirSignalSource::new(dir.path().join("signals")));
+        let mut engine = BookEngine::new(cfg.clone(), scheduler, venue, signals, status).unwrap();
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Partial);
+        assert!(engine.state.is_flat(), "the close fully filled");
+        assert_eq!(
+            rec.attempts_for("SOL"),
+            0,
+            "the close's send must not spend the still-unsent opening's attempt"
+        );
+        // With max_attempts: 1 the opening still has to have budget left to
+        // retry at all.
+        let before = rows(&cfg.paths.ledger).len();
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        let new_rows = &rows(&cfg.paths.ledger)[before..];
+        assert!(
+            new_rows.iter().any(|r| r["event"] == "order_intent"
+                && r["intent"]["symbol"] == "SOL"
+                && r["intent"]["reduce_only"] == false),
+            "the flip's opening is retried"
         );
     }
 
