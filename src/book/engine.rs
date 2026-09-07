@@ -214,7 +214,14 @@ impl BookEngine {
         } else if self.state.session.halted && self.cfg.risk.risk_ack_path.exists() {
             log::warn!("[RISK] RISK_ACK present but venue equity is unavailable; ack deferred");
         }
-        let events = self.risk.evaluate(&mut self.state, now, equity);
+        // Anchors, rollovers, and the loss limits are only ever evaluated
+        // against a fresh venue equity (paper equity is always fresh): a
+        // fallback value would anchor the session/day at a stale number.
+        let events = if equity_ready {
+            self.risk.evaluate(&mut self.state, now, equity)
+        } else {
+            Vec::new()
+        };
         for ev in &events {
             match ev {
                 RiskEvent::SessionHalt { .. } => {
@@ -328,6 +335,18 @@ impl BookEngine {
                     "entry_price": entry,
                 }),
             );
+            // Settle the stored leg's funding up to now before its quantity
+            // or basis changes, so the next accrual applies only to the
+            // adopted leg from this instant.
+            if self.state.positions.contains_key(&sym) {
+                let rate = self.exec.funding_rate_hourly(&sym).await;
+                let px = prices
+                    .get(&sym)
+                    .copied()
+                    .or_else(|| self.state.positions.get(&sym).map(|p| p.avg_price))
+                    .unwrap_or(0.0);
+                self.accrue_funding(&sym, now, px, rate);
+            }
             if venue_qty == 0.0 {
                 self.state.positions.remove(&sym);
             } else {
@@ -342,6 +361,7 @@ impl BookEngine {
                         funding_accrued_at: Some(now),
                     });
                 p.qty = venue_qty;
+                p.funding_accrued_at = Some(now);
                 // The venue's average entry is the only consistent basis
                 // once the book and the venue disagree (externally placed
                 // fill, or a crash between execution and persistence).
@@ -1472,7 +1492,7 @@ mod tests {
             }
         }
         async fn funding_rate_hourly(&self, _symbol: &str) -> Option<f64> {
-            None
+            Some(0.001)
         }
         async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
             if let Some(p) = &self.state_path {
@@ -1519,7 +1539,8 @@ mod tests {
         cfg.dry_run = false;
         // Book remembers 1 SOL @ 100; the venue says 3 SOL @ 150 (external add).
         let mut state = BookState::new(&cfg.instance_id);
-        state.apply_fill("SOL", 1.0, 100.0, 1);
+        // Opened one hour before the reconcile tick, funding never accrued.
+        state.apply_fill("SOL", 1.0, 100.0, secs("2026-09-05T23:00:00Z"));
         state.persist(&cfg.paths.state).unwrap();
         let venue = Arc::new(MockVenue {
             prices: [("SOL".to_string(), 160.0)].into(),
@@ -1545,6 +1566,10 @@ mod tests {
         let p = &engine.state.positions["SOL"];
         assert_eq!(p.qty, 3.0);
         assert_eq!(p.avg_price, 150.0);
+        // The old 1-lot leg was settled for its hour at the mid before the
+        // adoption, and the adopted leg accrues from the reconcile instant.
+        assert_eq!(p.funding_accrued_at, Some(secs("2026-09-06T00:00:00Z")));
+        assert!((engine.state.cum_funding_est_usd - (-1.0 * 160.0 * 0.001 * 1.0)).abs() < 1e-9);
         let adopt = rows(&cfg.paths.ledger)
             .into_iter()
             .find(|r| r["event"] == "adopt")
@@ -1581,6 +1606,10 @@ mod tests {
             BookEngine::new(cfg.clone(), scheduler, venue.clone(), signals, status).unwrap();
         engine.tick(d.timestamp()).await.unwrap();
         assert!(engine.state.is_flat());
+        // No anchors while equity is stale.
+        assert_eq!(engine.state.session.start_at, 0);
+        assert_eq!(engine.state.session.start_equity, 0.0);
+        assert!(engine.state.daily.date.is_empty());
         let blocked: Vec<Value> = rows(&cfg.paths.ledger)
             .into_iter()
             .filter(|r| r["event"] == "order_blocked")
@@ -1601,6 +1630,9 @@ mod tests {
             DecisionOutcome::Applied
         );
         assert!(!engine.state.is_flat());
+        // Anchored on the first fresh reading.
+        assert_eq!(engine.state.session.start_equity, 1000.0);
+        assert_eq!(engine.state.daily.date, "2026-09-06");
     }
 
     #[tokio::test]

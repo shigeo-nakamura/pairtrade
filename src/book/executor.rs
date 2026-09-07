@@ -207,10 +207,18 @@ impl Executor for PaperExecutor {
 pub struct LiveExecutor {
     connector: Arc<dyn DexConnector + Send + Sync>,
     prices: RwLock<HashMap<String, f64>>,
+    /// Ticker-sourced prices for symbols the WS feed does not carry (a leg
+    /// adopted from the venue outside the configured universe), with the
+    /// instant they were fetched; refreshed at most every
+    /// `FALLBACK_PRICE_TTL_SECS` so a reduce-only close of such a leg can
+    /// always be priced without hammering the REST fallback.
+    fallback_prices: RwLock<HashMap<String, (f64, Instant)>>,
     fill_confirm_timeout_secs: i64,
     slippage_bps: u32,
     allow_venue_protection_fallback: bool,
 }
+
+const FALLBACK_PRICE_TTL_SECS: u64 = 60;
 
 /// Whether `mid` is still within `slippage_bps` of the price the intent
 /// was sized at, in the adverse direction for `side` (a favourable move
@@ -236,6 +244,7 @@ impl LiveExecutor {
         Self {
             connector,
             prices: RwLock::new(HashMap::new()),
+            fallback_prices: RwLock::new(HashMap::new()),
             fill_confirm_timeout_secs,
             slippage_bps,
             allow_venue_protection_fallback,
@@ -335,11 +344,37 @@ impl Executor for LiveExecutor {
     }
 
     async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
-        let p = self.prices.read().await;
-        symbols
-            .iter()
-            .filter_map(|s| p.get(s).map(|v| (s.clone(), *v)))
-            .collect()
+        let mut out: HashMap<String, f64> = {
+            let p = self.prices.read().await;
+            symbols
+                .iter()
+                .filter_map(|s| p.get(s).map(|v| (s.clone(), *v)))
+                .collect()
+        };
+        let missing: Vec<&String> = symbols.iter().filter(|s| !out.contains_key(*s)).collect();
+        for s in missing {
+            let cached = self.fallback_prices.read().await.get(s).copied();
+            match cached {
+                Some((px, at)) if at.elapsed().as_secs() < FALLBACK_PRICE_TTL_SECS => {
+                    out.insert(s.clone(), px);
+                }
+                _ => match self.connector.get_ticker(s, None).await {
+                    Ok(t) => {
+                        if let Some(px) = t.price.to_f64().filter(|p| *p > 0.0) {
+                            self.fallback_prices
+                                .write()
+                                .await
+                                .insert(s.clone(), (px, Instant::now()));
+                            out.insert(s.clone(), px);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("[PRICE] no WS mid for {s} and ticker fallback failed: {e:?}")
+                    }
+                },
+            }
+        }
+        out
     }
 
     async fn lot_meta(&self, symbol: &str) -> Result<LotMeta> {

@@ -207,7 +207,11 @@ reduce_only }`.
   truth; any leg whose venue quantity differs from the book (opened or
   changed elsewhere, or by a crashed previous run) is adopted at the
   venue's quantity **and** average entry price (mid when the venue reports
-  none) and logged `[ADOPT]`; a leg the venue no longer holds is dropped.
+  none) and logged `[ADOPT]`; the stored leg's funding is settled up to
+  that instant first. A leg the venue no longer holds is dropped. The
+  runtime subscribes prices for the universe plus every persisted leg, and
+  a leg adopted outside that set is priced from the venue ticker (60 s
+  cache) so a reduce-only close can always be planned.
 - DRY_RUN: the paper book lives in `state.json`; fills are at
   `mid * (1 +/- paper_slippage_bps)` with `paper_fee_bps`; quantities are
   rounded the same way as live, so paper and live share every code path
@@ -221,8 +225,9 @@ reduce_only }`.
 - **Kill switch** (`risk.kill_switch_path` exists): no opening intents;
   reducing intents and flattens still run.
 - **Venue equity unavailable** (live `get_balance` fails or returns a
-  non-positive number): the tick evaluates the rails against the last
-  observation but blocks every opening intent (`order_blocked
+  non-positive number): the tick does not anchor, roll over, or evaluate
+  the rails at all (a stale number must never become an anchor) and blocks
+  every opening intent (`order_blocked
   reason=equity_unavailable`, `book.equity_ready=false` in `status.json`)
   until a fresh value is read; reductions and flattens still run.
 - **Session drawdown halt**: `session_start_equity - equity >

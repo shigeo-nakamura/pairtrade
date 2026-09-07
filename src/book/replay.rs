@@ -157,6 +157,11 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         let mut ticks: Vec<i64> = Vec::new();
         for d in scheduler.decisions_between(day_start, day_end - 1) {
             ticks.push(d.decision_at);
+            if let Some(f) = d.flatten_at {
+                if (day_start..day_end).contains(&f) {
+                    ticks.push(f);
+                }
+            }
         }
         // Flattens scheduled inside this day may belong to an earlier decision.
         let mut probe = day_start;
@@ -396,6 +401,47 @@ mod tests {
             .unwrap();
         assert_eq!(d0708["outcome"], "rejected");
         assert_eq!(d0708["reason"], "missing_price");
+    }
+
+    #[tokio::test]
+    async fn first_calendar_entry_after_midnight_flattens_at_its_own_time() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        let mut c = cfg();
+        c.schedule.kind = crate::book::config::ScheduleKind::Calendar;
+        c.schedule.anchor_date = None;
+        c.schedule.every_days = None;
+        c.schedule.decision_time_utc = None;
+        c.schedule.flatten_after_secs = None;
+        c.schedule.signal_grace_secs = 600;
+        c.schedule.calendar_path = Some(dir.path().join("cal.json"));
+        c.signal.require_dollar_neutral = false;
+        c.sizing.max_net_usd = 1_000.0;
+        std::fs::write(
+            dir.path().join("cal.json"),
+            r#"{"entries":[{"decision_key":"2026-07-05","decision_at":"2026-07-05T06:30:00Z","flatten_at":"2026-07-05T13:30:00Z"}]}"#,
+        )
+        .unwrap();
+        let decision_at = ts("2026-07-05T06:30:00Z");
+        let body = signal_json(
+            "test_producer",
+            decision_at - Duration::minutes(10),
+            decision_at - Duration::minutes(30),
+            "2026-07-05",
+            &[("SOL", 0.5)],
+        );
+        std::fs::create_dir_all(dir.path().join("signals")).unwrap();
+        std::fs::write(dir.path().join("signals").join("2026-07-05.json"), body).unwrap();
+        let out = dir.path().join("out");
+        run(c, dir.path(), &out).await.unwrap();
+        let ledger = read_rows(&out.join("ledger.jsonl"));
+        let flatten: Vec<_> = ledger.iter().filter(|r| r["event"] == "flatten").collect();
+        assert_eq!(flatten.len(), 1);
+        assert_eq!(
+            flatten[0]["ts_ms"],
+            ts("2026-07-05T13:30:00Z").timestamp_millis()
+        );
+        assert_eq!(flatten[0]["flat"], true);
     }
 
     #[tokio::test]

@@ -130,7 +130,19 @@ async fn main() -> Result<()> {
     let process_started_at = now_secs();
     prom::record_process_info(&cfg.instance_id, process_started_at);
 
-    let symbols = cfg.universe.symbols.clone();
+    // Subscribe the universe plus every symbol the persisted book still
+    // holds (a leg removed from the universe must stay priceable so it can
+    // be closed); legs adopted from the venue at runtime fall back to the
+    // ticker price inside LiveExecutor.
+    let mut symbols = cfg.universe.symbols.clone();
+    for s in debot::book::state::BookState::load_or_new(&cfg.paths.state, &cfg.instance_id)?
+        .positions
+        .keys()
+    {
+        if !symbols.contains(s) {
+            symbols.push(s.clone());
+        }
+    }
     let connector = DexConnectorBox::create(
         &cfg.venue,
         cfg.dry_run,
