@@ -735,6 +735,8 @@ struct Engine {
     state: State,
     last_status_write: u64,
     last_reconcile: u64,
+    /// When `margin_monitor` last ran (it also runs while halted).
+    last_margin_check: u64,
     /// Last runtime collateral-guard evaluation (status.json `margin`).
     last_margin: Option<MarginSnapshot>,
 }
@@ -997,6 +999,13 @@ impl Engine {
     /// fail closed). DRY_RUN evaluates and logs but never blocks — the
     /// DRY_RUN account holds no real collateral, so it would always be short.
     async fn margin_precheck(&self, adding_perp_usd: f64) -> Result<Option<String>> {
+        // `PERP_FRACTION=0` is a valid spot-only book. Decide that from state
+        // alone, BEFORE any venue read, so a Lighter outage cannot halt an
+        // ARM (or postpone a tranche) that needs no Lighter collateral.
+        let holds_perp = self.state.legs.values().any(|l| l.perp_size > 0.0);
+        if adding_perp_usd <= 0.0 && !holds_perp {
+            return Ok(None);
+        }
         let marks = self.lighter_marks().await?;
         let after = self.held_perp_notional_usd(&marks) + adding_perp_usd.max(0.0);
         if after <= 0.0 {
@@ -1036,6 +1045,7 @@ impl Engine {
     /// must keep running) and never de-risks; the remedy is a deposit.
     async fn margin_monitor(&mut self) {
         let now = now_secs();
+        self.last_margin_check = now;
         let marks = match self.lighter_marks().await {
             Ok(m) => m,
             Err(e) => {
@@ -1755,6 +1765,15 @@ impl Engine {
 
         if self.state.halted {
             log::error!("[HALT] active: {:?}", self.state.halt_reason);
+            // A halt blocks orders, not observation: perp collateral keeps
+            // eroding while the operator investigates, so keep the read-only
+            // collateral guard running on the reconcile cadence. Without this
+            // the last [MARGIN] snapshot would freeze until RISK_ACK.
+            if self.state.mode == Mode::On
+                && now.saturating_sub(self.last_margin_check) >= self.cfg.reconcile_every_secs
+            {
+                self.margin_monitor().await;
+            }
         } else if self.state.mode == Mode::On && intent != OperatorIntent::DisarmNow {
             self.daily_eval().await;
             // Next entry tranche, only if still On after the daily exit check
@@ -1903,6 +1922,7 @@ async fn main() -> Result<()> {
         state,
         last_status_write: 0,
         last_reconcile: 0,
+        last_margin_check: 0,
         last_margin: None,
         cfg,
     };
