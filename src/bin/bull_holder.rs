@@ -499,6 +499,18 @@ fn perp_notional_usd(sizes: &BTreeMap<String, f64>, marks: &BTreeMap<String, f64
 /// enough: a stop placed for less than the position now open (a failed
 /// re-placement after a tranche, or a venue position larger than the book)
 /// leaves the remainder with no exchange-side protection.
+///
+/// KNOWN LIMIT (bot-strategy#950): this trusts `stop_order_id` to still be
+/// resting on Lighter. A stop canceled at the venue, or a cancel whose
+/// response was lost, keeps the id in state and reads here as covered.
+/// Cross-checking `get_open_orders` was deliberately NOT added yet: that
+/// connector path returns WS-tracked orders only (no REST fallback), and
+/// whether Lighter publishes resting TRIGGER orders on that channel is
+/// unverified — pairtrade has never exercised Lighter trigger orders live
+/// (see this file's KNOWN GAPS and bot-strategy#895). Wiring the check
+/// against a channel that omits them would report every stop as missing,
+/// which is worse than the gap it closes. Settle it with the #895 live
+/// stop-order check, then add the cross-check.
 fn stop_covers(has_order: bool, stop_size: Option<f64>, size: f64) -> bool {
     // 1e-9 absorbs f64 round-trips through state.json.
     has_order && stop_size.map(|ss| ss + 1e-9 >= size).unwrap_or(false)
