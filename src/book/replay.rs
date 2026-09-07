@@ -643,10 +643,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_bars(dir.path(), None);
         write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("DOT", -0.5)]);
-        // 07-08 is published 30 minutes after the decision instant: late
-        // enough that the decision tick must refuse it as future-generated,
-        // but well inside the 3600 s grace window, so live trading would
-        // pick it up on the next tick. The replay has to do the same.
+        // 07-08 is published 30 minutes after the decision instant: the
+        // fixture is gated by its own `generated_at`, so the decision tick
+        // never even sees it (no early reject), and it is inside the
+        // 3600 s grace window, so the added arrival tick applies it -- the
+        // same as live would once the fetch delivers the file.
         let decision_at = ts("2026-07-08T00:30:00Z");
         let arrival = decision_at + Duration::minutes(30);
         let body = signal_json(
@@ -668,10 +669,9 @@ mod tests {
             .iter()
             .map(|r| r["outcome"].as_str().unwrap())
             .collect();
-        assert_eq!(outcomes, vec!["rejected", "applied"]);
-        assert_eq!(rows[0]["reason"], "future_generated");
+        assert_eq!(outcomes, vec!["applied"]);
         // Applied at its stated arrival, never before it.
-        assert_eq!(rows[1]["ts_ms"], arrival.timestamp_millis());
+        assert_eq!(rows[0]["ts_ms"], arrival.timestamp_millis());
         let state: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(out.join("state.json")).unwrap())
                 .unwrap();
@@ -709,12 +709,11 @@ mod tests {
             .iter()
             .map(|r| r["outcome"].as_str().unwrap())
             .collect();
-        // Refused at the decision and again at the end of that bar date
-        // (still future-generated at both), then applied on the next date
-        // at the stated arrival, which is what live would do.
-        assert_eq!(outcomes, vec!["rejected", "rejected", "applied"]);
-        assert!(rows[..2].iter().all(|r| r["reason"] == "future_generated"));
-        assert_eq!(rows[2]["ts_ms"], arrival.timestamp_millis());
+        // Not yet arrived at the decision or at the end of that bar date,
+        // so neither tick even sees the file (no early reject); applied on
+        // the next date at the stated arrival, which is what live would do.
+        assert_eq!(outcomes, vec!["applied"]);
+        assert_eq!(rows[0]["ts_ms"], arrival.timestamp_millis());
     }
 
     #[tokio::test]

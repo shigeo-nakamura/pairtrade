@@ -24,8 +24,10 @@ use super::status::{
 
 /// Where the runtime reads the producer's file from.
 pub trait SignalSource: Send + Sync {
-    /// Raw body for `decision_key`; `Ok(None)` when nothing is there yet.
-    fn read(&self, decision_key: &str) -> std::io::Result<Option<String>>;
+    /// Raw body for `decision_key` as of `now` (unix secs); `Ok(None)` when
+    /// nothing is there yet -- or, for a source that can tell, when the
+    /// file's own `generated_at` has not arrived as of `now`.
+    fn read(&self, decision_key: &str, now: i64) -> std::io::Result<Option<String>>;
 }
 
 pub struct FileSignalSource {
@@ -39,7 +41,9 @@ impl FileSignalSource {
 }
 
 impl SignalSource for FileSignalSource {
-    fn read(&self, _decision_key: &str) -> std::io::Result<Option<String>> {
+    fn read(&self, _decision_key: &str, _now: i64) -> std::io::Result<Option<String>> {
+        // Live: a file that exists on disk has, by construction, already
+        // arrived -- no `now`-gating needed.
         match std::fs::read_to_string(&self.path) {
             Ok(s) => Ok(Some(s)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -60,12 +64,25 @@ impl DirSignalSource {
 }
 
 impl SignalSource for DirSignalSource {
-    fn read(&self, decision_key: &str) -> std::io::Result<Option<String>> {
-        match std::fs::read_to_string(self.dir.join(format!("{decision_key}.json"))) {
-            Ok(s) => Ok(Some(s)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+    fn read(&self, decision_key: &str, now: i64) -> std::io::Result<Option<String>> {
+        let text = match std::fs::read_to_string(self.dir.join(format!("{decision_key}.json"))) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // Unlike a live fetch, every fixture in this directory exists from
+        // the start of the run, so its own `generated_at` -- not the
+        // reader's clock -- is what says whether it has arrived yet. A
+        // fixture that will not exist until later in the simulated
+        // timeline must not be visible to an earlier tick just because the
+        // file is already on disk; a parse failure here is left to
+        // `signal::validate` to reject uniformly.
+        if let Ok(file) = serde_json::from_str::<super::signal::SignalFile>(&text) {
+            if file.generated_at.timestamp() > now {
+                return Ok(None);
+            }
         }
+        Ok(Some(text))
     }
 }
 
@@ -233,8 +250,12 @@ impl BookEngine {
         // The ack is only consumed once the halt's own flatten has
         // finished. Clearing it over an exposed book would stop the
         // flatten retry while the position is still open, and the halted
-        // decision is not eligible for a residual retry either.
-        let halted_but_exposed = self.state.session.halted && !self.state.is_flat();
+        // decision is not eligible for a residual retry either. A failed
+        // live position read leaves `is_flat()` reading the last-known
+        // (possibly stale) book, so it cannot stand in for flatness on
+        // its own -- a fresh reconcile is required too.
+        let halted_but_exposed =
+            self.state.session.halted && (!self.positions_ready || !self.state.is_flat());
         if equity_ready && !halted_but_exposed {
             if let Some(ev) = self.risk.maybe_clear_halt(&mut self.state, now, equity) {
                 log::warn!("[RISK] session halt cleared by RISK_ACK: {ev:?}");
@@ -243,7 +264,7 @@ impl BookEngine {
             }
         } else if self.state.session.halted && self.cfg.risk.risk_ack_path.exists() {
             let why = if halted_but_exposed {
-                "the halted book is not flat yet"
+                "the halted book is not confirmed flat yet"
             } else {
                 "venue equity is unavailable"
             };
@@ -901,7 +922,7 @@ impl BookEngine {
         prices: &HashMap<String, f64>,
         attempts: u32,
     ) {
-        let body = match self.signals.read(&d.key) {
+        let body = match self.signals.read(&d.key, now) {
             Ok(Some(b)) => b,
             Ok(None) => {
                 self.signal_status = "waiting_for_file".to_string();
@@ -1609,13 +1630,40 @@ impl BookEngine {
     ) -> Option<f64> {
         let p = self.state.positions.get_mut(symbol)?;
         let since = p.funding_accrued_at.unwrap_or(p.opened_at);
-        // Leave `funding_accrued_at` unadvanced when the rate is unavailable
-        // so the whole interval (not just the part after this failed lookup)
-        // is booked once a rate reappears, instead of silently discarding it.
-        let rate = rate_hourly?;
         let hours = ((now - since).max(0)) as f64 / 3600.0;
-        let est = -p.qty * price * rate * hours;
+        let qty_hours_now = p.qty * hours;
+        // Always catch the leg up to `now`: the elapsed exposure is fully
+        // captured below (in `cum_funding_est_usd` or, absent a rate, in
+        // `pending_funding_qty_hours`), so leaving the timestamp behind
+        // would only risk double-counting a segment the caller is often
+        // about to mutate or close out from under us.
         p.funding_accrued_at = Some(now);
+        let rate = match rate_hourly {
+            Some(r) => r,
+            None => {
+                // Freeze this segment's notional (qty * hours, at the
+                // quantity actually open during it) into a symbol-keyed
+                // carry rather than the position itself, so an imminent
+                // fill that resizes or fully closes -- and removes -- the
+                // leg cannot erase or misattribute it. Folded back in and
+                // settled the next time a rate is available for the
+                // symbol, even across a close and later reopen.
+                if qty_hours_now != 0.0 {
+                    *self
+                        .state
+                        .pending_funding_qty_hours
+                        .entry(symbol.to_string())
+                        .or_insert(0.0) += qty_hours_now;
+                }
+                return None;
+            }
+        };
+        let pending = self
+            .state
+            .pending_funding_qty_hours
+            .remove(symbol)
+            .unwrap_or(0.0);
+        let est = -(pending + qty_hours_now) * price * rate;
         self.state.cum_funding_est_usd += est;
         Some(est)
     }
@@ -2209,6 +2257,81 @@ mod tests {
         assert!(pnl_rows
             .iter()
             .any(|r| r["event"] == "partial_reduce" && r["recovered"] == true));
+    }
+
+    #[tokio::test]
+    async fn funding_pending_across_a_full_close_is_settled_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let (mut engine, _exec) = paper_engine(cfg, dir.path(), vec![]).await;
+
+        let opened_at = secs("2026-09-06T00:00:00Z");
+        engine.state.apply_fill("BTC", 2.0, 100_000.0, opened_at);
+
+        // An hour passes with the funding rate unavailable: the 2 BTC * 1h
+        // exposure must be frozen rather than silently discarded once the
+        // leg closes right after this failed lookup.
+        let after_one_hour = opened_at + 3600;
+        assert!(engine
+            .accrue_funding("BTC", after_one_hour, 100_000.0, None)
+            .is_none());
+        assert_eq!(
+            engine.state.pending_funding_qty_hours.get("BTC").copied(),
+            Some(2.0)
+        );
+        assert_eq!(engine.state.cum_funding_est_usd, 0.0);
+
+        // The leg fully closes while the rate is still unknown -- removing
+        // it must not erase the carried notional.
+        engine.state.positions.remove("BTC");
+        assert_eq!(
+            engine.state.pending_funding_qty_hours.get("BTC").copied(),
+            Some(2.0)
+        );
+
+        // A new leg reopens on the same symbol; once a rate is available,
+        // the carried notional is folded into the settlement instead of
+        // being lost or restarted from the reopen.
+        engine
+            .state
+            .apply_fill("BTC", 1.0, 100_000.0, after_one_hour);
+        let est = engine
+            .accrue_funding("BTC", after_one_hour, 100_000.0, Some(0.0001))
+            .unwrap();
+        assert!((est - (-2.0 * 100_000.0 * 0.0001)).abs() < 1e-9);
+        assert!(engine.state.pending_funding_qty_hours.get("BTC").is_none());
+        assert!((engine.state.cum_funding_est_usd - est).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_halt_is_not_cleared_by_ack_without_a_confirmed_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let (mut engine, _exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+
+        engine.state.session.halted = true;
+        engine.state.session.halt_reason = Some("test".to_string());
+        engine.state.session.halted_at = Some(secs("2026-09-05T00:00:00Z"));
+        std::fs::write(&cfg.risk.risk_ack_path, "").unwrap();
+
+        // A failed live position read: the persisted book happens to be
+        // flat (nothing open), but that is not the same as a confirmed
+        // reconcile -- residual or externally opened venue exposure could
+        // still be sitting there unseen.
+        engine.positions_ready = false;
+
+        engine.tick(secs("2026-09-06T00:00:00Z")).await.unwrap();
+
+        assert!(
+            engine.state.session.halted,
+            "a halt must not clear on an ack until positions are confirmed reconciled"
+        );
+        assert!(
+            cfg.risk.risk_ack_path.exists(),
+            "the ack must be left in place, not consumed, while unconfirmed"
+        );
     }
 
     #[tokio::test]

@@ -133,6 +133,13 @@ pub struct BookState {
     pub cum_fees_usd: f64,
     #[serde(default)]
     pub cum_funding_est_usd: f64,
+    /// Funding notional (signed qty * elapsed hours, no rate/price applied
+    /// yet) frozen off a leg by a fill that changed its quantity while the
+    /// funding rate was unavailable. Settled -- at whatever rate is next
+    /// available for the symbol -- the next time `accrue_funding` succeeds,
+    /// even across a full close and later reopen. Keyed by symbol.
+    #[serde(default)]
+    pub pending_funding_qty_hours: BTreeMap<String, f64>,
     #[serde(default)]
     pub last_mark_date: Option<String>,
     /// Last equity observation (unix secs, usd).
@@ -159,6 +166,7 @@ impl BookState {
             cum_realized_usd: 0.0,
             cum_fees_usd: 0.0,
             cum_funding_est_usd: 0.0,
+            pending_funding_qty_hours: BTreeMap::new(),
             last_mark_date: None,
             last_equity: None,
             trades_closed: 0,
