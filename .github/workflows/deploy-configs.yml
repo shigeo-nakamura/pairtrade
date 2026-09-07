@@ -38,9 +38,14 @@ jobs:
           bash -n debot/scripts/install_engine_b_phase0.sh
           bash -n debot/scripts/run_engine_b_phase0.sh
           bash -n debot/scripts/install_engine_b_live.sh
+          bash -n debot/scripts/install_book_runtime.sh
+          bash -n debot/scripts/book_signal_fetch.sh
+          python3 -m py_compile debot/scripts/xsmom_signal_producer.py debot/scripts/test_xsmom_signal_producer.py
           python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
           python3 -m py_compile debot/scripts/book_signal_file.py debot/scripts/test_book_signal_file.py
+          python3 debot/scripts/test_book_signal_file.py
+          python3 debot/scripts/test_xsmom_signal_producer.py
 
       - name: Test Engine B Phase 0 observer
         run: |
@@ -66,6 +71,7 @@ jobs:
           systemd-analyze verify debot/deploy/engine-b-phase0.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.timer
+          systemd-analyze verify debot/deploy/book-signal-fetch-xsmom-695.timer
 
   deploy-configs:
     needs: validate-config-artifacts
@@ -128,6 +134,9 @@ jobs:
           aws s3 cp debot/deploy/engine-b-phase0.service "s3://${S3_BUCKET}/deploy/engine-b-phase0.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.service "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.timer "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.timer"
+          for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do
+            aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
+          done
           ENGINE_B_PREFIX="debot/engine-b-phase0/releases/${GITHUB_SHA}"
           aws s3 cp debot/scripts/engine_b_phase0.py "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/engine_b_phase0.py"
           aws s3 cp debot/scripts/engine_b_phase0_archive.sh "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/engine_b_phase0_archive.sh"

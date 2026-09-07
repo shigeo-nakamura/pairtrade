@@ -436,9 +436,12 @@ jobs:
             --exclude "*.pyc"
           aws s3 sync dist/configs/ "s3://${S3_BUCKET}/debot/configs/"
           aws s3 cp debot/deploy/engine-b-live.service "s3://${S3_BUCKET}/deploy/engine-b-live.service"
+          for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do
+            aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
+          done
 
   deploy-robinhood-lighter:
-    name: Deploy Engine B live binary to Robinhood Lighter host
+    name: Deploy Engine B live + book runtime binaries to Robinhood Lighter host
     needs: deploy
     runs-on: ubuntu-latest
     if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_dispatch' || inputs.target == 'deploy')
@@ -460,6 +463,7 @@ jobs:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
           LIBSIGNER_SHA256: ${{ needs.deploy.outputs.libsigner_sha256 }}
           ENGINE_B_LIVE_SHA256: ${{ needs.deploy.outputs.engine_b_live_sha256 }}
+          BOOK_RUNTIME_SHA256: ${{ needs.deploy.outputs.book_runtime_sha256 }}
         run: |
           test -n "${INSTANCE_ID}"
           # JSON --parameters file, not inline shorthand: a shorthand
@@ -486,16 +490,21 @@ jobs:
               "aws s3 cp s3://__S3_BUCKET__/deploy/engine-b-live.service __INSTALL_DIR__/deploy/engine-b-live.service",
               "aws s3 cp s3://__S3_BUCKET__/debot/libsigner.so __INSTALL_DIR__/deploy/engine-b-live-libsigner.so",
               "echo '__LIBSIGNER_SHA256__  __INSTALL_DIR__/deploy/engine-b-live-libsigner.so' | sha256sum -c -",
-              "sudo env ENGINE_B_LIVE_LIBSIGNER_SOURCE=__INSTALL_DIR__/deploy/engine-b-live-libsigner.so bash __INSTALL_DIR__/scripts/install_engine_b_live.sh"
+              "sudo env ENGINE_B_LIVE_LIBSIGNER_SOURCE=__INSTALL_DIR__/deploy/engine-b-live-libsigner.so bash __INSTALL_DIR__/scripts/install_engine_b_live.sh",
+              "aws s3 cp s3://__S3_BUCKET__/debot/book_runtime __INSTALL_DIR__/bin/book_runtime",
+              "echo '__BOOK_RUNTIME_SHA256__  __INSTALL_DIR__/bin/book_runtime' | sha256sum -c -",
+              "sudo chmod 755 __INSTALL_DIR__/bin/book_runtime",
+              "for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u __INSTALL_DIR__/deploy/$u; done",
+              "sudo env BOOK_INSTANCE=xsmom-695 BOOK_LIBSIGNER_SOURCE=__INSTALL_DIR__/deploy/engine-b-live-libsigner.so bash __INSTALL_DIR__/scripts/install_book_runtime.sh"
             ]
           }
           JSON
-          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g; s|__ENGINE_B_LIVE_SHA256__|${ENGINE_B_LIVE_SHA256}|g" /tmp/ssm-robinhood-deploy-params.json
+          sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g; s|__ENGINE_B_LIVE_SHA256__|${ENGINE_B_LIVE_SHA256}|g; s|__BOOK_RUNTIME_SHA256__|${BOOK_RUNTIME_SHA256}|g" /tmp/ssm-robinhood-deploy-params.json
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name AWS-RunShellScript \
-            --comment "Deploy Engine B live artifacts; no start or restart" \
+            --comment "Deploy Engine B live + book runtime artifacts; no start or restart" \
             --parameters file:///tmp/ssm-robinhood-deploy-params.json \
             --query Command.CommandId --output text)
           set +e

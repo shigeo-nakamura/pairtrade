@@ -34,6 +34,8 @@ jobs:
           diff configs/engine-b/trading_calendar.json /tmp/trading_calendar_check.json
       - name: Run book runtime signal-file helper tests
         run: python3 scripts/test_book_signal_file.py -v
+      - name: Run XSMOM signal producer tests
+        run: python3 scripts/test_xsmom_signal_producer.py -v
       - name: Run Arcus live signal replay unit tests
         run: python3 scripts/test_arcus_live_tick_signal_replay.py -v
       - name: Run Arcus durable event stream unit tests

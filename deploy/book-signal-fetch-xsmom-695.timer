@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll S3 for the xsmom-695 signal file every 5 minutes (bot-strategy#937)
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=30s
+Persistent=true
+Unit=book-signal-fetch-xsmom-695.service
+
+[Install]
+WantedBy=timers.target
