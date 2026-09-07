@@ -129,6 +129,15 @@ pub struct BookState {
     pub positions: BTreeMap<String, Position>,
     #[serde(default)]
     pub last_decision: Option<DecisionRecord>,
+    /// Unix seconds of the most recently *accepted* signal's own
+    /// `generated_at`, independent of `last_decision`: a later decision
+    /// key that is Rejected or Skipped overwrites `last_decision` entirely
+    /// (with no accepted signal of its own), but the book is still running
+    /// on the last one it did accept, so `book_signal_age_seconds` must
+    /// keep tracking that signal's age -- not reset to unknown -- across
+    /// both a live reject/skip and a restart afterward.
+    #[serde(default)]
+    pub last_accepted_signal_generated_at: Option<i64>,
     #[serde(default)]
     pub session: SessionRisk,
     #[serde(default)]
@@ -168,6 +177,7 @@ impl BookState {
             instance_id: instance_id.to_string(),
             positions: BTreeMap::new(),
             last_decision: None,
+            last_accepted_signal_generated_at: None,
             session: SessionRisk::default(),
             daily: DailyRisk::default(),
             peak_equity: 0.0,

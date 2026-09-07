@@ -148,7 +148,7 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
             }
         }
     }
-    let exec = Arc::new(PaperExecutor::new(
+    let exec = Arc::new(PaperExecutor::new_for_replay(
         cfg.execution.paper_slippage_bps,
         cfg.execution.paper_fee_bps,
     ));

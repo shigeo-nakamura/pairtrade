@@ -170,13 +170,13 @@ impl BookEngine {
         // `signal_status: "none"` (and a bogus signal age) for up to a
         // full schedule period even though the book already holds an
         // accepted or partially applied signal.
-        let (last_signal_generated_at, signal_status) = match state.last_decision.as_ref() {
+        let signal_status = match state.last_decision.as_ref() {
             Some(r) => {
                 let sha_prefix = r
                     .signal_sha256
                     .as_deref()
                     .map(|s| s[..12.min(s.len())].to_string());
-                let status = match r.outcome {
+                match r.outcome {
                     DecisionOutcome::Applied => {
                         format!("applied:{}", sha_prefix.as_deref().unwrap_or("-"))
                     }
@@ -190,11 +190,15 @@ impl BookEngine {
                         format!("skipped:{}", r.reject_reason.as_deref().unwrap_or("-"))
                     }
                     DecisionOutcome::Halted => "halted".to_string(),
-                };
-                (r.signal_generated_at, status)
+                }
             }
-            None => (None, "none".to_string()),
+            None => "none".to_string(),
         };
+        // Independent of `last_decision`/`signal_status` above: the last
+        // *accepted* signal's age must survive a later reject/skip
+        // overwriting `last_decision`, so it is restored from its own
+        // persisted field rather than from the current decision record.
+        let last_signal_generated_at = state.last_accepted_signal_generated_at;
         Ok(Self {
             cfg,
             scheduler,
@@ -615,12 +619,32 @@ impl BookEngine {
     /// is always fresh).
     async fn compute_equity(&self, prices: &HashMap<String, f64>) -> (f64, bool) {
         if self.exec.is_paper() {
+            // `unrealized_usd` silently substitutes a held leg's entry
+            // price when its mid is missing (expired WS feed, partial
+            // outage), which would erase that leg's mark-to-market from
+            // the rails while still reporting equity as fresh. A held
+            // position without a fresh mark must instead take the same
+            // not-fresh / opens-blocked path the live venue-unavailable
+            // case does.
+            let all_held_marked = self.state.positions.keys().all(|s| prices.contains_key(s));
+            if all_held_marked {
+                return (
+                    self.cfg.risk.equity_reference_usd + self.state.cum_realized_usd
+                        - self.state.cum_fees_usd
+                        + self.state.cum_funding_est_usd
+                        + self.state.unrealized_usd(prices),
+                    true,
+                );
+            }
+            log::warn!(
+                "[EQUITY] paper: missing a fresh mark for a held leg; using last observation, opens blocked"
+            );
             return (
-                self.cfg.risk.equity_reference_usd + self.state.cum_realized_usd
-                    - self.state.cum_fees_usd
-                    + self.state.cum_funding_est_usd
-                    + self.state.unrealized_usd(prices),
-                true,
+                self.state
+                    .last_equity
+                    .map(|(_, e)| e)
+                    .unwrap_or(self.cfg.risk.equity_reference_usd),
+                false,
             );
         }
         match self.exec.equity().await {
@@ -1075,6 +1099,7 @@ impl BookEngine {
             flatten_done: false,
             target_qty: plan.target_qty.clone(),
         });
+        self.state.last_accepted_signal_generated_at = Some(sig.generated_at.timestamp());
         if let Err(e) = self.state.persist(&self.cfg.paths.state) {
             log::error!(
                 "[DECISION] key={} cannot persist the accepted target ({e}); no orders sent this tick",
@@ -1104,6 +1129,7 @@ impl BookEngine {
             .unwrap_or(prior_attempts)
             .max(prior_attempts);
         self.last_signal_generated_at = Some(sig.generated_at.timestamp());
+        self.state.last_accepted_signal_generated_at = self.last_signal_generated_at;
         self.signal_status = format!(
             "{}:{}",
             match outcome {
@@ -2162,6 +2188,68 @@ mod tests {
         // skip's own timestamp -- there was no accepted signal.
         let (restarted, _) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
         assert_eq!(restarted.last_signal_generated_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_later_skip_does_not_erase_the_earlier_accepted_signals_age_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d1 = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d1, &[("BTC", 0.5), ("DOT", -0.5)]);
+        let (mut engine, _) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.tick(d1.timestamp()).await.unwrap();
+        let accepted_rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(accepted_rec.outcome, DecisionOutcome::Applied);
+        let accepted_generated_at = engine.last_signal_generated_at;
+        assert!(accepted_generated_at.is_some());
+
+        // Next grid key (every_days: 5) has no signal file at all, and the
+        // tick lands after its window closes: it lands as Skipped and
+        // overwrites `last_decision`, but the book is still running on
+        // the signal accepted for the prior key.
+        let d2 = ts("2026-09-11T00:30:00Z");
+        engine.tick(d2.timestamp() + 3601).await.unwrap();
+        let skipped_rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(skipped_rec.outcome, DecisionOutcome::Skipped);
+        assert_ne!(skipped_rec.key, accepted_rec.key);
+        assert_eq!(
+            engine.last_signal_generated_at, accepted_generated_at,
+            "the in-process gauge must not reset on a later skip"
+        );
+        drop(engine);
+
+        let (restarted, _) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        assert_eq!(
+            restarted.last_signal_generated_at, accepted_generated_at,
+            "a restart after the skip must still restore the earlier accepted signal's age"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_paper_mark_for_a_held_leg_is_not_fresh_equity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("DOT", -0.5)]);
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.tick(d.timestamp()).await.unwrap();
+        assert_eq!(
+            engine.state.last_decision.as_ref().unwrap().outcome,
+            DecisionOutcome::Applied
+        );
+        assert!(engine.equity_ready);
+
+        // BTC's mid goes missing (feed outage) while the leg is still
+        // held. `unrealized_usd` would otherwise silently substitute the
+        // entry price for it and this must not still read as fresh.
+        exec.clear_observations().await;
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        assert!(
+            !engine.equity_ready,
+            "a held leg with no fresh mark must not report equity as fresh"
+        );
     }
 
     #[tokio::test]

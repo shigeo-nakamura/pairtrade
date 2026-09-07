@@ -280,12 +280,21 @@ async fn main() -> Result<()> {
                     missing_lots = still;
                 }
                 if let Some(p) = &paper {
-                    // Keep paper funding rates fresh from the venue ticker.
+                    // Keep paper funding rates fresh from the venue
+                    // ticker. A failed refresh (request error, or no rate
+                    // in the response) must clear the prior observation
+                    // rather than leave it in place: an indefinitely
+                    // stale rate would otherwise keep charging marks and
+                    // closes at a number the venue no longer reports,
+                    // instead of taking the unavailable-rate path that
+                    // preserves a pending funding obligation.
                     for s in &symbols {
-                        if let Ok(t) = connector.get_ticker(s, None).await {
-                            if let Some(r) = t.funding_rate.and_then(|r| r.to_f64()) {
-                                p.set_funding_rate_hourly(s, r).await;
-                            }
+                        match connector.get_ticker(s, None).await {
+                            Ok(t) => match t.funding_rate.and_then(|r| r.to_f64()) {
+                                Some(r) => p.set_funding_rate_hourly(s, r).await,
+                                None => p.clear_funding_rate_hourly(s).await,
+                            },
+                            Err(_) => p.clear_funding_rate_hourly(s).await,
                         }
                     }
                 }

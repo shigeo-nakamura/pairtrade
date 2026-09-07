@@ -83,10 +83,28 @@ pub struct PaperExecutor {
     positions: Mutex<BTreeMap<String, VenuePosition>>,
     slippage_bps: f64,
     fee_bps: f64,
+    /// False for replay: a bar date is a simulated instant, not wall-clock
+    /// time, so a slow runner (large universe, loaded machine) taking real
+    /// seconds per bar must not expire prices that are perfectly fresh for
+    /// the date being replayed -- that would violate the documented
+    /// byte-identical replay guarantee. Only the long-running live DRY_RUN
+    /// loop, where `Instant::now()` really does track wall-clock staleness
+    /// of the WS feed, enables this.
+    expire_stale_mids: bool,
 }
 
 impl PaperExecutor {
     pub fn new(slippage_bps: f64, fee_bps: f64) -> Self {
+        Self::with_expiry(slippage_bps, fee_bps, true)
+    }
+
+    /// For replay: never treats a mid as stale by wall-clock age (see
+    /// `expire_stale_mids`).
+    pub fn new_for_replay(slippage_bps: f64, fee_bps: f64) -> Self {
+        Self::with_expiry(slippage_bps, fee_bps, false)
+    }
+
+    fn with_expiry(slippage_bps: f64, fee_bps: f64, expire_stale_mids: bool) -> Self {
         Self {
             prices: RwLock::new(HashMap::new()),
             lots: RwLock::new(HashMap::new()),
@@ -94,6 +112,7 @@ impl PaperExecutor {
             positions: Mutex::new(BTreeMap::new()),
             slippage_bps,
             fee_bps,
+            expire_stale_mids,
         }
     }
 
@@ -109,7 +128,7 @@ impl PaperExecutor {
     /// Current mid for `symbol` if a fresh-enough observation exists.
     async fn fresh_price(&self, symbol: &str) -> Option<f64> {
         let (px, at) = *self.prices.read().await.get(symbol)?;
-        if at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
+        if !self.expire_stale_mids || at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
             Some(px)
         } else {
             log::warn!(
@@ -126,6 +145,13 @@ impl PaperExecutor {
 
     pub async fn set_funding_rate_hourly(&self, symbol: &str, rate: f64) {
         self.funding.write().await.insert(symbol.to_string(), rate);
+    }
+
+    /// Drop a prior funding-rate observation (a failed or empty refresh):
+    /// `funding_rate_hourly` must go back to reporting unavailable rather
+    /// than keep serving the last known rate indefinitely.
+    pub async fn clear_funding_rate_hourly(&self, symbol: &str) {
+        self.funding.write().await.remove(symbol);
     }
 
     /// Drop every price and funding observation (replay: before each bar
@@ -762,6 +788,42 @@ mod tests {
             .execute(&intent("SOL", Side::Buy, 1.0, false))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_replay_executor_never_expires_a_mid_by_wall_clock_age() {
+        let ex = PaperExecutor::new_for_replay(10.0, 2.0);
+        ex.set_price("SOL", 100.0).await;
+        // Back-date the observation well past WS_PRICE_MAX_AGE_SECS: a
+        // slow bar (large universe, loaded runner) taking real seconds
+        // must not lose a price that is fresh for the simulated date, or
+        // replay stops being byte-identical across machines/speeds.
+        let stale_at = Instant::now() - std::time::Duration::from_secs(WS_PRICE_MAX_AGE_SECS + 1);
+        ex.prices
+            .write()
+            .await
+            .insert("SOL".to_string(), (100.0, stale_at));
+        assert_eq!(
+            ex.prices(&["SOL".to_string()]).await.get("SOL").copied(),
+            Some(100.0)
+        );
+        assert!(ex
+            .execute(&intent("SOL", Side::Buy, 1.0, false))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_failed_funding_refresh_clears_the_prior_rate() {
+        let ex = PaperExecutor::new(10.0, 2.0);
+        ex.set_funding_rate_hourly("SOL", 0.0001).await;
+        assert_eq!(ex.funding_rate_hourly("SOL").await, Some(0.0001));
+        ex.clear_funding_rate_hourly("SOL").await;
+        assert_eq!(
+            ex.funding_rate_hourly("SOL").await,
+            None,
+            "a cleared rate must not keep charging marks/closes at a stale number"
+        );
     }
 
     #[test]
