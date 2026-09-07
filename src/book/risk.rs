@@ -97,10 +97,35 @@ impl RiskRails {
         self.ensure_anchors(state, now, equity);
         let today = utc_date(now);
         if state.daily.date != today {
+            // Isolate the overnight move -- against equity as of the last
+            // observation (yesterday's closing mark), not the far-off
+            // morning anchor -- before resetting today's anchor to
+            // `equity`. `tick` accrues overnight funding before calling
+            // this, so `equity` already reflects it on this first tick of
+            // the new date; resetting the anchor to it first would make
+            // `daily_loss` compute to zero against itself, silently
+            // absorbing the move and never comparing it to the daily
+            // limit at all -- not even one tick later, unlike every other
+            // loss this rail is meant to catch. Comparing against the
+            // *last observed* equity rather than the morning anchor keeps
+            // a loss already handled by yesterday's own halt (equity never
+            // recovered, nothing moved overnight) from re-triggering every
+            // rollover: the daily halt is documented to clear each UTC day
+            // regardless of recovery, and only a genuinely new move in the
+            // crossover window should carry forward.
+            let old_daily_limit = self.cfg.max_daily_loss_bps / 10_000.0 * state.daily.start_equity;
+            let overnight_loss = state.last_equity.map_or(0.0, |(_, e)| e) - equity;
+            let carried_halt = state.daily.start_equity > 0.0 && overnight_loss > old_daily_limit;
+            if carried_halt {
+                events.push(RiskEvent::DailyHalt {
+                    loss_usd: overnight_loss,
+                    limit_usd: old_daily_limit,
+                });
+            }
             state.daily = super::state::DailyRisk {
                 date: today.clone(),
                 start_equity: equity,
-                halted: false,
+                halted: carried_halt,
             };
             events.push(RiskEvent::DailyRollover {
                 date: today,
@@ -265,5 +290,53 @@ mod tests {
         std::fs::write(dir.path().join("KILL_SWITCH"), "").unwrap();
         assert!(!r.opens_allowed(&s));
         assert_eq!(r.block_reason(&s), Some("kill_switch"));
+    }
+
+    #[test]
+    fn an_overnight_move_at_rollover_carries_the_daily_halt_into_the_new_day() {
+        // `tick` accrues overnight funding before calling `evaluate`, so on
+        // the first tick of a new date `equity` already reflects it. That
+        // move must be caught against the *old* day's anchor before the
+        // rollover below replaces it with `equity` itself (which would
+        // make the same-day loss compute to zero and open the new day's
+        // decision as if nothing happened).
+        let dir = tempfile::tempdir().unwrap();
+        let r = rails(dir.path());
+        let mut s = BookState::new("t");
+        r.evaluate(&mut s, T0, 1000.0);
+        // Last tick before midnight: no loss yet.
+        let ev = r.evaluate(&mut s, T0 + 86_000, 1000.0);
+        assert!(ev.is_empty());
+        // First tick of the next day: a $50 overnight funding accrual (3%
+        // daily limit on $1000 = $30) has already dropped equity by the
+        // time this call happens.
+        let ev = r.evaluate(&mut s, T0 + 86_400 + 1, 950.0);
+        assert!(matches!(ev[0], RiskEvent::DailyHalt { .. }), "{ev:?}");
+        assert!(matches!(ev[1], RiskEvent::DailyRollover { .. }), "{ev:?}");
+        assert!(s.daily.halted);
+        assert_eq!(s.daily.start_equity, 950.0);
+        assert_eq!(r.block_reason(&s), Some("daily_halted"));
+    }
+
+    #[test]
+    fn a_stale_unrecovered_loss_does_not_re_halt_every_rollover() {
+        // The daily halt is documented to clear each UTC day regardless of
+        // recovery (see the test above this one): a loss already handled
+        // by yesterday's own halt, with equity simply never recovering
+        // overnight, must not look like a fresh overnight move and
+        // re-trigger the halt on every subsequent rollover.
+        let dir = tempfile::tempdir().unwrap();
+        let r = rails(dir.path());
+        let mut s = BookState::new("t");
+        r.evaluate(&mut s, T0, 1000.0);
+        let ev = r.evaluate(&mut s, T0 + 3600, 965.0);
+        assert!(matches!(ev[0], RiskEvent::DailyHalt { .. }));
+        // Two more UTC days pass with no further movement at all.
+        for days in 1..=2 {
+            let ev = r.evaluate(&mut s, T0 + days * 86_400 + 1, 965.0);
+            assert_eq!(ev.len(), 1, "{ev:?}");
+            assert!(matches!(ev[0], RiskEvent::DailyRollover { .. }), "{ev:?}");
+            assert!(!s.daily.halted);
+        }
     }
 }

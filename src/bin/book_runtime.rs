@@ -301,14 +301,29 @@ async fn main() -> Result<()> {
             }
             _ = lot_retry.tick() => {
                 if !missing_lots.is_empty() {
+                    // Concurrent for the same reason as the paper-funding
+                    // refresh below: this arm runs inside the outer
+                    // `select!`, so fetching one symbol after another
+                    // would hold it for the sum of every request's
+                    // latency, blocking ticks, WS handling and SIGTERM
+                    // while lot metadata is unavailable for many symbols.
+                    let mut fetches = tokio::task::JoinSet::new();
+                    for s in missing_lots.clone() {
+                        let connector = connector.clone();
+                        fetches.spawn(async move {
+                            let lot = fetch_lot(&connector, &s).await;
+                            (s, lot)
+                        });
+                    }
                     let mut still = Vec::new();
-                    for s in &missing_lots {
-                        match fetch_lot(&connector, s).await {
-                            Some(lot) => {
-                                engine.set_lot(s, lot);
-                                if let Some(p) = &paper { p.set_lot(s, lot).await; }
+                    while let Some(res) = fetches.join_next().await {
+                        match res {
+                            Ok((s, Some(lot))) => {
+                                engine.set_lot(&s, lot);
+                                if let Some(p) = &paper { p.set_lot(&s, lot).await; }
                             }
-                            None => still.push(s.clone()),
+                            Ok((s, None)) => still.push(s),
+                            Err(e) => log::error!("[LOT] fetch task panicked: {e}"),
                         }
                     }
                     missing_lots = still;
