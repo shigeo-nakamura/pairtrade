@@ -51,6 +51,12 @@ def on_grid(d: date, anchor: date = ANCHOR, every: int = EVERY_DAYS) -> bool:
     return delta >= 0 and delta % every == 0
 
 
+def _reject_constant(token: str):
+    # NaN / Infinity are not JSON; the runtime's parser refuses them, so a
+    # row carrying them must not become a signal.
+    raise ValueError(f"non-standard JSON constant {token}")
+
+
 def load_rebalance_rows(path: str) -> list[dict]:
     rows = []
     with open(path) as f:
@@ -59,8 +65,8 @@ def load_rebalance_rows(path: str) -> list[dict]:
             if not line:
                 continue
             try:
-                r = json.loads(line)
-            except json.JSONDecodeError as e:
+                r = json.loads(line, parse_constant=_reject_constant)
+            except ValueError as e:  # JSONDecodeError and rejected NaN/Infinity
                 raise SystemExit(f"{path}:{i}: bad JSON: {e}")
             if r.get("type") == "rebalance":
                 rows.append(r)
@@ -109,11 +115,18 @@ def build(row: dict, gross: float, generated_at: datetime, producer_id: str = PR
     weights = weights_from_book(row["book"], gross)
     check_caps(weights, MAX_SYMBOL_WEIGHT, NET_TOLERANCE)
     as_of = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    def _finite_or_none(v):
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+            raise SystemExit(f"rebalance row metadata must be finite numbers, got {v!r}")
+        return v
+
     meta = {
         "source": "xsmom_shadow_695 ledger rebalance row",
-        "ledger_ts": row.get("ts"),
-        "n_eligible": row.get("n_eligible"),
-        "k": row.get("k"),
+        "ledger_ts": _finite_or_none(row.get("ts")),
+        "n_eligible": _finite_or_none(row.get("n_eligible")),
+        "k": _finite_or_none(row.get("k")),
         "n_positions": len(weights),
         "gross_usd": round(sum(abs(w) for w in weights.values()) * gross, 2),
         "net_usd": round(sum(weights.values()) * gross, 2),

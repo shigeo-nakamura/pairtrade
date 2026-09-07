@@ -74,6 +74,16 @@ class ProducerTests(unittest.TestCase):
         flat = dict(ROW, book={})
         self.assertEqual(xp.build(flat, 1000.0, datetime.now(timezone.utc))["weights"], {})
 
+    def test_non_finite_metadata_is_refused(self):
+        with self.assertRaises(SystemExit):
+            xp.build(dict(ROW, k=float("nan")), 1000.0, datetime.now(timezone.utc))
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "ledger.jsonl")
+            with open(ledger, "w") as f:
+                f.write(json.dumps(ROW).replace('"k": 11', '"k": NaN') + "\n")
+            with self.assertRaises(SystemExit):
+                xp.load_rebalance_rows(ledger)
+
     def test_cli_writes_only_on_a_rebalance_date(self):
         with tempfile.TemporaryDirectory() as d:
             ledger = os.path.join(d, "ledger.jsonl")

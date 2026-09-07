@@ -26,7 +26,9 @@ fi
 if ! SUMMARY=$(python3 - "$TMP" <<'PY'
 import hashlib, json, math, sys
 from datetime import datetime
-d = json.load(open(sys.argv[1]))
+def _reject_constant(token):
+    raise SystemExit(f"non-standard JSON constant {token} (the runtime's parser rejects it)")
+d = json.load(open(sys.argv[1]), parse_constant=_reject_constant)
 for k in ("schema_version", "producer_id", "generated_at", "as_of", "decision_key", "weights", "payload_sha256"):
     if k not in d:
         raise SystemExit(f"missing field {k}")
