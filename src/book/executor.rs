@@ -485,9 +485,12 @@ impl Executor for LiveExecutor {
                 self.slippage_bps, intent.reference_price, mid
             ))));
         }
+        // The preflight read happens before any submission, so a
+        // transient account-read outage here must not spend an attempt.
         let before = self
             .venue_position(&intent.symbol)
-            .await?
+            .await
+            .map_err(|e| anyhow!(PreSendAbort(format!("preflight position read: {e}"))))?
             .map(|p| p.qty)
             .unwrap_or(0.0);
         let side = match intent.side {

@@ -282,7 +282,10 @@ reduce_only }`.
   live, `equity_reference + cum realized + unrealized` paper) engages a
   sticky halt: flatten the book with reduce-only orders, block every
   opening intent, publish `session_halted=true`, and stay halted across
-  restarts until the `risk_ack_path` file is consumed (bot-strategy#932
+  restarts until the `risk_ack_path` file is consumed — consumed meaning
+  actually removed: if the file cannot be unlinked the halt stays engaged
+  and an error is logged, since a file left behind would clear the *next*
+  halt without an operator ever seeing it (bot-strategy#932
   semantics: the flatten fills are booked as exit fills from venue fills,
   not from the mid). Consuming the ack re-anchors both the session and the
   daily window at the current equity, and therefore only happens while the
@@ -334,7 +337,7 @@ rows; previous `state.json` / ledgers / status in `--out` are removed
 first so a rerun never resumes or appends; bar dates must be continuous,
 since a missing day loses its decisions, flattens, mark and funding
 accrual, and every leg the book holds must have a row on every date it is
-held), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
+held, and no `(date, symbol)` may repeat), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
 default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
 for every bar date `D` the closes of `D` become the prices, each decision /
 flatten scheduled inside `D` (a midnight decision belongs to the date it

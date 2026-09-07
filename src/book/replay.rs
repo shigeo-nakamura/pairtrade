@@ -63,9 +63,22 @@ pub fn load_bars(path: &Path) -> Result<BTreeMap<NaiveDate, HashMap<String, BarR
         if !(row.close.is_finite() && row.close > 0.0) {
             bail!("{}:{}: non-positive close", path.display(), i + 1);
         }
-        out.entry(row.date)
-            .or_default()
-            .insert(row.symbol.clone(), row);
+        let day = out.entry(row.date).or_default();
+        if let Some(prev) = day.get(&row.symbol) {
+            // Silently keeping the last row would let a duplicated or
+            // concatenated dataset change fills, funding and the final
+            // equity by row order alone.
+            bail!(
+                "{}:{}: duplicate row for {} on {} (close {} then {})",
+                path.display(),
+                i + 1,
+                row.symbol,
+                row.date,
+                prev.close,
+                row.close
+            );
+        }
+        day.insert(row.symbol.clone(), row);
     }
     if out.is_empty() {
         bail!("{} has no bars", path.display());
@@ -437,6 +450,25 @@ mod tests {
                 .to_string();
             assert!(err.contains(missing), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_bar_rows_fail_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        let bars = std::fs::read_to_string(dir.path().join("bars.jsonl")).unwrap();
+        let dup = bars
+            .lines()
+            .find(|l| l.contains("2026-07-05") && l.contains("\"BTC\""))
+            .unwrap()
+            .to_string();
+        std::fs::write(dir.path().join("bars.jsonl"), format!("{bars}{dup}\n")).unwrap();
+        let err = run(cfg(), dir.path(), &dir.path().join("out"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate row"), "{err}");
+        assert!(err.contains("BTC"), "{err}");
     }
 
     #[tokio::test]
