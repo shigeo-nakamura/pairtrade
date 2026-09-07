@@ -153,7 +153,11 @@ bot-strategy#580).
 - Restart safety: `state.json` carries `last_decision` (key + outcome +
   applied hash + rounded target quantities + `flatten_at`), written and
   persisted **before the first order of a decision is sent**, so a restart
-  inside a window (or mid-execution) neither re-applies nor double-trades. A `partial`
+  inside a window (or mid-execution) neither re-applies nor double-trades.
+  That pre-send record carries the **prior** attempt count: a crash before
+  or during the first submission must not consume an attempt, which with
+  `max_attempts: 1` would strand the target. The count advances only once
+  something has actually reached the venue. A `partial`
   decision is retried from the **persisted target quantities**, never by
   re-reading the producer file: one decision key stays tied to one
   accepted vector even if the file is rewritten or removed, and the
@@ -208,7 +212,8 @@ reduce_only }`.
    order. The tick's own evaluation still owns the actual halt and the
    flatten that follows. If that refresh cannot read the venue equity at
    all, the remaining openings are blocked as `equity_unavailable` rather
-   than sent unchecked.
+   than sent unchecked. A breach found this way is latched for the rest of
+   the plan, so every opening after it is blocked, not just the next one.
 
 ## 6. Execution and fill confirmation
 
@@ -306,7 +311,9 @@ reduce_only }`.
   funding estimate, per-symbol marks) plus one `exit` row per closed leg.
   A leg reduced over several fills is **one** trade: its win/loss
   classification uses everything the leg realized over its lifetime, not
-  the last fill, so +$50 then -$10 counts as one winner.
+  the last fill, so +$50 then -$10 counts as one winner. An unfilled
+  reduce-only IOC writes no exit row: zero-fill attempts are routine and
+  would otherwise read as phantom closes.
 - `status.json`: the flat `debot-dashboard` schema (`id`, `dry_run`,
   `has_position`, `positions`, `pnl_total`, `pnl_today`,
   `kill_switch_active`, `trade_stats`) plus a nested `book` block
@@ -326,7 +333,8 @@ engine against `bars.jsonl` (`{"date","symbol","close"[,"funding_rate_hourly"]}`
 rows; previous `state.json` / ledgers / status in `--out` are removed
 first so a rerun never resumes or appends; bar dates must be continuous,
 since a missing day loses its decisions, flattens, mark and funding
-accrual), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
+accrual, and every leg the book holds must have a row on every date it is
+held), an optional `lots.json` (`{"SYM": {"size_decimals", "min_order_qty"}}`,
 default 4 decimals) and `signals/<key>.json` files with a synthetic clock:
 for every bar date `D` the closes of `D` become the prices, each decision /
 flatten scheduled inside `D` (a midnight decision belongs to the date it

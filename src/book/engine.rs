@@ -822,6 +822,7 @@ impl BookEngine {
                 return;
             }
         };
+        let prior_attempts = attempts;
         let attempts = attempts + 1;
         log::info!(
             "[DECISION] key={} sha={} attempt={} intents={} gross_target=${:.2} net_target=${:.2} skipped={}",
@@ -836,14 +837,17 @@ impl BookEngine {
         // Durably record the accepted vector BEFORE the first order goes
         // out: a crash mid-execution then restarts with the hash and the
         // rounded targets on disk, so the residual is retried from them
-        // (never from a rewritten or missing producer file).
+        // (never from a rewritten or missing producer file). The attempt
+        // count stays at its prior value here -- a crash before or during
+        // the first submission must not consume an attempt, which with
+        // max_attempts: 1 would otherwise strand the target forever.
         self.state.last_decision = Some(DecisionRecord {
             key: d.key.clone(),
             outcome: DecisionOutcome::Partial,
             at: now,
             signal_sha256: Some(sig.payload_sha256.clone()),
             reject_reason: None,
-            attempts,
+            attempts: prior_attempts,
             flatten_at: d.flatten_at,
             flatten_done: false,
             target_qty: plan.target_qty.clone(),
@@ -865,7 +869,7 @@ impl BookEngine {
         // Same rule as the retry path: a first application whose intents
         // were all blocked has not spent an execution attempt.
         let attempts = if summary.sent == 0 {
-            attempts.saturating_sub(1)
+            prior_attempts
         } else {
             attempts
         };
@@ -956,6 +960,11 @@ impl BookEngine {
         // adversely (or its fees) can cross a limit mid-plan, and the
         // tick's own evaluation already ran before this loop.
         let mut fills_since_check = false;
+        // Once a rail is breached mid-plan it stays breached for every
+        // remaining opening: the read-only check engages no halt, so
+        // without latching only the first opening after the breach would
+        // be stopped and the next would go out against the same rail.
+        let mut rail_blocked: Option<String> = None;
         for (idx, intent) in plan.intents.iter().enumerate() {
             // Re-check the caps against the book that actually exists (see
             // `opening_cap_breach`): reductions ahead of this intent may
@@ -966,19 +975,25 @@ impl BookEngine {
             } else {
                 self.opening_cap_breach(&plan.intents[idx..], prices)
             };
-            if !intent.reduce_only && cap_breach.is_none() && fills_since_check {
-                fills_since_check = false;
-                let (equity, ready) = self.compute_equity(prices).await;
-                if ready {
-                    if let Some(rail) = self.risk.loss_rail_breached(&self.state, equity) {
-                        cap_breach = Some(rail.to_string());
+            if !intent.reduce_only && cap_breach.is_none() {
+                if let Some(rail) = &rail_blocked {
+                    cap_breach = Some(rail.clone());
+                } else if fills_since_check {
+                    fills_since_check = false;
+                    let (equity, ready) = self.compute_equity(prices).await;
+                    if ready {
+                        if let Some(rail) = self.risk.loss_rail_breached(&self.state, equity) {
+                            rail_blocked = Some(rail.to_string());
+                        }
+                    } else {
+                        // The rails cannot be checked against current venue
+                        // equity, and a fill has already moved the book:
+                        // block the rest of the openings rather than send
+                        // them blind.
+                        self.equity_ready = false;
+                        rail_blocked = Some("equity_unavailable".to_string());
                     }
-                } else {
-                    // The rails cannot be checked against current venue
-                    // equity, and a fill has already moved the book: block
-                    // the rest of the openings rather than send them blind.
-                    self.equity_ready = false;
-                    cap_breach = Some("equity_unavailable".to_string());
+                    cap_breach = rail_blocked.clone();
                 }
             }
             if !intent.reduce_only && (cap_breach.is_some() || !self.opens_allowed()) {
@@ -1218,7 +1233,12 @@ impl BookEngine {
                 "paper": self.exec.is_paper(),
             }),
         );
-        if realized != 0.0 || matches!(intent.kind, IntentKind::Close | IntentKind::Reduce) {
+        // An unfilled reduce-only IOC is routine; writing an exit row for
+        // it would put a phantom close in the PnL log while the leg is
+        // still open.
+        if fill.filled_qty > 0.0
+            && (realized != 0.0 || matches!(intent.kind, IntentKind::Close | IntentKind::Reduce))
+        {
             self.pnl.write(
                 now,
                 "exit",

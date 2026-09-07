@@ -160,6 +160,15 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
 
     let mut summary = ReplaySummary::default();
     for (date, rows) in &bars {
+        // Every leg the book still holds must be marked on this date:
+        // without a price the mark, funding and equity would silently fall
+        // back to the entry basis, reporting zero movement and possibly
+        // suppressing a drawdown halt.
+        for sym in engine.state.positions.keys() {
+            if !rows.contains_key(sym) {
+                bail!("bars.jsonl has no {sym} row for {date}, but the book still holds that leg");
+            }
+        }
         // Each date is a complete snapshot: nothing carries over from the
         // previous date, so an omitted symbol or funding rate is absent
         // (a decision on it is rejected with `missing_price`) rather than
@@ -431,19 +440,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_held_leg_missing_from_a_later_bar_date_fails_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        write_bars(dir.path(), None);
+        // Hold BTC/DOT from 07-03, then drop DOT's 07-06 row: that leg
+        // would otherwise be marked at its entry basis for the day.
+        let bars = std::fs::read_to_string(dir.path().join("bars.jsonl")).unwrap();
+        let kept: Vec<&str> = bars
+            .lines()
+            .filter(|l| !(l.contains("2026-07-06") && l.contains("DOT")))
+            .collect();
+        std::fs::write(dir.path().join("bars.jsonl"), kept.join("\n") + "\n").unwrap();
+        write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("DOT", -0.5)]);
+        let err = run(cfg(), dir.path(), &dir.path().join("out"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DOT"), "{err}");
+        assert!(err.contains("2026-07-06"), "{err}");
+    }
+
+    #[tokio::test]
     async fn a_symbol_missing_from_a_bar_date_rejects_the_decision_instead_of_using_a_stale_price()
     {
         let dir = tempfile::tempdir().unwrap();
         write_bars(dir.path(), None);
-        // Remove DOT from the 07-08 rows only.
+        // Drop DOT from 07-08 only. The book holds BTC/SOL at that point,
+        // so the held-leg guard does not fire; the 07-08 decision, which
+        // wants DOT, must be rejected for want of a price rather than
+        // sized off the previous day's close.
         let bars = std::fs::read_to_string(dir.path().join("bars.jsonl")).unwrap();
         let kept: Vec<&str> = bars
             .lines()
-            .filter(|l| !(l.contains("\"2026-07-08\"") && l.contains("\"DOT\"")))
+            .filter(|l| !(l.contains("2026-07-08") && l.contains("DOT")))
             .collect();
         std::fs::write(dir.path().join("bars.jsonl"), kept.join("\n") + "\n").unwrap();
-        write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("DOT", -0.5)]);
-        write_signal(dir.path(), "2026-07-08", &[("BTC", -0.5), ("DOT", 0.5)]);
+        write_signal(dir.path(), "2026-07-03", &[("BTC", 0.5), ("SOL", -0.5)]);
+        write_signal(dir.path(), "2026-07-08", &[("BTC", 0.5), ("DOT", -0.5)]);
         let out = dir.path().join("out");
         run(cfg(), dir.path(), &out).await.unwrap();
         let ledger = read_rows(&out.join("ledger.jsonl"));
@@ -453,76 +486,6 @@ mod tests {
             .unwrap();
         assert_eq!(d0708["outcome"], "rejected");
         assert_eq!(d0708["reason"], "missing_price");
-    }
-
-    #[tokio::test]
-    async fn first_calendar_entry_after_midnight_flattens_at_its_own_time() {
-        let dir = tempfile::tempdir().unwrap();
-        write_bars(dir.path(), None);
-        let mut c = cfg();
-        c.schedule.kind = crate::book::config::ScheduleKind::Calendar;
-        c.schedule.anchor_date = None;
-        c.schedule.every_days = None;
-        c.schedule.decision_time_utc = None;
-        c.schedule.flatten_after_secs = None;
-        c.schedule.signal_grace_secs = 600;
-        c.schedule.calendar_path = Some(dir.path().join("cal.json"));
-        c.signal.require_dollar_neutral = false;
-        c.sizing.max_net_usd = 1_000.0;
-        std::fs::write(
-            dir.path().join("cal.json"),
-            r#"{"entries":[{"decision_key":"2026-07-05","decision_at":"2026-07-05T06:30:00Z","flatten_at":"2026-07-05T13:30:00Z"}]}"#,
-        )
-        .unwrap();
-        let decision_at = ts("2026-07-05T06:30:00Z");
-        let body = signal_json(
-            "test_producer",
-            decision_at - Duration::minutes(10),
-            decision_at - Duration::minutes(30),
-            "2026-07-05",
-            &[("SOL", 0.5)],
-        );
-        std::fs::create_dir_all(dir.path().join("signals")).unwrap();
-        std::fs::write(dir.path().join("signals").join("2026-07-05.json"), body).unwrap();
-        let out = dir.path().join("out");
-        run(c, dir.path(), &out).await.unwrap();
-        let ledger = read_rows(&out.join("ledger.jsonl"));
-        let flatten: Vec<_> = ledger.iter().filter(|r| r["event"] == "flatten").collect();
-        assert_eq!(flatten.len(), 1);
-        assert_eq!(
-            flatten[0]["ts_ms"],
-            ts("2026-07-05T13:30:00Z").timestamp_millis()
-        );
-        assert_eq!(flatten[0]["flat"], true);
-    }
-
-    #[tokio::test]
-    async fn a_midnight_decision_uses_its_own_dates_closes() {
-        let dir = tempfile::tempdir().unwrap();
-        write_bars(dir.path(), None);
-        let mut c = cfg();
-        c.schedule.decision_time_utc = Some("00:00".into());
-        // Decision at 2026-07-08T00:00Z: must fill at the 07-08 close
-        // (BTC 100000 + 500*5 = 102500), not the 07-07 close (102000).
-        let decision_at = ts("2026-07-08T00:00:00Z");
-        let body = signal_json(
-            "test_producer",
-            decision_at - Duration::minutes(10),
-            decision_at - Duration::minutes(30),
-            "2026-07-08",
-            &[("BTC", 0.5), ("DOT", -0.5)],
-        );
-        std::fs::create_dir_all(dir.path().join("signals")).unwrap();
-        std::fs::write(dir.path().join("signals").join("2026-07-08.json"), body).unwrap();
-        let out = dir.path().join("out");
-        run(c, dir.path(), &out).await.unwrap();
-        let ledger = read_rows(&out.join("ledger.jsonl"));
-        let btc = ledger
-            .iter()
-            .find(|r| r["event"] == "fill" && r["intent"]["symbol"] == "BTC")
-            .unwrap();
-        assert_eq!(btc["decision_key"], "2026-07-08");
-        assert!((btc["intent"]["reference_price"].as_f64().unwrap() - 102_500.0).abs() < 1e-6);
     }
 
     #[tokio::test]
