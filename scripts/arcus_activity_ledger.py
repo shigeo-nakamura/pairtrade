@@ -383,7 +383,7 @@ def reconciled_attempts(ledger: dict[str, Any]) -> list[dict[str, Any]]:
 
 def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, Any]]],
                      window: tuple[datetime, datetime],
-                     ) -> tuple[list[Swap], list[int]]:
+                     ) -> tuple[list[Swap], list[tuple[int, datetime]]]:
     """Price every reconciled swap the event window actually covers.
 
     Coverage is decided by the *pricing event*, not by the dispatch clock.
@@ -403,24 +403,27 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
     """
     start, end = window
     swaps: list[Swap] = []
-    out_of_window: list[int] = []
+    out_of_window: list[tuple[int, datetime]] = []
     for attempt in reconciled_attempts(ledger):
+        dispatched_at = event_stream.parse_timestamp(attempt["dispatched_at"])
         event = find_event(attempt, index)
         if event is None:
-            dispatched_at = event_stream.parse_timestamp(attempt["dispatched_at"])
             if start <= dispatched_at <= end:
                 raise ActivityLedgerError(
                     f"ledger sequence {attempt.get('sequence')}: no would-rotate event at or "
                     f"before {attempt['prepared_at']} matches venue/symbols/sell_amount_raw -- "
                     "the event window probably does not cover this swap")
-            out_of_window.append(int(attempt["sequence"]))
+            out_of_window.append((int(attempt["sequence"]), dispatched_at))
             continue
         swap = swap_from_attempt(attempt, event)
         if not start <= swap.event_at <= end:
-            out_of_window.append(int(attempt["sequence"]))
+            out_of_window.append((int(attempt["sequence"]), dispatched_at))
             continue
         swaps.append(swap)
     swaps.sort(key=lambda swap: (swap.at, swap.sequence))
+    # The dispatch time rides along so the caller can tell an unpriceable
+    # swap it was asked about from one it was not: the first is a hole in
+    # the answer, the second is simply outside the question.
     return swaps, sorted(out_of_window)
 
 
@@ -587,7 +590,6 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # belongs to the day the caller named.
     if since is not None and until is not None and since > until:
         raise ActivityLedgerError("--since is after --until")
-    report_window = (since or stream[0], until or stream[1])
     swaps, out_of_window = reconciled_swaps(ledger, index, stream)
     # Pair over everything the stream priced, so a rotation that spans a
     # requested bound is still recognised as one rotation.
@@ -625,14 +627,32 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     total_open_gas = sum((row.open_leg_gas_usd for row in rows), Decimal(0))
     overall = (total_cost / total_volume * 1000) if total_volume else None
     streak = consecutive_days_over(rows, ceiling)
-    # An exit whose entry the stream does not hold means a rotation really
-    # closed in this window and its loss is not in any number below. The
-    # report still says what it can measure, but it will not hand back a
-    # stop verdict computed on a window it knows is short a rotation --
-    # this decides whether to keep funding the bot.
+    # An implicit endpoint is taken from what the report actually covers,
+    # not from the stream alone: with `--since` after the last observation
+    # but before its dispatch -- the midnight straddle live-tick produces --
+    # `stream[1]` as the end sits *before* the start, and the report then
+    # described a real row with an inverted interval.
+    dispatches = [swap.at for swap in swaps]
+    window_from = since if since is not None else min([stream[0], *dispatches])
+    window_to = until if until is not None else max([stream[1], *dispatches])
+    report_window = (window_from, max(window_to, window_from))
+
+    # Two ways this window can be short a rotation, and both make the stop
+    # verdict undecidable. The report still says what it can measure, but it
+    # will not hand back a verdict computed on a window it knows is
+    # incomplete -- this is what decides whether to keep funding the bot.
+    #
+    # An exit whose entry the stream does not hold: a rotation really closed
+    # here and its loss is in none of the figures.
     orphaned = sorted(swap.sequence for swap in orphan_exits
                       if within(swap.at, since, until))
-    complete = not orphaned
+    # And a ledger swap the caller asked about that the stream cannot price
+    # at all -- a bound reaching past the events supplied. Naming it in
+    # `ledger_swaps_outside_window` was never enough on its own: the swap is
+    # inside the question, so the answer is missing a piece.
+    unpriceable = sorted(sequence for sequence, dispatched_at in out_of_window
+                         if within(dispatched_at, since, until))
+    complete = not orphaned and not unpriceable
     return {
         "schema_version": 1,
         "window": {
@@ -643,7 +663,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
             "from": stream[0].isoformat().replace("+00:00", "Z"),
             "to": stream[1].isoformat().replace("+00:00", "Z"),
         },
-        "ledger_swaps_outside_window": out_of_window,
+        "ledger_swaps_outside_window": [sequence for sequence, _ in out_of_window],
         "ceiling_usd_per_1k": as_number(ceiling),
         "gas_price_usd": as_number(gas_price_usd),
         "days": [
@@ -683,6 +703,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
         "coverage": {
             "complete": complete,
             "exits_without_entry": orphaned,
+            "requested_but_unpriceable": unpriceable,
         },
         "stop_rule": {
             "consecutive_days_required": STOP_RULE_CONSECUTIVE_DAYS,
@@ -717,14 +738,22 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"{totals['round_trip_volume_usd']:.2f} | {totals['round_trip_loss_usd']:.4f} | "
         f"{totals['gas_usd']:.4f} | {totals['cost_usd']:.4f} | "
         f"{'—' if overall is None else f'{overall:.2f}'} |")
-    if not report["coverage"]["complete"]:
+    coverage = report["coverage"]
+    if not coverage["complete"]:
         lines.append("")
+        reasons = []
+        if coverage["exits_without_entry"]:
+            reasons.append(
+                "closes rotations whose entry the event stream does not hold (ledger sequences "
+                + ", ".join(str(s) for s in coverage["exits_without_entry"]) + ")")
+        if coverage["requested_but_unpriceable"]:
+            reasons.append(
+                "covers swaps the event stream cannot price at all (ledger sequences "
+                + ", ".join(str(s) for s in coverage["requested_but_unpriceable"]) + ")")
         lines.append(
-            "⚠️ This window closes rotations whose entry the event stream does not hold "
-            "(ledger sequences "
-            + ", ".join(str(s) for s in report["coverage"]["exits_without_entry"])
-            + "), so their loss is in none of the figures above and no stop verdict is "
-            "given. Re-run with the earlier event segment included.")
+            "⚠️ This window " + " and ".join(reasons)
+            + ", so their cost is in none of the figures above and no stop verdict is given. "
+              "Re-run with the missing event segment included.")
     open_gas = report["totals"]["open_leg_gas_usd"]
     if open_gas:
         lines.append("")

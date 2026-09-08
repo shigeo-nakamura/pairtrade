@@ -538,6 +538,52 @@ class ActivityLedgerTests(unittest.TestCase):
         # But the money is not lost.
         self.assertGreater(close_day["spent_usd"], close_day["cost_usd"])
 
+    def test_a_bound_reaching_past_the_events_withholds_the_verdict(self):
+        """A swap inside the question the stream cannot price is a hole.
+
+        Naming it in `ledger_swaps_outside_window` was never enough on its
+        own: the caller asked about that day, the swap's cost is in none of
+        the figures, and a definitive stop verdict was published anyway.
+        """
+        events, history = baseline_round_trip()
+        later = EXIT_AT + timedelta(days=1)
+        # A reconciled swap a day past the last observation, so nothing can
+        # price it -- but `--until` reaches over it.
+        history.append(attempt(10, later, sell="QQQ", buy="SPY", sell_quantity="0.5",
+                               buy_quantity="0.4"))
+        report = report_for(events, history, until=later + timedelta(hours=1))
+
+        self.assertEqual(report["ledger_swaps_outside_window"], [10])
+        self.assertEqual(report["coverage"]["requested_but_unpriceable"], [10])
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertTrue(report["stop_rule"]["undecidable"])
+        self.assertIn("cannot price at all", ledger_tool.render_markdown(report))
+
+        # The same unpriceable swap outside the requested bounds is simply
+        # not part of the question, and does not spoil the verdict.
+        bounded = report_for(events, history, until=EXIT_AT + timedelta(hours=1))
+        self.assertEqual(bounded["ledger_swaps_outside_window"], [10])
+        self.assertTrue(bounded["coverage"]["complete"])
+        self.assertFalse(bounded["stop_rule"]["undecidable"])
+
+    def test_the_reported_window_is_never_inverted(self):
+        """`--since` after the last observation is now a supported case."""
+        just_before_midnight = datetime(2026, 9, 4, 23, 59, 59, tzinfo=timezone.utc)
+        just_after = datetime(2026, 9, 5, 0, 0, 1, tzinfo=timezone.utc)
+        events = [would_rotate_event(1, just_before_midnight, trigger="entry_signal",
+                                     sell="QQQ", buy="SPY", sell_quantity="0.347094",
+                                     buy_quantity="0.323269", spy_mark="771.27",
+                                     qqq_mark="720.265")]
+        history = [attempt(8, just_before_midnight, sell="QQQ", buy="SPY",
+                           sell_quantity="0.347094", buy_quantity="0.323269",
+                           dispatched=just_after)]
+        report = report_for(events, history,
+                            since=datetime(2026, 9, 5, tzinfo=timezone.utc))
+
+        self.assertLessEqual(report["window"]["from"], report["window"]["to"])
+        # And it covers the row it emitted, rather than ending before it.
+        self.assertGreaterEqual(report["window"]["to"], "2026-09-05T00:00:01Z")
+
     def test_only_reconciled_attempts_are_counted(self):
         events, history = baseline_round_trip()
         history[1]["phase"] = "rejected"
