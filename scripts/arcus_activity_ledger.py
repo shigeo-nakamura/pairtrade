@@ -25,7 +25,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -36,6 +36,9 @@ import arcus_live_tick_event_stream as event_stream
 DEFAULT_CEILING_USD_PER_1K = Decimal("3")
 STOP_RULE_CONSECUTIVE_DAYS = 7
 WEI_PER_ETHER = Decimal(10) ** 18
+# `HARD_MAX_PLAN_AGE_SECS` in src/arcus_spot/live_executor.rs: the runtime
+# refuses to dispatch a plan older than this, whatever the config says.
+HARD_MAX_PLAN_AGE_SECS = 60
 
 
 class ActivityLedgerError(ValueError):
@@ -67,8 +70,22 @@ class Swap:
 
 @dataclass(frozen=True)
 class RoundTrip:
+    """One entry and every exit leg that unwinds it.
+
+    A rotation is not always closed by a single exit. When the recorder's
+    fixed-notional quote comes back smaller than the open quantity, the
+    runtime takes it as an ordinary partial exit and keeps the remainder
+    tracked as still open (`src/arcus_spot/runtime.rs`), so the unwind can
+    take several legs across several days.
+    """
+
     entry: Swap
-    exit: Swap
+    exits: tuple[Swap, ...]
+
+    @property
+    def exit(self) -> Swap:
+        """The leg that actually closed the rotation."""
+        return self.exits[-1]
 
     @property
     def date(self) -> str:
@@ -77,25 +94,30 @@ class RoundTrip:
 
     @property
     def volume_usd(self) -> Decimal:
-        return self.entry.notional_usd + self.exit.notional_usd
+        return self.entry.notional_usd + sum(
+            (leg.notional_usd for leg in self.exits), Decimal(0))
 
     @property
     def loss_usd(self) -> Decimal:
-        """Realized round-trip loss, marked at the exit tick.
+        """Realized round-trip loss, marked at the closing tick.
 
-        Both net token deltas are valued at the *exit* marks, so the number
-        includes whatever the pair drifted while the rotation was held. That
-        drift is not an execution cost, but it is money that the volume cost
-        us, and pricing each leg at its own entry mark would hide it.
+        Both net token deltas are valued at the marks of the leg that closed
+        the rotation, so the number includes whatever the pair drifted while
+        it was held. That drift is not an execution cost, but it is money
+        that the volume cost us, and pricing each leg at its own mark would
+        hide it. With one exit this is exactly the two-leg calculation; with
+        several it nets every leg first and prices the result once.
         """
-        base = self.exit.buy_quantity - self.entry.sell_quantity
-        quote = self.entry.buy_quantity - self.exit.sell_quantity
-        pnl = base * self.exit.buy_mark_usd + quote * self.exit.sell_mark_usd
+        sold = sum((leg.sell_quantity for leg in self.exits), Decimal(0))
+        bought = sum((leg.buy_quantity for leg in self.exits), Decimal(0))
+        held = self.entry.buy_quantity - sold
+        returned = bought - self.entry.sell_quantity
+        pnl = held * self.exit.sell_mark_usd + returned * self.exit.buy_mark_usd
         return -pnl
 
     @property
     def gas_wei(self) -> Decimal:
-        return self.entry.gas_wei + self.exit.gas_wei
+        return self.entry.gas_wei + sum((leg.gas_wei for leg in self.exits), Decimal(0))
 
 
 @dataclass
@@ -191,7 +213,29 @@ def would_rotate_index(events: Iterable[dict[str, Any]]) -> dict[tuple, list[dic
 
 def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]],
                ) -> dict[str, Any] | None:
-    """The would-rotate observation this dispatch was built from, if present."""
+    """The would-rotate observation this dispatch was built from, if present.
+
+    Venue, symbols and `sell_amount_raw` do not prove plan identity -- the
+    runtime says so itself and keeps a plan digest for exact identity
+    (`require_intent_matches_plan_shape` in
+    `src/arcus_spot/live_executor.rs`). The digest is over config+plan and
+    the config is not in the event stream, so it cannot be recomputed from
+    this side. Two things are available instead, and both come from the
+    runtime rather than from taste:
+
+    * the resolved token addresses, the same extra proof the runtime adds on
+      top of the coarse shape for the caller that has no digest; and
+    * the dispatch-time freshness bound. `validate_plan_age` refuses any
+      plan older than `max_plan_age_secs`, itself hard-capped at
+      `HARD_MAX_PLAN_AGE_SECS` = 60s, so the observation a dispatch was
+      built from is always within 60s of it. Live-tick runs on a 15-minute
+      timer (`deploy/arcus-spot-live-tick.timer`), so exactly one candidate
+      falls in that bound on the live path.
+
+    More than one is therefore not a tie to break by recency -- picking the
+    newest could price a swap at an unrelated tick's marks and trigger, e.g.
+    an offline execution of an older approved plan. It is refused.
+    """
     intent = attempt.get("intent") or {}
     key = (
         str(intent.get("venue", "")).lower(),
@@ -200,15 +244,45 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
         intent.get("sell_amount_raw"),
     )
     prepared_at = event_stream.parse_timestamp(attempt["prepared_at"])
-    candidates = [
-        event for event in index.get(key, [])
-        if event_stream.parse_timestamp(event["observed_at"]) <= prepared_at
-    ]
+    oldest_usable = prepared_at - timedelta(seconds=HARD_MAX_PLAN_AGE_SECS)
+    candidates = []
+    for event in index.get(key, []):
+        observed_at = event_stream.parse_timestamp(event["observed_at"])
+        if not oldest_usable <= observed_at <= prepared_at:
+            continue
+        plan = event["decision"]["plan"]
+        if not token_addresses_match(intent, plan):
+            continue
+        candidates.append(event)
     if not candidates:
         return None
-    # The plan a dispatch was built from is the newest matching observation,
-    # the same rule live-tick's own staleness check applies.
-    return max(candidates, key=lambda event: event_stream.parse_timestamp(event["observed_at"]))
+    if len(candidates) > 1:
+        raise ActivityLedgerError(
+            f"ledger sequence {attempt.get('sequence')}: {len(candidates)} would-rotate events "
+            f"within {HARD_MAX_PLAN_AGE_SECS}s before {attempt['prepared_at']} match this swap's "
+            "venue/symbols/amount/token addresses, so which marks and trigger priced it cannot "
+            "be proven -- refusing rather than guessing at "
+            + ", ".join(str(event["sequence"]) for event in candidates))
+    return candidates[0]
+
+
+def token_addresses_match(intent: dict[str, Any], plan: dict[str, Any]) -> bool:
+    """Same ERC-20 contracts on both sides, not merely the same symbols.
+
+    A symbol registry can resolve the same symbol to a different contract
+    later than it did when the intent was signed; the runtime checks the
+    pinned addresses for exactly this reason.
+    """
+    pairs = (
+        (intent.get("sell_token"), plan.get("sell_token_address")),
+        (intent.get("buy_token"), plan.get("buy_token_address")),
+    )
+    for on_intent, on_plan in pairs:
+        if on_intent is None or on_plan is None:
+            return False
+        if str(on_intent).lower() != str(on_plan).lower():
+            return False
+    return True
 
 
 def swap_from_attempt(attempt: dict[str, Any], event: dict[str, Any]) -> Swap:
@@ -327,29 +401,55 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
 
 
 def pair_round_trips(swaps: Sequence[Swap]) -> tuple[list[RoundTrip], list[Swap]]:
-    """Pair each entry with the exit that unwinds it.
+    """Pair each entry with the exit legs that unwind it.
 
     `trigger` is the runtime's own word for what a rotation was: only
     `entry_signal` opens one, and every other trigger (mean-reversion exit,
-    max-hold exit) closes it. An entry still open at the end of the window is
-    reported separately rather than being priced against nothing.
+    max-hold exit) sells against it.
+
+    A rotation closes when its exits have sold the whole quantity the entry
+    acquired, not on the first exit. That is the runtime's own rule, and it
+    is exact: the entry sets `rotated_quantity` to the quantity actually
+    bought, each exit subtracts the quantity actually sold, and the rotation
+    returns to Neutral only when the remainder reaches zero
+    (`src/arcus_spot/runtime.rs`). Closing on the first exit instead priced a
+    round trip from a fraction of its unwind -- understating both the loss
+    and the volume it was earned on -- and reported every later leg as
+    unpaired.
+
+    An entry whose exits never finish unwinding it is still open at the end
+    of the window; it and its partial legs are reported unpaired rather than
+    priced against an unwind that has not happened.
     """
     round_trips: list[RoundTrip] = []
-    open_entry: Swap | None = None
     unpaired: list[Swap] = []
+    open_entry: Swap | None = None
+    open_exits: list[Swap] = []
+    remaining = Decimal(0)
+
+    def abandon_open() -> None:
+        nonlocal open_entry, open_exits
+        if open_entry is not None:
+            unpaired.append(open_entry)
+            unpaired.extend(open_exits)
+        open_entry, open_exits = None, []
+
     for swap in swaps:
         if swap.trigger == "entry_signal":
-            if open_entry is not None:
-                unpaired.append(open_entry)
+            abandon_open()
             open_entry = swap
+            open_exits = []
+            remaining = swap.buy_quantity
             continue
         if open_entry is None:
             unpaired.append(swap)
             continue
-        round_trips.append(RoundTrip(entry=open_entry, exit=swap))
-        open_entry = None
-    if open_entry is not None:
-        unpaired.append(open_entry)
+        open_exits.append(swap)
+        remaining -= swap.sell_quantity
+        if remaining <= 0:
+            round_trips.append(RoundTrip(entry=open_entry, exits=tuple(open_exits)))
+            open_entry, open_exits = None, []
+    abandon_open()
     return round_trips, unpaired
 
 

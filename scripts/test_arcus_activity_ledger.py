@@ -29,6 +29,16 @@ def raw(quantity, decimals=18):
     return str(int(Decimal(quantity) * (Decimal(10) ** decimals)))
 
 
+# The runtime pins the resolved ERC-20 contract on both the plan and the
+# intent, so every real record carries them and the matcher requires them.
+TOKENS = {
+    "SPY": "0x1111111111111111111111111111111111111111",
+    "QQQ": "0x2222222222222222222222222222222222222222",
+    "NVDA": "0x3333333333333333333333333333333333333333",
+    "AMD": "0x4444444444444444444444444444444444444444",
+}
+
+
 def would_rotate_event(sequence, when, *, trigger, sell, buy, sell_quantity,
                        buy_quantity, spy_mark, qqq_mark, decimals=18):
     return {
@@ -50,6 +60,8 @@ def would_rotate_event(sequence, when, *, trigger, sell, buy, sell_quantity,
                 "buy_quantity": str(buy_quantity),
                 "sell_amount_raw": raw(sell_quantity, decimals),
                 "buy_amount_raw": raw(buy_quantity, decimals),
+                "sell_token_address": TOKENS[sell],
+                "buy_token_address": TOKENS[buy],
             },
         },
     }
@@ -83,6 +95,8 @@ def attempt(sequence, when, *, sell, buy, sell_quantity, buy_quantity,
             "sell_symbol": sell,
             "buy_symbol": buy,
             "sell_amount_raw": raw(sell_quantity, decimals),
+            "sell_token": TOKENS[sell],
+            "buy_token": TOKENS[buy],
         },
         "pre_balances": {
             "sell_balance_raw": raw(sell_before, decimals),
@@ -224,6 +238,104 @@ class ActivityLedgerTests(unittest.TestCase):
     def test_a_swap_inside_the_window_with_no_matching_event_is_an_error(self):
         events, history = baseline_round_trip()
         history[1]["intent"]["sell_amount_raw"] = raw("0.999999")
+        with self.assertRaisesRegex(ledger_tool.ActivityLedgerError, "no would-rotate event"):
+            report_for(events, history)
+
+    def test_a_rotation_unwound_in_two_legs_is_one_round_trip(self):
+        """A partial exit does not close a rotation.
+
+        When the recorder's fixed-notional quote comes back smaller than the
+        open quantity, the runtime keeps the remainder tracked as open and
+        sells it on a later tick. Closing on the first exit priced the round
+        trip from half its unwind and reported the other half as unpaired.
+        """
+        second_exit_at = EXIT_AT + timedelta(hours=1)
+        events = [
+            would_rotate_event(1, ENTRY_AT, trigger="entry_signal", sell="QQQ", buy="SPY",
+                               sell_quantity="0.347094", buy_quantity="0.323269",
+                               spy_mark="771.27", qqq_mark="720.265"),
+            would_rotate_event(2, EXIT_AT, trigger="mean_reversion_exit", sell="SPY", buy="QQQ",
+                               sell_quantity="0.161634", buy_quantity="0.173172",
+                               spy_mark="773.50", qqq_mark="721.00"),
+            would_rotate_event(3, second_exit_at, trigger="mean_reversion_exit", sell="SPY",
+                               buy="QQQ", sell_quantity="0.161635", buy_quantity="0.173173",
+                               spy_mark="773.50", qqq_mark="721.00"),
+        ]
+        history = [
+            attempt(8, ENTRY_AT, sell="QQQ", buy="SPY", sell_quantity="0.347094",
+                    buy_quantity="0.323269"),
+            attempt(9, EXIT_AT, sell="SPY", buy="QQQ", sell_quantity="0.161634",
+                    buy_quantity="0.173172", sell_before="0.323269", buy_before="0"),
+            attempt(10, second_exit_at, sell="SPY", buy="QQQ", sell_quantity="0.161635",
+                    buy_quantity="0.173173", sell_before="0.161635", buy_before="0.173172"),
+        ]
+        report = report_for(events, history)
+
+        self.assertEqual(report["totals"]["round_trips"], 1)
+        self.assertEqual(report["totals"]["swaps"], 3)
+        # Nothing left over: both exit legs belong to the rotation.
+        self.assertEqual([day["unpaired_swaps"] for day in report["days"]], [[], []])
+        # Volume is all three legs, and the loss is the same 0.000749 QQQ
+        # shortfall the single-exit case reports -- split across two exits,
+        # netted before pricing rather than measured from the first leg only.
+        expected_loss = Decimal("0.000749") * Decimal("721.00")
+        self.assertAlmostEqual(report["totals"]["cost_usd"], float(expected_loss), places=4)
+        # The same tokens moved, so the KPI denominator is the same as the
+        # single-exit baseline -- splitting the unwind neither inflates nor
+        # loses volume.
+        one_leg = report_for(*baseline_round_trip())
+        self.assertAlmostEqual(report["totals"]["round_trip_volume_usd"],
+                               one_leg["totals"]["round_trip_volume_usd"], places=2)
+
+    def test_a_rotation_left_partly_open_is_never_priced(self):
+        events, history = baseline_round_trip()
+        # The exit unwinds only half of what the entry bought, so the
+        # rotation is still open when the window ends.
+        events[1] = would_rotate_event(2, EXIT_AT, trigger="mean_reversion_exit", sell="SPY",
+                                       buy="QQQ", sell_quantity="0.161634",
+                                       buy_quantity="0.173172", spy_mark="773.50",
+                                       qqq_mark="721.00")
+        history[1] = attempt(9, EXIT_AT, sell="SPY", buy="QQQ", sell_quantity="0.161634",
+                             buy_quantity="0.173172", sell_before="0.323269", buy_before="0")
+        report = report_for(events, history)
+
+        self.assertEqual(report["totals"]["round_trips"], 0)
+        self.assertIsNone(report["totals"]["cost_per_1k_usd"])
+        self.assertEqual(sorted(sum((day["unpaired_swaps"] for day in report["days"]), [])),
+                         [8, 9])
+
+    def test_two_indistinguishable_events_are_refused_not_guessed_between(self):
+        """Recency is not proof of which plan was dispatched.
+
+        The runtime keeps a config+plan digest precisely because
+        venue/symbols/amount do not identify a plan, and that digest cannot
+        be recomputed from the event stream. Two candidates inside the
+        dispatch freshness bound therefore mean the marks are unprovable.
+        """
+        events, history = baseline_round_trip()
+        events.insert(1, would_rotate_event(
+            99, ENTRY_AT - timedelta(seconds=20), trigger="max_hold_exit", sell="QQQ", buy="SPY",
+            sell_quantity="0.347094", buy_quantity="0.323269",
+            spy_mark="999.00", qqq_mark="111.00"))
+        with self.assertRaisesRegex(ledger_tool.ActivityLedgerError, "refusing rather than"):
+            report_for(events, history)
+
+    def test_an_older_identical_plan_outside_the_freshness_bound_is_not_a_candidate(self):
+        """The runtime will not dispatch a plan older than 60s, so neither
+        will this match one."""
+        events, history = baseline_round_trip()
+        events.insert(1, would_rotate_event(
+            99, ENTRY_AT - timedelta(minutes=15), trigger="max_hold_exit", sell="QQQ", buy="SPY",
+            sell_quantity="0.347094", buy_quantity="0.323269",
+            spy_mark="999.00", qqq_mark="111.00"))
+        report = report_for(events, history)
+        self.assertEqual(report["totals"]["round_trips"], 1)
+
+    def test_a_remapped_token_contract_is_not_the_same_swap(self):
+        """Same symbols, different ERC-20: the runtime pins the address."""
+        events, history = baseline_round_trip()
+        events[1]["decision"]["plan"]["sell_token_address"] = (
+            "0x9999999999999999999999999999999999999999")
         with self.assertRaisesRegex(ledger_tool.ActivityLedgerError, "no would-rotate event"):
             report_for(events, history)
 
