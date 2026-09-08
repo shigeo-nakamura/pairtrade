@@ -85,7 +85,55 @@ install -o root -g "$SERVICE_GROUP" -m 0550 "$FETCH_SCRIPT_SOURCE" "$STAGE/bin/b
 # does not load `schedule.calendar_path`, so without this check a first
 # install promotes a bundle the service cannot start, and an update
 # silently keeps whatever calendar was installed before.
-KIND=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*kind:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+# Every value below comes from the staged binary parsing the staged
+# config, never from awk (bot-strategy#948, pairtrade#293). awk is not a
+# YAML parser: quoted scalars kept their quotes, values containing spaces
+# were truncated at the first token, trailing `# comments` leaked in, and
+# each fix only uncovered the next case -- while the binary that will run
+# the config is the one thing guaranteed to read it the same way the
+# service does. Same reasoning as bot-strategy#952 moving calendar
+# validation into the runtime. This runs before the calendar is staged,
+# so it deliberately does not build the scheduler.
+#
+# Feature-detected, because this workflow can legitimately run ahead of a
+# binary that supports it: deploy-configs.yml syncs scripts/ and then
+# stages whatever binary `book-runtime/current.json` currently points at,
+# while ci.yml republishes that pointer only after its much slower ARM
+# build -- and a config-only push never triggers a binary build at all.
+# So on the deploy that first carries this installer, the staged binary
+# can still be the previous one, whose argument parser rejects an unknown
+# flag and would fail the whole config deployment (pairtrade#293 Codex).
+FETCH_ENV_RENDERED=0
+if LD_LIBRARY_PATH="$STAGE/lib" "$STAGE/bin/book_runtime" --help 2>&1 | grep -q -- '--print-fetch-env'; then
+  FETCH_ENV_RENDERED=1
+  if ! LD_LIBRARY_PATH="$STAGE/lib" "$STAGE/bin/book_runtime" \
+        --config "$STAGE/${INSTANCE}.yaml" \
+        --print-fetch-env "$STAGE/${INSTANCE}.fetch.env"; then
+    echo "book runtime could not parse $CONFIG_SOURCE with $BINARY_SOURCE; installed bundle left untouched" >&2
+    exit 1
+  fi
+elif [ -f "$INSTALL_DIR/${INSTANCE}.fetch.env" ] \
+     && cmp -s "$STAGE/${INSTANCE}.yaml" "$INSTALL_DIR/${INSTANCE}.yaml"; then
+  # The published binary predates the flag, but the config is byte-identical
+  # to the installed one, so the installed fetch env already describes it.
+  # Carrying it forward keeps the deploy green without guessing at any
+  # value -- no YAML is parsed on this path either.
+  echo "note: published book_runtime predates --print-fetch-env; config unchanged, carrying the installed fetch env forward" >&2
+  cp -p "$INSTALL_DIR/${INSTANCE}.fetch.env" "$STAGE/${INSTANCE}.fetch.env"
+else
+  echo "the published book_runtime predates --print-fetch-env and there is no unchanged fetch env to carry forward; re-run Deploy Configs after this commit's binary deploy has published book-runtime/current.json" >&2
+  exit 1
+fi
+# Bare KEY=value lines, restricted to a character set systemd's
+# EnvironmentFile= parser and a shell read identically.
+# Every read below carries a `:-` default: on the compatibility path the
+# file was written by the *previous* installer, which did not emit
+# BOOK_CALENDAR_PATH at all, and `set -u` would abort the deploy on it
+# (pairtrade#293 Codex).
+# shellcheck disable=SC1090
+. "$STAGE/${INSTANCE}.fetch.env"
+KIND=${BOOK_SCHEDULE_KIND:-}
+CALENDAR_PATH=${BOOK_CALENDAR_PATH:-}
 if [ -z "$KIND" ]; then
   echo "could not read schedule.kind from $CONFIG_SOURCE" >&2
   exit 1
@@ -101,10 +149,17 @@ if [ "$KIND" = "calendar" ]; then
   # and a config naming any other path would install cleanly and then fail
   # at service start with the calendar sitting where the runtime does not
   # look.
-  CALENDAR_PATH=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*calendar_path:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
-  if [ "$CALENDAR_PATH" != "$INSTALL_DIR/${INSTANCE}.calendar.json" ]; then
-    echo "schedule.calendar_path must be $INSTALL_DIR/${INSTANCE}.calendar.json (got '${CALENDAR_PATH}'); installed bundle left untouched" >&2
-    exit 1
+  if [ "$FETCH_ENV_RENDERED" = 1 ]; then
+    if [ "$CALENDAR_PATH" != "$INSTALL_DIR/${INSTANCE}.calendar.json" ]; then
+      echo "schedule.calendar_path must be $INSTALL_DIR/${INSTANCE}.calendar.json (got '${CALENDAR_PATH}'); installed bundle left untouched" >&2
+      exit 1
+    fi
+  else
+    # Compatibility path only: the carried-forward env predates
+    # BOOK_CALENDAR_PATH, and it is only taken when the staged config is
+    # byte-identical to the installed one -- which the running service is
+    # already loading its calendar from, so the path is whatever it was.
+    echo "note: skipping the schedule.calendar_path check (carried-forward fetch env, config unchanged)" >&2
   fi
 fi
 if [ -n "$CALENDAR_SOURCE" ]; then
@@ -132,58 +187,35 @@ if ! LD_LIBRARY_PATH="$STAGE/lib" "$STAGE/bin/book_runtime" "${VALIDATE_ARGS[@]}
   echo "book runtime bundle failed validation ($CONFIG_SOURCE with $BINARY_SOURCE); installed bundle left untouched" >&2
   exit 1
 fi
-# The fetcher pre-filters downloads with the same freshness bound the
-# runtime enforces, so a stale S3 object cannot displace a usable local
-# signal. Derive it from the validated config rather than duplicating the
-# number in the unit file.
-MAX_AGE=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*max_age_secs:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
-case "$MAX_AGE" in
+# The fetch env was rendered by the binary above, before the calendar
+# checks; only its required-field assertions remain here, so a config
+# missing something the fetcher needs fails before promotion rather than
+# silently disabling one of the fetcher's checks.
+if [ -z "$BOOK_SIGNAL_PRODUCER_ID" ]; then
+  echo "signal.producer_id is empty in $CONFIG_SOURCE" >&2
+  exit 1
+fi
+case "$BOOK_SIGNAL_MAX_AGE_SECS" in
   ''|*[!0-9]*)
-    echo "could not read signal.max_age_secs from $CONFIG_SOURCE (got '${MAX_AGE}')" >&2
+    echo "signal.max_age_secs must be a non-negative integer in $CONFIG_SOURCE (got '${BOOK_SIGNAL_MAX_AGE_SECS}')" >&2
     exit 1
     ;;
 esac
-PRODUCER=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*producer_id:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
-if [ -z "$PRODUCER" ]; then
-  echo "could not read signal.producer_id from $CONFIG_SOURCE" >&2
-  exit 1
-fi
 # Only date-keyed schedules (interval_days / daily) let the fetcher derive
 # a decision time from the file's own decision_key; a calendar schedule
-# leaves this empty and the fetcher skips that one check. (`KIND` was
-# read above, before the calendar block.)
-DECISION_TIME=""
-ANCHOR_DATE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*anchor_date:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
-EVERY_DAYS=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*every_days:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+# leaves this empty and the fetcher skips that one check.
 case "$KIND" in
   interval_days|daily)
-    DECISION_TIME=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*decision_time_utc:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
-    if [ -z "$DECISION_TIME" ]; then
-      echo "could not read schedule.decision_time_utc from $CONFIG_SOURCE (kind=$KIND)" >&2
+    if [ -z "$BOOK_DECISION_TIME_UTC" ]; then
+      echo "schedule.decision_time_utc is required for kind=$KIND in $CONFIG_SOURCE" >&2
       exit 1
     fi
     ;;
 esac
-MAX_SYMBOL_WEIGHT=$(awk '/^sizing:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*max_symbol_weight:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
-NET_TOLERANCE=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*net_tolerance:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
-REQUIRE_NEUTRAL=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*require_dollar_neutral:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
-UNIVERSE=$(awk '/^universe:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*- /{printf "%s%s", sep, $2; sep=","}' "$STAGE/${INSTANCE}.yaml")
-if [ -z "$UNIVERSE" ]; then
-  echo "could not read universe.symbols from $CONFIG_SOURCE" >&2
+if [ -z "$BOOK_UNIVERSE" ]; then
+  echo "universe.symbols is empty in $CONFIG_SOURCE" >&2
   exit 1
 fi
-{
-  printf 'BOOK_SIGNAL_MAX_AGE_SECS=%s\n' "$MAX_AGE"
-  printf 'BOOK_SIGNAL_PRODUCER_ID=%s\n' "$PRODUCER"
-  printf 'BOOK_DECISION_TIME_UTC=%s\n' "$DECISION_TIME"
-  printf 'BOOK_SCHEDULE_KIND=%s\n' "$KIND"
-  printf 'BOOK_ANCHOR_DATE=%s\n' "$ANCHOR_DATE"
-  printf 'BOOK_EVERY_DAYS=%s\n' "$EVERY_DAYS"
-  printf 'BOOK_MAX_SYMBOL_WEIGHT=%s\n' "${MAX_SYMBOL_WEIGHT:-}"
-  printf 'BOOK_NET_TOLERANCE=%s\n' "${NET_TOLERANCE:-0.05}"
-  printf 'BOOK_REQUIRE_DOLLAR_NEUTRAL=%s\n' "${REQUIRE_NEUTRAL:-true}"
-  printf 'BOOK_UNIVERSE=%s\n' "$UNIVERSE"
-} > "$STAGE/${INSTANCE}.fetch.env"
 chown root:"$SERVICE_GROUP" "$STAGE/${INSTANCE}.fetch.env"
 chmod 0440 "$STAGE/${INSTANCE}.fetch.env"
 
