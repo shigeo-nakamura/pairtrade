@@ -1657,6 +1657,25 @@ impl EngineBLiveEngine {
         if self.day.t0_prices.is_some() {
             return;
         }
+        // A day that is already settled has no use for a t0 -- `maybe_enter`
+        // returns on `day.entered` before it ever reads one -- and so must
+        // not be *abandoned* for lacking one. Without this, restarting after
+        // a completed cycle recorded a spurious `no_usable_t0` over a day
+        // that had actually entered and exited: `roll_day_if_needed`
+        // restores `entered` from `last_session_date`, the persisted t0 is
+        // hours stale (or, after a `kr_primary` change, for the wrong
+        // symbol, so `recoverable_t0_prices` declines it), and the grace
+        // window below is long past. Observed live 2026-09-08 13:33 UTC
+        // after the +$0.69 cycle -- `last_session_skip_reason` and the
+        // dashboard then reported a traded day as skipped
+        // (bot-strategy#965).
+        //
+        // Deliberately here rather than in the grace branch: capturing a t0
+        // for a settled day would be equally pointless, and persisting one
+        // would only invite a later restart to trust it.
+        if self.day.entered {
+            return;
+        }
         let Some((t0, _, _)) = self.window else {
             return;
         };
@@ -4444,7 +4463,20 @@ mod tests {
             connector: connector.clone(),
             calendar: TradingCalendar {
                 calendar_version: "test".to_string(),
-                sessions: HashMap::new(),
+                // Must resolve 2026-09-08: `roll_day_if_needed` recomputes
+                // `window` from the calendar, so an empty one silently
+                // turns it to None and every window-gated path below
+                // becomes unreachable -- a test that then proves nothing.
+                sessions: HashMap::from([(
+                    "2026-09-08".to_string(),
+                    SessionEntry {
+                        krx_is_open: true,
+                        krx_open_utc_us: Some(T0_US),
+                        krx_close_utc_us: Some(T1_US),
+                        us_is_open: true,
+                        us_open_utc_us: Some(T2_US),
+                    },
+                )]),
             },
             http_client: Client::new(),
             feed: Arc::new(std::sync::Mutex::new(PriceFeed::default())),
@@ -4603,6 +4635,66 @@ mod tests {
             "inside the grace it is still a valid t0"
         );
         assert!(h2.engine.day.skip_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn restarting_after_a_completed_cycle_does_not_record_a_skip() {
+        // The 2026-09-08 13:33 UTC incident, reproduced (bot-strategy#965):
+        // the day entered at t1 and exited at t2, the process restarted,
+        // and `maybe_capture_t0` -- which deliberately ignores the entry
+        // window -- found no usable t0 hours past the grace and recorded
+        // `no_usable_t0` over a day that had actually traded.
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 1, "the day must actually trade");
+        let after_trade = load_state(&h.engine.cfg.state_path);
+        assert_eq!(after_trade.last_session_date.as_deref(), Some("2026-09-08"));
+        assert!(after_trade.last_session_skip_reason.is_none());
+
+        // Restart: same state file, nothing in memory, and (as after a
+        // kr_primary change) no persisted t0 this config can use.
+        let mut h2 = harness();
+        h2.engine.cfg.state_path = h.engine.cfg.state_path.clone();
+        h2.engine.state = RiskState {
+            t0_prices: HashMap::new(),
+            t0_snapshot_date: None,
+            ..after_trade
+        };
+        h2.engine.current_date = None;
+        let after_t2 = T2_US + 120_000_000;
+        h2.set_now(after_t2);
+        h2.engine.roll_day_if_needed(after_t2);
+        assert!(h2.engine.day.entered && h2.engine.day.restart_recovered);
+        h2.engine.maybe_capture_t0(after_t2);
+        assert!(
+            h2.engine.day.skip_reason.is_none(),
+            "a settled day must not be recorded as skipped, got {:?}",
+            h2.engine.day.skip_reason
+        );
+        let persisted = load_state(&h2.engine.cfg.state_path);
+        assert!(
+            persisted.last_session_skip_reason.is_none(),
+            "and the persisted reason must stay clean, got {:?}",
+            persisted.last_session_skip_reason
+        );
+        // The trade itself is untouched.
+        assert_eq!(persisted.last_session_date.as_deref(), Some("2026-09-08"));
+
+        // A day that has NOT been acted on is still abandoned as before.
+        let mut h3 = harness();
+        h3.engine
+            .maybe_capture_t0(T0_US + (h3.engine.cfg.t0_capture_grace_secs + 1) * 1_000_000);
+        assert!(h3
+            .engine
+            .day
+            .skip_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("no_usable_t0")));
     }
 
     #[test]
