@@ -381,6 +381,47 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertAlmostEqual(float(total[columns.index("RT loss $")]),
                                report["totals"]["round_trip_loss_usd"], places=4)
 
+    def test_a_requested_bound_selects_on_the_dispatch_it_dates_rows_by(self):
+        """Every date this report prints comes from the dispatch.
+
+        Live-tick commits the pricing event and then dispatches, so the two
+        can straddle midnight. Selecting on the observation while dating the
+        row from the dispatch made `--since` drop a swap the report itself
+        files under the requested day.
+        """
+        just_before_midnight = datetime(2026, 9, 4, 23, 59, 59, tzinfo=timezone.utc)
+        just_after = datetime(2026, 9, 5, 0, 0, 1, tzinfo=timezone.utc)
+        events = [would_rotate_event(1, just_before_midnight, trigger="entry_signal",
+                                     sell="QQQ", buy="SPY", sell_quantity="0.347094",
+                                     buy_quantity="0.323269", spy_mark="771.27",
+                                     qqq_mark="720.265")]
+        history = [attempt(8, just_before_midnight, sell="QQQ", buy="SPY",
+                           sell_quantity="0.347094", buy_quantity="0.323269",
+                           dispatched=just_after)]
+        report = report_for(events, history,
+                            since=datetime(2026, 9, 5, tzinfo=timezone.utc))
+
+        self.assertEqual(report["totals"]["swaps"], 1)
+        self.assertEqual([day["date"] for day in report["days"]], ["2026-09-05"])
+
+    def test_gas_on_a_leg_that_closed_nothing_is_still_counted(self):
+        """An open rotation's gas is money the wallet already paid."""
+        events, history = baseline_round_trip()
+        spent = str(int(WEI) - 10**15)
+        history[0] = attempt(8, ENTRY_AT, sell="QQQ", buy="SPY", sell_quantity="0.347094",
+                             buy_quantity="0.323269", gas_before=WEI, gas_after=spent)
+        # Only the entry: the rotation is still open at the end of the window.
+        report = ledger_tool.build_report({"history": history[:1]}, events[:1], CEILING,
+                                          Decimal("4000"))
+
+        day = report["days"][0]
+        self.assertEqual(day["unpaired_swaps"], [8])
+        self.assertEqual(day["gas_wei"], "1000000000000000")
+        self.assertAlmostEqual(day["gas_usd"], 4.0, places=6)
+        self.assertAlmostEqual(report["totals"]["cost_usd"], 4.0, places=6)
+        # No rotation closed, so there is no volume to divide it by.
+        self.assertIsNone(day["cost_per_1k_usd"])
+
     def test_only_reconciled_attempts_are_counted(self):
         events, history = baseline_round_trip()
         history[1]["phase"] = "rejected"

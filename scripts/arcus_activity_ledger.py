@@ -478,7 +478,18 @@ def daily_rows(swaps: Sequence[Swap], round_trips: Sequence[RoundTrip],
         row.gas_wei += trip.gas_wei
         row.gas_usd += trip.gas_wei / WEI_PER_ETHER * gas_price_usd
     for swap in unpaired:
-        row_for(swap.date).unpaired_entries.append(swap.sequence)
+        row = row_for(swap.date)
+        row.unpaired_entries.append(swap.sequence)
+        # Gas on a leg that has not closed a rotation is still money the
+        # wallet paid. A round trip's gas is filed on the day it closed,
+        # with the rest of its cost; a leg with no round trip to be filed
+        # under is charged to its own day instead of vanishing. A swap is
+        # either in a round trip or unpaired and never both, so this cannot
+        # double-count. Such a day carries a cost with no round-trip volume
+        # to divide it by, so `cost_per_1k` stays None there -- the gas is
+        # in the totals, and not in a rate it has no denominator for.
+        row.gas_wei += swap.gas_wei
+        row.gas_usd += swap.gas_wei / WEI_PER_ETHER * gas_price_usd
     return [rows[date] for date in sorted(rows)]
 
 
@@ -509,8 +520,23 @@ def as_number(value: Decimal | None, places: str = "0.0001") -> float | None:
     return float(value.quantize(Decimal(places)))
 
 
+def within(when: datetime, since: datetime | None, until: datetime | None) -> bool:
+    """Inside the caller's bounds, each of which is optional."""
+    if since is not None and when < since:
+        return False
+    if until is not None and when > until:
+        return False
+    return True
+
+
 def event_window(events: Sequence[dict[str, Any]], since: datetime | None,
                  until: datetime | None) -> tuple[datetime, datetime]:
+    """The span of observations available, optionally narrowed.
+
+    `build_report` calls this with no bounds, for the range the marks can
+    price at all. The bounds are kept for callers that want the clamped
+    span.
+    """
     if not events:
         raise ActivityLedgerError("event stream is empty")
     start = event_stream.parse_timestamp(events[0]["observed_at"])
@@ -537,15 +563,29 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # unpaired and took the rotation's whole loss and volume out of the very
     # day it was asked about, at every boundary.
     stream = event_window(events, None, None)
-    report_window = event_window(events, since, until)
+    # What the caller asked for, reported as asked. This is no longer
+    # clamped to the stream: a bound can legitimately sit outside it, since
+    # a swap dispatched just after the stream's last observation still
+    # belongs to the day the caller named.
+    if since is not None and until is not None and since > until:
+        raise ActivityLedgerError("--since is after --until")
+    report_window = (since or stream[0], until or stream[1])
     swaps, out_of_window = reconciled_swaps(ledger, index, stream)
     round_trips, unpaired = pair_round_trips(swaps)
-    start, end = report_window
-    swaps = [swap for swap in swaps if start <= swap.event_at <= end]
+    # The two bounds answer different questions and so read different
+    # clocks. Whether the stream can price a swap is about its marks, so
+    # that is `event_at` (above). Whether a caller asked to see it is about
+    # the swap, and every date this report prints -- `Swap.date`, and the
+    # day a round trip is filed under -- comes from the dispatch. Filtering
+    # on the observation instead put a swap dispatched at 00:00:01 outside a
+    # report starting at midnight, and could emit a row dated past
+    # `--until`. Only an explicitly requested bound narrows anything; with
+    # neither given the report covers everything the stream priced.
+    swaps = [swap for swap in swaps if within(swap.at, since, until)]
     # A round trip belongs to the day it closed, so that is what the
     # reporting window selects on -- carrying its entry leg in with it.
-    round_trips = [trip for trip in round_trips if start <= trip.exit.event_at <= end]
-    unpaired = [swap for swap in unpaired if start <= swap.event_at <= end]
+    round_trips = [trip for trip in round_trips if within(trip.exit.at, since, until)]
+    unpaired = [swap for swap in unpaired if within(swap.at, since, until)]
     rows = daily_rows(swaps, round_trips, unpaired, gas_price_usd)
 
     total_volume = sum((trip.volume_usd for trip in round_trips), Decimal(0))
