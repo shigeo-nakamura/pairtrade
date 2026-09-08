@@ -741,14 +741,35 @@ fn opposite(side: OrderSide) -> OrderSide {
 // arrived on, and every *entry* decision goes through `usable_prices`.
 // ---------------------------------------------------------------------
 
-/// How far a venue timestamp may sit from local receive time before it
-/// is treated as unusable *as a clock* rather than as evidence of stale
-/// data. A venue whose `timestamp` field changed units (ms vs us vs s --
-/// the Lighter WS path divides an alleged-microsecond field by 1000)
-/// would otherwise land decades away and fail-close the engine forever;
-/// at that distance the right read is "this timestamp means nothing",
-/// so the local receive clock is used alone and the mismatch is logged.
-const EXCHANGE_TS_PLAUSIBILITY_US: i64 = 86_400_000_000; // 1 day
+/// How far *ahead* of local receive time a venue timestamp may be before
+/// it is treated as a broken clock rather than as skew. A timestamp from
+/// the future cannot be evidence of stale data, so beyond this it is
+/// ignored (the local receive clock alone applies) and logged. Old
+/// timestamps get no such leniency: see `venue_timestamp_us`.
+const EXCHANGE_TS_MAX_FUTURE_SKEW_US: i64 = 86_400_000_000; // 1 day
+
+/// Normalise `PriceUpdate.timestamp` to epoch micros by its magnitude.
+/// The field is documented as milliseconds (the Lighter WS path divides
+/// an alleged-microsecond `last_updated_at` by 1000), but a unit change
+/// upstream must not either brick the engine (every update rejected as
+/// decades stale) or, worse, get waved through as "no clock" -- a venue
+/// replaying a snapshot from *days* ago carries a perfectly valid old
+/// timestamp, and that is exactly the data this check exists to reject
+/// (pairtrade#289 Codex round 2). So: seconds / millis / micros are
+/// recognised by their epoch-range magnitude and converted; anything
+/// outside every plausible range is `None` (genuinely meaningless).
+fn venue_timestamp_us(raw: u64) -> Option<i64> {
+    // Epoch ranges for 2001-09..2286-11 in each unit: 1e9..1e10 s,
+    // 1e12..1e13 ms, 1e15..1e16 us. Disjoint, so magnitude is decisive.
+    let raw = raw as i128;
+    let us = match raw {
+        1_000_000_000..=9_999_999_999 => raw * 1_000_000,
+        1_000_000_000_000..=9_999_999_999_999 => raw * 1_000,
+        1_000_000_000_000_000..=9_999_999_999_999_999 => raw,
+        _ => return None,
+    };
+    i64::try_from(us).ok()
+}
 
 /// One accepted price observation, with everything needed to decide
 /// later whether it is still fit to trade on (bot-strategy#916).
@@ -846,18 +867,17 @@ fn price_obs_from_update(
         // is reported rather than derived.
         return Err("mid_outside_book");
     }
-    // `PriceUpdate.timestamp` is milliseconds since epoch.
-    let raw_ts_us = (update.timestamp as i64).saturating_mul(1_000);
-    let exchange_ts_us = if (raw_ts_us - received_at_us).abs() <= EXCHANGE_TS_PLAUSIBILITY_US {
-        Some(raw_ts_us)
-    } else {
-        None
-    };
+    let exchange_ts_us = venue_timestamp_us(update.timestamp)
+        // Beyond this far in the future the clock is broken, not skewed;
+        // ignore it rather than reject the update (a future stamp cannot
+        // mean stale data).
+        .filter(|ts_us| ts_us - received_at_us <= EXCHANGE_TS_MAX_FUTURE_SKEW_US);
     if let Some(ts_us) = exchange_ts_us {
-        // A plausible timestamp that is far in the past means the venue
-        // is handing us old data on a healthy-looking connection (the
-        // stale-snapshot shape of bot-strategy#908 item 7). Future-dated
-        // within the plausibility bound is accepted as clock skew.
+        // Any recognisable timestamp older than the bound -- 31 seconds
+        // or 3 weeks -- means the venue is handing us old data on a
+        // healthy-looking connection (the stale-snapshot shape of
+        // bot-strategy#908 item 7). Future-dated within the skew bound
+        // is accepted as clock skew.
         if received_at_us - ts_us > max_staleness_secs.saturating_mul(1_000_000) {
             return Err("exchange_timestamp_stale");
         }
@@ -3824,15 +3844,65 @@ mod tests {
     }
 
     #[test]
-    fn ingest_ignores_an_implausible_venue_clock_instead_of_failing_closed_forever() {
-        // A unit change on the venue field (seconds where micros were
-        // assumed, say) lands decades away. That must degrade to "this
-        // timestamp means nothing, use the local receive clock", not
-        // reject every update for the life of the process.
+    fn ingest_rejects_a_valid_venue_timestamp_from_days_ago() {
+        // A venue replaying a snapshot from last week carries a perfectly
+        // valid old timestamp. That is stale data, not a broken clock,
+        // and must be rejected -- not waved through on local age alone
+        // (pairtrade#289 Codex round 2).
+        let week_ago_ms = NOW_MS - 7 * 86_400_000;
+        assert_eq!(
+            price_obs_from_update(
+                &update("100.5", "100.0", "101.0", week_ago_ms),
+                NOW_US,
+                0,
+                30
+            ),
+            Err("exchange_timestamp_stale")
+        );
+    }
+
+    #[test]
+    fn venue_timestamp_units_are_recognised_by_magnitude() {
+        // seconds / millis / micros all normalise to the same instant
+        assert_eq!(venue_timestamp_us(NOW_MS / 1_000), Some(NOW_US));
+        assert_eq!(venue_timestamp_us(NOW_MS), Some(NOW_US));
+        assert_eq!(venue_timestamp_us(NOW_MS * 1_000), Some(NOW_US));
+        // ...so a stale stamp is caught whichever unit it arrives in
+        let stale_secs = (NOW_MS - 600_000) / 1_000;
+        assert_eq!(
+            price_obs_from_update(
+                &update("100.5", "100.0", "101.0", stale_secs),
+                NOW_US,
+                0,
+                30
+            ),
+            Err("exchange_timestamp_stale")
+        );
+        // outside every epoch range: meaningless, not a clock
+        assert_eq!(venue_timestamp_us(0), None);
+        assert_eq!(venue_timestamp_us(1_788_825), None);
+        assert_eq!(venue_timestamp_us(u64::MAX), None);
+    }
+
+    #[test]
+    fn ingest_ignores_a_meaningless_venue_clock_instead_of_failing_closed_forever() {
+        // A value outside every plausible epoch range is not a timestamp
+        // in any unit. That must degrade to "use the local receive
+        // clock", not reject every update for the life of the process.
         let obs =
             price_obs_from_update(&update("100.5", "100.0", "101.0", 1_788_825), NOW_US, 0, 30)
-                .expect("an implausible venue clock must not reject the update");
+                .expect("a meaningless venue clock must not reject the update");
         assert_eq!(obs.exchange_ts_us, None);
+        // A stamp a year in the future is a broken clock, not stale
+        // data: ignored, update kept.
+        let far_future = price_obs_from_update(
+            &update("100.5", "100.0", "101.0", NOW_MS + 365 * 86_400_000),
+            NOW_US,
+            0,
+            30,
+        )
+        .expect("a far-future venue clock must not reject the update");
+        assert_eq!(far_future.exchange_ts_us, None);
         // Clock skew a few seconds into the future is accepted as skew.
         let future = price_obs_from_update(
             &update("100.5", "100.0", "101.0", NOW_MS + 5_000),
