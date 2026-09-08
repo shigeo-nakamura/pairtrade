@@ -409,6 +409,16 @@ dispatching tick takes -- and refuses unless the bot is genuinely idle:
   event and checkpoints it before the append rejects the discontinuity,
   leaving a pending event no later tick can recover, which is the wedged
   state this command exists to avoid.
+- a checkpoint whose reconciled inventory differs from the config's
+  `initial_inventory`, unless `initial_inventory` is itself one of the
+  changed fields. The fresh runtime takes its inventory from the
+  declaration, while confirmed fills have been adjusting the checkpoint's
+  inventory ever since funding -- so a window-length change on a bot that
+  has traded would roll the realized deltas back and size later swaps
+  against balances the wallet does not have. Update `initial_inventory` to
+  the reconciled holdings first; that is also what makes the re-anchored
+  risk baselines below mean something. A reset that *does* change
+  `initial_inventory` is the re-funding case and is unaffected.
 - a checkpoint whose sequence is not exactly the stream's tail, in either
   direction. Ahead of the stream is a recovery case (`repair-report`), not
   a reset. Behind it is the more dangerous one: the checkpoint reads as

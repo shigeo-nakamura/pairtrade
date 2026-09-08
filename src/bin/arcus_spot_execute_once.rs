@@ -2036,10 +2036,10 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
     // invoke the executor with the already-approved production config. The
     // approval gate authorises *this config*, not an unlimited number of
     // baseline erasures under it (Codex P1 follow-up, bot-strategy#903).
+    let changed = store
+        .state_invalidating_drift(&config.runtime)?
+        .unwrap_or_default();
     {
-        let changed = store
-            .state_invalidating_drift(&config.runtime)?
-            .unwrap_or_default();
         if changed.is_empty() {
             bail!(
                 "Arcus runtime checkpoint {} was written under a config whose state-invalidating \
@@ -2055,6 +2055,40 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
 
     let tail = publisher.stream().latest_committed()?;
     let tail_sequence = tail.map(|(sequence, _)| sequence).unwrap_or(0);
+    // Building a fresh runtime takes its inventory from
+    // `config.initial_inventory` -- the figure declared at funding -- while
+    // confirmed fills have been permanently adjusting `state.inventory`
+    // ever since. So a reset whose only state-invalidating change is
+    // `signal_window_samples` (the one field of the five that leaves the
+    // inventory's meaning intact) would silently roll realized trading
+    // deltas back to the declaration, and every later size and
+    // inventory-floor check would then reason about balances the wallet
+    // does not have.
+    //
+    // This does not guess which figure is right. The operator declares it:
+    // if the holdings have moved, `initial_inventory` has to be updated to
+    // the reconciled figure before the reset, which is also the change that
+    // makes the reset's re-anchoring of the risk baselines correct rather
+    // than arbitrary. A reset that *does* change `initial_inventory` is the
+    // re-funding case and is left alone -- there the declaration is meant
+    // to differ from what was held, and it is a deliberate act rather than
+    // a silent overwrite (Codex P1 follow-up, bot-strategy#903).
+    if !changed.contains(&"initial_inventory")
+        && previous.inventory != config.runtime.initial_inventory
+    {
+        bail!(
+            "Arcus runtime checkpoint holds inventory token_a={} token_b={} but this config \
+             declares initial_inventory token_a={} token_b={}; a reset builds the fresh runtime \
+             from the declared figure, so it would discard the difference and size later swaps \
+             against balances the wallet does not have. Set initial_inventory to the reconciled \
+             holdings first",
+            previous.inventory.token_a.normalize(),
+            previous.inventory.token_b.normalize(),
+            config.runtime.initial_inventory.token_a.normalize(),
+            config.runtime.initial_inventory.token_b.normalize(),
+        );
+    }
+
     // The two must be exactly in step. Ahead of the stream was already
     // refused; behind it is the more dangerous direction and was not,
     // because the checkpoint reads as valid while the events it has not
@@ -9221,6 +9255,41 @@ runtime:
             .expect("the replaced checkpoint is reported");
         assert_eq!(fs::read(copy).unwrap(), replaced);
         assert_ne!(fs::read(&next.runtime_state_path).unwrap(), replaced);
+    }
+
+    #[test]
+    fn reset_window_refuses_to_roll_reconciled_inventory_back_to_the_declaration() {
+        // Widening the signal window is the one state-invalidating change
+        // that leaves the inventory's meaning intact -- and building the
+        // fresh runtime takes inventory from `initial_inventory`, so a
+        // bot that has traded would have its realized deltas rolled back
+        // to the funding declaration, and every later size and floor check
+        // would reason about balances the wallet does not have (Codex P1
+        // follow-up).
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+        // A completed rotation left the wallet holding something other
+        // than what was declared at funding.
+        rewrite_checkpoint_state(&config.runtime_state_path, |state| {
+            state["inventory"]["token_a"] = serde_json::json!("0.20");
+        });
+        // Only the window length changes.
+        let mut next = reset_window_config(dir.path());
+        next.runtime.signal_window_samples += 8;
+
+        let error = commit_runtime_window_reset(&next).unwrap_err().to_string();
+
+        assert!(error.contains("holds inventory token_a=0.2"), "{error}");
+        assert!(
+            error.contains("Set initial_inventory to the reconciled holdings"),
+            "{error}"
+        );
+
+        // Re-declaring the holdings is what makes it proceed: the operator
+        // states the truth rather than the command inferring it.
+        next.runtime.initial_inventory.token_a = Decimal::new(20, 2);
+        commit_runtime_window_reset(&next).unwrap();
     }
 
     #[test]

@@ -8,8 +8,8 @@
 //! maintained copies of it.
 
 use super::{
-    ArcusSpotRegime, ArcusSpotRiskHalt, ArcusSpotRuntime, ArcusSpotRuntimeConfig,
-    ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    ArcusSpotInventory, ArcusSpotRegime, ArcusSpotRiskHalt, ArcusSpotRuntime,
+    ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 use anyhow::{bail, Context, Result};
 use dex_connector::ArcusSpotPair;
@@ -47,6 +47,12 @@ pub struct ArcusSpotCheckpointSummary {
     pub rotated_quantity: Option<Decimal>,
     pub risk_halt: Option<ArcusSpotRiskHalt>,
     pub relative_log_price_samples: usize,
+    /// What the bot is actually holding, as reconciled fills left it --
+    /// not what the config declared at funding. `reset-window` compares
+    /// the two, because building a fresh runtime takes the *declared*
+    /// figure and would otherwise overwrite realized trading deltas
+    /// (Codex P1 follow-up, bot-strategy#903).
+    pub inventory: ArcusSpotInventory,
 }
 
 /// How a config change since the checkpoint was written relates to the state
@@ -324,6 +330,7 @@ impl ArcusSpotRuntimeCheckpointStore {
             rotated_quantity: checkpoint.state.rotated_quantity,
             risk_halt: checkpoint.state.risk_halt,
             relative_log_price_samples: checkpoint.state.relative_log_price_history.len(),
+            inventory: checkpoint.state.inventory,
         }))
     }
 
