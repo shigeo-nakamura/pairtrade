@@ -75,16 +75,21 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   `ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS` (default 30). Consequences:
   - `t0`/`t1` are snapshotted only once both primaries have a usable price;
     a partial or stale snapshot is never captured or persisted.
-  - A `t0` that is still not capturable
-    `ENGINE_B_LIVE_T0_CAPTURE_GRACE_SECS` (default 300) after KRX open ends
-    the day with `skip_reason=no_usable_t0` rather than backfilling a
-    mid-session price as if it were the open.
+  - The `t0` capture is bounded by `ENGINE_B_LIVE_T0_CAPTURE_GRACE_SECS`
+    (default 300) after KRX open, whether or not a usable snapshot exists
+    by then: nothing usable ends the day with `skip_reason=no_usable_t0`,
+    and a snapshot that only *becomes* usable past the bound (a feed
+    recovering at t0+301 s) ends it with `skip_reason=late_t0`. Neither is
+    backfilled as if it were the open.
   - The order-sizing price is re-checked immediately before the send, not
     reused from the `t1` capture (the eligibility fetch and position read in
     between are awaits).
   - Every terminal no-entry path records a `skip_reason`, logged as
     `[SKIP] ...` and surfaced in `status.json` under `han_bridge`, alongside
-    `stale_or_missing_symbols` and `price_feed_generation`.
+    `stale_or_missing_symbols` and `price_feed_generation`. It is persisted
+    to `risk_state.json` as `last_session_skip_reason` beside
+    `last_session_date`, so a same-day restart restores why the day was
+    settled, not only that it was.
   - **These gates are entry-only.** `maybe_exit` and the unconfirmed-position
     adoption path read the last price raw, so a stale feed can never keep an
     open position from being closed or an unknown exposure from being

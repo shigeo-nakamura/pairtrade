@@ -540,6 +540,15 @@ struct RiskState {
     t0_snapshot_date: Option<String>,
     #[serde(default)]
     t0_prices: HashMap<String, f64>,
+    /// `DaySnapshot.skip_reason` for `last_session_date`'s day
+    /// (pairtrade#289 Codex round 3). Persisted beside the day marker so
+    /// a same-day restart restores *why* the day was settled, not only
+    /// that it was: `roll_day_if_needed` rebuilds `day.entered` from
+    /// `last_session_date`, and without this `status.json` would report
+    /// an already-decided day with `skip_reason: null`. `None` means the
+    /// day was settled by an entry rather than by a skip.
+    #[serde(default)]
+    last_session_skip_reason: Option<String>,
     /// A sendTx went out (or errored ambiguously) and the exchange position
     /// could not be read for the whole confirm window, so a live position
     /// may exist that this process does not track. Persisted (not
@@ -1348,7 +1357,9 @@ impl EngineBLiveEngine {
                 p.flatten_asap = true;
             }
             self.day.entered = true;
+            self.day.skip_reason = Some("carried_over_position".to_string());
             self.state.last_session_date = Some(today.to_string());
+            self.state.last_session_skip_reason = self.day.skip_reason.clone();
             atomic_write_json(&self.cfg.state_path, &self.state);
         }
         // Keyed off the *persisted* pnl_today_date, not the in-memory
@@ -1377,6 +1388,12 @@ impl EngineBLiveEngine {
             log::info!("[DAY] {today} already acted on before a restart; not re-entering");
             self.day.entered = true;
             self.day.restart_recovered = true;
+            // Restore *why* the day was settled, not only that it was
+            // (pairtrade#289 Codex round 3). Deliberately after the
+            // carry-over branch above, which sets its own reason.
+            if self.day.skip_reason.is_none() {
+                self.day.skip_reason = self.state.last_session_skip_reason.clone();
+            }
         }
         // Recover a t0 snapshot a prior run of this process already
         // captured and persisted today, rather than letting
@@ -1493,9 +1510,19 @@ impl EngineBLiveEngine {
             return;
         }
         log::warn!("[SKIP] {reason}");
-        self.day.skip_reason = Some(reason);
+        self.day.skip_reason = Some(reason.clone());
         self.day.entered = true;
+        self.mark_day_acted(Some(reason));
+    }
+
+    /// Record that `current_date` has been acted on -- entered, or
+    /// settled as a no-entry carrying `skip_reason` -- and persist both
+    /// facts in one write. Single writer for `last_session_date` so the
+    /// reason can never drift from the day marker it describes
+    /// (pairtrade#289 Codex round 3).
+    fn mark_day_acted(&mut self, skip_reason: Option<String>) {
         self.state.last_session_date = self.current_date.map(|d| d.to_string());
+        self.state.last_session_skip_reason = skip_reason;
         atomic_write_json(&self.cfg.state_path, &self.state);
     }
 
@@ -1556,6 +1583,33 @@ impl EngineBLiveEngine {
             &self.cfg.kr_primary_symbol,
             &self.cfg.us_primary_symbol,
         );
+        // The grace bound applies to ANY capture, complete or not
+        // (pairtrade#289 Codex round 3). A feed that recovers at
+        // t0 + grace + 1 s hands us a perfectly complete snapshot -- of
+        // mid-session prices, which is exactly what this bound exists to
+        // refuse. Checking it only on the incomplete path let that late
+        // recovery through and persisted those prices as the KRX open.
+        if delay_secs > self.cfg.t0_capture_grace_secs as f64 {
+            let detail = self.freshness_debug(now_us);
+            let reason = if complete {
+                format!(
+                    "late_t0: fresh {}/{} prices only became usable {delay_secs:.0}s after t0 \
+                     (grace {}s); refusing to label a mid-session price as the KRX open -- {detail}",
+                    self.cfg.kr_primary_symbol,
+                    self.cfg.us_primary_symbol,
+                    self.cfg.t0_capture_grace_secs
+                )
+            } else {
+                format!(
+                    "no_usable_t0: no fresh {}/{} price within {}s of t0 -- {detail}",
+                    self.cfg.kr_primary_symbol,
+                    self.cfg.us_primary_symbol,
+                    self.cfg.t0_capture_grace_secs
+                )
+            };
+            self.skip_day(reason);
+            return;
+        }
         if !complete {
             // Gated on completeness, not `delay_secs`: a snapshot missing
             // kr_primary/us_primary is unusable to compute_epsilon
@@ -1572,16 +1626,8 @@ impl EngineBLiveEngine {
             // KRX-open label (bot-strategy#916; this replaces the old
             // "capture whatever is there, WARN if it is incomplete or
             // >300 s late" behaviour, which left the day running on a
-            // snapshot the WARN itself called suspect).
-            if delay_secs > self.cfg.t0_capture_grace_secs as f64 {
-                let detail = self.freshness_debug(now_us);
-                self.skip_day(format!(
-                    "no_usable_t0: no fresh {}/{} price within {}s of t0 -- {detail}",
-                    self.cfg.kr_primary_symbol,
-                    self.cfg.us_primary_symbol,
-                    self.cfg.t0_capture_grace_secs
-                ));
-            }
+            // snapshot the WARN itself called suspect). The grace bound
+            // is enforced above, for complete and partial alike.
             return;
         }
         log::info!(
@@ -2061,8 +2107,7 @@ impl EngineBLiveEngine {
         // in-memory OpenPosition after a restart (see
         // docs/engine-b-live-operations.md's Stop and recovery section)
         // -- it only prevents a second entry.
-        self.state.last_session_date = self.current_date.map(|d| d.to_string());
-        atomic_write_json(&self.cfg.state_path, &self.state);
+        self.mark_day_acted(None);
         log::info!(
             "[ENTRY] side={side} epsilon={epsilon:.5} price={price:.4} notional=${notional_usd:.0} size={size:.6}{note}"
         );
@@ -2081,8 +2126,7 @@ impl EngineBLiveEngine {
     fn record_no_position_today(&mut self) {
         self.position = None;
         self.day.entered = true;
-        self.state.last_session_date = self.current_date.map(|d| d.to_string());
-        atomic_write_json(&self.cfg.state_path, &self.state);
+        self.mark_day_acted(None);
     }
 
     async fn maybe_enter(&mut self, now_us: i64) {
@@ -2427,6 +2471,7 @@ impl EngineBLiveEngine {
         // not persisted (KNOWN GAPS): after such a restart the operator
         // checks the exchange, which is the documented recovery.
         self.state.last_session_date = self.current_date.map(|d| d.to_string());
+        self.state.last_session_skip_reason = None;
         if let Err(e) = atomic_write_json_checked(&self.cfg.state_path, &self.state) {
             // No durable marker, no order: sending now would make the
             // at-most-one guarantee depend on this process surviving.
@@ -2723,8 +2768,7 @@ impl EngineBLiveEngine {
             );
         }
         self.day.exited = true;
-        self.state.last_session_date = self.current_date.map(|d| d.to_string());
-        atomic_write_json(&self.cfg.state_path, &self.state);
+        self.mark_day_acted(self.day.skip_reason.clone());
 
         append_pnl_log(
             &self.cfg.pnl_log_path,
@@ -4352,6 +4396,84 @@ mod tests {
             h.engine.day.entered,
             "an abandoned day must not be re-evaluated"
         );
+    }
+
+    #[test]
+    fn t0_capture_refuses_a_complete_snapshot_that_only_became_fresh_after_the_grace() {
+        // The feed recovers at t0 + grace + 1 s: both primaries now have
+        // perfectly fresh observations, and that is exactly the case the
+        // grace bound exists to refuse -- they are mid-session prices,
+        // not the KRX open (pairtrade#289 Codex round 3).
+        let mut h = harness();
+        let late = T0_US + (h.engine.cfg.t0_capture_grace_secs + 1) * 1_000_000;
+        h.observe_all(late, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(late);
+        assert!(
+            h.engine.day.t0_prices.is_none(),
+            "a complete but late snapshot must not become t0"
+        );
+        assert!(
+            h.engine.state.t0_prices.is_empty(),
+            "and must not be persisted for a later restart to recover"
+        );
+        let reason = h
+            .engine
+            .day
+            .skip_reason
+            .clone()
+            .expect("day must be abandoned");
+        assert!(
+            reason.starts_with("late_t0"),
+            "unexpected skip reason: {reason}"
+        );
+        // One second earlier, the same snapshot is accepted.
+        let mut h2 = harness();
+        let in_time = T0_US + h2.engine.cfg.t0_capture_grace_secs * 1_000_000;
+        h2.observe_all(in_time, 180.0, 1700.0);
+        h2.engine.maybe_capture_t0(in_time);
+        assert!(
+            h2.engine.day.t0_prices.is_some(),
+            "inside the grace it is still a valid t0"
+        );
+        assert!(h2.engine.day.skip_reason.is_none());
+    }
+
+    #[test]
+    fn a_settled_days_skip_reason_survives_a_same_day_restart() {
+        // roll_day_if_needed rebuilds `entered` from last_session_date;
+        // the reason must come back with it or status.json reports an
+        // already-decided day with skip_reason: null (pairtrade#289
+        // Codex round 3).
+        let mut h = harness();
+        h.engine
+            .skip_day("below_threshold: |epsilon|=0.00010 < threshold=0.00300".to_string());
+        let persisted = load_state(&h.engine.cfg.state_path);
+        assert_eq!(persisted.last_session_date.as_deref(), Some("2026-09-08"));
+        assert!(persisted
+            .last_session_skip_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("below_threshold")));
+        // A fresh process on the same day, same state file.
+        let mut h2 = harness();
+        h2.engine.cfg.state_path = h.engine.cfg.state_path.clone();
+        h2.engine.state = persisted;
+        h2.engine.current_date = None;
+        h2.engine.roll_day_if_needed(T1_US + 60_000_000);
+        assert!(h2.engine.day.entered && h2.engine.day.restart_recovered);
+        assert!(
+            h2.engine
+                .day
+                .skip_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("below_threshold")),
+            "the reason must be restored, got {:?}",
+            h2.engine.day.skip_reason
+        );
+        // A day settled by an entry carries no reason.
+        let mut h3 = harness();
+        h3.engine.mark_day_acted(None);
+        let after_entry = load_state(&h3.engine.cfg.state_path);
+        assert!(after_entry.last_session_skip_reason.is_none());
     }
 
     #[tokio::test]
