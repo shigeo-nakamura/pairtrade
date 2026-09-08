@@ -22,9 +22,9 @@ UNIT_SOURCE_DIR=${BOOK_UNIT_SOURCE_DIR:-/opt/debot/deploy}
 # next to the config as <INSTALL_DIR>/<instance>.calendar.json (the unit's
 # InaccessiblePaths hides /opt/debot from the service, so the runtime
 # cannot read it from the synced configs tree). Empty = the instance has no
-# calendar (interval_days / daily); a missing file when the config names
-# one is caught by the runtime at startup, not here, since --validate does
-# not load it.
+# calendar (interval_days / daily). A calendar-kind config with no source
+# at all is rejected below, before promotion, since --validate does not
+# load the calendar and the service would only fail at its next start.
 CALENDAR_SOURCE=${BOOK_CALENDAR_SOURCE:-}
 CALENDAR_VALIDATOR=${BOOK_CALENDAR_VALIDATOR:-$(dirname "$0")/validate_book_calendar.py}
 if [ -z "$CALENDAR_SOURCE" ] && [ -f "/opt/debot/configs/book/${INSTANCE}.calendar.json" ]; then
@@ -80,6 +80,21 @@ install -o root -g "$SERVICE_GROUP" -m 0550 "$BINARY_SOURCE" "$STAGE/bin/book_ru
 install -o root -g "$SERVICE_GROUP" -m 0440 "$LIBSIGNER_SOURCE" "$STAGE/lib/libsigner.so"
 install -o root -g "$SERVICE_GROUP" -m 0440 "$CONFIG_SOURCE" "$STAGE/${INSTANCE}.yaml"
 install -o root -g "$SERVICE_GROUP" -m 0550 "$FETCH_SCRIPT_SOURCE" "$STAGE/bin/book_signal_fetch.sh"
+# Read the schedule kind now, before the calendar block: a
+# `schedule.kind: calendar` config whose calendar source is absent must
+# fail HERE, not at the next service start. `book_runtime --validate`
+# does not load `schedule.calendar_path`, so without this check a first
+# install promotes a bundle the service cannot start, and an update
+# silently keeps whatever calendar was installed before.
+KIND=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*kind:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+if [ -z "$KIND" ]; then
+  echo "could not read schedule.kind from $CONFIG_SOURCE" >&2
+  exit 1
+fi
+if [ "$KIND" = "calendar" ] && [ -z "$CALENDAR_SOURCE" ]; then
+  echo "schedule.kind is calendar but no calendar source was found: set BOOK_CALENDAR_SOURCE or provide /opt/debot/configs/book/${INSTANCE}.calendar.json; installed bundle left untouched" >&2
+  exit 1
+fi
 if [ -n "$CALENDAR_SOURCE" ]; then
   if [ ! -f "$CALENDAR_SOURCE" ]; then
     echo "book runtime calendar source is missing: $CALENDAR_SOURCE" >&2
@@ -134,8 +149,8 @@ if [ -z "$PRODUCER" ]; then
 fi
 # Only date-keyed schedules (interval_days / daily) let the fetcher derive
 # a decision time from the file's own decision_key; a calendar schedule
-# leaves this empty and the fetcher skips that one check.
-KIND=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*kind:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+# leaves this empty and the fetcher skips that one check. (`KIND` was
+# read above, before the calendar block.)
 DECISION_TIME=""
 ANCHOR_DATE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*anchor_date:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
 EVERY_DAYS=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*every_days:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")

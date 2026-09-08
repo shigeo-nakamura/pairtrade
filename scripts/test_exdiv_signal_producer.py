@@ -518,6 +518,32 @@ class SignalTests(unittest.TestCase):
         self.assertAlmostEqual(ev, 650.0, places=6)
         self.assertIsNone(ctl)
 
+    def test_stale_books_are_rejected_from_the_t1_close_references_too(self):
+        """A row whose book had stalled before the close is not a close
+        sample: `_mid_at`/`close_index` must skip it like the current-day
+        window does, so the landed gate goes unavailable instead of
+        reading a drifted baseline."""
+        close = xp.session_close(date(2026, 9, 17))
+        t_last, t_prev = (close + timedelta(seconds=off) for off in xp.PREV_CLOSE_OFFSETS_SECS[:2])
+        stale = row("SPY", t_last, 639.97, 640.03, index=640.0, ob_age=xp.FRESH_OB_SECS + 1)
+        good = row("SPY", t_prev, 649.97, 650.03, index=650.0)
+        # the stalled row at the preferred minute is skipped, the fresh
+        # one at the next offset is used
+        self.assertAlmostEqual(xp._mid_at([stale, good], "SPY", t_last) or 0.0, 0.0)
+        self.assertAlmostEqual(xp.close_mid([stale, good], "SPY", date(2026, 9, 17)), 650.0, places=6)
+        self.assertEqual(xp.close_index([stale, good], "SPY", date(2026, 9, 17)), 650.0)
+        # nothing fresh at any offset -> no reference at all
+        self.assertIsNone(xp.close_mid([stale], "SPY", date(2026, 9, 17)))
+        self.assertIsNone(xp.close_index([stale], "SPY", date(2026, 9, 17)))
+        # the pair helper treats a stalled control the same way
+        ctl_stale = row("US500", t_last, 6599.9, 6600.1, ob_age=xp.FRESH_OB_SECS + 1)
+        ev, ctl = xp.close_mid_pair([good, row("SPY", t_last, 639.97, 640.03), ctl_stale],
+                                    "SPY", "US500", date(2026, 9, 17))
+        self.assertIsNone(ctl)
+        # exactly at the bound is still fresh
+        at_bound = row("SPY", t_last, 639.97, 640.03, ob_age=xp.FRESH_OB_SECS)
+        self.assertAlmostEqual(xp._mid_at([at_bound], "SPY", t_last), 640.0, places=6)
+
     def test_a_hedge_with_no_book_keeps_its_specific_reason(self):
         rows = [r for r in base_rows() if r["symbol"] != "US500"]
         e = xp.build_signal(EVENTS[:1], D, rows, prev_rows(), NOW)["meta"]["events"][0]

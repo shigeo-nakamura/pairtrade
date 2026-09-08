@@ -294,13 +294,23 @@ def l1_usd(r):
     return min(bs, as_) * m
 
 
-def fresh(r, cutoff: datetime) -> bool:
-    """`ob_age_secs` is intrinsic to the row (how stale the book was when it
-    was logged); the second bound is the row's own age, measured against the
-    decision cutoff rather than wall-clock now, so a late run reads exactly
-    the rows an on-time run would have read."""
+def book_fresh(r) -> bool:
+    """`ob_age_secs` is intrinsic to the row: how stale the book was when
+    the logger wrote it. A row carrying a stalled book is not a price
+    sample at all, whichever day it belongs to -- so this is the one check
+    both the current-day window and the T-1 close references apply. (The
+    close references used to skip it, so a book that stalled into the
+    previous close could shift the landed-step baseline by however far it
+    had drifted, against a gate of only a few bps.)"""
     age = _f(r.get("ob_age_secs"))
-    return age is not None and age <= FRESH_OB_SECS and (cutoff - r["_t"]).total_seconds() <= 600
+    return age is not None and age <= FRESH_OB_SECS
+
+
+def fresh(r, cutoff: datetime) -> bool:
+    """`book_fresh` plus the row's own age, measured against the decision
+    cutoff rather than wall-clock now, so a late run reads exactly the rows
+    an on-time run would have read."""
+    return book_fresh(r) and (cutoff - r["_t"]).total_seconds() <= 600
 
 
 def window_rows(rows, sym: str, cutoff: datetime, start: datetime) -> list[dict]:
@@ -338,7 +348,7 @@ def close_index(rows_prev, sym: str, prev_day: date,
         target = close + timedelta(seconds=off)
         xs = [_f(r.get("index_price")) for r in rows_prev
               if r.get("symbol") == sym and r["_t"].hour == target.hour
-              and r["_t"].minute == target.minute]
+              and r["_t"].minute == target.minute and book_fresh(r)]
         xs = [x for x in xs if x]
         if xs:
             return xs[-1]
@@ -388,9 +398,13 @@ def last_row_age_secs(win, cutoff: datetime):
 
 
 def _mid_at(rows_prev, sym: str, target: datetime):
+    """Mid of the last book-fresh row of `sym` in `target`'s minute. A row
+    whose book had already stalled (`book_fresh`) is skipped exactly as a
+    current-day row would be, so a stalled close makes the landed gate
+    unavailable rather than quietly wrong."""
     xs = [mid(r) for r in rows_prev
           if r.get("symbol") == sym and r["_t"].hour == target.hour
-          and r["_t"].minute == target.minute]
+          and r["_t"].minute == target.minute and book_fresh(r)]
     xs = [x for x in xs if x]
     return xs[-1] if xs else None
 
