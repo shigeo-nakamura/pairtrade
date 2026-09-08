@@ -46,6 +46,8 @@ jobs:
         run: python3 scripts/test_arcus_live_tick_signal_replay.py -v
       - name: Run Arcus durable event stream unit tests
         run: python3 scripts/test_arcus_live_tick_event_stream.py -v
+      - name: Run Arcus activity/cost ledger unit tests
+        run: python3 scripts/test_arcus_activity_ledger.py -v
       - name: Run Arcus event archive integration tests
         run: bash scripts/test_archive_arcus_live_tick_events.sh
       - name: Run Arcus event archive installer tests
