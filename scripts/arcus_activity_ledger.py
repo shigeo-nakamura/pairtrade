@@ -62,6 +62,10 @@ class Swap:
     buy_mark_usd: Decimal
     gas_wei: Decimal
     event_sequence: int
+    # When the marks this swap was priced at were observed. Every window
+    # question is answered with this rather than with `at` (the dispatch),
+    # because live-tick commits the event before dispatching against it.
+    event_at: datetime
 
     @property
     def notional_usd(self) -> Decimal:
@@ -332,6 +336,7 @@ def swap_from_attempt(attempt: dict[str, Any], event: dict[str, Any]) -> Swap:
         buy_mark_usd=buy_mark,
         gas_wei=gas_wei,
         event_sequence=int(event["sequence"]),
+        event_at=event_stream.parse_timestamp(event["observed_at"]),
     )
 
 
@@ -392,10 +397,11 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
                     "the event window probably does not cover this swap")
             out_of_window.append(int(attempt["sequence"]))
             continue
-        if not start <= event_stream.parse_timestamp(event["observed_at"]) <= end:
+        swap = swap_from_attempt(attempt, event)
+        if not start <= swap.event_at <= end:
             out_of_window.append(int(attempt["sequence"]))
             continue
-        swaps.append(swap_from_attempt(attempt, event))
+        swaps.append(swap)
     swaps.sort(key=lambda swap: (swap.at, swap.sequence))
     return swaps, sorted(out_of_window)
 
@@ -523,9 +529,23 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
                  since: datetime | None = None,
                  until: datetime | None = None) -> dict[str, Any]:
     index = would_rotate_index(events)
-    window = event_window(events, since, until)
-    swaps, out_of_window = reconciled_swaps(ledger, index, window)
+    # Two different windows, and conflating them dropped whole rotations.
+    # The stream window is what the marks can price at all; the report
+    # window is what the caller asked to see. Pairing must happen over the
+    # first, because a rotation that closes inside the reporting window can
+    # have opened before it -- discarding the entry there left the exit
+    # unpaired and took the rotation's whole loss and volume out of the very
+    # day it was asked about, at every boundary.
+    stream = event_window(events, None, None)
+    report_window = event_window(events, since, until)
+    swaps, out_of_window = reconciled_swaps(ledger, index, stream)
     round_trips, unpaired = pair_round_trips(swaps)
+    start, end = report_window
+    swaps = [swap for swap in swaps if start <= swap.event_at <= end]
+    # A round trip belongs to the day it closed, so that is what the
+    # reporting window selects on -- carrying its entry leg in with it.
+    round_trips = [trip for trip in round_trips if start <= trip.exit.event_at <= end]
+    unpaired = [swap for swap in unpaired if start <= swap.event_at <= end]
     rows = daily_rows(swaps, round_trips, unpaired, gas_price_usd)
 
     total_volume = sum((trip.volume_usd for trip in round_trips), Decimal(0))
@@ -535,8 +555,12 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     return {
         "schema_version": 1,
         "window": {
-            "from": window[0].isoformat().replace("+00:00", "Z"),
-            "to": window[1].isoformat().replace("+00:00", "Z"),
+            "from": report_window[0].isoformat().replace("+00:00", "Z"),
+            "to": report_window[1].isoformat().replace("+00:00", "Z"),
+        },
+        "event_stream": {
+            "from": stream[0].isoformat().replace("+00:00", "Z"),
+            "to": stream[1].isoformat().replace("+00:00", "Z"),
         },
         "ledger_swaps_outside_window": out_of_window,
         "ceiling_usd_per_1k": as_number(ceiling),
@@ -551,6 +575,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
                 "round_trip_loss_usd": as_number(row.round_trip_loss_usd),
                 "gas_wei": str(row.gas_wei),
                 "gas_usd": as_number(row.gas_usd),
+                "cost_usd": as_number(row.cost_usd),
                 "cost_per_1k_usd": as_number(row.cost_per_1k()),
                 "over_ceiling": (row.cost_per_1k() is not None
                                  and row.cost_per_1k() > ceiling),
@@ -562,6 +587,9 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
             "swaps": sum(row.swaps for row in rows),
             "round_trips": len(round_trips),
             "round_trip_volume_usd": as_number(total_volume, "0.01"),
+            "round_trip_loss_usd": as_number(
+                sum((row.round_trip_loss_usd for row in rows), Decimal(0))),
+            "gas_usd": as_number(sum((row.gas_usd for row in rows), Decimal(0))),
             "cost_usd": as_number(total_cost),
             "cost_per_1k_usd": as_number(overall),
             "over_ceiling": overall is not None and overall > ceiling,
@@ -576,29 +604,34 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
 
 def render_markdown(report: dict[str, Any]) -> str:
     lines = [
-        "| date | swaps | swap volume $ | round trips | RT volume $ | RT loss $ | gas $ | $/1k |",
-        "|---|---|---|---|---|---|---|---|",
+        "| date | swaps | swap volume $ | round trips | RT volume $ | RT loss $ | gas $ "
+        "| cost $ | $/1k |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for day in report["days"]:
-        cost = day["cost_per_1k_usd"]
+        rate = day["cost_per_1k_usd"]
         marker = " ⚠️" if day["over_ceiling"] else ""
         lines.append(
             f"| {day['date']} | {day['swaps']} | {day['swap_volume_usd']:.2f} | "
             f"{day['round_trips']} | {day['round_trip_volume_usd']:.2f} | "
             f"{day['round_trip_loss_usd']:.4f} | {day['gas_usd']:.4f} | "
-            f"{'—' if cost is None else f'{cost:.2f}{marker}'} |")
+            f"{day['cost_usd']:.4f} | "
+            f"{'—' if rate is None else f'{rate:.2f}{marker}'} |")
     totals = report["totals"]
     overall = totals["cost_per_1k_usd"]
+    # Each total under its own heading. Putting the cost in the gas column
+    # (and leaving the loss blank) read as "all of this was gas".
     lines.append(
         f"| **total** | {totals['swaps']} | | {totals['round_trips']} | "
-        f"{totals['round_trip_volume_usd']:.2f} | | {totals['cost_usd']:.4f} | "
+        f"{totals['round_trip_volume_usd']:.2f} | {totals['round_trip_loss_usd']:.4f} | "
+        f"{totals['gas_usd']:.4f} | {totals['cost_usd']:.4f} | "
         f"{'—' if overall is None else f'{overall:.2f}'} |")
     skipped = report["ledger_swaps_outside_window"]
     if skipped:
         lines.append("")
         lines.append(
-            f"Not covered by this window ({report['window']['from']} .. "
-            f"{report['window']['to']}): ledger sequences "
+            f"Not priceable from this event stream ({report['event_stream']['from']} .. "
+            f"{report['event_stream']['to']}): ledger sequences "
             + ", ".join(str(sequence) for sequence in skipped))
     return "\n".join(lines)
 

@@ -339,6 +339,48 @@ class ActivityLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ledger_tool.ActivityLedgerError, "no would-rotate event"):
             report_for(events, history)
 
+    def test_a_rotation_that_opened_before_since_is_still_priced_on_its_close_day(self):
+        """A reporting boundary must not delete the rotation it cuts.
+
+        Round trips are assigned to the day they closed, so asking about
+        that day has to carry the entry leg in with it. Filtering the entry
+        out before pairing left the exit unpaired and took the whole loss
+        and round-trip volume out of the very day being asked about --
+        understating the ceiling and stop metric at every boundary.
+        """
+        events, history = baseline_round_trip()
+        since = ENTRY_AT + timedelta(hours=1)
+        report = report_for(events, history, since=since)
+
+        self.assertEqual(report["totals"]["round_trips"], 1)
+        expected_loss = Decimal("0.000749") * Decimal("721.00")
+        self.assertAlmostEqual(report["totals"]["cost_usd"], float(expected_loss), places=4)
+        # Both legs' notional is the denominator, even though only one leg
+        # was dispatched inside the window.
+        self.assertGreater(report["totals"]["round_trip_volume_usd"], 490)
+        # The entry itself is not reported as a swap of the window, and it
+        # is not reported as uncovered either -- the stream priced it.
+        self.assertEqual(report["totals"]["swaps"], 1)
+        self.assertEqual(report["ledger_swaps_outside_window"], [])
+        self.assertEqual([day["unpaired_swaps"] for day in report["days"]], [[]])
+
+    def test_the_markdown_total_puts_each_number_under_its_own_heading(self):
+        events, history = baseline_round_trip()
+        report = report_for(events, history)
+        table = ledger_tool.render_markdown(report)
+        header, _, *body = table.splitlines()
+        columns = [c.strip() for c in header.strip("|").split("|")]
+        total = [c.strip() for c in body[-1].strip("|").split("|")]
+        self.assertEqual(len(total), len(columns))
+        # The cost belongs under "cost $", not under "gas $": this run has
+        # no gas at all, and reporting the trading loss there read as if
+        # every dollar of it were gas.
+        self.assertEqual(float(total[columns.index("gas $")]), 0.0)
+        self.assertAlmostEqual(float(total[columns.index("cost $")]),
+                               report["totals"]["cost_usd"], places=4)
+        self.assertAlmostEqual(float(total[columns.index("RT loss $")]),
+                               report["totals"]["round_trip_loss_usd"], places=4)
+
     def test_only_reconciled_attempts_are_counted(self):
         events, history = baseline_round_trip()
         history[1]["phase"] = "rejected"
