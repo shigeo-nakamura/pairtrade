@@ -977,6 +977,15 @@ impl PriceFeed {
 struct DaySnapshot {
     t0_prices: Option<HashMap<String, f64>>,
     t1_prices: Option<HashMap<String, f64>>,
+    /// The feed generation `t1_prices` was captured on
+    /// (pairtrade#289 Codex round 5). t1 is meant to be "the price right
+    /// now, at the KRX close", so unlike t0 -- a historical boundary
+    /// reference -- it stops being valid the moment the feed drops
+    /// updates: the KR leg may be arbitrarily behind even if the US leg
+    /// has since re-reported. A generation change discards the capture
+    /// and forces a full recapture of *both* legs, and also blocks the
+    /// send if it happens during the entry awaits.
+    t1_generation: Option<u64>,
     entered: bool,
     exited: bool,
     /// True when `entered` was restored from `RiskState.last_session_date`
@@ -2244,6 +2253,21 @@ impl EngineBLiveEngine {
             ));
             return;
         }
+        // A t1 captured before a feed lag is not a t1 any more: the KR
+        // leg feeding `compute_epsilon` may be arbitrarily behind even
+        // once the US leg has re-reported, and `t1_prices` is a bare
+        // map with no per-symbol metadata left to check (pairtrade#289
+        // Codex round 5). Discard the whole capture and take it again.
+        let generation_now = self.feed_generation();
+        if self.day.t1_generation.is_some_and(|g| g != generation_now) {
+            log::warn!(
+                "[ENTRY] discarding the t1 snapshot captured on feed generation {:?} (now \
+                 {generation_now}); recapturing both legs before any signal is computed",
+                self.day.t1_generation
+            );
+            self.day.t1_prices = None;
+            self.day.t1_generation = None;
+        }
         if self.day.t1_prices.is_none() {
             // Same bar as t0 (bot-strategy#916): capture only usable
             // observations, and only once both primaries are present.
@@ -2269,10 +2293,11 @@ impl EngineBLiveEngine {
                 return;
             }
             log::info!(
-                "[SIGNAL_INPUTS] t1 snapshot captured -- {}",
+                "[SIGNAL_INPUTS] t1 snapshot captured on feed generation {generation_now} -- {}",
                 self.freshness_debug(now_us)
             );
             self.day.t1_prices = Some(prices);
+            self.day.t1_generation = Some(generation_now);
         }
         let (Some(t0_prices), Some(t1_prices)) = (&self.day.t0_prices, &self.day.t1_prices) else {
             // t0 never captured. `maybe_capture_t0` keeps trying until
@@ -2509,6 +2534,22 @@ impl EngineBLiveEngine {
         // 鮮度を検査"; pairtrade#289 Codex review). Nothing below this
         // point awaits anything before `submit_order`.
         let send_now_us = self.now();
+        // The signal is only as good as the generation it was computed
+        // on. Checking the US price alone is not enough: one US update
+        // arriving on the new generation during the awaits above would
+        // satisfy `usable_prices` while epsilon still rests on a KR value
+        // captured before the drop (pairtrade#289 Codex round 5).
+        let send_generation = self.feed_generation();
+        if self.day.t1_generation != Some(send_generation) {
+            log::warn!(
+                "[ENTRY] feed generation moved from {:?} to {send_generation} while preparing the \
+                 entry; not sending -- today's signal is recomputed from a fresh t1 on the next tick",
+                self.day.t1_generation
+            );
+            self.day.t1_prices = None;
+            self.day.t1_generation = None;
+            return;
+        }
         let Some(price) = self
             .usable_prices(send_now_us)
             .get(&self.cfg.us_primary_symbol)
@@ -4107,10 +4148,11 @@ mod tests {
     struct StubConnector {
         orders: std::sync::Mutex<Vec<(String, Decimal, OrderSide, bool)>>,
         positions: std::sync::Mutex<Vec<PositionSnapshot>>,
-        /// When set, `get_positions` bumps this feed's generation --
-        /// standing in for the feed task processing a `Lagged` while
-        /// `maybe_enter` is awaiting the exchange (pairtrade#289 round 4).
-        lag_during_positions: std::sync::Mutex<Option<Arc<std::sync::Mutex<PriceFeed>>>>,
+        /// Runs inside `get_positions`, standing in for whatever the
+        /// feed task does to the shared `PriceFeed` while `maybe_enter`
+        /// is awaiting the exchange (pairtrade#289 rounds 4-5).
+        #[allow(clippy::type_complexity)]
+        on_get_positions: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl StubConnector {
@@ -4174,8 +4216,8 @@ mod tests {
             unimplemented!("engine_b_live does not call get_combined_balance")
         }
         async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, dex_connector::DexError> {
-            if let Some(feed) = self.lag_during_positions.lock().unwrap().as_ref() {
-                feed.lock().unwrap().note_lag();
+            if let Some(hook) = self.on_get_positions.lock().unwrap().as_ref() {
+                hook();
             }
             Ok(self
                 .positions
@@ -4748,7 +4790,10 @@ mod tests {
         h.observe_all(T1_US, 190.0, 1700.0);
         h.engine.day.eligibility_confirmed = true;
         h.set_now(T1_US + 1_000_000);
-        *h.connector.lag_during_positions.lock().unwrap() = Some(h.engine.feed.clone());
+        let feed = h.engine.feed.clone();
+        *h.connector.on_get_positions.lock().unwrap() = Some(Box::new(move || {
+            feed.lock().unwrap().note_lag();
+        }));
         h.engine.maybe_enter(T1_US + 1_000_000).await;
         assert_eq!(
             h.connector.order_count(),
@@ -4756,8 +4801,65 @@ mod tests {
             "a lag observed during entry preparation must block the send"
         );
         assert!(h.engine.position.is_none());
+        assert!(
+            h.engine.day.t1_prices.is_none(),
+            "the pre-lag t1 must be discarded, not reused"
+        );
         // Re-observed on the new generation, the next tick proceeds.
-        *h.connector.lag_during_positions.lock().unwrap() = None;
+        *h.connector.on_get_positions.lock().unwrap() = None;
+        h.observe_all(T1_US + 2_000_000, 190.0, 1700.0);
+        h.set_now(T1_US + 2_000_000);
+        h.engine.maybe_enter(T1_US + 2_000_000).await;
+        assert_eq!(h.connector.order_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_partial_refresh_after_a_lag_does_not_revive_a_stale_t1() {
+        // The nastier shape of the same bug: the feed lags during the
+        // entry awaits and the *US* leg re-reports on the new generation
+        // before the send. `usable_prices` is then satisfied for the
+        // traded symbol while epsilon still rests on a KR value captured
+        // before the drop, so the generation of the signal itself has to
+        // be the gate (pairtrade#289 Codex round 5).
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        let feed = h.engine.feed.clone();
+        *h.connector.on_get_positions.lock().unwrap() = Some(Box::new(move || {
+            let mut f = feed.lock().unwrap();
+            let generation = f.note_lag();
+            // only the US leg comes back on the new generation
+            f.latest.insert(
+                "SNDK".to_string(),
+                PriceObs {
+                    mid: 1700.0,
+                    best_bid: 1699.0,
+                    best_ask: 1701.0,
+                    received_at_us: T1_US + 1_000_000,
+                    exchange_ts_us: Some(T1_US + 1_000_000),
+                    generation,
+                },
+            );
+        }));
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.connector.order_count(),
+            0,
+            "a fresh US price does not make a pre-lag KR signal sendable"
+        );
+        assert!(
+            h.engine.day.t1_prices.is_none(),
+            "the stale t1 must be discarded"
+        );
+        assert!(
+            !h.engine.day.entered,
+            "the day is still open for a recomputed signal"
+        );
+        // Both legs back on the current generation: recaptured and sent.
+        *h.connector.on_get_positions.lock().unwrap() = None;
         h.observe_all(T1_US + 2_000_000, 190.0, 1700.0);
         h.set_now(T1_US + 2_000_000);
         h.engine.maybe_enter(T1_US + 2_000_000).await;
