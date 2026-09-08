@@ -19,6 +19,7 @@ from subsidy_ledger import (  # noqa: E402
     equity_daily_costs,
     load_execution,
     load_pnl,
+    render_table,
     summarize,
 )
 
@@ -342,6 +343,67 @@ def test_a_hold_spanning_a_funding_interval_needs_funding_coverage():
                                      "hold_secs": 7200}])
         day = load_pnl([held])[("2026-09-08", "freq")]
         assert day.incomplete and day.incomplete_reasons == {"funding_gap"}
+
+
+def render_for(rows):
+    return render_table(rows, summarize(rows))
+
+
+def test_the_daily_rate_is_suppressed_when_the_day_volume_is_a_lower_bound():
+    """The rule has to hold on the row, not only in the totals.
+
+    The row is what `--out` writes and what the daily table prints, so a
+    rate excluded from the aggregate but still published per day is the
+    same inflated number in the place an operator actually reads it.
+    """
+    incomplete = ExecDay(fills=1, volume_usd=10_000.0, fills_without_value=1)
+    row = build_rows({("2026-09-08", "freq"): incomplete},
+                     {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-50.0,
+                                                     funding_seen=True)})[0]
+    assert row.cost_usd == 50.0
+    assert row.cost_per_musd_volume is None
+    assert row.as_json()["fills_without_value"] == 1
+
+
+def test_every_printed_equation_shows_the_numerator_it_divided():
+    rows = build_rows(
+        {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=1_000_000.0)},
+        {("2026-09-07", "freq"): PnlDay(cycles=1, realized_pnl_usd=-500.0, funding_seen=True),
+         ("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-100.0, funding_seen=True)},
+        points={("2026-09-08", "freq"): 1000.0},
+    )
+    text = render_for(rows)
+    # The rate divides $100, so $100 is what the equation shows. Printing
+    # "$600 ... = $100 per $1M" is a false equation that no caveat repairs.
+    assert "$100.00 of it fell on $1,000,000 of measured volume = $100.00 per $1M traded" in text
+    assert "$100.00 of it over 1,000.0 points = $0.100000 per point" in text
+    # The full cost is still reported, on its own line.
+    assert "cost $600.00 across 2 costed day(s)" in text
+
+
+def test_a_known_cost_is_reported_even_when_no_rate_can_be_built():
+    """Unknown rate is not unknown cost.
+
+    Every costed day here lacks execution coverage, so no per-volume rate
+    exists -- but the cost itself came from the PnL ledger and saying it is
+    unknown would throw away the one number that is solid.
+    """
+    rows = build_rows(
+        {},
+        {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-250.0, funding_seen=True)},
+    )
+    text = render_for(rows)
+    assert "cost $250.00 across 1 costed day(s)" in text
+    assert "no costed day has fully measured volume" in text
+    assert "no PnL ledger or equity series covers these days" not in text
+    # And the diagnostic is not skipped past.
+    assert "$250.00 of cost fell on days whose volume is unmeasured" in text
+
+
+def test_an_arm_with_no_cost_source_at_all_still_says_so():
+    rows = build_rows({("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=5_000.0)}, {})
+    text = render_for(rows)
+    assert "cost unknown (no PnL ledger or equity series covers these days)" in text
 
 
 def test_reads_the_real_ledger_shapes():

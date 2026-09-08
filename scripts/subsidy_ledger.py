@@ -439,7 +439,11 @@ def build_rows(
         row.points = points.get((date, arm))
         if row.points is not None and row.points > 0 and row.cost_usd is not None:
             row.cost_per_point = round(row.cost_usd / row.points, 8)
-        if row.cost_usd is not None and row.volume_usd > 0:
+        # Same rule as the aggregate, and it has to live here too: this row
+        # is what `--out` writes and what the daily table prints, so a rate
+        # suppressed only in the totals would still be published per day.
+        if (row.cost_usd is not None and row.volume_usd > 0
+                and not row.fills_without_value):
             row.cost_per_musd_volume = round(row.cost_usd / (row.volume_usd / 1e6), 4)
         rows.append(row)
     return rows
@@ -562,19 +566,33 @@ def render_table(rows: list[Row], summary: dict) -> str:
     out.append("")
     out.append("Totals (cost is positive when the arm gave money up):")
     for arm in summary["arms"]:
-        if arm["cost_per_musd_volume"] is None:
-            # No costed volume at all: saying "cost $0.00" here would read
-            # as free rather than as unmeasured.
+        head = f"  {arm['arm']:6s} volume ${arm['volume_usd']:,.0f} over {arm['days']}d"
+        if arm["cost_days"] == 0:
+            # Nothing priced this arm at all. Saying "cost $0.00" here would
+            # read as free rather than as unmeasured.
             out.append(
-                f"  {arm['arm']:6s} volume ${arm['volume_usd']:,.0f} over {arm['days']}d, "
-                f"cost unknown (no PnL ledger or equity series covers these days)"
-            )
+                f"{head}, cost unknown (no PnL ledger or equity series covers these days)")
             continue
+        # The cost is known even when no rate can be built from it, so it is
+        # stated on its own line rather than folded into an equation. Every
+        # equation below prints the numerator it actually divided -- an
+        # equation that shows a larger total beside a rate computed from a
+        # subset is simply false, and a caveat further down does not repair
+        # it.
         out.append(
-            f"  {arm['arm']:6s} volume ${arm['volume_usd']:,.0f} over {arm['days']}d, "
-            f"cost ${arm['cost_usd']:,.2f} on ${arm['costed_volume_usd']:,.0f} of it"
-            f" = ${arm['cost_per_musd_volume']:,.2f} per $1M traded"
-        )
+            f"{head}, cost ${arm['cost_usd']:,.2f} across "
+            f"{arm['cost_days']} costed day(s)")
+        if arm["cost_per_musd_volume"] is None:
+            out.append(
+                "         no costed day has fully measured volume, so the per-$1M rate "
+                "is unavailable"
+            )
+        else:
+            out.append(
+                f"         ${arm['cost_usd_on_measured_volume']:,.2f} of it fell on "
+                f"${arm['costed_volume_usd']:,.0f} of measured volume"
+                f" = ${arm['cost_per_musd_volume']:,.2f} per $1M traded"
+            )
         if arm["uncosted_volume_usd"] > 0:
             out.append(
                 f"         ${arm['uncosted_volume_usd']:,.0f} of that volume has no cost "
@@ -593,7 +611,8 @@ def render_table(rows: list[Row], summary: dict) -> str:
             )
         if arm["cost_per_point"] is not None:
             out.append(
-                f"         {arm['points']:,.1f} points = ${arm['cost_per_point']:.6f} per point"
+                f"         ${arm['cost_usd_on_pointed_days']:,.2f} of it over "
+                f"{arm['points']:,.1f} points = ${arm['cost_per_point']:.6f} per point"
             )
             if arm["uncosted_points"]:
                 out.append(
