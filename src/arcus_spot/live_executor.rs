@@ -8,8 +8,9 @@ use super::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use dex_connector::{
-    sign_arcus_spot_quote, sign_rialto_spot_quote, ArcusSpotClient, ArcusSpotConfig, ArcusSpotPair,
-    ArcusSpotQuoteRoutePolicy, ArcusSpotSignableQuoteRequest, ArcusSpotSubmitError,
+    sign_arcus_spot_quote, sign_rialto_spot_quote, ArcusSpotClient, ArcusSpotConfig,
+    ArcusSpotError, ArcusSpotPair, ArcusSpotQuoteRoutePolicy, ArcusSpotSignableQuoteRequest,
+    ArcusSpotSubmitError,
 };
 use ethers::{
     signers::Signer,
@@ -17,13 +18,65 @@ use ethers::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt::Display, path::Path, str::FromStr};
+use std::{collections::BTreeMap, fmt, fmt::Display, path::Path, str::FromStr};
 
 const ARCUS_VENUE: &str = "arcus";
 const RIALTO_VENUE: &str = "rialto";
 const CANONICAL_SWAP_SHELL: &str = "0x4262efBd176F02824af27010bEa218429c33c7E8";
 const CANONICAL_ARCUS_SETTLEMENT: &str = "0x006102b16A04c20306A28b652745D3973D7D24fa";
 const CANONICAL_RIALTO_ROUTER: &str = "0xC94135b63772b91D79d0A2DaAb2a8801f32359bD";
+
+/// The venue could not quote, before this dispatch changed anything.
+///
+/// `execute_plan_once` writes no ledger entry, produces no signature and
+/// makes no on-chain call until the fresh signable quote returns, so a
+/// failure at that one point is provably indistinguishable from a tick that
+/// never tried to trade: there is nothing to reconcile and nothing to
+/// recover. Raised only when the router itself classified the failure as
+/// retryable (`ArcusSpotError::retryable()`), i.e. after its own retries
+/// were exhausted it still called the condition transient -- typically
+/// `NO_QUOTES` while an upstream venue is down, or a 429.
+///
+/// Exposed so a caller that re-evaluates on its next observation
+/// (`live-tick`) can hold instead of failing the run, the same way an
+/// unsupported recommended route already does (bot-strategy#817). A
+/// retryable failure *after* submission deliberately stays an ordinary hard
+/// error: by then an attempt exists and only reconciliation may resolve it
+/// (bot-strategy#967).
+#[derive(Debug)]
+pub struct ArcusSpotQuoteUnavailable {
+    pub venue: &'static str,
+    pub detail: String,
+}
+
+impl Display for ArcusSpotQuoteUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} could not quote this rotation right now: {}",
+            self.venue, self.detail
+        )
+    }
+}
+
+impl std::error::Error for ArcusSpotQuoteUnavailable {}
+
+/// Map a fresh-signable-quote failure onto either a transient hold or an
+/// ordinary error.
+///
+/// Split out from the call site so the classification -- the whole reason a
+/// live tick may exit successfully with a would-rotate decision -- is
+/// directly testable without a router.
+fn fresh_quote_failure(venue: &'static str, error: ArcusSpotError) -> anyhow::Error {
+    if error.retryable() {
+        return ArcusSpotQuoteUnavailable {
+            venue,
+            detail: error.to_string(),
+        }
+        .into();
+    }
+    anyhow::Error::new(error).context(format!("{venue} fresh signable quote failed"))
+}
 
 /// Whether a plan uses one of the explicitly validated Arcus-hosted execution
 /// venues. Both remain direct-token routes (`allowWrapped=false`); LI.FI and
@@ -252,7 +305,7 @@ where
             RIALTO_VENUE => self.client.rialto_signable_quote_by_symbol(&request).await,
             _ => unreachable!("canonical_live_venue returned an unsupported venue"),
         }
-        .with_context(|| format!("{venue} fresh signable quote failed"))?;
+        .map_err(|error| fresh_quote_failure(venue, error))?;
         let mut matching_quotes = observation
             .response
             .payload
@@ -1120,6 +1173,47 @@ mod tests {
     use super::*;
     use dex_connector::ArcusSpotSwapStatus;
     use tempfile::tempdir;
+
+    fn router_quote_error(retryable: bool) -> ArcusSpotError {
+        ArcusSpotError::Http {
+            endpoint: "https://router.spot.arcus.xyz/v1/quote".to_string(),
+            status: 422,
+            classification: dex_connector::ArcusSpotFailureClass::Http,
+            retryable,
+            attempts: 3,
+            retry_after_ms: None,
+            body: r#"{"code":"NO_QUOTES"}"#.to_string(),
+        }
+    }
+
+    /// The router exhausted its own retries and still called the condition
+    /// transient. Nothing has been signed, submitted or written to the
+    /// ledger at this point, so a caller that re-evaluates on its next
+    /// observation may hold rather than fail (bot-strategy#967).
+    #[test]
+    fn a_retryable_fresh_quote_failure_is_a_hold() {
+        let error = fresh_quote_failure("rialto", router_quote_error(true));
+        let hold = error
+            .downcast_ref::<ArcusSpotQuoteUnavailable>()
+            .expect("a retryable router refusal is a hold, not a fault");
+        assert_eq!(hold.venue, "rialto");
+        assert!(hold.detail.contains("NO_QUOTES"), "{hold}");
+    }
+
+    /// A permanent refusal is a genuine fault -- a malformed request, a
+    /// misconfigured taker -- and must keep failing the run rather than
+    /// being retried forever, one silent hold per tick.
+    #[test]
+    fn a_permanent_fresh_quote_failure_is_still_an_error() {
+        let error = fresh_quote_failure("arcus", router_quote_error(false));
+        assert!(error.downcast_ref::<ArcusSpotQuoteUnavailable>().is_none());
+        assert!(
+            error
+                .to_string()
+                .contains("arcus fresh signable quote failed"),
+            "{error}"
+        );
+    }
 
     fn execution_intent() -> ArcusSpotExecutionIntent {
         ArcusSpotExecutionIntent {
