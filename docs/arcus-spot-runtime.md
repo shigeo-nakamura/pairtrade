@@ -403,9 +403,19 @@ dispatching tick takes -- and refuses unless the bot is genuinely idle:
   baseline inventory, so daily and cumulative loss accrue -- and a halt can
   engage -- with zero swaps ever dispatched. Put the checkpoint back first,
   from the `.pre-reset` copy beside it or from a `state-backup` directory.
-  If neither exists, a live-tick starts a fresh window at sequence 1 by
-  itself; the hash-chained event stream is untouched either way, so what is
-  lost is checkpoint sequence continuity, not evidence.
+  Restore the copy matching the stream's **current tail**: a checkpoint
+  behind the stream is refused too (below), and a live-tick must not be
+  used to rebuild one -- against a non-empty stream it stages a sequence-1
+  event and checkpoints it before the append rejects the discontinuity,
+  leaving a pending event no later tick can recover, which is the wedged
+  state this command exists to avoid.
+- a checkpoint whose sequence is not exactly the stream's tail, in either
+  direction. Ahead of the stream is a recovery case (`repair-report`), not
+  a reset. Behind it is the more dangerous one: the checkpoint reads as
+  valid while the events it has not seen may hold a completed entry fill or
+  an engaged halt whose attempt the ledger has already archived, so every
+  other check above would pass on stale state and the reset would replace
+  the authoritative record rather than continue it.
 
 The replaced checkpoint is copied aside and the stale observation-evidence
 sidecar is moved aside, both as `<name>.pre-reset.<nanos>` in the state

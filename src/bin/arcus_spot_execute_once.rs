@@ -1993,9 +1993,12 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
              config a fresh window would differ from all live in it. Resetting would only \
              re-anchor the initial-equity and buy-and-hold loss baselines the cumulative halt \
              is measured against, which is what this command must never be a way to do. Put \
-             the checkpoint back first -- the `.pre-reset` copy beside it, or the copy in a \
-             state-backup directory. If neither exists, a live-tick will start a fresh window \
-             at sequence 1 on its own; the event stream is untouched either way",
+             the checkpoint back first, from the `.pre-reset` copy beside it or from a \
+             state-backup directory, and make sure it is the one matching the stream's current \
+             tail. Do not run a live-tick to rebuild it: against a non-empty stream it stages a \
+             sequence-1 event and checkpoints it before the append rejects the discontinuity, \
+             leaving a pending event no later tick can recover -- the wedged state this command \
+             exists to avoid",
             config.runtime_state_path.display(),
         ),
     };
@@ -2052,16 +2055,31 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
 
     let tail = publisher.stream().latest_committed()?;
     let tail_sequence = tail.map(|(sequence, _)| sequence).unwrap_or(0);
-    {
-        if previous.sequence > tail_sequence {
-            bail!(
-                "Arcus runtime checkpoint is at sequence {} but the event stream tail is {}; the \
-                 stream is behind its own checkpoint, which is a recovery case (repair-report), \
-                 not a reset",
-                previous.sequence,
-                tail_sequence,
-            );
-        }
+    // The two must be exactly in step. Ahead of the stream was already
+    // refused; behind it is the more dangerous direction and was not,
+    // because the checkpoint reads as valid while the events it has not
+    // seen may hold a completed entry fill or an engaged halt whose
+    // attempt the ledger has since archived -- so every other guard here
+    // passes on stale state, and the reset replaces the authoritative
+    // record with a neutral checkpoint at the tail. That is reachable by
+    // restoring an older `.pre-reset` copy or an older state-backup, which
+    // is exactly what this command's own refusals tell an operator to do
+    // (Codex P1 follow-up, bot-strategy#903).
+    if previous.sequence != tail_sequence {
+        bail!(
+            "Arcus runtime checkpoint is at sequence {} but the event stream tail is {}; the two \
+             must be in step before a reset. {} Reconcile them with repair-report first -- a \
+             checkpoint that has not seen every committed event cannot show whether the bot is \
+             idle, and a reset would replace that record rather than continue it",
+            previous.sequence,
+            tail_sequence,
+            if previous.sequence > tail_sequence {
+                "The stream is behind its own checkpoint, which is a recovery case, not a reset."
+            } else {
+                "The checkpoint has not seen the stream's later events, which may hold a fill or \
+                 a halt this reset would discard."
+            },
+        );
     }
 
     let runtime =
@@ -9203,6 +9221,34 @@ runtime:
             .expect("the replaced checkpoint is reported");
         assert_eq!(fs::read(copy).unwrap(), replaced);
         assert_ne!(fs::read(&next.runtime_state_path).unwrap(), replaced);
+    }
+
+    #[test]
+    fn reset_window_refuses_a_checkpoint_that_trails_the_stream() {
+        // Restoring an older `.pre-reset` copy or state-backup is exactly
+        // what this command's other refusals tell an operator to do, so a
+        // checkpoint behind the stream is reachable by following them. It
+        // reads as valid while the events it has not seen may hold a fill
+        // or an engaged halt, and every other guard here then passes on
+        // stale state (Codex P1 follow-up).
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 5);
+        // Roll the checkpoint back to an earlier sequence, leaving the
+        // append-only stream at 5.
+        rewrite_checkpoint_state(&config.runtime_state_path, |state| {
+            state["sequence"] = serde_json::json!(2);
+        });
+
+        let error = commit_runtime_window_reset(&reset_window_next_config(dir.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("must be in step"), "{error}");
+        assert!(
+            error.contains("has not seen the stream's later events"),
+            "{error}"
+        );
     }
 
     #[test]
