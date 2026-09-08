@@ -58,8 +58,37 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   `kr_primary`/`us_primary` is `force_reduce_only`, not `status=active`, or
   below `ENGINE_B_LIVE_MIN_DAILY_VOLUME_USD` (default `100000`, same
   placeholder value as `engine_b_phase0.py`'s `MIN_DAILY_VOLUME_USD` --
-  keep both in sync until #872 freezes a data-driven value). Fails open
-  (proceeds without the gate, logged as a warning) on a fetch/parse error.
+  keep both in sync until #872 freezes a data-driven value). **Fails
+  closed** (bot-strategy#916): a fetch/parse error blocks the entry and is
+  retried on the next 5 s tick, bounded by
+  `ENGINE_B_LIVE_MAX_ELIGIBILITY_ATTEMPTS` (default 6) and by the entry
+  deadline; once the attempts are spent the day is skipped with
+  `skip_reason=eligibility_unavailable`. It used to fail *open* -- a single
+  REST hiccup would have traded straight through a `force_reduce_only`
+  market.
+- **Fail-closed signal inputs** (bot-strategy#916): every entry decision
+  reads only price observations that passed ingest validation (positive mid
+  inside a two-sided, uncrossed book; a venue timestamp that is either
+  plausible-and-recent or discarded as a broken clock), arrived on the
+  current price-feed generation (a broadcast `Lagged` bumps it, so nothing
+  observed before dropped updates is reused), and are no older than
+  `ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS` (default 30). Consequences:
+  - `t0`/`t1` are snapshotted only once both primaries have a usable price;
+    a partial or stale snapshot is never captured or persisted.
+  - A `t0` that is still not capturable
+    `ENGINE_B_LIVE_T0_CAPTURE_GRACE_SECS` (default 300) after KRX open ends
+    the day with `skip_reason=no_usable_t0` rather than backfilling a
+    mid-session price as if it were the open.
+  - The order-sizing price is re-checked immediately before the send, not
+    reused from the `t1` capture (the eligibility fetch and position read in
+    between are awaits).
+  - Every terminal no-entry path records a `skip_reason`, logged as
+    `[SKIP] ...` and surfaced in `status.json` under `han_bridge`, alongside
+    `stale_or_missing_symbols` and `price_feed_generation`.
+  - **These gates are entry-only.** `maybe_exit` and the unconfirmed-position
+    adoption path read the last price raw, so a stale feed can never keep an
+    open position from being closed or an unknown exposure from being
+    adopted. A PnL booked off a stale mid is logged as such.
 - **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
   `docs/engine-b-order-spec.md` §4 -- introduced by pairtrade#272, so the
   file is absent until that PR merges): a live entry is only recorded once
