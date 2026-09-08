@@ -26,9 +26,12 @@ use debot::arcus_spot::{
     ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
-use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
+use debot::arcus_spot::{
+    ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold, ArcusSpotHoldCode,
+    ArcusSpotRiskHalt,
+};
 use dex_connector::{
-    ArcusSpotClient, ArcusSpotConfig, ArcusSpotRecorder, ArcusSpotRecorderConfig,
+    ArcusSpotClient, ArcusSpotConfig, ArcusSpotPair, ArcusSpotRecorder, ArcusSpotRecorderConfig,
     ArcusSpotRecorderSnapshot,
 };
 use ed25519_dalek::{
@@ -1892,6 +1895,245 @@ fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to fsync {}", path.display()))
 }
 
+/// Start a fresh signal window under a state-invalidating config change,
+/// keeping the durable event stream contiguous (bot-strategy#903).
+///
+/// The documented procedure used to be "remove the checkpoint file and let
+/// the next tick start a fresh window". That predates the hash-chained
+/// event stream (#825): a fresh checkpoint numbers its first event 1, the
+/// stream tail is at N, and `append` refuses the discontinuity -- so the
+/// tick exits non-zero *after* staging a pending event, and every later
+/// tick then refuses that incompatible pending event too. Recovering it
+/// took hand-editing executor state (the #902 pair change did exactly
+/// that), which is the one thing the rollback runbook says never to do.
+///
+/// So this is the sanctioned operation instead: same administrator policy
+/// digest gate and same exclusive lock as `clear-risk-halt`, refusing
+/// unless the bot is genuinely idle, and writing a fresh checkpoint whose
+/// sequence continues from the verified stream tail. The stream is neither
+/// truncated nor renumbered; the event's own `pair`/`mode` fields mark the
+/// boundary, and the replaced checkpoint is copied aside first.
+fn reset_runtime_window(config_path: &Path) -> Result<serde_json::Value> {
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+    // A reset re-arms exactly the dispatch path this gate governs, under a
+    // config the checkpoint itself can no longer vouch for, so it is held
+    // to the same administrator approval as clear-risk-halt.
+    let policy = auto_execute_policy_from_admin_file()?;
+    require_config_within_auto_execute_policy(&config, &policy)?;
+
+    // Pass the already-parsed, already-approved config object -- not
+    // config_path -- so the committing half cannot re-read CONFIG_YAML from
+    // disk a second time (same TOCTOU reasoning as archive-rejected-apply).
+    commit_runtime_window_reset(&config)
+}
+
+/// Everything `reset-window` does once its administrator gate has passed.
+fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<serde_json::Value> {
+    let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    // Same exclusive lock a dispatching tick takes: this read-modify-write
+    // must not interleave with one committing a fill.
+    let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+
+    let publisher = live_tick_event_publisher(config)?;
+    match fs::symlink_metadata(publisher.pending_path()) {
+        Ok(_) => bail!(
+            "Arcus pending durable event {} must be recovered by a live-tick run before the \
+             window can be reset -- resetting around it would strand an event the stream still \
+             expects",
+            publisher.pending_path().display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect Arcus pending durable event"),
+    }
+
+    let ledger = ledger_store.load_existing()?;
+    if let Some(active) = &ledger.active {
+        bail!(
+            "Arcus execution attempt {} is still active in phase {:?}; resolve it (auto-resume, \
+             archive-rejected-apply, or manual-reconcile-apply) before resetting the window",
+            active.sequence,
+            active.phase,
+        );
+    }
+    let pending_plan_path = live_tick_pending_plan_path(config)?;
+    match fs::symlink_metadata(&pending_plan_path) {
+        Ok(_) => bail!(
+            "Arcus live-tick pending plan {} still exists; it is the evidence of a dispatch this \
+             reset would orphan",
+            pending_plan_path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect Arcus live-tick pending plan"),
+    }
+
+    // Read the checkpoint without comparing it to this config: under a
+    // state-invalidating change load_existing refuses outright, and that
+    // refusal is the very situation being resolved here.
+    let previous = store.peek_summary()?;
+    if let Some(previous) = &previous {
+        if previous.regime != ArcusSpotRegime::Neutral || previous.rotated_quantity.is_some() {
+            bail!(
+                "Arcus runtime checkpoint holds an open rotation (regime {:?}, rotated quantity \
+                 {}); exit it under the config it was entered under before resetting the window -- \
+                 a fresh window has no record of what is still held",
+                previous.regime,
+                previous
+                    .rotated_quantity
+                    .map(|quantity| quantity.normalize().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            );
+        }
+        if let Some(halt) = &previous.risk_halt {
+            bail!(
+                "Arcus runtime checkpoint carries a {:?} risk halt engaged at {}; a reset would \
+                 silently discard it. Decide it deliberately with clear-risk-halt first \
+                 (bot-strategy#813)",
+                halt.kind,
+                halt.engaged_at,
+            );
+        }
+    }
+
+    let tail = publisher.stream().latest_committed()?;
+    let tail_sequence = tail.map(|(sequence, _)| sequence).unwrap_or(0);
+    if let Some(previous) = &previous {
+        if previous.sequence > tail_sequence {
+            bail!(
+                "Arcus runtime checkpoint is at sequence {} but the event stream tail is {}; the \
+                 stream is behind its own checkpoint, which is a recovery case (repair-report), \
+                 not a reset",
+                previous.sequence,
+                tail_sequence,
+            );
+        }
+    }
+
+    let runtime =
+        ArcusSpotRuntime::new_continuing_event_sequence(config.runtime.clone(), tail_sequence)
+            .map_err(anyhow::Error::msg)
+            .context("the configuration being reset to is itself invalid")?;
+
+    // The evidence sidecar describes the state being discarded, so it is
+    // retired before the checkpoint is replaced: the reverse order could
+    // leave a fresh checkpoint beside evidence that contradicts it, which
+    // state-backup refuses to capture.
+    let mut retired = Vec::new();
+    let evidence_path = live_tick_observation_evidence_path(config)?;
+    if let Some(path) = retire_replaced_state_file(&evidence_path, "pre-reset")? {
+        retired.push(path.display().to_string());
+    }
+    if previous.is_some() {
+        // Copied, not moved: a rename followed by a failed persist would
+        // leave the state directory with no checkpoint at all, and the next
+        // tick would then start a fresh window at sequence 1 -- exactly the
+        // discontinuity this command exists to prevent.
+        let checkpoint_bytes =
+            read_private_regular_file(&config.runtime_state_path, "Arcus runtime checkpoint")?;
+        retired.push(
+            copy_replaced_state_file(&config.runtime_state_path, &checkpoint_bytes, "pre-reset")?
+                .display()
+                .to_string(),
+        );
+    }
+    store.persist(&runtime)?;
+
+    eprintln!(
+        "[arcus-reset] fresh window for {} continuing the event stream at sequence {}; take a \
+         fresh state-backup, as backups from before this no longer verify",
+        pair_label(&config.runtime.pair),
+        tail_sequence,
+    );
+    Ok(serde_json::json!({
+        "reset": {
+            "pair": pair_label(&config.runtime.pair),
+            "mode": config.runtime.mode,
+            "checkpoint_sequence": tail_sequence,
+            "next_event_sequence": tail_sequence.saturating_add(1),
+        },
+        "previous_checkpoint": previous.map(|previous| serde_json::json!({
+            "pair": pair_label(&previous.pair),
+            "mode": previous.mode,
+            "sequence": previous.sequence,
+            "relative_log_price_samples": previous.relative_log_price_samples,
+        })),
+        "event_stream": {
+            "directory": publisher.stream().directory().display().to_string(),
+            "tail_sequence": tail_sequence,
+            "tail_observed_at": tail.map(|(_, observed_at)| observed_at),
+        },
+        "runtime_state_path": config.runtime_state_path,
+        "retired": retired,
+    }))
+}
+
+/// Move a state file being replaced aside, under a suffixed name in its own
+/// directory, and report where it went. `None` if there was nothing there.
+///
+/// Deliberately kept rather than deleted: this and `copy_replaced_state_file`
+/// leave the only trace of the replaced state that survives an operator who
+/// skipped the `state-backup` the runbook asks for. Neither is a backup --
+/// no manifest, nothing verifies them -- so nothing reads them back; they
+/// exist to be inspected.
+fn retire_replaced_state_file(path: &Path, reason: &str) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => bail!(
+            "Arcus state file {} must be a regular non-symlink file",
+            path.display()
+        ),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    }
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    let destination = parent.join(replaced_state_file_name(path, reason)?);
+    fs::rename(path, &destination).with_context(|| {
+        format!(
+            "failed to move {} aside to {}",
+            path.display(),
+            destination.display()
+        )
+    })?;
+    File::open(parent)?.sync_all()?;
+    Ok(Some(destination))
+}
+
+/// The same suffixed destination as `retire_replaced_state_file`, written
+/// as a private copy of `bytes` while the original stays in place.
+fn copy_replaced_state_file(path: &Path, bytes: &[u8], reason: &str) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    let destination = parent.join(replaced_state_file_name(path, reason)?);
+    write_new_private_file(&destination, bytes)?;
+    File::open(parent)?.sync_all()?;
+    Ok(destination)
+}
+
+/// `<name>.<reason>.<nanoseconds>`: unique per invocation, sorts by time,
+/// and stays inside the state directory the executor already owns.
+fn replaced_state_file_name(path: &Path, reason: &str) -> Result<String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("{} has no valid file name", path.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_nanos();
+    Ok(format!("{name}.{reason}.{stamp}"))
+}
+
+/// Symbols as the durable event's own `pair` field spells them.
+fn pair_label(pair: &ArcusSpotPair) -> String {
+    format!("{}/{}", pair.sell_symbol, pair.buy_symbol)
+}
+
 /// Create a complete immutable backup directory using a hidden staging
 /// directory and final rename. The live checkpoint/ledger are only read;
 /// nothing here is a restore operation.
@@ -3270,6 +3512,7 @@ fn usage() -> &'static str {
   arcus-spot-execute-once auto-resume CONFIG_YAML PLAN_JSON
   arcus-spot-execute-once live-tick CONFIG_YAML
   arcus-spot-execute-once clear-risk-halt CONFIG_YAML
+  arcus-spot-execute-once reset-window CONFIG_YAML
   arcus-spot-execute-once repair-report CONFIG_YAML EVENTS_JSONL
   arcus-spot-execute-once manual-reconcile-report CONFIG_YAML EVENTS_JSONL \
       EXPECTED_SELL_AMOUNT_RAW EXPECTED_BUY_AMOUNT_RAW
@@ -3296,6 +3539,21 @@ rather than silently archived. Both require CONFIG_YAML to match
 auto_execute_policy.json's administrator-approved digest (same gate as
 auto-execute/auto-resume/clear-risk-halt/manual-reconcile-report/apply)
 before doing anything else.
+
+reset-window starts a fresh signal window when a state-invalidating
+`runtime:` field changed (`mode`, `chain_id`, `pair`, `initial_inventory`,
+`signal_window_samples`), which the checkpoint otherwise refuses to load
+under. It never deletes or renumbers the hash-chained event stream: the new
+checkpoint continues from the stream's verified tail, so the audit chain
+stays contiguous across the strategy change and the events' own `pair`/`mode`
+fields mark the boundary (bot-strategy#903). It refuses unless the bot is
+idle -- no pending durable event, no active ledger attempt, no pending-plan
+evidence, no open rotation, and no engaged risk halt (clear-risk-halt is the
+deliberate decision for that one, never a side effect of a reset). The
+replaced checkpoint is copied aside and the stale observation-evidence
+sidecar is moved aside, both as `<name>.pre-reset.<nanos>`; neither is a
+verified backup, so still take a `state-backup` before the config swap (it
+verifies against the *old* config) and another once the reset is live.
 
 manual-reconcile-report/manual-reconcile-apply are the last-resort recovery
 path for exactly the incident class repair-report's own report describes as
@@ -3923,6 +4181,32 @@ async fn main() -> Result<()> {
             // approved_config_sha256 -- see docs/arcus-spot-runtime.md.
             let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
             let config = parse_config(&config_bytes, Path::new(config_path))?;
+            // stdout stays exactly the digest -- callers pipe it into the
+            // policy file. The cost budget goes to stderr: the cap is
+            // compared against the *all-in* figure (quoted round-trip loss
+            // plus both fixed buffers), and an operator who reads it as a
+            // cap on the quoted loss alone sizes it too low and then cannot
+            // tell why every tick holds on `cost_limit` (bot-strategy#903).
+            eprintln!(
+                "[arcus-config] cost budget: max_all_in_round_trip_cost_bps {} bps is compared \
+                 against quoted round-trip loss + gas_buffer_bps {} + settlement_buffer_bps {}, \
+                 so a quote clears the gate only below {} bps",
+                config.runtime.max_all_in_round_trip_cost_bps.normalize(),
+                config.runtime.gas_buffer_bps.normalize(),
+                config.runtime.settlement_buffer_bps.normalize(),
+                config
+                    .runtime
+                    .max_all_in_round_trip_cost_bps
+                    .checked_sub(
+                        config
+                            .runtime
+                            .gas_buffer_bps
+                            .checked_add(config.runtime.settlement_buffer_bps)
+                            .context("cost buffers exceed Decimal range")?
+                    )
+                    .context("cost buffers exceed Decimal range")?
+                    .normalize(),
+            );
             println!("{}", auto_execute_config_digest(&config)?);
             Ok(())
         }
@@ -3983,6 +4267,19 @@ async fn main() -> Result<()> {
                 "[arcus-risk] cleared a {:?} halt engaged at {}; take a fresh state-backup, as \
                  backups from before this no longer verify",
                 halt.kind, halt.engaged_at,
+            );
+            Ok(())
+        }
+        [command, config_path] if command == "reset-window" => {
+            // The sanctioned way to start a fresh signal window under a
+            // state-invalidating config change (a new pair, a re-funded
+            // inventory), replacing the JSON surgery #902 needed
+            // (bot-strategy#903). Printed rather than merely done: this
+            // discards an accumulated window on a live bot, so the record
+            // of what was discarded lands in the journal.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&reset_runtime_window(Path::new(config_path))?)?
             );
             Ok(())
         }
@@ -4533,6 +4830,7 @@ mod tests {
         assert!(usage().contains("state-verify-exact CONFIG_YAML BACKUP_DIR"));
         assert!(usage().contains("state-verify-continuity CONFIG_YAML BACKUP_DIR"));
         assert!(usage().contains("clear-risk-halt CONFIG_YAML"));
+        assert!(usage().contains("reset-window CONFIG_YAML"));
         assert!(usage().contains("repair-report CONFIG_YAML EVENTS_JSONL"));
     }
 
@@ -8720,5 +9018,266 @@ runtime:
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let error = auto_execute_policy_from_file(&link).unwrap_err();
         assert!(error.to_string().contains("non-symlink"));
+    }
+
+    // -- reset-window (bot-strategy#903) ---------------------------------
+
+    fn reset_window_config(dir: &Path) -> ArcusSpotExecuteOnceConfig {
+        execute_once_config(
+            dir.join("ledger.json").to_str().unwrap(),
+            dir.join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        )
+    }
+
+    fn reset_window_observe_event(
+        sequence: u64,
+        observed_at: DateTime<Utc>,
+    ) -> ArcusSpotRuntimeEvent {
+        let inventory = ArcusSpotInventory {
+            token_a: Decimal::new(35, 2),
+            token_b: Decimal::new(16, 2),
+        };
+        ArcusSpotRuntimeEvent {
+            sequence,
+            observed_at,
+            pair: "NVDA/AMD".to_string(),
+            mode: ArcusSpotRuntimeMode::Live,
+            token_a_reference_price_usd: Some(Decimal::from(200)),
+            token_b_reference_price_usd: Some(Decimal::from(100)),
+            relative_log_price: Some(0.5),
+            z_score: Some(0.1),
+            inventory_before: inventory,
+            inventory_after: inventory,
+            regime_before: ArcusSpotRegime::Neutral,
+            regime_after: ArcusSpotRegime::Neutral,
+            risk_before: None,
+            risk_after: None,
+            decision: ArcusSpotDecision::Observe {
+                hold: ArcusSpotHold {
+                    code: ArcusSpotHoldCode::NoSignal,
+                    detail: "z below entry threshold".to_string(),
+                },
+            },
+        }
+    }
+
+    /// A live host mid-probe: three committed events, and a checkpoint whose
+    /// accumulated window is at the same sequence.
+    fn seed_reset_window_host(config: &ArcusSpotExecuteOnceConfig, tail: u64) {
+        persist_initial_operator_state(config);
+        let stream = live_tick_event_stream(config).unwrap();
+        for sequence in 1..=tail {
+            stream
+                .append(&reset_window_observe_event(
+                    sequence,
+                    fixture_now() + chrono::Duration::seconds(sequence as i64),
+                ))
+                .unwrap();
+        }
+        let base = ArcusSpotRuntime::new(config.runtime.clone()).unwrap();
+        let mut state = base.state().clone();
+        state.sequence = tail;
+        state.relative_log_price_history = vec![0.11, 0.12, 0.13];
+        state.last_observation_at = Some(fixture_now());
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state).unwrap())
+            .unwrap();
+    }
+
+    /// The same config with a state-invalidating change: a re-funded
+    /// inventory baseline, which `classify_config_drift` refuses to carry
+    /// state across.
+    fn reset_window_next_config(dir: &Path) -> ArcusSpotExecuteOnceConfig {
+        let mut next = reset_window_config(dir);
+        next.runtime.initial_inventory.token_a = Decimal::new(50, 2);
+        next
+    }
+
+    #[test]
+    fn reset_window_starts_a_fresh_window_that_continues_the_event_stream() {
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+        let next = reset_window_next_config(dir.path());
+        let store = ArcusSpotRuntimeCheckpointStore::new(next.runtime_state_path.clone());
+        // The situation being resolved: the accumulated state cannot be
+        // loaded under the new config at all.
+        assert!(store.load_existing(&next.runtime).is_err());
+
+        let report = commit_runtime_window_reset(&next).unwrap();
+
+        assert_eq!(report["reset"]["checkpoint_sequence"], 3);
+        assert_eq!(report["reset"]["next_event_sequence"], 4);
+        assert_eq!(report["previous_checkpoint"]["sequence"], 3);
+        assert_eq!(
+            report["previous_checkpoint"]["relative_log_price_samples"],
+            3
+        );
+        let runtime = store.load_existing(&next.runtime).unwrap();
+        assert_eq!(runtime.state().sequence, 3);
+        assert!(runtime.state().relative_log_price_history.is_empty());
+        assert_eq!(runtime.state().inventory.token_a, Decimal::new(50, 2));
+        assert_eq!(runtime.state().last_observation_at, None);
+
+        // The invariant the whole command exists for: the next tick's event
+        // is the stream tail's successor, and the renumbering the old
+        // "remove the checkpoint" procedure produced is still refused.
+        let stream = live_tick_event_stream(&next).unwrap();
+        let at = fixture_now() + chrono::Duration::seconds(60);
+        assert!(stream.append(&reset_window_observe_event(1, at)).is_err());
+        stream.append(&reset_window_observe_event(4, at)).unwrap();
+    }
+
+    #[test]
+    fn reset_window_keeps_the_replaced_checkpoint_beside_the_new_one() {
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 2);
+        let replaced = fs::read(&config.runtime_state_path).unwrap();
+        let next = reset_window_next_config(dir.path());
+
+        let report = commit_runtime_window_reset(&next).unwrap();
+
+        let retired: Vec<String> = serde_json::from_value(report["retired"].clone()).unwrap();
+        let copy = retired
+            .iter()
+            .find(|path| path.contains("runtime.json.pre-reset."))
+            .expect("the replaced checkpoint is reported");
+        assert_eq!(fs::read(copy).unwrap(), replaced);
+        assert_ne!(fs::read(&next.runtime_state_path).unwrap(), replaced);
+    }
+
+    #[test]
+    fn reset_window_recovers_a_checkpoint_that_was_already_removed() {
+        // The #902 incident itself: the old runbook said to remove the
+        // checkpoint, so the file is gone and the stream tail is at 3.
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+        fs::remove_file(&config.runtime_state_path).unwrap();
+        let next = reset_window_next_config(dir.path());
+
+        let report = commit_runtime_window_reset(&next).unwrap();
+
+        assert_eq!(report["reset"]["checkpoint_sequence"], 3);
+        assert!(report["previous_checkpoint"].is_null());
+        let runtime = ArcusSpotRuntimeCheckpointStore::new(next.runtime_state_path.clone())
+            .load_existing(&next.runtime)
+            .unwrap();
+        assert_eq!(runtime.state().sequence, 3);
+    }
+
+    #[test]
+    fn reset_window_refuses_a_pending_durable_event() {
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+        live_tick_event_publisher(&config)
+            .unwrap()
+            .stage(&reset_window_observe_event(
+                4,
+                fixture_now() + chrono::Duration::seconds(30),
+            ))
+            .unwrap();
+
+        let error = commit_runtime_window_reset(&reset_window_next_config(dir.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("pending durable event"), "{error}");
+        // Nothing was reset: the old checkpoint is still the live one.
+        assert_eq!(
+            ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+                .peek_summary()
+                .unwrap()
+                .unwrap()
+                .relative_log_price_samples,
+            3
+        );
+    }
+
+    #[test]
+    fn reset_window_refuses_an_unresolved_ledger_attempt() {
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+        let plan = rotation_plan("entry_signal");
+        let ledger = ArcusSpotExecutionLedger {
+            next_sequence: 3,
+            active: Some(repair_report_active_submitted_attempt(
+                &config,
+                &plan,
+                fixture_now(),
+            )),
+            ..Default::default()
+        };
+        ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .persist(&ledger)
+            .unwrap();
+
+        let error = commit_runtime_window_reset(&reset_window_next_config(dir.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("still active in phase"), "{error}");
+    }
+
+    #[test]
+    fn reset_window_refuses_an_open_rotation() {
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let mut state = store
+            .load_existing(&config.runtime)
+            .unwrap()
+            .state()
+            .clone();
+        state.regime = ArcusSpotRegime::RotatedAToB;
+        state.rotated_quantity = Some(Decimal::new(4, 2));
+        state.last_rotation_at = Some(fixture_now());
+        store
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state).unwrap())
+            .unwrap();
+
+        let error = commit_runtime_window_reset(&reset_window_next_config(dir.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("open rotation"), "{error}");
+    }
+
+    #[test]
+    fn reset_window_refuses_an_engaged_risk_halt() {
+        // A reset builds a fresh state, and a fresh state has no halt: left
+        // unchecked, reset-window would be a second, undocumented way to
+        // disarm the sticky risk stop clear-risk-halt exists to gate.
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let mut state = store
+            .load_existing(&config.runtime)
+            .unwrap()
+            .state()
+            .clone();
+        state.risk_halt = Some(ArcusSpotRiskHalt {
+            kind: ArcusSpotRiskHaltKind::DailyLoss,
+            engaged_at: fixture_now(),
+            equity_usd: Decimal::from(90),
+            loss_usd: Decimal::from(3),
+            limit_usd: Decimal::from(2),
+        });
+        store
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state).unwrap())
+            .unwrap();
+
+        let error = commit_runtime_window_reset(&reset_window_next_config(dir.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("risk halt"), "{error}");
+        assert!(error.contains("clear-risk-halt"), "{error}");
     }
 }

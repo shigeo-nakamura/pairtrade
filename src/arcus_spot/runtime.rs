@@ -350,6 +350,29 @@ impl ArcusSpotRuntime {
         Ok(Self { config, state })
     }
 
+    /// A fresh window whose durable event numbering continues from
+    /// `last_event_sequence` (the event stream's tail), rather than from
+    /// zero as `new` does.
+    ///
+    /// The event stream is append-only and hash-chained: it "must never be
+    /// deleted, truncated, or restored" (docs/arcus-spot-state-rollback.md),
+    /// and `validate_event_continuity` refuses any append that is not the
+    /// tail's successor. So a state-invalidating config change -- a new
+    /// pair, a re-funded inventory -- cannot be handled by discarding the
+    /// checkpoint and letting the next tick renumber from 1: that tick
+    /// fails to commit, and every later one fails on the pending event it
+    /// left behind (bot-strategy#903). Starting the fresh window at the
+    /// tail keeps one contiguous audit chain across the strategy change,
+    /// with the event's own `pair`/`mode` fields marking the boundary.
+    pub fn new_continuing_event_sequence(
+        config: ArcusSpotRuntimeConfig,
+        last_event_sequence: u64,
+    ) -> Result<Self, String> {
+        let mut runtime = Self::new(config)?;
+        runtime.state.sequence = last_event_sequence;
+        Ok(runtime)
+    }
+
     pub fn from_state(
         mut config: ArcusSpotRuntimeConfig,
         state: ArcusSpotRuntimeState,

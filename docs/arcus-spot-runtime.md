@@ -292,6 +292,20 @@ Any change to CONFIG_YAML -- intentional or not -- requires recomputing and
 redeploying this digest, or `auto-execute`/`auto-resume`/`live-tick` refuse
 to run against it.
 
+`hash-config` also prints the config's cost budget to stderr (stdout stays
+exactly the digest, so it can still be piped):
+
+    [arcus-config] cost budget: max_all_in_round_trip_cost_bps 60 bps is
+    compared against quoted round-trip loss + gas_buffer_bps 10 +
+    settlement_buffer_bps 10, so a quote clears the gate only below 40 bps
+
+`max_all_in_round_trip_cost_bps` is the **all-in** limit: the quoted
+round-trip loss plus both fixed buffers is charged against it, not the
+quoted loss alone. Sizing it as if it capped the quoted loss is how a
+config ends up holding every tick on `cost_limit` for no visible reason
+(bot-strategy#903). A config whose buffers alone already exceed the cap is
+rejected outright at load, naming both figures.
+
 ## Changing `runtime:` under a live checkpoint
 
 Re-approving the digest above is necessary but not sufficient. The runtime
@@ -312,11 +326,9 @@ So the comparison is by field, not byte-for-byte (bot-strategy#809):
 - **State-invalidating** -- `mode`, `chain_id`, `pair`, `initial_inventory`,
   `signal_window_samples`. Changing any of these makes the stored signal
   window, regime, inventory, or risk baselines describe something other than
-  what they now claim to, so the load fails and names the field. Clear it
-  deliberately: stop the timer, take a `state-backup` (see
-  `docs/arcus-spot-state-rollback.md`), remove the checkpoint file, and let
-  the next tick start a fresh window. Expect to re-serve the full
-  `min_signal_samples` warmup before entries resume.
+  what they now claim to, so the load fails and names the field. Start a
+  fresh window deliberately, with `reset-window` (below). Expect to re-serve
+  the full `min_signal_samples` warmup before entries resume.
 - **State-preserving** -- every other field, including `notional_usd`,
   `inventory_floors`, `max_rotation_fraction`, `min_signal_samples`,
   `entry_z_score`/`exit_z_score`, the age/hold limits, the cost buffers, and
@@ -334,6 +346,60 @@ accumulated window; on the live probe that meant days of warmup to move
 Raising `inventory_floors` above the currently tracked inventory is still
 refused, by `ArcusSpotRuntime::from_state`'s own floor check rather than
 here, with a message that names that as the problem.
+
+### reset-window: starting a fresh window without breaking the event stream
+
+    arcus-spot-execute-once reset-window CONFIG_YAML
+
+This is the *only* sanctioned way to start a fresh window under a
+state-invalidating change (bot-strategy#903).
+
+The procedure this replaces -- "remove the checkpoint file and let the next
+tick start a fresh window" -- predates the hash-chained durable event stream
+(#825) and has not worked since. A fresh checkpoint numbers its first event
+1 while the stream tail is at N, `validate_event_continuity` refuses the
+discontinuity, and the tick exits non-zero *after* staging its pending
+event; every later tick then refuses that incompatible pending event too.
+The 2026-09-04 NVDA/AMD -> SPY/QQQ change hit exactly this and was only
+recovered by hand-editing executor state, which the rollback runbook
+otherwise forbids.
+
+`reset-window` instead writes a fresh checkpoint whose sequence continues
+from the stream's verified tail, so the audit chain stays contiguous across
+the strategy change and the events' own `pair`/`mode` fields mark the
+boundary. It never deletes, truncates, or renumbers the stream.
+
+It is gated exactly like `clear-risk-halt` -- the administrator-owned
+`approved_config_sha256` policy digest, plus the same exclusive lock a
+dispatching tick takes -- and refuses unless the bot is genuinely idle:
+
+- a staged pending durable event (run a live-tick first; it recovers one),
+- an unresolved ledger attempt (`auto-resume`, `archive-rejected-apply`,
+  `manual-reconcile-apply`, or a live-tick run for a reconciled one),
+- an on-disk live-tick pending plan,
+- an open rotation -- exit it under the config it was entered under, since
+  a fresh window has no record of what is still held,
+- an engaged risk halt -- a fresh state has no halt, so allowing this would
+  make `reset-window` a second, undocumented way to disarm the sticky stop
+  `clear-risk-halt` exists to gate (#813).
+
+The replaced checkpoint is copied aside and the stale observation-evidence
+sidecar is moved aside, both as `<name>.pre-reset.<nanos>` in the state
+directory. Neither is a verified backup (no manifest, nothing reads them
+back), so the surrounding procedure is unchanged:
+
+1. stop the timer,
+2. `state-backup` **before** the config swap (it verifies against the *old*
+   config),
+3. deploy the new CONFIG_YAML and its `hash-config` digest,
+4. `reset-window CONFIG_YAML`,
+5. a fresh `state-backup`, then re-enable the timer.
+
+The risk baselines restart with the window: `initial_equity_usd` and the
+buy-and-hold basket (#813) are re-marked on the next tick against the new
+inventory, so cumulative-loss accounting starts from the new baseline. That
+is inherent to re-funding or re-pairing the bot, but decide the loss limits
+with it in mind.
 
 One consequence to plan for: `state-verify-exact`/`state-verify-continuity`
 compare a backup's whole-config digest against the config supplied to them,

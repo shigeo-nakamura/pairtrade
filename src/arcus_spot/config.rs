@@ -147,7 +147,13 @@ impl ArcusSpotRuntimeConfig {
             .checked_add(self.settlement_buffer_bps)
             .ok_or("cost buffers exceed Decimal range")?;
         if fixed_buffers > self.max_all_in_round_trip_cost_bps {
-            return Err("gas + settlement buffers exceed the all-in cost limit".to_string());
+            // Named in full because the cap is routinely misread as a limit
+            // on the quoted round-trip loss alone: it is compared against
+            // that loss *plus* both fixed buffers (bot-strategy#903).
+            return Err(format!(
+                "gas_buffer_bps + settlement_buffer_bps ({fixed_buffers}) exceed                  max_all_in_round_trip_cost_bps ({}), which is the all-in limit those buffers are                  charged against, leaving no room for any quoted round-trip loss",
+                self.max_all_in_round_trip_cost_bps
+            ));
         }
         if self.max_inventory_imbalance_fraction < Decimal::ZERO
             || self.max_inventory_imbalance_fraction > Decimal::ONE
@@ -220,7 +226,18 @@ mod tests {
         let mut config = valid_config();
         config.gas_buffer_bps = Decimal::from(60);
         config.settlement_buffer_bps = Decimal::from(41);
-        assert!(config.validate().unwrap_err().contains("buffers"));
+        // The message has to name the all-in comparison, not just "buffers":
+        // the cap being charged the buffers *plus* the quoted round-trip loss
+        // is exactly what operators misread (bot-strategy#903).
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("gas_buffer_bps + settlement_buffer_bps (101)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("max_all_in_round_trip_cost_bps (100), which is the all-in limit"),
+            "{error}"
+        );
     }
 
     #[test]

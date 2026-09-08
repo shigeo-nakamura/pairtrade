@@ -78,6 +78,17 @@ impl ArcusSpotLiveTickEventStream {
         }
     }
 
+    /// Sequence and observation time of the stream's last committed event,
+    /// `None` while the stream has no records yet.
+    ///
+    /// Verifies the latest segment on the way, exactly as `append` does, so
+    /// a caller cannot chain new numbering onto a tail it has not checked.
+    pub fn latest_committed(&self) -> Result<Option<(u64, DateTime<Utc>)>> {
+        Ok(self
+            .latest_verified_record()?
+            .map(|latest| (latest.event.sequence, latest.event.observed_at)))
+    }
+
     /// Append one checkpointed event and fsync both data and a newly-created
     /// segment's directory entry.
     ///
