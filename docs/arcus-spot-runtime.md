@@ -381,7 +381,20 @@ dispatching tick takes -- and refuses unless the bot is genuinely idle:
   a fresh window has no record of what is still held,
 - an engaged risk halt -- a fresh state has no halt, so allowing this would
   make `reset-window` a second, undocumented way to disarm the sticky stop
-  `clear-risk-halt` exists to gate (#813).
+  `clear-risk-halt` exists to gate (#813),
+- a missing checkpoint on a bot that has already moved funds. With no
+  checkpoint the two checks above cannot run at all, and a completed fill
+  records its post-fill regime in the checkpoint rather than in the
+  preceding `WouldRotate` event -- so an open rotation would be invisible
+  here and the fresh neutral window would let the next tick buy on top of a
+  position it cannot see. The execution ledger is what survives the
+  checkpoint and settles it: no fund-moving attempt in its history means no
+  position can exist, which is the never-traded deployment this recovery
+  path was written for (the #902 runbook that removed the checkpoint).
+  Anything else is refused -- put the checkpoint back first, from the
+  `.pre-reset` copy beside it or from a `state-backup` directory. A risk
+  halt engaged before the checkpoint went missing is not recoverable from
+  the ledger either, so re-check risk before resuming.
 
 The replaced checkpoint is copied aside and the stale observation-evidence
 sidecar is moved aside, both as `<name>.pre-reset.<nanos>` in the state

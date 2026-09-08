@@ -1972,6 +1972,43 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
     // state-invalidating change load_existing refuses outright, and that
     // refusal is the very situation being resolved here.
     let previous = store.peek_summary()?;
+    if previous.is_none() {
+        // The #902 recovery case: the old runbook removed the checkpoint,
+        // so there is nothing here to read a regime or a halt out of. Both
+        // checks below are consequently skipped, which is safe only while
+        // the bot has never moved funds -- a completed fill leaves no
+        // active ledger attempt and records its post-fill regime in the
+        // checkpoint, not in the preceding WouldRotate event, so for a bot
+        // that has traded a missing checkpoint is exactly the case where an
+        // open rotation is invisible here. Resetting into a neutral window
+        // then lets the next tick open a second position on top of one it
+        // cannot see.
+        //
+        // The ledger settles it without guessing: it is the record of what
+        // was actually swapped, and it survives the checkpoint. No
+        // fund-moving attempt in its history means no position can exist,
+        // which is the never-traded deployment this recovery path was
+        // written for. Anything else is refused (Codex P1 follow-up,
+        // bot-strategy#903).
+        if let Some(attempt) = ledger.history.iter().find(|attempt| {
+            attempt.phase == ArcusSpotExecutionPhase::Reconciled || attempt.tx_hash.is_some()
+        }) {
+            bail!(
+                "Arcus runtime checkpoint {} is missing and the execution ledger shows this bot \
+                 has moved funds (attempt {} in phase {:?}), so nothing here can show whether a \
+                 rotation is still open: a fill's regime lives in the checkpoint, not in the \
+                 event stream, and resetting into a fresh neutral window would let the next tick \
+                 open a second position on top of one it cannot see. Put the checkpoint back \
+                 first -- the `.pre-reset` copy beside it, or the copy in a state-backup \
+                 directory -- then reset. Note that a risk halt engaged before the checkpoint \
+                 went missing is not recoverable from the ledger either; re-check risk before \
+                 resuming",
+                config.runtime_state_path.display(),
+                attempt.sequence,
+                attempt.phase,
+            );
+        }
+    }
     if let Some(previous) = &previous {
         if previous.regime != ArcusSpotRegime::Neutral || previous.rotated_quantity.is_some() {
             bail!(
@@ -3549,7 +3586,10 @@ stays contiguous across the strategy change and the events' own `pair`/`mode`
 fields mark the boundary (bot-strategy#903). It refuses unless the bot is
 idle -- no pending durable event, no active ledger attempt, no pending-plan
 evidence, no open rotation, and no engaged risk halt (clear-risk-halt is the
-deliberate decision for that one, never a side effect of a reset). The
+deliberate decision for that one, never a side effect of a reset). A missing
+checkpoint is allowed only while the execution ledger shows the bot has never
+moved funds: otherwise an open rotation would be invisible here, since a
+fill's regime lives in the checkpoint and not in the event stream. The
 replaced checkpoint is copied aside and the stale observation-evidence
 sidecar is moved aside, both as `<name>.pre-reset.<nanos>`; neither is a
 verified backup, so still take a `state-backup` before the config swap (it
@@ -9146,6 +9186,39 @@ runtime:
             .expect("the replaced checkpoint is reported");
         assert_eq!(fs::read(copy).unwrap(), replaced);
         assert_ne!(fs::read(&next.runtime_state_path).unwrap(), replaced);
+    }
+
+    #[test]
+    fn reset_window_refuses_a_missing_checkpoint_once_the_bot_has_moved_funds() {
+        // With no checkpoint there is nothing to read a regime out of, and
+        // a completed fill records its regime there rather than in the
+        // preceding WouldRotate event -- so an open rotation would be
+        // invisible and the fresh neutral window would let the next tick
+        // buy on top of a position it cannot see. The ledger is what
+        // survives the checkpoint and settles it (Codex P1 follow-up).
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+        let plan = rotation_plan("entry_signal");
+        let ledger = ArcusSpotExecutionLedger {
+            next_sequence: 3,
+            history: vec![reconciled_entry_attempt(&config, &plan, 2)],
+            ..Default::default()
+        };
+        ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .persist(&ledger)
+            .unwrap();
+        fs::remove_file(&config.runtime_state_path).unwrap();
+
+        let error = commit_runtime_window_reset(&reset_window_next_config(dir.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("has moved funds"), "{error}");
+        assert!(error.contains("attempt 2"), "{error}");
+        // The checkpoint is left alone: a refusal must not consume the
+        // state the operator still has to put back.
+        assert!(!config.runtime_state_path.exists());
     }
 
     #[test]
