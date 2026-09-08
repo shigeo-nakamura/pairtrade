@@ -1,0 +1,20 @@
+[Unit]
+Description=Fetch the exdiv-lighter signal file from S3 around the US cash open (bot-strategy#948 / #937)
+
+[Timer]
+# The producer publishes a couple of minutes before the US cash open on
+# ex-dividend days; the decision is at 09:29:00 and its acceptance window
+# closes at 09:29:45, before the open. Polling every 20 s from 09:27:00
+# through 09:29:40 covers that window and stops there: a fetch after the
+# window is useless, and a fetch after the open would only be able to
+# deliver a file the runtime must not act on. The timezone is the
+# market's, not UTC: the open is 13:30 UTC only under daylight saving and
+# 14:30 UTC in winter, and a fixed-UTC expression would stop an hour early
+# for a December event. Nothing polls outside that span.
+OnCalendar=Mon..Fri *-*-* 09:27..29:0/20 America/New_York
+AccuracySec=1s
+Persistent=false
+Unit=book-signal-fetch-exdiv-lighter.service
+
+[Install]
+WantedBy=timers.target

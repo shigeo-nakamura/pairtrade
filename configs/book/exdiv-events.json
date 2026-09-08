@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "_comment": "Human-maintained ex-dividend calendar for the exdiv-lighter book instance (bot-strategy#948). One row per (symbol, ex_date). Only status=declared rows reach the runtime calendar and the producer; keep status=estimated until the issuer has declared the date and amount, then update from the source. Symbols are Lighter perp names; hedge is US500 (S&P 500 ETFs) / US100 (QQQ) or null for unhedged single stocks. Regenerate the runtime calendar after every edit: scripts/exdiv_signal_producer.py calendar --events configs/book/exdiv-events.json --out configs/book/exdiv-lighter.calendar.json (CI checks the two agree).",
+  "events": [
+    {"symbol": "IWM", "ex_date": "2026-09-15", "dividend_usd": 0.68, "hedge": "US500", "status": "declared",
+     "source": "bot-strategy#948 calendar table (web-checked 2026-09-07)"},
+    {"symbol": "TSM", "ex_date": "2026-09-16", "dividend_usd": 1.11, "hedge": null, "status": "declared",
+     "source": "bot-strategy#948 calendar table (web-checked 2026-09-07)"},
+    {"symbol": "SPY", "ex_date": "2026-09-18", "dividend_usd": 1.83, "hedge": "US500", "status": "declared",
+     "source": "bot-strategy#948 calendar table (web-checked 2026-09-07)"},
+    {"symbol": "QQQ", "ex_date": "2026-09-21", "dividend_usd": 0.69, "hedge": "US100", "status": "declared",
+     "source": "bot-strategy#948 calendar table (web-checked 2026-09-07)"},
+    {"symbol": "EWY", "ex_date": "2026-12-16", "dividend_usd": 1.80, "hedge": "US500", "status": "estimated",
+     "source": "annual December distribution, date and amount not yet declared (bot-strategy#948)"}
+  ]
+}

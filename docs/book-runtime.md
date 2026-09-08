@@ -473,3 +473,21 @@ the 2026-09-10 smoke-test binary; migrating Phase 1 (#876) onto this
 runtime is a follow-up decision once #876's gate is reached — the
 required pieces (calendar schedule, flatten, single-symbol book) are
 implemented here so that decision is not blocked on the runtime.
+
+## 12. Ex-dividend gap bot on this runtime — decision (bot-strategy#948)
+
+Same shape as Engine B, on a calendar instead of a session table: one
+entry per declared ex-dividend date (decision one minute before the US
+cash open, flatten six minutes after it, both read from the frozen XNYS
+session table so they follow daylight saving, holidays and half days),
+weights `{SPY: -w, US500: +w}` (ETF hedged with the
+futures-derived index perp) or `{IBM: -w}` (single stock, unhedged), an
+empty map when the producer's skip gates fire. Skip gates and the
+slippage-budget size rule live in `scripts/exdiv_signal_producer.py`;
+nothing in `src/book/` changed for it. Instance `exdiv-lighter`
+(`configs/book/exdiv-lighter.yaml`, calendar generated from
+`configs/book/exdiv-events.json`); Hyperliquid would be a second instance
+once a perp IOC path exists in dex-connector. Runbook:
+`docs/exdiv-book-operations.md`. Installing it is gated on the September
+readouts (G1), not on this document.
+

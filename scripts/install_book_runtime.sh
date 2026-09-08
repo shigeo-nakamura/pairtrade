@@ -18,6 +18,18 @@ LIBSIGNER_SOURCE=${BOOK_LIBSIGNER_SOURCE:-/opt/debot/lib/libsigner.so}
 CONFIG_SOURCE=${BOOK_CONFIG_SOURCE:-/opt/debot/configs/book/${INSTANCE}.yaml}
 FETCH_SCRIPT_SOURCE=${BOOK_FETCH_SCRIPT_SOURCE:-/opt/debot/scripts/book_signal_fetch.sh}
 UNIT_SOURCE_DIR=${BOOK_UNIT_SOURCE_DIR:-/opt/debot/deploy}
+# Optional: a `schedule.kind: calendar` instance's calendar file, installed
+# next to the config as <INSTALL_DIR>/<instance>.calendar.json (the unit's
+# InaccessiblePaths hides /opt/debot from the service, so the runtime
+# cannot read it from the synced configs tree). Empty = the instance has no
+# calendar (interval_days / daily). A calendar-kind config with no source
+# at all is rejected below, before promotion, since --validate does not
+# load the calendar and the service would only fail at its next start.
+CALENDAR_SOURCE=${BOOK_CALENDAR_SOURCE:-}
+CALENDAR_VALIDATOR=${BOOK_CALENDAR_VALIDATOR:-$(dirname "$0")/validate_book_calendar.py}
+if [ -z "$CALENDAR_SOURCE" ] && [ -f "/opt/debot/configs/book/${INSTANCE}.calendar.json" ]; then
+  CALENDAR_SOURCE=/opt/debot/configs/book/${INSTANCE}.calendar.json
+fi
 SERVICE_USER=book-runtime
 SERVICE_GROUP=book-runtime
 LOCK_FILE=${BOOK_INSTALL_LOCK:-/var/lock/book-runtime-install.lock}
@@ -68,6 +80,66 @@ install -o root -g "$SERVICE_GROUP" -m 0550 "$BINARY_SOURCE" "$STAGE/bin/book_ru
 install -o root -g "$SERVICE_GROUP" -m 0440 "$LIBSIGNER_SOURCE" "$STAGE/lib/libsigner.so"
 install -o root -g "$SERVICE_GROUP" -m 0440 "$CONFIG_SOURCE" "$STAGE/${INSTANCE}.yaml"
 install -o root -g "$SERVICE_GROUP" -m 0550 "$FETCH_SCRIPT_SOURCE" "$STAGE/bin/book_signal_fetch.sh"
+# Read the schedule kind now, before the calendar block: a
+# `schedule.kind: calendar` config whose calendar source is absent must
+# fail HERE, not at the next service start. `book_runtime --validate`
+# does not load `schedule.calendar_path`, so without this check a first
+# install promotes a bundle the service cannot start, and an update
+# silently keeps whatever calendar was installed before.
+KIND=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*kind:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+if [ -z "$KIND" ]; then
+  echo "could not read schedule.kind from $CONFIG_SOURCE" >&2
+  exit 1
+fi
+if [ "$KIND" = "calendar" ]; then
+  if [ -z "$CALENDAR_SOURCE" ]; then
+    echo "schedule.kind is calendar but no calendar source was found: set BOOK_CALENDAR_SOURCE or provide /opt/debot/configs/book/${INSTANCE}.calendar.json; installed bundle left untouched" >&2
+    exit 1
+  fi
+  # The calendar is always promoted to <INSTALL_DIR>/<instance>.calendar.json
+  # (the unit's ProtectSystem/InaccessiblePaths assume the install dir), so
+  # the config must point exactly there -- --validate does not load it,
+  # and a config naming any other path would install cleanly and then fail
+  # at service start with the calendar sitting where the runtime does not
+  # look.
+  CALENDAR_PATH=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*calendar_path:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
+  if [ "$CALENDAR_PATH" != "$INSTALL_DIR/${INSTANCE}.calendar.json" ]; then
+    echo "schedule.calendar_path must be $INSTALL_DIR/${INSTANCE}.calendar.json (got '${CALENDAR_PATH}'); installed bundle left untouched" >&2
+    exit 1
+  fi
+fi
+if [ -n "$CALENDAR_SOURCE" ]; then
+  if [ ! -f "$CALENDAR_SOURCE" ]; then
+    echo "book runtime calendar source is missing: $CALENDAR_SOURCE" >&2
+    exit 1
+  fi
+  # Mirror what src/book/schedule.rs will accept, because
+  # `book_runtime --validate` does NOT load the calendar: without this an
+  # unparsable or self-inconsistent calendar installs cleanly and only
+  # fails when the service next starts. The checks (object shape and
+  # deny_unknown_fields at both levels, RFC 3339 timestamps, unique
+  # decision keys, flatten after decision, no overlap) live in
+  # validate_book_calendar.py so CI can run them on the committed file too.
+  if [ ! -f "$CALENDAR_VALIDATOR" ]; then
+    echo "calendar validator is missing: $CALENDAR_VALIDATOR" >&2
+    exit 1
+  fi
+  # Both the flatten and overlap rules depend on signal_grace_secs, so
+  # take it from the config being installed rather than the validator's
+  # default -- a wrong value would accept a calendar the runtime bails on.
+  GRACE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*signal_grace_secs:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+  case "$GRACE" in
+    ''|*[!0-9]*)
+      echo "could not read schedule.signal_grace_secs from $CONFIG_SOURCE (got '${GRACE}')" >&2
+      exit 1
+      ;;
+  esac
+  if ! python3 "$CALENDAR_VALIDATOR" "$CALENDAR_SOURCE" --grace-secs "$GRACE" >/dev/null; then
+    echo "book runtime calendar failed validation ($CALENDAR_SOURCE); installed bundle left untouched" >&2
+    exit 1
+  fi
+  install -o root -g "$SERVICE_GROUP" -m 0440 "$CALENDAR_SOURCE" "$STAGE/${INSTANCE}.calendar.json"
+fi
 if ! LD_LIBRARY_PATH="$STAGE/lib" "$STAGE/bin/book_runtime" --config "$STAGE/${INSTANCE}.yaml" --validate >/dev/null; then
   echo "book runtime bundle failed validation ($CONFIG_SOURCE with $BINARY_SOURCE); installed bundle left untouched" >&2
   exit 1
@@ -90,8 +162,8 @@ if [ -z "$PRODUCER" ]; then
 fi
 # Only date-keyed schedules (interval_days / daily) let the fetcher derive
 # a decision time from the file's own decision_key; a calendar schedule
-# leaves this empty and the fetcher skips that one check.
-KIND=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*kind:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+# leaves this empty and the fetcher skips that one check. (`KIND` was
+# read above, before the calendar block.)
 DECISION_TIME=""
 ANCHOR_DATE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*anchor_date:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
 EVERY_DAYS=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*every_days:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
@@ -132,6 +204,9 @@ mv -f "$STAGE/lib/libsigner.so" "$INSTALL_DIR/lib/libsigner.so"
 mv -f "$STAGE/bin/book_signal_fetch.sh" "$INSTALL_DIR/bin/book_signal_fetch.sh"
 mv -f "$STAGE/${INSTANCE}.yaml" "$INSTALL_DIR/${INSTANCE}.yaml"
 mv -f "$STAGE/${INSTANCE}.fetch.env" "$INSTALL_DIR/${INSTANCE}.fetch.env"
+if [ -n "$CALENDAR_SOURCE" ]; then
+  mv -f "$STAGE/${INSTANCE}.calendar.json" "$INSTALL_DIR/${INSTANCE}.calendar.json"
+fi
 
 install -d -o root -g "$SERVICE_GROUP" -m 0750 "$SECRETS_DIR"
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_ROOT" "$STATE_ROOT/${INSTANCE}"

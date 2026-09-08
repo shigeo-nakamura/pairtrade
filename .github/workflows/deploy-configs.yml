@@ -46,8 +46,24 @@ jobs:
           python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
           python3 -m py_compile debot/scripts/book_signal_file.py debot/scripts/test_book_signal_file.py
+          python3 -m py_compile debot/scripts/exdiv_signal_producer.py debot/scripts/test_exdiv_signal_producer.py
+          python3 -m py_compile debot/scripts/validate_book_calendar.py debot/scripts/test_validate_book_calendar.py
           python3 debot/scripts/test_book_signal_file.py
           python3 debot/scripts/test_xsmom_signal_producer.py
+          python3 debot/scripts/test_exdiv_signal_producer.py
+          python3 debot/scripts/test_validate_book_calendar.py
+          # The exdiv-lighter runtime calendar is generated from the human
+          # events file; a stale committed copy would schedule the wrong
+          # dates (bot-strategy#948).
+          python3 debot/scripts/exdiv_signal_producer.py calendar \
+            --events debot/configs/book/exdiv-events.json \
+            --out debot/configs/book/exdiv-lighter.calendar.json --check
+          # `book_runtime --validate` does not load the calendar, so check
+          # it the way install_book_runtime.sh will, with the grace value
+          # the deployed config actually uses.
+          EXDIV_GRACE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*signal_grace_secs:/{print $2; exit}' debot/configs/book/exdiv-lighter.yaml)
+          python3 debot/scripts/validate_book_calendar.py \
+            debot/configs/book/exdiv-lighter.calendar.json --grace-secs "$EXDIV_GRACE"
           bash debot/scripts/test_book_signal_fetch.sh
           bash debot/scripts/test_s3_object_present.sh
           bash debot/scripts/test_fetch_book_bundle.sh
@@ -77,6 +93,7 @@ jobs:
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.timer
           systemd-analyze verify debot/deploy/book-signal-fetch-xsmom-695.timer
+          systemd-analyze verify debot/deploy/book-signal-fetch-exdiv-lighter.timer
 
   deploy-configs:
     needs: validate-config-artifacts
@@ -139,7 +156,11 @@ jobs:
           aws s3 cp debot/deploy/engine-b-phase0.service "s3://${S3_BUCKET}/deploy/engine-b-phase0.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.service "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.service"
           aws s3 cp debot/deploy/engine-b-phase0-archive.timer "s3://${S3_BUCKET}/deploy/engine-b-phase0-archive.timer"
-          for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do
+          # exdiv-lighter units are published and delivered to the host but
+          # never installed or started by CI (bot-strategy#948): the manual
+          # install after gate G1 reads them from /opt/debot/deploy.
+          for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer \
+                   book-runtime-exdiv-lighter.service book-signal-fetch-exdiv-lighter.service book-signal-fetch-exdiv-lighter.timer; do
             aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
           done
           ENGINE_B_PREFIX="debot/engine-b-phase0/releases/${GITHUB_SHA}"
@@ -230,12 +251,14 @@ jobs:
           {
             "commands": [
               "set -e",
-              "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
+              "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs __INSTALL_DIR__/deploy",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exclude '*.env'",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
               "install -d -m 0755 /tmp/book-units-__GITHUB_SHA__",
               "for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u /tmp/book-units-__GITHUB_SHA__/$u; done",
+              "# exdiv-lighter (bot-strategy#948): delivered to the persistent deploy dir that install_book_runtime.sh reads by default, so the post-G1 manual install has its units. NOT installed and NOT started here -- only xsmom-695 is installed below.",
+              "for u in book-runtime-exdiv-lighter.service book-signal-fetch-exdiv-lighter.service book-signal-fetch-exdiv-lighter.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u __INSTALL_DIR__/deploy/$u; done",
               "# Both install paths stage everything from S3 into a per-run dir, so neither depends on the other having run first: ci.yml owns the binary object, this job owns the config and unit objects, and whichever installs last promotes the newest of both under install_book_runtime.sh's flock.",
               "install -d -m 0755 /tmp/engine-b-phase0-__GITHUB_SHA__",
               "aws s3 sync s3://__S3_BUCKET__/debot/engine-b-phase0/releases/__GITHUB_SHA__/ /tmp/engine-b-phase0-__GITHUB_SHA__/ --exact-timestamps",
