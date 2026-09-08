@@ -472,10 +472,11 @@ mod tests {
         // "...Z" form from the parsed DateTime<Utc> before hashing (the
         // bug) would report hash_mismatch on this untampered payload.
         let c = cfg();
-        let w: BTreeMap<String, f64> = [("BTC", 0.25), ("ETH", 0.25), ("SOL", -0.25), ("DOT", -0.25)]
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect();
+        let w: BTreeMap<String, f64> =
+            [("BTC", 0.25), ("ETH", 0.25), ("SOL", -0.25), ("DOT", -0.25)]
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect();
         let as_of_raw = "2026-09-06T00:00:00+00:00";
         let sha = payload_sha256("test_producer", as_of_raw, "2026-09-06", &w);
         let body = serde_json::json!({

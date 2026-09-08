@@ -330,7 +330,11 @@ impl BookState {
             // reduction even though the tail cleanup a few lines down
             // removes the leg from `positions` moments later.
             let remaining = pos.qty + signed_qty;
-            let remaining = if remaining.abs() < 1e-12 { 0.0 } else { remaining };
+            let remaining = if remaining.abs() < 1e-12 {
+                0.0
+            } else {
+                remaining
+            };
             if remaining == 0.0 || (remaining > 0.0) != (pos.qty > 0.0) {
                 // Closed, maybe flipped. One trade = one leg's lifetime,
                 // so classify on everything it realized, not this fill.

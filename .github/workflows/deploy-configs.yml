@@ -47,23 +47,23 @@ jobs:
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
           python3 -m py_compile debot/scripts/book_signal_file.py debot/scripts/test_book_signal_file.py
           python3 -m py_compile debot/scripts/exdiv_signal_producer.py debot/scripts/test_exdiv_signal_producer.py
-          python3 -m py_compile debot/scripts/validate_book_calendar.py debot/scripts/test_validate_book_calendar.py
           python3 debot/scripts/test_book_signal_file.py
           python3 debot/scripts/test_xsmom_signal_producer.py
           python3 debot/scripts/test_exdiv_signal_producer.py
-          python3 debot/scripts/test_validate_book_calendar.py
           # The exdiv-lighter runtime calendar is generated from the human
           # events file; a stale committed copy would schedule the wrong
           # dates (bot-strategy#948).
           python3 debot/scripts/exdiv_signal_producer.py calendar \
             --events debot/configs/book/exdiv-events.json \
             --out debot/configs/book/exdiv-lighter.calendar.json --check
-          # `book_runtime --validate` does not load the calendar, so check
-          # it the way install_book_runtime.sh will, with the grace value
-          # the deployed config actually uses.
-          EXDIV_GRACE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*signal_grace_secs:/{print $2; exit}' debot/configs/book/exdiv-lighter.yaml)
-          python3 debot/scripts/validate_book_calendar.py \
-            debot/configs/book/exdiv-lighter.calendar.json --grace-secs "$EXDIV_GRACE"
+          # The calendar's own rules (serde shape, duplicate keys, blank
+          # or absent entries, timestamps, flatten/overlap windows against
+          # the config's own signal_grace_secs) are checked by
+          # `Scheduler::build` -- in ci.yml, which is triggered on
+          # configs/book/** for exactly this reason, and again on the host
+          # with the staged binary before install_book_runtime.sh promotes
+          # anything (bot-strategy#952). This job only has to keep the
+          # generated file in step with the human events file above.
           bash debot/scripts/test_book_signal_fetch.sh
           bash debot/scripts/test_s3_object_present.sh
           bash debot/scripts/test_fetch_book_bundle.sh

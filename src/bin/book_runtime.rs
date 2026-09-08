@@ -4,7 +4,8 @@
 //! ```text
 //! book-runtime --config configs/book/xsmom-695.yaml            # live loop (DRY_RUN per config)
 //! book-runtime --config ... --replay <dir> --out <dir>         # deterministic replay
-//! book-runtime --config ... --validate                          # parse + fingerprint only
+//! book-runtime --config ... --validate                          # parse + fingerprint (+ calendar)
+//! book-runtime --config ... --validate --calendar <json>        # validate a not-yet-installed calendar
 //! ```
 //!
 //! Live orders are refused unless `dry_run: false` in the config AND
@@ -46,6 +47,9 @@ struct Args {
     replay: Option<PathBuf>,
     out: Option<PathBuf>,
     validate: bool,
+    /// `--validate` only: the calendar to check instead of
+    /// `schedule.calendar_path` (bot-strategy#952).
+    calendar: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -53,6 +57,7 @@ fn parse_args() -> Result<Args> {
     let mut replay = None;
     let mut out = None;
     let mut validate = false;
+    let mut calendar = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -60,20 +65,31 @@ fn parse_args() -> Result<Args> {
             "--replay" => replay = Some(PathBuf::from(it.next().context("--replay needs a dir")?)),
             "--out" => out = Some(PathBuf::from(it.next().context("--out needs a dir")?)),
             "--validate" => validate = true,
+            "--calendar" => {
+                calendar = Some(PathBuf::from(it.next().context("--calendar needs a path")?))
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: book-runtime --config <yaml> [--replay <dir> --out <dir>] [--validate]"
+                    "usage: book-runtime --config <yaml> [--replay <dir> --out <dir>] [--validate [--calendar <json>]]"
                 );
                 std::process::exit(0);
             }
             other => bail!("unknown argument {other}"),
         }
     }
+    // The running service always loads `schedule.calendar_path`; an
+    // override outside `--validate` would check one file and run another.
+    if calendar.is_some() && !validate {
+        bail!(
+            "--calendar is only valid with --validate (the runtime loads schedule.calendar_path)"
+        );
+    }
     Ok(Args {
         config: config.context("--config <yaml> (or BOOK_CONFIG) is required")?,
         replay,
         out,
         validate,
+        calendar,
     })
 }
 
@@ -129,7 +145,18 @@ async fn main() -> Result<()> {
     let cfg = BookConfig::load(&args.config)?;
     log::info!("{}", cfg.log_line());
     if args.validate {
-        println!("ok fp={}", cfg.fingerprint());
+        // Build the scheduler too, so a calendar-kind config is validated
+        // by the same code the service starts with (bot-strategy#952):
+        // `install_book_runtime.sh` runs this with the staged binary and
+        // the staged calendar before promoting either, which is what
+        // replaced the Python re-implementation of these rules.
+        let sched = Scheduler::from_config_with_calendar(&cfg.schedule, args.calendar.as_deref())
+            .context("validate schedule")?;
+        println!(
+            "ok fp={} calendar_entries={}",
+            cfg.fingerprint(),
+            sched.calendar().len()
+        );
         return Ok(());
     }
     if let (Some(replay_dir), Some(out_dir)) = (&args.replay, &args.out) {

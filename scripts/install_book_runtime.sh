@@ -26,7 +26,6 @@ UNIT_SOURCE_DIR=${BOOK_UNIT_SOURCE_DIR:-/opt/debot/deploy}
 # at all is rejected below, before promotion, since --validate does not
 # load the calendar and the service would only fail at its next start.
 CALENDAR_SOURCE=${BOOK_CALENDAR_SOURCE:-}
-CALENDAR_VALIDATOR=${BOOK_CALENDAR_VALIDATOR:-$(dirname "$0")/validate_book_calendar.py}
 if [ -z "$CALENDAR_SOURCE" ] && [ -f "/opt/debot/configs/book/${INSTANCE}.calendar.json" ]; then
   CALENDAR_SOURCE=/opt/debot/configs/book/${INSTANCE}.calendar.json
 fi
@@ -113,34 +112,23 @@ if [ -n "$CALENDAR_SOURCE" ]; then
     echo "book runtime calendar source is missing: $CALENDAR_SOURCE" >&2
     exit 1
   fi
-  # Mirror what src/book/schedule.rs will accept, because
-  # `book_runtime --validate` does NOT load the calendar: without this an
-  # unparsable or self-inconsistent calendar installs cleanly and only
-  # fails when the service next starts. The checks (object shape and
-  # deny_unknown_fields at both levels, RFC 3339 timestamps, unique
-  # decision keys, flatten after decision, no overlap) live in
-  # validate_book_calendar.py so CI can run them on the committed file too.
-  if [ ! -f "$CALENDAR_VALIDATOR" ]; then
-    echo "calendar validator is missing: $CALENDAR_VALIDATOR" >&2
-    exit 1
-  fi
-  # Both the flatten and overlap rules depend on signal_grace_secs, so
-  # take it from the config being installed rather than the validator's
-  # default -- a wrong value would accept a calendar the runtime bails on.
-  GRACE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*signal_grace_secs:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
-  case "$GRACE" in
-    ''|*[!0-9]*)
-      echo "could not read schedule.signal_grace_secs from $CONFIG_SOURCE (got '${GRACE}')" >&2
-      exit 1
-      ;;
-  esac
-  if ! python3 "$CALENDAR_VALIDATOR" "$CALENDAR_SOURCE" --grace-secs "$GRACE" >/dev/null; then
-    echo "book runtime calendar failed validation ($CALENDAR_SOURCE); installed bundle left untouched" >&2
-    exit 1
-  fi
+  # Staged next to the staged config so `--validate --calendar` below
+  # checks the file that is about to be promoted, not whatever calendar a
+  # previous install left at schedule.calendar_path.
   install -o root -g "$SERVICE_GROUP" -m 0440 "$CALENDAR_SOURCE" "$STAGE/${INSTANCE}.calendar.json"
 fi
-if ! LD_LIBRARY_PATH="$STAGE/lib" "$STAGE/bin/book_runtime" --config "$STAGE/${INSTANCE}.yaml" --validate >/dev/null; then
+# The staged binary validates the staged config AND (for calendar kinds)
+# the staged calendar, with `--calendar` pointing at the copy above
+# (bot-strategy#952). Reusing the binary's own loader is the point: a
+# separate re-implementation of serde's deny_unknown_fields, chrono's
+# timestamp parsing and the duplicate-key/flatten/overlap rules drifts,
+# and every drift is a bundle this installer promotes and the service
+# then refuses to start on.
+VALIDATE_ARGS=(--config "$STAGE/${INSTANCE}.yaml" --validate)
+if [ -n "$CALENDAR_SOURCE" ]; then
+  VALIDATE_ARGS+=(--calendar "$STAGE/${INSTANCE}.calendar.json")
+fi
+if ! LD_LIBRARY_PATH="$STAGE/lib" "$STAGE/bin/book_runtime" "${VALIDATE_ARGS[@]}" >/dev/null; then
   echo "book runtime bundle failed validation ($CONFIG_SOURCE with $BINARY_SOURCE); installed bundle left untouched" >&2
   exit 1
 fi
