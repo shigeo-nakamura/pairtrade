@@ -48,7 +48,7 @@ Extending past 2027 means regenerating that calendar first.
 | `configs/book/exdiv-lighter.calendar.json` | runtime calendar, **generated** from the events file (`decision_at 13:29:00Z`, `flatten_at 13:36:00Z`, one entry per date). CI fails if it is stale |
 | `configs/book/exdiv-lighter.yaml` | runtime config (`fp=08a901c93832` at 2026-09-07): universe = event symbols + `US500`/`US100`, gross $8,000 (weights are fractions of it, one leg ≤ 0.25 = $2,000), grace 45 s so the acceptance window closes 15 s before the open, `max_age_secs 300`, `require_dollar_neutral: false` (single stocks are unhedged by design), `max_net_usd 2200` |
 | `scripts/exdiv_signal_producer.py` | `calendar` (events → runtime calendar, `--check` for CI) and `signal` (pre-open cron: gates + sizing → `signal.json`, optional S3 upload). Both derive every instant from `configs/engine-b/trading_calendar.json` (`--trading-calendar` overrides) |
-| `scripts/validate_book_calendar.py` | what `install_book_runtime.sh` runs before installing a calendar, and CI runs on the committed one: `book_runtime --validate` does **not** load the calendar, so shape, `calendar_version` type, RFC 3339 timestamps, unique keys, flatten-outside-the-signal-window and non-overlap are checked here. Both window rules depend on `signal_grace_secs`, which the installer and CI read from the deployed config and pass as `--grace-secs` |
+| `scripts/validate_book_calendar.py` | what `install_book_runtime.sh` runs before installing a calendar, and CI runs on the committed one: `book_runtime --validate` does **not** load the calendar, so shape, duplicate JSON keys (which `json.load` would silently collapse but serde rejects), `calendar_version` type, RFC 3339 timestamps, unique keys, flatten-outside-the-signal-window and non-overlap are checked here. Both window rules depend on `signal_grace_secs`, which the installer and CI read from the deployed config and pass as `--grace-secs` |
 | `scripts/test_exdiv_signal_producer.py` | unit tests (synthetic logger rows) |
 | `deploy/book-runtime-exdiv-lighter.service` | runtime unit, PROM `127.0.0.1:9475`, status → `s3://debot-dashboard/debot/status/book-exdiv-lighter/` |
 | `deploy/book-signal-fetch-exdiv-lighter.{service,timer}` | S3 → local signal fetch, `Mon..Fri 09:27:00–09:29:40 America/New_York every 20 s` (`AccuracySec=1s`, so it follows US daylight saving); it stops before the open, and nothing polls outside that span |
@@ -140,8 +140,9 @@ trade. Hence `signal_grace_secs: 45` (window 09:29:00–09:29:45, ending 15 s
 before the open) and a fetch timer that stops at 09:29:40. A signal that
 misses the window is `skipped` and the book stays flat, which is the safe
 outcome. `scripts/test_exdiv_signal_producer.py` pins this invariant
-against the entry offset so the two cannot drift apart. `as_of` = the last row
-actually used (never after the decision, so never look-ahead);
+against the entry offset so the two cannot drift apart. `as_of` = the last
+row actually used, **including the hedge/control rows** whose spread and
+mid feed the gates (never after the decision, so never look-ahead);
 `decision_key` = the date, matching the calendar entry; `meta` records
 `decision_at`, `input_cutoff`, `session_open` and `prev_session`.
 
