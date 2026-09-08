@@ -120,9 +120,22 @@ impl Scheduler {
 
     /// Construct with an explicit calendar (tests / replay).
     pub fn build(cfg: &ScheduleConfig, mut calendar: Vec<CalendarEntry>) -> Result<Self> {
+        // Serde only checks field types, so these two are the calendar's
+        // remaining usability invariants: an empty list and a blank key
+        // both parse cleanly and leave the instance unable to decide
+        // anything, and `--validate` is what gates promotion.
+        if matches!(cfg.kind, ScheduleKind::Calendar) && calendar.is_empty() {
+            bail!("calendar schedule has no entries; the instance would never decide");
+        }
         calendar.sort_by_key(|e| e.decision_at);
         let mut keys = std::collections::HashSet::new();
         for e in &calendar {
+            if e.decision_key.trim().is_empty() {
+                bail!(
+                    "calendar entry at {} has a blank decision_key",
+                    e.decision_at
+                );
+            }
             if !keys.insert(e.decision_key.as_str()) {
                 bail!("calendar has duplicate decision_key {}", e.decision_key);
             }
@@ -371,6 +384,27 @@ mod tests {
         )
         .unwrap();
         assert!(Scheduler::from_config_with_calendar(&cfg.schedule, Some(&bad)).is_err());
+        // Both parse as valid JSON and valid serde, but leave the instance
+        // with nothing to decide -- the checks the deleted Python
+        // validator carried, now in the shared path (bot-strategy#952).
+        let empty = dir.path().join("empty.calendar.json");
+        std::fs::write(&empty, r#"{"calendar_version":"v1","entries":[]}"#).unwrap();
+        let e = format!(
+            "{:#}",
+            Scheduler::from_config_with_calendar(&cfg.schedule, Some(&empty)).unwrap_err()
+        );
+        assert!(e.contains("no entries"), "{e}");
+        let blank = dir.path().join("blank.calendar.json");
+        std::fs::write(
+            &blank,
+            r#"{"calendar_version":"v1","entries":[{"decision_key":"  ","decision_at":"2026-09-15T13:29:00Z","flatten_at":"2026-09-15T13:36:00Z"}]}"#,
+        )
+        .unwrap();
+        let e = format!(
+            "{:#}",
+            Scheduler::from_config_with_calendar(&cfg.schedule, Some(&blank)).unwrap_err()
+        );
+        assert!(e.contains("blank decision_key"), "{e}");
 
         // An interval_days config never loads a calendar, so validating
         // one against it would report on a file the runtime ignores.
