@@ -558,8 +558,31 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Serialises tests that hold an `flock` against tests that spawn a
+    /// child process.
+    ///
+    /// `Command` forks, and the child inherits every open descriptor until
+    /// it execs. A fork racing `acquire_instance_lock` therefore keeps that
+    /// lock's *open file description* alive past the `drop` that should
+    /// have released it, and the next acquisition fails with "already
+    /// locked" -- the whole binary's tests share one process, so a bash
+    /// spawn in one test can do this to a lock in another. Reproduced at
+    /// 5/20 runs with just this test and the two shell round-trips
+    /// scheduled together; 0/25 with either group alone.
+    ///
+    /// A test-harness constraint, not a product one: the runtime acquires
+    /// the instance lock once at startup and never forks while holding it.
+    static FORK_VS_FLOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Poison-tolerant: an unrelated panic inside the guard must not turn
+    /// every other test in the group into a failure.
+    fn no_fork_while_locked() -> std::sync::MutexGuard<'static, ()> {
+        FORK_VS_FLOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn a_second_instance_lock_on_the_same_state_is_refused() {
+        let _serialised = no_fork_while_locked();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
         let first = acquire_instance_lock(&state_path).unwrap();
@@ -574,6 +597,7 @@ mod tests {
 
     #[test]
     fn instance_locks_for_different_state_paths_do_not_interfere() {
+        let _serialised = no_fork_while_locked();
         let dir = tempfile::tempdir().unwrap();
         let a = acquire_instance_lock(&dir.path().join("a").join("state.json")).unwrap();
         let b = acquire_instance_lock(&dir.path().join("b").join("state.json")).unwrap();
@@ -747,9 +771,10 @@ paths:
 
     #[test]
     fn an_equals_sign_in_a_value_survives_the_split() {
-        // Both readers split the assignment at the first `=` only, so a
-        // value containing one needs no quoting and must not block a
-        // deploy (pairtrade#293 Codex).
+        let _serialised = no_fork_while_locked(); // spawns bash; see the lock
+                                                  // Both readers split the assignment at the first `=` only, so a
+                                                  // value containing one needs no quoting and must not block a
+                                                  // deploy (pairtrade#293 Codex).
         let line = env_line("BOOK_SIGNAL_PRODUCER_ID", "desk=one").unwrap();
         assert_eq!(line, "BOOK_SIGNAL_PRODUCER_ID=desk=one\n");
         let dir = tempfile::tempdir().unwrap();
@@ -768,10 +793,11 @@ paths:
 
     #[test]
     fn every_rendered_line_is_read_back_verbatim_by_a_shell() {
-        // The rendering has to survive its consumers unchanged. bash is
-        // the one available here; systemd's parser is the other, and the
-        // charset `env_safe` enforces is exactly the set the two read
-        // identically (unquoted, no expansion, no escapes).
+        let _serialised = no_fork_while_locked(); // spawns bash; see the lock
+                                                  // The rendering has to survive its consumers unchanged. bash is
+                                                  // the one available here; systemd's parser is the other, and the
+                                                  // charset `env_safe` enforces is exactly the set the two read
+                                                  // identically (unquoted, no expansion, no escapes).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.yaml");
         std::fs::write(

@@ -96,7 +96,11 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     `stale_or_missing_symbols` and `price_feed_generation`. It is persisted
     to `risk_state.json` as `last_session_skip_reason` beside
     `last_session_date`, so a same-day restart restores why the day was
-    settled, not only that it was.
+    settled, not only that it was. A day that is *already* settled — entered
+    this run, or restored from `last_session_date` after a restart — skips
+    the `t0` capture entirely, so restarting after a completed cycle cannot
+    record a `no_usable_t0` over a day that actually traded
+    (bot-strategy#965).
   - **These gates are entry-only.** `maybe_exit` and the unconfirmed-position
     adoption path read the last price raw, so a stale feed can never keep an
     open position from being closed or an unknown exposure from being
