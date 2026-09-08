@@ -2555,11 +2555,30 @@ impl EngineBLiveEngine {
         // One lock for both, so the generation cannot advance between
         // the check and the price it authorises (Codex round 6).
         let (usable_at_send, send_generation) = self.usable_prices_with_generation(send_now_us);
-        if self.day.t1_generation != Some(send_generation) {
+        // The signal is only sendable while *every* leg it rests on is
+        // still live. Two ways that can stop being true while the awaits
+        // above run, and both must invalidate the whole capture:
+        //   - the feed dropped updates (generation moved), or
+        //   - a leg simply stopped reporting and aged past the staleness
+        //     bound with no lag at all (Codex round 7) -- the KR leg can
+        //     stall while the US leg keeps ticking, and checking only the
+        //     traded symbol would send an epsilon whose KR half is no
+        //     longer backed by a live observation.
+        // `t1_prices` is a bare map with no per-symbol metadata left, so
+        // the check has to be "are the underlying observations still
+        // usable", not "how old is the map".
+        let signal_legs_live = t0_snapshot_has_required_symbols(
+            &usable_at_send,
+            &self.cfg.kr_primary_symbol,
+            &self.cfg.us_primary_symbol,
+        );
+        if self.day.t1_generation != Some(send_generation) || !signal_legs_live {
             log::warn!(
-                "[ENTRY] feed generation moved from {:?} to {send_generation} while preparing the \
-                 entry; not sending -- today's signal is recomputed from a fresh t1 on the next tick",
-                self.day.t1_generation
+                "[ENTRY] today's signal is no longer backed by live observations (t1 generation \
+                 {:?}, now {send_generation}; legs_live={signal_legs_live}); not sending -- t1 is \
+                 recaptured and epsilon recomputed on the next tick -- {}",
+                self.day.t1_generation,
+                self.freshness_debug(send_now_us)
             );
             self.day.t1_prices = None;
             self.day.t1_generation = None;
@@ -4874,6 +4893,62 @@ mod tests {
         h.observe_all(T1_US + 2_000_000, 190.0, 1700.0);
         h.set_now(T1_US + 2_000_000);
         h.engine.maybe_enter(T1_US + 2_000_000).await;
+        assert_eq!(h.connector.order_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_kr_leg_blocks_the_send_even_without_a_feed_lag() {
+        // No `Lagged` at all: the US leg keeps ticking through the entry
+        // awaits while the KR leg simply stops reporting and ages past
+        // the staleness bound. The generation still matches, so only a
+        // per-leg liveness check catches it (pairtrade#289 Codex round 7).
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        let feed = h.engine.feed.clone();
+        let bound_us = h.engine.cfg.max_price_staleness_secs * 1_000_000;
+        *h.connector.on_get_positions.lock().unwrap() = Some(Box::new(move || {
+            // Only SNDK comes back, well after the KR leg went stale.
+            let mut f = feed.lock().unwrap();
+            f.latest.insert(
+                "SNDK".to_string(),
+                PriceObs {
+                    mid: 1700.0,
+                    best_bid: 1699.0,
+                    best_ask: 1701.0,
+                    received_at_us: T1_US + bound_us + 2_000_000,
+                    exchange_ts_us: Some(T1_US + bound_us + 2_000_000),
+                    generation: 0,
+                },
+            );
+        }));
+        // Wall clock at send time is past the KR observation's bound.
+        h.set_now(T1_US + bound_us + 2_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.engine.feed_generation(),
+            0,
+            "this case has no feed lag -- the generation gate cannot be what catches it"
+        );
+        assert_eq!(
+            h.connector.order_count(),
+            0,
+            "a stale KR leg must block the send even though the traded symbol is fresh"
+        );
+        assert!(
+            h.engine.day.t1_prices.is_none(),
+            "the stale signal must be discarded"
+        );
+        assert!(!h.engine.day.entered);
+        // Both legs live again: recaptured and sent.
+        *h.connector.on_get_positions.lock().unwrap() = None;
+        let later = T1_US + bound_us + 3_000_000;
+        h.observe_all(later, 190.0, 1700.0);
+        h.set_now(later);
+        h.engine.maybe_enter(later).await;
         assert_eq!(h.connector.order_count(), 1);
     }
 

@@ -83,10 +83,13 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     backfilled as if it were the open.
   - The order-sizing price is re-checked immediately before the send, not
     reused from the `t1` capture (the eligibility fetch and position read in
-    between are awaits), and so is the *signal's* feed generation: a lag
-    between the `t1` capture and the send discards the whole capture and
-    recomputes both legs on the next tick, because a fresh US price does
-    not make a pre-lag KR value sendable. `t0` is exempt — it is a
+    between are awaits). So is the signal itself: immediately before the
+    send, **every leg it rests on must still be a live observation** —
+    same feed generation *and* inside the staleness bound, read under one
+    lock. Either a lag or a leg that simply stops reporting (the KR feed
+    stalling while the US feed keeps ticking) discards the whole `t1`
+    capture and recomputes epsilon on the next tick; a fresh US price
+    never makes a stale KR value sendable. `t0` is exempt — it is a
     historical boundary reference, not a current price.
   - Every terminal no-entry path records a `skip_reason`, logged as
     `[SKIP] ...` and surfaced in `status.json` under `han_bridge`, alongside
