@@ -132,7 +132,45 @@ never pair a new binary with the previous signer.
 The installer stages the whole bundle (binary, signer library, config,
 fetch script), runs `book_runtime --validate` on the staged config with the
 staged binary, and only then promotes all four files; a bundle that does
-not validate fails the deploy and leaves the previous one intact. It holds
+not validate fails the deploy and leaves the previous one intact.
+
+The signal fetcher's `<instance>.fetch.env` is rendered by the staged
+binary too (`--print-fetch-env`, bot-strategy#948), from the same parsed
+config the service will run. It used to be scraped out of the YAML with
+`awk`, which is not a YAML parser — quoted scalars kept their quotes,
+values containing spaces were truncated at the first token, and a trailing
+`# comment` leaked into the value; every such mismatch hands
+`book_signal_fetch.sh` a producer id or bound that differs from the
+runtime's, so it rejects signals the runtime would accept. Same reasoning
+as bot-strategy#952 moving calendar validation into the runtime. The units load
+that file with systemd `EnvironmentFile=` while `book_signal_fetch.sh`
+reads the same names as ordinary environment variables, and the two
+parsers agree on no quoting idiom, so the file is written as bare
+`KEY=value` and a value that would need quoting is **refused** — the
+install fails before promotion rather than shipping a fetcher that
+rejects every signal the runtime accepts. Within ASCII — where all of both
+parsers' syntax lives — that is an allowlist (alphanumerics and
+`_-.:,/+@`); beyond ASCII only control characters and separators are
+excluded, since nothing there is syntax to either parser and the runtime
+accepts such values. Everything the file carries is an identifier, path,
+date, time, number or comma-joined symbol list, so the restriction costs
+nothing real. `--print-fetch-env` runs before the
+calendar is staged (it parses the config without building the
+scheduler).
+
+The installer feature-detects that flag rather than assuming it. Deploy
+Configs syncs `scripts/` and then stages whatever binary
+`book-runtime/current.json` points at, while `ci.yml` republishes that
+pointer only after its slower ARM build — and a config-only push never
+builds a binary at all — so the installer can legitimately be newer than
+the published binary. When the staged binary predates the flag, an
+unchanged config carries the installed `fetch.env` forward (nothing to
+re-render) and the deploy stays green; a *changed* config fails with a
+message to re-run Deploy Configs once the binary deploy has published a
+new `current.json`. No YAML is parsed on either path. On the
+carried-forward path the `schedule.calendar_path` check is skipped (that
+file was written before `BOOK_CALENDAR_PATH` existed, and the config is
+byte-identical to the one the service is already running). It holds
 an exclusive `flock` on `/var/lock/book-runtime-install.lock` for that
 sequence, so the binary deploy (`ci.yml`) and the config deploy
 (`deploy-configs.yml`) can never interleave when a push fires both.

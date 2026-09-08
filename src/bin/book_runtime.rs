@@ -6,6 +6,7 @@
 //! book-runtime --config ... --replay <dir> --out <dir>         # deterministic replay
 //! book-runtime --config ... --validate                          # parse + fingerprint (+ calendar)
 //! book-runtime --config ... --validate --calendar <json>        # validate a not-yet-installed calendar
+//! book-runtime --config ... --print-fetch-env <path>            # emit <instance>.fetch.env from the parsed config
 //! ```
 //!
 //! Live orders are refused unless `dry_run: false` in the config AND
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use debot::book::config::BookConfig;
+use debot::book::config::{BookConfig, ScheduleKind};
 use debot::book::engine::{BookEngine, FileSignalSource};
 use debot::book::executor::{Executor, LiveExecutor, PaperExecutor, VenuePosition};
 use debot::book::rebalance::LotMeta;
@@ -47,6 +48,11 @@ struct Args {
     replay: Option<PathBuf>,
     out: Option<PathBuf>,
     validate: bool,
+    /// Write the signal fetcher's environment file from the parsed
+    /// config and exit (bot-strategy#948). Deliberately does NOT build
+    /// the scheduler, so `install_book_runtime.sh` can run it before the
+    /// calendar has been staged.
+    print_fetch_env: Option<PathBuf>,
     /// `--validate` only: the calendar to check instead of
     /// `schedule.calendar_path` (bot-strategy#952).
     calendar: Option<PathBuf>,
@@ -57,6 +63,7 @@ fn parse_args() -> Result<Args> {
     let mut replay = None;
     let mut out = None;
     let mut validate = false;
+    let mut print_fetch_env = None;
     let mut calendar = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -65,12 +72,17 @@ fn parse_args() -> Result<Args> {
             "--replay" => replay = Some(PathBuf::from(it.next().context("--replay needs a dir")?)),
             "--out" => out = Some(PathBuf::from(it.next().context("--out needs a dir")?)),
             "--validate" => validate = true,
+            "--print-fetch-env" => {
+                print_fetch_env = Some(PathBuf::from(
+                    it.next().context("--print-fetch-env needs a path")?,
+                ))
+            }
             "--calendar" => {
                 calendar = Some(PathBuf::from(it.next().context("--calendar needs a path")?))
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: book-runtime --config <yaml> [--replay <dir> --out <dir>] [--validate [--calendar <json>]]"
+                    "usage: book-runtime --config <yaml> [--replay <dir> --out <dir>] [--validate [--calendar <json>]] [--print-fetch-env <path>]"
                 );
                 std::process::exit(0);
             }
@@ -89,8 +101,131 @@ fn parse_args() -> Result<Args> {
         replay,
         out,
         validate,
+        print_fetch_env,
         calendar,
     })
+}
+
+/// Characters a value may contain and still mean exactly the same thing
+/// to **both** readers of this file. The units load it with systemd
+/// `EnvironmentFile=`, and `book_signal_fetch.sh` reads the same names as
+/// plain environment variables. The two parsers agree on no quoting
+/// idiom -- bash's `'\''` splice, for one, is not what systemd's
+/// environment-file parser decodes it to (pairtrade#293 Codex) -- so
+/// rather than pick a scheme and hope, a value that would need quoting is
+/// refused outright. Every field here is an identifier, a path, a date, a
+/// time, a number or a comma-joined symbol list, so nothing legitimate is
+/// excluded; anything else is a config mistake worth failing the install
+/// for, before promotion, instead of a fetcher that silently rejects
+/// every signal the runtime accepts.
+fn env_safe(value: &str) -> bool {
+    value.chars().all(|c| {
+        if c.is_ascii() {
+            // All the syntax both parsers know lives in ASCII, so this
+            // half stays an allowlist. `=` is in it because both split
+            // the assignment at the *first* `=` and keep the rest
+            // verbatim. Everything left out is left out for a reason and
+            // not merely unlisted: `$` backtick `\` `"` `'` are
+            // expansion or quoting; ` ` and tab are word separators;
+            // `~` is expanded by bash after an `=` and not by systemd;
+            // `#` starts a comment for one reader and not the other; and
+            // `* ? [ ] { } ( ) ; & | < > !` are shell syntax a future
+            // reader of this file might well subject them to.
+            c.is_ascii_alphanumeric() || "_-.:,/+@=".contains(c)
+        } else {
+            // Nothing outside ASCII is syntax to either parser, and the
+            // runtime itself accepts such values, so refusing them would
+            // block a config the service runs happily (pairtrade#293
+            // Codex). Only separators and control characters could still
+            // confuse a line-based reader.
+            !c.is_control() && !c.is_whitespace()
+        }
+    })
+}
+
+/// One bare `KEY=value` line. Both parsers read it identically because
+/// `env_safe` has ruled out everything they disagree about.
+fn env_line(key: &str, value: &str) -> Result<String> {
+    if !env_safe(value) {
+        bail!(
+            "{key}={value:?} contains characters systemd's EnvironmentFile= parser and a shell do \
+             not read identically; the fetch environment only carries identifiers, paths, dates, \
+             times, numbers and comma-joined symbol lists"
+        );
+    }
+    Ok(format!("{key}={value}\n"))
+}
+
+/// The signal fetcher's environment, rendered from the *parsed* config
+/// (bot-strategy#948, pairtrade#293). `install_book_runtime.sh` used to
+/// scrape these ten values out of the YAML with `awk`, which is not a
+/// YAML parser: quoted scalars kept their quotes, values with spaces were
+/// truncated at the first token, trailing `# comments` leaked in, and
+/// each fix uncovered the next case. The binary that will *run* the
+/// config is the only thing that reads it correctly, so it renders the
+/// file -- the same reasoning that moved calendar validation here in
+/// bot-strategy#952.
+///
+/// `book_signal_fetch.sh` treats any unset value as "skip that check",
+/// so an optional field simply comes through empty.
+fn fetch_env(cfg: &BookConfig) -> Result<String> {
+    let kind = match cfg.schedule.kind {
+        ScheduleKind::IntervalDays => "interval_days",
+        ScheduleKind::Daily => "daily",
+        ScheduleKind::Calendar => "calendar",
+    };
+    // Only a date-keyed schedule lets the fetcher derive a decision time
+    // from the file's own decision_key; a calendar schedule leaves this
+    // empty and the fetcher skips that one check.
+    let decision_time = match cfg.schedule.kind {
+        ScheduleKind::IntervalDays | ScheduleKind::Daily => {
+            cfg.schedule.decision_time_utc.as_deref().unwrap_or("")
+        }
+        ScheduleKind::Calendar => "",
+    };
+    let calendar_path = cfg
+        .schedule
+        .calendar_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let anchor_date = cfg
+        .schedule
+        .anchor_date
+        .map(|d| d.to_string())
+        .unwrap_or_default();
+    let every_days = cfg
+        .schedule
+        .every_days
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    let pairs: [(&str, &str); 11] = [
+        ("BOOK_SCHEDULE_KIND", kind),
+        ("BOOK_CALENDAR_PATH", &calendar_path),
+        ("BOOK_ANCHOR_DATE", &anchor_date),
+        ("BOOK_EVERY_DAYS", &every_days),
+        ("BOOK_DECISION_TIME_UTC", decision_time),
+        ("BOOK_SIGNAL_PRODUCER_ID", &cfg.signal.producer_id),
+        (
+            "BOOK_SIGNAL_MAX_AGE_SECS",
+            &cfg.signal.max_age_secs.to_string(),
+        ),
+        (
+            "BOOK_REQUIRE_DOLLAR_NEUTRAL",
+            &cfg.signal.require_dollar_neutral.to_string(),
+        ),
+        ("BOOK_NET_TOLERANCE", &cfg.signal.net_tolerance.to_string()),
+        (
+            "BOOK_MAX_SYMBOL_WEIGHT",
+            &cfg.sizing.max_symbol_weight.to_string(),
+        ),
+        ("BOOK_UNIVERSE", &cfg.universe.symbols.join(",")),
+    ];
+    let mut out = String::new();
+    for (key, value) in pairs {
+        out.push_str(&env_line(key, value)?);
+    }
+    Ok(out)
 }
 
 async fn fetch_lot(
@@ -144,6 +279,11 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     let cfg = BookConfig::load(&args.config)?;
     log::info!("{}", cfg.log_line());
+    if let Some(path) = &args.print_fetch_env {
+        std::fs::write(path, fetch_env(&cfg)?)
+            .with_context(|| format!("write fetch env {}", path.display()))?;
+        return Ok(());
+    }
     if args.validate {
         // Build the scheduler too, so a calendar-kind config is validated
         // by the same code the service starts with (bot-strategy#952):
@@ -439,5 +579,224 @@ mod tests {
         let b = acquire_instance_lock(&dir.path().join("b").join("state.json")).unwrap();
         drop(a);
         drop(b);
+    }
+
+    // ------------------------------------------------------------------
+    // fetch env rendering (bot-strategy#948 / pairtrade#293)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn env_line_accepts_what_the_fetch_env_carries_and_refuses_the_rest() {
+        // Every shape the real configs produce.
+        for v in [
+            "xsmom_695_L28_H5_q20_riskadj",
+            "/opt/book-runtime/exdiv-lighter.calendar.json",
+            "2026-07-03",
+            "00:30",
+            "0.05",
+            "true",
+            "SPY,QQQ,US500",
+            "",
+            // both parsers split at the first `=` and keep the rest
+            "desk=one",
+            // Non-ASCII is not syntax to either parser and the runtime
+            // accepts it, so it must not block a deploy.
+            "prîd_日本語",
+        ] {
+            assert!(env_safe(v), "{v:?} must be accepted");
+            assert_eq!(env_line("K", v).unwrap(), format!("K={v}\n"));
+        }
+        // Anything systemd's EnvironmentFile= parser and a shell would
+        // read differently is refused rather than quoted: there is no
+        // quoting idiom both accept identically.
+        for v in [
+            "desk's",
+            "desk one",
+            "a\"b",
+            "a\\b",
+            "a#b",
+            "$HOME",
+            "a`b`",
+            "a\nb",
+            "a;b",
+            // a non-ASCII *separator* is still a separator
+            "a\u{00a0}b",
+        ] {
+            assert!(!env_safe(v), "{v:?} must be refused");
+            let err = env_line("BOOK_SIGNAL_PRODUCER_ID", v)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("BOOK_SIGNAL_PRODUCER_ID") && err.contains("EnvironmentFile"),
+                "unhelpful error for {v:?}: {err}"
+            );
+        }
+    }
+
+    fn cfg_yaml(schedule: &str, signal_extra: &str) -> String {
+        format!(
+            r#"
+schema_version: 1
+instance_id: t
+venue: lighter
+dry_run: true
+universe:
+  symbols: [BTC, ETH]
+schedule:
+{schedule}
+signal:
+  path: /var/lib/book-runtime/t/signal.json
+  producer_id: {signal_extra}
+  max_age_secs: 7200
+sizing:
+  gross_notional_usd: 1000.0
+  max_symbol_weight: 0.15
+  max_gross_usd: 1000.0
+  max_net_usd: 100.0
+  min_order_usd: 10.0
+  rebalance_deadband_usd: 5.0
+execution:
+  slippage_bps: 50
+  max_attempts: 3
+  fill_confirm_timeout_secs: 15
+  paper_slippage_bps: 5.0
+risk:
+  equity_reference_usd: 1000.0
+  max_session_loss_bps: 500.0
+  max_daily_loss_bps: 500.0
+  kill_switch_path: /var/lib/book-runtime/t/KILL_SWITCH
+  risk_ack_path: /var/lib/book-runtime/t/RISK_ACK
+paths:
+  state: /var/lib/book-runtime/t/state.json
+  ledger: /var/lib/book-runtime/t/ledger.jsonl
+  pnl: /var/lib/book-runtime/t/pnl.jsonl
+  status: /var/lib/book-runtime/t/status.json
+"#
+        )
+    }
+
+    fn env_of(yaml: &str) -> std::collections::HashMap<String, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let cfg = BookConfig::load(&path).expect("fixture config must parse");
+        fetch_env(&cfg)
+            .expect("fixture config must render")
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn fetch_env_renders_a_date_keyed_schedule() {
+        let e = env_of(&cfg_yaml(
+            "  kind: interval_days\n  anchor_date: 2026-07-03\n  every_days: 5\n  decision_time_utc: \"00:30\"\n  signal_grace_secs: 5400\n",
+            "xsmom_695",
+        ));
+        assert_eq!(e["BOOK_SCHEDULE_KIND"], "interval_days");
+        assert_eq!(e["BOOK_ANCHOR_DATE"], "2026-07-03");
+        assert_eq!(e["BOOK_EVERY_DAYS"], "5");
+        // quoted in the YAML; the fetcher must see the decoded value
+        assert_eq!(e["BOOK_DECISION_TIME_UTC"], "00:30");
+        assert_eq!(e["BOOK_SIGNAL_PRODUCER_ID"], "xsmom_695");
+        assert_eq!(e["BOOK_SIGNAL_MAX_AGE_SECS"], "7200");
+        assert_eq!(e["BOOK_MAX_SYMBOL_WEIGHT"], "0.15");
+        assert_eq!(e["BOOK_UNIVERSE"], "BTC,ETH");
+        assert_eq!(e["BOOK_CALENDAR_PATH"], "");
+    }
+
+    #[test]
+    fn fetch_env_leaves_the_decision_time_empty_for_a_calendar_schedule() {
+        // A calendar schedule derives no decision time from the key, and
+        // the fetcher skips that check on an empty value. Emitting one
+        // (even if the YAML carried a stray decision_time_utc) would make
+        // the fetcher reject signals the runtime accepts.
+        let e = env_of(&cfg_yaml(
+            "  kind: calendar\n  calendar_path: /opt/book-runtime/t.calendar.json\n  decision_time_utc: \"09:29\"\n  signal_grace_secs: 45\n",
+            "exdiv_v1",
+        ));
+        assert_eq!(e["BOOK_SCHEDULE_KIND"], "calendar");
+        assert_eq!(e["BOOK_DECISION_TIME_UTC"], "");
+        assert_eq!(e["BOOK_CALENDAR_PATH"], "/opt/book-runtime/t.calendar.json");
+        assert_eq!(e["BOOK_ANCHOR_DATE"], "");
+        assert_eq!(e["BOOK_EVERY_DAYS"], "");
+    }
+
+    #[test]
+    fn fetch_env_refuses_a_producer_id_the_two_parsers_would_disagree_on() {
+        // A YAML-valid scalar that no quoting scheme renders identically
+        // for systemd's EnvironmentFile= parser and a shell. Failing here
+        // is the point: the installer runs this before promotion, so the
+        // deploy stops instead of shipping a fetcher that rejects every
+        // signal the runtime accepts.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(
+            &path,
+            cfg_yaml(
+                "  kind: daily\n  decision_time_utc: \"00:30\"\n  signal_grace_secs: 60\n",
+                "\"desk one's #1 feed\"",
+            ),
+        )
+        .unwrap();
+        let cfg = BookConfig::load(&path).expect("the config itself is valid YAML");
+        let err = fetch_env(&cfg).unwrap_err().to_string();
+        assert!(err.contains("BOOK_SIGNAL_PRODUCER_ID"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn an_equals_sign_in_a_value_survives_the_split() {
+        // Both readers split the assignment at the first `=` only, so a
+        // value containing one needs no quoting and must not block a
+        // deploy (pairtrade#293 Codex).
+        let line = env_line("BOOK_SIGNAL_PRODUCER_ID", "desk=one").unwrap();
+        assert_eq!(line, "BOOK_SIGNAL_PRODUCER_ID=desk=one\n");
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("fetch.env");
+        std::fs::write(&env_path, &line).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                ". {}; printf '%s' \"$BOOK_SIGNAL_PRODUCER_ID\"",
+                env_path.display()
+            ))
+            .output()
+            .expect("bash must be available");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "desk=one");
+    }
+
+    #[test]
+    fn every_rendered_line_is_read_back_verbatim_by_a_shell() {
+        // The rendering has to survive its consumers unchanged. bash is
+        // the one available here; systemd's parser is the other, and the
+        // charset `env_safe` enforces is exactly the set the two read
+        // identically (unquoted, no expansion, no escapes).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(
+            &path,
+            cfg_yaml(
+                "  kind: interval_days\n  anchor_date: 2026-07-03\n  every_days: 5\n  decision_time_utc: \"00:30\"\n  signal_grace_secs: 5400\n",
+                // non-ASCII included, since it is allowed through
+                "prîd_日本語_695",
+            ),
+        )
+        .unwrap();
+        let cfg = BookConfig::load(&path).unwrap();
+        let rendered = fetch_env(&cfg).unwrap();
+        assert!(rendered.contains("BOOK_SIGNAL_PRODUCER_ID=prîd_日本語_695"));
+        let env_path = dir.path().join("fetch.env");
+        std::fs::write(&env_path, &rendered).unwrap();
+        for line in rendered.lines() {
+            let (key, value) = line.split_once('=').unwrap();
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(". {}; printf '%s' \"${key}\"", env_path.display()))
+                .output()
+                .expect("bash must be available");
+            assert!(out.status.success(), "sourcing failed for {key}: {out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), value, "{key} changed");
+        }
     }
 }

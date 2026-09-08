@@ -52,7 +52,7 @@ Extending past 2027 means regenerating that calendar first.
 | `scripts/test_exdiv_signal_producer.py` | unit tests (synthetic logger rows) |
 | `deploy/book-runtime-exdiv-lighter.service` | runtime unit, PROM `127.0.0.1:9475`, status → `s3://debot-dashboard/debot/status/book-exdiv-lighter/` |
 | `deploy/book-signal-fetch-exdiv-lighter.{service,timer}` | S3 → local signal fetch, `Mon..Fri 09:27:00–09:29:40 America/New_York every 20 s` (`AccuracySec=1s`, so it follows US daylight saving); it stops before the open, and nothing polls outside that span |
-| `scripts/install_book_runtime.sh` | now also installs `BOOK_CALENDAR_SOURCE` (default `/opt/debot/configs/book/<instance>.calendar.json`) as `/opt/book-runtime/<instance>.calendar.json` — the service cannot read `/opt/debot` (`InaccessiblePaths`). A `schedule.kind: calendar` config with no calendar source at all, or whose `schedule.calendar_path` is not exactly `/opt/book-runtime/<instance>.calendar.json` (where the installer always puts it), is refused before promotion (the promoted bundle would otherwise fail only at the next service start). The staged calendar is then validated by the staged binary itself (`--validate --calendar`) before promotion |
+| `scripts/install_book_runtime.sh` | now also installs `BOOK_CALENDAR_SOURCE` (default `/opt/debot/configs/book/<instance>.calendar.json`) as `/opt/book-runtime/<instance>.calendar.json` — the service cannot read `/opt/debot` (`InaccessiblePaths`). A `schedule.kind: calendar` config with no calendar source at all, or whose `schedule.calendar_path` is not exactly `/opt/book-runtime/<instance>.calendar.json` (where the installer always puts it), is refused before promotion (the promoted bundle would otherwise fail only at the next service start). The staged calendar is then validated by the staged binary itself (`--validate --calendar`) before promotion, and the fetcher's `<instance>.fetch.env` is rendered by that same binary (`--print-fetch-env`) instead of scraped from the YAML with `awk` (bot-strategy#948) |
 
 Observation side (bot-strategy repo, `scripts/strategy_probes/exdiv_948/`,
 runs from flat copies in `~/bot/scripts/` on the workstation): the Lighter
@@ -149,10 +149,18 @@ mid feed the gates (never after the decision, so never look-ahead);
 ## Workstation cron (operator adds; agents do not edit crontab)
 
 The workstation runs on UTC, so both possible open times get a line and
-whichever one is not the market's 09:27 simply finds no event window:
+whichever one is not the market's 09:27 simply finds no event window.
+Create the log directory once before installing the lines — the shell
+opens the redirect *before* running Python, so on a first-time setup a
+missing directory makes cron fail without the producer ever starting (and
+`write_signal`'s own `mkdir` never gets the chance to run):
 
 ```
-27 13,14 * * 1-5 python3 $HOME/bot/.worktrees/pairtrade-master/scripts/exdiv_signal_producer.py signal --events $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-events.json --config $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-lighter.yaml --verify-host-status s3://debot-dashboard/debot/status/book-exdiv-lighter/status.json --out $HOME/bot/logs/exdiv_948/signal.json --s3-uri s3://debot-dashboard/debot/book/exdiv-lighter/signal.json >> $HOME/bot/logs/exdiv_948/producer.log 2>&1
+mkdir -p $HOME/bot/logs/exdiv_948
+```
+
+```
+27 13,14 * * 1-5 mkdir -p $HOME/bot/logs/exdiv_948 && python3 $HOME/bot/.worktrees/pairtrade-master/scripts/exdiv_signal_producer.py signal --events $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-events.json --config $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-lighter.yaml --verify-host-status s3://debot-dashboard/debot/status/book-exdiv-lighter/status.json --out $HOME/bot/logs/exdiv_948/signal.json --s3-uri s3://debot-dashboard/debot/book/exdiv-lighter/signal.json >> $HOME/bot/logs/exdiv_948/producer.log 2>&1
 ```
 
 `--verify-host-status` reads the running instance's published status and

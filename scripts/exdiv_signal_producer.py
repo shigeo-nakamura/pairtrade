@@ -123,11 +123,28 @@ DEFAULT_LOG_DIR = os.path.expanduser("~/bot/logs/lighter_exdiv")
 
 # ---------------------------------------------------------------- events
 
+def _no_duplicate_keys(pairs):
+    """`json.load` silently keeps the last of a repeated member, so a
+    hand-edited or badly merged row carrying two `dividend_usd` (or
+    `status`, or `ex_date`) values would pass the exact-key check against
+    the collapsed interpretation and be sized off whichever copy happened
+    to come last. Ambiguity is an error, not a coin flip. Mirrors
+    validate_book_calendar.py's hook, which exists because serde rejects
+    repeated struct fields."""
+    seen = set()
+    for k, _ in pairs:
+        if k in seen:
+            raise SystemExit(f"duplicate JSON key {k!r}")
+        seen.add(k)
+    return dict(pairs)
+
+
 def load_events(path: str) -> list[dict]:
     """Parse and validate the human calendar. Every row must have exactly
-    EVENT_KEYS; a typo'd key is an error, not a silently ignored field."""
+    EVENT_KEYS; a typo'd key is an error, not a silently ignored field,
+    and so is a repeated one."""
     with open(path) as f:
-        d = json.load(f)
+        d = json.load(f, object_pairs_hook=_no_duplicate_keys)
     if not isinstance(d, dict) or d.get("schema_version") != CALENDAR_SCHEMA:
         raise SystemExit(f"{path}: schema_version must be {CALENDAR_SCHEMA}")
     rows = d.get("events")
@@ -173,7 +190,7 @@ def load_trading_calendar(path: str = DEFAULT_TRADING_CALENDAR) -> dict:
     """The frozen XNYS/XKRX session table; only the `us_*` fields are read."""
     if path not in _CAL_CACHE:
         with open(path) as f:
-            d = json.load(f)
+            d = json.load(f, object_pairs_hook=_no_duplicate_keys)
         sessions = d.get("sessions")
         rng = d.get("range") or {}
         if not isinstance(sessions, dict) or not sessions:
