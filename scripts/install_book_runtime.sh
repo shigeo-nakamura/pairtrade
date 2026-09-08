@@ -91,9 +91,22 @@ if [ -z "$KIND" ]; then
   echo "could not read schedule.kind from $CONFIG_SOURCE" >&2
   exit 1
 fi
-if [ "$KIND" = "calendar" ] && [ -z "$CALENDAR_SOURCE" ]; then
-  echo "schedule.kind is calendar but no calendar source was found: set BOOK_CALENDAR_SOURCE or provide /opt/debot/configs/book/${INSTANCE}.calendar.json; installed bundle left untouched" >&2
-  exit 1
+if [ "$KIND" = "calendar" ]; then
+  if [ -z "$CALENDAR_SOURCE" ]; then
+    echo "schedule.kind is calendar but no calendar source was found: set BOOK_CALENDAR_SOURCE or provide /opt/debot/configs/book/${INSTANCE}.calendar.json; installed bundle left untouched" >&2
+    exit 1
+  fi
+  # The calendar is always promoted to <INSTALL_DIR>/<instance>.calendar.json
+  # (the unit's ProtectSystem/InaccessiblePaths assume the install dir), so
+  # the config must point exactly there -- --validate does not load it,
+  # and a config naming any other path would install cleanly and then fail
+  # at service start with the calendar sitting where the runtime does not
+  # look.
+  CALENDAR_PATH=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*calendar_path:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
+  if [ "$CALENDAR_PATH" != "$INSTALL_DIR/${INSTANCE}.calendar.json" ]; then
+    echo "schedule.calendar_path must be $INSTALL_DIR/${INSTANCE}.calendar.json (got '${CALENDAR_PATH}'); installed bundle left untouched" >&2
+    exit 1
+  fi
 fi
 if [ -n "$CALENDAR_SOURCE" ]; then
   if [ ! -f "$CALENDAR_SOURCE" ]; then
