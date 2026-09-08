@@ -72,17 +72,50 @@ fn unix(d: NaiveDate, secs_after_midnight: i64) -> i64 {
 
 impl Scheduler {
     pub fn from_config(cfg: &ScheduleConfig) -> Result<Self> {
+        Self::from_config_with_calendar(cfg, None)
+    }
+
+    /// `from_config`, but reading the calendar from `calendar_override`
+    /// when given, for `book_runtime --validate --calendar <path>`
+    /// (bot-strategy#952). `install_book_runtime.sh` must validate a
+    /// *staged* calendar before promoting it to `schedule.calendar_path`,
+    /// and pointing the binary at the staged copy is what lets the
+    /// installer reuse this exact code -- serde's `deny_unknown_fields`,
+    /// chrono's timestamp parsing, and `build`'s duplicate-key, flatten
+    /// and overlap rules -- instead of re-implementing them in Python,
+    /// where every mismatch between the two is a config the installer
+    /// promotes and the service then refuses to start on.
+    pub fn from_config_with_calendar(
+        cfg: &ScheduleConfig,
+        calendar_override: Option<&Path>,
+    ) -> Result<Self> {
         let calendar = match cfg.kind {
             ScheduleKind::Calendar => {
-                let path = cfg
-                    .calendar_path
-                    .as_deref()
+                let path = calendar_override
+                    .or(cfg.calendar_path.as_deref())
                     .context("calendar_path required")?;
                 load_calendar(path)?
             }
-            _ => Vec::new(),
+            _ => {
+                // Fail closed: an override for a schedule that never reads
+                // a calendar would validate a file the runtime ignores.
+                if let Some(p) = calendar_override {
+                    bail!(
+                        "calendar {} given for a {:?} schedule, which never loads one",
+                        p.display(),
+                        cfg.kind
+                    );
+                }
+                Vec::new()
+            }
         };
         Self::build(cfg, calendar)
+    }
+
+    /// The calendar this scheduler was built from (empty for
+    /// `interval_days` / `daily`), so `--validate` can report what it read.
+    pub fn calendar(&self) -> &[CalendarEntry] {
+        &self.calendar
     }
 
     /// Construct with an explicit calendar (tests / replay).
@@ -297,6 +330,70 @@ mod tests {
     fn interval() -> Scheduler {
         let cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
         Scheduler::from_config(&cfg.schedule).unwrap()
+    }
+
+    /// `--validate --calendar` has to reach the same rules the service
+    /// starts on, and has to refuse a file the service would never read
+    /// (bot-strategy#952).
+    #[test]
+    fn calendar_override_is_read_for_calendar_kinds_and_refused_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("staged.calendar.json");
+        std::fs::write(
+            &staged,
+            r#"{"calendar_version":"v1","entries":[{"decision_key":"2026-09-15","decision_at":"2026-09-15T13:29:00Z","flatten_at":"2026-09-15T13:36:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        cfg.schedule.kind = ScheduleKind::Calendar;
+        cfg.schedule.flatten_after_secs = None;
+        // The exdiv instance's grace: the 7-minute window between decision
+        // and flatten only clears a grace this short.
+        cfg.schedule.signal_grace_secs = 45;
+        // The configured path does not exist yet -- that is the installer's
+        // case, validating before it promotes the staged file.
+        cfg.schedule.calendar_path = Some(dir.path().join("not-installed-yet.json"));
+        let s = Scheduler::from_config_with_calendar(&cfg.schedule, Some(&staged)).unwrap();
+        assert_eq!(s.calendar().len(), 1);
+        assert_eq!(
+            s.current(ts("2026-09-15T13:29:30Z")).unwrap().key,
+            "2026-09-15"
+        );
+        // Without the override the missing configured path still fails.
+        assert!(Scheduler::from_config(&cfg.schedule).is_err());
+        // A staged calendar that breaks a build rule is rejected here, not
+        // at the service's next start.
+        let bad = dir.path().join("bad.calendar.json");
+        std::fs::write(
+            &bad,
+            r#"{"calendar_version":"v1","entries":[{"decision_key":"2026-09-15","decision_at":"2026-09-15T13:29:00Z","flatten_at":"2026-09-15T13:29:10Z"}]}"#,
+        )
+        .unwrap();
+        assert!(Scheduler::from_config_with_calendar(&cfg.schedule, Some(&bad)).is_err());
+
+        // An interval_days config never loads a calendar, so validating
+        // one against it would report on a file the runtime ignores.
+        let interval_cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        let e = format!(
+            "{:#}",
+            Scheduler::from_config_with_calendar(&interval_cfg.schedule, Some(&staged))
+                .unwrap_err()
+        );
+        assert!(e.contains("never loads one"), "{e}");
+    }
+
+    /// The committed exdiv-lighter calendar must build against the
+    /// committed config: CI regenerates the calendar from the events file
+    /// but only this check runs the runtime's own rules over the result
+    /// (bot-strategy#948 / #952).
+    #[test]
+    fn committed_exdiv_calendar_builds_against_its_config() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cfg = BookConfig::load(&root.join("configs/book/exdiv-lighter.yaml")).unwrap();
+        let calendar = root.join("configs/book/exdiv-lighter.calendar.json");
+        let s = Scheduler::from_config_with_calendar(&cfg.schedule, Some(&calendar)).unwrap();
+        assert!(!s.calendar().is_empty());
     }
 
     #[test]

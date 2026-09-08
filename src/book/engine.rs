@@ -131,7 +131,9 @@ fn merge_funding_detail(
     from: serde_json::Map<String, serde_json::Value>,
 ) {
     for (sym, new) in from {
-        let field = |v: &serde_json::Value, field: &str| v.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let field = |v: &serde_json::Value, field: &str| {
+            v.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0)
+        };
         let (hours, est_usd) = match into.get(&sym) {
             Some(prev) => (
                 field(prev, "hours") + field(&new, "hours"),
@@ -340,27 +342,26 @@ impl BookEngine {
         // failed append and the next retry does not lose it) so the
         // eventual successful row still reports the full breakdown.
         let today = utc_date(now);
-        let pending_mark = if self.mark_on_date_change
-            && self.state.last_mark_date.as_deref() != Some(&today)
-        {
-            let (accrual_date, funding_detail) = self.accrue_daily_funding(now, &prices).await;
-            let mut merged = std::mem::take(&mut self.state.pending_mark_funding_detail);
-            merge_funding_detail(&mut merged, funding_detail);
-            // The date this cycle was *first* attempted for, not
-            // whatever `accrue_daily_funding` just computed from `now`:
-            // a retry that doesn't succeed until after a UTC rollover
-            // must still write (and keep retrying) the date whose append
-            // actually failed, not silently relabel it as `today`'s row
-            // and permanently omit the stuck date. Funding accrual
-            // itself is unaffected either way -- it is always just hours
-            // elapsed since `funding_accrued_at`, independent of which
-            // date label this row ends up under.
-            let label = self.state.pending_mark_date.clone().unwrap_or(accrual_date);
-            self.state.pending_mark_date = Some(label.clone());
-            Some((label, merged))
-        } else {
-            None
-        };
+        let pending_mark =
+            if self.mark_on_date_change && self.state.last_mark_date.as_deref() != Some(&today) {
+                let (accrual_date, funding_detail) = self.accrue_daily_funding(now, &prices).await;
+                let mut merged = std::mem::take(&mut self.state.pending_mark_funding_detail);
+                merge_funding_detail(&mut merged, funding_detail);
+                // The date this cycle was *first* attempted for, not
+                // whatever `accrue_daily_funding` just computed from `now`:
+                // a retry that doesn't succeed until after a UTC rollover
+                // must still write (and keep retrying) the date whose append
+                // actually failed, not silently relabel it as `today`'s row
+                // and permanently omit the stuck date. Funding accrual
+                // itself is unaffected either way -- it is always just hours
+                // elapsed since `funding_accrued_at`, independent of which
+                // date label this row ends up under.
+                let label = self.state.pending_mark_date.clone().unwrap_or(accrual_date);
+                self.state.pending_mark_date = Some(label.clone());
+                Some((label, merged))
+            } else {
+                None
+            };
 
         let (equity, equity_ready) = self.compute_equity(&prices).await;
         self.equity_ready = equity_ready;
@@ -1834,19 +1835,20 @@ impl BookEngine {
         // Fetching lots here first would only add REST latency (blocking
         // the select! loop tick() runs inside) for metadata this plan
         // never reads.
-        let plan = match rebalance::plan_flatten(&current, prices, &HashMap::new(), &self.cfg.sizing) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("[FLATTEN] cannot plan ({reason}): {e}");
-                self.ledger.write(
-                    now,
-                    "flatten",
-                    None,
-                    json!({ "reason": reason, "error": e.to_string() }),
-                );
-                return;
-            }
-        };
+        let plan =
+            match rebalance::plan_flatten(&current, prices, &HashMap::new(), &self.cfg.sizing) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::error!("[FLATTEN] cannot plan ({reason}): {e}");
+                    self.ledger.write(
+                        now,
+                        "flatten",
+                        None,
+                        json!({ "reason": reason, "error": e.to_string() }),
+                    );
+                    return;
+                }
+            };
         log::warn!("[FLATTEN] reason={reason} legs={}", plan.intents.len());
         let key = self
             .state
@@ -2137,7 +2139,9 @@ impl BookEngine {
     ) -> Result<()> {
         let (equity, equity_ready) = self.compute_equity(prices).await;
         if !equity_ready {
-            log::warn!("[MARK] {date} deferred: a held leg has no fresh price yet, will retry next tick");
+            log::warn!(
+                "[MARK] {date} deferred: a held leg has no fresh price yet, will retry next tick"
+            );
             bail!("{date} mark deferred: a held leg has no fresh price yet");
         }
         // A held leg missing a fresh price (WS not connected yet on the
@@ -3107,7 +3111,10 @@ mod tests {
             .insert("XRP".to_string(), 100.0);
         assert!(!engine.state.positions.contains_key("XRP"));
 
-        engine.daily_mark_now(secs("2026-09-06T00:00:00Z")).await.unwrap();
+        engine
+            .daily_mark_now(secs("2026-09-06T00:00:00Z"))
+            .await
+            .unwrap();
         assert!(
             engine.state.pending_funding_qty_hours.get("XRP").is_none(),
             "an out-of-universe orphaned carry must still be priced and settled"

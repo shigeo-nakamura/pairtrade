@@ -348,7 +348,11 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         bail!(
             "replay finished with unresolved funding carry for {:?} -- \
              their bars.jsonl rows never had a funding_rate_hourly to settle against",
-            engine.state.pending_funding_qty_hours.keys().collect::<Vec<_>>()
+            engine
+                .state
+                .pending_funding_qty_hours
+                .keys()
+                .collect::<Vec<_>>()
         );
     }
     let prices = exec.prices(&cfg.universe.symbols).await;
@@ -582,8 +586,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut lines = Vec::new();
         for (day, btc_rate) in [("2026-07-03", Some(0.00001)), ("2026-07-04", None)] {
-            for (sym, px) in [("BTC", 100_000.0), ("ETH", 4_000.0), ("SOL", 200.0), ("DOT", 4.0)] {
-                let rate = if sym == "BTC" { btc_rate } else { Some(0.00001) };
+            for (sym, px) in [
+                ("BTC", 100_000.0),
+                ("ETH", 4_000.0),
+                ("SOL", 200.0),
+                ("DOT", 4.0),
+            ] {
+                let rate = if sym == "BTC" {
+                    btc_rate
+                } else {
+                    Some(0.00001)
+                };
                 lines.push(
                     serde_json::json!({
                         "date": day, "symbol": sym, "close": px,
