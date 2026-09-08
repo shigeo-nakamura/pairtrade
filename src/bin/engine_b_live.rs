@@ -776,11 +776,29 @@ impl PriceObs {
     /// Fit to base an entry decision on: same feed generation, not
     /// future-dated (a backwards clock step must fail closed, not
     /// produce a negative age that passes every bound), and no older
-    /// than `max_staleness_secs`.
+    /// than `max_staleness_secs` -- measured from local receipt *and*,
+    /// when the venue clock was plausible, from the venue's own
+    /// timestamp. Ingest only bounds the venue age at arrival; without
+    /// the second check here a quote that arrived 29 s late would stay
+    /// usable for another 30 s, i.e. an entry on ~59 s-old venue data
+    /// under a 30 s bound (pairtrade#289 Codex review).
     fn is_usable(&self, now_us: i64, generation: u64, max_staleness_secs: i64) -> bool {
+        let bound_us = max_staleness_secs.saturating_mul(1_000_000);
         self.generation == generation
             && self.received_at_us <= now_us
-            && self.age_secs(now_us) <= max_staleness_secs as f64
+            && now_us - self.received_at_us <= bound_us
+            && self
+                .exchange_ts_us
+                .is_none_or(|ts_us| now_us - ts_us <= bound_us)
+    }
+
+    /// The older of the two ages this observation carries, for logs.
+    fn effective_age_secs(&self, now_us: i64) -> f64 {
+        let venue_age = self
+            .exchange_ts_us
+            .map(|ts_us| (now_us - ts_us) as f64 / 1_000_000.0)
+            .unwrap_or(f64::MIN);
+        self.age_secs(now_us).max(venue_age)
     }
 }
 
@@ -1203,6 +1221,19 @@ struct EngineBLiveEngine {
     /// usable for entry: after a drop, what we hold may be arbitrarily
     /// behind the book, and only a fresh update per symbol clears that.
     feed_generation: u64,
+    /// Last positive mid seen per symbol from *any* update, accepted or
+    /// rejected at ingest (bot-strategy#916, pairtrade#289 Codex review).
+    /// Exit accounting only: when every update is being rejected (a
+    /// venue replaying a stale snapshot after a restart, say) the
+    /// validated `latest_price` can be empty, and an open position must
+    /// still be closable with *some* mid to book against. Never read by
+    /// an entry decision.
+    last_raw_mid: HashMap<String, f64>,
+    /// Wall clock, injectable so the tests can drive the send-time
+    /// freshness re-check (which must read a *fresh* clock, not the
+    /// tick's start time -- pairtrade#289 Codex review) against
+    /// synthetic timestamps. Production uses `now_us`.
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     current_date: Option<NaiveDate>,
     window: Option<(i64, i64, i64)>, // (t0, t1, t2) us epoch for current_date
     day: DaySnapshot,
@@ -1215,6 +1246,24 @@ struct EngineBLiveEngine {
 }
 
 impl EngineBLiveEngine {
+    fn now(&self) -> i64 {
+        (self.clock)()
+    }
+
+    /// Mid to book an exit or an adoption against, in order of trust:
+    /// the validated observation, then the last raw mid from any update,
+    /// then none. Deliberately never gated on freshness -- see
+    /// `usable_prices` -- and deliberately never used for entry.
+    fn exit_accounting_price(&self, symbol: &str) -> Option<(f64, &'static str)> {
+        if let Some(obs) = self.latest_price.get(symbol) {
+            return Some((obs.mid, "ws_mid"));
+        }
+        self.last_raw_mid
+            .get(symbol)
+            .copied()
+            .map(|mid| (mid, "raw_last_mid_rejected_at_ingest"))
+    }
+
     fn kill_switch_engaged(&self) -> bool {
         self.cfg.kill_switch_path.exists()
     }
@@ -1387,7 +1436,9 @@ impl EngineBLiveEngine {
                         "PRE_LAG"
                     } else if obs.received_at_us > now_us {
                         "FUTURE_DATED"
-                    } else if obs.age_secs(now_us) > self.cfg.max_price_staleness_secs as f64 {
+                    } else if obs.effective_age_secs(now_us)
+                        > self.cfg.max_price_staleness_secs as f64
+                    {
                         "STALE"
                     } else {
                         "ok"
@@ -1395,7 +1446,7 @@ impl EngineBLiveEngine {
                     format!(
                         "{symbol}={:.4}@{:.1}s/gen{}[{verdict}]",
                         obs.mid,
-                        obs.age_secs(now_us),
+                        obs.effective_age_secs(now_us),
                         obs.generation
                     )
                 }
@@ -1545,10 +1596,8 @@ impl EngineBLiveEngine {
         // stale mid only makes the *cost basis* an estimate, which
         // `entry_price_estimated` already records.
         let ws_price = self
-            .latest_price
-            .get(&self.cfg.us_primary_symbol)
-            .map(|obs| obs.mid)
-            .filter(|p| *p > 0.0);
+            .exit_accounting_price(&self.cfg.us_primary_symbol)
+            .map(|(mid, _)| mid);
         // Never adopt with a zero cost basis: without the exchange's
         // avg_entry_price and without a positive WS price yet (e.g. right
         // after a restart), wait for the next tick (pairtrade#275 Codex
@@ -2227,26 +2276,6 @@ impl EngineBLiveEngine {
         } else {
             OrderSide::Short
         };
-        // Re-checked here, immediately before the send, rather than
-        // reused from the t1 capture: eligibility fetch and position read
-        // above are awaits, so the price that sized the order must be
-        // proven fresh at send time, not merely fresh when the signal
-        // fired (bot-strategy#916, "送信直前に鮮度を検査").
-        let Some(price) = self
-            .usable_prices(now_us)
-            .get(&self.cfg.us_primary_symbol)
-            .copied()
-        else {
-            log::error!(
-                "[ENTRY] no fresh price for {}; cannot size order -- {}",
-                self.cfg.us_primary_symbol,
-                self.freshness_debug(now_us)
-            );
-            return;
-        };
-        if price <= 0.0 {
-            return;
-        }
         let notional_usd = self.cfg.lot_usd.min(self.cfg.max_notional_usd());
         if notional_usd < self.cfg.lot_usd {
             log::warn!(
@@ -2257,7 +2286,6 @@ impl EngineBLiveEngine {
                 self.cfg.leverage
             );
         }
-        let size = notional_usd / price;
 
         if !self.cfg.dry_run {
             // Exchange truth before we send anything (bot-strategy#875
@@ -2281,8 +2309,27 @@ impl EngineBLiveEngine {
                             self.cfg.us_primary_symbol,
                             existing.size
                         );
-                        let entry_price_estimated = existing.entry_price.is_none();
-                        let entry_price = existing.entry_price.unwrap_or(price);
+                        // Adoption is a get-flat path: never blocked by
+                        // the entry freshness gates, so the cost basis
+                        // falls back to whatever mid exists (see
+                        // `exit_accounting_price`) and is flagged.
+                        let (entry_price, entry_price_estimated) = match (
+                            existing.entry_price,
+                            self.exit_accounting_price(&self.cfg.us_primary_symbol),
+                        ) {
+                            (Some(e), _) => (e, false),
+                            (None, Some((mid, _))) => (mid, true),
+                            (None, None) => {
+                                log::warn!(
+                                    "[ENTRY] exchange holds {} {} size={:.6} but no entry price and \
+                                     no mid of any kind yet -- deferring adoption to the next tick",
+                                    existing.side,
+                                    self.cfg.us_primary_symbol,
+                                    existing.size
+                                );
+                                return;
+                            }
+                        };
                         self.record_entry(
                             OpenPosition {
                                 side: existing.side,
@@ -2322,6 +2369,27 @@ impl EngineBLiveEngine {
                 return;
             }
         }
+        // Sized immediately before the send, after every await above
+        // (eligibility fetch, position read, set_leverage), and against a
+        // *fresh* clock rather than the tick's start time `now_us`: those
+        // awaits can take seconds, so a quote near the staleness bound at
+        // tick start can be past it by now (bot-strategy#916 "送信直前に
+        // 鮮度を検査"; pairtrade#289 Codex review). Nothing below this
+        // point awaits anything before `submit_order`.
+        let send_now_us = self.now();
+        let Some(price) = self
+            .usable_prices(send_now_us)
+            .get(&self.cfg.us_primary_symbol)
+            .copied()
+        else {
+            log::error!(
+                "[ENTRY] no fresh price for {} at send time; not sending this tick -- {}",
+                self.cfg.us_primary_symbol,
+                self.freshness_debug(send_now_us)
+            );
+            return;
+        };
+        let size = notional_usd / price;
         // At most ONE entry sendTx per session day (bot-strategy#875 G-4).
         // Whatever the outcome below -- accepted, timed out, 5xx, rate
         // limited, rejected -- `self.pending` is set and `day.entered`
@@ -2354,7 +2422,7 @@ impl EngineBLiveEngine {
         // eligibility fetch / position read / sendTx above can take
         // seconds, so a deadline based on it could already be expired
         // when `pending` is installed (pairtrade#275 Codex review).
-        let sent_at_us = crate::now_us(); // the `now_us` parameter shadows the fn
+        let sent_at_us = self.now(); // the `now_us` parameter shadows the fn
         if self.cfg.dry_run {
             match submit {
                 Ok(requested) => self.record_entry(
@@ -2440,21 +2508,45 @@ impl EngineBLiveEngine {
         // price only books PnL, so a stale one costs accuracy, not
         // safety. The age is logged so a PnL booked off a stale mid is
         // identifiable after the fact.
-        let Some(obs) = self.latest_price.get(&self.cfg.us_primary_symbol).copied() else {
-            return;
+        //
+        // And when even that is empty (every update since a restart
+        // rejected at ingest, e.g. a venue replaying a stale snapshot),
+        // fall back to the last raw mid, and failing that to the entry
+        // price itself: the reduce-only is sent regardless, the only
+        // thing that degrades is which number the PnL is booked at, and
+        // the log says which (pairtrade#289 Codex review, P1).
+        let (price, price_source) = match self.exit_accounting_price(&self.cfg.us_primary_symbol) {
+            Some((price, source)) => (price, source),
+            None => {
+                log::error!(
+                    "[EXIT] no price of any kind seen for {} this process -- closing anyway; the \
+                     final remainder's PnL is booked at the entry price (i.e. 0) and must be \
+                     reconciled from the exchange fill",
+                    self.cfg.us_primary_symbol
+                );
+                (pos.entry_price, "entry_price_pnl_unknown")
+            }
         };
-        let price = obs.mid;
-        let price_age_secs = obs.age_secs(now_us);
-        if price_age_secs > self.cfg.max_price_staleness_secs as f64
-            || obs.generation != self.feed_generation
-        {
-            log::warn!(
-                "[EXIT] booking PnL off a stale mid for {} (age={price_age_secs:.1}s, \
-                 obs_gen={} feed_gen={}); exit still proceeds, sized from the exchange position",
-                self.cfg.us_primary_symbol,
-                obs.generation,
-                self.feed_generation
-            );
+        match self.latest_price.get(&self.cfg.us_primary_symbol) {
+            Some(obs)
+                if obs.generation != self.feed_generation
+                    || obs.effective_age_secs(now_us)
+                        > self.cfg.max_price_staleness_secs as f64 =>
+            {
+                log::warn!(
+                    "[EXIT] booking PnL off a stale mid for {} (age={:.1}s, obs_gen={} \
+                     feed_gen={}); exit still proceeds, sized from the exchange position",
+                    self.cfg.us_primary_symbol,
+                    obs.effective_age_secs(now_us),
+                    obs.generation,
+                    self.feed_generation
+                );
+            }
+            Some(_) => {}
+            None => log::warn!(
+                "[EXIT] no validated price for {}; booking PnL at {price:.4} (source={price_source})",
+                self.cfg.us_primary_symbol
+            ),
         }
         if self.cfg.dry_run {
             match self.submit_order(opposite(pos.side), pos.size, true).await {
@@ -2548,7 +2640,7 @@ impl EngineBLiveEngine {
         self.pending = Some(PendingConfirm::Exit {
             exit_price: price,
             // Fresh clock after the send, same reason as the entry path.
-            deadline_us: crate::now_us() + self.cfg.fill_confirm_timeout_secs.max(1) * 1_000_000,
+            deadline_us: self.now() + self.cfg.fill_confirm_timeout_secs.max(1) * 1_000_000,
             saw_reading: false,
         });
     }
@@ -2642,7 +2734,7 @@ impl EngineBLiveEngine {
     }
 
     async fn tick(&mut self) {
-        let now = now_us();
+        let now = self.now();
         self.roll_day_if_needed(now);
         self.maybe_clear_halt();
         self.maybe_capture_t0(now);
@@ -2919,6 +3011,8 @@ async fn main() -> Result<()> {
         http_client: Client::new(),
         latest_price: HashMap::new(),
         feed_generation: 0,
+        last_raw_mid: HashMap::new(),
+        clock: Arc::new(now_us),
         current_date: None,
         window: None,
         day: DaySnapshot::default(),
@@ -2935,7 +3029,10 @@ async fn main() -> Result<()> {
             update = price_rx.recv() => {
                 match update {
                     Ok(update) => {
-                        let received_at_us = now_us();
+                        let received_at_us = engine.now();
+                        if let Some(mid) = update.mid_price.to_f64().filter(|m| *m > 0.0) {
+                            engine.last_raw_mid.insert(update.symbol.clone(), mid);
+                        }
                         match price_obs_from_update(
                             &update,
                             received_at_us,
@@ -3774,6 +3871,23 @@ mod tests {
             !obs.is_usable(NOW_US - 1, 2, 30),
             "a future-dated observation (backwards clock step) must fail closed"
         );
+        // Arrived 29 s after the venue stamped it: usable for 1 more
+        // second, not for another 30 (pairtrade#289 Codex review).
+        let late = PriceObs {
+            received_at_us: NOW_US + 29_000_000,
+            ..obs
+        };
+        assert!(late.is_usable(NOW_US + 30_000_000, 2, 30));
+        assert!(
+            !late.is_usable(NOW_US + 31_000_000, 2, 30),
+            "venue age must be bounded at decision time, not only at ingest"
+        );
+        // No plausible venue clock: only the local age counts.
+        let no_venue_clock = PriceObs {
+            exchange_ts_us: None,
+            ..late
+        };
+        assert!(no_venue_clock.is_usable(NOW_US + 59_000_000, 2, 30));
     }
 
     // -------------------------------------------------------------
@@ -4012,6 +4126,9 @@ mod tests {
     struct Harness {
         engine: EngineBLiveEngine,
         connector: Arc<StubConnector>,
+        /// What `engine.now()` returns; tests move it explicitly so the
+        /// send-time re-check is exercised against synthetic timestamps.
+        clock: Arc<std::sync::atomic::AtomicI64>,
         // Kept alive for the lifetime of the harness: dropping it removes
         // the state/status/pnl files the engine writes.
         _dir: tempfile::TempDir,
@@ -4029,6 +4146,8 @@ mod tests {
     fn harness() -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let connector = Arc::new(StubConnector::default());
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(T0_US));
+        let clock_for_engine = clock.clone();
         let mut cfg = fixture_config();
         cfg.dry_run = false;
         cfg.state_path = dir.path().join("state.json");
@@ -4047,6 +4166,8 @@ mod tests {
             http_client: Client::new(),
             latest_price: HashMap::new(),
             feed_generation: 0,
+            last_raw_mid: HashMap::new(),
+            clock: Arc::new(move || clock_for_engine.load(std::sync::atomic::Ordering::SeqCst)),
             current_date: Some(NaiveDate::from_ymd_opt(2026, 9, 8).unwrap()),
             window: Some((T0_US, T1_US, T2_US)),
             day: DaySnapshot::default(),
@@ -4063,11 +4184,17 @@ mod tests {
         Harness {
             engine,
             connector,
+            clock,
             _dir: dir,
         }
     }
 
     impl Harness {
+        fn set_now(&self, now_us: i64) {
+            self.clock
+                .store(now_us, std::sync::atomic::Ordering::SeqCst);
+        }
+
         /// Put one observation in `latest_price` as if it had been
         /// accepted `age_secs` ago on generation `generation`.
         fn observe_at(&mut self, symbol: &str, mid: f64, received_at_us: i64, generation: u64) {
@@ -4189,6 +4316,7 @@ mod tests {
         // Re-observed on the new generation, the same tick would proceed.
         h.observe_all(T1_US + 2_000_000, 190.0, 1700.0);
         h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 2_000_000);
         h.engine.maybe_enter(T1_US + 2_000_000).await;
         assert!(
             h.engine.day.t1_prices.is_some(),
@@ -4240,11 +4368,79 @@ mod tests {
         h.observe_all(T1_US, 190.0, 1700.0);
         h.engine.day.eligibility_confirmed = true;
         // t1 captured from fresh prices, then the feed stalls before the
-        // order is sized: the send-time re-check is the last gate.
+        // order is sized: the send-time re-check is the last gate. The
+        // tick *started* 1 s after t1 (every price fresh by that clock);
+        // by the time the awaits are done the wall clock says 120 s, and
+        // that is the clock the re-check must read (pairtrade#289 Codex
+        // review).
         h.engine.day.t1_prices = Some(h.engine.usable_prices(T1_US));
-        h.engine.maybe_enter(T1_US + 120_000_000).await;
+        h.set_now(T1_US + 120_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
         assert_eq!(h.connector.order_count(), 0);
         assert!(h.engine.position.is_none());
+    }
+
+    #[tokio::test]
+    async fn exit_still_closes_when_every_update_was_rejected_at_ingest() {
+        // A restart into a venue replaying a stale snapshot: nothing ever
+        // passes ingest, `latest_price` stays empty, `last_raw_mid` holds
+        // whatever the rejected updates carried. The reduce-only must go
+        // out regardless (pairtrade#289 Codex review, P1).
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Short,
+            entry_price: 1700.0,
+            entry_price_estimated: true,
+            size: 0.058,
+            open_size: 0.058,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: true,
+        });
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(PositionSnapshot {
+                symbol: "SNDK".to_string(),
+                size: Decimal::from_str("0.058").unwrap(),
+                sign: -1,
+                entry_price: None,
+            });
+        h.engine.last_raw_mid.insert("SNDK".to_string(), 1690.0);
+        assert!(h.engine.latest_price.is_empty());
+        h.set_now(T1_US + 60_000_000);
+        h.engine.maybe_exit(T1_US + 60_000_000).await;
+        assert_eq!(
+            h.connector.order_count(),
+            1,
+            "exit must not depend on a validated price"
+        );
+        {
+            let orders = h.connector.orders.lock().unwrap();
+            assert_eq!(orders[0].2, OrderSide::Long, "reduce-only close of a short");
+            assert!(orders[0].3);
+        }
+        // And with no mid of any kind at all, still closes.
+        let mut h2 = harness();
+        h2.engine.position = h.engine.position.clone();
+        h2.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(PositionSnapshot {
+                symbol: "SNDK".to_string(),
+                size: Decimal::from_str("0.058").unwrap(),
+                sign: -1,
+                entry_price: None,
+            });
+        h2.set_now(T1_US + 60_000_000);
+        h2.engine.maybe_exit(T1_US + 60_000_000).await;
+        assert_eq!(
+            h2.connector.order_count(),
+            1,
+            "no price at all must not strand exposure"
+        );
     }
 
     #[tokio::test]
@@ -4254,6 +4450,7 @@ mod tests {
         h.engine.maybe_capture_t0(T0_US);
         h.observe_all(T1_US, 190.0, 1700.0);
         h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
         h.engine.maybe_enter(T1_US + 1_000_000).await;
         assert_eq!(
             h.connector.order_count(),
@@ -4296,6 +4493,7 @@ mod tests {
         // get flat on.
         h.observe_at("SNDK", 1710.0, T1_US, 0);
         h.engine.feed_generation = 5;
+        h.set_now(T2_US + 1_000_000);
         h.engine.maybe_exit(T2_US + 1_000_000).await;
         assert_eq!(
             h.connector.order_count(),

@@ -88,7 +88,12 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   - **These gates are entry-only.** `maybe_exit` and the unconfirmed-position
     adoption path read the last price raw, so a stale feed can never keep an
     open position from being closed or an unknown exposure from being
-    adopted. A PnL booked off a stale mid is logged as such.
+    adopted. A PnL booked off a stale mid is logged as such; if *every*
+    update has been rejected at ingest (e.g. a venue replaying a stale
+    snapshot after a restart) the close still goes out and the PnL is
+    booked off the last raw mid, or as a last resort off the entry price
+    with `source=entry_price_pnl_unknown` in the log -- reconcile that one
+    from the exchange fill.
 - **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
   `docs/engine-b-order-spec.md` §4 -- introduced by pairtrade#272, so the
   file is absent until that PR merges): a live entry is only recorded once
