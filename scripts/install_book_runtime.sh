@@ -86,7 +86,16 @@ install -o root -g "$SERVICE_GROUP" -m 0550 "$FETCH_SCRIPT_SOURCE" "$STAGE/bin/b
 # does not load `schedule.calendar_path`, so without this check a first
 # install promotes a bundle the service cannot start, and an update
 # silently keeps whatever calendar was installed before.
-KIND=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*kind:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+# Reads one scalar from a top-level section of the staged config and
+# strips YAML quoting: `kind: "calendar"` and `kind: calendar` are the same
+# value, and comparing the raw token would silently bypass every check
+# below on a quoted-but-valid config (pairtrade#288 Codex round 2).
+yaml_scalar() { # <section> <key>
+  awk -v key="$2" '$0 ~ "^"section":" {f=1;next} /^[a-z_]+:/{f=0}
+                   f && $1 == key":" {print $2; exit}' \
+      section="$1" "$STAGE/${INSTANCE}.yaml" | tr -d "\"'"
+}
+KIND=$(yaml_scalar schedule kind)
 if [ -z "$KIND" ]; then
   echo "could not read schedule.kind from $CONFIG_SOURCE" >&2
   exit 1
@@ -102,7 +111,7 @@ if [ "$KIND" = "calendar" ]; then
   # and a config naming any other path would install cleanly and then fail
   # at service start with the calendar sitting where the runtime does not
   # look.
-  CALENDAR_PATH=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*calendar_path:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
+  CALENDAR_PATH=$(yaml_scalar schedule calendar_path)
   if [ "$CALENDAR_PATH" != "$INSTALL_DIR/${INSTANCE}.calendar.json" ]; then
     echo "schedule.calendar_path must be $INSTALL_DIR/${INSTANCE}.calendar.json (got '${CALENDAR_PATH}'); installed bundle left untouched" >&2
     exit 1
@@ -127,7 +136,7 @@ if [ -n "$CALENDAR_SOURCE" ]; then
   # Both the flatten and overlap rules depend on signal_grace_secs, so
   # take it from the config being installed rather than the validator's
   # default -- a wrong value would accept a calendar the runtime bails on.
-  GRACE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*signal_grace_secs:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+  GRACE=$(yaml_scalar schedule signal_grace_secs)
   case "$GRACE" in
     ''|*[!0-9]*)
       echo "could not read schedule.signal_grace_secs from $CONFIG_SOURCE (got '${GRACE}')" >&2
@@ -148,14 +157,14 @@ fi
 # runtime enforces, so a stale S3 object cannot displace a usable local
 # signal. Derive it from the validated config rather than duplicating the
 # number in the unit file.
-MAX_AGE=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*max_age_secs:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+MAX_AGE=$(yaml_scalar signal max_age_secs)
 case "$MAX_AGE" in
   ''|*[!0-9]*)
     echo "could not read signal.max_age_secs from $CONFIG_SOURCE (got '${MAX_AGE}')" >&2
     exit 1
     ;;
 esac
-PRODUCER=$(awk '/^signal:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*producer_id:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+PRODUCER=$(yaml_scalar signal producer_id)
 if [ -z "$PRODUCER" ]; then
   echo "could not read signal.producer_id from $CONFIG_SOURCE" >&2
   exit 1
@@ -165,11 +174,11 @@ fi
 # leaves this empty and the fetcher skips that one check. (`KIND` was
 # read above, before the calendar block.)
 DECISION_TIME=""
-ANCHOR_DATE=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*anchor_date:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
-EVERY_DAYS=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*every_days:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml")
+ANCHOR_DATE=$(yaml_scalar schedule anchor_date)
+EVERY_DAYS=$(yaml_scalar schedule every_days)
 case "$KIND" in
   interval_days|daily)
-    DECISION_TIME=$(awk '/^schedule:/{f=1;next} /^[a-z_]+:/{f=0} f && /^[[:space:]]*decision_time_utc:/{print $2; exit}' "$STAGE/${INSTANCE}.yaml" | tr -d '"')
+    DECISION_TIME=$(yaml_scalar schedule decision_time_utc)
     if [ -z "$DECISION_TIME" ]; then
       echo "could not read schedule.decision_time_utc from $CONFIG_SOURCE (kind=$KIND)" >&2
       exit 1
