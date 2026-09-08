@@ -25,8 +25,8 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from decimal import Decimal
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -266,11 +266,10 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
         intent.get("sell_amount_raw"),
     )
     prepared_at = event_stream.parse_timestamp(attempt["prepared_at"])
-    oldest_usable = prepared_at - timedelta(seconds=HARD_MAX_PLAN_AGE_SECS)
     candidates = []
     for event in index.get(key, []):
         observed_at = event_stream.parse_timestamp(event["observed_at"])
-        if not oldest_usable <= observed_at <= prepared_at:
+        if not within_plan_age(observed_at, prepared_at):
             continue
         plan = event["decision"]["plan"]
         if not token_addresses_match(intent, plan):
@@ -286,6 +285,21 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
             "be proven -- refusing rather than guessing at "
             + ", ".join(str(event["sequence"]) for event in candidates))
     return candidates[0]
+
+
+def within_plan_age(observed_at: datetime, prepared_at: datetime) -> bool:
+    """The freshness bound the runtime actually applies, to the second.
+
+    `validate_plan_age` compares `plan_age.num_seconds()` against
+    `max_plan_age_secs`, and `num_seconds()` truncates toward zero -- so a
+    plan prepared 60.4s after its observation is accepted under a 60s cap.
+    Comparing exact datetimes here rejected the same event the runtime had
+    already accepted and persisted, which turned a real swap into an
+    unmatched one: reported unpriceable, or a hard error. Truncating the
+    same way keeps the two in step.
+    """
+    age = int((prepared_at - observed_at).total_seconds())
+    return 0 <= age <= HARD_MAX_PLAN_AGE_SECS
 
 
 def token_addresses_match(intent: dict[str, Any], plan: dict[str, Any]) -> bool:
@@ -771,6 +785,26 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def non_negative_decimal(text: str) -> Decimal:
+    """A price or a threshold, refused when it cannot be one.
+
+    A negative `--gas-price-usd` turns gas the wallet paid into a credit
+    and lowers the KPI; a negative `--ceiling-per-1k` puts every ordinary
+    day over the threshold. Either produces a definitive-looking verdict
+    from an impossible input, and this report's whole premise is that it
+    does not publish numbers it cannot stand behind.
+    """
+    try:
+        value = Decimal(text)
+    except InvalidOperation as error:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from error
+    if not value.is_finite():
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite number")
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} must not be negative")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -778,10 +812,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="hash-chained live-tick event segment(s), in chain order")
     parser.add_argument("--ledger", type=Path, required=True,
                         help="execution ledger JSON (ledger.json)")
-    parser.add_argument("--ceiling-per-1k", type=Decimal,
+    parser.add_argument("--ceiling-per-1k", type=non_negative_decimal,
                         default=DEFAULT_CEILING_USD_PER_1K,
                         help="owner-declared cost ceiling per $1k of volume (default: 3 = 0.3%%)")
-    parser.add_argument("--gas-price-usd", type=Decimal, default=Decimal(0),
+    parser.add_argument("--gas-price-usd", type=non_negative_decimal, default=Decimal(0),
                         help="USD price of one native gas token; the router has paid gas so far, "
                              "so the default leaves gas at $0 rather than inventing a mark")
     parser.add_argument("--since", type=event_stream.parse_timestamp,

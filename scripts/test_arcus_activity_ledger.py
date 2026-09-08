@@ -584,6 +584,45 @@ class ActivityLedgerTests(unittest.TestCase):
         # And it covers the row it emitted, rather than ending before it.
         self.assertGreaterEqual(report["window"]["to"], "2026-09-05T00:00:01Z")
 
+    def test_the_freshness_bound_truncates_the_way_the_runtime_does(self):
+        """A swap the runtime accepted must not become unmatchable here.
+
+        `validate_plan_age` compares `num_seconds()`, which truncates, so a
+        plan prepared 60.4s after its observation clears a 60s cap and is
+        persisted. Comparing exact datetimes rejected that same event and
+        turned a real, already-executed swap into an unpriceable one.
+        """
+        events, history = baseline_round_trip()
+        # Prepared 60.4s after the pricing observation: inside the runtime's
+        # bound, outside an exact-datetime one.
+        history[0] = attempt(8, ENTRY_AT + timedelta(seconds=60, milliseconds=400),
+                             sell="QQQ", buy="SPY", sell_quantity="0.347094",
+                             buy_quantity="0.323269")
+        report = report_for(events, history)
+        self.assertEqual(report["totals"]["round_trips"], 1)
+        self.assertEqual(report["ledger_swaps_outside_window"], [])
+
+        # 61.0s is genuinely past it, and the runtime would not have
+        # dispatched: still refused.
+        events, history = baseline_round_trip()
+        history[0] = attempt(8, ENTRY_AT + timedelta(seconds=61), sell="QQQ", buy="SPY",
+                             sell_quantity="0.347094", buy_quantity="0.323269")
+        with self.assertRaisesRegex(ledger_tool.ActivityLedgerError, "no would-rotate event"):
+            report_for(events, history)
+
+    def test_an_impossible_price_or_ceiling_is_refused(self):
+        """A definitive verdict must not come out of an impossible input."""
+        parser = ledger_tool.build_parser()
+        for argument, value in (("--gas-price-usd", "-1"), ("--ceiling-per-1k", "-0.5"),
+                                ("--gas-price-usd", "NaN"), ("--gas-price-usd", "Infinity"),
+                                ("--ceiling-per-1k", "cheap")):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["events.jsonl", "--ledger", "l.json", argument, value])
+        ok = parser.parse_args(["events.jsonl", "--ledger", "l.json",
+                                "--gas-price-usd", "0", "--ceiling-per-1k", "3"])
+        self.assertEqual(ok.gas_price_usd, Decimal(0))
+        self.assertEqual(ok.ceiling_per_1k, Decimal(3))
+
     def test_only_reconciled_attempts_are_counted(self):
         events, history = baseline_round_trip()
         history[1]["phase"] = "rejected"
