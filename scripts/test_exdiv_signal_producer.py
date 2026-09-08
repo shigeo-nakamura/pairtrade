@@ -544,6 +544,27 @@ class SignalTests(unittest.TestCase):
         at_bound = row("SPY", t_last, 639.97, 640.03, ob_age=xp.FRESH_OB_SECS)
         self.assertAlmostEqual(xp._mid_at([at_bound], "SPY", t_last), 640.0, places=6)
 
+    def test_duplicate_json_keys_in_the_events_file_are_rejected(self):
+        """json.load keeps the last repeated member, so a badly merged row
+        with two dividend_usd values would pass the exact-key check and be
+        sized off whichever copy came last."""
+        import tempfile
+        good = ('{"schema_version": %d, "events": [{"symbol": "SPY", "ex_date": "2026-09-18", '
+                '"dividend_usd": 1.83, "hedge": "US500", "status": "declared", "source": "t"}]}'
+                % xp.CALENDAR_SCHEMA)
+        dup = good.replace('"dividend_usd": 1.83', '"dividend_usd": 1.83, "dividend_usd": 9.99')
+        with tempfile.TemporaryDirectory() as td:
+            ok_path = os.path.join(td, "ok.json")
+            with open(ok_path, "w") as f:
+                f.write(good)
+            self.assertEqual(len(xp.load_events(ok_path)), 1)
+            bad_path = os.path.join(td, "dup.json")
+            with open(bad_path, "w") as f:
+                f.write(dup)
+            with self.assertRaises(SystemExit) as cm:
+                xp.load_events(bad_path)
+            self.assertIn("duplicate JSON key", str(cm.exception))
+
     def test_a_hedge_with_no_book_keeps_its_specific_reason(self):
         rows = [r for r in base_rows() if r["symbol"] != "US500"]
         e = xp.build_signal(EVENTS[:1], D, rows, prev_rows(), NOW)["meta"]["events"][0]
