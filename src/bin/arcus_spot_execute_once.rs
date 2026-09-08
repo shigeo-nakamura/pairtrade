@@ -1971,45 +1971,35 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
     // Read the checkpoint without comparing it to this config: under a
     // state-invalidating change load_existing refuses outright, and that
     // refusal is the very situation being resolved here.
-    let previous = store.peek_summary()?;
-    if previous.is_none() {
-        // The #902 recovery case: the old runbook removed the checkpoint,
-        // so there is nothing here to read a regime or a halt out of. Both
-        // checks below are consequently skipped, which is safe only while
-        // the bot has never moved funds -- a completed fill leaves no
-        // active ledger attempt and records its post-fill regime in the
-        // checkpoint, not in the preceding WouldRotate event, so for a bot
-        // that has traded a missing checkpoint is exactly the case where an
-        // open rotation is invisible here. Resetting into a neutral window
-        // then lets the next tick open a second position on top of one it
-        // cannot see.
-        //
-        // The ledger settles it without guessing: it is the record of what
-        // was actually swapped, and it survives the checkpoint. No
-        // fund-moving attempt in its history means no position can exist,
-        // which is the never-traded deployment this recovery path was
-        // written for. Anything else is refused (Codex P1 follow-up,
-        // bot-strategy#903).
-        if let Some(attempt) = ledger.history.iter().find(|attempt| {
-            attempt.phase == ArcusSpotExecutionPhase::Reconciled || attempt.tx_hash.is_some()
-        }) {
-            bail!(
-                "Arcus runtime checkpoint {} is missing and the execution ledger shows this bot \
-                 has moved funds (attempt {} in phase {:?}), so nothing here can show whether a \
-                 rotation is still open: a fill's regime lives in the checkpoint, not in the \
-                 event stream, and resetting into a fresh neutral window would let the next tick \
-                 open a second position on top of one it cannot see. Put the checkpoint back \
-                 first -- the `.pre-reset` copy beside it, or the copy in a state-backup \
-                 directory -- then reset. Note that a risk halt engaged before the checkpoint \
-                 went missing is not recoverable from the ledger either; re-check risk before \
-                 resuming",
-                config.runtime_state_path.display(),
-                attempt.sequence,
-                attempt.phase,
-            );
-        }
-    }
-    if let Some(previous) = &previous {
+    // Everything this command promises to check -- flat regime, no open
+    // rotation, no engaged halt, and a config change worth resetting for --
+    // is read out of the checkpoint. Without one, none of them can be
+    // established, so the reset would be an unconditional re-anchoring of
+    // the loss baselines rather than a reset of anything.
+    //
+    // An earlier revision allowed it while the execution ledger showed no
+    // fund-moving attempt, on the theory that a bot which never swapped can
+    // hold no position. That covers positions and nothing else: the risk
+    // marks are computed from prices against the baseline inventory, so
+    // daily and cumulative loss accrue -- and a halt can engage -- with
+    // zero swaps ever dispatched. "Never traded" is therefore not evidence
+    // that a reset is safe, and the missing-checkpoint case is refused
+    // outright (Codex P1 follow-up, bot-strategy#903).
+    let previous = match store.peek_summary()? {
+        Some(previous) => previous,
+        None => bail!(
+            "Arcus runtime checkpoint {} is missing, so none of this command's preconditions \
+             can be checked: the regime, any open rotation, any engaged risk halt and the \
+             config a fresh window would differ from all live in it. Resetting would only \
+             re-anchor the initial-equity and buy-and-hold loss baselines the cumulative halt \
+             is measured against, which is what this command must never be a way to do. Put \
+             the checkpoint back first -- the `.pre-reset` copy beside it, or the copy in a \
+             state-backup directory. If neither exists, a live-tick will start a fresh window \
+             at sequence 1 on its own; the event stream is untouched either way",
+            config.runtime_state_path.display(),
+        ),
+    };
+    {
         if previous.regime != ArcusSpotRegime::Neutral || previous.rotated_quantity.is_some() {
             bail!(
                 "Arcus runtime checkpoint holds an open rotation (regime {:?}, rotated quantity \
@@ -2043,7 +2033,10 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
     // invoke the executor with the already-approved production config. The
     // approval gate authorises *this config*, not an unlimited number of
     // baseline erasures under it (Codex P1 follow-up, bot-strategy#903).
-    if let Some(changed) = store.state_invalidating_drift(&config.runtime)? {
+    {
+        let changed = store
+            .state_invalidating_drift(&config.runtime)?
+            .unwrap_or_default();
         if changed.is_empty() {
             bail!(
                 "Arcus runtime checkpoint {} was written under a config whose state-invalidating \
@@ -2059,7 +2052,7 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
 
     let tail = publisher.stream().latest_committed()?;
     let tail_sequence = tail.map(|(sequence, _)| sequence).unwrap_or(0);
-    if let Some(previous) = &previous {
+    {
         if previous.sequence > tail_sequence {
             bail!(
                 "Arcus runtime checkpoint is at sequence {} but the event stream tail is {}; the \
@@ -2085,7 +2078,7 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
     if let Some(path) = retire_replaced_state_file(&evidence_path, "pre-reset")? {
         retired.push(path.display().to_string());
     }
-    if previous.is_some() {
+    {
         // Copied, not moved: a rename followed by a failed persist would
         // leave the state directory with no checkpoint at all, and the next
         // tick would then start a fresh window at sequence 1 -- exactly the
@@ -2113,12 +2106,12 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
             "checkpoint_sequence": tail_sequence,
             "next_event_sequence": tail_sequence.saturating_add(1),
         },
-        "previous_checkpoint": previous.map(|previous| serde_json::json!({
+        "previous_checkpoint": serde_json::json!({
             "pair": pair_label(&previous.pair),
             "mode": previous.mode,
             "sequence": previous.sequence,
             "relative_log_price_samples": previous.relative_log_price_samples,
-        })),
+        }),
         "event_stream": {
             "directory": publisher.stream().directory().display().to_string(),
             "tail_sequence": tail_sequence,
@@ -3611,9 +3604,9 @@ fields mark the boundary (bot-strategy#903). It refuses unless the bot is
 idle -- no pending durable event, no active ledger attempt, no pending-plan
 evidence, no open rotation, and no engaged risk halt (clear-risk-halt is the
 deliberate decision for that one, never a side effect of a reset). A missing
-checkpoint is allowed only while the execution ledger shows the bot has never
-moved funds: otherwise an open rotation would be invisible here, since a
-fill's regime lives in the checkpoint and not in the event stream. The
+checkpoint is refused outright: every one of those checks reads the
+checkpoint, and losses accrue against the baseline inventory even on a bot
+that has never swapped, so nothing else on the host can stand in for it. The
 replaced checkpoint is copied aside and the stale observation-evidence
 sidecar is moved aside, both as `<name>.pre-reset.<nanos>`; neither is a
 verified backup, so still take a `state-backup` before the config swap (it
@@ -9213,6 +9206,33 @@ runtime:
     }
 
     #[test]
+    fn reset_window_refuses_a_missing_checkpoint() {
+        // Every precondition this command promises -- flat regime, no open
+        // rotation, no engaged halt, a config change worth resetting for --
+        // is read out of the checkpoint, so without one the reset is just
+        // an unconditional re-anchoring of the loss baselines.
+        //
+        // This replaces an earlier allowance for the #902 case (the old
+        // runbook removed the checkpoint). Gating it on "the ledger shows
+        // no fund-moving attempt" was not enough: the risk marks are priced
+        // against the baseline inventory, so losses accrue and a halt can
+        // engage with zero swaps ever dispatched (Codex P1 follow-up).
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+        fs::remove_file(&config.runtime_state_path).unwrap();
+
+        let error = commit_runtime_window_reset(&reset_window_next_config(dir.path()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("is missing"), "{error}");
+        // Refusing must not leave a checkpoint behind: the operator still
+        // has to put the real one back.
+        assert!(!config.runtime_state_path.exists());
+    }
+
+    #[test]
     fn reset_window_refuses_an_unchanged_config() {
         // A reset re-anchors initial_equity_usd and the buy-and-hold
         // basket, so cumulative-loss accounting starts over. With nothing
@@ -9236,59 +9256,6 @@ runtime:
             .unwrap();
         assert_eq!(summary.sequence, 3);
         assert_eq!(summary.relative_log_price_samples, 3);
-    }
-
-    #[test]
-    fn reset_window_refuses_a_missing_checkpoint_once_the_bot_has_moved_funds() {
-        // With no checkpoint there is nothing to read a regime out of, and
-        // a completed fill records its regime there rather than in the
-        // preceding WouldRotate event -- so an open rotation would be
-        // invisible and the fresh neutral window would let the next tick
-        // buy on top of a position it cannot see. The ledger is what
-        // survives the checkpoint and settles it (Codex P1 follow-up).
-        let dir = tempdir().unwrap();
-        let config = reset_window_config(dir.path());
-        seed_reset_window_host(&config, 3);
-        let plan = rotation_plan("entry_signal");
-        let ledger = ArcusSpotExecutionLedger {
-            next_sequence: 3,
-            history: vec![reconciled_entry_attempt(&config, &plan, 2)],
-            ..Default::default()
-        };
-        ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
-            .persist(&ledger)
-            .unwrap();
-        fs::remove_file(&config.runtime_state_path).unwrap();
-
-        let error = commit_runtime_window_reset(&reset_window_next_config(dir.path()))
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("has moved funds"), "{error}");
-        assert!(error.contains("attempt 2"), "{error}");
-        // The checkpoint is left alone: a refusal must not consume the
-        // state the operator still has to put back.
-        assert!(!config.runtime_state_path.exists());
-    }
-
-    #[test]
-    fn reset_window_recovers_a_checkpoint_that_was_already_removed() {
-        // The #902 incident itself: the old runbook said to remove the
-        // checkpoint, so the file is gone and the stream tail is at 3.
-        let dir = tempdir().unwrap();
-        let config = reset_window_config(dir.path());
-        seed_reset_window_host(&config, 3);
-        fs::remove_file(&config.runtime_state_path).unwrap();
-        let next = reset_window_next_config(dir.path());
-
-        let report = commit_runtime_window_reset(&next).unwrap();
-
-        assert_eq!(report["reset"]["checkpoint_sequence"], 3);
-        assert!(report["previous_checkpoint"].is_null());
-        let runtime = ArcusSpotRuntimeCheckpointStore::new(next.runtime_state_path.clone())
-            .load_existing(&next.runtime)
-            .unwrap();
-        assert_eq!(runtime.state().sequence, 3);
     }
 
     #[test]

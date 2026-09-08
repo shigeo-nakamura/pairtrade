@@ -394,19 +394,18 @@ dispatching tick takes -- and refuses unless the bot is genuinely idle:
   cumulative halt at all. The approval gate authorises *this config*, not an
   unlimited number of baseline erasures under it. Deploy the changed
   CONFIG_YAML first,
-- a missing checkpoint on a bot that has already moved funds. With no
-  checkpoint the two checks above cannot run at all, and a completed fill
-  records its post-fill regime in the checkpoint rather than in the
-  preceding `WouldRotate` event -- so an open rotation would be invisible
-  here and the fresh neutral window would let the next tick buy on top of a
-  position it cannot see. The execution ledger is what survives the
-  checkpoint and settles it: no fund-moving attempt in its history means no
-  position can exist, which is the never-traded deployment this recovery
-  path was written for (the #902 runbook that removed the checkpoint).
-  Anything else is refused -- put the checkpoint back first, from the
-  `.pre-reset` copy beside it or from a `state-backup` directory. A risk
-  halt engaged before the checkpoint went missing is not recoverable from
-  the ledger either, so re-check risk before resuming.
+- a missing checkpoint, unconditionally. Every check above reads the
+  checkpoint, so without one none of them can run and the reset would be a
+  bare re-anchoring of the loss baselines below. The `#902` runbook that
+  removed the checkpoint is exactly the case that must not be served this
+  way: gating it on "the execution ledger shows no fund-moving attempt"
+  covers positions only, while the risk marks are priced against the
+  baseline inventory, so daily and cumulative loss accrue -- and a halt can
+  engage -- with zero swaps ever dispatched. Put the checkpoint back first,
+  from the `.pre-reset` copy beside it or from a `state-backup` directory.
+  If neither exists, a live-tick starts a fresh window at sequence 1 by
+  itself; the hash-chained event stream is untouched either way, so what is
+  lost is checkpoint sequence continuity, not evidence.
 
 The replaced checkpoint is copied aside and the stale observation-evidence
 sidecar is moved aside, both as `<name>.pre-reset.<nanos>` in the state
