@@ -126,6 +126,16 @@ class RoundTrip:
 
 @dataclass
 class DailyRow:
+    """One day, with the closed rotations kept apart from the open ones.
+
+    The KPI is a price per unit of volume, so its numerator and denominator
+    must describe the same trades. A completed rotation supplies both. An
+    open leg supplies gas but no volume it can be charged against, so its
+    gas is accounted separately: adding it to `cost_usd` would divide it by
+    some other rotation's volume, and on a quiet day that alone could push
+    the arm over the ceiling and raise a stop signal nothing earned.
+    """
+
     date: str
     swaps: int = 0
     swap_volume_usd: Decimal = Decimal(0)
@@ -134,11 +144,19 @@ class DailyRow:
     round_trip_loss_usd: Decimal = Decimal(0)
     gas_wei: Decimal = Decimal(0)
     gas_usd: Decimal = Decimal(0)
-    unpaired_entries: list[int] = field(default_factory=list)
+    open_leg_gas_wei: Decimal = Decimal(0)
+    open_leg_gas_usd: Decimal = Decimal(0)
+    open_legs: list[int] = field(default_factory=list)
 
     @property
     def cost_usd(self) -> Decimal:
+        """What the closed rotations of this day cost -- the KPI numerator."""
         return self.round_trip_loss_usd + self.gas_usd
+
+    @property
+    def spent_usd(self) -> Decimal:
+        """Every dollar the wallet gave up on this day, priced or not."""
+        return self.cost_usd + self.open_leg_gas_usd
 
     def cost_per_1k(self) -> Decimal | None:
         """None on a day that closed no rotation.
@@ -424,47 +442,49 @@ def pair_round_trips(swaps: Sequence[Swap]) -> tuple[list[RoundTrip], list[Swap]
     unpaired.
 
     An entry whose exits never finish unwinding it is still open at the end
-    of the window; it and its partial legs are reported unpaired rather than
-    priced against an unwind that has not happened.
+    of the window, and is not returned here at all: `build_report` derives
+    the open set as "in the window and in no round trip it kept", which
+    stays exhaustive whatever the reporting bounds remove.
+
+    What *is* returned alongside the round trips is the exits whose entry
+    the stream does not hold -- a stream that begins mid-rotation. Those are
+    a hole in the report rather than an open position, and the caller
+    refuses to publish a stop verdict on a window containing one.
     """
     round_trips: list[RoundTrip] = []
-    unpaired: list[Swap] = []
+    orphan_exits: list[Swap] = []
     open_entry: Swap | None = None
     open_exits: list[Swap] = []
     remaining = Decimal(0)
 
-    def abandon_open() -> None:
-        nonlocal open_entry, open_exits
-        if open_entry is not None:
-            unpaired.append(open_entry)
-            unpaired.extend(open_exits)
-        open_entry, open_exits = None, []
-
     for swap in swaps:
         if swap.trigger == "entry_signal":
-            abandon_open()
-            open_entry = swap
-            open_exits = []
+            open_entry, open_exits = swap, []
             remaining = swap.buy_quantity
             continue
         if open_entry is None:
-            unpaired.append(swap)
+            # An exit whose entry the stream does not hold. The rotation it
+            # closes really happened and really cost something, but its
+            # entry marks are not here, so the loss cannot be computed.
+            orphan_exits.append(swap)
             continue
         open_exits.append(swap)
         remaining -= swap.sell_quantity
         if remaining <= 0:
             round_trips.append(RoundTrip(entry=open_entry, exits=tuple(open_exits)))
             open_entry, open_exits = None, []
-    abandon_open()
-    return round_trips, unpaired
+    return round_trips, orphan_exits
 
 
 def daily_rows(swaps: Sequence[Swap], round_trips: Sequence[RoundTrip],
-               unpaired: Sequence[Swap], gas_price_usd: Decimal) -> list[DailyRow]:
+               open_legs: Sequence[Swap], gas_price_usd: Decimal) -> list[DailyRow]:
     rows: dict[str, DailyRow] = {}
 
     def row_for(date: str) -> DailyRow:
         return rows.setdefault(date, DailyRow(date=date))
+
+    def gas_usd(wei: Decimal) -> Decimal:
+        return wei / WEI_PER_ETHER * gas_price_usd
 
     for swap in swaps:
         row = row_for(swap.date)
@@ -476,20 +496,18 @@ def daily_rows(swaps: Sequence[Swap], round_trips: Sequence[RoundTrip],
         row.round_trip_volume_usd += trip.volume_usd
         row.round_trip_loss_usd += trip.loss_usd
         row.gas_wei += trip.gas_wei
-        row.gas_usd += trip.gas_wei / WEI_PER_ETHER * gas_price_usd
-    for swap in unpaired:
+        row.gas_usd += gas_usd(trip.gas_wei)
+    for swap in open_legs:
+        # Gas on a leg that has closed no rotation is money the wallet paid
+        # and is never dropped -- but it is kept out of `cost_usd`, because
+        # the rate divides that by the *closed* rotations' volume. Charging
+        # an open leg's gas against another rotation's volume is how a quiet
+        # day gets pushed over the ceiling by a swap that has not yet cost
+        # anything measurable.
         row = row_for(swap.date)
-        row.unpaired_entries.append(swap.sequence)
-        # Gas on a leg that has not closed a rotation is still money the
-        # wallet paid. A round trip's gas is filed on the day it closed,
-        # with the rest of its cost; a leg with no round trip to be filed
-        # under is charged to its own day instead of vanishing. A swap is
-        # either in a round trip or unpaired and never both, so this cannot
-        # double-count. Such a day carries a cost with no round-trip volume
-        # to divide it by, so `cost_per_1k` stays None there -- the gas is
-        # in the totals, and not in a rate it has no denominator for.
-        row.gas_wei += swap.gas_wei
-        row.gas_usd += swap.gas_wei / WEI_PER_ETHER * gas_price_usd
+        row.open_legs.append(swap.sequence)
+        row.open_leg_gas_wei += swap.gas_wei
+        row.open_leg_gas_usd += gas_usd(swap.gas_wei)
     return [rows[date] for date in sorted(rows)]
 
 
@@ -571,7 +589,10 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
         raise ActivityLedgerError("--since is after --until")
     report_window = (since or stream[0], until or stream[1])
     swaps, out_of_window = reconciled_swaps(ledger, index, stream)
-    round_trips, unpaired = pair_round_trips(swaps)
+    # Pair over everything the stream priced, so a rotation that spans a
+    # requested bound is still recognised as one rotation.
+    round_trips, orphan_exits = pair_round_trips(swaps)
+
     # The two bounds answer different questions and so read different
     # clocks. Whether the stream can price a swap is about its marks, so
     # that is `event_at` (above). Whether a caller asked to see it is about
@@ -585,13 +606,33 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # A round trip belongs to the day it closed, so that is what the
     # reporting window selects on -- carrying its entry leg in with it.
     round_trips = [trip for trip in round_trips if within(trip.exit.at, since, until)]
-    unpaired = [swap for swap in unpaired if within(swap.at, since, until)]
-    rows = daily_rows(swaps, round_trips, unpaired, gas_price_usd)
+
+    # Everything else in the window is an open leg, derived here rather than
+    # carried from `pair_round_trips`. A leg whose rotation closes after
+    # `--until` was paired and then dropped with its trip; asking the
+    # pairing pass for the open set would not know that, and the leg went
+    # missing from the report entirely -- neither priced nor reported open,
+    # with its gas gone. Defining "open" as "in the window and not in a
+    # round trip this report kept" makes the two sets exhaustive by
+    # construction, whatever the bounds do.
+    closed = {id(leg) for trip in round_trips for leg in (trip.entry, *trip.exits)}
+    open_legs = [swap for swap in swaps if id(swap) not in closed]
+
+    rows = daily_rows(swaps, round_trips, open_legs, gas_price_usd)
 
     total_volume = sum((trip.volume_usd for trip in round_trips), Decimal(0))
     total_cost = sum((row.cost_usd for row in rows), Decimal(0))
+    total_open_gas = sum((row.open_leg_gas_usd for row in rows), Decimal(0))
     overall = (total_cost / total_volume * 1000) if total_volume else None
     streak = consecutive_days_over(rows, ceiling)
+    # An exit whose entry the stream does not hold means a rotation really
+    # closed in this window and its loss is not in any number below. The
+    # report still says what it can measure, but it will not hand back a
+    # stop verdict computed on a window it knows is short a rotation --
+    # this decides whether to keep funding the bot.
+    orphaned = sorted(swap.sequence for swap in orphan_exits
+                      if within(swap.at, since, until))
+    complete = not orphaned
     return {
         "schema_version": 1,
         "window": {
@@ -616,10 +657,13 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
                 "gas_wei": str(row.gas_wei),
                 "gas_usd": as_number(row.gas_usd),
                 "cost_usd": as_number(row.cost_usd),
+                "open_leg_gas_wei": str(row.open_leg_gas_wei),
+                "open_leg_gas_usd": as_number(row.open_leg_gas_usd),
+                "spent_usd": as_number(row.spent_usd),
                 "cost_per_1k_usd": as_number(row.cost_per_1k()),
                 "over_ceiling": (row.cost_per_1k() is not None
                                  and row.cost_per_1k() > ceiling),
-                "unpaired_swaps": row.unpaired_entries,
+                "open_legs": row.open_legs,
             }
             for row in rows
         ],
@@ -631,13 +675,20 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
                 sum((row.round_trip_loss_usd for row in rows), Decimal(0))),
             "gas_usd": as_number(sum((row.gas_usd for row in rows), Decimal(0))),
             "cost_usd": as_number(total_cost),
+            "open_leg_gas_usd": as_number(total_open_gas),
+            "spent_usd": as_number(total_cost + total_open_gas),
             "cost_per_1k_usd": as_number(overall),
             "over_ceiling": overall is not None and overall > ceiling,
+        },
+        "coverage": {
+            "complete": complete,
+            "exits_without_entry": orphaned,
         },
         "stop_rule": {
             "consecutive_days_required": STOP_RULE_CONSECUTIVE_DAYS,
             "longest_consecutive_days_over_ceiling": streak,
-            "stop_candidate": streak >= STOP_RULE_CONSECUTIVE_DAYS,
+            "stop_candidate": complete and streak >= STOP_RULE_CONSECUTIVE_DAYS,
+            "undecidable": not complete,
         },
     }
 
@@ -666,6 +717,21 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"{totals['round_trip_volume_usd']:.2f} | {totals['round_trip_loss_usd']:.4f} | "
         f"{totals['gas_usd']:.4f} | {totals['cost_usd']:.4f} | "
         f"{'—' if overall is None else f'{overall:.2f}'} |")
+    if not report["coverage"]["complete"]:
+        lines.append("")
+        lines.append(
+            "⚠️ This window closes rotations whose entry the event stream does not hold "
+            "(ledger sequences "
+            + ", ".join(str(s) for s in report["coverage"]["exits_without_entry"])
+            + "), so their loss is in none of the figures above and no stop verdict is "
+            "given. Re-run with the earlier event segment included.")
+    open_gas = report["totals"]["open_leg_gas_usd"]
+    if open_gas:
+        lines.append("")
+        lines.append(
+            f"Gas on rotations still open: ${open_gas:.4f}. It is real spend and is in "
+            f"`spent_usd` (${report['totals']['spent_usd']:.4f}), but not in the $/1k rate "
+            "above, which has no volume to divide it by until those rotations close.")
     skipped = report["ledger_swaps_outside_window"]
     if skipped:
         lines.append("")

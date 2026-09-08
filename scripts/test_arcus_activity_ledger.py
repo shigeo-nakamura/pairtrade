@@ -173,7 +173,7 @@ class ActivityLedgerTests(unittest.TestCase):
         report = report_for(events[:1], history[:1])
         self.assertEqual(report["totals"]["round_trips"], 0)
         self.assertIsNone(report["totals"]["cost_per_1k_usd"])
-        self.assertEqual(report["days"][0]["unpaired_swaps"], [8])
+        self.assertEqual(report["days"][0]["open_legs"], [8])
 
     def test_actual_balance_deltas_win_over_the_planned_amounts(self):
         """The plan is an intent; only the wallet says what was swapped."""
@@ -274,7 +274,7 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertEqual(report["totals"]["round_trips"], 1)
         self.assertEqual(report["totals"]["swaps"], 3)
         # Nothing left over: both exit legs belong to the rotation.
-        self.assertEqual([day["unpaired_swaps"] for day in report["days"]], [[], []])
+        self.assertEqual([day["open_legs"] for day in report["days"]], [[], []])
         # Volume is all three legs, and the loss is the same 0.000749 QQQ
         # shortfall the single-exit case reports -- split across two exits,
         # netted before pricing rather than measured from the first leg only.
@@ -301,7 +301,7 @@ class ActivityLedgerTests(unittest.TestCase):
 
         self.assertEqual(report["totals"]["round_trips"], 0)
         self.assertIsNone(report["totals"]["cost_per_1k_usd"])
-        self.assertEqual(sorted(sum((day["unpaired_swaps"] for day in report["days"]), [])),
+        self.assertEqual(sorted(sum((day["open_legs"] for day in report["days"]), [])),
                          [8, 9])
 
     def test_two_indistinguishable_events_are_refused_not_guessed_between(self):
@@ -362,7 +362,7 @@ class ActivityLedgerTests(unittest.TestCase):
         # is not reported as uncovered either -- the stream priced it.
         self.assertEqual(report["totals"]["swaps"], 1)
         self.assertEqual(report["ledger_swaps_outside_window"], [])
-        self.assertEqual([day["unpaired_swaps"] for day in report["days"]], [[]])
+        self.assertEqual([day["open_legs"] for day in report["days"]], [[]])
 
     def test_the_markdown_total_puts_each_number_under_its_own_heading(self):
         events, history = baseline_round_trip()
@@ -415,12 +415,128 @@ class ActivityLedgerTests(unittest.TestCase):
                                           Decimal("4000"))
 
         day = report["days"][0]
-        self.assertEqual(day["unpaired_swaps"], [8])
-        self.assertEqual(day["gas_wei"], "1000000000000000")
-        self.assertAlmostEqual(day["gas_usd"], 4.0, places=6)
-        self.assertAlmostEqual(report["totals"]["cost_usd"], 4.0, places=6)
+        self.assertEqual(day["open_legs"], [8])
+        # Kept, but as open-leg gas: it has no closed rotation to be part
+        # of, so it must not enter the rate's numerator.
+        self.assertEqual(day["open_leg_gas_wei"], "1000000000000000")
+        self.assertAlmostEqual(day["open_leg_gas_usd"], 4.0, places=6)
+        self.assertAlmostEqual(day["spent_usd"], 4.0, places=6)
+        self.assertEqual(day["gas_wei"], "0")
+        self.assertEqual(day["cost_usd"], 0.0)
+        self.assertAlmostEqual(report["totals"]["spent_usd"], 4.0, places=6)
         # No rotation closed, so there is no volume to divide it by.
         self.assertIsNone(day["cost_per_1k_usd"])
+
+    def test_a_stream_beginning_mid_rotation_refuses_a_stop_verdict(self):
+        """An exit whose entry the stream lacks is a hole, not a zero.
+
+        The rotation really closed and really cost something; its loss is in
+        none of the figures. Publishing a KPI and a stop verdict anyway --
+        the number that decides whether to keep funding the bot -- would be
+        deciding on a window known to be short a rotation.
+        """
+        events, history = baseline_round_trip()
+        # The export starts after the entry: only the closing observation
+        # and only the closing attempt are present.
+        report = report_for(events[1:], history[1:])
+
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertEqual(report["coverage"]["exits_without_entry"], [9])
+        self.assertTrue(report["stop_rule"]["undecidable"])
+        self.assertFalse(report["stop_rule"]["stop_candidate"])
+        self.assertIn("no stop verdict is given", ledger_tool.render_markdown(report))
+
+    def test_a_streak_that_would_trip_the_stop_rule_is_withheld_while_incomplete(self):
+        """The guard has to bind where it matters: on a firing streak.
+
+        A window missing a rotation can still run a streak of over-ceiling
+        days. Publishing `stop_candidate` from it would retire the bot on
+        an arithmetic the report itself knows is short a trade.
+        """
+        # An exit with no entry ahead of an ordinary, complete rotation.
+        orphan_at = ENTRY_AT - timedelta(days=1)
+        events = [would_rotate_event(0, orphan_at, trigger="mean_reversion_exit", sell="SPY",
+                                     buy="QQQ", sell_quantity="0.1", buy_quantity="0.1",
+                                     spy_mark="770", qqq_mark="720")]
+        history = [attempt(7, orphan_at, sell="SPY", buy="QQQ", sell_quantity="0.1",
+                           buy_quantity="0.1")]
+        baseline_events, baseline_history = baseline_round_trip()
+        events += baseline_events
+        history += baseline_history
+
+        # Ceiling of zero makes the one closing day over-ceiling, and a
+        # one-day rule makes that streak enough to fire.
+        original = ledger_tool.STOP_RULE_CONSECUTIVE_DAYS
+        ledger_tool.STOP_RULE_CONSECUTIVE_DAYS = 1
+        try:
+            report = ledger_tool.build_report({"history": history}, events,
+                                              Decimal(0), NO_GAS)
+            complete = ledger_tool.build_report({"history": baseline_history},
+                                                baseline_events, Decimal(0), NO_GAS)
+        finally:
+            ledger_tool.STOP_RULE_CONSECUTIVE_DAYS = original
+
+        # The same streak fires when the window is whole ...
+        self.assertGreaterEqual(complete["stop_rule"]["longest_consecutive_days_over_ceiling"], 1)
+        self.assertTrue(complete["stop_rule"]["stop_candidate"])
+        # ... and is withheld when it is not.
+        self.assertGreaterEqual(report["stop_rule"]["longest_consecutive_days_over_ceiling"], 1)
+        self.assertFalse(report["stop_rule"]["stop_candidate"])
+        self.assertTrue(report["stop_rule"]["undecidable"])
+
+    def test_a_rotation_closing_after_until_is_reported_open_not_lost(self):
+        """A bound that cuts a rotation must not delete its entry.
+
+        Pairing runs over the whole stream, so the entry belongs to a trip
+        the `--until` filter then removes. Asking the pairing pass for the
+        open set would not know that, and the leg vanished from the report
+        entirely -- neither priced nor reported open, with its gas gone.
+        """
+        events, history = baseline_round_trip()
+        spent = str(int(WEI) - 10**15)
+        history[0] = attempt(8, ENTRY_AT, sell="QQQ", buy="SPY", sell_quantity="0.347094",
+                             buy_quantity="0.323269", gas_before=WEI, gas_after=spent)
+        report = ledger_tool.build_report(
+            {"history": history}, events, CEILING, Decimal("4000"),
+            until=ENTRY_AT + timedelta(hours=1))
+
+        self.assertEqual(report["totals"]["round_trips"], 0)
+        self.assertEqual([day["date"] for day in report["days"]], ["2026-09-04"])
+        day = report["days"][0]
+        self.assertEqual(day["open_legs"], [8])
+        self.assertAlmostEqual(day["open_leg_gas_usd"], 4.0, places=6)
+        self.assertTrue(report["coverage"]["complete"])
+
+    def test_an_open_leg_gas_never_enters_a_completed_trip_rate(self):
+        """A day with both a close and a fresh open must not mix them.
+
+        Dividing the open leg's gas by the closed rotation's volume can push
+        an arm over the ceiling on a day that earned no such thing, and the
+        stop rule is built on exactly that comparison.
+        """
+        events, history = baseline_round_trip()
+        reopen_at = EXIT_AT + timedelta(hours=2)
+        events.append(would_rotate_event(3, reopen_at, trigger="entry_signal", sell="QQQ",
+                                         buy="SPY", sell_quantity="0.347094",
+                                         buy_quantity="0.323269", spy_mark="773.50",
+                                         qqq_mark="721.00"))
+        spent = str(int(WEI) - 10**16)
+        history.append(attempt(10, reopen_at, sell="QQQ", buy="SPY",
+                               sell_quantity="0.347094", buy_quantity="0.323269",
+                               gas_before=WEI, gas_after=spent))
+        with_gas = ledger_tool.build_report({"history": history}, events, CEILING,
+                                            Decimal("4000"))
+        no_gas = report_for(*baseline_round_trip())
+
+        close_day = [d for d in with_gas["days"] if d["date"] == "2026-09-05"][0]
+        self.assertEqual(close_day["open_legs"], [10])
+        self.assertGreater(close_day["open_leg_gas_usd"], 39)
+        # The rate is the same as if the fresh entry had not happened.
+        self.assertAlmostEqual(close_day["cost_per_1k_usd"],
+                               no_gas["days"][1]["cost_per_1k_usd"], places=6)
+        self.assertFalse(close_day["over_ceiling"])
+        # But the money is not lost.
+        self.assertGreater(close_day["spent_usd"], close_day["cost_usd"])
 
     def test_only_reconciled_attempts_are_counted(self):
         events, history = baseline_round_trip()
