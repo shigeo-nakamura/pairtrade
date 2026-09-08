@@ -3445,6 +3445,51 @@ mod tests {
     }
 
     #[test]
+    fn the_all_in_cost_gate_is_inclusive_at_the_cap() {
+        // `hash-config` prints the residual budget an operator sizes
+        // against, and the wording has to match the comparison: build_plan
+        // rejects on `all_in_cost > cap`, so a quote landing exactly on the
+        // cap clears. This matters most when the buffers equal the cap and
+        // the residual is 0 bps (Codex, bot-strategy#903).
+        let plan_at = |cap: Decimal| {
+            let mut cfg = config();
+            cfg.max_all_in_round_trip_cost_bps = cap;
+            let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+            let current = (200.0_f64 / 100.0_f64).ln();
+            runtime.state.relative_log_price_history = vec![current + 0.01, current + 0.02];
+            runtime
+                .step_at(
+                    &snapshot_with_bidirectional_rows(event_time()),
+                    event_time(),
+                )
+                .decision
+        };
+
+        // Read the quote's own all-in cost off a plan built under a cap
+        // that cannot bind, so the boundary below is the real one.
+        let cost = match plan_at(Decimal::from(10_000)) {
+            ArcusSpotDecision::SimulatedFill { plan } => plan.all_in_round_trip_cost_bps,
+            other => panic!("expected a plan under an unbinding cap, got {other:?}"),
+        };
+
+        // Exactly at the cap: accepted.
+        assert!(
+            matches!(plan_at(cost), ArcusSpotDecision::SimulatedFill { .. }),
+            "a quote at exactly {cost} bps must clear a cap of {cost} bps",
+        );
+
+        // One tick under it: held, so the boundary is where it is claimed.
+        let just_under = cost.checked_sub(Decimal::new(1, cost.scale())).unwrap();
+        assert!(
+            matches!(
+                plan_at(just_under),
+                ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::CostLimit
+            ),
+            "a cap of {just_under} bps must hold a {cost} bps quote",
+        );
+    }
+
+    #[test]
     fn flat_history_guard_preserves_max_hold_exit_without_a_z_score() {
         let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
         let flat_price = (200.0_f64 / 100.0_f64).ln();

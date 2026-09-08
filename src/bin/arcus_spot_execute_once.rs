@@ -4230,7 +4230,7 @@ async fn main() -> Result<()> {
             eprintln!(
                 "[arcus-config] cost budget: max_all_in_round_trip_cost_bps {} bps is compared \
                  against quoted round-trip loss + gas_buffer_bps {} + settlement_buffer_bps {}, \
-                 so a quote clears the gate only below {} bps",
+                 so a quote clears the gate only at or below {} bps",
                 config.runtime.max_all_in_round_trip_cost_bps.normalize(),
                 config.runtime.gas_buffer_bps.normalize(),
                 config.runtime.settlement_buffer_bps.normalize(),

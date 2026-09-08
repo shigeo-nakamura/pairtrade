@@ -297,14 +297,19 @@ exactly the digest, so it can still be piped):
 
     [arcus-config] cost budget: max_all_in_round_trip_cost_bps 60 bps is
     compared against quoted round-trip loss + gas_buffer_bps 10 +
-    settlement_buffer_bps 10, so a quote clears the gate only below 40 bps
+    settlement_buffer_bps 10, so a quote clears the gate only at or below
+    40 bps
 
 `max_all_in_round_trip_cost_bps` is the **all-in** limit: the quoted
 round-trip loss plus both fixed buffers is charged against it, not the
 quoted loss alone. Sizing it as if it capped the quoted loss is how a
 config ends up holding every tick on `cost_limit` for no visible reason
 (bot-strategy#903). A config whose buffers alone already exceed the cap is
-rejected outright at load, naming both figures.
+rejected outright at load, naming both figures. The comparison is
+inclusive -- `build_plan` rejects on `all_in_cost > cap` -- so a quote
+landing exactly on the residual budget passes. That matters most when the
+buffers equal the cap: the residual is then 0 bps, and a zero-loss quote
+still clears.
 
 ## Changing `runtime:` under a live checkpoint
 
