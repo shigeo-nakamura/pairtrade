@@ -712,6 +712,14 @@ struct OpenPosition {
     /// flattens it on the next tick instead of waiting for today's `t2`
     /// (pairtrade#275 Codex review).
     flatten_asap: bool,
+    /// `t2 + exit_deadline_secs` of the session this position was entered
+    /// for, carried through a restart. `maybe_exit` reads *this*, not
+    /// today's recomputed window: a calendar edit or an
+    /// `exit_deadline_secs` change between entry and restart would
+    /// otherwise move the deadline out from under an already-open
+    /// position and leave it waiting past the boundary it was actually
+    /// scheduled against (pairtrade#300 Codex review).
+    exit_deadline_us: Option<i64>,
 }
 
 /// Fill / flat confirmation in flight, advanced by `poll_pending_confirm`
@@ -809,6 +817,20 @@ fn opposite(side: OrderSide) -> OrderSide {
 /// rounding.
 fn sizes_agree(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-9 + 1e-6 * a.abs().max(b.abs())
+}
+
+/// What `note_shutdown_signal` had to report. Returned rather than only
+/// logged so the "nothing tracked in memory is not nothing open"
+/// distinction is testable (pairtrade#300 Codex review).
+#[derive(Debug, Clone, PartialEq)]
+enum ShutdownReport {
+    /// A position this process was actively tracking is left open.
+    TrackedPosition,
+    /// Nothing in memory, but the persisted record still claims one this
+    /// process never reconciled against the exchange.
+    UnreconciledClaim,
+    /// Nothing tracked and nothing claimed.
+    Nothing,
 }
 
 /// What startup reconciliation decided about the account (bot-strategy#917).
@@ -1561,6 +1583,15 @@ impl EngineBLiveEngine {
         !self.kill_switch_engaged() && !self.state.session_halted && self.reconciled
     }
 
+    /// `t2 + exit_deadline_secs` for the session currently in `window` --
+    /// the boundary an entry made *now* is scheduled against. Stamped onto
+    /// the position at entry so it survives a restart, a calendar edit or
+    /// a config change (pairtrade#300 Codex review).
+    fn scheduled_exit_deadline_us(&self) -> Option<i64> {
+        self.window
+            .map(|(_t0, _t1, t2)| t2 + self.cfg.exit_deadline_secs * 1_000_000)
+    }
+
     /// Mirror `self.position` into `state.open_position` and persist, so a
     /// restart can resume tracking it (bot-strategy#917). Called from
     /// every place that changes the position -- entry, adoption, partial
@@ -1619,9 +1650,9 @@ impl EngineBLiveEngine {
             entered_at_us: p.entered_at_us,
             flatten_asap: p.flatten_asap,
             session_date: self.current_date.map(|d| d.to_string()).unwrap_or_default(),
-            exit_deadline_us: self
-                .window
-                .map(|(_t0, _t1, t2)| t2 + self.cfg.exit_deadline_secs * 1_000_000),
+            // The position's own boundary, not one recomputed from
+            // whatever `self.window` says now (pairtrade#300 Codex review).
+            exit_deadline_us: p.exit_deadline_us,
         });
         if self.state.open_position == persisted {
             return false;
@@ -1663,6 +1694,22 @@ impl EngineBLiveEngine {
                 ),
             }
             if let Some(p) = self.state.open_position.clone() {
+                // A `us_primary` change must not relabel the saved
+                // position onto the new instrument: `restore_persisted`
+                // would then price and close it as that other symbol,
+                // corrupting the simulated trade and its PnL. Keep the
+                // record, refuse to manage it, and say so
+                // (pairtrade#300 Codex review).
+                if p.symbol != symbol {
+                    log::error!(
+                        "[RECONCILE] DRY_RUN: the saved position is on {} but this instance now \
+                         trades {symbol} -- not resuming it, and not relabelling it. The record \
+                         is kept for the operator",
+                        p.symbol
+                    );
+                    self.reconciled = true;
+                    return;
+                }
                 let window_gone =
                     p.session_date != today || p.exit_deadline_us.is_some_and(|d| now_us > d);
                 match self.restore_persisted(&p, p.flatten_asap || window_gone) {
@@ -1802,6 +1849,7 @@ impl EngineBLiveEngine {
             realized_partial_pnl: p.realized_partial_pnl,
             entered_at_us: p.entered_at_us,
             flatten_asap,
+            exit_deadline_us: p.exit_deadline_us,
         });
         self.persist_position();
         Ok(())
@@ -1814,11 +1862,35 @@ impl EngineBLiveEngine {
     /// `avg_entry_price` when it has one, else the last WS mid -- and then
     /// the booked PnL is flagged as an estimate.
     fn adopt_from_exchange(&mut self, live: &ExchangePosition, now_us: i64, reason: &str) {
+        // A mismatch on quantity alone still describes the *same* position:
+        // same symbol, same side, with reductions already booked before the
+        // shutdown. Dropping `realized_partial_pnl` there would silently
+        // omit that PnL when the adopted remainder closes, so carry it (and
+        // the cost basis it was booked against) forward. A side or symbol
+        // disagreement is a different position and carries nothing
+        // (pairtrade#300 Codex review).
+        let carried = self.state.open_position.as_ref().filter(|p| {
+            p.symbol == self.cfg.us_primary_symbol
+                && side_from_str(&p.side) == Some(live.side)
+                && p.realized_partial_pnl != 0.0
+        });
+        let carried_partial_pnl = carried.map(|p| p.realized_partial_pnl).unwrap_or(0.0);
+        let carried_basis = carried.map(|p| (p.entry_price, p.entry_price_estimated));
+        if carried_partial_pnl != 0.0 {
+            log::warn!(
+                "[RECONCILE] carrying ${carried_partial_pnl:.2} of already-booked partial PnL \
+                 into the adopted position"
+            );
+        }
         let ws_price = self
             .exit_accounting_price(&self.cfg.us_primary_symbol)
             .map(|(mid, _)| mid);
         let (entry_price, entry_price_estimated) = match (live.entry_price, ws_price) {
             (Some(e), _) => (e, false),
+            // The record's own basis beats a current mid when it describes
+            // this same position: it is what the carried partial PnL was
+            // booked against.
+            (None, _) if carried_basis.is_some() => carried_basis.expect("checked"),
             (None, Some(w)) => (w, true),
             // No cost basis of any kind yet: still adopt (getting flat
             // matters more than the PnL number), booking against the exit
@@ -1837,9 +1909,11 @@ impl EngineBLiveEngine {
             entry_price_estimated,
             size: live.size,
             open_size: live.size,
-            realized_partial_pnl: 0.0,
+            realized_partial_pnl: carried_partial_pnl,
             entered_at_us: now_us,
             flatten_asap: true,
+            // Flattened on the next tick; there is no window to wait for.
+            exit_deadline_us: None,
         });
         self.persist_position();
         self.halt_session(format!("reconcile_adopted_position: {reason}"));
@@ -1849,7 +1923,7 @@ impl EngineBLiveEngine {
     /// reduce-only-close on shutdown, so say so loudly and leave the
     /// persisted record behind for the next process to resume from --
     /// never a close this process did not actually see.
-    fn note_shutdown_signal(&mut self, signal: &str) {
+    fn note_shutdown_signal(&mut self, signal: &str) -> ShutdownReport {
         self.persist_position();
         match self.position.as_ref() {
             Some(p) => {
@@ -1869,8 +1943,40 @@ impl EngineBLiveEngine {
                         p.side, self.cfg.us_primary_symbol, p.open_size
                     ),
                 );
+                ShutdownReport::TrackedPosition
             }
-            None => log::warn!("[SHUTDOWN] {signal}: no open position tracked; exiting"),
+            // Nothing tracked in memory is not the same as nothing open:
+            // before reconciliation succeeds (or after it refused to
+            // manage a foreign-symbol record), the persisted claim is the
+            // only thing that knows about an exposure. Reporting "no open
+            // position" there would be falsely reassuring
+            // (pairtrade#300 Codex review).
+            None => match self.state.open_position.as_ref() {
+                Some(p) => {
+                    log::error!(
+                        "[SHUTDOWN] {signal}: nothing is tracked in memory, but the saved record \
+                         still claims an open {} {} size={:.6} from session {} that this process \
+                         never reconciled -- check the exchange",
+                        p.side,
+                        p.symbol,
+                        p.open_size,
+                        p.session_date
+                    );
+                    send_notification(
+                        format!("Han Bridge SHUTDOWN with an unreconciled position ({signal})"),
+                        format!(
+                            "saved record: {} {} size={:.6} session={} -- this process never \
+                             confirmed it against the exchange. Verify the account.",
+                            p.side, p.symbol, p.open_size, p.session_date
+                        ),
+                    );
+                    ShutdownReport::UnreconciledClaim
+                }
+                None => {
+                    log::warn!("[SHUTDOWN] {signal}: no open position tracked; exiting");
+                    ShutdownReport::Nothing
+                }
+            },
         }
     }
 
@@ -2280,6 +2386,7 @@ impl EngineBLiveEngine {
             realized_partial_pnl: 0.0,
             entered_at_us: now_us,
             flatten_asap: true,
+            exit_deadline_us: None,
         });
         send_notification(
             format!("Han Bridge ENTRY ADOPTED {} {}", self.cfg.us_primary_symbol, live.side),
@@ -2528,6 +2635,7 @@ impl EngineBLiveEngine {
                 realized_partial_pnl: 0.0,
                 entered_at_us: now_us,
                 flatten_asap: false,
+                exit_deadline_us: self.scheduled_exit_deadline_us(),
             },
             epsilon,
             notional_usd,
@@ -3001,6 +3109,7 @@ impl EngineBLiveEngine {
                                 realized_partial_pnl: 0.0,
                                 entered_at_us: now_us,
                                 flatten_asap: true,
+                                exit_deadline_us: None,
                             },
                             epsilon,
                             notional_usd,
@@ -3130,6 +3239,7 @@ impl EngineBLiveEngine {
                         realized_partial_pnl: 0.0,
                         entered_at_us: sent_at_us,
                         flatten_asap: false,
+                        exit_deadline_us: self.scheduled_exit_deadline_us(),
                     },
                     epsilon,
                     notional_usd,
@@ -3181,6 +3291,20 @@ impl EngineBLiveEngine {
                  ({} size={:.6}); not waiting for today's t2",
                 pos.side,
                 pos.open_size
+            );
+            true
+        } else if pos
+            .exit_deadline_us
+            .is_some_and(|deadline| now_us > deadline)
+        {
+            // The boundary this position was actually scheduled against
+            // has passed. Read from the position, not from today's
+            // recomputed window: a calendar edit or an
+            // `exit_deadline_secs` change across a restart must not move
+            // the deadline out from under an open position and leave it
+            // waiting (pairtrade#300 Codex review).
+            log::warn!(
+                "[EXIT] the position's own exit deadline has passed; forcing emergency close"
             );
             true
         } else {
@@ -3787,11 +3911,11 @@ async fn main() -> Result<()> {
                 engine.tick().await;
             }
             _ = sigterm.recv() => {
-                engine.note_shutdown_signal("SIGTERM");
+                let _ = engine.note_shutdown_signal("SIGTERM");
                 break;
             }
             _ = sigint.recv() => {
-                engine.note_shutdown_signal("SIGINT");
+                let _ = engine.note_shutdown_signal("SIGINT");
                 break;
             }
         }
@@ -5389,6 +5513,7 @@ mod tests {
             realized_partial_pnl: 0.0,
             entered_at_us: T1_US,
             flatten_asap: true,
+            exit_deadline_us: None,
         });
         h.connector
             .positions
@@ -5620,6 +5745,7 @@ mod tests {
             realized_partial_pnl: 0.0,
             entered_at_us: T1_US,
             flatten_asap: false,
+            exit_deadline_us: None,
         });
         h.connector
             .positions
@@ -6035,6 +6161,7 @@ mod tests {
                 realized_partial_pnl: 0.0,
                 entered_at_us: T1_US,
                 flatten_asap: false,
+                exit_deadline_us: h.engine.scheduled_exit_deadline_us(),
             },
             0.0142,
             100.0,
@@ -6149,6 +6276,7 @@ mod tests {
             realized_partial_pnl: 0.0,
             entered_at_us: T1_US,
             flatten_asap: false,
+            exit_deadline_us: None,
         });
         h.engine.persist_position();
         h.engine.on_exit(1769.1, T2_US);
@@ -6158,6 +6286,132 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 2, P2: a calendar or
+    /// `exit_deadline_secs` change must not move the deadline out from
+    /// under an already-open position.
+    #[tokio::test]
+    async fn a_resumed_position_keeps_its_own_exit_deadline() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // Saved against a deadline much earlier than the one today's
+        // window would produce (t2 + 900 s): the restart happens *before*
+        // that saved deadline, so the position resumes normally rather
+        // than as `flatten_asap` -- and then the saved deadline passes
+        // while today's t2 is still hours away.
+        let mut saved = persisted_long(0.057, TODAY);
+        saved.exit_deadline_us = Some(T1_US + 120_000_000);
+        h.engine.state.open_position = Some(saved);
+        h.engine.state.last_session_date = Some(TODAY.to_string());
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        let before = T1_US + 60_000_000;
+        h.set_now(before);
+        h.observe_all(before, 190.0, 1760.0);
+        h.engine.tick().await;
+        let resumed = h.engine.position.clone().expect("resumed");
+        assert!(
+            !resumed.flatten_asap,
+            "resumed on schedule: its own deadline has not passed yet"
+        );
+        assert_eq!(h.connector.order_count(), 0, "and nothing closes yet");
+        // Past the saved deadline, still long before today's t2.
+        let after = T1_US + 180_000_000;
+        assert!(after < T2_US, "the test only means anything before t2");
+        h.set_now(after);
+        h.observe_all(after, 190.0, 1760.0);
+        h.engine.tick().await;
+        assert_eq!(
+            h.connector.order_count(),
+            1,
+            "its own deadline passed, so it must close rather than wait for today's t2"
+        );
+        let orders = h.connector.orders.lock().unwrap();
+        assert_eq!(orders[0].2, OrderSide::Short);
+        assert!(orders[0].3, "reduce_only");
+    }
+
+    /// pairtrade#300 Codex review round 2, P2: PnL booked by reductions
+    /// before a shutdown must not vanish when the remainder is adopted.
+    #[tokio::test]
+    async fn adopting_a_resized_position_keeps_the_partial_pnl_already_booked() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        let mut saved = persisted_long(0.057, TODAY);
+        saved.realized_partial_pnl = 0.42;
+        h.engine.state.open_position = Some(saved);
+        // The exchange holds a different quantity: same symbol, same side.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.030", 1, None));
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        let adopted = h.engine.position.clone().expect("adopted");
+        assert!(
+            (adopted.realized_partial_pnl - 0.42).abs() < 1e-12,
+            "booked partial PnL must survive the adoption, got {}",
+            adopted.realized_partial_pnl
+        );
+        assert!(
+            (adopted.entry_price - 1756.92).abs() < 1e-9,
+            "and the basis it was booked against, got {}",
+            adopted.entry_price
+        );
+        assert!(h.engine.state.session_halted, "a resize still halts");
+    }
+
+    /// pairtrade#300 Codex review round 2, P2: DRY_RUN must not relabel a
+    /// saved position onto a newly configured symbol.
+    #[tokio::test]
+    async fn dry_run_refuses_to_relabel_a_saved_position_onto_a_new_symbol() {
+        let mut h = harness();
+        h.engine.cfg.dry_run = true;
+        h.engine.reconciled = false;
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(
+            h.engine.position.is_none(),
+            "never resume a position as a different instrument"
+        );
+        assert_eq!(
+            h.engine
+                .state
+                .open_position
+                .as_ref()
+                .map(|p| p.symbol.clone()),
+            Some("SNDK".to_string()),
+            "and never rewrite the record's symbol"
+        );
+    }
+
+    /// pairtrade#300 Codex review round 2, P2: "no open position" on
+    /// shutdown must not be said while an unreconciled claim exists.
+    #[tokio::test]
+    async fn shutdown_reports_a_saved_position_that_was_never_reconciled() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.position = None;
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::UnreconciledClaim,
+            "an unreconciled claim must not be reported as 'no open position'"
+        );
+        // The claim survives the shutdown untouched -- the next start is
+        // what resolves it against the exchange.
+        assert_eq!(
+            h.engine.state.open_position.as_ref().map(|p| p.open_size),
+            Some(0.057)
+        );
+        assert_eq!(h.connector.order_count(), 0, "and nothing was closed");
     }
 
     /// The mechanism behind the test above: the field sync on its own must
@@ -6176,6 +6430,7 @@ mod tests {
             realized_partial_pnl: 0.0,
             entered_at_us: T1_US,
             flatten_asap: false,
+            exit_deadline_us: None,
         });
         h.engine.persist_position();
         let before = std::fs::read_to_string(&h.engine.cfg.state_path).unwrap();
@@ -6198,8 +6453,12 @@ mod tests {
             realized_partial_pnl: 0.0,
             entered_at_us: T1_US,
             flatten_asap: false,
+            exit_deadline_us: None,
         });
-        h.engine.note_shutdown_signal("SIGTERM");
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::TrackedPosition
+        );
         // No close was invented, and the record is durable for the next
         // process to resume from.
         assert_eq!(h.connector.order_count(), 0);
