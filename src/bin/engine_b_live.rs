@@ -122,9 +122,15 @@
 //! visible in the log and in `status.json`.
 //!
 //! The gates are one-directional on purpose: `maybe_exit` and
-//! `try_adopt_unconfirmed` read `latest_price` raw, so a stale feed can
-//! never keep an open position from being closed or an unknown exposure
-//! from being adopted. Fail-closed on entry, fail-open on getting flat.
+//! `try_adopt_unconfirmed` read the last price raw (see
+//! `exit_accounting_price`), so a stale feed can never keep an open
+//! position from being closed or an unknown exposure from being adopted.
+//! Fail-closed on entry, fail-open on getting flat.
+//!
+//! The feed itself runs on its own task (`spawn_price_feed`) writing into
+//! a shared `PriceFeed`, not as an arm of the tick loop: `tick()` awaits
+//! the exchange for seconds at a time, and a `Lagged` queued behind it
+//! would not bump the generation until after the order had been sent.
 //!
 //! DRY_RUN must stay on until a human explicitly flips the `refuse_live`
 //! gate below (mirrors `robinhood_dipgrid.rs`'s pattern: flipping
@@ -901,6 +907,72 @@ fn price_obs_from_update(
     })
 }
 
+/// The price feed's shared view: the latest accepted observation per
+/// symbol, the last raw mid from *any* update, and the feed generation.
+///
+/// Owned by a dedicated task (`spawn_price_feed`) rather than updated
+/// from the main `select!` arm, so the broadcast keeps being drained
+/// while `tick()` is awaiting the exchange. Under the old shape a
+/// `Lagged` that happened *during* entry preparation (eligibility fetch,
+/// position read, set_leverage) sat queued behind the running `tick()`
+/// and could not bump `generation` until after the order had been sent,
+/// so the send-time freshness check would have accepted pre-lag
+/// observations as current (pairtrade#289 Codex round 4).
+///
+/// Guarded by a `std::sync::Mutex`: every critical section here is a few
+/// map operations with no `.await` inside, and the engine's accessors
+/// return owned values so no guard ever crosses an await point.
+#[derive(Debug, Default)]
+struct PriceFeed {
+    latest: HashMap<String, PriceObs>,
+    /// Last positive mid seen per symbol from any update, accepted or
+    /// rejected at ingest (bot-strategy#916). Exit accounting only: when
+    /// every update is being rejected (a venue replaying a stale
+    /// snapshot, say) `latest` can be empty and an open position must
+    /// still be closable with *some* mid to book against. Never read by
+    /// an entry decision.
+    last_raw_mid: HashMap<String, f64>,
+    /// Bumped every time the broadcast reports dropped updates
+    /// (`Lagged`). Observations from an older generation are never
+    /// usable for entry: after a drop, what we hold may be arbitrarily
+    /// behind the book, and only a fresh update per symbol clears that.
+    generation: u64,
+}
+
+impl PriceFeed {
+    /// Validate and store one update, or return why it was dropped.
+    /// Dropping (rather than storing a bad value) is what makes this
+    /// fail closed: whatever was held keeps ageing until it is stale.
+    fn ingest(
+        &mut self,
+        update: &PriceUpdate,
+        received_at_us: i64,
+        max_staleness_secs: i64,
+    ) -> Result<(), &'static str> {
+        if let Some(mid) = update.mid_price.to_f64().filter(|m| *m > 0.0) {
+            self.last_raw_mid.insert(update.symbol.clone(), mid);
+        }
+        let obs =
+            price_obs_from_update(update, received_at_us, self.generation, max_staleness_secs)?;
+        self.latest.insert(update.symbol.clone(), obs);
+        Ok(())
+    }
+
+    /// Returns the new generation.
+    fn note_lag(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    fn usable(&self, now_us: i64, max_staleness_secs: i64) -> HashMap<String, f64> {
+        self.latest
+            .iter()
+            .filter(|(_, obs)| obs.is_usable(now_us, self.generation, max_staleness_secs))
+            .map(|(symbol, obs)| (symbol.clone(), obs.mid))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct DaySnapshot {
     t0_prices: Option<HashMap<String, f64>>,
@@ -1240,24 +1312,10 @@ struct EngineBLiveEngine {
     /// `bull_holder.rs`'s `Engine.http`) instead of a fresh `Client::new()`
     /// per call.
     http_client: Client,
-    /// Last accepted observation per symbol (bot-strategy#916). Read
-    /// directly only by paths that must work regardless of feed health
-    /// (exit PnL, unconfirmed-position adoption); every entry decision
-    /// goes through `usable_prices`.
-    latest_price: HashMap<String, PriceObs>,
-    /// Bumped every time the price broadcast reports dropped updates
-    /// (`Lagged`). Observations from an older generation are never
-    /// usable for entry: after a drop, what we hold may be arbitrarily
-    /// behind the book, and only a fresh update per symbol clears that.
-    feed_generation: u64,
-    /// Last positive mid seen per symbol from *any* update, accepted or
-    /// rejected at ingest (bot-strategy#916, pairtrade#289 Codex review).
-    /// Exit accounting only: when every update is being rejected (a
-    /// venue replaying a stale snapshot after a restart, say) the
-    /// validated `latest_price` can be empty, and an open position must
-    /// still be closable with *some* mid to book against. Never read by
-    /// an entry decision.
-    last_raw_mid: HashMap<String, f64>,
+    /// Shared with the price-feed task, which keeps draining the
+    /// broadcast while this engine is awaiting the exchange -- see
+    /// `PriceFeed`.
+    feed: Arc<std::sync::Mutex<PriceFeed>>,
     /// Wall clock, injectable so the tests can drive the send-time
     /// freshness re-check (which must read a *fresh* clock, not the
     /// tick's start time -- pairtrade#289 Codex review) against
@@ -1284,13 +1342,27 @@ impl EngineBLiveEngine {
     /// then none. Deliberately never gated on freshness -- see
     /// `usable_prices` -- and deliberately never used for entry.
     fn exit_accounting_price(&self, symbol: &str) -> Option<(f64, &'static str)> {
-        if let Some(obs) = self.latest_price.get(symbol) {
+        let feed = self.feed.lock().expect("price feed mutex");
+        if let Some(obs) = feed.latest.get(symbol) {
             return Some((obs.mid, "ws_mid"));
         }
-        self.last_raw_mid
+        feed.last_raw_mid
             .get(symbol)
             .copied()
             .map(|mid| (mid, "raw_last_mid_rejected_at_ingest"))
+    }
+
+    fn feed_generation(&self) -> u64 {
+        self.feed.lock().expect("price feed mutex").generation
+    }
+
+    fn latest_obs(&self, symbol: &str) -> Option<PriceObs> {
+        self.feed
+            .lock()
+            .expect("price feed mutex")
+            .latest
+            .get(symbol)
+            .copied()
     }
 
     fn kill_switch_engaged(&self) -> bool {
@@ -1432,17 +1504,10 @@ impl EngineBLiveEngine {
     /// price -- the price only books PnL. Fail-closed on entry must never
     /// mean fail-closed on getting flat.
     fn usable_prices(&self, now_us: i64) -> HashMap<String, f64> {
-        self.latest_price
-            .iter()
-            .filter(|(_, obs)| {
-                obs.is_usable(
-                    now_us,
-                    self.feed_generation,
-                    self.cfg.max_price_staleness_secs,
-                )
-            })
-            .map(|(symbol, obs)| (symbol.clone(), obs.mid))
-            .collect()
+        self.feed
+            .lock()
+            .expect("price feed mutex")
+            .usable(now_us, self.cfg.max_price_staleness_secs)
     }
 
     /// Symbols whose latest observation is missing or not usable for an
@@ -1462,14 +1527,18 @@ impl EngineBLiveEngine {
     /// generation, staleness verdict (bot-strategy#916 -- "healthyな
     /// DRY_RUNでdecisionに使った価格・時刻・鮮度・skip理由を確認できる").
     fn freshness_debug(&self, now_us: i64) -> String {
+        // One lock for the whole line, so every symbol is described
+        // against the same generation.
+        let feed = self.feed.lock().expect("price feed mutex");
+        let generation = feed.generation;
         let parts: Vec<String> = self
             .cfg
             .all_symbols()
             .into_iter()
-            .map(|symbol| match self.latest_price.get(&symbol) {
+            .map(|symbol| match feed.latest.get(&symbol) {
                 None => format!("{symbol}=never_observed"),
                 Some(obs) => {
-                    let verdict = if obs.generation != self.feed_generation {
+                    let verdict = if obs.generation != generation {
                         "PRE_LAG"
                     } else if obs.received_at_us > now_us {
                         "FUTURE_DATED"
@@ -1490,8 +1559,7 @@ impl EngineBLiveEngine {
             })
             .collect();
         format!(
-            "gen={} staleness_bound={}s {}",
-            self.feed_generation,
+            "gen={generation} staleness_bound={}s {}",
             self.cfg.max_price_staleness_secs,
             parts.join(" ")
         )
@@ -2592,9 +2660,10 @@ impl EngineBLiveEngine {
                 (pos.entry_price, "entry_price_pnl_unknown")
             }
         };
-        match self.latest_price.get(&self.cfg.us_primary_symbol) {
+        let feed_generation = self.feed_generation();
+        match self.latest_obs(&self.cfg.us_primary_symbol) {
             Some(obs)
-                if obs.generation != self.feed_generation
+                if obs.generation != feed_generation
                     || obs.effective_age_secs(now_us)
                         > self.cfg.max_price_staleness_secs as f64 =>
             {
@@ -2604,7 +2673,7 @@ impl EngineBLiveEngine {
                     self.cfg.us_primary_symbol,
                     obs.effective_age_secs(now_us),
                     obs.generation,
-                    self.feed_generation
+                    feed_generation
                 );
             }
             Some(_) => {}
@@ -2895,7 +2964,7 @@ impl EngineBLiveEngine {
             session_halt_reason: extra.session_halt_reason.clone(),
             skip_reason: self.day.skip_reason.clone(),
             stale_or_missing_symbols,
-            price_feed_generation: self.feed_generation,
+            price_feed_generation: self.feed_generation(),
         };
         let status = FullStatus {
             dashboard: DashboardStatus {
@@ -3051,7 +3120,7 @@ async fn main() -> Result<()> {
         .context("failed to start connector")?;
     let connector: std::sync::Arc<dyn DexConnector + Send + Sync> = std::sync::Arc::new(connector);
 
-    let mut price_rx = connector
+    let price_rx = connector
         .subscribe_price_updates()
         .context("subscribe_price_updates failed")?;
 
@@ -3073,9 +3142,7 @@ async fn main() -> Result<()> {
         connector,
         calendar,
         http_client: Client::new(),
-        latest_price: HashMap::new(),
-        feed_generation: 0,
-        last_raw_mid: HashMap::new(),
+        feed: Arc::new(std::sync::Mutex::new(PriceFeed::default())),
         clock: Arc::new(now_us),
         current_date: None,
         window: None,
@@ -3087,68 +3154,91 @@ async fn main() -> Result<()> {
         status_s3_mirror: S3Mirror::from_env(),
     };
 
+    // The feed runs in its own task rather than as an arm of the tick
+    // loop's `select!` (pairtrade#289 Codex round 4): `tick()` awaits the
+    // exchange for seconds at a time, and a `Lagged` queued behind it
+    // would not bump the generation until after the order had been sent,
+    // so the send-time freshness check would accept pre-lag observations
+    // as current. With the feed on its own task, the generation moves
+    // while entry preparation is in flight and that check sees it.
+    let feed_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_price_feed(
+        price_rx,
+        engine.feed.clone(),
+        engine.clock.clone(),
+        engine.cfg.max_price_staleness_secs,
+        feed_closed.clone(),
+    );
+
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
-        tokio::select! {
-            update = price_rx.recv() => {
-                match update {
-                    Ok(update) => {
-                        let received_at_us = engine.now();
-                        if let Some(mid) = update.mid_price.to_f64().filter(|m| *m > 0.0) {
-                            engine.last_raw_mid.insert(update.symbol.clone(), mid);
-                        }
-                        match price_obs_from_update(
-                            &update,
-                            received_at_us,
-                            engine.feed_generation,
-                            engine.cfg.max_price_staleness_secs,
-                        ) {
-                            Ok(obs) => {
-                                engine.latest_price.insert(update.symbol, obs);
-                            }
-                            Err(reason) => {
-                                // Rejected, not stored: whatever was held
-                                // for this symbol keeps ageing, so a book
-                                // that stays untrustworthy turns into a
-                                // stale-price skip rather than into an
-                                // entry on a bad mid (bot-strategy#916).
-                                log::warn!(
-                                    "[WS] {} price update rejected ({reason}): mid={} bid={} ask={} ts_ms={}",
-                                    update.symbol,
-                                    update.mid_price,
-                                    update.best_bid,
-                                    update.best_ask,
-                                    update.timestamp
-                                );
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        // Dropped updates mean every price now held may be
-                        // arbitrarily behind the book. Bump the generation
-                        // so no entry decision uses a pre-lag observation
-                        // until that symbol reports again
-                        // (bot-strategy#916).
-                        engine.feed_generation += 1;
-                        log::warn!(
-                            "[WS] price feed lagged, dropped {n} updates -- feed generation now {}; \
-                             held prices are unusable for entry until re-observed",
-                            engine.feed_generation
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log::error!("[WS] price feed closed, exiting");
-                        break;
-                    }
-                }
-            }
-            _ = tick_interval.tick() => {
-                engine.tick().await;
-            }
+        tick_interval.tick().await;
+        if feed_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            log::error!("[WS] price feed closed, exiting");
+            break;
         }
+        engine.tick().await;
     }
 
     Ok(())
+}
+
+/// Drain the price broadcast into `feed` for as long as it is open,
+/// independently of the tick loop. Sets `closed` when the sender is gone
+/// so the tick loop can exit -- the task itself never decides to stop the
+/// process.
+fn spawn_price_feed(
+    mut price_rx: tokio::sync::broadcast::Receiver<PriceUpdate>,
+    feed: Arc<std::sync::Mutex<PriceFeed>>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    max_staleness_secs: i64,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match price_rx.recv().await {
+                Ok(update) => {
+                    let received_at_us = clock();
+                    // Locked only for the map writes; nothing is awaited
+                    // while the guard is alive.
+                    let result = {
+                        let mut feed = feed.lock().expect("price feed mutex");
+                        feed.ingest(&update, received_at_us, max_staleness_secs)
+                    };
+                    if let Err(reason) = result {
+                        // Rejected, not stored: whatever was held for this
+                        // symbol keeps ageing, so a book that stays
+                        // untrustworthy turns into a stale-price skip
+                        // rather than into an entry on a bad mid
+                        // (bot-strategy#916).
+                        log::warn!(
+                            "[WS] {} price update rejected ({reason}): mid={} bid={} ask={} ts_ms={}",
+                            update.symbol,
+                            update.mid_price,
+                            update.best_bid,
+                            update.best_ask,
+                            update.timestamp
+                        );
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Dropped updates mean every price now held may be
+                    // arbitrarily behind the book. Bump the generation so
+                    // no entry decision uses a pre-lag observation until
+                    // that symbol reports again (bot-strategy#916).
+                    let generation = feed.lock().expect("price feed mutex").note_lag();
+                    log::warn!(
+                        "[WS] price feed lagged, dropped {n} updates -- feed generation now \
+                         {generation}; held prices are unusable for entry until re-observed"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -4017,6 +4107,10 @@ mod tests {
     struct StubConnector {
         orders: std::sync::Mutex<Vec<(String, Decimal, OrderSide, bool)>>,
         positions: std::sync::Mutex<Vec<PositionSnapshot>>,
+        /// When set, `get_positions` bumps this feed's generation --
+        /// standing in for the feed task processing a `Lagged` while
+        /// `maybe_enter` is awaiting the exchange (pairtrade#289 round 4).
+        lag_during_positions: std::sync::Mutex<Option<Arc<std::sync::Mutex<PriceFeed>>>>,
     }
 
     impl StubConnector {
@@ -4080,6 +4174,9 @@ mod tests {
             unimplemented!("engine_b_live does not call get_combined_balance")
         }
         async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, dex_connector::DexError> {
+            if let Some(feed) = self.lag_during_positions.lock().unwrap().as_ref() {
+                feed.lock().unwrap().note_lag();
+            }
             Ok(self
                 .positions
                 .lock()
@@ -4278,9 +4375,7 @@ mod tests {
                 sessions: HashMap::new(),
             },
             http_client: Client::new(),
-            latest_price: HashMap::new(),
-            feed_generation: 0,
-            last_raw_mid: HashMap::new(),
+            feed: Arc::new(std::sync::Mutex::new(PriceFeed::default())),
             clock: Arc::new(move || clock_for_engine.load(std::sync::atomic::Ordering::SeqCst)),
             current_date: Some(NaiveDate::from_ymd_opt(2026, 9, 8).unwrap()),
             window: Some((T0_US, T1_US, T2_US)),
@@ -4309,10 +4404,10 @@ mod tests {
                 .store(now_us, std::sync::atomic::Ordering::SeqCst);
         }
 
-        /// Put one observation in `latest_price` as if it had been
-        /// accepted `age_secs` ago on generation `generation`.
+        /// Put one observation in the feed as if it had been accepted at
+        /// `received_at_us` on generation `generation`.
         fn observe_at(&mut self, symbol: &str, mid: f64, received_at_us: i64, generation: u64) {
-            self.engine.latest_price.insert(
+            self.engine.feed.lock().unwrap().latest.insert(
                 symbol.to_string(),
                 PriceObs {
                     mid,
@@ -4328,7 +4423,7 @@ mod tests {
         /// Every subscribed symbol observed at `received_at_us` on the
         /// engine's current generation.
         fn observe_all(&mut self, received_at_us: i64, kr: f64, us: f64) {
-            let generation = self.engine.feed_generation;
+            let generation = self.engine.feed_generation();
             self.observe_at("SKHY", kr, received_at_us, generation);
             self.observe_at("SNDK", us, received_at_us, generation);
             self.observe_at("SOXL", 100.0, received_at_us, generation);
@@ -4501,7 +4596,7 @@ mod tests {
         // Fresh by the clock, but observed before the broadcast reported
         // dropped updates: what we hold may be arbitrarily behind.
         h.observe_all(T1_US, 190.0, 1700.0);
-        h.engine.feed_generation += 1;
+        h.engine.feed.lock().unwrap().note_lag();
         h.engine.maybe_enter(T1_US + 1_000_000).await;
         assert!(h.engine.day.t1_prices.is_none());
         assert_eq!(h.connector.order_count(), 0);
@@ -4599,8 +4694,13 @@ mod tests {
                 sign: -1,
                 entry_price: None,
             });
-        h.engine.last_raw_mid.insert("SNDK".to_string(), 1690.0);
-        assert!(h.engine.latest_price.is_empty());
+        h.engine
+            .feed
+            .lock()
+            .unwrap()
+            .last_raw_mid
+            .insert("SNDK".to_string(), 1690.0);
+        assert!(h.engine.feed.lock().unwrap().latest.is_empty());
         h.set_now(T1_US + 60_000_000);
         h.engine.maybe_exit(T1_US + 60_000_000).await;
         assert_eq!(
@@ -4633,6 +4733,35 @@ mod tests {
             1,
             "no price at all must not strand exposure"
         );
+    }
+
+    #[tokio::test]
+    async fn entry_sends_nothing_when_the_feed_lags_during_the_entry_awaits() {
+        // The eligibility fetch / position read / set_leverage awaits can
+        // take seconds. A `Lagged` during them means everything held may
+        // be behind the book, and because the feed runs on its own task
+        // the generation moves while those awaits are in flight -- the
+        // send-time check must see it (pairtrade#289 Codex round 4).
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        *h.connector.lag_during_positions.lock().unwrap() = Some(h.engine.feed.clone());
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.connector.order_count(),
+            0,
+            "a lag observed during entry preparation must block the send"
+        );
+        assert!(h.engine.position.is_none());
+        // Re-observed on the new generation, the next tick proceeds.
+        *h.connector.lag_during_positions.lock().unwrap() = None;
+        h.observe_all(T1_US + 2_000_000, 190.0, 1700.0);
+        h.set_now(T1_US + 2_000_000);
+        h.engine.maybe_enter(T1_US + 2_000_000).await;
+        assert_eq!(h.connector.order_count(), 1);
     }
 
     #[tokio::test]
@@ -4684,7 +4813,7 @@ mod tests {
         // unusable for any entry, and deliberately still good enough to
         // get flat on.
         h.observe_at("SNDK", 1710.0, T1_US, 0);
-        h.engine.feed_generation = 5;
+        h.engine.feed.lock().unwrap().generation = 5;
         h.set_now(T2_US + 1_000_000);
         h.engine.maybe_exit(T2_US + 1_000_000).await;
         assert_eq!(
@@ -4710,7 +4839,7 @@ mod tests {
         assert!(stale.contains(&"SKHY".to_string()));
         assert!(stale.contains(&"SNDK".to_string()));
         // A symbol that never arrived is reported too.
-        h.engine.latest_price.remove("SNDK");
+        h.engine.feed.lock().unwrap().latest.remove("SNDK");
         assert!(h
             .engine
             .stale_or_missing_symbols(T1_US)

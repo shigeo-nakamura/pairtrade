@@ -93,7 +93,11 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   - **These gates are entry-only.** `maybe_exit` and the unconfirmed-position
     adoption path read the last price raw, so a stale feed can never keep an
     open position from being closed or an unknown exposure from being
-    adopted. A PnL booked off a stale mid is logged as such; if *every*
+    adopted. The feed runs on its own task writing into a shared
+    `PriceFeed`, not as an arm of the tick loop, so a `Lagged` during the
+    seconds a tick spends awaiting the exchange bumps the generation while
+    entry preparation is still in flight and the send-time check sees it.
+    A PnL booked off a stale mid is logged as such; if *every*
     update has been rejected at ingest (e.g. a venue replaying a stale
     snapshot after a restart) the close still goes out and the PnL is
     booked off the last raw mid, or as a last resort off the entry price
